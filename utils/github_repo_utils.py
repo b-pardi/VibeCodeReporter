@@ -1,26 +1,24 @@
 import requests
 import json
+import os
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
+
 
 url = "https://api.github.com/search/repositories"
 current_dir = Path(__file__).parent 
-GITHUB_TOKEN = "YOUR_TOKEN" #TODO: Replace with env var
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 
 
-def search_github_by_topic(topic, min_stars=100, limit=500, language="python"):
+def search_github_by_topic(topic, filters=[], limit=500, language="python"):
     
     all_repos = []
     
     for page in range(1, (limit // 100) + 1):
-        filters = [ f"topic:{topic}", 
-                "has:license", 
-                f"stars:>{min_stars}", 
-                f"language:{language}"
-        ]
         query = " ".join(filters)
 
         print(f"Fetching page {page}... for topic '{topic}'")
-        
         params = {
             "q": query,
             "sort": "stars",
@@ -41,24 +39,73 @@ def search_github_by_topic(topic, min_stars=100, limit=500, language="python"):
             
             data = response.json()
             all_repos.extend(data.get('items', []))
-
-            print(f"Total Results Found: {data['total_count']}\n")
                 
         except requests.exceptions.HTTPError as err:
             print(f"HTP error occurred: {err}")
         except Exception as err:
             print(f"An error occurred: {err}")
 
-    save_data({"items": all_repos}, name=f'github_repos_{topic}.json')
+    return all_repos
 
-def save_data(data, name = 'github_repos.json'):
-    path = current_dir.joinpath('..', 'data', 'github_repos')
-    print(f"Saving {len(data['items'])} repositories to {path.joinpath(name)}")
+def save_data(data, path=current_dir):
+    print(f"Saving {len(data['items'])} repositories to {path}")
 
-    with open(path.joinpath(name), 'w') as f:
+    with open(path, 'w') as f:
         json.dump(data, f, indent=4)
 
-search_github_by_topic("machine-learning")
-search_github_by_topic("web-development", language="javascript")
-search_github_by_topic("mobile-development", language="java")
-search_github_by_topic("gamedev", language="c++")
+
+def mine_github_repos():
+    # Define topics, languages, minimum stars, and limits
+    topics = [
+        ("machine-learning", "python", 50, 100),
+        ("machine-learning", "c++", 50, 100),
+        ("machine-learning", "java", 50, 100),
+        ("frontend", "javascript", 50, 200),
+        ("frontend", "python", 50, 100),
+        ("frontend", "java", 50, 100),
+        ("database", "python", 50, 100),
+        ("database", "java", 50, 100),
+        ("database", "javascript", 50, 100),
+        ("cybersecurity", "python", 50, 250),
+        ("cybersecurity", "c", 50, 100),
+        ("cybersecurity", "go", 50, 100),
+        ("cybersecurity", "c++", 50, 100),
+        ("cybersecurity", "java", 50, 100),
+        ("gamedev", "c++", 50, 100),
+        ("gamedev", "c#", 50, 100),
+        ("gamedev", "javascript", 50, 100),
+        ("gamedev", "python", 50, 100),
+        ("gamedev", "java", 50, 100),
+        ("compiler", "c", 50, 100),
+        ("compiler", "c++", 50, 100),
+        ("compiler", "python", 50, 100)
+    ]
+    
+    for topic, language, min_stars, limit in topics:
+        path = current_dir.joinpath('..', 'data', 'github_repos', 'pre2022', f'{topic}_{language}_repos.json')
+
+        #This filters help filter out repositories that aren't projects
+        filters = [
+            f"topic:{topic}",
+            f"stars:>{min_stars}",
+            f"language:{language}",
+            f"created:<2022-01-01",
+        ]
+        repos = search_github_by_topic(topic, filters, limit=limit, language=language)
+        save_data({"items": repos}, path=path)
+
+    for topic, language, min_stars, limit in topics:
+        path = current_dir.joinpath('..', 'data', 'github_repos','post2022', f'{topic}_{language}_repos.json')
+
+        #This filters help filter out repositories that aren't projects
+        filters = [
+            f"topic:{topic}",
+            f"stars:>{min_stars}",
+            f"language:{language}",
+            f"created:>2023-01-01",
+        ]
+        repos = search_github_by_topic(topic, filters, limit=limit, language=language)
+        save_data({"items": repos}, path=path)
+
+if __name__ == "__main__":
+    mine_github_repos()
