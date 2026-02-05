@@ -266,9 +266,9 @@ def build_file_filter(cfg: MiningConfig) -> FileFilter:
 
 
 def get_checkpoint_path(cfg: MiningConfig, repo_id: str) -> Path:
-    """Get path to checkpoint CSV for a repo."""
+    """Get path to checkpoint pickle file for a repo."""
     safe_id = re.sub(r'[^\w\-_.]', '_', str(repo_id))
-    return cfg.checkpoint_dir / f"repo_{safe_id}.csv"
+    return cfg.checkpoint_dir / f"repo_{safe_id}.pkl"
 
 
 def is_repo_processed(cfg: MiningConfig, repo_id: str) -> bool:
@@ -277,11 +277,11 @@ def is_repo_processed(cfg: MiningConfig, repo_id: str) -> bool:
 
 
 def save_checkpoint(cfg: MiningConfig, repo_id: str, rows: list) -> Path:
-    """Save checkpoint CSV for a repo."""
+    """Save checkpoint pickle file for a repo."""
     cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = get_checkpoint_path(cfg, repo_id)
     df = pd.DataFrame(rows)
-    df.to_csv(checkpoint_path, index=False, encoding='utf-8', escapechar="\\")
+    df.to_pickle(checkpoint_path)
     return checkpoint_path
 
 

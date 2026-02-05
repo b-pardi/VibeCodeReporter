@@ -9,7 +9,7 @@ This tool:
 2. Builds a metadata dataset of repositories
 3. Mines code from repositories (full source + diffs)
 4. Computes code metrics (LOC, complexity, comment density)
-5. Outputs per-repo CSV checkpoints that can be merged
+5. Outputs per-repo pickle checkpoints that can be merged into CSV
 
 ## Installation
 
@@ -43,7 +43,7 @@ VibeCodeReporter/
 │   ├── 1_find_repos.py         # Find GitHub repos by criteria
 │   ├── 2_build_meta_dataset.py # Build metadata CSV from repo JSONs
 │   ├── 3_repo_mining.py        # Main mining script
-│   └── 4_merge_repo_datasets.py # Merge checkpoint CSVs
+│   └── 4_merge_repo_datasets.py # Merge checkpoint pickles into CSV
 ├── utils/
 │   ├── mining_utils.py         # PyDriller helper functions
 │   ├── file_filters.py         # File filtering logic
@@ -55,7 +55,7 @@ VibeCodeReporter/
 │   ├── repos_dataset.csv       # Metadata CSV (input)
 │   └── temp/                   # Temporary cloned repos
 └── output/
-    └── repo_checkpoints/       # Per-repo CSV outputs
+    └── repo_checkpoints/       # Per-repo pickle outputs
 ```
 
 ## Usage (WIP)
@@ -124,7 +124,7 @@ Options:
 
 ### Step 3: Merge Checkpoints
 
-After mining, merge per-repo CSVs into a single dataset:
+After mining, merge per-repo pickle files into a single CSV dataset:
 
 ```bash
 python src/4_merge_repo_datasets.py
@@ -132,7 +132,7 @@ python src/4_merge_repo_datasets.py
 
 Options:
 ```bash
---checkpoint-dir PATH   Directory with checkpoint CSVs
+--checkpoint-dir PATH   Directory with checkpoint pickle files
 --output PATH           Output merged CSV path
 --quiet                 Suppress progress output
 ```
@@ -147,7 +147,7 @@ All settings can be configured in `src/configs.py`:
 | `data_base_path` | `data/` | Base path for input data |
 | `output_base_path` | `output/` | Base path for outputs |
 | `clone_repo_to` | `data/temp/` | Temporary clone directory |
-| `checkpoint_dir` | `output/repo_checkpoints/` | Per-repo CSV outputs |
+| `checkpoint_dir` | `output/repo_checkpoints/` | Per-repo pickle outputs |
 
 ### Date Filters
 | Option | Default | Description |
@@ -198,7 +198,7 @@ All settings can be configured in `src/configs.py`:
 
 ## Output Format
 
-Each checkpoint CSV contains:
+Each checkpoint pickle file contains:
 
 | Column | Description |
 |--------|-------------|

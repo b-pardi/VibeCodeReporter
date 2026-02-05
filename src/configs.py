@@ -17,7 +17,7 @@ class MiningConfig:
     checkpoint_dir: Path = output_base_path / 'repo_checkpoints'    # path to per-repo CSV checkpoints
     metadata_csv: Path = data_base_path / 'repos_dataset.csv'
     # Date Filters:
-    date_since: str = "2000-01-01"          # ISO date string formatted as "YYYY-mm-dd" indicating earliest date to grab commits from
+    date_since: str = "1980-01-01"          # ISO date string formatted as "YYYY-mm-dd" indicating earliest date to grab commits from
     date_to: str = "2030-12-31"             # ISO date string formatted as "YYYY-mm-dd" indicating latest date to grab commits from
     
     # Commit Filters:
