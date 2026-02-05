@@ -71,3 +71,4 @@ def is_code_file(modified_file):
 
     # Return True if extension is in CODE_EXTENSIONS or filename is in ALT_FNS
     return ext in CODE_EXTENSIONS or fn in ALT_FNS
+

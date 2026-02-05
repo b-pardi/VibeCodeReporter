@@ -15,10 +15,10 @@ class MiningConfig:
     output_csv_path: Path = output_base_path / 'repo_data.csv'      # path to output file from pydriller
     clone_repo_to: Path = data_base_path / 'temp'                   # path to where pydriller stores temporary commits
     checkpoint_dir: Path = output_base_path / 'repo_checkpoints'    # path to per-repo CSV checkpoints
-
+    metadata_csv: Path = data_base_path / 'repos_dataset.csv'
     # Date Filters:
     date_since: str = "2000-01-01"          # ISO date string formatted as "YYYY-mm-dd" indicating earliest date to grab commits from
-    date_to: str = "2025-12-31"             # ISO date string formatted as "YYYY-mm-dd" indicating latest date to grab commits from
+    date_to: str = "2030-12-31"             # ISO date string formatted as "YYYY-mm-dd" indicating latest date to grab commits from
     
     # Commit Filters:
     only_in_main_branch: bool = False       # only analyze commits from main
@@ -28,13 +28,13 @@ class MiningConfig:
     only_code_files: bool = True            # whitelists files based on extensions listed in `consts/code_file_exts.py`
 
     # Commit Sampling:
-    min_commit_interval_days: int = 7       # min days between grabbed commits (0 = grab all)
-    commit_skip: int = 0                    # take every Nth commit (0 or 1 = no skip, 2 = every 2nd, etc.)
+    min_commit_interval_days: int = 0       # min days between grabbed commits (0 = grab all)
+    commit_skip: int = 10                   # take every Nth commit (0 or 1 = no skip, 2 = every 2nd, etc.)
     min_repo_commits: int = 50              # min number of commits for a repo to be considered for mining
     min_branch_commits: int = 10            # min number of commits for a branch to be analyzed
 
     # File Size Filters:
-    max_repo_size_mb: int = 100             # max size of a repo to analyze (MB)
+    max_repo_size_mb: int = 1000             # max size of a repo to analyze (MB)
     min_file_size: int = 500                # min file size in bytes
     max_file_size: int = 100_000            # max file size in bytes (100KB)
     min_lines: int = 10                     # min number of lines for a file to be included
@@ -68,13 +68,19 @@ class MiningConfig:
     ])
 
     # Parallelization:
-    num_workers: int = 4                    # threads for parallel commit processing (1 = sequential)
+    num_workers: int = 1                    # threads for parallel commit processing (1 = sequential)
     max_cloned_repos: int = 10              # max repos to clone ahead of processing (clone queue size)
+    parallel_cloning: bool = True           # clone repos in background while processing (works even with num_workers=1)
+    commit_timeout: int = 5                 # timeout in seconds for processing a single commit
+    batch_timeout: int = 120                # timeout in seconds for a batch of commits (per branch)
+
+    def __post_init__(self):
+        """Convert date strings to datetime objects after initialization."""
+        if isinstance(self.date_since, str):
+            self.date_since = datetime.strptime(self.date_since, '%Y-%m-%d')
+        if isinstance(self.date_to, str):
+            self.date_to = datetime.strptime(self.date_to, '%Y-%m-%d')
 
 
 # global config objects
 mining_cfg = MiningConfig()
-
-# format time strings to datetime objects (easier with pandas)
-mining_cfg.date_since = datetime.strptime(mining_cfg.date_since, '%Y-%m-%d')
-mining_cfg.date_to = datetime.strptime(mining_cfg.date_to, '%Y-%m-%d')
