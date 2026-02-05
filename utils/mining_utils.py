@@ -64,10 +64,10 @@ def read_repo_urls_file(fp):
     return repo_urls_list
 
 def is_code_file(modified_file):
-    path_lower = (modified_file.new_path or modified_file.old_path or "")
+    """Check if a modified file is a code file based on extension."""
+    path_lower = (modified_file.new_path or modified_file.old_path or "").lower()
     fn = os.path.basename(path_lower)
     _, ext = os.path.splitext(path_lower)
-    
-    if ext not in CODE_EXTENSIONS and fn not in ALT_FNS:
-        return True
-    else: return False
+
+    # Return True if extension is in CODE_EXTENSIONS or filename is in ALT_FNS
+    return ext in CODE_EXTENSIONS or fn in ALT_FNS
