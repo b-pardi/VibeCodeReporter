@@ -20,12 +20,13 @@ from pathlib import Path
 import time
 from datetime import datetime, timedelta
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 import threading
 import traceback
 from typing import NamedTuple, Optional, Dict, Any
 import warnings
 warnings.filterwarnings("ignore", message=".*deallocator.*")
+warnings.filterwarnings("ignore", category=SyntaxWarning, message=".*invalid escape sequence.*")
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -396,24 +397,13 @@ def get_branch_names(local_path: str) -> list:
 
 
 def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
-                   cfg: MiningConfig, file_filter: FileFilter,
-                   worker_stats: dict = None) -> list:
+                   cfg: MiningConfig, file_filter: FileFilter) -> tuple:
     """
-    Process a single commit and return list of row dicts.
-    This function is designed to be called in parallel.
+    Process a single commit and return (rows, filter_stats).
     """
-    # Track worker activity
-    if worker_stats is not None:
-        thread_id = threading.current_thread().name
-        with worker_stats['lock']:
-            worker_stats['active'] += 1
-            if thread_id not in worker_stats['jobs_per_worker']:
-                worker_stats['jobs_per_worker'][thread_id] = 0
-            worker_stats['jobs_per_worker'][thread_id] += 1
-
     rows = []
-    # Debug counters (use worker_stats lock for thread safety)
-    filter_stats = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0}
+    filter_stats = {'no_diff': 0, 'not_code': 0, 'file_filter': 0,
+                    'too_few_lines': 0, 'passed': 0, 'errors': 0}
 
     try:
         for modified_file in commit.modified_files:
@@ -512,21 +502,25 @@ def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
             rows.append(row)
 
     except Exception as e:
-        # Track errors instead of silently swallowing them
         filter_stats['errors'] = filter_stats.get('errors', 0) + 1
-    finally:
-        # Update worker stats and aggregate filter stats
-        if worker_stats is not None:
-            with worker_stats['lock']:
-                worker_stats['active'] -= 1
-                worker_stats['completed'] += 1
-                # Aggregate filter stats
-                if 'filter_stats' not in worker_stats:
-                    worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0, 'errors': 0}
-                for k, v in filter_stats.items():
-                    worker_stats['filter_stats'][k] = worker_stats['filter_stats'].get(k, 0) + v
 
-    return rows
+    return rows, filter_stats
+
+
+def _mp_process_commit(args):
+    """
+    Process a single commit in a subprocess. Used by multiprocessing.Pool.
+    Opens the repo independently by commit hash (all args are picklable).
+    """
+    local_path, commit_hash, repo_id, repo_url, branch_name, cfg, filter_config = args
+    file_filter = FileFilter(filter_config)
+    try:
+        for commit in Repository(path_to_repo=local_path, single=commit_hash).traverse_commits():
+            rows, stats = process_commit(commit, repo_id, repo_url, branch_name, cfg, file_filter)
+            return commit_hash, rows, stats
+    except Exception:
+        return commit_hash, [], {'errors': 1}
+    return commit_hash, [], {}
 
 
 def filter_commits_by_sampling(commits: list, cfg: MiningConfig) -> list:
@@ -564,127 +558,33 @@ def process_cloned_repo(
     queued_repo: QueuedRepo,
     cfg: MiningConfig,
     file_filter: FileFilter,
-    worker_stats: dict,
-    is_parallel: bool,
     total_bytes_ref: list,  # Using list as mutable reference
     branch_pbar_position: int = 1,
     deadline: float = None,
-) -> list:
+) -> tuple:
     """
-    Process a single cloned repo and return list of row dicts.
-    Uses local_path instead of repo_url for PyDriller operations.
+    Process a single cloned repo and return (rows, aggregate_filter_stats).
+    Uses multiprocessing.Pool so stuck workers can be killed via pool.terminate().
+    Works for both parallel (num_workers>1) and sequential (num_workers=1) modes.
     """
     repo_id = queued_repo.repo_id
     repo_url = queued_repo.repo_url  # Keep original URL for metadata
     local_path = str(queued_repo.local_path)
     repo_rows = []
+    repo_filter_stats = {'no_diff': 0, 'not_code': 0, 'file_filter': 0,
+                         'too_few_lines': 0, 'passed': 0, 'errors': 0}
 
     # Get branch names (fast - just reads git refs, no commit parsing)
     branch_names = get_branch_names(local_path)
     if not branch_names:
-        return repo_rows
+        return repo_rows, repo_filter_stats
 
-    if is_parallel:
-        # Parallel mode: use nested tqdm bars (branch bar + commit completion bar)
-        branch_pbar = tqdm(
-            branch_names,
-            desc="    Branches",
-            unit="branch",
-            leave=False,
-            position=branch_pbar_position,
-        )
+    # Extract picklable FilterConfig for subprocess workers
+    filter_config = file_filter.config
+    num_procs = max(cfg.num_workers, 1)
+    pool = multiprocessing.Pool(processes=num_procs)
 
-        for branch_name in branch_pbar:
-            # Check repo deadline
-            if deadline and time.time() > deadline:
-                tqdm.write(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
-                break
-
-            branch_display = (branch_name or "default")[:20]
-            branch_pbar.set_postfix_str(branch_display)
-
-            try:
-                all_commits, enum_timed_out = collect_commits_with_timeout(
-                    local_path, cfg, branch_name, timeout=cfg.batch_timeout
-                )
-                if enum_timed_out:
-                    tqdm.write(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
-                    if not all_commits:
-                        continue
-            except Exception:
-                continue
-
-            # Check min branch commits (replaces the old get_branches_with_commit_counts pre-check)
-            if len(all_commits) < cfg.min_branch_commits:
-                continue
-
-            # Apply sampling
-            filtered_commits = filter_commits_by_sampling(all_commits, cfg)
-            if not filtered_commits:
-                continue
-
-            branch_pbar.set_postfix_str(f"{branch_display} ({len(filtered_commits)} commits)")
-
-            # Process commits in parallel with progress bar
-            commit_pbar = tqdm(
-                total=len(filtered_commits),
-                desc="      Commits",
-                unit="commit",
-                leave=False,
-                position=branch_pbar_position + 1,
-            )
-
-            executor = ThreadPoolExecutor(max_workers=cfg.num_workers)
-            timed_out_commits = []
-            try:
-                futures = {
-                    executor.submit(
-                        process_commit, commit, repo_id, repo_url,
-                        branch_name, cfg, file_filter, worker_stats
-                    ): commit.hash
-                    for commit in filtered_commits
-                }
-
-                # batch_timeout controls max wait between completions.
-                # Individual threads can't be killed in Python; batch_timeout
-                # is the safety net that detects when all remaining workers are stuck.
-                done_count = 0
-                for future in as_completed(futures, timeout=cfg.batch_timeout):
-                    commit_hash = futures[future]
-                    try:
-                        # Future is already complete (returned by as_completed), no timeout needed
-                        rows = future.result()
-                        for r in rows:
-                            row_size = estimate_row_size(r)
-                            total_bytes_ref[0] += row_size
-                            repo_rows.append(r)
-                    except Exception:
-                        pass
-
-                    done_count += 1
-                    commit_pbar.update(1)
-                    with worker_stats['lock']:
-                        commit_pbar.set_postfix_str(
-                            f"Est: {format_size(total_bytes_ref[0])} | Workers: {worker_stats['active']}/{cfg.num_workers}"
-                        )
-
-            except TimeoutError:
-                # Batch timeout - no futures completed within batch_timeout seconds
-                pending = [futures[f][:8] for f in futures if not f.done()]
-                timed_out_commits.extend(pending)
-                tqdm.write(f"      [TIMEOUT] Batch timeout after {cfg.batch_timeout}s, {len(pending)} commits stuck: {pending[:5]}...")
-            finally:
-                if timed_out_commits:
-                    tqdm.write(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
-                executor.shutdown(wait=False, cancel_futures=True)
-                with worker_stats['lock']:
-                    worker_stats['active'] = 0
-
-            commit_pbar.close()
-        branch_pbar.close()
-
-    else:
-        # Sequential mode: show all nested progress bars
+    try:
         branch_pbar = tqdm(
             branch_names,
             desc="    Branches",
@@ -717,59 +617,103 @@ def process_cloned_repo(
             if len(all_commits) < cfg.min_branch_commits:
                 continue
 
+            # Apply sampling
             filtered_commits = filter_commits_by_sampling(all_commits, cfg)
             if not filtered_commits:
                 continue
 
             branch_pbar.set_postfix_str(f"{branch_display} ({len(filtered_commits)} commits)")
 
+            # Extract commit hashes for multiprocessing (commit objects aren't picklable)
+            commit_hashes = [c.hash for c in filtered_commits]
+            # Release commit objects to free memory
+            del filtered_commits, all_commits
+
             commit_pbar = tqdm(
-                total=len(filtered_commits),
+                total=len(commit_hashes),
                 desc="      Commits",
                 unit="commit",
                 leave=False,
                 position=branch_pbar_position + 1,
             )
 
-            # Use a single-worker executor so we can enforce per-commit timeouts.
-            # If a commit hangs, we abandon the stuck thread and create a fresh executor.
             timed_out_commits = []
-            commit_executor = ThreadPoolExecutor(max_workers=1)
-            for commit in filtered_commits:
-                # Check repo deadline
-                if deadline and time.time() > deadline:
-                    tqdm.write(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining commits")
-                    break
+            try:
+                # Submit all commits to the process pool
+                pending = {}  # commit_hash -> (AsyncResult, submit_time)
+                for commit_hash in commit_hashes:
+                    args = (local_path, commit_hash, repo_id, repo_url,
+                            branch_name, cfg, filter_config)
+                    ar = pool.apply_async(_mp_process_commit, (args,))
+                    pending[commit_hash] = (ar, time.time())
 
-                commit_pbar.set_postfix_str(f"{commit.hash[:8]} | Est: {format_size(total_bytes_ref[0])}")
+                # Poll for results with per-commit and overall timeouts
+                while pending:
+                    if deadline and time.time() > deadline:
+                        tqdm.write(f"    [TIMEOUT] Repo deadline reached, abandoning {len(pending)} commits")
+                        for ch in pending:
+                            timed_out_commits.append(ch[:8])
+                        commit_pbar.update(len(pending))
+                        break
 
-                future = commit_executor.submit(
-                    process_commit, commit, repo_id, repo_url,
-                    branch_name, cfg, file_filter, worker_stats
-                )
-                try:
-                    rows = future.result(timeout=cfg.commit_timeout)
-                    for r in rows:
-                        row_size = estimate_row_size(r)
-                        total_bytes_ref[0] += row_size
-                        repo_rows.append(r)
-                except TimeoutError:
-                    timed_out_commits.append(commit.hash[:8])
-                    # Abandon stuck thread, create fresh executor
-                    commit_executor.shutdown(wait=False, cancel_futures=True)
-                    commit_executor = ThreadPoolExecutor(max_workers=1)
-                except Exception:
-                    pass
+                    done_hashes = []
+                    need_pool_restart = False
 
-                commit_pbar.update(1)
+                    for commit_hash, (ar, submit_time) in list(pending.items()):
+                        if ar.ready():
+                            done_hashes.append(commit_hash)
+                            try:
+                                result_hash, rows, stats = ar.get(timeout=1)
+                                for r in rows:
+                                    total_bytes_ref[0] += estimate_row_size(r)
+                                    repo_rows.append(r)
+                                for key in repo_filter_stats:
+                                    repo_filter_stats[key] += stats.get(key, 0)
+                            except Exception:
+                                repo_filter_stats['errors'] += 1
+                        elif time.time() - submit_time > cfg.commit_timeout:
+                            # Per-commit timeout exceeded — mark as timed out
+                            done_hashes.append(commit_hash)
+                            timed_out_commits.append(commit_hash[:8])
+                            need_pool_restart = True
 
-            if timed_out_commits:
-                print(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
-            commit_executor.shutdown(wait=False)
+                    for h in done_hashes:
+                        del pending[h]
+                        commit_pbar.update(1)
+                        commit_pbar.set_postfix_str(
+                            f"Est: {format_size(total_bytes_ref[0])}"
+                        )
+
+                    if need_pool_restart and pending:
+                        # Kill stuck worker processes and recreate pool
+                        tqdm.write(f"      [TIMEOUT] Killing stuck workers, resubmitting {len(pending)} remaining commits")
+                        pool.terminate()
+                        pool.join()
+                        pool = multiprocessing.Pool(processes=num_procs)
+                        # Resubmit remaining commits with fresh pool
+                        for ch in list(pending.keys()):
+                            args = (local_path, ch, repo_id, repo_url,
+                                    branch_name, cfg, filter_config)
+                            new_ar = pool.apply_async(_mp_process_commit, (args,))
+                            pending[ch] = (new_ar, time.time())
+
+                    if not done_hashes:
+                        time.sleep(0.2)  # Avoid busy-waiting
+
+                if timed_out_commits:
+                    tqdm.write(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
+
+            except Exception as e:
+                tqdm.write(f"      [ERROR] Branch processing error: {e}")
+
             commit_pbar.close()
         branch_pbar.close()
 
-    return repo_rows
+    finally:
+        pool.terminate()
+        pool.join()
+
+    return repo_rows, repo_filter_stats
 
 
 def mine_repos_from_metadata(
@@ -843,14 +787,6 @@ def mine_repos_from_metadata(
     skipped_commits = 0
     skipped_no_files = 0
 
-    # Worker stats for parallel mode
-    worker_stats = {
-        'lock': threading.Lock(),
-        'active': 0,
-        'completed': 0,
-        'jobs_per_worker': {},
-    }
-
     # Clone stats
     clone_stats = CloneStats()
 
@@ -895,8 +831,7 @@ def mine_repos_from_metadata(
             if clone_stats.current_cloning:
                 status += f", Cloning: {clone_stats.current_cloning}"
         if is_parallel:
-            with worker_stats['lock']:
-                status += f" | Workers: {worker_stats['active']}/{cfg.num_workers}"
+            status += f" | Workers: {cfg.num_workers}"
         return status
 
     while True:
@@ -950,26 +885,20 @@ def mine_repos_from_metadata(
 
             # Process the cloned repo (with deadline for overall repo timeout)
             deadline = time.time() + cfg.repo_timeout
-            repo_rows = process_cloned_repo(
+            repo_rows, filter_stats = process_cloned_repo(
                 queued_repo=queued_repo,
                 cfg=cfg,
                 file_filter=file_filter,
-                worker_stats=worker_stats,
-                is_parallel=is_parallel,
                 total_bytes_ref=total_bytes_ref,
                 branch_pbar_position=1,
                 deadline=deadline,
             )
 
             # Save checkpoint
-            with worker_stats['lock']:
-                fs = worker_stats.get('filter_stats', {})
-                tqdm.write(f"  [DEBUG] Repo {queued_repo.repo_name}: {len(repo_rows)} rows | "
-                          f"no_diff={fs.get('no_diff',0)}, not_code={fs.get('not_code',0)}, "
-                          f"file_filter={fs.get('file_filter',0)}, too_few_lines={fs.get('too_few_lines',0)}, "
-                          f"passed={fs.get('passed',0)}, errors={fs.get('errors',0)}")
-                # Reset filter stats for next repo
-                worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0, 'errors': 0}
+            tqdm.write(f"  [DEBUG] Repo {queued_repo.repo_name}: {len(repo_rows)} rows | "
+                      f"no_diff={filter_stats.get('no_diff',0)}, not_code={filter_stats.get('not_code',0)}, "
+                      f"file_filter={filter_stats.get('file_filter',0)}, too_few_lines={filter_stats.get('too_few_lines',0)}, "
+                      f"passed={filter_stats.get('passed',0)}, errors={filter_stats.get('errors',0)}")
             if repo_rows:
                 save_checkpoint(cfg, queued_repo.repo_id, repo_rows)
                 successful += 1
@@ -1014,14 +943,6 @@ def mine_repos_from_metadata(
         repo_pbar.update(remaining)
 
     repo_pbar.close()
-
-    # Print worker stats summary for parallel mode
-    if is_parallel:
-        print(f"\nWorker Statistics:")
-        with worker_stats['lock']:
-            for worker_name, job_count in sorted(worker_stats['jobs_per_worker'].items()):
-                print(f"  {worker_name}: {job_count} commits processed")
-            print(f"  Total commits processed: {worker_stats['completed']}")
 
     # Print clone stats
     print(f"\nClone Statistics:")
