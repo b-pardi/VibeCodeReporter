@@ -222,7 +222,7 @@ def cloner_worker(
 
             if success:
                 # Put in clone queue (blocks if queue is full)
-                # Commit count check happens in processor via get_branches_with_commit_counts
+                # Commit count check happens in processor via collect_commits_with_timeout
                 queued_repo = QueuedRepo(
                     repo_id=repo_id,
                     repo_url=repo_url,
@@ -366,77 +366,33 @@ def save_checkpoint(cfg: MiningConfig, repo_id: str, rows: list) -> Path:
     return checkpoint_path
 
 
-def get_repo_total_commits(repo_url: str, cfg: MiningConfig, debug: bool = False) -> int:
-    """Get total commit count for a repo (with date filtering)."""
-    try:
-        count = 0
-        for _ in Repository(
-            path_to_repo=repo_url,
-            since=cfg.date_since,
-            to=cfg.date_to,
-            only_no_merge=cfg.only_no_merge,
-        ).traverse_commits():
-            count += 1
-        if debug:
-            print(f"  DEBUG: {repo_url} has {count} commits (date range: {cfg.date_since} to {cfg.date_to})")
-        return count
-    except Exception as e:
-        if debug:
-            print(f"  DEBUG: Error counting commits for {repo_url}: {e}")
-        return 0
-
-
-def get_branches_with_commit_counts(repo_url: str, cfg: MiningConfig, timeout_per_branch: int = 60) -> list:
+def get_repo_commit_count_fast(local_path: str, timeout: int = 30) -> int:
     """
-    Get list of branches with their commit counts.
-    Returns list of (branch_name, commit_count) tuples.
-    Each branch counting is wrapped in a timeout to prevent hanging.
+    Fast commit count using git rev-list (doesn't parse commit contents).
+    Returns total commit count across all branches. Much faster than PyDriller
+    traversal since it only counts objects without parsing diffs/files.
     """
-    branches = []
     try:
-        git_repo = Git(repo_url)
-        repo_branches = git_repo.repo.branches
-
-        for branch in repo_branches:
-            bname = branch.name
-            try:
-                def _count_branch(branch_name=bname):
-                    count = 0
-                    for _ in Repository(
-                        path_to_repo=repo_url,
-                        since=cfg.date_since,
-                        to=cfg.date_to,
-                        only_no_merge=cfg.only_no_merge,
-                        only_in_branch=branch_name,
-                    ).traverse_commits():
-                        count += 1
-                    return count
-
-                count, timed_out = run_with_timeout(
-                    _count_branch, timeout=timeout_per_branch, default=0
-                )
-                if timed_out:
-                    continue
-
-                if count >= cfg.min_branch_commits:
-                    branches.append((bname, count))
-            except Exception:
-                continue
-
+        result = subprocess.run(
+            ['git', '-C', local_path, 'rev-list', '--count', '--all'],
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
     except Exception:
-        # Fallback: just use default branch
-        try:
-            count, timed_out = run_with_timeout(
-                lambda: get_repo_total_commits(repo_url, cfg),
-                timeout=timeout_per_branch,
-                default=0
-            )
-            if not timed_out and count >= cfg.min_branch_commits:
-                branches.append((None, count))
-        except Exception:
-            pass
+        pass
+    return 0
 
-    return branches
+
+def get_branch_names(local_path: str) -> list:
+    """Get list of branch names (fast - just reads git refs, no commit parsing)."""
+    try:
+        git_repo = Git(local_path)
+        return [b.name for b in git_repo.repo.branches]
+    except Exception:
+        return []
 
 
 def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
@@ -623,25 +579,25 @@ def process_cloned_repo(
     local_path = str(queued_repo.local_path)
     repo_rows = []
 
-    # Get branches from local clone
-    branches = get_branches_with_commit_counts(local_path, cfg)
-    if not branches:
+    # Get branch names (fast - just reads git refs, no commit parsing)
+    branch_names = get_branch_names(local_path)
+    if not branch_names:
         return repo_rows
 
     if is_parallel:
         # Parallel mode: use nested tqdm bars (branch bar + commit completion bar)
         branch_pbar = tqdm(
-            branches,
+            branch_names,
             desc="    Branches",
             unit="branch",
             leave=False,
             position=branch_pbar_position,
         )
 
-        for branch_name, branch_commit_count in branch_pbar:
+        for branch_name in branch_pbar:
             # Check repo deadline
             if deadline and time.time() > deadline:
-                print(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
+                tqdm.write(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
                 break
 
             branch_display = (branch_name or "default")[:20]
@@ -652,10 +608,14 @@ def process_cloned_repo(
                     local_path, cfg, branch_name, timeout=cfg.batch_timeout
                 )
                 if enum_timed_out:
-                    print(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
+                    tqdm.write(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
                     if not all_commits:
                         continue
             except Exception:
+                continue
+
+            # Check min branch commits (replaces the old get_branches_with_commit_counts pre-check)
+            if len(all_commits) < cfg.min_branch_commits:
                 continue
 
             # Apply sampling
@@ -712,10 +672,10 @@ def process_cloned_repo(
                 # Batch timeout - no futures completed within batch_timeout seconds
                 pending = [futures[f][:8] for f in futures if not f.done()]
                 timed_out_commits.extend(pending)
-                print(f"      [TIMEOUT] Batch timeout after {cfg.batch_timeout}s, {len(pending)} commits stuck: {pending[:5]}...")
+                tqdm.write(f"      [TIMEOUT] Batch timeout after {cfg.batch_timeout}s, {len(pending)} commits stuck: {pending[:5]}...")
             finally:
                 if timed_out_commits:
-                    print(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
+                    tqdm.write(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
                 executor.shutdown(wait=False, cancel_futures=True)
                 with worker_stats['lock']:
                     worker_stats['active'] = 0
@@ -726,17 +686,17 @@ def process_cloned_repo(
     else:
         # Sequential mode: show all nested progress bars
         branch_pbar = tqdm(
-            branches,
+            branch_names,
             desc="    Branches",
             unit="branch",
             leave=False,
             position=branch_pbar_position,
         )
 
-        for branch_name, branch_commit_count in branch_pbar:
+        for branch_name in branch_pbar:
             # Check repo deadline
             if deadline and time.time() > deadline:
-                print(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
+                tqdm.write(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
                 break
 
             branch_display = (branch_name or "default")[:20]
@@ -747,10 +707,14 @@ def process_cloned_repo(
                     local_path, cfg, branch_name, timeout=cfg.batch_timeout
                 )
                 if enum_timed_out:
-                    print(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
+                    tqdm.write(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
                     if not all_commits:
                         continue
             except Exception:
+                continue
+
+            # Check min branch commits
+            if len(all_commits) < cfg.min_branch_commits:
                 continue
 
             filtered_commits = filter_commits_by_sampling(all_commits, cfg)
@@ -774,7 +738,7 @@ def process_cloned_repo(
             for commit in filtered_commits:
                 # Check repo deadline
                 if deadline and time.time() > deadline:
-                    print(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining commits")
+                    tqdm.write(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining commits")
                     break
 
                 commit_pbar.set_postfix_str(f"{commit.hash[:8]} | Est: {format_size(total_bytes_ref[0])}")
@@ -972,24 +936,9 @@ def mine_repos_from_metadata(
                 repo_pbar.update(1)
                 continue
 
-            # Quick commit count check (with timeout to avoid hanging on corrupt repos)
+            # Quick commit count check using fast git command (no PyDriller parsing)
             local_path = str(queued_repo.local_path)
-            try:
-                total_commits, count_timed_out = run_with_timeout(
-                    lambda lp=local_path: get_repo_total_commits(lp, cfg, debug=False),
-                    timeout=120,
-                    default=0
-                )
-            except Exception:
-                total_commits, count_timed_out = 0, False
-
-            if count_timed_out:
-                repo_pbar.set_postfix_str(f"Skipped (commit count timed out) | {get_status()}")
-                delete_cloned_repo(queued_repo.local_path)
-                skipped_commits += 1
-                processed += 1
-                repo_pbar.update(1)
-                continue
+            total_commits = get_repo_commit_count_fast(local_path)
 
             if total_commits < cfg.min_repo_commits:
                 repo_pbar.set_postfix_str(f"Skipped ({total_commits}<{cfg.min_repo_commits} commits)")
@@ -1015,10 +964,10 @@ def mine_repos_from_metadata(
             # Save checkpoint
             with worker_stats['lock']:
                 fs = worker_stats.get('filter_stats', {})
-                print(f"  [DEBUG] Repo {queued_repo.repo_name}: {len(repo_rows)} rows | "
-                      f"no_diff={fs.get('no_diff',0)}, not_code={fs.get('not_code',0)}, "
-                      f"file_filter={fs.get('file_filter',0)}, too_few_lines={fs.get('too_few_lines',0)}, "
-                      f"passed={fs.get('passed',0)}, errors={fs.get('errors',0)}")
+                tqdm.write(f"  [DEBUG] Repo {queued_repo.repo_name}: {len(repo_rows)} rows | "
+                          f"no_diff={fs.get('no_diff',0)}, not_code={fs.get('not_code',0)}, "
+                          f"file_filter={fs.get('file_filter',0)}, too_few_lines={fs.get('too_few_lines',0)}, "
+                          f"passed={fs.get('passed',0)}, errors={fs.get('errors',0)}")
                 # Reset filter stats for next repo
                 worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0, 'errors': 0}
             if repo_rows:

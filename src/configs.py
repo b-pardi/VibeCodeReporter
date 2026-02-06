@@ -29,8 +29,8 @@ class MiningConfig:
 
     # Commit Sampling:
     min_commit_interval_days: int = 0       # min days between grabbed commits (0 = grab all)
-    commit_skip: int = 10                   # take every Nth commit (0 or 1 = no skip, 2 = every 2nd, etc.)
-    min_repo_commits: int = 50              # min number of commits for a repo to be considered for mining
+    commit_skip: int = 5                   # take every Nth commit (0 or 1 = no skip, 2 = every 2nd, etc.)
+    min_repo_commits: int = 30              # min number of commits for a repo to be considered for mining
     min_branch_commits: int = 10            # min number of commits for a branch to be analyzed
 
     # File Size Filters:
