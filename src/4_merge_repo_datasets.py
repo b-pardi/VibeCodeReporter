@@ -59,6 +59,7 @@ def merge_checkpoints(checkpoint_dir: str, output_path: str, verbose: bool = Tru
         print(f"Concatenating {len(dfs)} dataframes ({total_rows} total rows)...")
 
     combined_df = pd.concat(dfs, ignore_index=True)
+    print(combined_df.head())
 
     # Save merged output
     output_file.parent.mkdir(parents=True, exist_ok=True)

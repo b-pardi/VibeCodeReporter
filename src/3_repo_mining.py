@@ -17,6 +17,7 @@ import queue
 import shutil
 import subprocess
 from pathlib import Path
+import time
 from datetime import datetime, timedelta
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -72,6 +73,21 @@ class CloneStats:
     def increment(self, field: str, amount: int = 1):
         with self.lock:
             setattr(self, field, getattr(self, field) + amount)
+
+
+def is_valid_clone(local_path: Path) -> bool:
+    """Check if a cloned repo directory is a valid, usable git repo."""
+    if not local_path.exists() or not (local_path / '.git').exists():
+        return False
+    try:
+        result = subprocess.run(
+            ['git', '-C', str(local_path), 'rev-parse', '--is-inside-work-tree'],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def clone_repo(repo_url: str, dest_path: Path, timeout: int = 600) -> bool:
@@ -182,20 +198,24 @@ def cloner_worker(
 
             # Check if already cloned but not yet processed
             local_path = cfg.clone_repo_to / f"repo_{repo_id}"
-            if local_path.exists() and (local_path / '.git').exists():
-                # Already cloned, just queue it
-                queued_repo = QueuedRepo(
-                    repo_id=repo_id,
-                    repo_url=repo_url,
-                    repo_name=repo_name,
-                    local_path=local_path,
-                    metadata=dict(repo_info),
-                )
-                clone_queue.put(queued_repo)
-                clone_stats.increment('reused')
-                clone_stats.increment('queued')
-                repo_queue.task_done()
-                continue
+            if local_path.exists():
+                if is_valid_clone(local_path):
+                    # Already cloned and valid, just queue it
+                    queued_repo = QueuedRepo(
+                        repo_id=repo_id,
+                        repo_url=repo_url,
+                        repo_name=repo_name,
+                        local_path=local_path,
+                        metadata=dict(repo_info),
+                    )
+                    clone_queue.put(queued_repo)
+                    clone_stats.increment('reused')
+                    clone_stats.increment('queued')
+                    repo_queue.task_done()
+                    continue
+                else:
+                    # Corrupt/partial clone, clean up and re-clone
+                    shutil.rmtree(local_path, ignore_errors=True)
 
             # Clone the repo
             success = clone_repo(repo_url, local_path)
@@ -245,6 +265,67 @@ def estimate_row_size(row: dict) -> int:
         else:
             size += len(str(value))
     return size
+
+
+def run_with_timeout(func, timeout, default=None):
+    """
+    Run a callable with a timeout using a daemon thread.
+    Returns (result, timed_out).
+
+    On timeout, the thread is abandoned (Python threads can't be killed).
+    The abandoned thread is a daemon and will die when the process exits.
+    """
+    result_container = [default]
+    error_container = [None]
+
+    def wrapper():
+        try:
+            result_container[0] = func()
+        except Exception as e:
+            error_container[0] = e
+
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        return default, True
+    if error_container[0] is not None:
+        raise error_container[0]
+    return result_container[0], False
+
+
+def collect_commits_with_timeout(local_path, cfg, branch_name, timeout):
+    """
+    Collect commits from a repo branch with a timeout.
+    Returns (commits_list, timed_out).
+
+    Uses a daemon thread so the main thread can move on if enumeration hangs.
+    Returns whatever commits were collected before the timeout.
+    """
+    all_commits = []
+
+    def _collect():
+        repository = Repository(
+            path_to_repo=local_path,
+            since=cfg.date_since,
+            to=cfg.date_to,
+            only_no_merge=cfg.only_no_merge,
+            only_in_branch=branch_name,
+            only_releases=cfg.only_releases,
+        )
+        for commit in repository.traverse_commits():
+            if not commit.merge:
+                all_commits.append(commit)
+
+    thread = threading.Thread(target=_collect, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        # Return a copy of what we collected so far (thread may still append)
+        return list(all_commits), True
+    return all_commits, False
 
 
 def build_file_filter(cfg: MiningConfig) -> FileFilter:
@@ -305,10 +386,11 @@ def get_repo_total_commits(repo_url: str, cfg: MiningConfig, debug: bool = False
         return 0
 
 
-def get_branches_with_commit_counts(repo_url: str, cfg: MiningConfig) -> list:
+def get_branches_with_commit_counts(repo_url: str, cfg: MiningConfig, timeout_per_branch: int = 60) -> list:
     """
     Get list of branches with their commit counts.
     Returns list of (branch_name, commit_count) tuples.
+    Each branch counting is wrapped in a timeout to prevent hanging.
     """
     branches = []
     try:
@@ -316,28 +398,40 @@ def get_branches_with_commit_counts(repo_url: str, cfg: MiningConfig) -> list:
         repo_branches = git_repo.repo.branches
 
         for branch in repo_branches:
-            branch_name = branch.name
+            bname = branch.name
             try:
-                count = 0
-                for _ in Repository(
-                    path_to_repo=repo_url,
-                    since=cfg.date_since,
-                    to=cfg.date_to,
-                    only_no_merge=cfg.only_no_merge,
-                    only_in_branch=branch_name,
-                ).traverse_commits():
-                    count += 1
+                def _count_branch(branch_name=bname):
+                    count = 0
+                    for _ in Repository(
+                        path_to_repo=repo_url,
+                        since=cfg.date_since,
+                        to=cfg.date_to,
+                        only_no_merge=cfg.only_no_merge,
+                        only_in_branch=branch_name,
+                    ).traverse_commits():
+                        count += 1
+                    return count
+
+                count, timed_out = run_with_timeout(
+                    _count_branch, timeout=timeout_per_branch, default=0
+                )
+                if timed_out:
+                    continue
 
                 if count >= cfg.min_branch_commits:
-                    branches.append((branch_name, count))
+                    branches.append((bname, count))
             except Exception:
                 continue
 
     except Exception:
         # Fallback: just use default branch
         try:
-            count = get_repo_total_commits(repo_url, cfg)
-            if count >= cfg.min_branch_commits:
+            count, timed_out = run_with_timeout(
+                lambda: get_repo_total_commits(repo_url, cfg),
+                timeout=timeout_per_branch,
+                default=0
+            )
+            if not timed_out and count >= cfg.min_branch_commits:
                 branches.append((None, count))
         except Exception:
             pass
@@ -462,8 +556,8 @@ def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
             rows.append(row)
 
     except Exception as e:
-        # Silently skip problematic commits (GitPython parsing errors are common)
-        pass
+        # Track errors instead of silently swallowing them
+        filter_stats['errors'] = filter_stats.get('errors', 0) + 1
     finally:
         # Update worker stats and aggregate filter stats
         if worker_stats is not None:
@@ -472,9 +566,9 @@ def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
                 worker_stats['completed'] += 1
                 # Aggregate filter stats
                 if 'filter_stats' not in worker_stats:
-                    worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0}
+                    worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0, 'errors': 0}
                 for k, v in filter_stats.items():
-                    worker_stats['filter_stats'][k] += v
+                    worker_stats['filter_stats'][k] = worker_stats['filter_stats'].get(k, 0) + v
 
     return rows
 
@@ -518,6 +612,7 @@ def process_cloned_repo(
     is_parallel: bool,
     total_bytes_ref: list,  # Using list as mutable reference
     branch_pbar_position: int = 1,
+    deadline: float = None,
 ) -> list:
     """
     Process a single cloned repo and return list of row dicts.
@@ -544,25 +639,22 @@ def process_cloned_repo(
         )
 
         for branch_name, branch_commit_count in branch_pbar:
+            # Check repo deadline
+            if deadline and time.time() > deadline:
+                print(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
+                break
+
             branch_display = (branch_name or "default")[:20]
             branch_pbar.set_postfix_str(branch_display)
 
             try:
-                repository = Repository(
-                    path_to_repo=local_path,
-                    since=cfg.date_since,
-                    to=cfg.date_to,
-                    only_no_merge=cfg.only_no_merge,
-                    only_in_branch=branch_name,
-                    only_releases=cfg.only_releases,
+                all_commits, enum_timed_out = collect_commits_with_timeout(
+                    local_path, cfg, branch_name, timeout=cfg.batch_timeout
                 )
-
-                # Collect commits
-                all_commits = []
-                for commit in repository.traverse_commits():
-                    if not commit.merge:
-                        all_commits.append(commit)
-
+                if enum_timed_out:
+                    print(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
+                    if not all_commits:
+                        continue
             except Exception:
                 continue
 
@@ -593,19 +685,19 @@ def process_cloned_repo(
                     for commit in filtered_commits
                 }
 
-                # Process with individual timeouts - don't let one stuck commit block others
+                # batch_timeout controls max wait between completions.
+                # Individual threads can't be killed in Python; batch_timeout
+                # is the safety net that detects when all remaining workers are stuck.
                 done_count = 0
                 for future in as_completed(futures, timeout=cfg.batch_timeout):
                     commit_hash = futures[future]
                     try:
-                        rows = future.result(timeout=cfg.commit_timeout)
+                        # Future is already complete (returned by as_completed), no timeout needed
+                        rows = future.result()
                         for r in rows:
                             row_size = estimate_row_size(r)
                             total_bytes_ref[0] += row_size
                             repo_rows.append(r)
-                    except TimeoutError:
-                        timed_out_commits.append(commit_hash[:8])
-                        future.cancel()
                     except Exception:
                         pass
 
@@ -617,16 +709,14 @@ def process_cloned_repo(
                         )
 
             except TimeoutError:
-                # Batch timeout - find which commits are still pending
+                # Batch timeout - no futures completed within batch_timeout seconds
                 pending = [futures[f][:8] for f in futures if not f.done()]
+                timed_out_commits.extend(pending)
                 print(f"      [TIMEOUT] Batch timeout after {cfg.batch_timeout}s, {len(pending)} commits stuck: {pending[:5]}...")
             finally:
-                # Log timed out commits
                 if timed_out_commits:
                     print(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
-                # Shutdown executor without waiting for stuck workers
                 executor.shutdown(wait=False, cancel_futures=True)
-                # Reset worker count since cancelled workers don't decrement
                 with worker_stats['lock']:
                     worker_stats['active'] = 0
 
@@ -644,24 +734,22 @@ def process_cloned_repo(
         )
 
         for branch_name, branch_commit_count in branch_pbar:
+            # Check repo deadline
+            if deadline and time.time() > deadline:
+                print(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining branches")
+                break
+
             branch_display = (branch_name or "default")[:20]
             branch_pbar.set_postfix_str(branch_display)
 
             try:
-                repository = Repository(
-                    path_to_repo=local_path,
-                    since=cfg.date_since,
-                    to=cfg.date_to,
-                    only_no_merge=cfg.only_no_merge,
-                    only_in_branch=branch_name,
-                    only_releases=cfg.only_releases,
+                all_commits, enum_timed_out = collect_commits_with_timeout(
+                    local_path, cfg, branch_name, timeout=cfg.batch_timeout
                 )
-
-                all_commits = []
-                for commit in repository.traverse_commits():
-                    if not commit.merge:
-                        all_commits.append(commit)
-
+                if enum_timed_out:
+                    print(f"      [TIMEOUT] Commit enumeration timed out for branch '{branch_display}'")
+                    if not all_commits:
+                        continue
             except Exception:
                 continue
 
@@ -672,24 +760,48 @@ def process_cloned_repo(
             branch_pbar.set_postfix_str(f"{branch_display} ({len(filtered_commits)} commits)")
 
             commit_pbar = tqdm(
-                filtered_commits,
+                total=len(filtered_commits),
                 desc="      Commits",
                 unit="commit",
                 leave=False,
                 position=branch_pbar_position + 1,
             )
 
-            for commit in commit_pbar:
+            # Use a single-worker executor so we can enforce per-commit timeouts.
+            # If a commit hangs, we abandon the stuck thread and create a fresh executor.
+            timed_out_commits = []
+            commit_executor = ThreadPoolExecutor(max_workers=1)
+            for commit in filtered_commits:
+                # Check repo deadline
+                if deadline and time.time() > deadline:
+                    print(f"    [TIMEOUT] Repo processing exceeded repo_timeout, skipping remaining commits")
+                    break
+
                 commit_pbar.set_postfix_str(f"{commit.hash[:8]} | Est: {format_size(total_bytes_ref[0])}")
 
-                rows = process_commit(
-                    commit, repo_id, repo_url, branch_name, cfg, file_filter
+                future = commit_executor.submit(
+                    process_commit, commit, repo_id, repo_url,
+                    branch_name, cfg, file_filter, worker_stats
                 )
-                for r in rows:
-                    row_size = estimate_row_size(r)
-                    total_bytes_ref[0] += row_size
-                    repo_rows.append(r)
+                try:
+                    rows = future.result(timeout=cfg.commit_timeout)
+                    for r in rows:
+                        row_size = estimate_row_size(r)
+                        total_bytes_ref[0] += row_size
+                        repo_rows.append(r)
+                except TimeoutError:
+                    timed_out_commits.append(commit.hash[:8])
+                    # Abandon stuck thread, create fresh executor
+                    commit_executor.shutdown(wait=False, cancel_futures=True)
+                    commit_executor = ThreadPoolExecutor(max_workers=1)
+                except Exception:
+                    pass
 
+                commit_pbar.update(1)
+
+            if timed_out_commits:
+                print(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
+            commit_executor.shutdown(wait=False)
             commit_pbar.close()
         branch_pbar.close()
 
@@ -731,6 +843,13 @@ def mine_repos_from_metadata(
     if limit:
         df = df.head(limit)
 
+    # Pre-filter: remove repos that already have checkpoints (fast filesystem scan)
+    cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    pre_filter_count = len(df)
+    df = df[~df['id'].apply(lambda rid: get_checkpoint_path(cfg, str(rid)).exists())]
+    skipped_pre = pre_filter_count - len(df)
+    print(f"Resume check: {skipped_pre} repos already have checkpoints, {len(df)} remaining")
+
     is_parallel = cfg.num_workers > 1
     total_repos = len(df)
 
@@ -740,6 +859,7 @@ def mine_repos_from_metadata(
     print(f"        num_workers={cfg.num_workers} ({'parallel commits' if is_parallel else 'sequential commits'})")
     print(f"        parallel_cloning={cfg.parallel_cloning} (clone while processing)")
     print(f"        max_cloned_repos={cfg.max_cloned_repos} (clone queue size)")
+    print(f"        repo_timeout={cfg.repo_timeout}s, batch_timeout={cfg.batch_timeout}s, commit_timeout={cfg.commit_timeout}s")
     if cfg.max_repo_size_mb:
         print(f"        max_repo_size_mb={cfg.max_repo_size_mb}")
     print()
@@ -844,9 +964,33 @@ def mine_repos_from_metadata(
         repo_pbar.set_postfix_str(get_status())
 
         try:
-            # Quick commit count check
+            # Safety net: check if this repo was already processed (checkpoint exists)
+            # The cloner_worker also checks this, but a race condition or crash could skip it
+            if is_repo_processed(cfg, queued_repo.repo_id):
+                delete_cloned_repo(queued_repo.local_path)
+                processed += 1
+                repo_pbar.update(1)
+                continue
+
+            # Quick commit count check (with timeout to avoid hanging on corrupt repos)
             local_path = str(queued_repo.local_path)
-            total_commits = get_repo_total_commits(local_path, cfg, debug=False)
+            try:
+                total_commits, count_timed_out = run_with_timeout(
+                    lambda lp=local_path: get_repo_total_commits(lp, cfg, debug=False),
+                    timeout=120,
+                    default=0
+                )
+            except Exception:
+                total_commits, count_timed_out = 0, False
+
+            if count_timed_out:
+                repo_pbar.set_postfix_str(f"Skipped (commit count timed out) | {get_status()}")
+                delete_cloned_repo(queued_repo.local_path)
+                skipped_commits += 1
+                processed += 1
+                repo_pbar.update(1)
+                continue
+
             if total_commits < cfg.min_repo_commits:
                 repo_pbar.set_postfix_str(f"Skipped ({total_commits}<{cfg.min_repo_commits} commits)")
                 delete_cloned_repo(queued_repo.local_path)
@@ -855,7 +999,8 @@ def mine_repos_from_metadata(
                 repo_pbar.update(1)
                 continue
 
-            # Process the cloned repo
+            # Process the cloned repo (with deadline for overall repo timeout)
+            deadline = time.time() + cfg.repo_timeout
             repo_rows = process_cloned_repo(
                 queued_repo=queued_repo,
                 cfg=cfg,
@@ -864,6 +1009,7 @@ def mine_repos_from_metadata(
                 is_parallel=is_parallel,
                 total_bytes_ref=total_bytes_ref,
                 branch_pbar_position=1,
+                deadline=deadline,
             )
 
             # Save checkpoint
@@ -872,9 +1018,9 @@ def mine_repos_from_metadata(
                 print(f"  [DEBUG] Repo {queued_repo.repo_name}: {len(repo_rows)} rows | "
                       f"no_diff={fs.get('no_diff',0)}, not_code={fs.get('not_code',0)}, "
                       f"file_filter={fs.get('file_filter',0)}, too_few_lines={fs.get('too_few_lines',0)}, "
-                      f"passed={fs.get('passed',0)}")
+                      f"passed={fs.get('passed',0)}, errors={fs.get('errors',0)}")
                 # Reset filter stats for next repo
-                worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0}
+                worker_stats['filter_stats'] = {'no_diff': 0, 'not_code': 0, 'file_filter': 0, 'too_few_lines': 0, 'passed': 0, 'errors': 0}
             if repo_rows:
                 save_checkpoint(cfg, queued_repo.repo_id, repo_rows)
                 successful += 1
@@ -993,6 +1139,8 @@ def main():
                         help='Number of threads for parallel commit processing (default: 4, use 1 for sequential)')
     parser.add_argument('--max-cloned-repos', type=int, default=10,
                         help='Max repos to clone ahead of processing (default: 10)')
+    parser.add_argument('--repo-timeout', type=int, default=None,
+                        help='Timeout in seconds for processing a single repo (default: from config)')
 
     # Subset selection
     parser.add_argument('--repo-ids', type=int, nargs='+', help='Specific repo IDs to process')
@@ -1030,6 +1178,8 @@ def main():
     cfg.min_lines = args.min_lines
     cfg.num_workers = args.num_workers
     cfg.max_cloned_repos = args.max_cloned_repos
+    if args.repo_timeout is not None:
+        cfg.repo_timeout = args.repo_timeout
 
     if args.include_autogenerated:
         cfg.exclude_autogenerated = False

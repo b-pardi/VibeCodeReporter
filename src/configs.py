@@ -73,6 +73,7 @@ class MiningConfig:
     parallel_cloning: bool = True           # clone repos in background while processing (works even with num_workers=1)
     commit_timeout: int = 5                 # timeout in seconds for processing a single commit
     batch_timeout: int = 120                # timeout in seconds for a batch of commits (per branch)
+    repo_timeout: int = 600                 # timeout in seconds for processing an entire repo
 
     def __post_init__(self):
         """Convert date strings to datetime objects after initialization."""
