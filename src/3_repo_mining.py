@@ -15,6 +15,7 @@ import re
 import argparse
 import queue
 import shutil
+import json
 import subprocess
 from pathlib import Path
 import time
@@ -367,6 +368,31 @@ def save_checkpoint(cfg: MiningConfig, repo_id: str, rows: list) -> Path:
     return checkpoint_path
 
 
+def save_repo_stats(cfg: MiningConfig, repo_id: str, repo_name: str,
+                    repo_url: str, filter_stats: dict, num_rows: int,
+                    processing_time: float) -> Path:
+    """Save per-repo stats/error log as JSON alongside the checkpoint pickle."""
+    safe_id = re.sub(r'[^\w\-_.]', '_', str(repo_id))
+    stats_path = cfg.checkpoint_dir / f"repo_{safe_id}_stats.json"
+    stats = {
+        'repo_id': repo_id,
+        'repo_name': repo_name,
+        'repo_url': repo_url,
+        'timestamp': datetime.now().isoformat(),
+        'processing_time_s': round(processing_time, 2),
+        'rows_extracted': num_rows,
+        'filter_stats': {
+            k: v for k, v in filter_stats.items()
+            if k not in ('error_details', 'timed_out_commits')
+        },
+        'timed_out_commits': filter_stats.get('timed_out_commits', []),
+        'error_details': filter_stats.get('error_details', []),
+    }
+    with open(stats_path, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, indent=2, default=str)
+    return stats_path
+
+
 def get_repo_commit_count_fast(local_path: str, timeout: int = 30) -> int:
     """
     Fast commit count using git rev-list (doesn't parse commit contents).
@@ -403,7 +429,8 @@ def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
     """
     rows = []
     filter_stats = {'no_diff': 0, 'not_code': 0, 'file_filter': 0,
-                    'too_few_lines': 0, 'passed': 0, 'errors': 0}
+                    'too_few_lines': 0, 'passed': 0, 'errors': 0,
+                    'error_details': []}
 
     try:
         for modified_file in commit.modified_files:
@@ -502,7 +529,12 @@ def process_commit(commit, repo_id: str, repo_url: str, branch_name: str,
             rows.append(row)
 
     except Exception as e:
-        filter_stats['errors'] = filter_stats.get('errors', 0) + 1
+        filter_stats['errors'] += 1
+        filter_stats['error_details'].append({
+            'commit': commit.hash,
+            'file': file_path if 'file_path' in dir() else None,
+            'error': str(e),
+        })
 
     return rows, filter_stats
 
@@ -518,8 +550,11 @@ def _mp_process_commit(args):
         for commit in Repository(path_to_repo=local_path, single=commit_hash).traverse_commits():
             rows, stats = process_commit(commit, repo_id, repo_url, branch_name, cfg, file_filter)
             return commit_hash, rows, stats
-    except Exception:
-        return commit_hash, [], {'errors': 1}
+    except Exception as e:
+        return commit_hash, [], {
+            'errors': 1,
+            'error_details': [{'commit': commit_hash, 'file': None, 'error': str(e)}],
+        }
     return commit_hash, [], {}
 
 
@@ -572,7 +607,8 @@ def process_cloned_repo(
     local_path = str(queued_repo.local_path)
     repo_rows = []
     repo_filter_stats = {'no_diff': 0, 'not_code': 0, 'file_filter': 0,
-                         'too_few_lines': 0, 'passed': 0, 'errors': 0}
+                         'too_few_lines': 0, 'passed': 0, 'errors': 0,
+                         'error_details': [], 'timed_out_commits': []}
 
     # Get branch names (fast - just reads git refs, no commit parsing)
     branch_names = get_branch_names(local_path)
@@ -651,8 +687,7 @@ def process_cloned_repo(
                 while pending:
                     if deadline and time.time() > deadline:
                         tqdm.write(f"    [TIMEOUT] Repo deadline reached, abandoning {len(pending)} commits")
-                        for ch in pending:
-                            timed_out_commits.append(ch[:8])
+                        timed_out_commits.extend(pending.keys())
                         commit_pbar.update(len(pending))
                         break
 
@@ -667,14 +702,21 @@ def process_cloned_repo(
                                 for r in rows:
                                     total_bytes_ref[0] += estimate_row_size(r)
                                     repo_rows.append(r)
-                                for key in repo_filter_stats:
+                                for key in ('no_diff', 'not_code', 'file_filter',
+                                            'too_few_lines', 'passed', 'errors'):
                                     repo_filter_stats[key] += stats.get(key, 0)
-                            except Exception:
+                                repo_filter_stats['error_details'].extend(
+                                    stats.get('error_details', []))
+                            except Exception as e:
                                 repo_filter_stats['errors'] += 1
+                                repo_filter_stats['error_details'].append({
+                                    'commit': commit_hash, 'file': None,
+                                    'error': f'Result retrieval failed: {e}',
+                                })
                         elif time.time() - submit_time > cfg.commit_timeout:
                             # Per-commit timeout exceeded — mark as timed out
                             done_hashes.append(commit_hash)
-                            timed_out_commits.append(commit_hash[:8])
+                            timed_out_commits.append(commit_hash)
                             need_pool_restart = True
 
                     for h in done_hashes:
@@ -701,10 +743,16 @@ def process_cloned_repo(
                         time.sleep(0.2)  # Avoid busy-waiting
 
                 if timed_out_commits:
-                    tqdm.write(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {timed_out_commits[:5]}...")
+                    display = [h[:8] for h in timed_out_commits[:5]]
+                    tqdm.write(f"      [TIMEOUT] {len(timed_out_commits)} commits timed out: {display}...")
+                    repo_filter_stats['timed_out_commits'].extend(timed_out_commits)
 
             except Exception as e:
                 tqdm.write(f"      [ERROR] Branch processing error: {e}")
+                repo_filter_stats['error_details'].append({
+                    'commit': None, 'file': None,
+                    'error': f'Branch {branch_name} processing error: {e}',
+                })
 
             commit_pbar.close()
         branch_pbar.close()
@@ -884,7 +932,8 @@ def mine_repos_from_metadata(
                 continue
 
             # Process the cloned repo (with deadline for overall repo timeout)
-            deadline = time.time() + cfg.repo_timeout
+            repo_start_time = time.time()
+            deadline = repo_start_time + cfg.repo_timeout
             repo_rows, filter_stats = process_cloned_repo(
                 queued_repo=queued_repo,
                 cfg=cfg,
@@ -893,12 +942,16 @@ def mine_repos_from_metadata(
                 branch_pbar_position=1,
                 deadline=deadline,
             )
+            processing_time = time.time() - repo_start_time
 
-            # Save checkpoint
+            # Save checkpoint and stats
             tqdm.write(f"  [DEBUG] Repo {queued_repo.repo_name}: {len(repo_rows)} rows | "
                       f"no_diff={filter_stats.get('no_diff',0)}, not_code={filter_stats.get('not_code',0)}, "
                       f"file_filter={filter_stats.get('file_filter',0)}, too_few_lines={filter_stats.get('too_few_lines',0)}, "
                       f"passed={filter_stats.get('passed',0)}, errors={filter_stats.get('errors',0)}")
+            save_repo_stats(cfg, queued_repo.repo_id, queued_repo.repo_name,
+                           queued_repo.repo_url, filter_stats, len(repo_rows),
+                           processing_time)
             if repo_rows:
                 save_checkpoint(cfg, queued_repo.repo_id, repo_rows)
                 successful += 1
