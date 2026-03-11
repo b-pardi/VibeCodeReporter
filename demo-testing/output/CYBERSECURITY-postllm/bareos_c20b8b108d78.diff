@@ -1,0 +1,106 @@
+@@ -1201,19 +1201,20 @@ static inline bool SendPlainData(b_ctx& bctx)
+               SerEnd(header_data, OFFSET_FADDR_SIZE);
+             }
+             if (compctx) {
+-              std::optional comp_size = ThreadlocalCompress(
++              result comp_size = ThreadlocalCompress(
+                   compctx->algorithm, compctx->level, buf->data(), buf->size(),
+                   file_data + sizeof(comp_stream_header),
+                   data_size - sizeof(comp_stream_header));
+ 
+-              if (!comp_size) {
+-                PoolMem error{"compression error"};
+-                return error;
++              if (comp_size.holds_error()) {
++                return std::move(comp_size.error_unchecked());
+               }
+ 
+-              if (*comp_size > std::numeric_limits<std::uint32_t>::max()) {
++              auto csize = comp_size.value_unchecked();
++
++              if (csize > std::numeric_limits<std::uint32_t>::max()) {
+                 PoolMem error;
+-                Mmsg(error, "Compressed size to big (%llu > %llu)", *comp_size,
++                Mmsg(error, "Compressed size to big (%llu > %llu)", csize,
+                      std::numeric_limits<std::uint32_t>::max());
+                 return error;
+               }
+@@ -1223,14 +1224,13 @@ static inline bool SendPlainData(b_ctx& bctx)
+                 ser_declare;
+                 SerBegin(file_data, sizeof(comp_stream_header));
+                 ser_uint32(compctx->ch.magic);
+-                ser_uint32(*comp_size);
++                ser_uint32(csize);
+                 ser_uint16(compctx->ch.level);
+                 ser_uint16(compctx->ch.version);
+                 SerEnd(file_data, sizeof(comp_stream_header));
+               }
+ 
+-              total_size
+-                  = header_size + *comp_size + sizeof(comp_stream_header);
++              total_size = header_size + csize + sizeof(comp_stream_header);
+             } else {
+               std::memcpy(file_data, buf->data(), buf->size());
+             }
+
+
+
+
+@@ -35,6 +35,7 @@
+ #include "include/streams.h"
+ #include "lib/edit.h"
+ #include "lib/serial.h"
++#include "lib/compression.h"
+ 
+ #ifdef HAVE_LIBZ
+ #  include <zlib.h>
+@@ -132,7 +133,7 @@ std::size_t RequiredCompressionOutputBufferSize(uint32_t algo,
+ class z4_compressor {
+   zfast_stream pZfastStream{};
+   bool init_error{false};
+-  bool error{false};
++  std::optional<PoolMem> error{};
+ 
+  public:
+   z4_compressor(int type, zfast_stream_compressor compressor)
+@@ -144,23 +145,22 @@ class z4_compressor {
+ 
+     if (auto zstat = fastlzlibCompressInit(&pZfastStream, type);
+         zstat != Z_OK) {
+-      // Jmsg(jcr, M_FATAL, 0, _("Failed to initialize FASTLZ compression\n"));
+       init_error = true;
+-      error = true;
++      error.emplace("Failed to initialize FASTLZ compression");
+     }
+ 
+     if (auto zstat = fastlzlibSetCompressor(&pZfastStream, compressor);
+         zstat != Z_OK) {
+-      error = true;
++      error.emplace("Failed to set FASTLZ compressor");
+     }
+   }
+ 
+-  std::optional<std::size_t> compress(char const* input,
+-                                      std::size_t size,
+-                                      char* output,
+-                                      std::size_t capacity)
++  result<std::size_t> compress(char const* input,
++                               std::size_t size,
++                               char* output,
++                               std::size_t capacity)
+   {
+-    if (error) { return std::nullopt; }
++    if (error) { return PoolMem{error->c_str()}; }
+ 
+     pZfastStream.next_in = (Bytef*)input;
+     pZfastStream.avail_in = size;
+@@ -169,14 +169,15 @@ class z4_compressor {
+ 
+     if (auto zstat = fastlzlibCompress(&pZfastStream, Z_FINISH);
+         zstat != Z_STREAM_END) {
+-      // Jmsg(jcr, M_FATAL, 0, _("Compression fastlzlibCompress error: %d\n"),
+-      // 	   zstat);
+-      // jcr->setJobStatusWithPriorityCheck(JS_ErrorTerminated);
+-      return std::nullopt;
++      PoolMem errmsg;
++      Mmsg(errmsg, "Compressi

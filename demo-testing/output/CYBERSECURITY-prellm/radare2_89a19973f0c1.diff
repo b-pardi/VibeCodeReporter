@@ -1,0 +1,127 @@
+@@ -9,6 +9,8 @@
+ #define VA_TRUE     1
+ #define VA_NOREBASE 2
+ 
++#define LOAD_BSS_MALLOC 0
++
+ #define IS_MODE_SET(mode) (mode & R_CORE_BIN_SET)
+ #define IS_MODE_SIMPLE(mode) (mode & R_CORE_BIN_SIMPLE)
+ #define IS_MODE_SIMPLEST(mode) (mode & R_CORE_BIN_SIMPLEST)
+@@ -2118,8 +2120,9 @@ static int bin_sections(RCore *r, int mode, ut64 laddr, int va, ut64 at, const c
+ 	else if (IS_MODE_RAD (mode) && !at) r_cons_printf ("fs %ss\n", type);
+ 	else if (IS_MODE_NORMAL (mode) && !at && !printHere) {
+ 		r_cons_printf ("[%s]\n", print_segments ? "Segments" : "Sections");
+-	} else if (IS_MODE_NORMAL (mode) && printHere) r_cons_printf("Current section\n");
+-	else if (IS_MODE_SET (mode)) {
++	} else if (IS_MODE_NORMAL (mode) && printHere) {
++		r_cons_printf("Current section\n");
++	} else if (IS_MODE_SET (mode)) {
+ 		fd = r_core_file_cur_fd (r);
+ 		r_flag_space_set (r->flags, print_segments ? "segments" : "sections");
+ 	}
+
+
+
+
+@@ -62,16 +62,18 @@ static const char *help_msg_ob[] = {
+ 	"Usage:", "ob", " # List open binary files backed by fd",
+ 	"ob", "", "List opened binary files and objid",
+ 	"ob*", "", "List opened binary files and objid (r2 commands)",
++// those 3 commands are VERY SIMILAR, need love
+ 	"ob", " [fd objid]", "Switch to open binary file by fd number and objid",
++	"obo", " [objid]", "Switch to open binary file by objid",
++	"obb", " [fd]", "Switch to open binfile by fd number",
++
+ 	"oba", " [addr]", "Open bin info from the given address",
+ 	"oba", " [addr] [filename]", "Open file and load bin info at given address",
+-	"obb", " [fd]", "Switch to open binfile by fd number",
+ 	"obf", " ([file])", "Load bininfo for current file (useful for r2 -n)",
+ 	"obj", "", "List opened binary files and objid (JSON format)",
+ 	"obr", " [baddr]", "Rebase current bin object",
+ 	"ob-", "[objid]", "Delete binfile by binobjid",
+ 	"ob-", "*", "Delete all binfiles",
+-	"obo", " [objid]", "Switch to open binary file by objid",
+ 	NULL
+ };
+ 
+@@ -1142,11 +1144,9 @@ static int cmd_open(void *data, const char *input) {
+ 				RIODesc *desc = r_io_desc_get (core->io, fd);
+ 				if (desc) {
+ 					// only useful for io.va=0
+-					core->io->desc = desc;
+-#if 0
+ 					// load bininfo for given fd
+-					r_core_cmdf (core, "ob %d", fd);
+-#endif
++					r_core_cmdf (core, "obb %d", fd);
++					core->io->desc = desc;
+ 				}
+ 			}
+ 			r_core_block_read (core);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2017 - condret */
++/* radare - LGPL - Copyright 2017-2018 - condret */
+ 
+ #include <r_io.h>
+ #include <r_util.h>
+@@ -10,6 +10,30 @@ static int __access_log_e_cmp (const void *a, const void *b) {
+ 	return (A->buf_idx > B->buf_idx);
+ }
+ 
++typedef struct {
++	const char *uri;
++	RIODesc *desc;
++} FindFile;
++
++static bool findFile(void *user, void *data, ut32 id) {
++	FindFile *res = (FindFile*)user;
++	RIODesc *desc = (RIODesc*)data;
++	if (!strcmp (desc->uri, res->uri)) {
++		res->desc = desc;
++		return false;
++	}
++	return true;
++}
++
++static RIODesc *findReusableFile(RIO *io, const char *uri) {
++	FindFile arg = {
++		.uri = uri,
++		.desc = NULL,
++	};
++	r_id_storage_foreach (io->files, findFile, &arg);
++	return arg.desc;
++}
++
+ R_API bool r_io_create_mem_map(RIO *io, RIOSection *sec, ut64 at, bool null, bool do_skyline) {
+ 	RIOMap *map = NULL;
+ 	RIODesc *desc = NULL;
+@@ -20,10 +44,13 @@ R_API bool r_io_create_mem_map(RIO *io, RIOSection *sec, ut64 at, bool null, boo
+ 	}
+ 	if (null) {
+ 		uri = r_str_newf ("null://%"PFMT64u "", sec->vsize - sec->size);
++		desc = findReusableFile (io, uri);
+ 	} else {
+ 		uri = r_str_newf ("malloc://%"PFMT64u "", sec->vsize - sec->size);
+ 	}
+-	desc = r_io_open_at (io, uri, sec->flags, 664, at);
++	if (!desc) {
++		desc = r_io_open_at (io, uri, sec->flags, 664, at);
++	}
+ 	free (uri);
+ 	if (!desc) {
+ 		return false;
+
+
+
+
+@@ -393,33 +393,27 @@ R_API bool r_io_section_priorize_bin(RIO *io, ut32 bin_id) {
+ }
+ 
+ static bool _section_apply_for_anal_patch(RIO *io, RIOSection *sec, bool patch) {
+-	ut64 at;
+ 	if (sec->vsize > sec->size) {
+ 		// in that case, we just h

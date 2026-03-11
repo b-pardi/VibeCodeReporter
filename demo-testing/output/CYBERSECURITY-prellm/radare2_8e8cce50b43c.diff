@@ -1,0 +1,154 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,374 @@
++/* radare - LGPL - Copyright 2020 - mrmacete */
++
++#include <r_types.h>
++#include <r_util.h>
++#include <r_hash.h>
++#include "coresymbolication.h"
++
++#define R_CS_EL_OFF_SEGS 0x58
++#define R_CS_EL_SIZE_SEG 0x20
++#define R_CS_EL_SIZE_SECT_64 0x18
++#define R_CS_EL_SIZE_SECT_32 0x10
++#define R_CS_EL_SIZE_SYM 0x18
++#define R_CS_EL_SIZE_LSYM 0x24
++#define R_CS_EL_SIZE_LINFO 0x14
++
++static RCoreSymCacheElementHdr *r_coresym_cache_element_header_new(RBuffer *buf, size_t off, int bits) {
++	RCoreSymCacheElementHdr *hdr = R_NEW0 (RCoreSymCacheElementHdr);
++	if (hdr && r_buf_fread_at (buf, off, (ut8 *)hdr, "13i16c5i", 1) == sizeof (RCoreSymCacheElementHdr)) {
++		return hdr;
++	}
++	free (hdr);
++	return NULL;
++}
++
++static void r_coresym_cache_element_segment_fini(RCoreSymCacheElementSegment *seg) {
++	if (seg) {
++		free (seg->name);
++	}
++}
++
++static void r_coresym_cache_element_section_fini(RCoreSymCacheElementSection *sec) {
++	if (sec) {
++		free (sec->name);
++	}
++}
++
++static void r_coresym_cache_element_flc_fini(RCoreSymCacheElementFLC *flc) {
++	if (flc) {
++		free (flc->file);
++	}
++}
++
++static void r_coresym_cache_element_symbol_fini(RCoreSymCacheElementSymbol *sym) {
++	if (sym) {
++		free (sym->name);
++		free (sym->mangled_name);
++	}
++}
++
++static void r_coresym_cache_element_lined_symbol_fini(RCoreSymCacheElementLinedSymbol *sym) {
++	if (sym) {
++		r_coresym_cache_element_symbol_fini (&sym->sym);
++		r_coresym_cache_element_flc_fini (&sym->flc);
++	}
++}
++
++static void r_coresym_cache_element_line_info_fini(RCoreSymCacheElementLineInfo *line) {
++	if (line) {
++		r_coresym_cache_element_flc_fini (&line->flc);
++	}
++}
++
++void r_coresym_cache_element_free(RCoreSymCacheElement *element) {
++	if (!element) {
++		return;
++	}
++	size_t i;
++	if (element->segments) {
++		for (i = 0; i < element->hdr->n_segments; i++) {
++			r_coresym_cache_element_segment_fini (&element->segments[i]);
++		}
++	}
++	if (element->sections) {
++		for (i = 0; i < element->hdr->n_sections; i++) {
++			r_coresym_cache_element_section_fini (&element->sections[i]);
++		}
++	}
++	if (element->symbols) {
++		for (i = 0; i < element->hdr->n_symbols; i++) {
++			r_coresym_cache_element_symbol_fini (&element->symbols[i]);
++		}
++	}
++	if (element->lined_symbols) {
++		for (i = 0; i < element->hdr->n_lined_symbols; i++) {
++			r_coresym_cache_element_lined_symbol_fini (&element->lined_symbols[i]);
++		}
++	}
++	if (element->line_info) {
++		for (i = 0; i < element->hdr->n_line_info; i++) {
++			r_coresym_cache_element_line_info_fini (&element->line_info[i]);
++		}
++	}
++	free (element->segments);
++	free (element->sections);
++	free (element->symbols);
++	free (element->lined_symbols);
++	free (element->line_info);
++	free (element->hdr);
++	free (element->file_name);
++	free (element->binary_version);
++	free (element);
++}
++
++ut64 r_coresym_cache_element_pa2va(RCoreSymCacheElement *element, ut64 pa) {
++	size_t i;
++	for (i = 0; i < element->hdr->n_segments; i++) {
++		RCoreSymCacheElementSegment *seg = &element->segments[i];
++		if (seg->size == 0) {
++			continue;
++		}
++		if (seg->paddr < pa && pa < seg->paddr + seg->size) {
++			return pa - seg->paddr + seg->vaddr;
++		}
++	}
++	return pa;
++}
++
++static void meta_add_fileline(RBinFile *bf, ut64 vaddr, ut32 size, RCoreSymCacheElementFLC *flc) {
++	Sdb *s = bf->sdb_addrinfo;
++	if (!s) {
++		return;
++	}
++	char aoffset[64];
++	ut64 cursor = vaddr;
++	ut64 end = cursor + R_MAX (size, 1);
++	char *fileline = r_str_newf ("%s:%d", flc->file, flc->line);
++	while (cursor < end) {
++		char *aoffsetptr = sdb_itoa (cursor, aoffset, 16);
++		if (!aoffsetptr) {
++			break;
++		}
++		sdb_set (s, aoffsetptr, fileline, 0);
++		sdb_set (s, fileline, aoffsetptr, 0);
++		cursor += 2;
++	}
++	free (fileline);
++}
++
++static char *str_dup_safe(const ut8 *b, const ut8 *str, const ut8 *end) {
++	if (str >= b && str < end) {
++		int len = r_str_nlen ((const char *)str, end - str);
++		if (len) {
++			return r_str_ndup ((const char *)str, len);
++		}
++	}
++	return NULL;
++}
++
++stati

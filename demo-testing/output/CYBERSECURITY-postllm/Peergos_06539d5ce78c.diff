@@ -1,0 +1,98 @@
+@@ -265,17 +265,19 @@ public class JdbcUsageStore implements UsageStore {
+     }
+ 
+     @Override
+-    public List<Multihash> getAllTargets() {
++    public List<Pair<Multihash, String>> getAllTargets() {
+         try (Connection conn = getConnection();
+-             PreparedStatement get = conn.prepareStatement("SELECT target FROM writerusage;")) {
+-            List<Multihash> res = new ArrayList<>();
++             PreparedStatement get = conn.prepareStatement("SELECT writerusage.target,users.name FROM writerusage " +
++                     "INNER JOIN users ON writerusage.user_id=users.id;")) {
++            List<Pair<Multihash, String>> res = new ArrayList<>();
+             ResultSet resultSet = get.executeQuery();
+             while (resultSet.next()) {
+                 MaybeMultihash target = Optional.ofNullable(resultSet.getBytes(1))
+                     .map(x -> MaybeMultihash.of(Cid.cast(x)))
+                     .orElse(MaybeMultihash.empty());
++                String username = resultSet.getString(2);
+                 if (target.isPresent())
+-                    res.add(target.get());
++                    res.add(new Pair<>(target.get(), username));
+             }
+             return res;
+         } catch (SQLException sqe) {
+
+
+
+
+@@ -5,6 +5,7 @@ import peergos.shared.*;
+ import peergos.shared.cbor.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.Multihash;
++import peergos.shared.util.*;
+ 
+ import java.io.*;
+ import java.nio.file.*;
+@@ -108,9 +109,12 @@ public class RamUsageStore implements UsageStore {
+     }
+ 
+     @Override
+-    public List<Multihash> getAllTargets() {
++    public List<Pair<Multihash, String>> getAllTargets() {
+         return state.currentView.values().stream()
+-                .flatMap(wu -> wu.target().toOptional().stream())
++                .flatMap(wu -> wu.target()
++                        .toOptional()
++                        .map(h -> new Pair<>(h, wu.owner))
++                        .stream())
+                 .collect(Collectors.toList());
+     }
+ 
+
+
+
+
+@@ -3,6 +3,7 @@ package peergos.server.space;
+ import peergos.shared.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.Multihash;
++import peergos.shared.util.*;
+ 
+ import java.util.*;
+ 
+@@ -22,5 +23,6 @@ public interface WriterUsageStore {
+                            Set<PublicKeyHash> addedOwnedKeys,
+                            long retainedStorage);
+ 
+-    List<Multihash> getAllTargets();
++    // return current usage root, and username
++    List<Pair<Multihash, String>> getAllTargets();
+ }
+
+
+
+
+@@ -118,7 +118,7 @@ public class GarbageCollector {
+         System.out.println("Listing " + allPointers.size() + " pointers took " + (t3-t2)/1_000_000_000 + "s");
+ 
+         // Get the current roots from the usage store which shouldn't be GC'd until usage has been updated
+-        List<Multihash> usageRoots = usage.getAllTargets();
++        List<Pair<Multihash, String>> usageRoots = usage.getAllTargets();
+ 
+         Map<Multihash, Integer> toIndex = new HashMap<>();
+         for (int i = 0; i < present.size(); i++)
+@@ -129,15 +129,16 @@ public class GarbageCollector {
+         int markParallelism = 10;
+         ForkJoinPool markPool = Threads.newPool(markParallelism, "GC-mark-");
+         List<ForkJoinTask<Boolean>> usageMarked = usageRoots.stream()
+-                .map(r -> markPool.submit(() -> markReachable(storage, (Cid)r, toIndex, reachable, metadata)))
++                .map(r -> markPool.submit(() -> markReachable(storage, (Cid)r.left, r.right, toIndex, reachable, metadata)))
+                 .collect(Collectors.toList());
+         usageMarked.forEach(f -> f.join());
+         long t4 = System.nanoTime();
+         System.out.println("Marking reachable from "+usageRoots.size()+" usage roots took " + (t4-t3)/1_000_000_000 + "s");
+ 
+-        Set<Multihash> fromUsage = new HashSet<>(usageRoots);
++        Set<Multihash> fromUsage = new HashSet<>(usageRoots.size());
++        fromUsage.addAll(usageRoots.st

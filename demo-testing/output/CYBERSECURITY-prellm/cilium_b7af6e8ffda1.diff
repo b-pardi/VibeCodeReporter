@@ -1,0 +1,101 @@
+@@ -116,21 +116,21 @@ static inline __u32 __inline__ __ct_update_timeout(struct ct_entry *entry,
+ 						   union tcp_flags flags)
+ {
+ 	__u32 now = bpf_ktime_get_sec();
+-	__u8 *accumulated_flags;
++	__u8 accumulated_flags;
+ 	__u8 seen_flags = flags.lower_bits;
+-	__u32 *last_report;
++	__u32 last_report;
+ 
+ #ifdef NEEDS_TIMEOUT
+ 	entry->lifetime = now + lifetime;
+ #endif
+ 	if (dir == CT_INGRESS) {
+-		accumulated_flags = &entry->rx_flags_seen;
+-		last_report = &entry->last_rx_report;
++		accumulated_flags = READ_ONCE(entry->rx_flags_seen);
++		last_report = READ_ONCE(entry->last_rx_report);
+ 	} else {
+-		accumulated_flags = &entry->tx_flags_seen;
+-		last_report = &entry->last_tx_report;
++		accumulated_flags = READ_ONCE(entry->tx_flags_seen);
++		last_report = READ_ONCE(entry->last_tx_report);
+ 	}
+-	seen_flags |= *accumulated_flags;
++	seen_flags |= accumulated_flags;
+ 
+ 	/* It's possible for multiple CPUs to execute the branch statement here
+ 	 * one after another, before the first CPU is able to execute the entry
+@@ -162,10 +162,16 @@ static inline __u32 __inline__ __ct_update_timeout(struct ct_entry *entry,
+ 	 * otherwise be sent if the MONITOR_AGGREGATION level is set to none
+ 	 * (ie, sending a notification for every packet).
+ 	 */
+-	if (*last_report + CT_REPORT_INTERVAL < now ||
+-	    *accumulated_flags != seen_flags) {
+-		*last_report = now;
+-		*accumulated_flags = seen_flags;
++	if (last_report + CT_REPORT_INTERVAL < now ||
++	    accumulated_flags != seen_flags) {
++		/* verifier workaround: we don't use reference here. */
++		if (dir == CT_INGRESS) {
++			WRITE_ONCE(entry->rx_flags_seen, seen_flags);
++			WRITE_ONCE(entry->last_rx_report, now);
++		} else {
++			WRITE_ONCE(entry->tx_flags_seen, seen_flags);
++			WRITE_ONCE(entry->last_tx_report, now);
++		}
+ 		return TRACE_PAYLOAD_LEN;
+ 	}
+ 	return 0;
+
+
+
+
+@@ -89,9 +89,7 @@ skb_redirect_to_proxy_hairpin(struct __sk_buff *skb, __be16 proxy_port)
+ 	int ret;
+ 
+ 	skb->cb[0] = MARK_MAGIC_TO_PROXY | (proxy_port << 16);
+-	/* Workaround to avoid verifier complaint:
+-	 * dereference of modified ctx ptr R5 off=48+0, ctx+const is allowed, ctx+const+const is not */
+-	asm volatile("": : :"memory");
++	bpf_barrier(); /* verifier workaround */
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip4))
+ 		return DROP_INVALID;
+
+
+
+
+@@ -36,6 +36,31 @@
+ 	_x > _y ? _x : _y;	\
+ })
+ 
++static inline void bpf_barrier(void)
++{
++	/* Workaround to avoid verifier complaint:
++	 * "dereference of modified ctx ptr R5 off=48+0, ctx+const is allowed, ctx+const+const is not"
++	 */
++	asm volatile("" ::: "memory");
++}
++
++#ifndef __READ_ONCE
++# define __READ_ONCE(x)		(*(volatile typeof(x) *)&x)
++#endif
++#ifndef __WRITE_ONCE
++# define __WRITE_ONCE(x, v)	(*(volatile typeof(x) *)&x) = (v)
++#endif
++
++/* {READ,WRITE}_ONCE() with verifier workaround via bpf_barrier(). */
++#ifndef READ_ONCE
++# define READ_ONCE(x)		\
++	({ typeof(x) __val; __val = __READ_ONCE(x); bpf_barrier(); __val; })
++#endif
++#ifndef WRITE_ONCE
++# define WRITE_ONCE(x, v)	\
++	({ typeof(x) __val = (v); __WRITE_ONCE(x, __val); bpf_barrier(); __val; })
++#endif
++
+ /* Clear CB values */
+ static inline void bpf_clear_cb(struct __sk_buff *skb)
+ {

@@ -1,0 +1,112 @@
+@@ -4,6 +4,7 @@
+ # See http://www.secdev.org/projects/scapy for more information
+ # Copyright (C) Nils Weiss <nils@we155.de>
+ # Copyright (C) Enrico Pozzobon <enricopozzobon@gmail.com>
++# Copyright (C) Alexander Schroeder <alexander1.schroeder@st.othr.de>
+ # This program is published under a GPLv2 license
+ 
+ # scapy.contrib.description = ISO-TP (ISO 15765-2)
+@@ -34,10 +35,12 @@ from scapy.error import Scapy_Exception, warning, log_loading
+ from scapy.supersocket import SuperSocket
+ from scapy.config import conf
+ from scapy.consts import LINUX
++from scapy.contrib.cansocket import PYTHON_CAN
+ 
+ __all__ = ["ISOTP", "ISOTPHeader", "ISOTPHeaderEA", "ISOTP_SF", "ISOTP_FF",
+            "ISOTP_CF", "ISOTP_FC", "ISOTPSniffer", "ISOTPSoftSocket",
+-           "ISOTPSocket", "ISOTPSocketImplementation", "ISOTPMessageBuilder"]
++           "ISOTPSocket", "ISOTPSocketImplementation", "ISOTPMessageBuilder",
++           "ISOTPScan"]
+ 
+ USE_CAN_ISOTP_KERNEL_MODULE = False
+ if six.PY3 and LINUX:
+@@ -1611,3 +1614,394 @@ if six.PY3 and LINUX:
+ 
+ if USE_CAN_ISOTP_KERNEL_MODULE:
+     ISOTPSocket = ISOTPNativeSocket
++
++
++# ###################################################################
++# #################### ISOTPSCAN ####################################
++# ###################################################################
++def send_multiple_ext(sock, ext_id, packet, number_of_packets):
++    """ Send multiple packets with extended addresses at once
++
++    Args:
++        sock: socket for can interface
++        ext_id: extended id. First id to send.
++        packet: packet to send
++        number_of_packets: number of packets send
++
++    This function is used for scanning with extended addresses.
++    It sends multiple packets at once. The number of packets
++    is defined in the number_of_packets variable.
++    It only iterates the extended ID, NOT the actual ID of the packet.
++    This method is used in extended scan function.
++    """
++    end_id = min(ext_id + number_of_packets, 255)
++    for i in range(ext_id, end_id + 1):
++        packet.extended_address = i
++        sock.send(packet)
++
++
++def get_isotp_packet(identifier=0x0, extended=False):
++    """ Craft ISO TP packet
++    Args:
++        identifier: identifier of crafted packet
++        extended: boolean if packet uses extended address
++    """
++
++    if extended:
++        pkt = ISOTPHeaderEA() / ISOTP_FF()
++        pkt.extended_address = 0
++        pkt.data = b'\x00\x00\x00\x00\x00'
++    else:
++        pkt = ISOTPHeader() / ISOTP_FF()
++        pkt.data = b'\x00\x00\x00\x00\x00\x00'
++
++    pkt.identifier = identifier
++    pkt.message_size = 100
++    return pkt
++
++
++def filter_periodic_packets(packet_dict, verbose=False):
++    """ Filter for periodic packets
++
++    Args:
++        packet_dict: Dictionary with Send-to-ID as key and a tuple
++                     (received packet, Recv_ID)
++        verbose: Displays further information
++
++    ISOTP-Filter for periodic packets (same ID, always same timegap)
++    Deletes periodic packets in packet_dict
++    """
++    filter_dict = {}
++
++    for key, value in packet_dict.items():
++        pkt = value[0]
++        idn = value[1]
++        if idn not in filter_dict:
++            filter_dict[idn] = ([key], [pkt])
++        else:
++            key_lst, pkt_lst = filter_dict[idn]
++            filter_dict[idn] = (key_lst + [key], pkt_lst + [pkt])
++
++    for idn in filter_dict:
++        key_lst = filter_dict[idn][0]
++        pkt_lst = filter_dict[idn][1]
++        if len(pkt_lst) < 3:
++            continue
++
++        tg = [p1.time - p2.time for p1, p2 in zip(pkt_lst[1:], pkt_lst[:-1])]
++        if all(abs(t1 - t2) < 0.001 for t1, t2 in zip(tg[1:], tg[:-1])):
++            if verbose:
++                print("[i] Identifier 0x%03x seems to be periodic. "
++                      "Filtered.")
++            for k in key_lst:
++                del packet_dict[k]
++
++
++def get_isotp_fc(id_value, id_list, noise_ids, extended, packet,
++                 verbose=False):
++  

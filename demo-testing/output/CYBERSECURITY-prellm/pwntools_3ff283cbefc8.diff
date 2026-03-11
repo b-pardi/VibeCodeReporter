@@ -1,0 +1,109 @@
+@@ -479,43 +479,121 @@ def make_unpacker(word_size = None, endianness = None, sign = None, **kwargs):
+     else:
+         return lambda number: unpack(number, word_size, endianness, sign)
+ 
++def _fit(pieces, preprocessor, packer, filler):
++    # Pulls bytes from `filler` and adds them to `pad` until it ends in `key`.
++    # Returns the index of `key` in `pad`.
++    pad = []
++    def fill(key):
++        key = list(key)
++        while len(pad) < len(key) or pad[-len(key):] != key:
++            pad.append(filler.next())
++        return len(pad) - len(key)
++
++    # Key conversion:
++    # - convert str/unicode keys to offsets
++    # - convert large int (no null-bytes in a machine word) keys to offsets
++    pieces_ = dict()
++    large_key = 2**(context.word_size-8)
++    for k, v in pieces.items():
++        if isinstance(k, (int, long)):
++            if k >= large_key:
++                k = fill(pack(k))
++        elif isinstance(k, unicode):
++            k = fill(k.encode('utf8'))
++        elif isinstance(k, bytearray):
++            k = fill(str(k))
++        elif isinstance(k, str):
++            k = fill(k)
++        else:
++            raise TypeError("flat(): offset must be of type int or str, but got '%s'" % type(k))
++        if k in pieces_:
++            raise ValueError("flag(): multiple values at offset %d" % k)
++        pieces_[k] = v
++    pieces = pieces_
++
++    # We must "roll back" `filler` so each recursive call to `_flat` gets it in
++    # the right position
++    filler = iters.chain(pad, filler)
++
++    # Build output
++    out = ''
++    for k, v in sorted(pieces.items()):
++        if k < len(out):
++            raise ValueError("flat(): data at offset %d overlaps with previous data which ends at offset %d" % (k, len(out)))
+ 
++        # Fill up to offset
++        while len(out) < k:
++            out += filler.next()
++
++        # Recursively flatten data
++        out += _flat([v], preprocessor, packer, filler)
+ 
+-def _flat(args, preprocessor, packer):
++    return filler, out
++
++def _flat(args, preprocessor, packer, filler):
+     out = []
+     for arg in args:
+ 
+-        if not isinstance(arg, (list, tuple)):
++        if not isinstance(arg, (list, tuple, dict)):
+             arg_ = preprocessor(arg)
+             if arg_ != None:
+                 arg = arg_
+ 
+         if hasattr(arg, '__flat__'):
+-            out.append(arg.__flat__())
++            val = arg.__flat__()
+         elif isinstance(arg, (list, tuple)):
+-            out.append(_flat(arg, preprocessor, packer))
++            val = _flat(arg, preprocessor, packer, filler)
++        elif isinstance(arg, dict):
++            filler, val = _fit(arg, preprocessor, packer, filler)
+         elif isinstance(arg, str):
+-            out.append(arg)
++            val = arg
+         elif isinstance(arg, unicode):
+-            out.append(arg.encode('utf8'))
++            val = arg.encode('utf8')
+         elif isinstance(arg, (int, long)):
+-            out.append(packer(arg))
++            val = packer(arg)
+         elif isinstance(arg, bytearray):
+-            out.append(str(arg))
++            val = str(arg)
+         else:
+             raise ValueError("flat(): Flat does not support values of type %s" % type(arg))
++
++        out.append(val)
++
++        # Advance `filler` for "non-recursive" values
++        if not isinstance(arg, (list, tuple, dict)):
++            for _ in xrange(len(val)):
++                filler.next()
++
+     return ''.join(out)
+ 
+ @LocalContext
+ def flat(*args, **kwargs):
+-    """flat(*args, preprocessor = None, word_size = None, endianness = None, sign = None)
++    """flat(*args, preprocessor = None, length = None, filler = de_bruijn(),
++     word_size = None, endianness = None, sign = None) -> str
+ 
+     Flattens the arguments into a string.
+ 
+-    This function takes an arbitrary number of arbitrarily nested lists and
+-    tuples. It will then find every string and number inside those and flatten
+-    them out. Strings are inserted directly while numbers are packed us

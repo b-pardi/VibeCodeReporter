@@ -1,0 +1,127 @@
+@@ -2,7 +2,7 @@ from contextlib import contextmanager
+ 
+ from django.conf import settings
+ from django.contrib.auth.models import BaseUserManager
+-from django.db import models
++from django.db import models, transaction, connection
+ from psycopg2 import connect as psycopg2_connect
+ from psycopg2.extensions import new_type, register_type, register_adapter, AsIs
+ 
+@@ -40,6 +40,14 @@ def psycopg_connection(database_alias: str):
+             psycopg2_connection.close()
+ 
+ 
++@contextmanager
++def tenant_transaction(tenant_id: str):
++    with transaction.atomic():
++        with connection.cursor() as cursor:
++            cursor.execute(f"SELECT set_config('api.tenant_id', '{tenant_id}', TRUE);")
++            yield cursor
++
++
+ class CustomUserManager(BaseUserManager):
+     def create_user(self, email, password=None, **extra_fields):
+         if not email:
+
+
+
+
+@@ -1,22 +1,16 @@
+ import logging
+ import time
+ 
+-from django.http import HttpRequest
+-
+ from config.custom_logging import BackendLogger
+ 
+ 
+-def extract_tenant_id(request: HttpRequest) -> str | None:
+-    """
+-    Extract the tenant ID from the request headers.
+-
+-    Args:
+-        request (HttpRequest): The HTTP request object.
+-
+-    Returns:
+-        str: The tenant ID if present in the headers, otherwise None.
+-    """
+-    return request.headers.get("X-Tenant-ID")
++def extract_auth_info(request) -> dict:
++    if not hasattr(request, "auth") or request.auth is not None:
++        tenant_id = request.auth.get("tenant_id", "N/A")
++        user_id = request.auth.get("user_id", "N/A")
++    else:
++        tenant_id, user_id = "N/A", "N/A"
++    return {"tenant_id": tenant_id, "user_id": user_id}
+ 
+ 
+ class APILoggingMiddleware:
+@@ -38,15 +32,17 @@ class APILoggingMiddleware:
+ 
+         response = self.get_response(request)
+         duration = time.time() - request_start_time
++        auth_info = extract_auth_info(request)
+         self.logger.info(
+             "",
+             extra={
++                "user_id": auth_info["user_id"],
++                "tenant_id": auth_info["tenant_id"],
+                 "method": request.method,
+                 "path": request.path,
+                 "query_params": request.GET.dict(),
+                 "status_code": response.status_code,
+                 "duration": duration,
+-                "tenant_id": extract_tenant_id(request),
+             },
+         )
+ 
+
+
+
+
+@@ -420,6 +420,70 @@ class Migration(migrations.Migration):
+                 name="unique_provider_uids",
+             ),
+         ),
++        migrations.CreateModel(
++            name="Task",
++            fields=[
++                (
++                    "id",
++                    models.UUIDField(
++                        default=uuid.uuid4,
++                        editable=False,
++                        primary_key=True,
++                        serialize=False,
++                    ),
++                ),
++                ("inserted_at", models.DateTimeField(auto_now_add=True)),
++                (
++                    "task_runner_task",
++                    models.OneToOneField(
++                        blank=True,
++                        null=True,
++                        on_delete=django.db.models.deletion.CASCADE,
++                        related_name="task",
++                        related_query_name="task",
++                        to="django_celery_results.taskresult",
++                    ),
++                ),
++                (
++                    "tenant",
++                    models.ForeignKey(
++                        on_delete=django.db.models.deletion.CASCADE, to="api.tenant"
++                    ),
++                ),
++            ],
++            options={
++                "db_table": "tasks",
++                "abstract": False,
++            },
++        ),
++        migrations.AddConstraint(
++            model_name="task",
++            constraint=api.rls.RowLevelSecurityConstraint(
++                "tenant_id",
++                name="rls_on_task",
++              

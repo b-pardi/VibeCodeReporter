@@ -1,0 +1,135 @@
+@@ -107,6 +107,8 @@
+ #error CALI_RES_ values need to be increased above TC_ACT_VALUE_MAX
+ #endif
+ 
++#define HAS_MAGLEV        (CALI_F_FROM_HEP && CALI_F_MAIN)
++
+ #ifndef CALI_FIB_LOOKUP_ENABLED
+ #define CALI_FIB_LOOKUP_ENABLED true
+ #endif
+
+
+
+
+@@ -788,7 +788,13 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_lookup(struct cali_tc_c
+ 				!ip_equal(result.tun_ip, ctx->state->tun_ip)) {
+ 			CALI_CT_DEBUG("tunnel src changed from " IP_FMT " to " IP_FMT "",
+ 					debug_ip(result.tun_ip), debug_ip(ctx->state->tun_ip));
++
+ 			ct_result_set_flag(result.rc, CT_RES_TUN_SRC_CHANGED);
++
++			if (result.flags & CALI_CT_FLAG_MAGLEV) {
++				CALI_DEBUG("overwriting tunnel src for Maglev packet");
++				tracking_v->tun_ip = ctx->state->tun_ip;
++			}
+ 		}
+ 
+ 		if (tracking_v->a_to_b.approved && tracking_v->b_to_a.approved) {
+
+
+
+
+@@ -40,6 +40,7 @@ enum cali_ct_type {
+ #define CALI_CT_FLAG_NP_NO_DSR	0x2000 /* marks connections from a client which is excluded from DSR */
+ #define CALI_CT_FLAG_SKIP_REDIR_PEER	0x4000 /* marks connections from a client which is excluded from redir */
+ #define CALI_CT_FLAG_SET_DSCP	0x8000 /* marks connections that needs to set DSCP */
++#define CALI_CT_FLAG_MAGLEV	0X10000 /* marks Maglev connections. Allows packets of an existing to arrive via a different tunnel after failover. */
+ 
+ struct calico_ct_leg {
+ 	__u64 bytes;
+@@ -154,9 +155,9 @@ struct ct_create_ctx {
+ 	ipv46_addr_t tun_ip; /* is set when the packet arrive through the NP tunnel.
+ 			* It is also set on the first node when we create the
+ 			* initial CT entry for the tunneled traffic. */
+-	__u16 flags;
++	__u32 flags;
+ 	__u8 proto;
+-	__u8 __pad;
++	__u8 __pad[3];
+ 	enum cali_ct_type type;
+ 	bool allow_return;
+ };
+@@ -203,6 +204,11 @@ enum calico_ct_result_type {
+ 	 * or for packet that have a conntrack entry that is only approved by the other leg
+ 	 * (indicating that policy on this leg failed to allow the packet). */
+ 	CALI_CT_INVALID = 6,
++	/* CALI_CT_MAGLEV_MID_FLOW_MISS is set (in the Maglev program) for packets which were
++	 * originally CALI_CT_MID_FLOW_MISS, but where the maglev-lookup returned a backend.
++	 * It indicates that a midflow Maglev packet should be treated as a failed-over connection.
++	 * This is similar to handling CALI_CT_NEW. */
++	CALI_CT_MAGLEV_MID_FLOW_MISS = 7,
+ };
+ 
+ #define CT_RES_RELATED         0x100
+
+
+
+
+@@ -8,7 +8,7 @@
+ #include "bpf.h"
+ #include "types.h"
+ 
+-#define MAX_COUNTERS_SIZE 25
++#define MAX_COUNTERS_SIZE 26
+ 
+ typedef __u64 counters_t[MAX_COUNTERS_SIZE];
+ 
+@@ -21,7 +21,7 @@ struct counters_key {
+ #define COUNTERS_TC_EGRESS	1
+ #define COUNTERS_XDP		2
+ 
+-CALI_MAP(cali_counters, 5,
++CALI_MAP(cali_counters, 6,
+ 		BPF_MAP_TYPE_PERCPU_HASH,
+ 		struct counters_key, counters_t, 20000,
+ 		0)
+
+
+
+
+@@ -27,6 +27,7 @@ struct name {                              \
+ 	__u32 log_filter_jmp;                  \
+ 	__u32 jumps[40];                       \
+ 	__s8 dscp;                             \
++	__u32 maglev_lut_size;                 \
+ }
+ 
+ DECLARE_TC_GLOBAL_DATA(cali_tc_global_data, ipv6_addr_t);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,163 @@
++
++/* 
++ * Copyright (C) 2006. Bob Jenkins (bob_jenkins@burtleburtle.net)
++ *
++ * https://burtleburtle.net/bob/hash/
++ *
++ * These are the credits from Bob's sources:
++ *
++ * lookup3.c, by Bob Jenkins, May 2006, Public Domain.
++ *
++ * These are functions for producing 32-bit hashes for hash table lookup.
++ * hashword(), hashlittle(), hashlittle2(), hashbig(), mix(), and final()
++ * are externally useful functions.  Routines to test the hash are included
++ * if SELF_TEST is defined.  You can use this free for any purpose.  It's in
++ * the public domain.  It has no warranty.
++ */
++
++/*
++ * I've chopped and wrapped Jenkins' work.
++ * Any bugs belong to me... :-(
++ * -Alex
++*/
++
++
++#include "bpf.h"
++
++#define hashsize(n) ((__u32)1<<(n))
++#define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
++
++/*
++-------------------------------------------------------------------------------
++mix -- mix 3 32-bit valu

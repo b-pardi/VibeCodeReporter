@@ -1,0 +1,116 @@
+@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
+     LONG_DESC = fh.read()
+     setup(
+         name="hydra-ray-launcher",
+-        version="0.1.2",
++        version="0.1.3",
+         author="Jieru Hu",
+         author_email="jieru@fb.com",
+         description="Hydra Ray launcher plugin",
+
+
+
+
+@@ -7,7 +7,7 @@ import subprocess
+ import sys
+ import tempfile
+ from pathlib import Path
+-from typing import Generator, List, Optional
++from typing import Generator, Optional
+ 
+ import boto3  # type: ignore
+ import pkg_resources
+@@ -54,7 +54,7 @@ except (NoCredentialsError, NoRegionError):
+     aws_not_configured = True
+ 
+ 
+-ami = os.environ.get("AWS_RAY_AMI", "ami-0e597fd7c6b402fce")
++ami = os.environ.get("AWS_RAY_AMI", "ami-04dd9d05269d635cf")
+ security_group_id = os.environ.get("AWS_RAY_SECURITY_GROUP", "sg-0a12b09a5ff961aee")
+ subnet_id = os.environ.get("AWS_RAY_SUBNET", "subnet-acd2cfe7")
+ instance_role = os.environ.get(
+@@ -79,12 +79,36 @@ ray_nodes_conf = {
+ 
+ ray_nodes_conf_override = str(ray_nodes_conf).replace("'", "").replace(" ", "")
+ 
++pip_lib_skip = [
++    "omegaconf",
++    "hydra_core",
++    "ray",
++    "cloudpickle",
++    "pickle5",
++    "hydra_ray_launcher",
++]
++
++common_overrides = [
++    f"hydra.launcher.ray.cluster.cluster_name={cluster_name}",
++    "hydra.launcher.stop_cluster=False",
++    f"hydra.launcher.ray.cluster.provider.key_pair.key_name=hydra_test_{cluster_name}",
++    # Port 443 is blocked for testing instance, as a result, pip install would fail.
++    # To get around this, we pre-install all the dependencies on the test AMI.
++    "hydra.launcher.ray.cluster.setup_commands=[]",
++    "hydra.launcher.env_setup.commands=[]",
++    f"+hydra.launcher.ray.cluster.worker_nodes={ray_nodes_conf_override}",
++    f"+hydra.launcher.ray.cluster.head_node={ray_nodes_conf_override}",
++]
++common_overrides.extend(
++    [f"~hydra.launcher.env_setup.pip_packages.{lib}" for lib in pip_lib_skip]
++)
++
+ log = logging.getLogger(__name__)
+ 
+ chdir_plugin_root()
+ 
+ 
+-def build_ray_launcher_wheel(tmpdir: str) -> List[str]:
++def build_ray_launcher_wheel(tmpdir: str) -> str:
+     """
+     This  only works on ray launcher plugin wheels for now, reasons being in our base AMI
+     we do not necessarily have the dependency for other plugins.
+@@ -96,25 +120,23 @@ def build_ray_launcher_wheel(tmpdir: str) -> List[str]:
+         len(plugins_path) == 1 and "hydra_ray_launcher" == plugins_path[0]
+     ), "Ray test AMI doesn't have dependency installed for other plugins."
+ 
+-    wheels = []
+-    for p in plugins_path:
+-        wheel = build_plugin_wheel(p, tmpdir)
+-        wheels.append(wheel)
+-    return wheels
++    return build_plugin_wheel(tmpdir)
+ 
+ 
+-def build_plugin_wheel(plugin: str, tmp_wheel_dir: str) -> str:
++def build_plugin_wheel(tmp_wheel_dir: str) -> str:
+     chdir_hydra_root()
++    plugin = "hydra_ray_launcher"
+     os.chdir(Path("plugins") / plugin)
+     log.info(f"Build wheel for {plugin}, save wheel to {tmp_wheel_dir}.")
++    version = subprocess.getoutput("python setup.py --version")
++    plugin_wheel = f"{plugin}-{version}-py3-none-any.whl"
+     subprocess.getoutput(
+-        f"python setup.py sdist bdist_wheel && cp dist/*.whl {tmp_wheel_dir}"
++        f"python setup.py sdist bdist_wheel && cp dist/{plugin_wheel} {tmp_wheel_dir}"
+     )
+     log.info("Download all plugin dependency wheels.")
+     subprocess.getoutput(f"pip download . -d {tmp_wheel_dir}")
+-    wheel = subprocess.getoutput("ls dist/*.whl").split("/")[-1]
+     chdir_hydra_root()
+-    return wheel
++    return plugin_wheel
+ 
+ 
+ def build_core_wheel(tmp_wheel_dir: str) -> str:
+@@ -135,7 +157,7 @@ def upload_and_install_wheels(
+     tmp_wheel_dir: str,
+     yaml: str,
+     core_wheel: str,
+-    plugin_wheels: List[str],
++    plugin_wheel: str,
+ ) -> None:
+     ray_rsync_up(yaml, tmp_wheel_dir + "/", temp_remote_wheel_dir)
+     log.info(f"Install hydra-core wheel {core_wheel}")
+@@ -148,16 +170,15 @@ def upload_and_install_wheels(
+         ]
+     )
+ 
+-    for p in 

@@ -1,0 +1,144 @@
+@@ -315,7 +315,7 @@ struct STWIStatus
+     u8 unk_17;
+     void (*callbackM)();
+     void (*callbackS)(u16);
+-    void (*unk_20)(void);
++    void (*callbackID)(void);
+     union RfuPacket *txPacket;
+     union RfuPacket *rxPacket;
+     vu8 unk_2c;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,403 @@
++#include "global.h"
++#include "librfu.h"
++
++static void sio32intr_clock_master(void);
++static void sio32intr_clock_slave(void);
++static u16 handshake_wait(u16 slot);
++static void STWI_set_timer_in_RAM(u8 count);
++static void STWI_stop_timer_in_RAM(void);
++static void STWI_init_slave(void);
++static void Callback_Dummy_M(int reqCommandId, int error, void (*callbackM)());
++static void Callback_Dummy_S(u16 reqCommandId, void (*callbackS)(u16));
++static void Callback_Dummy_ID(void (*callbackId)(void));
++
++void IntrSIO32(void)
++{
++    if (gSTWIStatus->state == 10)
++    {
++        if (gSTWIStatus->callbackID != NULL)
++            Callback_Dummy_ID(gSTWIStatus->callbackID);
++    }
++    else
++    {
++        if (gSTWIStatus->msMode == AGB_CLK_MASTER)
++            sio32intr_clock_master();
++        else
++            sio32intr_clock_slave();
++    }
++}
++
++static void sio32intr_clock_master(void)
++{
++    u32 regSIODATA32;
++    u32 ackLen;
++
++    STWI_set_timer_in_RAM(80);
++    regSIODATA32 = REG_SIODATA32;
++
++    if (gSTWIStatus->state == 0)
++    {
++        if (regSIODATA32 == 0x80000000)
++        {
++            if (gSTWIStatus->reqNext <= gSTWIStatus->reqLength)
++            {
++                REG_SIODATA32 = ((u32*)gSTWIStatus->txPacket->rfuPacket8.data)[gSTWIStatus->reqNext];
++                gSTWIStatus->reqNext++;
++            }
++            else
++            {
++                gSTWIStatus->state = 1;
++                REG_SIODATA32 = 0x80000000;
++            }
++        }
++        else
++        {
++            STWI_stop_timer_in_RAM();
++            STWI_set_timer_in_RAM(130);
++            return;
++        }
++    }
++    else if (gSTWIStatus->state == 1)
++    {
++        if ((regSIODATA32 & 0xFFFF0000) == 0x99660000)
++        {
++            gSTWIStatus->ackNext = 0;
++            ((u32*)gSTWIStatus->rxPacket)[gSTWIStatus->ackNext] = regSIODATA32;
++            gSTWIStatus->ackNext++;
++            gSTWIStatus->ackActiveCommand = regSIODATA32;
++            gSTWIStatus->ackLength = ackLen = regSIODATA32 >> 8;
++            if ((ackLen = gSTWIStatus->ackLength) >= gSTWIStatus->ackNext)
++            {
++                gSTWIStatus->state = 2;
++                REG_SIODATA32 = 0x80000000;
++            }
++            else
++            {
++                gSTWIStatus->state = 3;
++            }
++        }
++        else
++        {
++            STWI_stop_timer_in_RAM();
++            STWI_set_timer_in_RAM(130);
++            return;
++        }
++    }
++    else if (gSTWIStatus->state == 2)
++    {
++        ((u32*)gSTWIStatus->rxPacket)[gSTWIStatus->ackNext] = regSIODATA32;
++        gSTWIStatus->ackNext++;
++        if (gSTWIStatus->ackLength < gSTWIStatus->ackNext)
++            gSTWIStatus->state = 3;
++        else
++            REG_SIODATA32 = 0x80000000;
++    }
++
++    if (handshake_wait(1) == 1)
++        return;
++
++    REG_SIOCNT = 0x500B;
++
++    if (handshake_wait(0) == 1)
++        return;
++
++    STWI_stop_timer_in_RAM();
++
++    if (gSTWIStatus->state == 3)
++    {
++        if (
++            gSTWIStatus->ackActiveCommand == (0x80 | ID_MS_CHANGE_REQ)
++         || gSTWIStatus->ackActiveCommand == (0x80 | ID_DATA_TX_AND_CHANGE_REQ)
++         || gSTWIStatus->ackActiveCommand == (0x80 | ID_UNK35_REQ)
++         || gSTWIStatus->ackActiveCommand == (0x80 | ID_RESUME_RETRANSMIT_AND_CHANGE_REQ)
++        )
++        {
++
++            gSTWIStatus->msMode = 0;
++            REG_SIODATA32 = 0x80000000;
++            REG_SIOCNT = 0x5002;
++            REG_SIOCNT = 0x5082;
++            gSTWIStatus->state = 5;
++        }
++        else
++        {
++
++            if (gSTWIStatus->ackActiveCommand == 238)
++            {
++                REG_SIOCNT = 0x5003;
++                gSTWIStatus->state = 4;
++ 

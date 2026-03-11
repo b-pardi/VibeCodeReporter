@@ -1,0 +1,124 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,361 @@
++from panda.extras.file_hook import FileHook
++import logging
++
++'''
++Framework for halucinating files inside the guest through
++modifications around syscalls involving filenames and file
++descriptors.
++
++High-level idea:
++    When we see an open of a file we want to fake, change it to another filename
++    that really exists and capture the file descriptor assigned to it.
++    Then whenever there are uses of that file descriptor, ignore/drop the request
++    and fake return values.
++'''
++
++class FakeFile:
++    '''
++    A fake file behind a hyperFD - this class will generate data when the
++    corresponding file descriptor(s) are accessed.
++    Users can inherit and modify this to customize how data is generated
++
++    Note: a single FileFaker might be opened and in use by multiple FDs in the guest
++
++    '''
++    def __init__(self, fake_contents=""):
++        self.logger = logging.getLogger('panda.hooking')
++
++        if isinstance(fake_contents, str):
++            fake_contents = fake_contents.encode("utf8")
++        fake_contents += b'\x00'
++        self.contents = fake_contents
++        self.initial_contents = fake_contents
++        self.refcount = 0 # Reference count
++
++    def read(self, size, offset):
++        '''
++        Generate data for a given read of size.  Returns data.
++        '''
++
++        if offset >= len(self.contents):  # No bytes left to read
++            return b""
++        # Otherwise there are bytes left to read
++        read_data = self.contents[offset:offset+size]
++
++        return read_data
++
++    def write(self, offset, write_data):
++        '''
++        Update contents from offset. It's a bytearray so we can't just mutate
++        Return how much HyperFD offset should be incremented by
++        XXX what about writes past end of the file?
++        '''
++        new_data  = self.contents[:offset]
++        new_data += write_data
++        new_data += self.contents[offset+len(new_data):]
++
++        self.contents = new_data
++        return len(write_data)
++
++    def close(self):
++        self.refcount -= 1
++        if self.refcount == 0: # All FDs are now closed
++            if self.initial_contents == self.contents:
++                self.logger.debug(f"All handles to Faker({self.filename}) closed. Unmodified contents")
++            else: # it was mutated!
++                self.logger.info(f"All handles to Faker({self.filename}) closed. Modified contents: {repr(self.contents)}")
++
++    def get_mode(self):
++        return 0o664 # Regular file (octal)
++
++    def get_size(self, bytesize):
++        return ceil(len(self.contents)/bytesize)
++
++    def __str__(self):
++        return f"Faker({self.filename} -> {repr(self.contents[:10])}..."
++
++
++    def _delete(self):
++        self.close()
++
++    def __del__(self):
++        # XXX: This destructor isn't called automatically
++        self._delete()
++
++class HyperFD:
++    '''
++    A HyperFD is what we use to track the state of a faked FD in the guest.
++    It is backed by a FakeFile.
++    Stores the filename originally associated with it at time of open
++    '''
++    def __init__(self,  filename, fakefile, offset=0):
++        self.name = filename
++        self.file = fakefile
++        self.file.refcount+=1 # Count of open FDs pointing to the file
++        self.offset = offset
++
++    def read(self, size):
++        '''
++        Read from the file descriptor. Determine current offset
++        and then pass request through to FakeFile
++        Returns (data read, count)
++        '''
++        assert(self.file)
++        data = self.file.read(size, self.offset)
++        self.offset+=len(data)
++        return (data, len(data))
++
++    def write(self, data):
++        assert(self.file)
++        bytes_written =  self.file.write(self.offset, data)
++        self.offset +- bytes_written
++        return bytes_written
++
++    def get_mode(self):
++        assert(self.file)
++        return self.file.get_mode()
++
++    def get_size(self):
++      

@@ -1,0 +1,139 @@
+@@ -270,3 +270,19 @@ static __always_inline int egressgw_status_check(const struct __ctx_buff *ctx,
+ 
+ 	test_finish();
+ }
++
++static __always_inline int create_ct_entry(struct __ctx_buff *ctx, __be16 client_port)
++{
++	struct ipv4_ct_tuple tuple = {};
++	struct ct_state ct_state = {};
++
++	tuple.nexthdr = IPPROTO_TCP;
++	tuple.daddr = EXTERNAL_SVC_IP;
++	tuple.sport = EXTERNAL_SVC_PORT;
++	tuple.saddr = CLIENT_IP;
++	tuple.dport = client_port;
++	__ipv4_ct_tuple_reverse(&tuple);
++
++	return ct_create4(get_ct_map4(&tuple), &CT_MAP_ANY4, &tuple, ctx,
++			 CT_EGRESS, &ct_state, NULL);
++}
+
+
+
+
+@@ -3,10 +3,10 @@
+ 
+ static __always_inline void
+ __ipcache_v4_add_entry(__be32 addr, __u8 cluster_id, __u32 sec_identity,
+-		       __u32 tunnel_ep, __u8 spi, bool flag_skip_tunnel)
++		       __u32 tunnel_ep, __u8 spi, bool flag_skip_tunnel, __u32 mask_size)
+ {
+ 	struct ipcache_key key = {
+-		.lpm_key.prefixlen = IPCACHE_PREFIX_LEN(V4_CACHE_KEY_LEN),
++		.lpm_key.prefixlen = IPCACHE_PREFIX_LEN(mask_size),
+ 		.cluster_id = cluster_id,
+ 		.family = ENDPOINT_KEY_IPV4,
+ 		.ip4 = addr,
+@@ -25,14 +25,23 @@ static __always_inline void
+ ipcache_v4_add_entry(__be32 addr, __u8 cluster_id, __u32 sec_identity,
+ 		     __u32 tunnel_ep, __u8 spi)
+ {
+-	__ipcache_v4_add_entry(addr, cluster_id, sec_identity, tunnel_ep, spi, false);
++	__ipcache_v4_add_entry(addr, cluster_id, sec_identity, tunnel_ep, spi, false,
++			       V4_CACHE_KEY_LEN);
+ }
+ 
+ static __always_inline void
+ ipcache_v4_add_entry_with_flags(__be32 addr, __u8 cluster_id, __u32 sec_identity,
+ 				__u32 tunnel_ep, __u8 spi, bool flag_skip_tunnel)
+ {
+-	__ipcache_v4_add_entry(addr, cluster_id, sec_identity, tunnel_ep, spi, flag_skip_tunnel);
++	__ipcache_v4_add_entry(addr, cluster_id, sec_identity, tunnel_ep, spi, flag_skip_tunnel,
++			       V4_CACHE_KEY_LEN);
++}
++
++static __always_inline void
++ipcache_v4_add_entry_with_mask_size(__be32 addr, __u8 cluster_id, __u32 sec_identity,
++				    __u32 tunnel_ep, __u8 spi, __u32 mask_size)
++{
++	__ipcache_v4_add_entry(addr, cluster_id, sec_identity, tunnel_ep, spi, false, mask_size);
+ }
+ 
+ static __always_inline void
+
+
+
+
+@@ -64,6 +64,8 @@ static volatile const __u8 mac_zero[] =  {0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+ #define v4_pod_two	IPV4(192, 168, 0, 2)
+ #define v4_pod_three	IPV4(192, 168, 0, 3)
+ 
++#define v4_all	IPV4(0, 0, 0, 0)
++
+ /* IPv6 addresses for pods in the cluster */
+ static volatile const __section(".rodata") __u8 v6_pod_one[] = {0xfd, 0x04, 0, 0, 0, 0, 0, 0,
+ 					   0, 0, 0, 0, 0, 0, 0, 1};
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++
++#include <bpf/ctx/skb.h>
++#include "pktgen.h"
++#include "config_replacement.h"
++
++/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
++#define ETH_HLEN 14
++
++/* Enable code paths under test */
++#define ENABLE_IPV4
++#define ENABLE_NODEPORT
++#define ENABLE_EGRESS_GATEWAY
++#define ENABLE_MASQUERADE_IPV4
++#define ENCAP_IFINDEX 0
++
++#define SECCTX_FROM_IPCACHE 1
++
++#include "bpf_host.c"
++
++#include "lib/egressgw.h"
++#include "lib/ipcache.h"
++#include "lib/policy.h"
++
++#define TO_NETDEV 0
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 1);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[TO_NETDEV] = &cil_to_netdev,
++	},
++};
++
++/* Test that a packet matching an egress gateway policy on the to-netdev
++ * program gets redirected to the gateway node.
++ */
++PKTGEN("tc", "tc_egressgw_redirect")
++int egressgw_redirect_pktgen(struct __ctx_buff *ctx)
++{
++	return egressgw_pktgen(ctx, (struct egressgw_test_ctx) {
++			.test = TEST_REDIRECT,
++		});
++}
++
++SETUP("tc", "tc_egressgw_redirect")
++int egressgw_redirect_setup(struct __ctx_buff *ctx)
++{
++	ipcache_v4_add_entry_with_mask_size(v4_all, 0, WORLD_IPV4_ID, 0, 0, 0);
++	create_ct_entry(ctx, client_port(TEST_REDIRECT));
++	add_egressgw_policy_entry(CLIENT_

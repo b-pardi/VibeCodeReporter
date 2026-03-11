@@ -1,0 +1,88 @@
+@@ -2027,9 +2027,9 @@ public final class CiscoConfiguration extends VendorConfiguration {
+       if (!firstNonNull(nat.getVrf(), Configuration.DEFAULT_VRF_NAME).equals(vrfName)) {
+         continue;
+       }
+-      nat.toIncomingTransformation(c.getIpAccessLists(), _natPools, _interfaces)
++      nat.toIncomingTransformation(c.getIpAccessLists(), _routeMaps, _natPools, _interfaces, _w)
+           .ifPresent(incoming -> convertedIncomingNats.put(nat, incoming));
+-      nat.toOutgoingTransformation(_natPools, getNatInside(), _interfaces, c)
++      nat.toOutgoingTransformation(_routeMaps, _natPools, getNatInside(), _interfaces, c, _w)
+           .ifPresent(outgoing -> convertedOutgoingNats.put(nat, outgoing));
+     }
+ 
+
+
+
+
+@@ -1,11 +1,13 @@
+ package org.batfish.representation.cisco;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
++import static com.google.common.base.Preconditions.checkState;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.and;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.permittedByAcl;
+ import static org.batfish.datamodel.transformation.Transformation.when;
+ import static org.batfish.datamodel.transformation.TransformationStep.assignDestinationIp;
+ import static org.batfish.datamodel.transformation.TransformationStep.assignSourceIp;
++import static org.batfish.representation.cisco.CiscoIosNatUtil.toMatchExpr;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+ import java.util.Comparator;
+@@ -18,6 +20,7 @@ import java.util.stream.Collectors;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import javax.annotation.ParametersAreNonnullByDefault;
++import org.batfish.common.Warnings;
+ import org.batfish.datamodel.AclLine;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.ExprAclLine;
+@@ -162,8 +165,10 @@ public final class CiscoIosDynamicNat extends CiscoIosNat {
+   @Override
+   public Optional<Transformation.Builder> toIncomingTransformation(
+       Map<String, IpAccessList> ipAccessLists,
++      Map<String, RouteMap> routeMaps,
+       Map<String, NatPool> natPools,
+-      Map<String, Interface> interfaces) {
++      Map<String, Interface> interfaces,
++      Warnings w) {
+     // SOURCE_OUTSIDE matches and dynamically translates source addresses on ingress.
+     if (getAction() != RuleAction.SOURCE_OUTSIDE) {
+       // INSIDE rules require reverse translation on ingress, which is not
+@@ -171,19 +176,22 @@ public final class CiscoIosDynamicNat extends CiscoIosNat {
+       return Optional.empty();
+     }
+ 
+-    if (isMalformed(natPools, ipAccessLists, interfaces)) {
++    if (isMalformed(natPools, ipAccessLists, routeMaps, interfaces, w)) {
+       return Optional.empty();
+     }
+ 
+-    return Optional.of(makeTransformation(permittedByAcl(_aclName), false, natPools, interfaces));
++    return makeFilterMatchExpr(routeMaps, ipAccessLists.keySet(), null, w)
++        .map(matchExpr -> makeTransformation(matchExpr, false, natPools, interfaces));
+   }
+ 
+   @Override
+   public Optional<Transformation.Builder> toOutgoingTransformation(
++      Map<String, RouteMap> routeMaps,
+       Map<String, NatPool> natPools,
+       Set<String> insideInterfaces,
+       Map<String, Interface> interfaces,
+-      Configuration c) {
++      Configuration c,
++      Warnings w) {
+     /*
+      * SOURCE_INSIDE matches and dynamically translates source addresses on egress
+      * DESTINATION_INSIDE matches and dynamically translates destination addresses on egress
+@@ -195,63 +203,110 @@ public final class CiscoIosDynamicNat extends CiscoIosNat {
+       return Optional.empty();
+     }
+ 
+-    if (isMalformed(natPools, c.getIpAccessLists(), interfaces)) {
++    if (isMalformed(natPools, c.getIpAccessLists(), routeMaps, interfaces, w)) {
+       return Optional.empty();
+     }
+-    assert _aclName != null; // invariant of isMalformed being false, to help compiler.
+ 
+-    IpAccessList natAcl = c.getIpAccessLists().get(_aclName);
++    return makeFilterMatchExpr

@@ -1,0 +1,109 @@
+@@ -72,7 +72,7 @@ class Utils {
+   static bool postHTTPJsonData(char *username, char *password, char *url, char *json, HTTPTranferStats *stats);
+   static bool postHTTPJsonData(char *username, char *password, char *url, char *json, HTTPTranferStats *stats, char *return_data, int return_data_size, int *response_code);
+   static bool sendMail(char *from, char *to, char *message, char *smtp_server);
+-  static bool postHTTPTextFile(char *username, char *password, char *url, char *path, int timeout, HTTPTranferStats *stats);
++  static bool postHTTPTextFile(lua_State* vm, char *username, char *password, char *url, char *path, int timeout, HTTPTranferStats *stats);
+   static bool httpGetPost(lua_State* vm, char *url, char *username,
+ 		      char *password, int timeout, bool return_content,
+ 		      bool use_cookie_authentication, HTTPTranferStats *stats, const char *form_data);
+
+
+
+
+@@ -77,7 +77,8 @@ typedef enum {
+   alert_flow_web_mining = 21,
+   alert_nfq_flushed = 22,
+   alert_device_protocol_not_allowed = 24,
+-  alert_user_activity,
++  alert_user_activity = 25,
++  alert_influxdb_export_failure = 26,
+ } AlertType; /*
+ 	       NOTE:
+ 	       keep it in sync with alert_type_keys
+@@ -105,6 +106,7 @@ typedef enum {
+   alert_entity_host_pool,
+   alert_entity_process,
+   alert_entity_user,
++  alert_entity_influx_db,
+ } AlertEntity;
+ 
+ typedef enum {
+
+
+
+
+@@ -5007,7 +5007,6 @@ static int ntop_http_post(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
+-// ***API***
+ static int ntop_post_http_text_file(lua_State* vm) {
+   char *username, *password, *url, *path;
+   bool delete_file_after_post = false;
+@@ -5035,18 +5034,16 @@ static int ntop_post_http_text_file(lua_State* vm) {
+   if(timeout < 1)
+     timeout = 1;
+ 
+-  if(Utils::postHTTPTextFile(username, password, url, path, timeout, &stats)) {
++  if(Utils::postHTTPTextFile(vm, username, password, url, path, timeout, &stats)) {
+     if(delete_file_after_post) {
+       if(unlink(path) != 0)
+ 	ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to delete file %s", path);
+       else
+ 	ntop->getTrace()->traceEvent(TRACE_INFO, "Deleted file %s", path);
+     }
++  }
+ 
+-    lua_pushboolean(vm, true);
+-    return(CONST_LUA_OK);
+-  } else
+-    return(CONST_LUA_ERROR);
++  return(CONST_LUA_OK);
+ }
+ 
+ /* ****************************************** */
+
+
+
+
+@@ -61,6 +61,9 @@ static cap_value_t cap_values[] = {
+ int num_cap = sizeof(cap_values)/sizeof(cap_value_t);
+ #endif
+ 
++static size_t curl_writefunc_to_lua(char *buffer, size_t size, size_t nitems, void *userp);
++static size_t curl_hdf(char *buffer, size_t size, size_t nitems, void *userp);
++
+ /* ****************************************************** */
+ 
+ char* Utils::jsonLabel(int label, const char *label_str,char *buf, u_int buf_len){
+@@ -1371,7 +1374,7 @@ static size_t read_callback(void *ptr, size_t size, size_t nmemb, void *stream)
+   return(fread(ptr, size, nmemb, (FILE*)stream));
+ }
+ 
+-bool Utils::postHTTPTextFile(char *username, char *password, char *url,
++bool Utils::postHTTPTextFile(lua_State* vm, char *username, char *password, char *url,
+ 			     char *path, int timeout, HTTPTranferStats *stats) {
+   CURL *curl;
+   bool ret = true;
+@@ -1387,6 +1390,7 @@ bool Utils::postHTTPTextFile(char *username, char *password, char *url,
+   curl = curl_easy_init();
+   if(curl) {
+     CURLcode res;
++    DownloadState *state = NULL;
+     struct curl_slist* headers = NULL;
+ 
+     memset(stats, 0, sizeof(HTTPTranferStats));
+@@ -1422,19 +1426,51 @@ bool Utils::postHTTPTextFile(char *username, char *password, char *url,
+ #ifdef CURLOPT_CONNECTTIMEOUT_MS
+     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout*1000);
+ #endif
+-    
++
++    state = (DownloadState*)malloc(sizeof(DownloadState));
++    if(state != NULL) {
++      memset(state, 0, sizeof(DownloadState));
++
++      curl_easy_setopt(curl, CURLOPT_WRITEDATA, state);
++      curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_writefunc_to_lua);
++      curl_easy_setopt(curl, CURLOPT

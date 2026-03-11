@@ -1,0 +1,125 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,4 @@
++from prowler.providers.aws.services.bedrock.bedrock_service import BedrockAgent
++from prowler.providers.common.provider import Provider
++
++bedrock_agent_client = BedrockAgent(Provider.get_global_provider())
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,24 @@
++from prowler.lib.check.models import Check, Check_Report_AWS
++from prowler.providers.aws.services.bedrock.bedrock_agent_client import (
++    bedrock_agent_client,
++)
++
++
++class bedrock_agent_guardrail_enabled(Check):
++    def execute(self):
++        findings = []
++        for agent in bedrock_agent_client.agents.values():
++            report = Check_Report_AWS(self.metadata())
++            report.region = agent.region
++            report.resource_id = agent.id
++            report.resource_arn = agent.arn
++            report.resource_tags = agent.tags
++            report.status = "FAIL"
++            report.status_extended = f"Bedrock Agent {agent.name} is not using any guardrail to protect agent sessions."
++            if agent.guardrail_id:
++                report.status = "PASS"
++                report.status_extended = f"Bedrock Agent {agent.name} is using guardrail {agent.guardrail_id} to protect agent sessions."
++
++            findings.append(report)
++
++        return findings
+
+
+
+
+@@ -110,3 +110,58 @@ class Guardrail(BaseModel):
+     tags: Optional[list] = []
+     sensitive_information_filter: bool = False
+     prompt_attack_filter_strength: Optional[str]
++
++
++class BedrockAgent(AWSService):
++    def __init__(self, provider):
++        # Call AWSService's __init__
++        super().__init__("bedrock-agent", provider)
++        self.agents = {}
++        self.__threading_call__(self._list_agents)
++        self.__threading_call__(self._list_tags_for_resource, self.agents.values())
++
++    def _list_agents(self, regional_client):
++        logger.info("Bedrock Agent - Listing Agents...")
++        try:
++            for agent in regional_client.list_agents().get("agentSummaries", []):
++                agent_arn = f"arn:aws:bedrock:{regional_client.region}:{self.audited_account}:agent/{agent['agentId']}"
++                if not self.audit_resources or (
++                    is_resource_filtered(agent_arn, self.audit_resources)
++                ):
++                    self.agents[agent_arn] = Agent(
++                        id=agent["agentId"],
++                        name=agent["agentName"],
++                        arn=agent_arn,
++                        guardrail_id=agent.get("guardrailConfiguration", {}).get(
++                            "guardrailIdentifier"
++                        ),
++                        region=regional_client.region,
++                    )
++        except Exception as error:
++            logger.error(
++                f"{regional_client.region} -- {error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
++            )
++
++    def _list_tags_for_resource(self, resource):
++        logger.info("Bedrock Agent - Listing Tags for Resource...")
++        try:
++            agent_tags = (
++                self.regional_clients[resource.region]
++                .list_tags_for_resource(resourceArn=resource.arn)
++                .get("tags", {})
++            )
++            if agent_tags:
++                resource.tags = [agent_tags]
++        except Exception as error:
++            logger.error(
++                f"{resource.region} -- {error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
++            )
++
++
++class Agent(BaseModel):
++    id: str
++    name: str
++    arn: str
++    guardrail_id: Optional[str]
++    region: str
++    tags: Optional[list] = []
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,136 @@
++from unittest import mock
++
++import botocore
++from boto3 import client
++from moto import mock_aws
++
++from tests.providers.aws.utils import (
++    AWS_ACCOUNT_NUMBER,
++    AWS_REGION_EU_WEST_1,
++    AWS_REGION_US_EAST_1,
++    set_mocked_aws_provider,
++)
++
++make_api_call = botocore.client.BaseCli

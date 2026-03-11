@@ -1,0 +1,134 @@
+@@ -178,7 +178,9 @@
+ #include "detect-geoip.h"
+ #include "detect-app-layer-protocol.h"
+ #include "detect-template.h"
++#include "detect-krb5-cname.h"
+ #include "detect-krb5-msgtype.h"
++#include "detect-krb5-sname.h"
+ #include "detect-target.h"
+ #include "detect-template-buffer.h"
+ #include "detect-bypass.h"
+@@ -491,7 +493,9 @@ void SigTableSetup(void)
+     DetectBase64DecodeRegister();
+     DetectBase64DataRegister();
+     DetectTemplateRegister();
++    DetectKrb5CNameRegister();
+     DetectKrb5MsgTypeRegister();
++    DetectKrb5SNameRegister();
+     DetectTargetRegister();
+     DetectTemplateBufferRegister();
+     DetectBypassRegister();
+
+
+
+
+@@ -198,6 +198,8 @@ enum {
+     DETECT_BASE64_DATA,
+ 
+     DETECT_AL_KRB5_MSGTYPE,
++    DETECT_AL_KRB5_CNAME,
++    DETECT_AL_KRB5_SNAME,
+ 
+     DETECT_TEMPLATE,
+     DETECT_FTPDATA,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,245 @@
++/* Copyright (C) 2018 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Pierre Chifflier <chifflier@wzdftpd.net>
++ */
++
++#include "suricata-common.h"
++#include "util-unittest.h"
++
++#include "detect-parse.h"
++#include "detect-engine.h"
++#include "detect-engine-mpm.h"
++#include "detect-engine-state.h"
++#include "detect-engine-prefilter.h"
++#include "detect-engine-content-inspection.h"
++
++#include "detect-krb5-cname.h"
++
++#ifdef HAVE_RUST
++#include "rust.h"
++#include "app-layer-krb5.h"
++#include "rust-krb-detect-gen.h"
++
++static int g_krb5_cname_buffer_id = 0;
++
++struct Krb5PrincipalNameDataArgs {
++    int local_id;  /**< used as index into thread inspect array */
++    void *txv;
++};
++
++static int DetectKrb5CNameSetup(DetectEngineCtx *de_ctx, Signature *s, const char *arg)
++{
++    DetectBufferSetActiveList(s, g_krb5_cname_buffer_id);
++
++    if (DetectSignatureSetAppProto(s, ALPROTO_KRB5) != 0)
++        return -1;
++
++    return 0;
++}
++
++/** \brief get an InspectionBuffer. Make space if we have to. */
++static InspectionBuffer *GetBuffer(InspectionBufferMultipleForList *fb, uint32_t id)
++{
++    if (id >= fb->size) {
++        uint32_t old_size = fb->size;
++        uint32_t new_size = id + 1;
++        uint32_t grow_by = new_size - old_size;
++        SCLogDebug("size is %u, need %u, so growing by %u",
++                old_size, new_size, grow_by);
++
++        void *ptr = SCRealloc(fb->inspection_buffers, (id + 1) * sizeof(InspectionBuffer));
++        if (ptr == NULL)
++            return NULL;
++
++        InspectionBuffer *to_zero = (InspectionBuffer *)ptr + old_size;
++        SCLogDebug("fb->inspection_buffers %p ptr %p to_zero %p",
++                fb->inspection_buffers, ptr, to_zero);
++        memset((uint8_t *)to_zero, 0, (grow_by * sizeof(InspectionBuffer)));
++        fb->inspection_buffers = ptr;
++        fb->size = new_size;
++    }
++
++    InspectionBuffer *buffer = &fb->inspection_buffers[id];
++    SCLogDebug("using file_data buffer %p", buffer);
++    return buffer;
++}
++
++static InspectionBuffer *GetKrb5CNameData(DetectEngineThreadCtx *det_ctx,
++        const DetectEngineTransforms *transforms,
++        Flow *_f, const struct Krb5PrincipalNameDataArgs *cbdata,
++        int list_id, bool first)
++{
++    SCEnter();
++
++    InspectionBufferMultipleForList *fb = &det_ctx->multi_inspect_buffers[list_id];
++    InspectionBuffer *buffer = GetBuffer(fb, cbdata->local_id);
++    if (buffer == NULL)
++        retur

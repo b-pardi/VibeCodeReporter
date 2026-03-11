@@ -1,0 +1,96 @@
+@@ -1176,6 +1176,152 @@ class AuditReportCommand(Command):
+     def get_parser(self):
+         return audit_report_parser
+ 
++    @staticmethod
++    def fetch_audit_events(params, audit_filter, columns=None, aggregate=None, report_type='span', limit=None, order=None):
++        # type: (KeeperParams, Dict[str, Any], Optional[List[str]], Optional[List[str]], str, Optional[int], Optional[str]) -> List[Dict[str, Any]]
++        """
++        Fetch audit events with pagination support.
++
++        This method handles pagination for both raw and span/consolidated reports,
++        making it suitable for enterprises with large numbers of users/events.
++
++        Args:
++            params: KeeperParams object
++            audit_filter: dict with filter criteria (audit_event_type, created, username, etc.)
++            columns: list of columns for non-raw reports (default: ['username'])
++            aggregate: list of aggregates for non-raw reports (default: ['last_created'] for span)
++            report_type: 'raw', 'span', 'hour', 'day', 'week', 'month' (default: 'span')
++            limit: maximum number of events to return (None for all)
++            order: 'ascending' or 'descending' (default: None, uses API default)
++
++        Returns:
++            list of event dictionaries
++        """
++        rq = {
++            'command': 'get_audit_event_reports',
++            'report_type': report_type,
++            'scope': 'enterprise' if params.enterprise else 'user'
++        }
++
++        if columns:
++            rq['columns'] = columns
++        elif report_type != 'raw':
++            rq['columns'] = ['username']
++
++        if aggregate:
++            rq['aggregate'] = aggregate
++        elif report_type == 'span':
++            rq['aggregate'] = ['last_created']
++
++        api_row_limit = API_EVENT_SUMMARY_ROW_LIMIT if report_type != 'raw' else API_EVENT_RAW_ROW_LIMIT
++        rq_limit = api_row_limit if limit is None else min(limit, api_row_limit) if limit > 0 else api_row_limit
++        rq['limit'] = rq_limit
++
++        if order:
++            rq['order'] = order
++
++        if audit_filter:
++            rq['filter'] = copy.deepcopy(audit_filter)
++
++        events = []
++        reqs = [rq]
++        max_iterations = 1000
++        iteration_count = 0
++
++        while reqs and iteration_count < max_iterations:
++            iteration_count += 1
++            rss = api.execute_batch(params, reqs)
++            next_reqs = []
++            should_stop = False
++
++            for idx, rs in enumerate(rss):
++                batch_events = rs.get('audit_event_overview_report_rows', [])
++                if not batch_events or not isinstance(batch_events, list):
++                    continue
++
++                events.extend(batch_events)
++
++                # Check if user limit reached
++                if limit is not None and limit > 0 and len(events) >= limit:
++                    events = events[:limit]
++                    should_stop = True
++                    break
++
++                # Check if we need to paginate
++                batch_limit = api_row_limit if report_type != 'raw' else API_EVENT_RAW_ROW_LIMIT
++                if len(batch_events) >= batch_limit:
++                    if idx >= len(reqs):
++                        continue
++
++                    current_req = reqs[idx]
++
++                    # Determine timestamp field based on report type
++                    timestamp_field = None
++                    if report_type == 'span':
++                        if batch_events and 'last_created' in batch_events[-1]:
++                            timestamp_field = 'last_created'
++                        elif batch_events and 'first_created' in batch_events[-1]:
++                            timestamp_field = 'first_created'
++                        elif batch_events and 'created' in batch_events[-1]:
++                            timestamp_field = 'created'
++                    else:
++                        timestamp_field = 'created'
++
++        

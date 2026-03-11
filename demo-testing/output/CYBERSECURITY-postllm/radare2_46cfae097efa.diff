@@ -1,0 +1,133 @@
+@@ -798,7 +798,7 @@ static void cmd_prc_zoom(RCore *core, const char *input) {
+ 	}
+ 
+ 	core->print->zoom->mode = (input && *input)? input[1]: 'e';
+-	r_print_zoom_buf (core->print, core, printzoomcallback, from, to, len, len);
++	r_print_zoom_buf (core->print, printzoomcallback, core, from, to, len, len);
+ 	block = core->print->zoom->buf;
+ 
+ 	for (i = 0; i < len; i += cols) {
+@@ -2596,8 +2596,8 @@ static bool count_pzf(RFlagItem *fi, void *u) {
+ 	return true;
+ }
+ 
+-static int printzoomcallback(void *user, int mode, ut64 addr, ut8 *bufz, ut64 size) {
+-	RCore *core = (RCore *) user;
++static int printzoomcallback(void *cbarg, int mode, ut64 addr, ut8 *bufz, ut64 size) {
++	RCore *core = (RCore *) cbarg;
+ 	int j, ret = 0;
+ 	struct count_pz_t u;
+ 
+@@ -4976,13 +4976,16 @@ static void print_json_string(RCore *core, const char* block, int len, const cha
+ 	const char* section_name = r_core_get_section_name (core, core->offset);
+ 	if (section_name && strlen (section_name) < 1) {
+ 		section_name = "unknown";
+-	} else {
++	} else if (section_name) {
+ 		// cleaning useless spaces in section name in json data.
+ 		section_name = r_str_trim_head_ro (section_name);
+ 		char* p;
+ 		for (p = (char*) section_name; *p && *p != ' '; p++) {}
+ 		*p = '\0';
+ 	}
++	if (!section_name) {
++		section_name = "unknown";
++	}
+ 	if (!type) {
+ 		switch (get_string_type (core->block, len)) {
+ 		case 'w': type = "wide"; break;
+@@ -8118,7 +8121,7 @@ static int cmd_print(void *data, const char *input) {
+ 				}
+ 			}
+ 			if (do_zoom && l > 0) {
+-				r_print_zoom (core->print, core, printzoomcallback,
++				r_print_zoom (core->print, printzoomcallback, core,
+ 					from, to, l, (int) maxsize);
+ 			}
+ 			if (oldmode) {
+
+
+
+
+@@ -18,11 +18,16 @@
+ #define ds_bufat(ds)  ((ds)->buf + ds_offset (ds))
+ #define ds_left(ds)   ((ds)->len - ds_offset (ds))
+ 
+-#define DEBUG_DISASM 0
+-
+ // ugly globals but meh
+ static R_TH_LOCAL ut64 emustack_min = 0LL;
+ static R_TH_LOCAL ut64 emustack_max = 0LL;
++static R_TH_LOCAL ut64 lastaddr = UT64_MAX;
++static R_TH_LOCAL char *hint_syntax = NULL;
++static R_TH_LOCAL RFlagItem sfi = {0};
++
++// global cache
++static R_TH_LOCAL ut64 Goaddr = UT64_MAX;
++static R_TH_LOCAL char *Gsection = NULL; // maybe as a fixed array size is less racy, but still incorrect as its not guarded and its global
+ 
+ static const char* r_vline_a[] = {
+ 	"|",  // LINE_VERT
+@@ -76,7 +81,8 @@ static const char* r_vline_uc[] = {
+ 
+ // TODO: what about using bit shifting and enum for keys? see libr/util/bitmap.c
+ // the problem of this is that the fields will be more opaque to bindings, but we will earn some bits
+-typedef struct {
++// imho this should be moved to RAsm
++typedef struct r_disasm_state_t {
+ 	RCore *core;
+ 	char str[1024], strsub[1024];
+ 	bool immtrim;
+@@ -96,6 +102,7 @@ typedef struct {
+ 	int atabsoff;
+ 	int decode;
+ 	bool pseudo;
++	bool sparse;
+ 	bool subnames;
+ 	bool interactive;
+ 	bool subjmp;
+@@ -137,13 +144,16 @@ typedef struct {
+ 	bool show_emu_ssa;
+ 	bool show_section;
+ 	int show_section_col;
+-	bool flags_inline;
+ 	bool show_section_perm;
+ 	bool show_section_name;
+ 	bool show_symbols;
+ 	int show_symbols_col;
+ 	bool show_offseg;
+ 	bool show_flags;
++	bool flags_inline;
++	RSpace *flagspace_ports;
++	bool asm_flags_right;
++	int midflags;
+ 	bool bblined;
+ 	bool show_bytes;
+ 	bool show_bytes_align;
+@@ -182,7 +192,6 @@ typedef struct {
+ 	RStrEnc strenc;
+ 	int cursor;
+ 	int show_comment_right_default;
+-	RSpace *flagspace_ports;
+ 	bool show_flag_in_bytes;
+ 	int lbytes;
+ 	int show_comment_right;
+@@ -199,11 +208,9 @@ typedef struct {
+ 	int vliw_count;
+ 	bool show_varaccess;
+ 	bool show_vars;
+-	bool asm_flags_right;
+ 	bool show_fcnsig;
+ 	bool hinted_line;
+ 	int show_varsum;
+-	int midflags;
+ 	bool midbb;
+ 	bool midcursor;
+ 	bool show_noisy_comments;
+@@ -446,39 +453,46 @@ static void get_bits_comment(RCore *core, RAnalFunction *f, char *cmt, int cmt_s
+ 	}
+ }
+ 
+-R_API const char *r_core_get_section_name(RCore *core, ut64 addr) {
+-	static R_TH_LOCAL char section[128] = "";
+-	static R

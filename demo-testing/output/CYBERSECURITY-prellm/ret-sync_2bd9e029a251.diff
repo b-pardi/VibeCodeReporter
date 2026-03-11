@@ -1,0 +1,142 @@
+@@ -1,5 +1,5 @@
+ ﻿#
+-# Copyright (C) 2016, Alexandre Gazet.
++# Copyright (C) 2016-2019, Alexandre Gazet.
+ #
+ # Copyright (C) 2012-2014, Quarkslab.
+ #
+@@ -33,18 +33,53 @@ import tempfile
+ import threading
+ import json
+ import gdb
++import traceback
++
+ try:
+     import configparser
+ except ImportError:
+     import ConfigParser as configparser
+ 
+ 
+-VERBOSE = 0
+-
+ HOST = "localhost"
+ PORT = 9100
+ 
+ TIMER_PERIOD = 0.2
++PYTHON_MAJOR = sys.version_info[0]
++
++# encoding settings (for data going in/out the plugin)
++RS_ENCODING = 'utf-8'
++
++
++def rs_encode(buffer_str):
++    return buffer_str.encode(RS_ENCODING)
++
++
++def rs_decode(buffer_bytes):
++    return buffer_bytes.decode(RS_ENCODING)
++
++
++# function show_last_exception courtesy of saidelike
++# exception handler to ease commands debug
++def show_last_exception(cmd):
++    horizontal_line = "-"
++    right_arrow = "->"
++    down_arrow = "\\->"
++
++    print("")
++    exc_type, exc_value, exc_traceback = sys.exc_info()
++    print(" Exception raised in {} command".format(cmd).center(80, horizontal_line))
++    print("{}: {}".format(exc_type.__name__, exc_value))
++    print(" Detailed stacktrace ".center(80, horizontal_line))
++    for fs in traceback.extract_tb(exc_traceback)[::-1]:
++        if PYTHON_MAJOR == 2:
++            filename, lineno, method, code = fs
++        else:
++            filename, lineno, method, code = fs.filename, fs.lineno, fs.name, fs.line
++
++        print("""{} File "{}", line {:d}, in {}()""".format(down_arrow, filename,
++                                                            lineno, method))
++        print("   {}    {}".format(right_arrow, code))
+ 
+ 
+ # function gdb_execute courtesy of StalkR
+@@ -73,12 +108,14 @@ def get_pid(ctx=None):
+     if (ctx is not None) and ("pid" in ctx.keys()):
+         return ctx["pid"]
+ 
+-    inferiors = gdb.inferiors()
+     for inf in gdb.inferiors():
+-        if inf.is_valid():
++        # if Inferior.threads() is an empty tuple
++        # the program being debugged is not being run.
++        if inf.is_valid() and inf.threads():
+             return inf.pid
+ 
+-    raise Exception("get_pid(): failed to find program's pid")
++    print("get_pid(): failed to find program's pid")
++    return None
+ 
+ 
+ def coalesce_space(maps, next_start, next_name):
+@@ -94,20 +131,19 @@ def coalesce_space(maps, next_start, next_name):
+     return False
+ 
+ 
+-def get_maps(verbose=True, ctx=None):
++def get_maps(ctx=None):
+     "Return list of maps (start, end, permissions, file name) via /proc"
+ 
+     if (ctx is not None) and ("mappings" in ctx.keys()):
+         return ctx["mappings"]
+ 
+     pid = get_pid(ctx=ctx)
+-    if pid is False:
+-        if verbose:
+-            print("Program not started")
++    if pid is None:
+         return []
+-    maps = []
+ 
++    maps = []
+     mapping = gdb_execute('info proc mappings')
++
+     try:
+         for line in mapping.splitlines():
+             e = [x for x in line.strip().split() if x != '']
+@@ -188,7 +224,7 @@ class Tunnel():
+         self.sock.setblocking(False)
+ 
+         try:
+-            msg = self.sock.recv(4096).decode()
++            msg = rs_decode(self.sock.recv(4096))
+         except socket.error as e:
+             err = e.args[0]
+             if (err == errno.EAGAIN or err == errno.EWOULDBLOCK):
+@@ -206,7 +242,7 @@ class Tunnel():
+             return
+ 
+         try:
+-            self.sock.send(msg.encode())
++            self.sock.send(rs_encode(msg))
+         except socket.error as msg:
+             print(msg)
+             self.sync = False
+@@ -291,10 +327,30 @@ class Poller(threading.Thread):
+         self.evt_stop.set()
+ 
+ 
++# wrap gdb.Command invoke in try/catch
++class WrappedCommand(gdb.Command):
++
++    def __init__(self, sync, offline=False):
++        self.sync = sync
++        self.offline = offline
++
++    def invoke(self, arg, from_tty):
++        if not self.offline:
++            if not self.sync.base:
++                print("[sync] process not synced, command is dropped")
++                return
++
++    

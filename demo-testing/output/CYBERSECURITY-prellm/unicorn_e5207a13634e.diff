@@ -1,0 +1,141 @@
+@@ -358,6 +358,28 @@ typedef enum uc_arm64_reg {
+     UC_ARM64_REG_LR = UC_ARM64_REG_X30,
+ } uc_arm64_reg;
+ 
++// Callback function for tracing MRS/MSR/SYS/SYSL. If this callback returns
++// true, the read/write to system registers would be skipped. Note one callback
++// per instruction is allowed.
++// @reg: The source/destination register.
++// @cp_reg: The source/destincation system register.
++// @user_data: The user data.
++typedef uint32_t (*uc_cb_insn_sys_t)(uc_engine *uc, uc_arm64_reg reg,
++                                     const uc_arm64_cp_reg *cp_reg,
++                                     void *user_data);
++
++//> ARM64 instructions
++typedef enum uc_arm64_insn {
++    UC_ARM64_INS_INVALID = 0,
++
++    UC_ARM64_INS_MRS,
++    UC_ARM64_INS_MSR,
++    UC_ARM64_INS_SYS,
++    UC_ARM64_INS_SYSL,
++
++    UC_ARM64_INS_ENDING
++} uc_arm64_insn;
++
+ #ifdef __cplusplus
+ }
+ #endif
+
+
+
+
+@@ -2976,4 +2976,5 @@
+ #define ssra_op ssra_op_aarch64
+ #define aarch64_translator_ops aarch64_translator_ops_aarch64
+ #define pred_esz_masks pred_esz_masks_aarch64
++#define helper_uc_hooksys64 helper_uc_hooksys64_aarch64
+ #endif
+
+
+
+
+@@ -83,6 +83,7 @@ DEF_HELPER_3(set_cp_reg, void, env, ptr, i32)
+ DEF_HELPER_2(get_cp_reg, i32, env, ptr)
+ DEF_HELPER_3(set_cp_reg64, void, env, ptr, i64)
+ DEF_HELPER_2(get_cp_reg64, i64, env, ptr)
++DEF_HELPER_3(uc_hooksys64, i32, env, i32, ptr)
+ 
+ DEF_HELPER_2(get_r13_banked, i32, env, i32)
+ DEF_HELPER_3(set_r13_banked, void, env, i32, i32)
+
+
+
+
+@@ -932,3 +932,38 @@ uint32_t HELPER(ror_cc)(CPUARMState *env, uint32_t x, uint32_t i)
+         return ((uint32_t)x >> shift) | (x << (32 - shift));
+     }
+ }
++
++uint32_t HELPER(uc_hooksys64)(CPUARMState *env, uint32_t insn, void *hk)
++{
++    uc_arm64_reg uc_rt;
++    struct hook *hook = (struct hook*)hk;
++    uc_arm64_cp_reg cp_reg;
++    uint32_t rt;
++
++    if (hook->to_delete) {
++        return 0;
++    }
++
++    rt = extract32(insn, 0, 5);
++    cp_reg.op0 = extract32(insn, 19, 2);
++    cp_reg.op1 = extract32(insn, 16, 3);
++    cp_reg.crn = extract32(insn, 12, 4);
++    cp_reg.crm = extract32(insn, 8, 4);
++    cp_reg.op2 = extract32(insn, 5, 3);
++
++    if (rt <= 28 && rt >= 0) {
++        uc_rt = UC_ARM64_REG_X0 + rt;
++        cp_reg.val = env->xregs[rt];
++    } else if (rt == 29 ) {
++        uc_rt = UC_ARM64_REG_X29;
++        cp_reg.val = env->xregs[29];
++    } else if (rt == 30) {
++        uc_rt = UC_ARM64_REG_X30;
++        cp_reg.val = env->xregs[30];
++    } else {
++        uc_rt = UC_ARM64_REG_XZR;
++        cp_reg.val = 0;
++    }
++
++    return ((uc_cb_insn_sys_t)(hook->callback))(env->uc, uc_rt, &cp_reg, hook->user_data);
++}
+\ No newline at end of file
+
+
+
+
+@@ -1748,6 +1748,38 @@ static void gen_set_nzcv(TCGContext *tcg_ctx, TCGv_i64 tcg_rt)
+     tcg_temp_free_i32(tcg_ctx, nzcv);
+ }
+ 
++
++static TCGLabel *gen_hook_sys(DisasContext *s, uint32_t insn, struct hook *hk)
++{
++    uc_engine *uc = s->uc;
++    TCGContext *tcg_ctx = uc->tcg_ctx;
++    TCGLabel *label = gen_new_label(tcg_ctx);
++    TCGv_i32 tcg_skip, tcg_insn;
++    TCGv_ptr tcg_hk;
++
++    tcg_skip = tcg_temp_new_i32(tcg_ctx);
++    tcg_insn = tcg_const_i32(tcg_ctx, insn);
++    tcg_hk = tcg_const_ptr(tcg_ctx, (void*)hk);
++
++    // Only one hook per instruction for SYS/SYSL/MRS/MSR is allowed.
++    // This is intended and may be extended if it's really necessary.
++    gen_helper_uc_hooksys64(tcg_ctx, tcg_skip, tcg_ctx->cpu_env, tcg_insn, tcg_hk);
++
++    tcg_gen_brcondi_i32(tcg_ctx, TCG_COND_NE, tcg_skip, 0, label);
++    
++    tcg_temp_free_i32(tcg_ctx, tcg_skip);
++    tcg_temp_free_i32(tcg_ctx, tcg_insn);
++    tcg_temp_free_ptr(tcg_ctx, tcg_hk);
++
++    return label;
++}
++
++static void may_gen_set_label(DisasContext *s, TCGLabel *label) {
++    if (label) {
++        gen_set_label(s->uc->tcg_ctx, label);
++    }
++}
++
+ /* MRS - move from system register
+  * MSR (register) - move to system register
+  * SYS
+@@ -1762,6 +1794,52 @@ static void handle_sys(DisasContext *s, uint32_t insn, bool isread,
+     TCGContext *tcg_ctx = s->uc->tcg_ctx;
+     

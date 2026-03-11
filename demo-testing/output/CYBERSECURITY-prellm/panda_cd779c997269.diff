@@ -1,0 +1,87 @@
+@@ -45,14 +45,15 @@ int serial_receive_callback(CPUState *cpu, uint64_t fifo_addr, uint8_t value)
+ int serial_read_callback(CPUState *cpu, uint64_t fifo_addr, uint32_t port_addr,
+                          uint8_t value)
+ {
+-    // Iterate over the labels for the address in the FIFO and add them to the
+-    // port shadow.
++#ifdef TARGET_I386
++    // Copy taint from the IO shadow into the EAX register.
+     taint2_labelset_io_iter(fifo_addr,
+-                            [](uint32_t elt, void *port_addr) {
+-                                taint2_label_port(*(uint32_t *)port_addr, elt);
++                            [](uint32_t elt, void *unused) {
++                                taint2_label_reg_additive(R_EAX, 0, elt);
+                                 return 0;
+                             },
+-                            &port_addr);
++                            NULL);
++#endif
+     return 0;
+ }
+ 
+@@ -65,14 +66,17 @@ int serial_write(CPUState *cpu, uint64_t fifo_addr, uint32_t port_addr,
+         return 0;
+     }
+ 
+-    // During a write, propagate taint from the port shadow to IO shadow.
+-    taint2_labelset_port_iter(port_addr,
+-                              [](uint32_t label, void *fifo_addr) {
+-                                  taint2_label_io(*(uint64_t *)fifo_addr,
+-                                                  label);
+-                                  return 0;
+-                              },
+-                              &fifo_addr);
++#ifdef TARGET_I386
++    // During a write, propagate taint from the register shadow at EAX to IO
++    // shadow.
++    taint2_labelset_reg_iter(R_EAX, 0,
++                             [](uint32_t label, void *p_fifo_addr) {
++                                 taint2_label_io(*(uint64_t *)p_fifo_addr,
++                                                 label);
++                                 return 0;
++                             },
++                             &fifo_addr);
++#endif
+ 
+     return 0;
+ }
+
+
+
+
+@@ -194,7 +194,6 @@ bool PandaTaintFunctionPass::doInitialization(Module &M) {
+     PTV.grvConst = const_struct_ptr(ctx, shadP, &shad->grv);
+     PTV.gsvConst = const_struct_ptr(ctx, shadP, &shad->gsv);
+     PTV.retConst = const_struct_ptr(ctx, shadP, &shad->ret);
+-    PTV.portConst = const_struct_ptr(ctx, shadP, &shad->ports);
+ 
+     PTV.dataLayout = new DataLayout(&M);
+ 
+@@ -1303,18 +1302,12 @@ void PandaTaintVisitor::visitCallInst(CallInst &I) {
+         } else if (calledName == "ldexp" || calledName == "atan2") {
+             insertTaintCompute(I, I.getArgOperand(0), I.getArgOperand(1), true);
+             return;
++#ifdef TARGET_I386
+         } else if (calledName == "helper_outb") {
+-            // Cast the port address to a 64-bit unsigned integer as that's what
+-            // the taint copy function accepts for the destination address.
+-            CastInst *port_addr_cast = CastInst::CreateIntegerCast(
+-                I.getArgOperand(1), Type::getInt64Ty(ctx), false);
+-            port_addr_cast->insertBefore(&I);
+-
+-            // Call taint_copy to copy taint from LLVM to Port. The helper's
+-            // third argument is the value we are going to write to the IO port.
+-            // The taint data (if any) is associated with this argument.
+-            vector<Value *> copy_args{portConst,
+-                                      port_addr_cast,
++            // Call taint_copy to copy taint from LLVM to the EAX register. We
++            // have to copy taint here to ensure that EAX becomes tainted.
++            vector<Value *> copy_args{grvConst,
++                                      const_uint64(ctx, R_EAX),
+                                       llvConst,
+                                       constSlot(I.getArgOperand(2)),
+                                       const_uint64(ctx, 1),
+@@ -1325,23 +1318,21 @@ void PandaTaintVisitor::visitCallInst(CallInst &I) {
+             // on the device.
+             call_inst->insertBefore(&I);
+         } else if (calledName == "he

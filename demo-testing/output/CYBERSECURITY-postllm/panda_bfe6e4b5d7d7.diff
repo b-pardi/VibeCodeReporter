@@ -1,0 +1,137 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,523 @@
++/* PANDABEGINCOMMENT
++ * 
++ * Authors:
++ *  Tim Leek               tleek@ll.mit.edu
++ *  Ryan Whelan            rwhelan@ll.mit.edu
++ *  Joshua Hodosh          josh.hodosh@ll.mit.edu
++ *  Michael Zhivich        mzhivich@ll.mit.edu
++ *  Brendan Dolan-Gavitt   brendandg@gatech.edu
++ * 
++ * This work is licensed under the terms of the GNU GPL, version 2. 
++ * See the COPYING file in the top-level directory. 
++ * 
++PANDAENDCOMMENT */
++// This needs to be defined before anything is included in order to get
++// the PRIx64 macro
++#define __STDC_FORMAT_MACROS
++
++#include "panda/plugin.h"
++
++#include "callstack_instr/callstack_instr.h"
++#include "callstack_instr/callstack_instr_ext.h"
++
++#include "keyfind.h"
++
++#include <unordered_set>
++#include <vector>
++#include <set>
++#include <map>
++
++//#include "../common/prog_point.h"
++//#include "pandalog.h"
++//#include "../callstack_instr/callstack_instr_ext.h"
++    
++// These need to be extern "C" so that the ABI is compatible with
++// QEMU/PANDA, which is written in C
++extern "C" {
++
++bool init_plugin(void *);
++void uninit_plugin(void *);
++int mem_write_callback(CPUState *env, target_ulong pc, target_ulong addr, target_ulong size, void *buf);
++//int before_block_translate_cb(CPUState *env, target_ulong pc);
++//int after_block_translate_cb(CPUState *env, TranslationBlock *tb);
++
++}
++
++//typedef struct cand_prog_point_struct {
++
++
++// Utility functions
++#define CHECK(var,label) \
++    if (!var) { fprintf(stderr, label ": failed. Exiting.\n"); return false; }
++#define MASTER_SECRET_SIZE 48
++
++unsigned char hexchar_to_int(int c)
++{
++    if (c >= 0x30 && c < 0x40) return c - 0x30;
++    else if (c >= 0x41 && c < 0x5B) return c - 0x37;
++    else return 0;
++}
++
++void read_hex_string(std::string in, unsigned char *out)
++{
++    unsigned char *ptr = out;
++    for(unsigned int i = 0; i < in.length(); i += 2) {
++        int high = toupper(in[i]);
++        int low = toupper(in[i+1]);
++        *ptr++ = (hexchar_to_int(high) << 4) | hexchar_to_int(low);
++    }
++}
++
++// Globals
++StringInfo g_keydata;
++StringInfo g_master_secret;
++StringInfo g_out;
++StringInfo g_client_random;
++StringInfo g_server_random;
++StringInfo g_version;
++StringInfo g_content_type;
++StringInfo g_enc_msg;
++const EVP_CIPHER *g_ciph = NULL;
++const EVP_MD *g_md = NULL;
++
++bool have_candidates = true;
++
++typedef std::tuple<target_ulong, target_ulong, target_ulong> candidate_prog_point;
++std::set <candidate_prog_point> candidates;
++
++// Optimization
++std::unordered_set <target_ulong> asids;
++std::vector <target_ulong> eips;
++
++// Ringbuf-like structure
++struct key_buf {
++    uint8_t key[MASTER_SECRET_SIZE];
++    int start;
++    bool filled;
++};
++
++
++typedef std::tuple <target_ulong, target_ulong, std::string> match;
++std::set<match> matches;
++std::map<prog_point,key_buf> key_tracker;
++
++bool check_key(StringInfo *master_secret, StringInfo *client_random, StringInfo *server_random,
++               StringInfo *enc_msg, StringInfo *version, StringInfo *content_type,
++               const EVP_MD *md, const EVP_CIPHER *ciph)
++{
++    // Generate the session keys
++    if (version->data[0] == 0x03 && version->data[1] == 0x03) {
++        tls12_prf(EVP_sha256(), master_secret, "key expansion", server_random, client_random, &g_keydata);
++    } else {
++        tls_prf(master_secret, "key expansion", server_random, client_random, &g_keydata);
++    }
++    
++    // Divvy up the key block
++    unsigned char *client_mac_key;
++    //unsigned char *server_mac_key;
++    unsigned char *client_enc_key;
++    //unsigned char *server_enc_key;
++    unsigned char *client_enc_iv;
++    //unsigned char *server_enc_iv;
++
++    unsigned char *keyblock_ptr = g_keydata.data;
++    // Client MAC
++    client_mac_key = keyblock_ptr;
++    keyblock_ptr += EVP_MD_size(md);
++    // Server MAC
++    //server_mac_key = keyblock_ptr;
++    keyblock_ptr += EVP_MD_size(md);
++    // Client enc
++    client_enc_key = keyblock_ptr;
++    keyblock_ptr += E

@@ -1,0 +1,130 @@
+@@ -234,7 +234,6 @@ R_API RAnal *r_anal_free(RAnal *a) {
+ 		a->esil = NULL;
+ 	}
+ 	free (a->last_disasm_reg);
+-	memset (a, 0, sizeof (RAnal));
+ 	free (a);
+ 	return NULL;
+ }
+@@ -300,14 +299,11 @@ R_API bool r_anal_set_reg_profile(RAnal *anal) {
+ 
+ R_API bool r_anal_set_fcnsign(RAnal *anal, const char *name) {
+ 	const char *dirPrefix = r_sys_prefix (NULL);
+-	char *file = NULL;
+ 	const char *arch = (anal->cur && anal->cur->arch) ? anal->cur->arch : R_SYS_ARCH;
+-	if (name && *name) {
+-		file = sdb_fmt (R_JOIN_3_PATHS ("%s", R2_SDB_FCNSIGN, "%s.sdb"), dirPrefix, name);
+-	} else {
+-		file = sdb_fmt (R_JOIN_3_PATHS ("%s", R2_SDB_FCNSIGN, "%s-%s-%d.sdb"), dirPrefix,
++	const char *file = (name && *name)
++		? sdb_fmt (R_JOIN_3_PATHS ("%s", R2_SDB_FCNSIGN, "%s.sdb"), dirPrefix, name)
++		: sdb_fmt (R_JOIN_3_PATHS ("%s", R2_SDB_FCNSIGN, "%s-%s-%d.sdb"), dirPrefix,
+ 			anal->os, arch, anal->bits);
+-	}
+ 	if (r_file_exists (file)) {
+ 		sdb_close (anal->sdb_fcnsign);
+ 		sdb_free (anal->sdb_fcnsign);
+
+
+
+
+@@ -218,6 +218,13 @@ R_API int r_meta_del(RAnal *a, int type, ut64 addr, ut64 size) {
+ 	char key[100], *dtr, *s, *p, *next;
+ 	const char *val;
+ 	int i;
++	/* send event */
++	REventMeta rems = {
++		.type = type,
++		.addr = addr,
++		.string = NULL
++	};
++	r_event_send (a->ev, R_EVENT_META_DEL, &rems);
+ 	if (size == UT64_MAX) {
+ 		// FULL CLEANUP
+ 		// XXX: this thing ignores the type
+@@ -226,7 +233,7 @@ R_API int r_meta_del(RAnal *a, int type, ut64 addr, ut64 size) {
+ 		} else {
+ 			snprintf (key, sizeof (key)-1, "meta.%c.count", type);
+ 			int last = (ut64)sdb_num_get (DB, key, NULL)/K;
+-			for (i=0; i<last; i++) {
++			for (i = 0; i < last; i++) {
+ 				snprintf (key, sizeof (key)-1, "meta.%c.%d", type, i);
+ 				dtr = sdb_get (DB, key, 0);
+ 				for (p = dtr; p; p = next) {
+
+
+
+
+@@ -3621,6 +3621,8 @@ out_finish:
+ }
+ 
+ R_API void run_pending_anal(RCore *core) {
++	// allow incall events in the run_pending step
++	core->ev->incall = false;
+ 	if (core && core->anal && core->anal->cmdtail) {
+ 		char *res = core->anal->cmdtail;
+ 		core->anal->cmdtail = NULL;
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2018 - pancake */
++/* radare - LGPL - Copyright 2009-2019 - pancake */
+ 
+ #include <string.h>
+ #include "r_config.h"
+@@ -36,7 +36,8 @@ static const char *help_msg_T[] = {
+ 	"Tm", " [idx]", "display log messages without index",
+ 	"Ts", "", "list files in current directory (see pwd, cd)",
+ 	"TT", "", "enter into the text log chat console",
+-	"T=", "", "Use http.sync to get logs from another r2",
++	"T=", "[.]", "Use http.sync to get logs from another r2",
++	"T=&", "", "Start background thread syncing with the remote server",
+ 	NULL
+ };
+ 
+@@ -203,6 +204,13 @@ static int log_callback_all (RCore *log, int count, const char *line) {
+ 	return 0;
+ }
+ 
++static void http_sync_thread(void *user, char *out) {
++	RCore *core = (RCore *)user;
++	eprintf ("Sync\n");
++	//r_core_task_sleep_begin (user);
++	//r_core_break (user);
++}
++
+ static int cmd_log(void *data, const char *input) {
+ 	RCore *core = (RCore *) data;
+ 	const char *arg, *input2;
+@@ -251,22 +259,39 @@ static int cmd_log(void *data, const char *input) {
+ 		}
+ 		break;
+ 	case '=':
+-		if (atoi (input + 1) > 0 || (input[1] == '0')) {
+-			core->sync_index = 0;
+-		} else {
+-			RCoreLogCallback log_callback = (input[1] == '*')
+-				? log_callback_all: log_callback_r2;
+-			char *res = r_core_log_get (core, core->sync_index);
+-			if (res) {
+-				// r_cons_printf ("%s\n", res);
+-				int idx = getIndexFromLogString (res);
+-				if (idx != -1) {
+-					core->sync_index = idx + 1;
++		if (input[1] == '&') {
++			if (input[2] == '&') {
++				r_cons_break_push (NULL, NULL);
++				while (!r_cons_is_breaked ()) {
++					r_core_cmd0 (core, "T=");
++					void *bed = r_cons_sleep_begin();
++					r_sys_usleep (100);
++					r_cons_sleep_end (bed);
+ 				}
+-				r_core_log_run (core, res, log_callback);
+-				free (res);
++				r_cons_break_pop ();
++			} else {
++				// TODO: Sucks that we can't enqueue functions, only commands
++				eprintf ("B

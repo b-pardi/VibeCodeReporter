@@ -1,0 +1,107 @@
+@@ -1002,8 +1002,13 @@ class ARPingResult(SndRcvList):
+ 
+ 
+ @conf.commands.register
+-def arping(net, timeout=2, cache=0, verbose=None, **kargs):
+-    # type: (str, int, int, Optional[int], **Any) -> Tuple[ARPingResult, PacketList] # noqa: E501
++def arping(net: str,
++           timeout: int = 2,
++           cache: int = 0,
++           verbose: Optional[int] = None,
++           threaded: bool = True,
++           **kargs: Any,
++           ) -> Tuple[ARPingResult, PacketList]:
+     """
+     Send ARP who-has requests to determine which hosts are up::
+ 
+@@ -1028,6 +1033,7 @@ def arping(net, timeout=2, cache=0, verbose=None, **kargs):
+         verbose=verbose,
+         filter="arp and arp[7] = 2",
+         timeout=timeout,
++        threaded=threaded,
+         iface_hint=net,
+         **kargs,
+     )
+
+
+
+
+@@ -90,7 +90,8 @@ _DOC_SNDRCV_PARAMS = """
+     :param prebuild: pre-build the packets before starting to send them.
+         Automatically enabled when a generator is passed as the packet
+     :param _flood:
+-    :param threaded: if True, packets will be sent in an individual thread
++    :param threaded: if True, packets are sent in a thread and received in another.
++        defaults to False.
+     :param session: a flow decoder used to handle stream of packets
+     :param chainEX: if True, exceptions during send will be forwarded
+     :param stop_filter: Python function applied to each packet to determine if
+@@ -109,9 +110,8 @@ class SndRcvHandler(object):
+     This matches the requests and answers.
+ 
+     Notes::
+-      - threaded mode: enabling threaded mode will likely
+-        break packet timestamps, but might result in a speedup
+-        when sending a big amount of packets. Disabled by default
++      - threaded: if you're planning to send/receive many packets, it's likely
++        a good idea to use threaded mode.
+       - DEVS: store the outgoing timestamp right BEFORE sending the packet
+         to avoid races that could result in negative latency. We aren't Stadia
+     """
+@@ -156,6 +156,8 @@ class SndRcvHandler(object):
+         self.notans = 0
+         self.noans = 0
+         self._flood = _flood
++        self.threaded = threaded
++        self.breakout = False
+         # Instantiate packet holders
+         if prebuild and not self._flood:
+             self.tobesent = list(pkt)  # type: _PacketIterable
+@@ -175,22 +177,35 @@ class SndRcvHandler(object):
+ 
+             if threaded or self._flood:
+                 # Send packets in thread.
+-                # https://github.com/secdev/scapy/issues/1791
+                 snd_thread = Thread(
+                     target=self._sndrcv_snd
+                 )
+                 snd_thread.daemon = True
+ 
+                 # Start routine with callback
+-                self._sndrcv_rcv(snd_thread.start)
++                interrupted = None
++                try:
++                    self._sndrcv_rcv(snd_thread.start)
++                except KeyboardInterrupt as ex:
++                    interrupted = ex
++
++                self.breakout = True
+ 
+                 # Ended. Let's close gracefully
+                 if self._flood:
+                     # Flood: stop send thread
+                     self._flood.stop()
+                 snd_thread.join()
++
++                if interrupted and self.chainCC:
++                    raise interrupted
+             else:
+-                self._sndrcv_rcv(self._sndrcv_snd)
++                # Send packets, then receive.
++                try:
++                    self._sndrcv_rcv(self._sndrcv_snd)
++                except KeyboardInterrupt:
++                    if self.chainCC:
++                        raise
+ 
+             if multi:
+                 remain = [
+@@ -252,6 +267,8 @@ class SndRcvHandler(object):
+                 self.pks.send(p)
+                 if self.inter:
+                     time.sleep(self.inter)
++                if self.breakout:
++                    break
+                 i += 1
+             if self.verbose:
+                 print("Finished

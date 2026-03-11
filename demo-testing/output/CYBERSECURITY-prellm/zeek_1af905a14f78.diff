@@ -1,0 +1,172 @@
+@@ -680,11 +680,6 @@ std::vector<Func*> ID::GetOptionHandlers() const
+ 	return v;
+ 	}
+ 
+-void IDOptInfo::AddInitExpr(ExprPtr init_expr)
+-	{
+-	init_exprs.emplace_back(std::move(init_expr));
+-	}
+-
+ 	} // namespace detail
+ 
+ 	} // namespace zeek
+
+
+
+
+@@ -17,6 +17,7 @@
+ #include "zeek/Traverse.h"
+ #include "zeek/Val.h"
+ #include "zeek/module_util.h"
++#include "zeek/script_opt/IDOptInfo.h"
+ #include "zeek/script_opt/StmtOptInfo.h"
+ #include "zeek/script_opt/UsageAnalyzer.h"
+ 
+@@ -117,12 +118,12 @@ static bool add_prototype(const IDPtr& id, Type* t, std::vector<AttrPtr>* attrs,
+ 	return true;
+ 	}
+ 
+-static void initialize_var(const IDPtr& id, InitClass c, ExprPtr init)
++static ExprPtr initialize_var(const IDPtr& id, InitClass c, ExprPtr init)
+ 	{
+ 	if ( ! id->HasVal() )
+ 		{
+ 		if ( c == INIT_REMOVE )
+-			return;
++			return nullptr;
+ 
+ 		bool no_init = ! init;
+ 
+@@ -134,7 +135,7 @@ static void initialize_var(const IDPtr& id, InitClass c, ExprPtr init)
+ 			auto& t = id->GetType();
+ 
+ 			if ( ! IsAggr(t) )
+-				return;
++				return nullptr;
+ 
+ 			ValPtr init_val;
+ 
+@@ -147,7 +148,7 @@ static void initialize_var(const IDPtr& id, InitClass c, ExprPtr init)
+ 				catch ( InterpreterException& )
+ 					{
+ 					id->Error("initialization failed");
+-					return;
++					return nullptr;
+ 					}
+ 				}
+ 
+@@ -157,11 +158,11 @@ static void initialize_var(const IDPtr& id, InitClass c, ExprPtr init)
+ 			else if ( t->Tag() == TYPE_VECTOR )
+ 				init_val = make_intrusive<VectorVal>(cast_intrusive<VectorType>(t));
+ 
+-			id->SetVal(init_val);
+-			return;
++			init = make_intrusive<ConstExpr>(init_val);
++			c = INIT_FULL;
+ 			}
+ 
+-		if ( c == INIT_EXTRA )
++		else if ( c == INIT_EXTRA )
+ 			c = INIT_FULL;
+ 		}
+ 
+@@ -177,19 +178,12 @@ static void initialize_var(const IDPtr& id, InitClass c, ExprPtr init)
+ 		assignment = make_intrusive<RemoveFromExpr>(lhs, init);
+ 	else
+ 		// This can happen due to error propagation.
+-		return;
++		return nullptr;
+ 
+ 	if ( assignment->IsError() )
+-		return;
++		return nullptr;
+ 
+-	try
+-		{
+-		(void)assignment->Eval(nullptr);
+-		}
+-	catch ( InterpreterException& )
+-		{
+-		id->Error("initialization failed");
+-		}
++	return assignment;
+ 	}
+ 
+ static void make_var(const IDPtr& id, TypePtr t, InitClass c, ExprPtr init,
+@@ -347,11 +341,29 @@ static void make_var(const IDPtr& id, TypePtr t, InitClass c, ExprPtr init,
+ 
+ 		if ( init && ((c == INIT_EXTRA && id->GetAttr(ATTR_ADD_FUNC)) ||
+ 		              (c == INIT_REMOVE && id->GetAttr(ATTR_DEL_FUNC))) )
++			{
+ 			// Just apply the function.
+ 			id->SetVal(init, c);
++			id->GetOptInfo()->AddInitExpr(init, c);
++			}
+ 
+ 		else if ( dt != VAR_REDEF || init || ! attr )
+-			initialize_var(id, c, init);
++			{
++			auto init_expr = initialize_var(id, c, init);
++			if ( init_expr )
++				{
++				id->GetOptInfo()->AddInitExpr(init_expr);
++
++				try
++					{
++					(void)init_expr->Eval(nullptr);
++					}
++				catch ( InterpreterException& )
++					{
++					id->Error("initialization failed");
++					}
++				}
++			}
+ 		}
+ 
+ 	if ( dt == VAR_CONST )
+
+
+
+
+@@ -51,6 +51,8 @@ void IDDefRegion::Dump() const
+ 	printf("\n");
+ 	}
+ 
++std::vector<IDInitInfo> IDOptInfo::global_init_exprs;
++
+ void IDOptInfo::Clear()
+ 	{
+ 	static bool did_init = false;
+@@ -69,6 +71,17 @@ void IDOptInfo::Clear()
+ 	tracing = trace_ID && util::streq(trace_ID, my_id->Name());
+ 	}
+ 
++void IDOptInfo::AddInitExpr(ExprPtr init_expr, InitClass ic)
++	{
++	if ( ! init_expr )
++		return;
++
++	if ( my_id->IsGlobal() )
++		global_init_exprs.emplace_back(IDInitInfo(my_id, init_expr, ic));
++
++	init_exprs.emplace_back(std::move(init_expr));
++	}
++
+ void IDOptInfo::DefinedAfter(const Stmt* s, const ExprPtr& e,
+                              const std::vector<const Stmt*>& conf_blocks, zeek_uint_t conf_start)
+ 	{
+
+
+
+
+@@ -105,6 +105,24 @@ protected:
+ 	ExprPtr def_expr;
+ 	};
+ 
++// Class tracking information associated with a (global) identifier's
++// (re-)initialization.
++
++class IDInitInfo
++	{
++public:
++	IDInitInfo(const ID* _id, ExprPtr _init, InitClass _ic) : id(_id

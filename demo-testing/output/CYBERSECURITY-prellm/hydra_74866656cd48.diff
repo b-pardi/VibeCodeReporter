@@ -1,0 +1,108 @@
+@@ -282,13 +282,11 @@ class ConfigLoaderImpl(ConfigLoader):
+                 )
+             if not ret.is_schema_source:
+                 try:
+-                    schema = ConfigStore.instance().load(
+-                        config_path=ConfigSource._normalize_file_name(
+-                            filename=input_file
+-                        )
+-                    )
++                    schema_source = self.repository.get_schema_source()
++                    config_path = ConfigSource._normalize_file_name(filename=input_file)
++                    schema = schema_source.load_config(config_path)
+ 
+-                    merged = OmegaConf.merge(schema.node, ret.config)
++                    merged = OmegaConf.merge(schema.config, ret.config)
+                     assert isinstance(merged, DictConfig)
+                     return (
+                         merged,
+
+
+
+
+@@ -23,6 +23,14 @@ class ConfigRepository:
+             source = source_type(search_path.provider, search_path.path)
+             self.sources.append(source)
+ 
++    def get_schema_source(self) -> ConfigSource:
++        source = self.sources[-1]  # should always be last
++        assert (
++            source.__class__.__name__ == "StructuredConfigSource"
++            and source.provider == "schema"
++        )
++        return source
++
+     def load_config(self, config_path: str) -> Optional[ConfigResult]:
+         source = self._find_config(config_path=config_path)
+         ret = None
+
+
+
+
+@@ -19,16 +19,18 @@ class FileConfigSource(ConfigSource):
+         return "file"
+ 
+     def load_config(self, config_path: str) -> ConfigResult:
+-        config_path = self._normalize_file_name(config_path)
+-        full_path = os.path.realpath(os.path.join(self.path, config_path))
++        normalized_config_path = self._normalize_file_name(config_path)
++        full_path = os.path.realpath(os.path.join(self.path, normalized_config_path))
+         if not os.path.exists(full_path):
+             raise ConfigLoadError(f"FileConfigSource: Config not found : {full_path}")
+         with open(full_path) as f:
+             header_text = f.read(512)
+             header = ConfigSource._get_header_dict(header_text)
++            self._update_package_in_header(header, normalized_config_path)
+             f.seek(0)
++            cfg = OmegaConf.load(f)
+             return ConfigResult(
+-                config=OmegaConf.load(f),
++                config=self._embed_config(cfg, header["package"]),
+                 path=f"{self.scheme()}://{self.path}",
+                 provider=self.provider,
+                 header=header,
+
+
+
+
+@@ -33,9 +33,11 @@ class PackageConfigSource(ConfigSource):
+             with resource_stream(module_name, resource_name) as stream:
+                 header_text = stream.read(512)
+                 header = ConfigSource._get_header_dict(header_text.decode())
++                self._update_package_in_header(header, config_path)
+                 stream.seek(0)
++                cfg = OmegaConf.load(stream)
+                 return ConfigResult(
+-                    config=OmegaConf.load(stream),
++                    config=self._embed_config(cfg, header["package"]),
+                     path=f"{self.scheme()}://{self.path}",
+                     provider=self.provider,
+                     header=header,
+
+
+
+
+@@ -35,8 +35,10 @@ class StructuredConfigSource(ConfigSource):
+         header = {}
+         if ret.package:
+             header["package"] = ret.package
++        self._update_package_in_header(header, full_path)
++        cfg = self._embed_config(ret.node, header["package"])
+         return ConfigResult(
+-            config=ret.node,
++            config=cfg,
+             path=f"{self.scheme()}://{self.path}",
+             provider=provider,
+             header=header,
+
+
+
+
+@@ -35,12 +35,15 @@ class ConfigStoreWithProvider:
+ @dataclass
+ class ConfigNode:
+     name: str
+-    node: Any
++    node: Any  # TODO: DictConfig or Container?
+     group: Optional[str]
+     package: Optional[st

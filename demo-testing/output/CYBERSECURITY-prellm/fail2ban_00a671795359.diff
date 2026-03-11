@@ -1,0 +1,121 @@
+@@ -99,6 +99,7 @@ protocol = [
+ ["set <JAIL> bantime <TIME>", "sets the number of seconds <TIME> a host will be banned for <JAIL>"], 
+ ["set <JAIL> datepattern <PATTERN>", "sets the <PATTERN> used to match date/times for <JAIL>"],
+ ["set <JAIL> usedns <VALUE>", "sets the usedns mode for <JAIL>"],
++["set <JAIL> attempt <IP> [<failure1> ... <failureN>]", "manually notify about <IP> failure"], 
+ ["set <JAIL> banip <IP> ... <IP>", "manually Ban <IP> for <JAIL>"], 
+ ["set <JAIL> unbanip [--report-absent] <IP> ... <IP>", "manually Unban <IP> in <JAIL>"], 
+ ["set <JAIL> maxretry <RETRY>", "sets the number of failures <RETRY> before banning the host for <JAIL>"], 
+
+
+
+
+@@ -428,6 +428,34 @@ class Filter(JailThread):
+ 		else:
+ 			self.__ignoreCache = None
+ 
++	def performBan(self, ip=None):
++		"""Performs a ban for IPs (or given ip) that are reached maxretry of the jail."""
++		try: # pragma: no branch - exception is the only way out
++			while True:
++				ticket = self.failManager.toBan(ip)
++				self.jail.putFailTicket(ticket)
++		except FailManagerEmpty:
++			self.failManager.cleanup(MyTime.time())
++
++	def addAttempt(self, ip, *matches):
++		"""Generate a failed attempt for ip"""
++		if not isinstance(ip, IPAddr):
++			ip = IPAddr(ip)
++		matches = list(matches) # tuple to list
++
++		# Generate the failure attempt for the IP:
++		unixTime = MyTime.time()
++		ticket = FailTicket(ip, unixTime, matches=matches)
++		logSys.info(
++			"[%s] Attempt %s - %s", self.jailName, ip, datetime.datetime.fromtimestamp(unixTime).strftime("%Y-%m-%d %H:%M:%S")
++		)
++		self.failManager.addFailure(ticket, len(matches) or 1)
++
++		# Perform the ban if this attempt is resulted to:
++		self.performBan(ip)
++
++		return 1
++
+ 	##
+ 	# Ignore own IP/DNS.
+ 	#
+
+
+
+
+@@ -473,9 +473,12 @@ class Server:
+ 	def setBanTime(self, name, value):
+ 		self.__jails[name].actions.setBanTime(value)
+ 	
++	def addAttemptIP(self, name, *args):
++		return self.__jails[name].filter.addAttempt(*args)
++
+ 	def setBanIP(self, name, value):
+ 		return self.__jails[name].actions.addBannedIP(value)
+-		
++
+ 	def setUnbanIP(self, name=None, value=None, ifexists=True):
+ 		if name is not None:
+ 			# single jail:
+
+
+
+
+@@ -282,6 +282,9 @@ class Transmitter:
+ 			value = command[2]
+ 			self.__server.setBanTime(name, value)
+ 			return self.__server.getBanTime(name)
++		elif command[1] == "attempt":
++			value = command[2:]
++			return self.__server.addAttemptIP(name, *value)
+ 		elif command[1] == "banip":
+ 			value = command[2:]
+ 			return self.__server.setBanIP(name,value)
+
+
+
+
+@@ -394,6 +394,14 @@ class IgnoreIP(LogCaptureTestCase):
+ 		self.assertLogged('Ignore 192.168.1.32')
+ 		tearDownMyTime()
+ 
++	def testAddAttempt(self):
++		self.filter.setMaxRetry(3)
++		for i in xrange(1, 1+3):
++			self.filter.addAttempt('192.0.2.1')
++			self.assertLogged('Attempt 192.0.2.1', '192.0.2.1:%d' % i, all=True, wait=True)
++		self.jail.actions._Actions__checkBan()
++		self.assertLogged('Ban 192.0.2.1', wait=True)
++
+ 	def testIgnoreCommand(self):
+ 		self.filter.ignoreCommand = sys.executable + ' ' + os.path.join(TEST_FILES_DIR, "ignorecommand.py <ip>")
+ 		self.assertTrue(self.filter.inIgnoreIPList("10.0.0.1"))
+
+
+
+
+@@ -347,6 +347,25 @@ class Transmitter(TransmitterBase):
+ 			self.transm.proceed(
+ 				["set", self.jailName, "unbanip", "--report-absent", "192.0.2.255"])[0],1)
+ 
++	def testJailAttemptIP(self):
++		self.server.startJail(self.jailName) # Jail must be started
++
++		def attempt(ip, matches):
++			return self.transm.proceed(["set", self.jailName, "attempt", ip] + matches)
++
++		self.setGetTest("maxretry", "5", 5, jail=self.jailName)
++		# produce 2 single attempts per IP:
++		for i in (1, 2):
++			for ip in ("192.0.2.1", "192.0.2.2"):
++				self.assertEqual(attempt(ip, ["test failure %d" % i]), (0, 1))
++		self.assertLogged("192.0.2.1:2", "192.0.2.2:2", all=True, wait=True)
++		# this 3 attempts at once should cause a ban:
++		self.assertEqual(attempt(ip, ["test failure %d" % i for i in (3,4,5)]), (0, 1))
++		self.assertLogged("192.0.2.2:5", wait=True)

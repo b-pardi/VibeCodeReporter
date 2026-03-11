@@ -1,0 +1,128 @@
+@@ -735,6 +735,7 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx, Packet
+     /* If a gap notification, relay the notification on to the
+      * app-layer if known. */
+     if (flags & STREAM_GAP) {
++        SCLogDebug("GAP of size %u", data_len);
+         if (alproto == ALPROTO_UNKNOWN) {
+             StreamTcpSetStreamFlagAppProtoDetectionCompleted(*stream);
+             SCLogDebug("ALPROTO_UNKNOWN flow %p, due to GAP in stream start", f);
+
+
+
+
+@@ -872,6 +872,10 @@ const struct DecodeEvents_ DEvents[] = {
+             "stream.reassembly_insert_invalid",
+             STREAM_REASSEMBLY_INSERT_INVALID,
+     },
++    {
++            "stream.reassembly_urgent_oob_limit_reached",
++            STREAM_REASSEMBLY_URGENT_OOB_LIMIT_REACHED,
++    },
+ 
+     /* ARP EVENTS */
+     {
+
+
+
+
+@@ -296,6 +296,7 @@ enum {
+     STREAM_REASSEMBLY_INSERT_MEMCAP,
+     STREAM_REASSEMBLY_INSERT_LIMIT,
+     STREAM_REASSEMBLY_INSERT_INVALID,
++    STREAM_REASSEMBLY_URGENT_OOB_LIMIT_REACHED,
+ 
+     /* ARP EVENTS */
+     ARP_PKT_TOO_SMALL,         /**< arp packet smaller than minimum size */
+
+
+
+
+@@ -889,6 +889,8 @@ const char *PacketDropReasonToString(enum PacketDropReason r)
+             return "stream memcap";
+         case PKT_DROP_REASON_STREAM_MIDSTREAM:
+             return "stream midstream";
++        case PKT_DROP_REASON_STREAM_URG:
++            return "stream urgent";
+         case PKT_DROP_REASON_STREAM_REASSEMBLY:
+             return "stream reassembly";
+         case PKT_DROP_REASON_APPLAYER_ERROR:
+@@ -929,6 +931,8 @@ static const char *PacketDropReasonToJsonString(enum PacketDropReason r)
+             return "ips.drop_reason.stream_memcap";
+         case PKT_DROP_REASON_STREAM_MIDSTREAM:
+             return "ips.drop_reason.stream_midstream";
++        case PKT_DROP_REASON_STREAM_URG:
++            return "ips.drop_reason.stream_urgent";
+         case PKT_DROP_REASON_STREAM_REASSEMBLY:
+             return "ips.drop_reason.stream_reassembly";
+         case PKT_DROP_REASON_APPLAYER_ERROR:
+
+
+
+
+@@ -371,6 +371,7 @@ enum PacketDropReason {
+     PKT_DROP_REASON_STREAM_MEMCAP,
+     PKT_DROP_REASON_STREAM_MIDSTREAM,
+     PKT_DROP_REASON_STREAM_REASSEMBLY,
++    PKT_DROP_REASON_STREAM_URG,
+     PKT_DROP_REASON_NFQ_ERROR,    /**< no nfq verdict, must be error */
+     PKT_DROP_REASON_INNER_PACKET, /**< drop issued by inner (tunnel) packet */
+     PKT_DROP_REASON_MAX,
+
+
+
+
+@@ -632,8 +632,7 @@ static void StreamTcpSegmentAddPacketData(
+  *  In case of error, this function returns the segment to the pool
+  */
+ int StreamTcpReassembleInsertSegment(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
+-        TcpStream *stream, TcpSegment *seg, Packet *p,
+-        uint8_t *pkt_data, uint16_t pkt_datalen)
++        TcpStream *stream, TcpSegment *seg, Packet *p, uint8_t *pkt_data, uint16_t pkt_datalen)
+ {
+     SCEnter();
+ 
+
+
+
+
+@@ -288,6 +288,8 @@ typedef struct TcpSession_ {
+     int8_t data_first_seen_dir;
+     /** track all the tcp flags we've seen */
+     uint8_t tcp_packet_flags;
++    uint16_t urg_offset_ts;            /**< SEQ offset from accepted OOB urg bytes */
++    uint16_t urg_offset_tc;            /**< SEQ offset from accepted OOB urg bytes */
+     /* coccinelle: TcpSession:flags:STREAMTCP_FLAG */
+     uint32_t flags;
+     uint32_t reassembly_depth; /**< reassembly depth for the stream */
+
+
+
+
+@@ -28,10 +28,12 @@
+ 
+ #include "suricata-common.h"
+ #include "suricata.h"
++#include "packet.h"
+ #include "detect.h"
+ #include "flow.h"
+ #include "threads.h"
+ #include "conf.h"
++#include "action-globals.h"
+ 
+ #include "flow-util.h"
+ 
+@@ -604,6 +606,15 @@ void StreamTcpReassembleFreeThreadCtx(TcpReassemblyThreadCtx *ra_ctx)
+     SCReturn;
+ }
+ 
++static void StreamTcpReassembleExceptionPolicyStatsIncr(
++        ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx, enum ExceptionPolicy policy)
++{
++    uint16_t id = ra_ctx->counter_tcp_reas_eps.eps_id[policy];
++    if (likely(tv && id > 0)) {
++        StatsIncr(tv, id);
++    }
++}
++
+ /**
+  *  \brief check if strea

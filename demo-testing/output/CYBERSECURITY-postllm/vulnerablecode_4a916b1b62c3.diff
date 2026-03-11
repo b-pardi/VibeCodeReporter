@@ -1,0 +1,100 @@
+@@ -187,6 +187,8 @@ class ReferenceV2:
+         reference_id = get_reference_id(url)
+         if "GHSA-" in reference_id.upper():
+             return cls(reference_id=reference_id, url=url)
++        if reference_id.startswith(("RHSA-", "RHEA-", "RHBA-")):
++            return cls(reference_id=reference_id, url=url)
+         if is_cve(reference_id):
+             return cls(url=url, reference_id=reference_id.upper())
+         return cls(url=url)
+
+
+
+
+@@ -57,6 +57,7 @@ from vulnerabilities.pipelines.v2_importers import oss_fuzz as oss_fuzz_v2
+ from vulnerabilities.pipelines.v2_importers import postgresql_importer as postgresql_importer_v2
+ from vulnerabilities.pipelines.v2_importers import pypa_importer as pypa_importer_v2
+ from vulnerabilities.pipelines.v2_importers import pysec_importer as pysec_importer_v2
++from vulnerabilities.pipelines.v2_importers import redhat_importer as redhat_importer_v2
+ from vulnerabilities.pipelines.v2_importers import vulnrichment_importer as vulnrichment_importer_v2
+ from vulnerabilities.pipelines.v2_importers import xen_importer as xen_importer_v2
+ from vulnerabilities.utils import create_registry
+@@ -79,6 +80,7 @@ IMPORTERS_REGISTRY = create_registry(
+         postgresql_importer_v2.PostgreSQLImporterPipeline,
+         mozilla_importer_v2.MozillaImporterPipeline,
+         github_osv_importer_v2.GithubOSVImporterPipeline,
++        redhat_importer_v2.RedHatImporterPipeline,
+         nvd_importer.NVDImporterPipeline,
+         github_importer.GitHubAPIImporterPipeline,
+         gitlab_importer.GitLabImporterPipeline,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,195 @@
++#
++# Copyright (c) nexB Inc. and others. All rights reserved.
++# VulnerableCode is a trademark of nexB Inc.
++# SPDX-License-Identifier: Apache-2.0
++# See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
++# See https://github.com/aboutcode-org/vulnerablecode for support or download.
++# See https://aboutcode.org for more information about nexB OSS projects.
++#
++
++import json
++import logging
++import shutil
++import tempfile
++from io import DEFAULT_BUFFER_SIZE
++from pathlib import Path
++from typing import Iterable
++from urllib.parse import urljoin
++
++import dateparser
++import requests
++from extractcode import ExtractError
++from packageurl import PackageURL
++from univers.version_range import RpmVersionRange
++from univers.version_range import VersionRange
++
++from vulnerabilities.importer import AdvisoryData
++from vulnerabilities.importer import AffectedPackageV2
++from vulnerabilities.importer import ReferenceV2
++from vulnerabilities.importer import VulnerabilitySeverity
++from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipelineV2
++from vulnerabilities.pipes import extractcode_utils
++from vulnerabilities.severity_systems import REDHAT_AGGREGATE
++from vulnerabilities.utils import load_json
++from vulntotal import vulntotal_utils
++
++
++class RedHatImporterPipeline(VulnerableCodeBaseImporterPipelineV2):
++    """Import RedHat Advisories (RHSA, RHEA and RHBA)
++
++    Ingest CSAF advisories published by RedHat, including Red Hat Security Advisory (RHSA),
++    Red Hat Enhancement Advisory (RHEA), and Red Hat Bug Fix Advisory (RHBA).
++    """
++
++    pipeline_id = "redhat_importer_v2"
++    spdx_license_expression = "CC-BY-4.0"
++    license_url = "https://access.redhat.com/security/data/"
++    url = "https://security.access.redhat.com/data/csaf/v2/advisories/"
++
++    @classmethod
++    def steps(cls):
++        return (
++            cls.fetch,
++            cls.collect_and_store_advisories,
++            cls.clean_download,
++        )
++
++    def fetch(self):
++        archive_latest_url = urljoin(self.url, "archive_latest.txt")
++        response = requests.get(archive_latest_url)
++        response.raise_for_status()
++        self.latest_archive_name = response.text.strip()
++
++        self.location = self.cleanup_location = Path(tempfile.mkdtemp())
++        archive_path = self.location / self.latest_archive_name
++        archive_url = urljoin

@@ -1,0 +1,140 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,17 @@
++package org.batfish.datamodel;
++
++import java.util.Map;
++import java.util.Set;
++
++public interface ArpAnalysis {
++
++  /** Mapping: hostname -> inInterface -> ipsToArpReplyTo */
++  Map<String, Map<String, IpAddressAcl>> getArpReplies();
++
++  /**
++   * Mapping: hostname -> vrfName -> route -> outInterface -> arpIpChoice ->
++   * dstIpsForWhichSomeoneSendsArpReply
++   */
++  Map<String, Map<String, Map<AbstractRoute, Map<String, Map<ArpIpChoice, Set<IpAddressAcl>>>>>>
++      getArpRequests();
++}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,35 @@
++package org.batfish.datamodel;
++
++import java.util.Objects;
++import javax.annotation.Nonnull;
++
++public class ArpIpChoice {
++
++  public static final ArpIpChoice USE_DST_IP = new ArpIpChoice(Route.UNSET_ROUTE_NEXT_HOP_IP);
++
++  public static ArpIpChoice of(@Nonnull Ip ip) {
++    return ip == Route.UNSET_ROUTE_NEXT_HOP_IP ? USE_DST_IP : new ArpIpChoice(ip);
++  }
++
++  private final Ip _ip;
++
++  private ArpIpChoice(@Nonnull Ip ip) {
++    _ip = ip;
++  }
++
++  @Override
++  public boolean equals(Object obj) {
++    return obj != null
++        && obj instanceof ArpIpChoice
++        && Objects.equals(_ip, ((ArpIpChoice) obj)._ip);
++  }
++
++  public Ip getIp() {
++    return _ip;
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hash(_ip);
++  }
++}
+
+
+
+
+@@ -10,13 +10,16 @@ import org.batfish.datamodel.collections.NodeInterfacePair;
+ 
+ public interface DataPlane extends Serializable {
+ 
+-  Map<String, Map<String, SortedSet<FibRow>>> getFibs();
++  /** Mapping: hostname -> vrfName -> fibRows */
++  Map<String, Map<String, SortedSet<FibRow>>> getFibRows();
+ 
+   Set<NodeInterfacePair> getFlowSinks();
+ 
+   SortedMap<String, Map<Ip, SortedSet<Edge>>> getPolicyRouteFibNodeMap();
+ 
+-  SortedMap<String, SortedMap<String, IRib<AbstractRoute>>> getRibs();
++  SortedMap<String, SortedMap<String, GenericRib<AbstractRoute>>> getRibs();
++
++  Map<String, Map<String, Fib>> getFibs();
+ 
+   SortedSet<Edge> getTopologyEdges();
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,293 @@
++package org.batfish.datamodel;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Maps;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Map.Entry;
++import java.util.Set;
++import java.util.SortedMap;
++import java.util.function.Function;
++import org.batfish.datamodel.collections.NodeInterfacePair;
++
++public class DataPlaneArpAnalysis implements ArpAnalysis {
++
++  private final Map<String, Map<String, IpAddressAcl>> _arpReplies;
++
++  private final Map<
++          String, Map<String, Map<AbstractRoute, Map<String, Map<ArpIpChoice, Set<IpAddressAcl>>>>>>
++      _arpRequests;
++
++  public DataPlaneArpAnalysis(
++      Map<String, Configuration> configurations,
++      SortedMap<String, SortedMap<String, GenericRib<AbstractRoute>>> ribs,
++      Map<String, Map<String, Fib>> fibs,
++      Topology topology) {
++    _arpReplies = computeArpReplies(configurations, ribs, fibs);
++    _arpRequests = computeArpRequests(fibs, topology);
++  }
++
++  /**
++   * Compute an IP address ACL for each interface of each node permitting only those IPs for which
++   * the node would send out an ARP reply on that interface: <br>
++   * <br>
++   * 1) PERMIT IPs belonging to the interface.<br>
++   * 2) (Proxy-ARP) DENY any IP for which there is a longest-prefix match entry in the FIB that goes
++   * through the interface.<br>
++   * 3) (Proxy-ARP) PERMIT any other IP routable via the VRF of the interface.
++   */
++  private Map<String, Map<String, IpAddressAcl>> computeArpReplies(
++      Map<String, Configuration> configurations,
++      SortedMap<String, SortedMap<String, GenericRib<AbstractRoute>>> ribs,
++      Map<String, Map<String, Fib>> fibs) {
++    Map<String, Map<String, IpSpace>> routableIpsByNodeVrf = computeRoutableIpsByNodeVrf(ribs);
++    return ribs.entrySet()
++        .stream()
++        .

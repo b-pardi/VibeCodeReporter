@@ -1,0 +1,108 @@
+@@ -221,6 +221,7 @@ class Host : public GenericHashEntry, public AlertableEntity {
+ 		u_int64_t sent_packets, u_int64_t sent_bytes, u_int64_t sent_goodput_bytes,
+ 		u_int64_t rcvd_packets, u_int64_t rcvd_bytes, u_int64_t rcvd_goodput_bytes,
+     bool peer_is_unicast);
++  inline void checkpoint(lua_State* vm) { if(stats) return stats->checkpoint(vm); };
+   void incHitter(Host *peer, u_int64_t sent_bytes, u_int64_t rcvd_bytes);
+   virtual void updateHostTrafficPolicy(char *key) {};
+   bool addIfMatching(lua_State* vm, AddressTree * ptree, char *key);
+
+
+
+
+@@ -41,6 +41,12 @@ class HostStats: public TimeseriesStats {
+   PacketStats sent_stats, recv_stats;
+   u_int32_t total_num_flows_as_client, total_num_flows_as_server;
+ 
++  /* Used to store checkpoint data to build top talkers stats */
++  struct {
++    u_int64_t sent_bytes;
++    u_int64_t rcvd_bytes;
++  } checkpoints;
++
+  public:
+   HostStats(Host *_host);
+   virtual ~HostStats();
+@@ -50,6 +56,7 @@ class HostStats: public TimeseriesStats {
+ 		u_int64_t sent_packets, u_int64_t sent_bytes, u_int64_t sent_goodput_bytes,
+ 		u_int64_t rcvd_packets, u_int64_t rcvd_bytes, u_int64_t rcvd_goodput_bytes,
+ 		bool peer_is_unicast);
++  void checkpoint(lua_State* vm);
+   virtual void getJSONObject(json_object *my_object, DetailsLevel details_level);
+   inline void incFlagStats(bool as_client, u_int8_t flags)  { if (as_client) sent_stats.incFlagStats(flags); else recv_stats.incFlagStats(flags); };
+ 
+
+
+
+
+@@ -350,6 +350,7 @@ class NetworkInterface : public AlertableEntity {
+   void dumpAggregatedFlow(time_t when, AggregatedFlow *f, bool is_top_aggregated_flow, bool is_top_cli, bool is_top_srv);
+   void flushFlowDump();
+ #endif
++  void checkPointHostTalker(lua_State* vm, char *host_ip, u_int16_t vlan_id);
+   int dumpLocalHosts2redis(bool disable_purge);
+   inline void incRetransmittedPkts(u_int32_t num)   { tcpPacketStats.incRetr(num); };
+   inline void incOOOPkts(u_int32_t num)             { tcpPacketStats.incOOO(num);  };
+
+
+
+
+@@ -40,6 +40,8 @@ HostStats::HostStats(Host *_host) : TimeseriesStats(_host) {
+ #ifdef NTOPNG_PRO
+   quota_enforcement_stats = quota_enforcement_stats_shadow = NULL;
+ #endif
++
++  memset(&checkpoints, 0, sizeof(checkpoints));
+ }
+ 
+ /* *************************************** */
+@@ -53,6 +55,29 @@ HostStats::~HostStats() {
+ 
+ /* *************************************** */
+ 
++/* NOTE: this function is used by Lua to create the minute-by-minute host top talkers,
++   both for remote and local hosts. Top talkerts are created by doing a checkpoint
++   of the current value. */
++void HostStats::checkpoint(lua_State* vm) {
++  u_int64_t new_val;
++
++  lua_newtable(vm);
++
++  lua_newtable(vm);
++
++  lua_push_uint64_table_entry(vm, "sent", (new_val = getNumBytesSent()) - checkpoints.sent_bytes);
++  checkpoints.sent_bytes = new_val;
++
++  lua_push_uint64_table_entry(vm, "rcvd", (new_val = getNumBytesRcvd()) - checkpoints.rcvd_bytes);
++  checkpoints.rcvd_bytes = new_val;
++
++  lua_pushstring(vm, "delta");
++  lua_insert(vm, -2);
++  lua_settable(vm, -3);
++}
++
++/* *************************************** */
++
+ /* NOTE: check out LocalHostStats for deserialization */
+ void HostStats::getJSONObject(json_object *my_object, DetailsLevel details_level) {
+   if(details_level >= details_high) {
+
+
+
+
+@@ -183,6 +183,10 @@ void LocalHostStats::deserialize(json_object *o) {
+   if(json_object_object_get_ex(o, "host_unreachable_flows.as_client", &obj))  host_unreachable_flows_as_client = json_object_get_int(obj);
+   if(json_object_object_get_ex(o, "host_unreachable_flows.as_server", &obj))  host_unreachable_flows_as_server = json_object_get_int(obj);
+   if(json_object_object_get_ex(o, "total_alerts", &obj))  total_alerts = json_object_get_int(obj);
++
++  /* Restores possibly checkpointed data */
++  checkpoints.sent_bytes = getNumBytesSent();
++  checkpoints.rcvd_bytes = getNumBytesRcvd();
+ }
+ 
+ /* *************************************** */
+
+
+
+
+@@ -2734,6 +2734,34 @@ static int ntop_get_interface_networks_stats(lua_

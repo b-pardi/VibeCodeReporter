@@ -1,0 +1,93 @@
+@@ -18,21 +18,15 @@ logger = logging.getLogger(__name__)
+ MIN_STR_LEN = 6
+ 
+ 
+-def decode_and_validate(binary_string: bytes, addr: int, min_length: int) -> Iterable[StaticString]:
+-    try:
+-        decoded_string = binary_string.decode("utf-8")
+-        if decoded_string.isprintable() and len(decoded_string) >= min_length:
+-            yield StaticString(string=decoded_string, offset=addr, encoding=StringEncoding.UTF8)
+-    except UnicodeDecodeError:
+-        pass
+-
+-
+ def extract_strings_from_import_data(pe: pefile.PE) -> Iterable[StaticString]:
++    if not hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
++        raise ValueError("Import directory does not exist in the provided PE file.")
++    
+     for entry in pe.DIRECTORY_ENTRY_IMPORT:
+         for imp in entry.imports:
+             if imp.name is not None:
+                 addr = imp.name_offset
+-                yield StaticString(string=imp.name.decode("utf-8"), offset=addr, encoding=StringEncoding.UTF8)
++                yield StaticString(string=imp.name.decode("ascii"), offset=addr, encoding=StringEncoding.ASCII)
+ 
+ 
+ def extract_build_id(section_data, min_length) -> Iterable[StaticString]:
+@@ -51,23 +45,38 @@ def extract_build_id(section_data, min_length) -> Iterable[StaticString]:
+     if s:
+         addr = s.start()
+         binary_string = s.group("buildid")
+-        yield from decode_and_validate(binary_string, addr, min_length)
++        
++        try:
++            string = StaticString.from_utf8(binary_string, addr, min_length)
++            yield string
++        except ValueError:
++            pass
++
++        return string
+ 
+ 
+ def extract_stackstring(extract_stackstring_pattern, section_data, min_length) -> Iterable[StaticString]:
+     for m in extract_stackstring_pattern.finditer(section_data):
+         for i in range(1, 8):
+             try:
+-                tmp_string = m.group(i)
+-                if tmp_string != b"":
++                binary_string = m.group(i)
++                if binary_string != b"":
+                     addr = m.start()
+-                    yield from decode_and_validate(tmp_string, addr, min_length)
++                    try:
++                        string = StaticString.from_utf8(binary_string, addr, min_length)
++                        yield string
++                    except ValueError:
++                        pass
+             except AttributeError:
+                 break
+ 
+ 
+-def extract_string_blob(pe: pefile.PE, section_data, section_va, min_length) -> Iterable[StaticString]:
++def extract_reflection_strings(pe: pefile.PE, section_data, section_va, min_length) -> Iterable[StaticString]:
+     # Extract string blob in .rdata section
++    # The data looks like <start_byte><length><string>  <start_byte><length><string>...
++    # <start_byte> is 0x00 or 0x01 or 0x02 or 0x03
++
++    # Data:-
+     """
+     0048E620  5B 34 5D 75 69 6E 74 38  00 09 2A 5B 38 5D 69 6E  [4]uint8..*[8]in
+     0048E630  74 33 32 00 09 2A 5B 38  5D 75 69 6E 74 38 00 09  t32..*[8]uint8..
+@@ -82,14 +91,32 @@ def extract_string_blob(pe: pefile.PE, section_data, section_va, min_length) ->
+     0048E6C0  6F 64 01 09 50 72 65 63  69 73 69 6F 6E 01 09 52  od..Precision..R
+     """
+ 
+-    blob_pattern = re.compile(b"(\x00|\x01)(?P<blob>.)", re.DOTALL)
+-    for m in blob_pattern.finditer(section_data):
+-        if m.group("blob") != b"\x00":
++
++    # The blob start like 00 00 <data> and ends like this:
++    """
++    0000000000492A40  6C 65 63 74 2E 53 74 72  75 63 74 46 69 65 6C 64  lect.StructField
++    0000000000492A50  2C 20 62 6F 6F 6C 29 00  00 00 00 00 00 00 00 00  , bool).........
++    0000000000492A60  08 00 00 00 00 00 00 00  08 00 00 00 00 00 00 00  ................
++    """
++
++    # Get the blob
++    blob_end_pattern = re.compile(b"\x00{8}.\x00{7}.\x00{7}")
++    blob_end = re.search(blob_end_pattern, section_data[2:])
++    blob = section_data[2:blob_end.start()]
++
++
++    # Extract strings from the blob
++    blob_pattern = re.compile(b"(\x00|\x01|\x02|\x03)(?P<string_le

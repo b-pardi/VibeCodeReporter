@@ -1,0 +1,128 @@
+@@ -49,6 +49,16 @@ def _call_target(target: Callable, *args, **kwargs) -> Any:  # type: ignore
+     """Call target (type) with args and kwargs."""
+     try:
+         args, kwargs = _extract_pos_args(*args, **kwargs)
++        # detaching configs from parent.
++        # At this time, everything is resolved and the parent link can cause
++        # issues when serializing objects in some scenarios.
++        for arg in args:
++            if OmegaConf.is_config(arg):
++                arg._set_parent(None)
++        for v in kwargs.values():
++            if OmegaConf.is_config(v):
++                v._set_parent(None)
++
+         return target(*args, **kwargs)
+     except Exception as e:
+         raise type(e)(
+@@ -162,6 +172,8 @@ def instantiate(config: Any, *args: Any, **kwargs: Any) -> Any:
+         if kwargs:
+             config = OmegaConf.merge(config, kwargs)
+ 
++        OmegaConf.resolve(config)
++
+         _recursive_ = config.pop(_Keys.RECURSIVE, True)
+         _convert_ = config.pop(_Keys.CONVERT, ConvertMode.NONE)
+ 
+
+
+
+
+@@ -1,5 +1,6 @@
+ # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+ import copy
++import pickle
+ import re
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional, Tuple
+@@ -15,6 +16,7 @@ from tests.instantiate import (
+     Adam,
+     AdamConf,
+     AnotherClass,
++    ArgsClass,
+     ASubclass,
+     BadAdamConf,
+     BClass,
+@@ -274,37 +276,17 @@ def test_interpolation_accessing_parent(
+     assert input_conf == cfg_copy
+ 
+ 
+-def test_interpolation_is_live_in_instantiated_object(instantiate_func: Any) -> None:
+-    """
+-    Interpolations in instantiated objects are live config objects but not for primitive objects.
+-    """
+-    cfg = OmegaConf.create(
+-        {
+-            "node": {
+-                "_target_": "tests.instantiate.AClass",
+-                "a": "${value}",
+-                "b": {"x": "${value}"},
+-                "c": 30,
+-                "d": 40,
+-            },
+-            "value": 99,
+-        }
+-    )
+-    obj = instantiate_func(cfg.node)
+-    assert obj.a == 99
+-    assert obj.b.x == 99
+-
+-    cfg.value = 3.14
+-
+-    # interpolation is not live for primitive objects
+-    assert obj.a == 99  # unchanged
+-    # but is live for config objects
+-    assert obj.b.x == 3.14
+-
+-
+ @mark.parametrize(
+     "src",
+-    [({"_target_": "tests.instantiate.AClass", "b": 200, "c": {"x": 10, "y": "${b}"}})],
++    [
++        (
++            {
++                "_target_": "tests.instantiate.AClass",
++                "b": 200,
++                "c": {"x": 10, "y": "${b}"},
++            }
++        )
++    ],
+ )
+ def test_class_instantiate_omegaconf_node(instantiate_func: Any, config: Any) -> Any:
+     obj = instantiate_func(config, a=10, d=AnotherClass(99))
+@@ -323,6 +305,25 @@ def test_instantiate_adam(instantiate_func: Any, config: Any) -> None:
+     assert res == Adam(params=adam_params)
+ 
+ 
++def test_regression_1483(instantiate_func: Any) -> None:
++    """
++    In 1483, pickle is failing because the parent node of lst node contains
++    a generator, which is not picklable.
++    The solution is to resolve and retach from the parent before calling the function.
++    This tests verifies the expected behavior.
++    """
++
++    def gen() -> Any:
++        yield 10
++
++    res: ArgsClass = instantiate_func(
++        {"_target_": "tests.instantiate.ArgsClass"},
++        gen=gen(),
++        lst=[1, 2],
++    )
++    pickle.dumps(res.kwargs["lst"])
++
++
+ def test_instantiate_adam_conf(instantiate_func: Any) -> None:
+     with raises(TypeError):
+         # can't instantiate without passing params
+
+
+
+
+@@ -1,5 +1,4 @@
+ # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+-import os
+ import re
+ from dataclasses import dataclass
+ from textwrap import dedent

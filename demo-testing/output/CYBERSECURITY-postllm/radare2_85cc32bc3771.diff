@@ -1,0 +1,110 @@
+@@ -1877,6 +1877,7 @@ static int bin_relocs(RCore *r, PJ *pj, int mode, int va) {
+ 		}
+ 		// r_core_cmd_call (r, "wcs"); // write cache squash
+ 	}
++	r_io_drain_overlay (r->io);
+ 
+ 	if (IS_MODE_RAD (mode)) {
+ 		r_cons_println ("fs relocs");
+
+
+
+
+@@ -367,7 +367,8 @@ R_API RList* r_io_map_get_by_fd(RIO *io, int fd);
+ R_API bool r_io_map_resize(RIO *io, ut32 id, ut64 newsize);
+ R_API void r_io_map_read_from_overlay(RIOMap *map, ut64 addr, ut8 *buf, int len);
+ R_API bool r_io_map_write_to_overlay(RIOMap *map, ut64 addr, const ut8 *buf, int len);
+-R_IPI bool _io_map_get_overlay_intersects(RIOMap *map, RQueue *q, ut64 addr, int len);
++R_IPI bool io_map_get_overlay_intersects(RIOMap *map, RQueue *q, ut64 addr, int len);
++R_API void r_io_map_drain_overlay(RIOMap *map);
+ 
+ // next free address to place a map.. maybe just unify
+ R_API bool r_io_map_locate(RIO *io, ut64 *addr, const ut64 size, ut64 load_align);
+@@ -438,6 +439,7 @@ R_API bool r_io_set_write_mask(RIO *io, const ut8 *mask, int len);
+ R_API void r_io_bind(RIO *io, RIOBind *bnd);
+ R_API bool r_io_shift(RIO *io, ut64 start, ut64 end, st64 move);
+ R_API ut64 r_io_seek(RIO *io, ut64 offset, int whence);
++R_API void r_io_drain_overlay(RIO *io);
+ R_API void r_io_fini(RIO *io);
+ R_API void r_io_free(RIO *io);
+ #define r_io_bind_init(x) memset (&(x), 0, sizeof (x))
+
+
+
+
+@@ -556,7 +556,7 @@ R_API bool r_io_shift(RIO* io, ut64 start, ut64 end, st64 move) {
+ 	return true;
+ }
+ 
+-R_API ut64 r_io_seek(RIO* io, ut64 offset, int whence) {
++R_API ut64 r_io_seek(RIO *io, ut64 offset, int whence) {
+ 	if (!io) {
+ 		return 0LL;
+ 	}
+@@ -575,6 +575,15 @@ R_API ut64 r_io_seek(RIO* io, ut64 offset, int whence) {
+ 	return io->off;
+ }
+ 
++static bool drain_cb (void *user, void *data, ut32 id) {
++	r_io_map_drain_overlay ((RIOMap *)data);
++	return true;
++}
++
++R_API void r_io_drain_overlay(RIO *io) {
++	r_id_storage_foreach (io->maps, drain_cb, NULL);
++}
++
+ #if HAVE_PTRACE
+ 
+ #if USE_PTRACE_WRAP
+
+
+
+
+@@ -799,6 +799,7 @@ R_API bool r_io_bank_write_at(RIO *io, const ut32 bankid, ut64 addr, const ut8 *
+ 	r_return_val_if_fail (io, false);
+ 	RIOBank *bank = r_io_bank_get (io, bankid);
+ 	if (!bank) {
++		R_LOG_WARN ("Tfw no bank(id %u) in the io", bankid);
+ 		return false;
+ 	}
+ 	RIOSubMap fake_sm = {{0}};
+@@ -825,11 +826,10 @@ R_API bool r_io_bank_write_at(RIO *io, const ut32 bankid, ut64 addr, const ut8 *
+ 			ret = false;
+ 			continue;
+ 		}
+-		// check for overlay here
+ 		const ut64 buf_off = R_MAX (addr, r_io_submap_from (sm)) - addr;
+ 		const int write_len = R_MIN (r_io_submap_to ((&fake_sm)),
+ 					     r_io_submap_to (sm)) - (addr + buf_off) + 1;
+-		if (_io_map_get_overlay_intersects (map, bank->todo, addr + buf_off, write_len) &&
++		if (io_map_get_overlay_intersects (map, bank->todo, addr + buf_off, write_len) &&
+ 			!r_queue_is_empty (bank->todo)) {
+ 			ut64 _buf_off = buf_off;
+ 			int _write_len = write_len;
+
+
+
+
+@@ -472,7 +472,7 @@ static int _overlay_chunk_find (void *incoming, void *in, void *user) {
+ 
+ R_API void r_io_map_read_from_overlay(RIOMap *map, ut64 addr, ut8 *buf, int len) {
+ 	r_return_if_fail (map && buf);
+-	if (!map->overlay || !len || addr > r_io_map_to (map)) {
++	if (!map->overlay || len < 1 || addr > r_io_map_to (map)) {
+ 		return;
+ 	}
+ 	RInterval x = {addr, len};
+@@ -496,8 +496,9 @@ R_API void r_io_map_read_from_overlay(RIOMap *map, ut64 addr, ut8 *buf, int len)
+ 	do {
+ 		addr = R_MAX (r_itv_begin (search_itv), r_itv_begin (chunk->itv));
+ 		ut8 *dst = &buf[addr - r_itv_begin (search_itv)];
+-		ut8 *src = &chunk->buf[addr - r_itv_begin (chunk->itv)];
+-		memcpy (dst, src, (size_t)(R_MIN (r_itv_end (search_itv), r_itv_end (chunk->itv)) - addr));
++		const ut8 *src = &chunk->buf[addr - r_itv_begin (chunk->itv)];
++		const size_t read_len = (size_t)(R_MIN (r_itv_end (search_itv), r_itv_end (chunk->itv)) - addr);
++		memcpy (dst, src, read_len);
+ 		node = r_rbnode_next (node);
+ 		chunk = node? (MapOverlayChunk *)node->data: NULL;
+ 	} while (chunk && r_itv_overlap (chunk->itv, search_itv));
+@@ -572,7 +

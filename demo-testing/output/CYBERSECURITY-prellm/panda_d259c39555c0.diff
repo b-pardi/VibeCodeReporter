@@ -1,0 +1,111 @@
+@@ -34,6 +34,7 @@ typedef const std::set<uint32_t> *LabelSetP;
+ typedef void (*on_branch2_t) (Addr, uint64_t);
+ typedef void (*on_indirect_jump_t) (Addr, uint64_t);
+ typedef void (*on_taint_change_t) (Addr, uint64_t);
++typedef void (*on_taint_prop_t) (Addr, Addr, uint64_t);
+ typedef void (*on_ptr_load_t) (Addr, uint64_t, uint64_t);
+ typedef void (*on_ptr_store_t) (Addr, uint64_t, uint64_t);
+ typedef void (*on_after_load_t) (Addr, uint64_t, uint64_t);
+
+
+
+
+@@ -38,12 +38,15 @@ PANDAENDCOMMENT */
+ #include "panda/plugin_plugin.h"
+ #include "panda/tcg-llvm.h"
+ 
++#include "addr.h"
+ #include "shad.h"
+ #include "label_set.h"
++#include "taint2.h"
+ #include "taint_ops.h"
+ #include "taint_utils.h"
+ 
+ extern TCGLLVMTranslator *tcg_llvm_translator;
++extern ShadowState *shadow;
+ 
+ uint64_t labelset_count;
+ 
+@@ -54,6 +57,9 @@ extern bool detaint_cb0_bytes;
+ 
+ }
+ 
++PPP_PROT_REG_CB(on_taint_prop);
++PPP_CB_BOILERPLATE(on_taint_prop);
++
+ void detaint_on_cb0(Shad *shad, uint64_t addr, uint64_t size);
+ void taint_delete(FastShad *shad, uint64_t dest, uint64_t size);
+ 
+@@ -203,6 +209,38 @@ static inline CBMasks compile_cb_masks(Shad *shad, uint64_t addr,
+ static inline void write_cb_masks(Shad *shad, uint64_t addr, uint64_t size,
+                                   CBMasks value);
+ 
++Addr get_addr_from_shad(Shad *shad, uint64_t shad_addr)
++{
++    Addr addr;
++    if (shad == &shadow->llv) {
++        addr = make_laddr(shad_addr / MAXREGSIZE, shad_addr % MAXREGSIZE);
++    } else if (shad == &shadow->ram) {
++        addr = make_maddr(shad_addr);
++    } else if (shad == &shadow->grv) {
++        addr = make_greg(shad_addr / sizeof(target_ulong), shad_addr % sizeof(target_ulong));
++    } else if (shad == &shadow->gsv) {
++        addr.typ = GSPEC;
++        addr.val.gs = shad_addr;
++        addr.off = 0;
++        addr.flag = (AddrFlag)0;
++    } else if (shad == &shadow->ret) {
++        addr.typ = RET;
++        addr.val.ret = 0;
++        addr.off = shad_addr;
++        addr.flag = (AddrFlag)0;
++    } else if (shad == &shadow->hd) {
++        addr = make_haddr(shad_addr);
++    } else if (shad == &shadow->io) {
++        addr = make_iaddr(shad_addr);
++    } else {
++        addr.typ = UNK;
++        addr.val.ma = 0;
++        addr.off = 0;
++        addr.flag = (AddrFlag)0;
++    }
++    return addr;
++}
++
+ // Taint operations
+ void taint_copy(Shad *shad_dest, uint64_t dest, Shad *shad_src, uint64_t src,
+         uint64_t size, uint64_t opcode, uint64_t instruction_flags,
+@@ -255,6 +293,11 @@ void taint_copy(Shad *shad_dest, uint64_t dest, Shad *shad_src, uint64_t src,
+ 
+     update_cb(shad_dest, dest, shad_src, src, size, opcode, instruction_flags,
+         operands);
++
++    // Taint propagation notifications.
++    Addr dest_addr = get_addr_from_shad(shad_dest, dest);
++    Addr src_addr = get_addr_from_shad(shad_src, src);
++    PPP_RUN_CB(on_taint_prop, dest_addr, src_addr, size);
+ }
+ 
+ void taint_parallel_compute(Shad *shad, uint64_t dest, uint64_t ignored,
+@@ -276,6 +319,13 @@ void taint_parallel_compute(Shad *shad, uint64_t dest, uint64_t ignored,
+                 shad->query_full(src2 + i), true);
+         shad->set_full(dest + i, td);
+     }
++    // Taint propagation notifications.
++    Addr dest_addr = get_addr_from_shad(shad, dest);
++    Addr src1_addr = get_addr_from_shad(shad, src1);
++    Addr src2_addr = get_addr_from_shad(shad, src2);
++    PPP_RUN_CB(on_taint_prop, dest_addr, src1_addr, src_size);
++    PPP_RUN_CB(on_taint_prop, dest_addr, src2_addr, src_size);
++
+ 
+     // Unlike mixed computes, parallel computes guaranteed to be bitwise.
+     // This means we can honestly compute CB masks; in fact we have to because
+@@ -347,6 +397,15 @@ void taint_mix_compute(Shad *shad, uint64_t dest, uint64_t dest_size,
+     taint_log("mcompute: %s[%lx+%lx] <- %lx + %lx ",
+             shad->name(), dest, dest_size, src1, src2);
+     taint_log_labels(shad, dest, dest_size);
++
++    // Taint propagation notifications
++    Addr src1_addr = get_addr_from_shad(shad, src1);
++    

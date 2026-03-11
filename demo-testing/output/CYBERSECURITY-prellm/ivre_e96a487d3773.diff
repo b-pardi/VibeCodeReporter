@@ -1,0 +1,91 @@
+@@ -47,7 +47,7 @@ import pymongo
+ 
+ 
+ from ivre.db import DB, DBActive, DBNmap, DBPassive, DBAgent, DBView, LockError
+-from ivre import config, utils, xmlnmap
++from ivre import config, passive, utils, xmlnmap
+ 
+ 
+ class Nmap2Mongo(xmlnmap.Nmap2DB):
+@@ -283,6 +283,13 @@ e.g.  .explain()) based on the column and a filter.
+             for index in indexes:
+                 self.db[colname].ensure_index(index[0], **index[1])
+ 
++    def _migrate_update_record(self, colname, recid, update):
++        """Define how an update is handled. Purpose-specific subclasses may
++want to do something special here, e.g., mix with other records.
++
++        """
++        return self.db[colname].update({"_id": recid}, update)
++
+     def migrate_schema(self, colname, version):
+         """Process to schema migrations in column `colname` starting
+         from `version`.
+@@ -290,41 +297,56 @@ e.g.  .explain()) based on the column and a filter.
+         """
+         failed = 0
+         while version in self.schema_migrations[colname]:
+-            updated = False
+             new_version, migration_function = self.schema_migrations[
+                 colname][version]
+             utils.LOGGER.info(
+                 "Migrating column %s from version %r to %r",
+                 colname, version, new_version,
+             )
++            # Ensuring new indexes
++            for idx in self.schema_migrations_indexes[colname].get(
++                    new_version, {}
++            ).get("ensure", []):
++                function = self.db[colname].ensure_index
++                try:
++                    function(idx[0], **idx[1])
++                except pymongo.errors.OperationFailure:
++                    utils.LOGGER.debug("Cannot ensure index %s", idx,
++                                       exc_info=True)
++            updated = False
+             # unlimited find()!
+             for record in self.find(colname, self.searchversion(version)):
+                 try:
+                     update = migration_function(record)
+                 except Exception:
+                     utils.LOGGER.warning(
+-                        "Cannot migrate host %s", record['_id'], exc_info=True,
++                        "Cannot migrate result %s", record['_id'],
++                        exc_info=True,
+                     )
+                     failed += 1
+                 else:
+                     if update is not None:
+                         updated = True
+-                        self.db[colname].update({"_id": record["_id"]}, update)
+-            if updated:
+-                for action, indexes in viewitems(
+-                        self.schema_migrations_indexes[colname].get(
+-                            new_version, {}
++                        self._migrate_update_record(colname, record["_id"],
++                                                    update)
++            # Checking for required actions on indexes
++            for action, indexes in viewitems(
++                    self.schema_migrations_indexes[colname].get(
++                        new_version, {}
++                    )
++            ):
++                if action == "ensure":
++                    continue
++                function = getattr(self.db[colname], "%s_index" % action)
++                for idx in indexes:
++                    try:
++                        function(idx[0], **idx[1])
++                    except pymongo.errors.OperationFailure:
++                        (utils.LOGGER.warning if updated
++                         else utils.LOGGER.debug)(
++                            "Cannot %s index %s", action, idx,
++                            exc_info=True
+                         )
+-                ):
+-                    function = getattr(self.db[colname], "%s_index" % action)
+-                    for idx in indexes:
+-                        try:
+-                            function(idx[0], **idx[1])
+-                        except pymongo.errors.OperationFailure as exc:
+-                          

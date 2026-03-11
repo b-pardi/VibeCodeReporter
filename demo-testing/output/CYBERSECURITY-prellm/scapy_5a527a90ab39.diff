@@ -1,0 +1,117 @@
+@@ -253,11 +253,11 @@ def BER_tagging_dec(s,  # type: bytes
+     return real_tag, s
+ 
+ 
+-def BER_tagging_enc(s, implicit_tag=None, explicit_tag=None):
+-    # type: (bytes, Optional[int], Optional[int]) -> bytes
++def BER_tagging_enc(s, hidden_tag=None, implicit_tag=None, explicit_tag=None):
++    # type: (bytes, Optional[Any], Optional[int], Optional[int]) -> bytes
+     if len(s) > 0:
+         if implicit_tag is not None:
+-            s = BER_id_enc(implicit_tag) + s[1:]
++            s = BER_id_enc((hash(hidden_tag) & ~(0x1f)) | implicit_tag) + s[1:]
+         elif explicit_tag is not None:
+             s = BER_id_enc(explicit_tag) + BER_len_enc(len(s)) + s
+     return s
+
+
+
+
+@@ -165,7 +165,8 @@ class ASN1F_field(ASN1F_element, Generic[_I, _A]):
+                 raise ASN1_Error("Encoding Error: got %r instead of an %r for field [%s]" % (x, self.ASN1_tag, self.name))  # noqa: E501
+         else:
+             s = self.ASN1_tag.get_codec(pkt.ASN1_codec).enc(x)
+-        return BER_tagging_enc(s, implicit_tag=self.implicit_tag,
++        return BER_tagging_enc(s, hidden_tag=self.ASN1_tag,
++                               implicit_tag=self.implicit_tag,
+                                explicit_tag=self.explicit_tag)
+ 
+     def any2i(self, pkt, x):
+@@ -752,7 +753,8 @@ class ASN1F_CHOICE(ASN1F_field[_CHOICE_T, ASN1_Object[Any]]):
+             s = raw(x)
+             if hash(type(x)) in self.pktchoices:
+                 imp, exp = self.pktchoices[hash(type(x))]
+-                s = BER_tagging_enc(s, implicit_tag=imp,
++                s = BER_tagging_enc(s, hidden_tag=self.ASN1_tag,
++                                    implicit_tag=imp,
+                                     explicit_tag=exp)
+         return BER_tagging_enc(s, explicit_tag=self.explicit_tag)
+ 
+@@ -836,7 +838,8 @@ class ASN1F_PACKET(ASN1F_field['ASN1_Packet', Optional['ASN1_Packet']]):
+                 s = b""
+         else:
+             s = raw(x)
+-        return BER_tagging_enc(s, implicit_tag=self.implicit_tag,
++        return BER_tagging_enc(s, hidden_tag=self.ASN1_tag,
++                               implicit_tag=self.implicit_tag,
+                                explicit_tag=self.explicit_tag)
+ 
+     def randval(self):
+
+
+
+
+@@ -1527,7 +1527,11 @@ class _PacketField(_StrField[K]):
+ 
+ 
+ class PacketField(_PacketField[BasePacket]):
+-    pass
++    def any2i(self, pkt, x):
++        # type: (Optional[Packet], BasePacket) -> BasePacket
++        if x and pkt and hasattr(x, "add_parent"):
++            cast("Packet", x).add_parent(pkt)
++        return super(PacketField, self).any2i(pkt, x)
+ 
+ 
+ class PacketLenField(_PacketField[Optional[BasePacket]]):
+@@ -1693,9 +1697,15 @@ class PacketListField(_PacketField[List[BasePacket]]):
+     def any2i(self, pkt, x):
+         # type: (Optional[Packet], Any) -> List[BasePacket]
+         if not isinstance(x, list):
++            if x and pkt and hasattr(x, "add_parent"):
++                x.add_parent(pkt)
+             return [x]
+-        else:
+-            return x
++        elif pkt:
++            for i in x:
++                if not i or not hasattr(i, "add_parent"):
++                    continue
++                i.add_parent(pkt)
++        return x
+ 
+     def i2count(self,
+                 pkt,  # type: Optional[Packet]
+
+
+
+
+@@ -7,10 +7,14 @@ r"""
+ Kerberos V5
+ 
+ Implements parts of:
++
+ - Kerberos Network Authentication Service (V5): RFC4120
+ - Kerberos Version 5 GSS-API: RFC1964, RFC4121
+ - Kerberos Pre-Authentication: RFC6113 (FAST)
+ 
++You will find more complete documentation for this layer over
++`Kerberos <https://scapy.readthedocs.io/en/latest/layers/kerberos.html>`_
++
+ Example decryption:
+ 
+ >>> from scapy.libs.rfc3961 import Key, EncryptionType
+@@ -31,10 +35,19 @@ e87127a819d42e69b5e22de0ddc63da80096d"))
+ >>> enc.decrypt(k)
+ """
+ 
++from collections import namedtuple
++from datetime import datetime, timedelta
++import re
++import socket
+ import struct
+ 
+ import scapy.asn1.mib  # noqa: F401
+ from scapy.asn1.asn1 import (
++    ASN1_BIT_STRING,
++

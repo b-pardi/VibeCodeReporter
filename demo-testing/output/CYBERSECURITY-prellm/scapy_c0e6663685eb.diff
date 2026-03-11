@@ -1,0 +1,137 @@
+@@ -24,20 +24,35 @@ from scapy.error import (
+     log_runtime,
+     warning,
+ )
+-from scapy.interfaces import network_name, InterfaceProvider, NetworkInterface
++from scapy.interfaces import (
++    InterfaceProvider,
++    NetworkInterface,
++    _GlobInterfaceType,
++    network_name,
++)
++from scapy.packet import Packet
+ from scapy.pton_ntop import inet_ntop
+ from scapy.supersocket import SuperSocket
+ from scapy.utils import str2mac
+ 
+ import scapy.consts
+ 
++from scapy.compat import (
++    Dict,
++    List,
++    NoReturn,
++    Optional,
++    Tuple,
++    Type,
++)
++
+ if not scapy.consts.WINDOWS:
+     from fcntl import ioctl
+ 
+ # AF_LINK is only available and provided on BSD (MAC)
+ # but because we use its value elsewhere, let's patch it.
+ if not hasattr(socket, "AF_LINK"):
+-    socket.AF_LINK = 18
++    socket.AF_LINK = 18  # type: ignore
+ 
+ ############
+ #  COMMON  #
+@@ -61,39 +76,58 @@ _pcap_if_flags = [
+ 
+ 
+ class _L2libpcapSocket(SuperSocket):
+-    def __init__(self):
+-        self.cls = None
++    __slots__ = ["pcap_fd"]
++
++    def __init__(self, fd):
++        # type: (_PcapWrapper_libpcap) -> None
++        self.pcap_fd = fd
++        ll = self.pcap_fd.datalink()
++        if ll in conf.l2types:
++            self.cls = conf.l2types[ll]
++        else:
++            self.cls = conf.default_l2
++            warning(
++                "Unable to guess datalink type "
++                "(interface=%s linktype=%i). Using %s",
++                self.iface, ll, self.cls.name
++            )
+ 
+     def recv_raw(self, x=MTU):
+-        """Receives a packet, then returns a tuple containing (cls, pkt_data, time)"""  # noqa: E501
+-        if self.cls is None:
+-            ll = self.ins.datalink()
+-            if ll in conf.l2types:
+-                self.cls = conf.l2types[ll]
+-            else:
+-                self.cls = conf.default_l2
+-                warning(
+-                    "Unable to guess datalink type "
+-                    "(interface=%s linktype=%i). Using %s",
+-                    self.iface, ll, self.cls.name
+-                )
+-
+-        ts, pkt = self.ins.next()
++        # type: (int) -> Tuple[Optional[Type[Packet]], Optional[bytes], Optional[float]]  # noqa: E501
++        """
++        Receives a packet, then returns a tuple containing
++        (cls, pkt_data, time)
++        """
++        ts, pkt = self.pcap_fd.next()
+         if pkt is None:
+             return None, None, None
+         return self.cls, pkt, ts
+ 
+-    def nonblock_recv(self):
++    def nonblock_recv(self, x=MTU):
++        # type: (int) -> Optional[Packet]
+         """Receives and dissect a packet in non-blocking mode."""
+-        self.ins.setnonblock(1)
+-        p = self.recv(MTU)
+-        self.ins.setnonblock(0)
++        self.pcap_fd.setnonblock(True)
++        p = self.recv(x)
++        self.pcap_fd.setnonblock(False)
+         return p
+ 
++    def fileno(self):
++        # type: () -> int
++        return self.pcap_fd.fileno()
++
+     @staticmethod
+     def select(sockets, remain=None):
++        # type: (List[SuperSocket], Optional[float]) -> List[SuperSocket]
+         return select_objects(sockets, remain)
+ 
++    def close(self):
++        # type: () -> None
++        if self.closed:
++            return
++        self.closed = True
++        self.pcap_fd.close()
++
++
+ ##########
+ #  PCAP  #
+ ##########
+@@ -124,14 +158,19 @@ if conf.use_pcap:
+             pcap_next_ex,
+             pcap_open_live,
+             pcap_pkthdr,
+-            pcap_sendpacket,
+             pcap_setfilter,
+             pcap_setnonblock,
+             sockaddr_in,
+             sockaddr_in6,
+         )
++        try:
++            from scapy.libs.winpcapy import pcap_inject
++        except ImportError:
++            # Fallback for Winpcap... (for how long?)
++            from scapy.libs.winpcapy import pcap_sendpacket as pcap_inject
+ 
+         def load_winpcapy():
++            # type: () -> None
+             """This functions calls libpcap ``pcap_findalldevs`` function,
+             and extracts and parse a

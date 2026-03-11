@@ -1,0 +1,91 @@
+@@ -7,6 +7,7 @@ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.ImmutableSet.Builder;
+ import com.google.common.collect.ImmutableSortedSet;
+ import com.google.common.collect.Sets;
++import com.google.common.graph.EndpointPair;
+ import io.opentracing.ActiveSpan;
+ import io.opentracing.util.GlobalTracer;
+ import java.util.Collection;
+@@ -20,9 +21,12 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Objects;
++import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Function;
+ import java.util.stream.Collectors;
+ import java.util.stream.IntStream;
++import java.util.stream.Stream;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import org.apache.commons.configuration2.builder.fluent.Configurations;
+@@ -41,6 +45,9 @@ import org.batfish.datamodel.NetworkConfigurations;
+ import org.batfish.datamodel.Prefix;
+ import org.batfish.datamodel.SwitchportMode;
+ import org.batfish.datamodel.Topology;
++import org.batfish.datamodel.VniSettings;
++import org.batfish.datamodel.vxlan.VxlanNode;
++import org.batfish.datamodel.vxlan.VxlanTopology;
+ 
+ public final class TopologyUtil {
+ 
+@@ -181,6 +188,11 @@ public final class TopologyUtil {
+     edges.add(new Layer2Edge(node1, null, node2, null, i1Tag));
+   }
+ 
++  @VisibleForTesting
++  static String computeVniName(int vni) {
++    return String.format("~vni~%d", vni);
++  }
++
+   @VisibleForTesting
+   static void computeLayer2SelfEdges(
+       @Nonnull Configuration config, @Nonnull ImmutableSet.Builder<Layer2Edge> edges) {
+@@ -221,6 +233,11 @@ public final class TopologyUtil {
+                 }
+               });
+         });
++    Map<Integer, VniSettings> vniSettingsByVlan =
++        config.getVrfs().values().stream()
++            .flatMap(vrf -> vrf.getVniSettings().values().stream())
++            .filter(vniSettings -> vniSettings.getVlan() != null)
++            .collect(ImmutableMap.toImmutableMap(VniSettings::getVlan, Function.identity()));
+     config.getAllInterfaces().values().stream()
+         .filter(Interface::getActive)
+         .filter(i -> i.getInterfaceType() == InterfaceType.VLAN && i.getVlan() != null)
+@@ -228,26 +245,64 @@ public final class TopologyUtil {
+             irbInterface -> {
+               String irbName = irbInterface.getName();
+               int vlanId = irbInterface.getVlan();
+-              switchportsByVlan
+-                  .getOrDefault(vlanId, ImmutableList.of())
+-                  .forEach(
+-                      switchportName -> {
++              computeSelfSwitchportNonSwitchportEdges(switchportsByVlan, hostname, irbName, vlanId)
++                  .forEach(edges::add);
++              // Link IRB to VNI in same VLAN
++              Optional.ofNullable(vniSettingsByVlan.get(vlanId))
++                  .map(vniSettings -> computeVniName(vniSettings.getVni()))
++                  .ifPresent(
++                      vniName -> {
+                         edges.add(
+-                            new Layer2Edge(
+-                                hostname, irbName, null, hostname, switchportName, vlanId, null));
++                            new Layer2Edge(hostname, irbName, null, hostname, vniName, null, null));
+                         edges.add(
+-                            new Layer2Edge(
+-                                hostname, switchportName, vlanId, hostname, irbName, null, null));
++                            new Layer2Edge(hostname, vniName, null, hostname, irbName, null, null));
+                       });
+             });
++    // Link each VNI to switchports in same VLAN
++    vniSettingsByVlan.forEach(
++        (vlanId, vniSettings) -> {
++          String vniName = computeVniName(vniSettings.getVni());
++          computeSelfSwitchportNonSwitchportEdges(switchportsByVlan, hostname, vniName, vlanId)
++              .forEach(edges::add);
++        });
+   }
+ 
+   /**
+-   * Compute the layer-2 topology via the {@code layer1LogicalTopology} and switching 

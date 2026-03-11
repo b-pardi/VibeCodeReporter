@@ -1,0 +1,112 @@
+@@ -134,7 +134,7 @@ def get_lea_xrefs(pe: pefile.PE) -> Iterable[VA]:
+                 yield xref
+ 
+ 
+-@dataclass
++@dataclass(frozen=True)
+ class StructString:
+     address: VA
+     length: int
+@@ -229,7 +229,7 @@ def get_struct_string_candidates(pe: pefile.PE) -> Iterable[StructString]:
+         else:
+             raise ValueError("unhandled architecture")
+ 
+-        with floss.utils.timing("find struct string candidates"):
++        with floss.utils.timing("find struct string candidates (raw)"):
+             candidates = list(candidates)
+ 
+         for candidate in candidates:
+@@ -284,96 +284,131 @@ def get_struct_string_candidates(pe: pefile.PE) -> Iterable[StructString]:
+             # to valid UTF-8 data;
+             # however, even copying the bytes here is very slow,
+             # dozens of seconds or more (suspect many minutes).
+-            try:
+-                s = instance_data.tobytes().decode("utf-8")
+-            except UnicodeDecodeError:
+-                continue
+ 
+-            if not s:
+-                continue
+ 
+-            if s.encode("utf-8") != instance_data:
+-                # re-encoding the string should produce the same bytes,
+-                # otherwise, the string may not be the length intended.
+-                continue
++def find_longest_monotonically_increasing_run(l: List[int]) -> Tuple[int, int]:
++    """
++    for the given sorted list of values,
++    find the (start, end) indices of the longest run of values
++    such that each value is greater than or equal to the previous value.
++
++    for example:
++    
++        [4, 4, 1, 2, 3, 0, 0] -> (2, 4)
++               ^^^^^^^
++    """
++    max_run_length = 0
++    max_run_end_index = 0
+ 
+-            yield candidate
++    current_run_length = 0
++    prior_value = 0
+ 
++    for i, value in enumerate(l):
++        if value >= prior_value:
++            current_run_length += 1
++        else:
++            current_run_length = 1
+ 
+-def get_string_blob_range(pe: pefile.PE, struct_strings: List[StructString]) -> Tuple[VA, VA]:
+-    """
+-    find the most common range of bytes between | 00 00 | pairs
+-    that contains the data from a likely struct string.
++        if current_run_length > max_run_length:
++            max_run_length = current_run_length
++            max_run_end_index = i
+ 
+-    we don't expect UTF-8 data to ever contain | 00 00 |, so this
+-    shouldn't be found in the string blob.
++        prior_value = value
+ 
+-    we assume that the range with the most pointers like this is
+-    the string blob. this might not be the case if:
+-      - there's more than one string blob
+-      - there's lots of structures that look like struct String but aren't
+-      - ???
++    max_run_start_index = max_run_end_index - max_run_length + 1
+ 
+-    these don't seem likely today, but possible.
+-    """
++    return max_run_start_index, max_run_end_index
++
++
++def read_struct_string(pe: pefile.PE, instance: StructString) -> str:
+     image_base = pe.OPTIONAL_HEADER.ImageBase
+ 
+-    # cache the section data so that we can avoid pefile overhead
+-    section_datas: List[Tuple[VA, VA, bytes]] = []
+-    for section in pe.sections:
+-        if not section.IMAGE_SCN_MEM_READ:
+-            continue
++    instance_rva = instance.address - image_base
+ 
+-        section_datas.append(
+-            (
+-                image_base + section.VirtualAddress,
+-                image_base + section.VirtualAddress + section.SizeOfRawData,
+-                section.get_data(),
+-            )
+-        )
++    # fetch data for the string *and* the next byte,
++    # which we'll use to ensure the string is not NULL terminated.
++    buf = pe.get_data(instance_rva, instance.length + 1)
++    instance_data = buf[: instance.length]
++    next_byte = buf[instance.length]
++
++    try:
++        s = instance_data.decode("utf-8")
++    except UnicodeDecodeError:
++        raise ValueError("struct string instance does not contain valid UTF-8")
+ 
+-    range_votes = collections.Counter()
+-    for instance in stru

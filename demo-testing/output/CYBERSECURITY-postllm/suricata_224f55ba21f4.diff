@@ -1,0 +1,107 @@
+@@ -3276,6 +3276,10 @@ TmEcode DetectEngineThreadCtxInit(ThreadVars *tv, void *initdata, void **data)
+     det_ctx->counter_alerts = StatsRegisterCounter("detect.alert", tv);
+     det_ctx->counter_alerts_overflow = StatsRegisterCounter("detect.alert_queue_overflow", tv);
+     det_ctx->counter_alerts_suppressed = StatsRegisterCounter("detect.alerts_suppressed", tv);
++
++    /* Register counter for Lua rule errors. */
++    det_ctx->lua_rule_errors = StatsRegisterCounter("detect.lua.errors", tv);
++
+ #ifdef PROFILING
+     det_ctx->counter_mpm_list = StatsRegisterAvgCounter("detect.mpm_list", tv);
+     det_ctx->counter_nonmpm_list = StatsRegisterAvgCounter("detect.nonmpm_list", tv);
+
+
+
+
+@@ -165,6 +165,8 @@ void DetectLuaRegister(void)
+ 
+ #define DATATYPE_BUFFER BIT_U32(22)
+ 
++#define ERROR_LOGGED BIT_U32(23)
++
+ #if 0
+ /** \brief dump stack from lua state to screen */
+ void LuaDumpStack(lua_State *state)
+@@ -202,44 +204,30 @@ void LuaDumpStack(lua_State *state)
+ }
+ #endif
+ 
+-int DetectLuaMatchBuffer(DetectEngineThreadCtx *det_ctx,
+-        const Signature *s, const SigMatchData *smd,
+-        const uint8_t *buffer, uint32_t buffer_len, uint32_t offset,
+-        Flow *f)
++/**
++ * \brief Common function to run the Lua match function and process
++ *     the return value.
++ */
++static int DetectLuaRunMatch(
++        DetectEngineThreadCtx *det_ctx, const DetectLuaData *lua, DetectLuaThreadData *tlua)
+ {
+-    SCEnter();
+-    int ret = 0;
+-
+-    if (buffer == NULL || buffer_len == 0)
+-        SCReturnInt(0);
+-
+-    DetectLuaData *lua = (DetectLuaData *)smd->ctx;
+-    if (lua == NULL)
+-        SCReturnInt(0);
+-
+-    DetectLuaThreadData *tlua = (DetectLuaThreadData *)DetectThreadCtxGetKeywordThreadCtx(det_ctx, lua->thread_ctx_id);
+-    if (tlua == NULL)
++    if (lua_pcall(tlua->luastate, 1, 1, 0) != 0) {
++        if (!(tlua->flags & ERROR_LOGGED)) {
++            /* Log once per thread, the message from Lua will include
++             * the filename. */
++            SCLogWarning(
++                    "Lua script failed to run successfully: %s", lua_tostring(tlua->luastate, -1));
++            tlua->flags |= ERROR_LOGGED;
++        }
++        StatsIncr(det_ctx->tv, det_ctx->lua_rule_errors);
++        while (lua_gettop(tlua->luastate) > 0) {
++            lua_pop(tlua->luastate, 1);
++        }
+         SCReturnInt(0);
+-
+-    LuaExtensionsMatchSetup(tlua->luastate, lua, det_ctx, f, /* no packet in the ctx */ NULL, s, 0);
+-
+-    /* prepare data to pass to script */
+-    lua_getglobal(tlua->luastate, "match");
+-    lua_newtable(tlua->luastate); /* stack at -1 */
+-
+-    lua_pushliteral (tlua->luastate, "offset"); /* stack at -2 */
+-    lua_pushnumber (tlua->luastate, (int)(offset + 1));
+-    lua_settable(tlua->luastate, -3);
+-
+-    lua_pushstring (tlua->luastate, lua->buffername); /* stack at -2 */
+-    LuaPushStringBuffer(tlua->luastate, (const uint8_t *)buffer, (size_t)buffer_len);
+-    lua_settable(tlua->luastate, -3);
+-
+-    int retval = lua_pcall(tlua->luastate, 1, 1, 0);
+-    if (retval != 0) {
+-        SCLogInfo("failed to run script: %s", lua_tostring(tlua->luastate, -1));
+     }
+ 
++    int match = 0;
++
+     /* process returns from script */
+     if (lua_gettop(tlua->luastate) > 0) {
+         /* script returns a number (return 1 or return 0) */
+@@ -249,7 +237,7 @@ int DetectLuaMatchBuffer(DetectEngineThreadCtx *det_ctx,
+             lua_pop(tlua->luastate, 1);
+ 
+             if (script_ret == 1.0)
+-                ret = 1;
++                match = 1;
+ 
+         /* script returns a table */
+         } else if (lua_type(tlua->luastate, 1) == LUA_TTABLE) {
+@@ -271,10 +259,10 @@ int DetectLuaMatchBuffer(DetectEngineThreadCtx *det_ctx,
+                         SCLogError("Invalid value "
+                                    "for \"retval\" from LUA return table: '%s'",
+                                 v);
+-                        ret = 0;
++                        match = 0;
+                     }
+                     else if (val == 1) {
+-            

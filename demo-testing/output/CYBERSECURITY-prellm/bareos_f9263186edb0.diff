@@ -1,0 +1,95 @@
+@@ -33,15 +33,10 @@
+ 
+ #include "lib/tls_conf.h"
+ #include "lib/bnet.h"
++#include "lib/qualified_resource_name_type_converter.h"
+ 
+ const int debuglevel = 50;
+ 
+-/* Commands sent to Director */
+-static char DIRhello[]    = "Hello %s calling\n";
+-
+-/* Response from Director */
+-static char DIROKhello[]   = "1000 OK:";
+-
+ /* Commands sent to Storage daemon and File daemon and received
+  *  from the User Agent */
+ static char SDFDhello[]    = "Hello Director %s calling\n";
+@@ -51,56 +46,95 @@ static char SDOKhello[]   = "3000 OK Hello\n";
+ /* Response from FD */
+ static char FDOKhello[] = "2000 OK Hello";
+ 
+-/* Forward referenced functions */
++static std::map<AuthenticationResult,std::string> authentication_error_to_string_map {
++  { AuthenticationResult::kNoError, "No Error" },
++  { AuthenticationResult::kAlreadyAuthenticated, "Already authenticated" },
++  { AuthenticationResult::kQualifiedResourceNameFailed, "Could not generate a qualified resource name" },
++  { AuthenticationResult::kTlsHandshakeFailed, "TLS Handshake failed" },
++  { AuthenticationResult::kSendHelloMessageFailed, "Send of hello handshake message failed" },
++  { AuthenticationResult::kCramMd5HandshakeFailed, "Challenge resonse handshake failed" },
++  { AuthenticationResult::kDaemonResponseFailed, "Daemon response could not be read" },
++  { AuthenticationResult::kRejectedByDaemon, "Authentication was rejected by the daemon" },
++  { AuthenticationResult::kUnknownDaemon, "Unkown daemon type" }
++};
++
++bool GetAuthenticationResultString(AuthenticationResult err, std::string &buffer)
++{
++  if (authentication_error_to_string_map.find(err) != authentication_error_to_string_map.end() ) {
++    buffer = authentication_error_to_string_map.at(err);
++    return true;
++  }
++  return false;
++}
++
++static AuthenticationResult AuthenticateWithDirector(JobControlRecord *jcr, DirectorResource *dir_res)
++{
++   if (jcr->authenticated) {
++      return AuthenticationResult::kAlreadyAuthenticated;
++   }
+ 
+-/*
+- * Authenticate Director
+- */
+-static bool AuthenticateWithDirector(JobControlRecord *jcr, DirectorResource *dir_res) {
+    MonitorResource *monitor = MonitorItemThread::instance()->getMonitor();
++   std::string qualified_resource_name;
++   if (!my_config->GetQualifiedResourceNameTypeConverter()->ResourceToString(
++                  monitor->name(), R_CONSOLE, qualified_resource_name)) {
++     return AuthenticationResult::kQualifiedResourceNameFailed;
++   }
++
++   int tls_policy = dir_res->tls_psk.IsActivated() || dir_res->tls_cert.IsActivated()
++                  ? TlsConfigBase::BNET_TLS_AUTO : TlsConfigBase::BNET_TLS_NONE;
+ 
+    BareosSocket *dir = jcr->dir_bsock;
+-   char bashed_name[MAX_NAME_LENGTH];
++   if (!dir->DoTlsHandshake(tls_policy, dir_res, false, qualified_resource_name.c_str(), monitor->password.value, jcr)) {
++      return AuthenticationResult::kTlsHandshakeFailed;
++   }
++
+    char errmsg[1024];
+    int32_t errmsg_len = sizeof(errmsg);
+-
+-   bstrncpy(bashed_name, monitor->name(), sizeof(bashed_name));
+-   BashSpaces(bashed_name);
+-
+-   if (!dir->AuthenticateWithDirector(jcr, bashed_name,(s_password &) monitor->password, errmsg, errmsg_len, monitor)) {
++   if (!dir->AuthenticateWithDirector(jcr, monitor->name(),(s_password &) monitor->password, errmsg, errmsg_len, dir_res)) {
+       Jmsg(jcr, M_FATAL, 0, _("Director authorization problem.\n"
+                                  "Most likely the passwords do not agree.\n"
+                                  "Please see %s for help.\n"), MANUAL_AUTH_URL);
+-      return false;
++      return AuthenticationResult::kCramMd5HandshakeFailed;
+    }
+ 
+-   return true;
++   return AuthenticationResult::kNoError;
+ }
+ 
+-/*
+- * Authenticate Storage daemon connection
+- */
+-static bool AuthenticateWithStorageDaemon(JobControlRecord *jcr, StorageResource* store)
++static AuthenticationResult AuthenticateWithStorageDaemon(JobControlRecord *jcr, StorageResource* store)
+ {
+-   const MonitorResource *monitor = MonitorItemThread::instance()->ge

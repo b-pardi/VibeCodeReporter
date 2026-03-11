@@ -1,0 +1,107 @@
+@@ -1,8 +1,23 @@
+ """
+ NERD - functions to work with the main task queue (RabbitMQ)
+ 
+-RabbitMQ plug-in "Consistent Hash Exchange Type" must be installed
+-(exchange of the type 'x-consistent-hash' is used to distribute tasks to workers)
++There are two queues for each worker process:
++- "normal" queue for tasks added by other components, this has a limit of 100
++  tasks.
++- "priority" one for tasks added by workers themselves, this has no limit since
++  workers mustn't be stopped by waiting for the queue.
++
++These queues are presented as a single one by this wrapper.
++The ??? get() ??? method first looks into the "priority" queue and only if there
++is no task waiting, it read the normal one.
++
++Tasks are distributed to worker processes (and threads) by hash of the entity
++which is to be modified. The destination queue is decided by the message source,
++so each source must know how many worker processes are there.
++
++
++Exchange and queues must be declared externally! (TODO at least check their presence here - but chcing presence means to attempt to declare them)
++
+ 
+ Related configuration keys and their defaults:
+ (should be part of global NERD config files)
+@@ -13,22 +28,58 @@ rabbitmq:
+   virtual_host: /
+   username: guest
+   password: guest
++
++parallel:
++  processes: 1
+ """
+ 
+-import sys
+ import json
+ import time
+ import logging
+ import datetime
++import collections
++import hashlib
++import threading
+ 
+ import pika
++import pika.exceptions
+ 
+-# Exchange to write messages to
+-WRITE_EXCHANGE_NAME = 'nerd-main-task-exchange'
+-READ_EXCHANGE_NAME = 'nerd-task-distributor'
++# This sets logging level of all component in this file
++LOG_LEVEL = logging.INFO
++#LOG_LEVEL = logging.DEBUG
+ 
+-# Maximum number of pending messages per worker
+-MAX_QUEUE_LENGTH = 100
++# Exchange and queue names
++# They must be pre-declared ('direct' exchange type) and binded.
++# Numbers from 0 to number_of_workers-1 are used as routing/binding keys.
++DEFAULT_EXCHANGE = 'nerd-main-task-exchange'
++DEFAULT_PRIORITY_EXCHANGE = 'nerd-priority-task-exchange'
++DEFAULT_QUEUE = 'worker-{}'
++DEFAULT_PRIORITY_QUEUE = 'worker-{}-pri'
++
++# Hash function used to distribute tasks to worker processes. Takes string, returns int.
++# (last 4 bytes of MD5)
++HASH = lambda x: int(hashlib.md5(x.encode('utf8')).hexdigest()[-4:], 16)
++
++# Maximum number of pending messages per worker process (TODO maybe increase)
++# MAX_QUEUE_LENGTH = 100 # Should be defined externally
++
++# When reading, pre-fetch only a limited amount of messages
++# (because pre-fetched messages are not counted to queue length limit)
++PREFETCH_COUNT = 2
++
++
++RECONNECT_DELAYS = [1, 2, 5, 10, 30] # number of seconds to wait for the i-th attempt to reconnect after error
++
++# Set up logging if not part of another program (i.e. when testing/debugging)
++if __name__ == '__main__':
++    #LOGFORMAT = "%(asctime)-15s,%(threadName)s,%(name)s,[%(levelname)s] %(message)s"
++    LOGFORMAT = "[%(levelname)s] %(name)s: %(message)s"
++    LOGDATEFORMAT = "%Y-%m-%dT%H:%M:%S"
++    
++    logging.basicConfig(level=logging.INFO, format=LOGFORMAT, datefmt=LOGDATEFORMAT)
++
++
++# ===== Auxiliary functions =====
+ 
+ # Functions that allow to (de)serialize some objects we need to pass via TaskQueue.
+ # Inspired by bson.json_util, but for different set of types (and much simpler).
+@@ -64,17 +115,43 @@ def conv_from_json(dct):
+     return dct
+ 
+ 
+-class TaskQueue:
++# Decorator for RabbitMQ wrappers to retry a method that may fail due to broken connection
++def reconnect_and_retry_on_error(func):
++    def wrapper(self, *args, **kwargs):
++        sleep_time = 1
++        while True:
++            try:
++                return func(self, *args, **kwargs)
++            except (pika.exceptions.AMQPConnectionError, pika.exceptions.AMQPChannelError) as e:
++                # pass Unroutable or Nack errors to upper layer, since reconnection is not needed in such case
++                if isinstance(e, (pika.exceptions.UnroutableError, pika.exceptions.NackError)):
++  

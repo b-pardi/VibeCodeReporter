@@ -1,0 +1,128 @@
+@@ -184,7 +184,6 @@ private:
+   FlowProfile *trafficProfile;
+ #else
+   u_int8_t routing_table_id;
+-  u_int16_t cli2srv_in, cli2srv_out, srv2cli_in, srv2cli_out;
+   L7PolicySource_t cli_quota_source, srv_quota_source;
+ #endif
+   CounterTrend throughputTrend, goodputTrend, thptRatioTrend;
+@@ -343,14 +342,10 @@ private:
+ 
+ #ifdef HAVE_NEDGE
+   struct {
+-    struct {
+-      TrafficShaper *ingress, *egress;
+-    } cli2srv;
+-
+-    struct {
+-      TrafficShaper *ingress, *egress;
+-    } srv2cli;
++    TrafficShaper *cli;
++    TrafficShaper *srv;
+   } flowShapers;
++  u_int16_t cli_shaper_id, srv_shaper_id;
+ #endif
+   struct timeval last_update_time;
+ 
+@@ -1378,18 +1373,11 @@ public:
+ 
+   void setPacketsBytes(time_t now, u_int32_t s2d_pkts, u_int32_t d2s_pkts,
+                        u_int64_t s2d_bytes, u_int64_t d2s_bytes);
+-  void getFlowShapers(bool src2dst_direction, TrafficShaper **shaper_ingress,
+-                      TrafficShaper **shaper_egress) {
+-    if (src2dst_direction) {
+-      *shaper_ingress = flowShapers.cli2srv.ingress,
+-	*shaper_egress = flowShapers.cli2srv.egress;
+-    } else {
+-      *shaper_ingress = flowShapers.srv2cli.ingress,
+-	*shaper_egress = flowShapers.srv2cli.egress;
+-    }
++  void getFlowShapers(TrafficShaper **shaper_cli, TrafficShaper **shaper_srv) {
++    *shaper_cli = flowShapers.cli;
++    *shaper_srv = flowShapers.srv;
+   }
+-  bool updateCli2SrvShapers(TrafficShaper **ingress_shaper, TrafficShaper **egress_shaper);
+-  bool updateSrv2CliShapers(TrafficShaper **ingress_shaper, TrafficShaper **egress_shaper);
++  bool updateCliSrvShapers(TrafficShaper **ingress_shaper, TrafficShaper **egress_shaper);
+   void updateFlowShapers(bool first_update = false);
+   void recheckQuota(const struct tm *now);
+   inline u_int8_t getFlowRoutingTableId() { return (routing_table_id); }
+
+
+
+
+@@ -345,7 +345,7 @@ class Host : public GenericHashEntry,
+   };
+ 
+ #ifdef HAVE_NEDGE
+-  TrafficShaper *get_shaper(ndpi_protocol ndpiProtocol, bool isIngress);
++  TrafficShaper *get_shaper(ndpi_protocol ndpiProtocol);
+ 
+   inline AddressTree* getDynamicBlacklist() const {
+     return (iface->getHostPools()->getDynamicBlacklist(host_pool_id));
+
+
+
+
+@@ -1018,8 +1018,6 @@ public:
+   }
+ #endif
+ 
+-  bool passShaperPacket(TrafficShaper *a_shaper, TrafficShaper *b_shaper,
+-                        struct pcap_pkthdr *h);
+   void initL7Policer();
+ #endif
+ 
+
+
+
+
+@@ -229,7 +229,7 @@ class Utils {
+     if (!ewma) return;
+     (*ewma) = (alpha_percent * sample + (100 - alpha_percent) * (*ewma)) / 100;
+   }
+-  static inline u_int64_t toUs(struct timeval *t) {
++  static inline u_int64_t toUs(const struct timeval *t) {
+     return (((u_int64_t)t->tv_sec) * 1000000 + ((u_int64_t)t->tv_usec));
+   };
+   static void replacestr(char *line, const char *search, const char *replace);
+
+
+
+
+@@ -1242,8 +1242,8 @@ typedef enum {
+   DROP_REASON_QUOTA_EXCEEDED,
+   DROP_REASON_DROP_CLI,
+   DROP_REASON_DROP_SRV,
+-  DROP_REASON_CLI2SRV_SHAPER,
+-  DROP_REASON_SRV2CLI_SHAPER,
++  DROP_REASON_CLI_SHAPER,
++  DROP_REASON_SRV_SHAPER,
+   DROP_REASON_DEV_NOT_ALLOW_PROTO_CLI,
+   DROP_REASON_DEV_NOT_ALLOW_PROTO_SRV,
+   DROP_REASON_FLOW_SIZE_EXCEEDED
+
+
+
+
+@@ -296,7 +296,7 @@ Flow::Flow(NetworkInterface *_iface,
+ #ifndef HAVE_NEDGE
+   trafficProfile = NULL;
+ #else
+-  cli2srv_in = cli2srv_out = srv2cli_in = srv2cli_out = DEFAULT_SHAPER_ID;
++  cli_shaper_id = srv_shaper_id = DEFAULT_SHAPER_ID;
+   memset(&flowShapers, 0, sizeof(flowShapers));
+   cli_quota_source = srv_quota_source = policy_source_default;
+ #endif
+@@ -1781,30 +1781,18 @@ char* Flow::print(char *buf, u_int buf_len, bool full_report) const {
+ #if defined(NTOPNG_PRO) && defined(SHAPER_DEBUG)
+   char shapers[64];
+ 
+-  TrafficShaper *cli2srv_in  = flowShapers.cli2srv.ingress;
+-  TrafficShaper *cli2srv_out = flowShapers.cli2srv.egress;
+-  TrafficShaper *srv2cli_in  = flowShapers.srv2cli.ingress;
+-  TrafficShaper *srv2cli_out = flowShapers.srv2cli.egress;
+-
+   if(iface->is_bridge_interface()) {
+-    snprintf(
+-	     shapers, siz

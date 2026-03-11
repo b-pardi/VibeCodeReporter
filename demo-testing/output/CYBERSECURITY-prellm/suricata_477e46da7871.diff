@@ -1,0 +1,107 @@
+@@ -65,257 +65,6 @@
+ 
+ #include "util-validate.h"
+ 
+-#define BUFFER_STEP 50
+-
+-static inline int HCBDCreateSpace(DetectEngineThreadCtx *det_ctx, uint64_t size)
+-{
+-    if (size >= (USHRT_MAX - BUFFER_STEP))
+-        return -1;
+-
+-    void *ptmp;
+-    if (size > det_ctx->hcbd_buffers_size) {
+-        uint16_t grow_by = size - det_ctx->hcbd_buffers_size;
+-        grow_by = MAX(grow_by, BUFFER_STEP);
+-
+-        ptmp = SCRealloc(det_ctx->hcbd,
+-                         (det_ctx->hcbd_buffers_size + grow_by) * sizeof(HttpReassembledBody));
+-        if (ptmp == NULL) {
+-            SCFree(det_ctx->hcbd);
+-            det_ctx->hcbd = NULL;
+-            det_ctx->hcbd_buffers_size = 0;
+-            det_ctx->hcbd_buffers_list_len = 0;
+-            return -1;
+-        }
+-        det_ctx->hcbd = ptmp;
+-
+-        memset(det_ctx->hcbd + det_ctx->hcbd_buffers_size, 0, grow_by * sizeof(HttpReassembledBody));
+-        det_ctx->hcbd_buffers_size += grow_by;
+-
+-        uint16_t i;
+-        for (i = det_ctx->hcbd_buffers_list_len; i < det_ctx->hcbd_buffers_size; i++) {
+-            det_ctx->hcbd[i].buffer_len = 0;
+-            det_ctx->hcbd[i].offset = 0;
+-        }
+-    }
+-
+-    return 0;
+-}
+-
+-/**
+- */
+-static const uint8_t *DetectEngineHCBDGetBufferForTX(htp_tx_t *tx, uint64_t tx_id,
+-                                               DetectEngineCtx *de_ctx,
+-                                               DetectEngineThreadCtx *det_ctx,
+-                                               Flow *f, HtpState *htp_state,
+-                                               const uint8_t flags,
+-                                               uint32_t *buffer_len,
+-                                               uint32_t *stream_start_offset)
+-{
+-    int index = 0;
+-    const uint8_t *buffer = NULL;
+-    *buffer_len = 0;
+-    *stream_start_offset = 0;
+-
+-    if (det_ctx->hcbd_buffers_list_len == 0) {
+-        /* get the inspect id to use as a 'base id' */
+-        uint64_t base_inspect_id = AppLayerParserGetTransactionInspectId(f->alparser, flags);
+-        BUG_ON(base_inspect_id > tx_id);
+-        /* see how many space we need for the current tx_id */
+-        uint64_t txs = (tx_id - base_inspect_id) + 1;
+-        if (HCBDCreateSpace(det_ctx, txs) < 0)
+-            goto end;
+-
+-        index = (tx_id - base_inspect_id);
+-        det_ctx->hcbd_start_tx_id = base_inspect_id;
+-        det_ctx->hcbd_buffers_list_len = txs;
+-    } else {
+-        if ((tx_id - det_ctx->hcbd_start_tx_id) < det_ctx->hcbd_buffers_list_len) {
+-            if (det_ctx->hcbd[(tx_id - det_ctx->hcbd_start_tx_id)].buffer_len != 0) {
+-                *buffer_len = det_ctx->hcbd[(tx_id - det_ctx->hcbd_start_tx_id)].buffer_len;
+-                *stream_start_offset = det_ctx->hcbd[(tx_id - det_ctx->hcbd_start_tx_id)].offset;
+-                return det_ctx->hcbd[(tx_id - det_ctx->hcbd_start_tx_id)].buffer;
+-            }
+-        } else {
+-            uint64_t txs = (tx_id - det_ctx->hcbd_start_tx_id) + 1;
+-            if (HCBDCreateSpace(det_ctx, txs) < 0)
+-                goto end; /* let's consider it as stage not done for now */
+-
+-            det_ctx->hcbd_buffers_list_len = txs;
+-        }
+-        index = (tx_id - det_ctx->hcbd_start_tx_id);
+-    }
+-
+-    HtpTxUserData *htud = (HtpTxUserData *)htp_tx_get_user_data(tx);
+-    if (htud == NULL) {
+-        SCLogDebug("no htud");
+-        goto end;
+-    }
+-
+-    /* no new data */
+-    if (htud->request_body.body_inspected == htud->request_body.content_len_so_far) {
+-        SCLogDebug("no new data");
+-        goto end;
+-    }
+-
+-    HtpBodyChunk *cur = htud->request_body.first;
+-    if (cur == NULL) {
+-        SCLogDebug("No http chunks to inspect for this transacation");
+-        goto end;
+-    }
+-
+-    if (!htp_state->cfg->http_body_inline) {
+-        /* inspect the body if the transfer is complete or we have hit
+-        * our body size limit */
+-        if ((htp_state->cfg->request.body_limit == 0 ||
+-             htud->request_body.conten

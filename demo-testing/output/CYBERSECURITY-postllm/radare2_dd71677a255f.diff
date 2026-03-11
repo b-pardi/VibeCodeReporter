@@ -1,0 +1,173 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,743 @@
++/* radare - LGPL - Copyright 2017-2025 - pancake, defragger */
++
++// based on the algorithm described https://arxiv.org/abs/1902.01437
++
++#include <r_anal.h>
++#include <r_core.h>
++
++typedef enum bb_type {
++	TRAP,
++	NORMAL,
++	JUMP,
++	FAIL,
++	CALL,
++	END,
++} bb_type_t;
++
++typedef struct bb {
++	ut64 start;
++	ut64 end;
++	ut64 jump;
++	ut64 fail;
++	int score;
++	int called;
++	int reached;
++	bb_type_t type;
++} bb_t;
++
++typedef struct fcn {
++	ut64 addr;
++	ut64 size;
++	RList *bbs;
++	st64 score;
++	ut64 ends;
++} fcn_t;
++
++typedef struct {
++	ut64 addr;
++	int size;
++} IsDataCache;
++
++static inline bool is_datablock(RAnalBlock *block, void *user) {
++	bool *block_exists = user;
++	*block_exists = true;
++	return false;
++}
++
++static int isdata(RAnal *anal, ut64 addr, IsDataCache *cache) {
++	// Check cache first
++	if (cache && cache->addr != UT64_MAX && addr >= cache->addr && addr < cache->addr + cache->size) {
++		return cache->addr + cache->size - addr;
++	}
++
++	bool block_exists = false;
++	// This will just set block_exists = true if there is any basic block at this addr
++	r_anal_blocks_foreach_in (anal, addr, is_datablock, &block_exists);
++	if (block_exists) {
++		return 1;
++	}
++
++	RVecIntervalNodePtr *list = r_meta_get_all_in (anal, addr, R_META_TYPE_ANY);
++	RIntervalNode **it;
++	int result = 0;
++	R_VEC_FOREACH (list, it) {
++		RIntervalNode *node = *it;
++		RAnalMetaItem *meta = node->data;
++		switch (meta->type) {
++		case R_META_TYPE_DATA:
++		case R_META_TYPE_STRING:
++		case R_META_TYPE_FORMAT:
++			result = node->end - addr + 1;
++			if (cache) {
++				cache->addr = addr;
++				cache->size = result;
++			}
++			goto exit;
++		default:
++			break;
++		}
++	}
++exit:
++	RVecIntervalNodePtr_free (list);
++	return result;
++}
++
++static bool fcnAddBB(fcn_t *fcn, bb_t *block) {
++	if (!fcn) {
++		R_LOG_ERROR ("No function given to add a basic block");
++		return false;
++	}
++	fcn->score += block->score;
++	fcn->size += block->end - block->start;
++	if (block->type == END) {
++		fcn->ends++;
++	}
++	if (!fcn->bbs) {
++		R_LOG_ERROR ("Block list not initialized");
++		return false;
++	}
++	r_list_append (fcn->bbs, block);
++	return true;
++}
++
++static fcn_t *fcnNew(bb_t *block) {
++	fcn_t *fcn = R_NEW0 (fcn_t);
++	fcn->addr = block->start;
++	fcn->bbs = r_list_new ();
++	if (!fcnAddBB (fcn, block)) {
++		R_LOG_ERROR ("Failed to add block to function");
++	}
++	return fcn;
++}
++
++static void fcnFree(fcn_t *fcn) {
++	r_list_free (fcn->bbs);
++	free (fcn);
++}
++
++static int bbCMP(void *_a, void *_b) {
++	bb_t *a = (bb_t *)_a;
++	bb_t *b = (bb_t *)_b;
++	if (b->start > a->start) {
++		return 1;
++	}
++	if (b->start < a->start) {
++		return -1;
++	}
++	return 0;
++}
++
++static void initBB(bb_t *bb, ut64 start, ut64 end, ut64 jump, ut64 fail, bb_type_t type, int score, int reached, int called) {
++	if (bb) {
++		bb->start = start;
++		bb->end = end;
++		bb->jump = jump;
++		bb->fail = fail;
++		bb->type = type;
++		bb->score = score;
++		bb->reached = reached;
++		bb->called = called;
++	}
++}
++
++static bool addBB(RList *block_list, ut64 start, ut64 end, ut64 jump, ut64 fail, bb_type_t type, int score) {
++	bb_t *bb = R_NEW0 (bb_t);
++	initBB (bb, start, end, jump, fail, type, score, 0, 0);
++	if (jump < UT64_MAX) {
++		bb_t *jump_bb = R_NEW0 (bb_t);
++		if (type == CALL) {
++			initBB (jump_bb, jump, UT64_MAX, UT64_MAX, UT64_MAX, CALL, 0, 1, 1);
++		} else {
++			initBB (jump_bb, jump, UT64_MAX, UT64_MAX, UT64_MAX, JUMP, 0, 1, 0);
++		}
++		r_list_append (block_list, jump_bb);
++	}
++	if (fail < UT64_MAX) {
++		bb_t *fail_bb = R_NEW0 (bb_t);
++		initBB (fail_bb, fail, UT64_MAX, UT64_MAX, UT64_MAX, FAIL, 0, 1, 0);
++		r_list_append (block_list, fail_bb);
++	}
++	r_list_append (block_list, bb);
++	return true;
++}
++
++static bool addBBWithLookup(RList *block_list, HtUP *ht_lookup, ut64 start, ut64 end, ut64 jump, ut64 fail, bb_type_t type, int score) {
++	bb_t *bb = R_NEW0 (bb_t);
++	initBB (bb, start, end, jump, fail, type, score, 0, 0);
++	r_list_append (block_list, bb);
++	ht_up_insert (ht_lookup,

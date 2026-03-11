@@ -1,0 +1,132 @@
+@@ -65,6 +65,8 @@
+ 
+ #include "util-action.h"
+ #include "util-radix-tree.h"
++#include "util-radix4-tree.h"
++#include "util-radix6-tree.h"
+ #include "util-host-os-info.h"
+ #include "util-cidr.h"
+ #include "util-unittest-helper.h"
+@@ -172,6 +174,8 @@ static void RegisterUnittests(void)
+     IPPairRegisterUnittests();
+     SCSigRegisterSignatureOrderingTests();
+     SCRadixRegisterTests();
++    SCRadix4RegisterTests();
++    SCRadix6RegisterTests();
+     DefragRegisterTests();
+     SigGroupHeadRegisterTests();
+     SCHInfoRegisterTests();
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,966 @@
++/* Copyright (C) 2007-2022 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Victor Julien <victor@inliniac.net>
++ * \author Anoop Saldanha <anoopsaldanha@gmail.com>
++ *
++ * Implementation of radix trees
++ */
++
++#include "util-validate.h"
++
++#ifndef ADDRESS_BYTES
++#error "define ADDRESS_BYTES"
++#endif
++#ifndef NETMASK_MAX
++#error "define NETMASK_MAX"
++#endif
++
++#define RADIX_BITTEST(x, y) ((x) & (y))
++
++/**
++ * \brief Structure that hold the user data and the netmask associated with it.
++ */
++typedef struct RadixUserData {
++    /* holds a pointer to the user data associated with the particular netmask */
++    void *user;
++    /* pointer to the next user data in the list */
++    struct RadixUserData *next;
++    /* holds the netmask value that corresponds to this user data pointer */
++    uint8_t netmask;
++} RadixUserData;
++
++/**
++ * \brief Allocates and returns a new instance of RadixUserData.
++ *
++ * \param netmask The netmask entry (cidr) that has to be made in the new
++ *                RadixUserData instance
++ * \param user    The user data that has to be set for the above
++ *                netmask in the newly created RadixUserData instance.
++ *
++ * \retval user_data Pointer to a new instance of RadixUserData.
++ */
++static RadixUserData *AllocUserData(uint8_t netmask, void *user)
++{
++    RadixUserData *user_data = SCCalloc(1, sizeof(RadixUserData));
++    if (unlikely(user_data == NULL)) {
++        sc_errno = SC_ENOMEM;
++        return NULL;
++    }
++    user_data->netmask = netmask;
++    user_data->user = user;
++    return user_data;
++}
++
++/**
++ * \brief Deallocates an instance of RadixUserData.
++ *
++ * \param user_data Pointer to the instance of RadixUserData that has to be
++ *                  freed.
++ */
++static void FreeUserData(RadixUserData *user_data)
++{
++    SCFree(user_data);
++}
++
++/**
++ * \brief Appends a user_data instance(RadixUserData) to a
++ *        user_data(RadixUserData) list.  We add the new entry in descending
++ *        order with respect to the netmask contained in the RadixUserData.
++ *
++ * \param new  Pointer to the RadixUserData to be added to the list.
++ * \param list Pointer to the RadixUserData list head, to which "new" has to
++ *             be appended.
++ */
++static void AppendToUserDataList(RadixUserData *add, RadixUserData **list)
++{
++    RadixUserData *temp = NULL;
++
++    BUG_ON(add == NULL || list == NULL);
++
++    /* add to the list in descending order.  The reason we do this is for
++     * optimizing key retrieval for a ip key under a netblock */
++    RadixUserData *prev = temp = *list;
++    while (temp != NULL) {
++        if (add->netmask > temp->netmask)
++            break;
++        prev = temp;
++        temp = temp->next;
++    }
++
++    if 

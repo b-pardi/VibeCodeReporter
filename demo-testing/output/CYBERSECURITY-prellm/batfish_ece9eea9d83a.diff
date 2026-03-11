@@ -1,0 +1,108 @@
+@@ -11,9 +11,19 @@ import org.batfish.allinone.config.Settings;
+ import org.batfish.client.Client;
+ import org.batfish.common.BatfishLogger;
+ import org.batfish.common.util.BindPortFutures;
++import org.batfish.coordinator.BatfishWorkerServiceWorkExecutor;
++import org.batfish.coordinator.PoolWorkExecutor;
++import org.batfish.coordinator.WorkExecutorCreator;
++import org.batfish.main.Driver;
+ 
+ public class AllInOne {
+ 
++  /**
++   * If true, use old-style pool manager and worker registration (takes up two ports). Else, work
++   * manager should directly spawn Batfish worker threads.
++   */
++  private static final boolean USE_LEGACY_POOL_WORK_EXECUTOR = false;
++
+   private static String[] getArgArrayFromString(String argString) {
+     if (Strings.isNullOrEmpty(argString)) {
+       return new String[0];
+@@ -137,14 +147,18 @@ public class AllInOne {
+ 
+     String batfishArgs =
+         String.format(
+-            "%s -%s %s -%s %s -%s %s -%s %s",
++            "%s -%s %s -%s %s %s -%s %s",
+             _settings.getBatfishArgs(),
+             org.batfish.config.Settings.ARG_RUN_MODE,
+             _settings.getBatfishRunMode(),
+             org.batfish.config.Settings.ARG_COORDINATOR_REGISTER,
+             "true",
+-            org.batfish.config.Settings.ARG_COORDINATOR_POOL_PORT,
+-            bindPortFutures.getPoolPort().get(),
++            USE_LEGACY_POOL_WORK_EXECUTOR
++                ? String.format(
++                    "-%s %s",
++                    org.batfish.config.Settings.ARG_COORDINATOR_POOL_PORT,
++                    bindPortFutures.getPoolPort().get())
++                : "",
+             org.batfish.config.Settings.ARG_TRACING_ENABLE,
+             _settings.getTracingEnable());
+     // If we are running a command file, just use an ephemeral port for worker
+@@ -161,7 +175,7 @@ public class AllInOne {
+           @Override
+           public void run() {
+             try {
+-              org.batfish.main.Driver.main(argArray, _logger);
++              org.batfish.main.Driver.main(argArray, _logger, USE_LEGACY_POOL_WORK_EXECUTOR);
+             } catch (Exception e) {
+               _logger.errorf(
+                   "Initialization of batfish failed with args: %s\nExceptionMessage: %s\n",
+@@ -201,8 +215,21 @@ public class AllInOne {
+         new Thread("coordinatorThread") {
+           @Override
+           public void run() {
++            WorkExecutorCreator workExecutorCreator =
++                USE_LEGACY_POOL_WORK_EXECUTOR
++                    ? PoolWorkExecutor::new
++                    : (logger, settings) ->
++                        new BatfishWorkerServiceWorkExecutor(
++                            logger,
++                            settings.getContainersLocation(),
++                            Driver.getBatfishWorkerService());
+             try {
+-              org.batfish.coordinator.Main.main(argArray, _logger, bindPortFutures);
++              org.batfish.coordinator.Main.main(
++                  argArray,
++                  _logger,
++                  bindPortFutures,
++                  workExecutorCreator,
++                  USE_LEGACY_POOL_WORK_EXECUTOR);
+             } catch (Exception e) {
+               _logger.errorf(
+                   "Initialization of coordinator failed with args: %s\nExceptionMessage: %s\n",
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,17 @@
++package org.batfish.common;
++
++import javax.annotation.Nullable;
++
++/**
++ * Service that can run Batfish workitems composed of a taskId and arguments, and provide status of
++ * running work items.
++ */
++public interface BatfishWorkerService {
++
++  /** Get task status for taskId, or {@code null} if there is no task with given ID. */
++  @Nullable
++  Task getTaskStatus(String taskId);
++
++  /** Launch the task defined by args that has the given taskId. */
++  LaunchResult runTask(String taskId, String[] args);
++}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,58 @@
++package org.batfish.common;
++
++import static com.google.common.base.Preconditions.checkState;
++
++import java

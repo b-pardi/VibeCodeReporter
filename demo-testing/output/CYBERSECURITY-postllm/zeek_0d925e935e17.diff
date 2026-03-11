@@ -1,0 +1,137 @@
+@@ -50,6 +50,7 @@ const char* TimerNames[] = {
+     "ThreadHeartbeat",
+     "UnknownProtocolExpire",
+     "LogDelayExpire",
++    "LogFlushWriteBufferTimer",
+ };
+ 
+ const char* timer_type_to_string(TimerType type) { return TimerNames[type]; }
+
+
+
+
+@@ -57,8 +57,9 @@ enum TimerType : uint8_t {
+     TIMER_THREAD_HEARTBEAT,
+     TIMER_UNKNOWN_PROTOCOL_EXPIRE,
+     TIMER_LOG_DELAY_EXPIRE,
++    TIMER_LOG_FLUSH_WRITE_BUFFER,
+ };
+-constexpr int NUM_TIMER_TYPES = int(TIMER_LOG_DELAY_EXPIRE) + 1;
++constexpr int NUM_TIMER_TYPES = int(TIMER_LOG_FLUSH_WRITE_BUFFER) + 1;
+ 
+ extern const char* timer_type_to_string(TimerType type);
+ 
+
+
+
+
+@@ -16,6 +16,7 @@
+ #include "zeek/NetVar.h"
+ #include "zeek/OpaqueVal.h"
+ #include "zeek/RunState.h"
++#include "zeek/Timer.h"
+ #include "zeek/Type.h"
+ #include "zeek/broker/Manager.h"
+ #include "zeek/input.h"
+@@ -39,6 +40,21 @@ extern zeek::OpaqueTypePtr log_delay_token_type;
+ namespace zeek::logging {
+ 
+ namespace detail {
++
++// A timer that regularly flushes the write buffer of all WriterFrontends.
++class LogFlushWriteBufferTimer : public zeek::detail::Timer {
++public:
++    explicit LogFlushWriteBufferTimer(double t) : Timer(t, zeek::detail::TIMER_LOG_FLUSH_WRITE_BUFFER) {}
++
++    void Dispatch(double t, bool is_expire) override {
++        zeek::log_mgr->FlushAllWriteBuffers();
++
++        if ( ! is_expire )
++            zeek::log_mgr->StartLogFlushTimer();
++    }
++};
++
++
+ using DelayTokenType = zeek_uint_t;
+ 
+ class DelayInfo;
+@@ -414,7 +430,6 @@ void Manager::Stream::DispatchDelayExpiredTimer(double t, bool is_expire) {
+         ScheduleLogDelayExpiredTimer(delay_queue.front()->ExpireTime());
+ }
+ 
+-
+ Manager::Manager()
+     : plugin::ComponentManager<logging::Component>("Log", "Writer"),
+       total_log_stream_writes_family(telemetry_mgr->CounterFamily("zeek", "log-stream-writes", {"module", "stream"},
+@@ -598,6 +613,9 @@ bool Manager::CreateStream(EnumVal* id, RecordVal* sval) {
+     DBG_LOG(DBG_LOGGING, "Created new logging stream '%s', raising event %s", streams[idx]->name.c_str(),
+             event ? streams[idx]->event->Name() : "<none>");
+ 
++    if ( ! log_flush_timer )
++        StartLogFlushTimer();
++
+     return true;
+ }
+ 
+@@ -2033,4 +2051,20 @@ bool Manager::FinishedRotation(WriterFrontend* writer, const char* new_name, con
+     return result;
+ }
+ 
++void Manager::FlushAllWriteBuffers() {
++    for ( const auto* s : zeek::log_mgr->streams ) {
++        if ( ! s ) // may store nullptr
++            continue;
++
++        for ( const auto& [_, info] : s->writers )
++            info->writer->FlushWriteBuffer();
++    }
++}
++
++void Manager::StartLogFlushTimer() {
++    double next_t = zeek::run_state::network_time + BifConst::Log::flush_interval;
++    log_flush_timer = new detail::LogFlushWriteBufferTimer(next_t);
++    zeek::detail::timer_mgr->Add(log_flush_timer);
++}
++
+ } // namespace zeek::logging
+
+
+
+
+@@ -32,6 +32,8 @@ class RotationTimer;
+ 
+ namespace detail {
+ 
++class LogFlushWriteBufferTimer;
++
+ class DelayInfo;
+ 
+ using WriteIdx = uint64_t;
+@@ -348,6 +350,7 @@ protected:
+     friend class RotationFinishedMessage;
+     friend class RotationFailedMessage;
+     friend class RotationTimer;
++    friend class detail::LogFlushWriteBufferTimer;
+ 
+     // Instantiates a new WriterBackend of the given type (note that
+     // doing so creates a new thread!).
+@@ -364,6 +367,12 @@ protected:
+     bool FinishedRotation(WriterFrontend* writer, const char* new_name, const char* old_name, double open, double close,
+                           bool success, bool terminating);
+ 
++    // Flush write buffers of all writers.
++    void FlushAllWriteBuffers();
++
++    // Start the regular log flushing timer.
++    void StartLogFlushTimer();
++
+ private:
+     struct Filter;
+     struct Stream;
+@@ -404,6 +413,9 @@ private:
+ 
+     zeek_uint_t last_delay_token = 0;
+     std::vector<detail::WriteContext> active_writes;
++
++    // Timer for flushing write buffers of frontends.
++    detail::LogFlushWriteBufferTimer* log_flush_timer = nullp

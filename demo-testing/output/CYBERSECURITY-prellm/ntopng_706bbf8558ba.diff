@@ -1,0 +1,131 @@
+@@ -96,7 +96,7 @@ class Flow : public GenericHashEntry {
+   u_int32_t last_conntrack_update; 
+   u_int32_t marker;
+ #endif
+-  
++ 
+   union {
+     struct {
+       char *last_url, *last_method;
+
+
+
+
+@@ -29,7 +29,8 @@ class MySQLDB : public DB {
+   MYSQL mysql;
+   bool db_operational;
+   struct timeval lastUpdateTime;
+-  u_int32_t mysqlDroppedFlows;
++  u_int32_t mysqlDroppedFlows, mysqlConsumerDroppedFlows;
++  u_int32_t mysqlEnqueuedFlows;
+   u_int64_t mysqlExportedFlows, mysqlLastExportedFlows;
+   float mysqlExportRate;
+ 
+@@ -55,9 +56,9 @@ class MySQLDB : public DB {
+   void checkPointCounters(bool drops_only) {
+     if(!drops_only)
+       checkpointExportedFlows = mysqlExportedFlows;
+-    checkpointDroppedFlows = mysqlDroppedFlows;
++    checkpointDroppedFlows = mysqlDroppedFlows + mysqlConsumerDroppedFlows;
+   };
+-  inline u_int32_t numDroppedFlows() const { return mysqlDroppedFlows; };
++  inline u_int32_t numDroppedFlows() const { return mysqlDroppedFlows + mysqlConsumerDroppedFlows; };
+   inline float exportRate()          const { return mysqlExportRate; };
+   static char *escapeAphostrophes(const char *unescaped);
+   int flow2InsertValues(Flow *f, char *json, char *values_buf, size_t values_buf_len) const;
+
+
+
+
+@@ -32,6 +32,7 @@ class SPSCQueue {
+   Mutex *m;
+     
+  public:
++
+   SPSCQueue(bool multi_consumer = false) {
+     q = (spsc_queue_t *) calloc(1, sizeof(spsc_queue_t));
+     if(q == NULL) throw 1;
+@@ -50,6 +51,18 @@ class SPSCQueue {
+ 
+   /* ************************************** */
+ 
++  inline bool isNotEmpty() {
++    u_int32_t next_tail;
++    bool rc;
++    if(m) m->lock(__FILE__, __LINE__); 
++    next_tail = (q->shadow_tail + 1) & QUEUE_ITEMS_MASK;
++    rc = (next_tail != q->head);
++    if(m) m->unlock(__FILE__, __LINE__);
++    return(rc);
++  }
++
++  /* ************************************** */
++
+   inline bool dequeue(void** item) {
+     u_int32_t next_tail;
+     bool rc;
+
+
+
+
+@@ -859,9 +859,11 @@ bool Flow::dumpFlow(bool dump_alert) {
+     }
+ 
+     if(!idle()) {
+-      if((now - get_first_seen()) < CONST_DB_DUMP_FREQUENCY
+-	 || (now - last_db_dump.last_dump) < CONST_DB_DUMP_FREQUENCY)
++      if(iface->getIfType() == interface_type_PCAP_DUMP
++         || (now - get_first_seen()) < CONST_DB_DUMP_FREQUENCY
++	 || (now - last_db_dump.last_dump) < CONST_DB_DUMP_FREQUENCY) {
+ 	return(rc);
++      }
+     } else {
+       /* flows idle, i.e., ready to be purged, are always dumped */
+     }
+
+
+
+
+@@ -473,7 +473,8 @@ bool MySQLDB::createNprobeDBView() {
+ /* ******************************************* */
+ 
+ MySQLDB::MySQLDB(NetworkInterface *_iface) : DB(_iface) {
+-  mysqlDroppedFlows = 0;
++  mysqlDroppedFlows = mysqlConsumerDroppedFlows = 0;
++  mysqlEnqueuedFlows = 0;
+   mysqlExportedFlows = 0, mysqlLastExportedFlows = 0;
+   mysqlExportRate = 0;
+   checkpointDroppedFlows = checkpointExportedFlows = 0;
+@@ -531,7 +532,7 @@ void MySQLDB::lua(lua_State *vm, bool since_last_checkpoint) const {
+   lua_push_uint64_table_entry(vm, "flow_export_count",
+ 			   mysqlExportedFlows - (since_last_checkpoint ? checkpointExportedFlows : 0));
+   lua_push_int32_table_entry(vm, "flow_export_drops",
+-			     mysqlDroppedFlows - (since_last_checkpoint ? checkpointDroppedFlows : 0));
++			     (mysqlDroppedFlows + mysqlConsumerDroppedFlows) - (since_last_checkpoint ? checkpointDroppedFlows : 0));
+   lua_push_float_table_entry(vm, "flow_export_rate",
+ 			     mysqlExportRate >= 0 ? mysqlExportRate : 0);
+ }
+
+
+
+
+@@ -586,8 +586,6 @@ NetworkInterface::~NetworkInterface() {
+   }
+ #endif
+ 
+-  if(db) db->shutdown();
+-
+   if(getNumPackets() > 0) {
+     ntop->getTrace()->traceEvent(TRACE_NORMAL,
+ 				 "Flushing host contacts for interface %s",
+@@ -597,7 +595,11 @@ NetworkInterface::~NetworkInterface() {
+ 
+   deleteDataStructures();
+ 
+-  if(db)             delete db;
++  if(db) {
++    /* note: keep this after deleteDataStructures to flush aggregated flows */
++    db->shutdown();
++    delete db;
++  }
+   if(host_pools)     delete host_pools;     /* note: this requires

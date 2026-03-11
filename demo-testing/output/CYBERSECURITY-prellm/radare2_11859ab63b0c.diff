@@ -1,0 +1,105 @@
+@@ -135,7 +135,7 @@ static bool init_func() {
+ 		RtlDestroyQueryDebugBuffer = (NTSTATUS (NTAPI *)(PDEBUG_BUFFER))GetProcAddress (ntdll, "RtlDestroyQueryDebugBuffer");
+ 	}
+ 	if (!w32_NtQueryInformationProcess) {
+-		w32_NtQueryInformationProcess = (NTSTATUS *)GetProcAddress (ntdll, "NtQueryInformationProcess");
++		w32_NtQueryInformationProcess = (NTSTATUS (NTAPI *)(HANDLE,PROCESSINFOCLASS,PVOID,ULONG,PULONG))GetProcAddress (ntdll, "NtQueryInformationProcess");
+ 	}
+ 	return true;
+ }
+@@ -184,10 +184,10 @@ static bool GetFirstHeapBlock(PDEBUG_HEAP_INFORMATION heapInfo, PHeapBlock hb) {
+ 		index++;
+ 	} while (block[index].flags & 2);
+ 
+-	hb->index = index;
+-
+ 	WPARAM flags = block[hb->index].flags;
+ 	UPDATE_FLAGS (hb, flags);
++	
++	hb->index = index;
+ 	return true;
+ }
+ 
+@@ -444,7 +444,7 @@ static PDEBUG_BUFFER InitHeapInfo(RDebug *dbg, DWORD mask) {
+ 	*params =  (th_query_params) { dbg, mask, db, 0, false, false };
+ 	HANDLE th = CreateThread (NULL, 0, __th_QueryDebugBuffer, params, 0, NULL);
+ 	if (th) {
+-		WaitForSingleObject (th, 10000);
++		WaitForSingleObject (th, 5000);
+ 	} else {
+ 		RtlDestroyQueryDebugBuffer (db);
+ 		return NULL;
+@@ -459,7 +459,7 @@ static PDEBUG_BUFFER InitHeapInfo(RDebug *dbg, DWORD mask) {
+ 	} else if (params->ret) {
+ 		RtlDestroyQueryDebugBuffer (db);
+ 		db = NULL;
+-		r_sys_perror ("InitHeapInfo");
++		r_sys_perror ("RtlQueryProcessDebugInformation");
+ 	}
+ 	CloseHandle (th);
+ 	if (db) {
+@@ -744,7 +744,6 @@ static PDEBUG_BUFFER GetHeapBlocks(DWORD pid, RDebug *dbg) {
+ 	PHeapInformation heapInfo = db->HeapInformation;
+ 	int i;
+ 	for (i = 0; i < heapInfo->count; i++) {
+-		size_t tot_allocated = 0;
+ 		WPARAM from = 0;
+ 		ut64 count = 0;
+ 		PDEBUG_HEAP_INFORMATION heap = &heapInfo->heaps[i];
+@@ -789,7 +788,6 @@ static PDEBUG_BUFFER GetHeapBlocks(DWORD pid, RDebug *dbg) {
+ 			extra->granularity = sizeof (HEAP_VIRTUAL_ALLOC_ENTRY);
+ 			extra->unusedBytes = vAlloc.ReserveSize - vAlloc.CommitSize;
+ 			blocks[count].extra = EXTRA_FLAG | (WPARAM)extra;
+-			tot_allocated += blocks[count].size - extra->granularity;
+ 			count++;
+ 			entry = vAlloc.Entry.Flink;
+ 		}
+@@ -861,7 +859,6 @@ static PDEBUG_BUFFER GetHeapBlocks(DWORD pid, RDebug *dbg) {
+ 							extra->granularity = sizeof (HEAP_ENTRY);
+ 							extra->segment = curSubsegment;
+ 							blocks[count].extra = EXTRA_FLAG | (WPARAM)extra;
+-							tot_allocated += blocks[count].size - extra->granularity;
+ 							count++;
+ 						}
+ 						mask <<= 1;
+@@ -912,7 +909,6 @@ next_subsegment:
+ 				blocks[count].flags = heapEntry.Flags | NT_BLOCK | BACKEND_BLOCK;
+ 				blocks[count].size = real_sz;
+ 				from += real_sz;
+-				tot_allocated += blocks[count].size - extra->granularity;
+ 				count++;
+ 			} while (from <= (WPARAM)segment.LastValidEntry);
+ next:
+@@ -925,7 +921,7 @@ next:
+ 
+ 		if (!heap->Committed && !heap->Allocated) {
+ 			heap->Committed = heapHeader.Counters.TotalMemoryCommitted;
+-			heap->Allocated = tot_allocated;
++			heap->Allocated = heapHeader.Counters.LastPolledSize;
+ 		}
+ 	}
+ 	CloseHandle (h_proc);
+@@ -1163,6 +1159,17 @@ err:
+ 	return NULL;
+ }
+ 
++static RTable *__new_heapblock_tbl() {
++	RTable *tbl = r_table_new ();
++	r_table_add_column (tbl, r_table_type ("number"), "HeaderAddress", -1);
++	r_table_add_column (tbl, r_table_type ("number"), "UserAddress", -1);
++	r_table_add_column (tbl, r_table_type ("number"), "Size", -1);
++	r_table_add_column (tbl, r_table_type ("number"), "Granularity", -1);
++	r_table_add_column (tbl, r_table_type ("number"), "Unused", -1);
++	r_table_add_column (tbl, r_table_type ("String"), "Type", -1);
++	return tbl;
++}
++
+ static void w32_list_heaps(RCore *core, const char format) {
+ 	ULONG pid = core->dbg->pid;
+ 	PDEBUG_BUFFER db = InitHeapInfo (core->dbg, PDI_HEAPS | PDI_HEAP_BLOCKS);
+@@ -1178,6 +1185,11 @@ static void w32_list_heaps(RCore *core, const char format) {
+ 	PHeapInformation heapInfo = db->HeapInformation;
+ 	CHECK_INFO (heapInfo);
+ 	int i;
++	RTable *tbl = r_table_new ();
++	r_table_add_column (tbl, r_table_type ("number"), "Address"

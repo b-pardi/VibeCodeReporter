@@ -1,0 +1,158 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,7 @@
++/* radare - LGPL - Copyright 2025 - MiKi (mikelloc) */
++
++#include <r_main.h>
++
++int main(int argc, const char **argv) {
++	return r_main_rafs2 (argc, argv);
++}
+
+
+
+
+@@ -40,6 +40,7 @@ R_API int r_main_ragg2(int argc, const char **argv);
+ R_API int r_main_rasign2(int argc, const char **argv);
+ R_API int r_main_r2pm(int argc, const char **argv);
+ R_API int r_main_rapatch2(int argc, const char **argv);
++R_API int r_main_rafs2(int argc, const char **argv);
+ 
+ #ifdef __cplusplus
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,320 @@
++/* radare - LGPL - Copyright 2025 - MiKi (mikelloc) */
++
++#define R_LOG_ORIGIN "rafs2"
++
++#include <r_main.h>
++#include <r_fs.h>
++#include <r_io.h>
++#include <r_cons.h>
++
++typedef struct {
++	RFS *fs;
++	RIO *io;
++	const char *fstype;
++	const char *file;
++	const char *mountpoint;
++	ut64 offset;
++	bool interactive;
++} Rafs2Options;
++
++static void rafs2_options_init(Rafs2Options *opt) {
++	memset(opt, 0, sizeof (Rafs2Options));
++	opt->mountpoint = "/";
++	opt->offset = 0;
++	opt->interactive = false;
++}
++
++static void rafs2_options_fini(Rafs2Options *opt) {
++	if (opt) {
++		r_fs_free(opt->fs);
++		r_io_free(opt->io);
++	}
++}
++
++static void show_usage(void) {
++	printf("Usage: rafs2 [options] -t <fstype> <file>\n"
++	       "Options:\n"
++	       "  -t <type>    Filesystem type (ext2, fat, ntfs, iso9660, hfs, ubifs, etc.)\n"
++	       "  -o <offset>  Offset to mount filesystem (default: 0)\n"
++	       "  -m <path>    Mount point path (default: /)\n"
++	       "  -i           Interactive mode (shell)\n"
++	       "  -l <path>    List directory contents\n"
++	       "  -c <file>    Cat file contents\n"
++	       "  -x <src:dst> Extract file from image to host\n"
++	       "  -n           Show filesystem details (like 'mn' command)\n"
++	       "  -L           List available filesystem types\n"
++	       "  -h           Show this help\n"
++	       "  -v           Show version\n"
++	       "\n"
++	       "Examples:\n"
++	       "  rafs2 -L\n"
++	       "  rafs2 -t ext2 -l / image.img\n"
++	       "  rafs2 -t fat -o 0x1000 -c /boot/config.txt disk.img\n"
++	       "  rafs2 -t ntfs -n filesystem.img\n"
++	       "  rafs2 -t iso9660 -i cdrom.iso\n"
++	       "  rafs2 -t ext2 -x /etc/passwd:passwd.txt image.img\n");
++}
++
++static int rafs2_list_plugins(void) {
++	RFS *fs = r_fs_new();
++	if (!fs) {
++		R_LOG_ERROR("Cannot create FS instance");
++		return 1;
++	}
++
++	printf("Available filesystem types:\n");
++	RListIter *iter;
++	RFSPlugin *plugin;
++	r_list_foreach (fs->plugins, iter, plugin) {
++		if (plugin->meta.name) {
++			const char *desc = plugin->meta.desc ? plugin->meta.desc : "";
++			printf("  %-12s %s\n", plugin->meta.name, desc);
++		}
++	}
++
++	r_fs_free(fs);
++	return 0;
++}
++
++static int rafs2_list(Rafs2Options *opt, const char *path) {
++	RList *list = r_fs_dir(opt->fs, path);
++	if (!list) {
++		R_LOG_ERROR("Cannot list directory: %s", path);
++		return 1;
++	}
++
++	RListIter *iter;
++	RFSFile *file;
++	r_list_foreach (list, iter, file) {
++		char type = file->type;
++		printf("%c %10u  %s\n", type, file->size, file->name);
++	}
++	r_list_free(list);
++	return 0;
++}
++
++static int rafs2_cat(Rafs2Options *opt, const char *path) {
++	RFSFile *file = r_fs_open(opt->fs, path, false);
++	if (!file) {
++		R_LOG_ERROR("Cannot open file: %s", path);
++		return 1;
++	}
++
++	if (file->size > 0) {
++		int len = r_fs_read(opt->fs, file, 0, file->size);
++		if (len > 0 && file->data) {
++			fwrite(file->data, 1, len, stdout);
++		}
++	}
++
++	r_fs_close(opt->fs, file);
++	return 0;
++}
++
++static int rafs2_details(Rafs2Options *opt) {
++	RList *roots = r_fs_root(opt->fs, opt->mountpoint);
++	if (!roots || r_list_empty(roots)) {
++		R_LOG_ERROR("No mounted filesystem found at %s", opt->mountpoint);
++		return 1;
++	}
++
++	RFSRoot *root = (RFSRoot *)r_list_get_n(roots, 0);
++	if (!root || !root->p || !root->p->details) {
++		R_LOG_ERROR("This filesystem doesn't support details");
++		return 1;
++	}
++
++	RStrBuf *sb = r_strbuf_new("");
++	root->p->details(root, sb);

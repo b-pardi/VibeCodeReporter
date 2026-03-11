@@ -1,0 +1,98 @@
+@@ -34,6 +34,10 @@ int64_t get_raw_value(const std::vector<uint8_t> &msg, const Signal &sig) {
+ 
+ 
+ bool MessageState::parse(uint64_t nanos, const std::vector<uint8_t> &dat) {
++  std::vector<double> tmp_vals(parse_sigs.size());
++  bool checksum_failed = false;
++  bool counter_failed = false;
++
+   for (int i = 0; i < parse_sigs.size(); i++) {
+     const auto &sig = parse_sigs[i];
+ 
+@@ -44,27 +48,29 @@ bool MessageState::parse(uint64_t nanos, const std::vector<uint8_t> &dat) {
+ 
+     //DEBUG("parse 0x%X %s -> %ld\n", address, sig.name, tmp);
+ 
+-    bool checksum_failed = false;
+     if (!ignore_checksum) {
+       if (sig.calc_checksum != nullptr && sig.calc_checksum(address, sig, dat) != tmp) {
+         checksum_failed = true;
+       }
+     }
+ 
+-    bool counter_failed = false;
+     if (!ignore_counter) {
+-      if (sig.type == SignalType::COUNTER) {
+-        counter_failed = !update_counter_generic(tmp, sig.size);
++      if (sig.type == SignalType::COUNTER && !update_counter_generic(tmp, sig.size)) {
++        counter_failed = true;
+       }
+     }
+ 
+-    if (checksum_failed || counter_failed) {
+-      LOGE("0x%X message checks failed, checksum failed %d, counter failed %d", address, checksum_failed, counter_failed);
+-      return false;
+-    }
++    tmp_vals[i] = tmp * sig.factor + sig.offset;
++  }
+ 
+-    // TODO: these may get updated if the invalid or checksum gets checked later
+-    vals[i] = tmp * sig.factor + sig.offset;
++  // only update values if both checksum and counter are valid
++  if (checksum_failed || counter_failed) {
++    LOGE("0x%X message checks failed, checksum failed %d, counter failed %d", address, checksum_failed, counter_failed);
++    return false;
++  }
++
++  for (int i = 0; i < parse_sigs.size(); i++) {
++    vals[i] = tmp_vals[i];
+     all_vals[i].push_back(vals[i]);
+   }
+   last_seen_nanos = nanos;
+
+
+
+
+@@ -121,6 +121,42 @@ class TestCanParserPacker(unittest.TestCase):
+     parser.update_strings([bts])
+     self.assertTrue(parser.can_valid)
+ 
++  def test_parser_no_partial_update(self):
++    """
++    Ensure that the CANParser doesn't partially update messages with invalid signals (COUNTER/CHECKSUM).
++    Previously, the signal update loop would only break once it got to one of these invalid signals,
++    after already updating most/all of the signals.
++    """
++    msgs = [
++      ("STEERING_CONTROL", 0),
++    ]
++    packer = CANPacker("honda_civic_touring_2016_can_generated")
++    parser = CANParser("honda_civic_touring_2016_can_generated", msgs, 0)
++
++    def rx_steering_msg(values, bad_checksum=False):
++      msg = packer.make_can_msg("STEERING_CONTROL", 0, values)
++      if bad_checksum:
++        # add 1 to checksum
++        msg[2] = bytearray(msg[2])
++        msg[2][4] = (msg[2][4] & 0xF0) | ((msg[2][4] & 0x0F) + 1)
++
++      bts = can_list_to_can_capnp([msg])
++      parser.update_strings([bts])
++
++    rx_steering_msg({"STEER_TORQUE": 100}, bad_checksum=False)
++    self.assertEqual(parser.vl["STEERING_CONTROL"]["STEER_TORQUE"], 100)
++    self.assertEqual(parser.vl_all["STEERING_CONTROL"]["STEER_TORQUE"], [100])
++
++    for _ in range(5):
++      rx_steering_msg({"STEER_TORQUE": 200}, bad_checksum=True)
++      self.assertEqual(parser.vl["STEERING_CONTROL"]["STEER_TORQUE"], 100)
++      self.assertEqual(parser.vl_all["STEERING_CONTROL"]["STEER_TORQUE"], [])
++
++    # Even if CANParser doesn't update instantaneous vl, make sure it didn't add invalid values to vl_all
++    rx_steering_msg({"STEER_TORQUE": 300}, bad_checksum=False)
++    self.assertEqual(parser.vl["STEERING_CONTROL"]["STEER_TORQUE"], 300)
++    self.assertEqual(parser.vl_all["STEERING_CONTROL"]["STEER_TORQUE"], [300])
++
+   def test_packer_parser(self):
+     msgs = [
+       ("Brake_Status", 0),

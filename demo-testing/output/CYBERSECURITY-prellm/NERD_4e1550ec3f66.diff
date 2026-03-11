@@ -1,0 +1,141 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,512 @@
++import sys
++import os
++import signal
++import datetime
++import logging
++import pandas
++import numpy as np
++import xgboost as xgb
++from collections import Counter
++from pymongo import UpdateOne
++from pymongo.errors import BulkWriteError
++from apscheduler.schedulers.background import BlockingScheduler
++
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
++import common.config
++import common.task_queue
++import core.mongodb
++from common.utils import ipstr2int, int2ipstr
++
++EWMA_ALPHA = 0.25 # a parameter (there's no strong reason for the value selected, I just feel that 0.25 gives reasonable weights for the 7 day long period)
++EWMA_WEIGHTS = [(EWMA_ALPHA * (1 - EWMA_ALPHA)**i) for i in range(7)]
++
++# Currently supported features:
++# [alert metadata]
++#  0 alerts_1d
++#  1 nodes_1d
++#  2 conns_1d
++#  3 alerts_7d
++#  4 nodes_7d
++#  5 conns_7d
++#  6 alerts_ewma
++#  7 conns_ewma
++#  8 binalerts_ewma
++#  9 last_alert_age
++# [prefix alert metadata]
++#  10 intervals_avg
++#  11 intervals_med
++#  12 prefix_alerts_1d
++#  13 prefix_nodes_1d
++#  14 prefix_conns_1d
++#  15 prefix_ips_1d
++#  16 prefix_alerts_7d
++#  17 prefix_nodes_7d
++#  18 prefix_conns_7d
++#  19 prefix_ips_7d
++#  20 prefix_alerts_ewma
++#  21 prefix_conns_ewma
++#  22 prefix_binalerts_ewma
++# [blacklists]
++#  23 tor
++#  24 blocklist-de-ssh
++#  25 uceprotect
++#  26 sorbs-dul
++#  27 sorbs-noserver
++#  28 sorbs-spam
++#  29 spamcop
++#  30 spamhaus-pbl
++#  31 spamhaus-pbl-isp
++#  32 spamhaus-xbl-cbl
++# [tags]
++#  33 hostname_exists
++#  34 dynamic_static
++#  35 dsl
++#  36 ip_in_hostname
++# [geolocation]
++#  37 ctry_badness
++#  38 asn_badness
++
++
++def stop(signal, frame):
++    scheduler.shutdown()
++
++
++def get_asn_sizes():
++    file_path = '/data/geo_data/GeoLite2-ASN-Blocks-IPv4.csv'
++    asn_size_map = Counter()
++
++    # Get total sizes of ASNs from GeoLite database
++    first_skipped = False
++    for line in open(file_path, encoding='utf-8'):
++        if not first_skipped:
++            assert line.startswith("network,autonomous_system_number,"), "Unexpected data in '{}'".format(sys.argv[1])
++            first_skipped = True
++            continue
++        if line.strip() == "":
++            continue
++        net,asn,_ = line.split(',', 2)
++        _,prefixlen = net.split('/')
++        size = 2**(32-int(prefixlen))
++        asn_size_map[asn] += size
++    return asn_size_map
++
++
++def get_ctry_sizes():
++    file_path = "/data/geo_data/GeoLite2-Country-Locations-en.csv"
++    ctry_size_map = Counter()
++    geoid_ctry_map = dict()
++
++    # Load mapping of geoid to country code
++    first_skipped=False
++    for line in open(file_path).readlines():
++        if not first_skipped:
++            assert line.startswith("geoname_id,"), "Unexpected data in '{}'".format(sys.argv[2])
++            first_skipped = True
++            continue
++        if line.strip() == "":
++            continue
++        geoid,_,_,_,ctry,_ = line.split(',', 5)
++        geoid_ctry_map[geoid] = ctry
++
++    # Get total sizes of countries from GeoLite database
++    file_path = "/data/geo_data/GeoLite2-Country-Blocks-IPv4.csv"
++    first_skipped = False
++    for line in open(file_path).readlines():
++        if not first_skipped:
++            assert line.startswith("network,geoname_id,"), "Unexpected data in '{}'".format(sys.argv[1])
++            first_skipped = True
++            continue
++        if line.strip() == "":
++            continue
++        net,geoid,geoid2,_,_,_ = line.split(',', 5)
++        if geoid == "":
++            geoid = geoid2
++        ctry = geoid_ctry_map.get(geoid, None)
++        if not ctry:
++            continue
++        _,prefixlen = net.split('/')
++        size = 2**(32-int(prefixlen))
++        ctry_size_map[ctry] += size
++    return ctry_size_map
++
++
++def get_badness(attr, value, records, geo_data):
++    if value not in geo_data['badness'][attr]:
++        total_entities_count = geo_data['sizes'][attr][value]
++   

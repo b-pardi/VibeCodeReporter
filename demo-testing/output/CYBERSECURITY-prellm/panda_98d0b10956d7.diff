@@ -1,0 +1,133 @@
+@@ -70,6 +70,11 @@ target_ulong panda_current_pc(CPUState *cpu);
+ 
+ // END_PYPANDA_NEEDS_THIS -- do not delete this comment!
+ 
++/**
++ * @brief Return the max address of system memory that maps to RAM.
++ */
++Int128 panda_find_max_ram_address(void);
++
+ /**
+  * @brief Reads/writes data into/from \p buf from/to guest physical address \p addr.
+  */
+
+
+
+
+@@ -47,8 +47,6 @@ PANDAENDCOMMENT */
+ // needed for the threaded stack_type
+ #include "osi/osi_types.h"
+ #include "osi/osi_ext.h"
+-#include "wintrospection/wintrospection.h"
+-#include "wintrospection/wintrospection_ext.h"
+ #include "osi_linux/osi_linux_ext.h"
+ 
+ #include "callstack_instr.h"
+
+
+
+
+@@ -22,7 +22,6 @@ PANDAENDCOMMENT */
+ #include "osi/osi_types.h"
+ #include "osi/osi_ext.h"
+ 
+-#include "wintrospection/wintrospection.h"
+ #include "wintrospection/wintrospection_ext.h"
+ 
+ #include "osi_linux/osi_linux_ext.h"
+@@ -207,7 +206,7 @@ void windows_read_enter(CPUState *cpu, target_ulong pc, uint32_t FileHandle,
+                         uint32_t ByteOffset, uint32_t Key)
+ {
+     // get_handle_name will assert if the filename is null
+-    char *filename = get_handle_name(cpu, get_current_proc(cpu), FileHandle);
++    char *filename = get_handle_name(cpu, FileHandle);
+     std::string ob_path = filename;
+     // Check if the file handle is absolute, if not we need to make it absolute.
+     if (filename[0] != '\\') {
+@@ -221,7 +220,7 @@ void windows_read_enter(CPUState *cpu, target_ulong pc, uint32_t FileHandle,
+         g_free(cwd);
+     }
+     verbose_printf("file_taint windows object path: %s\n", ob_path.c_str());
+-    int64_t pos = get_file_handle_pos(cpu, get_current_proc(cpu), FileHandle);
++    int64_t pos = get_file_handle_pos(cpu, FileHandle);
+     read_enter(ob_path, FileHandle, pos);
+     g_free(filename);
+ }
+
+
+
+
+@@ -1068,7 +1068,7 @@ bool init_plugin(void *self) {
+             std::cerr << PANDA_MSG "using profile for windows sp3 x86 32-bit" << std::endl;
+             syscalls_profile = &profiles[PROFILE_WINDOWS_XPSP3_X86];
+         }
+-        if (0 == strcmp(panda_os_variant, "7")) {
++        if (0 == strncmp(panda_os_variant, "7", 1)) {
+             std::cerr << PANDA_MSG "using profile for windows 7 x86 32-bit" << std::endl;
+             syscalls_profile = &profiles[PROFILE_WINDOWS_7_X86];
+         }
+
+deleted file mode 100644
+
+
+
+@@ -1,156 +0,0 @@
+-/* PANDABEGINCOMMENT
+- *
+- * Authors:
+- *  Tim Leek               tleek@ll.mit.edu
+- *  Ryan Whelan            rwhelan@ll.mit.edu
+- *  Joshua Hodosh          josh.hodosh@ll.mit.edu
+- *  Michael Zhivich        mzhivich@ll.mit.edu
+- *  Brendan Dolan-Gavitt   brendandg@gatech.edu
+- *
+- * This work is licensed under the terms of the GNU GPL, version 2.
+- * See the COPYING file in the top-level directory.
+- *
+-PANDAENDCOMMENT */
+-#define __STDC_FORMAT_MACROS
+-
+-#include <glib.h>
+-#include "panda/plugin.h"
+-#include "panda/plugin_plugin.h"
+-
+-extern "C" {
+-
+-#include "osi/osi_types.h"
+-#include "osi/os_intro.h"
+-
+-#include "qemu/rcu.h"
+-#include "qemu/rcu_queue.h"
+-
+-#include "exec/address-spaces.h"
+-
+-#include "wintrospection/wintrospection.h"
+-#include "wintrospection/wintrospection_ext.h"
+-
+-bool init_plugin(void *);
+-void uninit_plugin(void *);
+-void on_get_mappings(CPUState *cpu, OsiProc *p, GArray **out);
+-PTR get_win2000_kpcr(CPUState *cpu);
+-HandleObject *get_win2000_handle_object(CPUState *cpu, uint32_t eproc, uint32_t handle);
+-PTR get_win2000_kddebugger_data(CPUState *cpu);
+-}
+-
+-#include <cstdio>
+-#include <cstdlib>
+-
+-#ifdef TARGET_I386
+-
+-#define HANDLE_TABLE_L1_OFF    0x008    // _HANDLE_TABLE.Layer1
+-#define KDDEBUGGER_DATA_SIZE   0x208
+-
+-#define HANDLE_LOCK_FLAG 0x80000000
+-
+-// Windows 2000 has a fixed location for the KPCR
+-PTR get_win2000_kpcr(CPUState *cpu) {
+-    return 0xFFDFF000;
+-}
+-
+-// i.e. return pointer to the object represented by this handle
+-static uint32_t get_handle_table_entry(CPUState *cpu, uint32_t pHandleTable, uint32_t handle) {
+-    uint32_t L1_index = (handle & HANDLE_MASK3) >> HANDLE_SHIFT3;
+-   

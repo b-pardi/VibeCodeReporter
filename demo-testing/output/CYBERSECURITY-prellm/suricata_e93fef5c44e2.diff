@@ -1,0 +1,133 @@
+@@ -43,6 +43,9 @@
+ #include "decode-events.h"
+ #include "conf.h"
+ 
++#include "util-crypt.h"
++#include "util-decode-der.h"
++#include "util-decode-der-get.h"
+ #include "util-spm.h"
+ #include "util-unittest.h"
+ #include "util-debug.h"
+@@ -139,6 +142,8 @@ SslConfig ssl_config;
+ 
+ #define SSL_RECORD_MINIMUM_LENGTH       6
+ 
++#define SHA1_STRING_LENGTH             60
++
+ #define HAS_SPACE(n) ((uint32_t)((input) + (n) - (initial_input)) > (uint32_t)(input_len)) ?  0 : 1
+ 
+ static void SSLParserReset(SSLState *ssl_state)
+@@ -255,6 +260,250 @@ static void SSLSetTxDetectFlags(void *vtx, uint8_t dir, uint64_t flags)
+     }
+ }
+ 
++static void TlsDecodeHSCertificateErrSetEvent(SSLState *ssl_state, uint32_t err)
++{
++    switch (err) {
++        case ERR_DER_UNKNOWN_ELEMENT:
++            SSLSetEvent(ssl_state,
++                        TLS_DECODER_EVENT_CERTIFICATE_UNKNOWN_ELEMENT);
++            break;
++        case ERR_DER_ELEMENT_SIZE_TOO_BIG:
++        case ERR_DER_INVALID_SIZE:
++        case ERR_DER_RECURSION_LIMIT:
++            SSLSetEvent(ssl_state,
++                        TLS_DECODER_EVENT_CERTIFICATE_INVALID_LENGTH);
++            break;
++        case ERR_DER_UNSUPPORTED_STRING:
++            SSLSetEvent(ssl_state,
++                        TLS_DECODER_EVENT_CERTIFICATE_INVALID_STRING);
++            break;
++        case ERR_DER_MISSING_ELEMENT:
++            SSLSetEvent(ssl_state,
++                        TLS_DECODER_EVENT_CERTIFICATE_MISSING_ELEMENT);
++            break;
++        case ERR_DER_INVALID_TAG:
++        case ERR_DER_INVALID_OBJECT:
++        case ERR_DER_GENERIC:
++        default:
++            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_CERTIFICATE);
++            break;
++    }
++}
++
++static inline int TlsDecodeHSCertificateSubject(SSLState *ssl_state,
++                                                Asn1Generic *cert)
++{
++    if (unlikely(ssl_state->server_connp.cert0_subject != NULL))
++        return 0;
++
++    uint32_t err = 0;
++    char buffer[512];
++
++    int rc = Asn1DerGetSubjectDN(cert, buffer, sizeof(buffer), &err);
++    if (rc != 0) {
++        TlsDecodeHSCertificateErrSetEvent(ssl_state, err);
++        return 0;
++    }
++
++    ssl_state->server_connp.cert0_subject = SCStrdup(buffer);
++    if (ssl_state->server_connp.cert0_subject == NULL)
++        return -1;
++
++    return 0;
++}
++
++static inline int TlsDecodeHSCertificateIssuer(SSLState *ssl_state,
++                                               Asn1Generic *cert)
++{
++    if (unlikely(ssl_state->server_connp.cert0_issuerdn != NULL))
++        return 0;
++
++    uint32_t err = 0;
++    char buffer[512];
++
++    int rc = Asn1DerGetIssuerDN(cert, buffer, sizeof(buffer), &err);
++    if (rc != 0) {
++        TlsDecodeHSCertificateErrSetEvent(ssl_state, err);
++        return 0;
++    }
++
++    ssl_state->server_connp.cert0_issuerdn = SCStrdup(buffer);
++    if (ssl_state->server_connp.cert0_issuerdn == NULL)
++        return -1;
++
++    return 0;
++}
++
++static inline int TlsDecodeHSCertificateSerial(SSLState *ssl_state,
++                                               Asn1Generic *cert)
++{
++    if (unlikely(ssl_state->server_connp.cert0_serial != NULL))
++        return 0;
++
++    uint32_t err = 0;
++    char buffer[512];
++
++    int rc = Asn1DerGetSerial(cert, buffer, sizeof(buffer), &err);
++    if (rc != 0) {
++        TlsDecodeHSCertificateErrSetEvent(ssl_state, err);
++        return 0;
++    }
++
++    ssl_state->server_connp.cert0_serial = SCStrdup(buffer);
++    if (ssl_state->server_connp.cert0_serial == NULL)
++        return -1;
++
++    return 0;
++}
++
++static inline int TlsDecodeHSCertificateValidity(SSLState *ssl_state,
++                                                 Asn1Generic *cert)
++{
++    uint32_t err = 0;
++    time_t not_before;
++    time_t not_after;
++
++    int rc = Asn1DerGetValidity(cert, &not_before, &not_after, &err);
++    if (rc != 0) {
++        TlsDecodeHSCertificateErrSetEvent(ssl_state, err);
++        return 0;
++    }
++
++    ssl_state->server_connp.cert0_not_before = not_be

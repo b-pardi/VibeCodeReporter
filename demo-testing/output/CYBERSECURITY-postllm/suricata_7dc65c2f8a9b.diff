@@ -1,0 +1,128 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,248 @@
++/* Copyright (C) 2007-2024 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Lukas Sismis <lsismis@oisf.net>
++ *
++ * MPM pattern matcher that calls the Hyperscan regex matcher.
++ */
++
++#include "suricata-common.h"
++#include "suricata.h"
++#include "detect-engine.h"
++#include "util-debug.h"
++#include "util-hash-lookup3.h"
++#include "util-mpm-hs-core.h"
++#include "util-mpm-hs-cache.h"
++#include "util-path.h"
++
++#ifdef BUILD_HYPERSCAN
++
++#include <hs.h>
++
++static const char *HSCacheConstructFPath(const char *folder_path, uint64_t hs_db_hash)
++{
++    static char hash_file_path[PATH_MAX];
++
++    char hash_file_path_suffix[] = "_v1.hs";
++    char filename[PATH_MAX];
++    uint64_t r =
++            snprintf(filename, sizeof(filename), "%020lu%s", hs_db_hash, hash_file_path_suffix);
++    if (r != (uint64_t)(20 + strlen(hash_file_path_suffix)))
++        return NULL;
++
++    r = PathMerge(hash_file_path, sizeof(hash_file_path), folder_path, filename);
++    if (r)
++        return NULL;
++
++    return hash_file_path;
++}
++
++static char *HSReadStream(const char *file_path, size_t *buffer_sz)
++{
++    FILE *file = fopen(file_path, "rb");
++    if (!file) {
++        SCLogDebug("Failed to open file %s: %s", file_path, strerror(errno));
++        return NULL;
++    }
++
++    // Seek to the end of the file to determine its size
++    fseek(file, 0, SEEK_END);
++    long file_sz = ftell(file);
++    if (file_sz < 0) {
++        SCLogDebug("Failed to determine file size of %s: %s", file_path, strerror(errno));
++        fclose(file);
++        return NULL;
++    }
++
++    char *buffer = (char *)SCCalloc(file_sz, sizeof(char));
++    if (!buffer) {
++        SCLogWarning("Failed to allocate memory");
++        fclose(file);
++        return NULL;
++    }
++
++    // Rewind file pointer and read the file into the buffer
++    rewind(file);
++    size_t bytes_read = fread(buffer, 1, file_sz, file);
++    if (bytes_read != (size_t)file_sz) {
++        SCLogDebug("Failed to read the entire file %s: %s", file_path, strerror(errno));
++        SCFree(buffer);
++        fclose(file);
++        return NULL;
++    }
++
++    *buffer_sz = file_sz;
++    fclose(file);
++    return buffer;
++}
++
++/**
++ * Function to hash the searched pattern, only things relevant to Hyperscan
++ * compilation are hashed.
++ */
++static void SCHSCachePatternHash(const SCHSPattern *p, uint32_t *h1, uint32_t *h2)
++{
++    BUG_ON(p->original_pat == NULL);
++    BUG_ON(p->sids == NULL);
++
++    hashlittle2_safe(&p->len, sizeof(p->len), h1, h2);
++    hashlittle2_safe(&p->flags, sizeof(p->flags), h1, h2);
++    hashlittle2_safe(p->original_pat, p->len, h1, h2);
++    hashlittle2_safe(&p->id, sizeof(p->id), h1, h2);
++    hashlittle2_safe(&p->offset, sizeof(p->offset), h1, h2);
++    hashlittle2_safe(&p->depth, sizeof(p->depth), h1, h2);
++    hashlittle2_safe(&p->sids_size, sizeof(p->sids_size), h1, h2);
++    hashlittle2_safe(p->sids, p->sids_size * sizeof(SigIntId), h1, h2);
++}
++
++int HSLoadCache(hs_database_t **hs_db, uint64_t hs_db_hash, const char *dirpath)
++{
++    const char *hash_file_static = HSCacheConstructFPath(dirpath, hs_db_hash);
++    if (hash_file_static == NULL)
++        return -1;
++
++    SCLogDebug("Loading the cached HS DB from %s", hash_file_static);
++    if (!SCPathExists(hash_file_static))
++     

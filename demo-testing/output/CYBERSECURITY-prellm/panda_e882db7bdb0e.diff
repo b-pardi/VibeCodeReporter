@@ -1,0 +1,147 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,53 @@
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu-common.h"
++#include "sysemu/char.h"
++#include "char-panda.h"
++
++static void chardev_open(Chardev *chr, ChardevBackend *backend,
++                             bool *be_opened, Error **errp)
++{
++    *be_opened = false;
++}
++
++// Response to command comes in here
++static int chardev_monitor_write(Chardev *chr, const uint8_t *buf, int len)
++{
++  //printf("Panda chardev recving message: %s\n", buf);
++  // store buffer in PandaChardev's buf
++  PandaChardev *s = PANDA_CHARDEV(chr);
++  char *b = (char*)malloc(len+1);
++  memcpy(b, buf, len);
++  s->buf = b;
++  s->buf[len] =0;
++  return 0;
++}
++
++static void fd_chr_update_read_handler(Chardev *chr,
++                                       GMainContext *context)
++{
++  PandaChardev *s = PANDA_CHARDEV(chr);
++  s->buf = NULL; // Zero results buffer. TODO: memory leak?
++}
++
++static void char_panda_class_init(ObjectClass *oc, void *data)
++{
++  ChardevClass *cc = CHARDEV_CLASS(oc);
++  cc->internal = true;
++  cc->chr_write = chardev_monitor_write;
++  cc->open = chardev_open;
++  cc->chr_update_read_handler = fd_chr_update_read_handler;
++}
++
++static const TypeInfo char_panda_type_info = {
++    .name = TYPE_CHARDEV_PANDA,
++    .parent = TYPE_CHARDEV,
++    .class_init = char_panda_class_init,
++};
++
++static void register_types(void)
++{
++    type_register_static(&char_panda_type_info);
++}
++
++type_init(register_types);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,17 @@
++#ifndef CHAR_PD_H
++#define CHAR_PD_H
++
++#include "io/channel.h"
++#include "sysemu/char.h"
++
++typedef struct PandaChardev {
++    Chardev parent;
++    Chardev *chr;
++    char *buf;
++} PandaChardev;
++
++#define TYPE_CHARDEV_PANDA "chardev-panda"
++
++#define PANDA_CHARDEV(obj) OBJECT_CHECK(PandaChardev, (obj), TYPE_CHARDEV_PANDA)
++// Only defined functions are static so no need to describe them here
++#endif /* CHAR_PD_H */
+
+
+
+
+@@ -34,6 +34,7 @@
+ #endif
+ #include "sysemu/cpus.h"
+ #include "sysemu/replay.h"
++#include "sysemu/sysemu.h"
+ #include "panda/rr/rr_log.h"
+ #include "panda/callback_support.h"
+ #include "panda/common.h"
+@@ -47,7 +48,7 @@ int generate_llvm = 0;
+ int execute_llvm = 0;
+ extern bool panda_tb_chaining;
+ 
+-extern bool panda_exit_loop;
++bool panda_stopped;
+ 
+ /* -icount align implementation. */
+ 
+@@ -185,7 +186,13 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+ 
+     cpu->can_do_io = !use_icount;
+ 
+-    panda_callbacks_before_block_exec(cpu, itb);
++    if (cpu->tcg_exit_req == 0)
++        panda_callbacks_before_block_exec(cpu, itb);
++
++    if (panda_break_cpu_loop_req) {;
++        cpu->can_do_io = 1;
++        return TB_EXIT_REQUESTED;
++    }
+ 
+     // NB: This is where we did this in panda1
+     panda_bb_invalidate_done = false;
+@@ -211,6 +218,13 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+     exitCode = (uint8_t)tb_exit;
+     panda_callbacks_after_block_exec(cpu, itb, exitCode);
+ 
++    // if we were asked to exit that last bb *and* didn't actually
++    // execute any of the guest code, then we shouldn't run the
++    // after-block panda callbacks
++    if (!(tb_exit == TB_EXIT_REQUESTED
++          && last_tb->pc == itb->pc))
++        panda_callbacks_after_block_exec(cpu, itb, exitCode);
++
+     trace_exec_tb_exit(last_tb, tb_exit);
+ 
+     if (tb_exit > TB_EXIT_IDX1) {
+@@ -500,7 +514,8 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
+         cpu_breakpoint_remove_by_instr(cpu, cpu->last_gdb_instr-1, BP_GDB);
+         cpu->reverse_flags = 0;
+     }
+-    
++
++    cpu->exception_index = panda_callbacks_before_handle_exception(cpu, cpu->exception_index);
+ 
+     if (cpu->exception_index >= 0) {
+         if (cpu->exception_index >= EXCP_INTERRUPT) {
+@@ -788,14 +803,17 @@ int cpu_exec(CPUState *cpu)
+     /* if an exception is pending, we execute it here */
+     while (!cpu_handle_exception(cpu, &ret)) {
+ 
+-        if (panda_exit_loop) break;
++     

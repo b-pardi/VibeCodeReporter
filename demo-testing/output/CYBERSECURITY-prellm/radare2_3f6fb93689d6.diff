@@ -1,0 +1,96 @@
+@@ -5,6 +5,8 @@
+ #include <r_util.h>
+ #include <r_list.h>
+ 
++extern int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut64 ip, ut64 jmptbl_loc, ut64 jmptbl_off, ut64 sz, int jmptbl_size, ut64 default_case, int ret0);
++extern bool try_get_delta_jmptbl_info(RAnal *anal, RAnalFunction *fcn, ut64 jmp_addr, ut64 lea_addr, ut64 *table_size, ut64 *default_case);
+ #define USE_SDB_CACHE 0
+ #define READ_AHEAD 1
+ #define SDB_KEY_BB "bb.0x%"PFMT64x ".0x%"PFMT64x
+@@ -458,187 +460,6 @@ static RAnalBlock *appendBasicBlock(RAnal *anal, RAnalFunction *fcn, ut64 addr)
+ 		return R_ANAL_RET_ERROR;\
+ 	}
+ 
+-static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth);
+-
+-static int fcn_recurse_at(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth) {
+-	int ret = fcn_recurse (anal, fcn, addr, anal->opt.bb_max_size, depth - 1);
+-	r_anal_fcn_update_tinyrange_bbs (fcn);
+-	r_anal_fcn_set_size (anal, fcn, r_anal_fcn_size (fcn));
+-	return ret;
+-}
+-
+-#define recurseAt(x) {\
+-	ret = fcn_recurse (anal, fcn, x, anal->opt.bb_max_size, depth - 1);\
+-	r_anal_fcn_update_tinyrange_bbs (fcn);\
+-	r_anal_fcn_set_size (anal, fcn, r_anal_fcn_size (fcn));\
+-}
+-
+-static void queue_case(RAnal *anal, ut64 switch_addr, int offset_sz, ut64 case_addr, ut64 id, ut64 case_addr_loc) {
+-	// eprintf ("** queue_case: 0x%"PFMT64x " from 0x%"PFMT64x "\n", case_addr, case_addr_loc);
+-	anal->cmdtail = r_str_appendf (anal->cmdtail,
+-		"Cd %d @ 0x%08"PFMT64x"\n", offset_sz, case_addr_loc);
+-	anal->cmdtail = r_str_appendf (anal->cmdtail,
+-		"ahi 10 @ 0x%08"PFMT64x"\n", case_addr_loc);
+-	anal->cmdtail = r_str_appendf (anal->cmdtail,
+-		"axc 0x%"PFMT64x " 0x%"PFMT64x "\n",
+-		(ut64)case_addr, (ut64)switch_addr);
+-	anal->cmdtail = r_str_appendf (anal->cmdtail,
+-		"afbe 0x%"PFMT64x " 0x%"PFMT64x "\n",
+-		(ut64)switch_addr, (ut64)case_addr);
+-	// anal->cmdtail = r_str_appendf (anal->cmdtail,
+-	// 	"aho case %d: from 0x%"PFMT64x " @ 0x%"PFMT64x "\n",
+-	// 	id, switch_addr, case_addr_loc);
+-	// anal->cmdtail = r_str_appendf (anal->cmdtail,
+-	// 	"CCu case %d: @ 0x%"PFMT64x "\n",
+-	// 	id, case_addr);
+-	anal->cmdtail = r_str_appendf (anal->cmdtail,
+-		"f case.0x%"PFMT64x ".%d 1 @ 0x%08"PFMT64x "\n",
+-		(ut64)switch_addr, (int)id, (ut64)case_addr);
+-}
+-
+-// TODO: find a better function name
+-static int walkthrough_arm_jmptbl_style(RAnal *anal, RAnalFunction *fcn, int depth, ut64 ip, ut64 jmptbl_loc, ut64 sz, ut64 jmptbl_size, ut64 default_case, int ret0) {
+-	/*
+-	 * Example about arm jump table
+-	 *
+-	 * 0x000105b4      060050e3       cmp r0, 3
+-	 * 0x000105b8      00f18f90       addls pc, pc, r0, lsl 2
+-	 * 0x000105bc      0d0000ea       b loc.000105f8
+-	 * 0x000105c0      050000ea       b 0x105dc
+-	 * 0x000105c4      050000ea       b 0x105e0
+-	 * 0x000105c8      060000ea       b 0x105e8
+-	 * ; CODE XREF from loc._a_7 (+0x10)
+-	 * 0x000105dc      b6ffffea       b sym.input_1
+-	 * ; CODE XREF from loc._a_7 (+0x14)
+-	 * 0x000105e0      b9ffffea       b sym.input_2
+-	 * ; CODE XREF from loc._a_7 (+0x28)
+-	 * 0x000105e4      ccffffea       b sym.input_7
+-	 * ; CODE XREF from loc._a_7 (+0x18)
+-	 * 0x000105e8      bbffffea       b sym.input_3
+-	 */
+-
+-	ut64 offs, jmpptr;
+-	int ret = ret0;
+-
+-	if (jmptbl_size == 0) {
+-		jmptbl_size = JMPTBLSZ;
+-	}
+-
+-	for (offs = 0; offs + sz - 1 < jmptbl_size * sz; offs += sz) {
+-		jmpptr = jmptbl_loc + offs;
+-		queue_case (anal, ip, sz, jmpptr, offs / sz, jmptbl_loc + offs);
+-		recurseAt (jmpptr);
+-	}
+-
+-	if (offs > 0) {
+-		// eprintf("\n\nSwitch statement at 0x%llx:\n", ip);
+-		anal->cmdtail = r_str_appendf (anal->cmdtail,
+-			"CCu switch table (%d cases) at 0x%"PFMT64x " @ 0x%"PFMT64x "\n",
+-			offs / sz, jmptbl_loc, ip);
+-		anal->cmdtail = r_str_appendf (anal->cmdtail,
+-			"f switch.0x%08"PFMT64x" 1 @ 0x%08"PFMT64x"\n",
+-			ip, ip);
+-		if (default_case != 0 && default_case != UT64_MAX && default_case != UT32_MAX) {
+-			anal->cmdtail = r_str_appendf (anal->cmdtail,
+-				"f case.default.0x%"PFMT64x " 1 @ 0x%

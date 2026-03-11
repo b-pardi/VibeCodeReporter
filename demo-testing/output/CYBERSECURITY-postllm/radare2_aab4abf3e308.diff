@@ -1,0 +1,129 @@
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2009-2024 - pancake, nibble, dso */
++/* radare2 - LGPL - Copyright 2009-2025 - pancake, nibble, dso */
+ 
+ #define R_LOG_ORIGIN "bin.obj"
+ 
+@@ -60,23 +60,10 @@ static void object_delete_items(RBinObject *o) {
+ 		RVecRBinImport_fini (&o->imports_vec);
+ 	}
+ 	if (!RVecRBinSymbol_empty (&o->symbols_vec)) {
+-		/* explicit deep cleanup for symbols */
+-		RBinSymbol *sym;
+-		R_VEC_FOREACH (&o->symbols_vec, sym) {
+-			if (sym) {
+-				if (sym->name) {
+-					r_bin_name_free (sym->name);
+-					sym->name = NULL;
+-				}
+-				free (sym->libname);
+-				sym->libname = NULL;
+-				free (sym->classname);
+-				sym->classname = NULL;
+-			}
+-		}
++		/* explicit deep cleanup for symbols via fini which calls r_bin_symbol_fini */
+ 		RVecRBinSymbol_fini (&o->symbols_vec);
+ 		if (o->symbols) {
+-			o->symbols->free = NULL;
++			o->symbols->free = NULL; /* shared pointers, already freed by vec fini */
+ 		}
+ 	}
+ 	r_list_free (o->symbols);
+@@ -484,11 +471,11 @@ R_API int r_bin_object_set_items(RBinFile *bf, RBinObject *bo) {
+ 	}
+ 	if (bin->filter_rules & (R_BIN_REQ_RELOCS | R_BIN_REQ_IMPORTS)) {
+ 		if (p->relocs) {
+-			RList *l = (RList *)p->relocs (bf); // XXX this is an internal list (should be a vector), and shouldnt be freed by the caller
++			RList *l = (RList *)p->relocs (bf);
+ 			if (l) {
+ 				REBASE_PADDR (bo, l, RBinReloc);
+ 				bo->relocs = list2rbtree ((RList*)l);
+-				l->free = NULL; // may leak or crash
++				l->free = NULL; // owned by tree now, via clone with proper cleanup
+ 				r_list_free (l);
+ 			}
+ 		}
+
+
+
+
+@@ -5474,10 +5474,10 @@ void Elf_(free)(ELFOBJ* eo) {
+ 	eo->phdr_symbols_vec = NULL;
+ 	RVecRBinElfSymbol_free (eo->phdr_imports_vec);
+ 	eo->phdr_imports_vec = NULL;
+-#if INVALID_FREE_OR_LEAK
+ 	RVecRBinElfSymbol_free (eo->g_symbols_vec);
++	eo->g_symbols_vec = NULL;
+ 	RVecRBinElfSymbol_free (eo->g_imports_vec);
+-#endif
++	eo->g_imports_vec = NULL;
+ #if 0
+ 	// R2_590
+ 	r_vector_free (eo->g_symbols);
+
+
+
+
+@@ -38,8 +38,8 @@ static void setimpord(ELFOBJ* eo, ut32 ord, RBinImport *ptr) {
+ 	if (!eo->imports_by_ord || ord >= eo->imports_by_ord_size) {
+ 		return;
+ 	}
+-	// leak or uaf wtf
+-	// r_bin_import_free (eo->imports_by_ord[ord]);
++	r_bin_import_free (eo->imports_by_ord[ord]);
++	// Clone so this array owns a separate copy from the imports list
+ 	eo->imports_by_ord[ord] = r_bin_import_clone (ptr);
+ }
+ 
+@@ -363,6 +363,12 @@ static bool symbols_vec(RBinFile *bf) {
+ 			break;
+ 		}
+ 		RVecRBinSymbol_push_back (list, ptr);
++		// Vector copies the struct, but pointers are shallow copies
++		// Only free the wrapper, not the contents
++		ptr->name = NULL;
++		ptr->libname = NULL;
++		ptr->classname = NULL;
++		r_bin_symbol_free (ptr);
+ 	}
+ 
+ 	// traverse imports
+@@ -394,6 +400,12 @@ static bool symbols_vec(RBinFile *bf) {
+ 			ptr->vaddr = 0;
+ 		}
+ 		RVecRBinSymbol_push_back (list, ptr);
++		// Vector copies the struct, but pointers are shallow copies
++		// Only free the wrapper, not the contents
++		ptr->name = NULL;
++		ptr->libname = NULL;
++		ptr->classname = NULL;
++		r_bin_symbol_free (ptr);
+ 	}
+ 	return true;
+ #endif
+@@ -482,7 +494,9 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
+ 	}
+ 	if (rel->sym) {
+ 		if (rel->sym < eo->imports_by_ord_size && eo->imports_by_ord[rel->sym]) {
+-			r->import = eo->imports_by_ord[rel->sym];
++			// Clone the import so relocations own their own copy
++			// This avoids UAF if imports are modified later
++			r->import = r_bin_import_clone (eo->imports_by_ord[rel->sym]);
+ 		} else if (rel->sym < eo->symbols_by_ord_size && eo->symbols_by_ord[rel->sym]) {
+ 			r->symbol = eo->symbols_by_ord[rel->sym];
+ 		}
+@@ -867,6 +881,13 @@ static ut32 murmur3_32(const char* data, ut32 len, ut32 seed) {
+ 	return hash;
+ }
+ 
++static void _r_bin_elf_reloc_free(RBinReloc *reloc) {
++	if (reloc) {
++		r_bin_import_free (reloc->import);
++		free (reloc);
++	}
++}
++
+ static RList* relocs(RBinFile *bf) {
+ 	R_RETURN_VAL_IF_FAIL (bf && bf->bo && bf->bo->bin_obj, NULL);
+ 	ELFOBJ *eo = 

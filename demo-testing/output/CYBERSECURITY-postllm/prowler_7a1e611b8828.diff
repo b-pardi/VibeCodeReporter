@@ -1,0 +1,106 @@
+@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
+ from django.conf import settings
+ from django.contrib.auth.models import BaseUserManager
+ from django.db import connection, models, transaction
++from django_celery_beat.models import PeriodicTask
+ from psycopg2 import connect as psycopg2_connect
+ from psycopg2.extensions import AsIs, new_type, register_adapter, register_type
+ from rest_framework_json_api.serializers import ValidationError
+@@ -105,11 +106,12 @@ def generate_random_token(length: int = 14, symbols: str | None = None) -> str:
+     return "".join(secrets.choice(symbols or _symbols) for _ in range(length))
+ 
+ 
+-def batch_delete(queryset, batch_size=5000):
++def batch_delete(tenant_id, queryset, batch_size=5000):
+     """
+     Deletes objects in batches and returns the total number of deletions and a summary.
+ 
+     Args:
++        tenant_id (str): Tenant ID the queryset belongs to.
+         queryset (QuerySet): The queryset of objects to delete.
+         batch_size (int): The number of objects to delete in each batch.
+ 
+@@ -120,15 +122,16 @@ def batch_delete(queryset, batch_size=5000):
+     deletion_summary = {}
+ 
+     while True:
+-        # Get a batch of IDs to delete
+-        batch_ids = set(
+-            queryset.values_list("id", flat=True).order_by("id")[:batch_size]
+-        )
+-        if not batch_ids:
+-            # No more objects to delete
+-            break
++        with rls_transaction(tenant_id, POSTGRES_TENANT_VAR):
++            # Get a batch of IDs to delete
++            batch_ids = set(
++                queryset.values_list("id", flat=True).order_by("id")[:batch_size]
++            )
++            if not batch_ids:
++                # No more objects to delete
++                break
+ 
+-        deleted_count, deleted_info = queryset.filter(id__in=batch_ids).delete()
++            deleted_count, deleted_info = queryset.filter(id__in=batch_ids).delete()
+ 
+         total_deleted += deleted_count
+         for model_label, count in deleted_info.items():
+@@ -137,6 +140,18 @@ def batch_delete(queryset, batch_size=5000):
+     return total_deleted, deletion_summary
+ 
+ 
++def delete_related_daily_task(provider_id: str):
++    """
++    Deletes the periodic task associated with a specific provider.
++
++    Args:
++        provider_id (str): The unique identifier for the provider
++                           whose related periodic task should be deleted.
++    """
++    task_name = f"scan-perform-scheduled-{provider_id}"
++    PeriodicTask.objects.filter(name=task_name).delete()
++
++
+ # Postgres Enums
+ 
+ 
+
+
+
+
+@@ -1,12 +1,12 @@
+ from celery import states
+ from celery.signals import before_task_publish
++from config.celery import celery_app
+ from django.db.models.signals import post_delete
+ from django.dispatch import receiver
+-from django_celery_beat.models import PeriodicTask
+ from django_celery_results.backends.database import DatabaseBackend
+ 
++from api.db_utils import delete_related_daily_task
+ from api.models import Provider
+-from config.celery import celery_app
+ 
+ 
+ def create_task_result_on_publish(sender=None, headers=None, **kwargs):  # noqa: F841
+@@ -31,5 +31,4 @@ before_task_publish.connect(
+ @receiver(post_delete, sender=Provider)
+ def delete_provider_scan_task(sender, instance, **kwargs):  # noqa: F841
+     # Delete the associated periodic task when the provider is deleted
+-    task_name = f"scan-perform-scheduled-{instance.id}"
+-    PeriodicTask.objects.filter(name=task_name).delete()
++    delete_related_daily_task(instance.id)
+
+
+
+
+@@ -131,9 +131,10 @@ class TestBatchDelete:
+         return provider_count
+ 
+     @pytest.mark.django_db
+-    def test_batch_delete(self, create_test_providers):
++    def test_batch_delete(self, tenants_fixture, create_test_providers):
++        tenant_id = str(tenants_fixture[0].id)
+         _, summary = batch_delete(
+-            Provider.objects.all(), batch_size=create_test_providers // 2
++            tenant_id, Provider.objects.all(), batch_size=create_test_providers 

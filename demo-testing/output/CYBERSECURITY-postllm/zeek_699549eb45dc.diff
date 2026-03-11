@@ -1,0 +1,129 @@
+@@ -2382,6 +2382,18 @@ IndexExpr::IndexExpr(ExprPtr arg_op1, ListExprPtr arg_op2, bool arg_is_slice, bo
+     if ( IsError() )
+         return;
+ 
++    if ( op1->GetType()->Tag() == TYPE_TABLE ) { // Check for a table[pattern] being indexed by a string
++        auto table_type = op1->GetType()->AsTableType();
++        auto& it = table_type->GetIndexTypes();
++        auto& rhs_type = op2->GetType()->AsTypeList()->GetTypes();
++        if ( it.size() == 1 && it[0]->Tag() == TYPE_PATTERN && table_type->Yield() && rhs_type.size() == 1 &&
++             rhs_type[0]->Tag() == TYPE_STRING ) {
++            is_pattern_table = true;
++            SetType(make_intrusive<VectorType>(op1->GetType()->Yield()));
++            return;
++        }
++    }
++
+     int match_type = op1->GetType()->MatchesIndex(op2->AsListExpr());
+ 
+     if ( match_type == DOES_NOT_MATCH_INDEX ) {
+@@ -2532,7 +2544,12 @@ ValPtr IndexExpr::Fold(Val* v1, Val* v2) const {
+                 return index_slice(vect, lv);
+         } break;
+ 
+-        case TYPE_TABLE: v = v1->AsTableVal()->FindOrDefault({NewRef{}, v2}); break;
++        case TYPE_TABLE:
++            if ( is_pattern_table )
++                return v1->AsTableVal()->LookupPattern(v2->AsListVal()->Idx(0)->AsStringVal());
++
++            v = v1->AsTableVal()->FindOrDefault({NewRef{}, v2});
++            break;
+ 
+         case TYPE_STRING: return index_string(v1->AsString(), v2->AsListVal());
+ 
+
+
+
+
+@@ -1012,6 +1012,7 @@ protected:
+ 
+     bool is_slice;
+     bool is_inside_when;
++    bool is_pattern_table = false;
+ };
+ 
+ // The following execute the heart of IndexExpr functionality for
+
+
+
+
+@@ -251,6 +251,33 @@ int Specific_RE_Matcher::Match(const u_char* bv, int n) {
+     return 0;
+ }
+ 
++void Specific_RE_Matcher::MatchDisjunction(const String* s, std::vector<int>& matches) {
++    auto bv = s->Bytes();
++    auto n = s->Len();
++
++    ASSERT(dfa);
++
++    DFA_State* d = dfa->StartState();
++    d = d->Xtion(ecs[SYM_BOL], dfa);
++
++    while ( d ) {
++        if ( --n < 0 )
++            break;
++
++        int ec = ecs[*(bv++)];
++        d = d->Xtion(ec, dfa);
++    }
++
++    if ( d )
++        d = d->Xtion(ecs[SYM_EOL], dfa);
++
++    if ( d )
++        if ( auto a_set = d->Accept() )
++            for ( auto a : *a_set )
++                matches.push_back(a);
++}
++
++
+ void Specific_RE_Matcher::Dump(FILE* f) { dfa->Dump(f); }
+ 
+ inline void RE_Match_State::AddMatches(const AcceptingSet& as, MatchPos position) {
+@@ -425,6 +452,23 @@ void RE_Matcher::MakeSingleLine() {
+ 
+ bool RE_Matcher::Compile(bool lazy) { return re_anywhere->Compile(lazy) && re_exact->Compile(lazy); }
+ 
++RE_DisjunctiveMatcher::RE_DisjunctiveMatcher(const std::vector<const RE_Matcher*>& REs) {
++    matcher = std::make_unique<detail::Specific_RE_Matcher>(detail::MATCH_EXACTLY);
++
++    std::string disjunction;
++    for ( auto re : REs )
++        disjunction += std::string("||") + re->PatternText();
++
++    matcher->SetPat(disjunction.c_str());
++    auto status = matcher->Compile();
++    ASSERT(status);
++}
++
++void RE_DisjunctiveMatcher::Match(const String* s, std::vector<int>& matches) {
++    matches.clear();
++    return matcher->MatchDisjunction(s, matches);
++}
++
+ TEST_SUITE("re_matcher") {
+     TEST_CASE("simple_pattern") {
+         RE_Matcher match("[0-9]+");
+
+
+
+
+@@ -36,6 +36,7 @@ extern CCL* curr_ccl;
+ extern NFA_Machine* nfa;
+ extern Specific_RE_Matcher* rem;
+ extern const char* RE_parse_input;
++extern int RE_accept_num;
+ 
+ extern int clower(int);
+ extern void synerr(const char str[]);
+@@ -104,6 +105,17 @@ public:
+     int Match(const String* s);
+     int Match(const u_char* bv, int n);
+ 
++    // A disjunction is a collection of regular expressions (that under
++    // the hood are matches as a single RE, not serially) for which
++    // the match operation returns *all* of the matches.  Disjunctions
++    // are constructed using the internal "||" RE operator, and the
++    // matches are returned as indices into the position, left-to-right,
++    // of which REs matched. IM

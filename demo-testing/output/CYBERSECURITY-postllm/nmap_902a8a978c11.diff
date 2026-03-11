@@ -1,0 +1,112 @@
+@@ -377,6 +377,54 @@ static int start_subprocess(char *cmdexec, struct subprocess_info *info)
+     return pid;
+ }
+ 
++#define i_PIPE_IN  0
++#define i_PIPE_OUT  1
++#define i_PROC  2
++static void shutdown_PIPE_IN(struct subprocess_info *info, HANDLE *events, int *idx, int *nCount)
++{
++  int i = idx[i_PIPE_IN];
++  int n = *nCount;
++  if (!o.noshutdown
++#ifdef HAVE_OPENSSL
++      // SSL can only shut down in the write direction
++      && info->fdn.ssl == NULL
++#endif
++    ) {
++    shutdown(info->fdn.fd, SD_RECEIVE);
++  }
++  WSACloseEvent(events[i]);
++  for (i += 1; i < n; i++) {
++    events[i - 1] = events[i];
++    idx[i] -= 1;
++  }
++  *nCount = n - 1;
++  idx[i_PIPE_IN] = -1;
++  CloseHandle(info->child_in_w);
++}
++
++static void shutdown_PIPE_OUT(struct subprocess_info *info, HANDLE *events, int *idx, int *nCount)
++{
++  int i = idx[i_PIPE_OUT];
++  int n = *nCount;
++  if (!o.noshutdown) {
++#ifdef HAVE_OPENSSL
++    if (info->fdn.ssl != NULL &&
++        // These errors mean we cannot send close_notify alert
++        info->fdn.lasterr != SSL_ERROR_SYSCALL && info->fdn.lasterr != SSL_ERROR_SSL) {
++      SSL_shutdown(info->fdn.ssl);
++    } else
++#endif
++      shutdown(info->fdn.fd, SD_SEND);
++  }
++  for (i += 1; i < n; i++) {
++    events[i - 1] = events[i];
++    idx[i] -= 1;
++  }
++  *nCount = n - 1;
++  idx[i_PIPE_OUT] = -1;
++  CloseHandle(info->child_out_r);
++}
++
+ /* Relay data between a socket and a process until the process dies or stops
+    sending or receiving data. The socket descriptor and process pipe handles
+    are in the data argument, which must be a pointer to struct subprocess_info.
+@@ -399,14 +447,19 @@ static DWORD WINAPI subprocess_thread_func(void *data)
+     HANDLE events[3];
+     DWORD ret, rc;
+     int crlf_state = 0;
++    DWORD nCount = 3;
++    int idx[3];
+ 
+     info = (struct subprocess_info *) data;
+ 
+     /* Three events we watch for: socket read, pipe read, and process end. */
+-    events[0] = (HANDLE) WSACreateEvent();
+-    WSAEventSelect(info->fdn.fd, events[0], FD_READ | FD_CLOSE);
+-    events[1] = info->child_out_r;
+-    events[2] = info->proc;
++    events[i_PIPE_IN] = (HANDLE) WSACreateEvent();
++    idx[i_PIPE_IN] = i_PIPE_IN;
++    WSAEventSelect(info->fdn.fd, events[i_PIPE_IN], FD_READ | FD_CLOSE);
++    events[i_PIPE_OUT] = info->child_out_r;
++    idx[i_PIPE_OUT] = i_PIPE_OUT;
++    events[i_PROC] = info->proc;
++    idx[i_PROC] = i_PROC;
+ 
+     /* To avoid blocking or polling, we use asynchronous I/O, or what Microsoft
+        calls "overlapped" I/O, on the process pipe. WaitForMultipleObjects
+@@ -414,17 +467,25 @@ static DWORD WINAPI subprocess_thread_func(void *data)
+     ReadFile(info->child_out_r, pipe_buffer, sizeof(pipe_buffer), NULL, &overlap);
+ 
+     /* Loop until EOF or error. */
+-    for (;;) {
++    /* There are 2 directions that are managed together:
++     * PIPE_IN: Data read from socket read written to child stdin. */
++#define PIPE_IN_IS_OPEN() (idx[i_PIPE_IN] >= 0)
++    /* PIPE_OUT: Data read from child stdout and written to socket. */
++#define PIPE_OUT_IS_OPEN() (idx[i_PIPE_OUT] >= 0)
++    /* PIPE_CLOSE sets idx[_PipeName] to -1, shifts events down, updates idx, decrements nCount */
++#define PIPE_CLOSE(_PipeName) shutdown_##_PipeName(info, events, idx, &nCount)
++
++    while (nCount > 0) {
+         DWORD n_r, n_w;
+         int i, n;
+         char *crlf = NULL, *wbuf;
+         char buffer[BUFSIZ];
+         int pending;
+         WSANETWORKEVENTS triggered;
++        int old_i_proc = idx[i_PROC];
+ 
+-        i = WaitForMultipleObjects(3, events, FALSE, INFINITE);
+-        switch(i) {
+-          case WAIT_OBJECT_0:
++        i = WaitForMultipleObjects(nCount, events, FALSE, INFINITE);
++        if (PIPE_IN_IS_OPEN() && i == WAIT_OBJECT_0 + idx[i_PIPE_IN]) {
+             /* Read from socket, write to process. */
+ 
+             /* Reset events on the socket. */
+@@ -443,23 +504,22 @@ static DWORD WINAPI subprocess_thread_func(void *data)
+                     if(n == 0 && info->fdn.lasterr == 0) {
+         

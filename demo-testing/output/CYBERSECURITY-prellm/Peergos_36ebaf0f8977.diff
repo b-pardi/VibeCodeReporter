@@ -1,0 +1,84 @@
+@@ -16,15 +16,46 @@ import java.util.logging.*;
+ public class GatewayHandler implements HttpHandler {
+ 	private static final Logger LOG = Logging.LOG();
+ 	private static final boolean LOGGING = true;
++	private static final int MAX_ASSET_SIZE_CACHE = 200*1024;
+ 
+     private final String domainSuffix;
+     private final NetworkAccess network;
+     private final Crypto crypto;
++    private final LRUCache<String, FileWrapper> webRootCache;
++    private final LRUCache<String, Asset> assetCache;
+ 
+     public GatewayHandler(String domainSuffix, Crypto crypto, NetworkAccess network) {
+         this.domainSuffix = domainSuffix;
+         this.crypto = crypto;
+         this.network = network;
++        this.webRootCache = new LRUCache<>(1000);
++        this.assetCache = new LRUCache<>(1000);
++    }
++
++    private final class Asset {
++        public final FileWrapper source;
++        public final byte[] data;
++
++        public Asset(FileWrapper source, byte[] data) {
++            this.source = source;
++            this.data = data;
++        }
++    }
++
++    private synchronized FileWrapper lookupRoot(String owner) {
++        return webRootCache.get(owner);
++    }
++
++    private synchronized void cacheRoot(String owner, FileWrapper webRoot) {
++        webRootCache.put(owner, webRoot);
++    }
++
++    private synchronized Asset lookupAsset(String path) {
++        return assetCache.get(path);
++    }
++
++    private synchronized void cacheAsset(String path, Asset asset) {
++        assetCache.put(path, asset);
+     }
+ 
+     @Override
+@@ -40,16 +71,36 @@ public class GatewayHandler implements HttpHandler {
+             if (! domain.endsWith(domainSuffix))
+                 throw new IllegalStateException("Incorrect domain! " + domain);
+             String owner = domain.substring(0, domain.length() - domainSuffix.length());
+-            Path toProfileEntry = Paths.get(owner).resolve(".profile").resolve("webroot");
+-            AbsoluteCapability capToWebrootField = UserContext.getPublicCapability(toProfileEntry, network).join();
+-            Optional<FileWrapper> profileField = network.getFile(capToWebrootField, owner).join();
+-            Path toWebroot = Paths.get(new String(Serialize.readFully(profileField.get(), crypto, network).join()));
+-
+-            AbsoluteCapability capToWebroot = UserContext.getPublicCapability(toWebroot, network).join();
+-            Optional<FileWrapper> webroot = network.getFile(capToWebroot, owner).join();
+-            Optional<FileWrapper> assetOpt = webroot.get().getDescendentByPath(path, crypto.hasher, network).join();
++
++            Asset cached = lookupAsset(path);
++            if (cached != null) {
++                FileWrapper updated = cached.source.getUpdated(network).join();
++                if (updated.version.equals(cached.source.version)) {
++                    serveAsset(cached.data, path, httpExchange);
++                    return;
++                }
++            }
++
++            Optional<FileWrapper> webRoot = Optional.ofNullable(lookupRoot(owner));
++            Optional<FileWrapper> assetOpt;
++            if (webRoot.isPresent()) {
++                FileWrapper updated = webRoot.get().getUpdated(network).join();
++                cacheRoot(owner, updated);
++                assetOpt = updated.getDescendentByPath(path, crypto.hasher, network).join();
++            } else {
++                Path toProfileEntry = Paths.get(owner).resolve(".profile").resolve("webroot");
++                AbsoluteCapability capToWebrootField = UserContext.getPublicCapability(toProfileEntry, network).join();
++                Optional<FileWrapper> profileField = network.getFile(capToWebrootField, owner).join();
++                Path toWebroot = Paths.get(new String(Serialize.readFully(profileField.get(), crypto, network).join()));
++
++                AbsoluteCapability capToWebroot = UserContext.getPublicCapability(toWebroot, network).join();
++                webRoot = network.getFile(capToWebroot, owner).join();
++                

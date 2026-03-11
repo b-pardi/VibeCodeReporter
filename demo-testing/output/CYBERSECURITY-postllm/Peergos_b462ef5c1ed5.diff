@@ -1,0 +1,90 @@
+@@ -235,13 +235,21 @@ public class Builder {
+ 
+                 FileBlockCache cborCache = new FileBlockCache(a.fromPeergosDir("block-cache-dir", "block-cache"), 1024 * 1024 * 1024L);
+                 FileBlockBuffer blockBuffer = new FileBlockBuffer(a.fromPeergosDir("s3-block-buffer-dir", "block-buffer"));
++
++                String remoteS3Prefix = "remote.";
++                if (a.hasArg("mirror.node.id") && S3Config.useS3(a, remoteS3Prefix)) {
++                    LOG.info("Reading directly from remote S3 for mirror");
++                    S3Config remoteConfig = S3Config.build(a, Optional.of(remoteS3Prefix));
++                    Cid nodeToMirrorId = Cid.decode(a.getArg("mirror.node.id"));
++                    p2pGets = new DirectS3Proxy(remoteConfig, nodeToMirrorId, hasher);
++                }
+                 S3BlockStorage s3 = new S3BlockStorage(config, ipfs.ids().join(), props, linkHost, transactions, authoriser,
+                         bats, meta, usage, cborCache, blockBuffer,
+                         a.getLong(Main.GLOBAL_DOWNLOAD_BANDWIDTH_LIMIT.name),
+                         a.getLong(Main.GLOBAL_S3_READ_REQUESTS_LIMIT.name),
+                         a.getLong(Main.USER_DOWNLOAD_BANDWIDTH_LIMIT.name),
+                         a.getLong(Main.USER_S3_READ_REQUESTS_LIMIT.name),
+-                        hasher, p2pBlockRetriever, new ContentAddressedStorageProxy.HTTP(p2pHttpProxy));
++                        hasher, p2pBlockRetriever, p2pGets);
+                 s3.updateMetadataStoreIfEmpty();
+                 return new LocalIpnsStorage(s3, ids);
+             }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,157 @@
++package peergos.server.storage;
++
++import peergos.server.util.HttpUtil;
++import peergos.shared.cbor.CborObject;
++import peergos.shared.crypto.hash.Hasher;
++import peergos.shared.crypto.hash.PublicKeyHash;
++import peergos.shared.io.ipfs.Cid;
++import peergos.shared.io.ipfs.Multihash;
++import peergos.shared.storage.*;
++import peergos.shared.storage.auth.BatWithId;
++import peergos.shared.storage.auth.S3Request;
++import peergos.shared.user.fs.EncryptedCapability;
++import peergos.shared.user.fs.SecretLink;
++import peergos.shared.util.Futures;
++import peergos.shared.util.Pair;
++import peergos.shared.util.ProgressConsumer;
++
++import javax.net.ssl.SSLException;
++import java.io.IOException;
++import java.net.SocketTimeoutException;
++import java.time.LocalDateTime;
++import java.time.ZonedDateTime;
++import java.util.List;
++import java.util.Optional;
++import java.util.concurrent.CompletableFuture;
++import java.util.function.Supplier;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++
++import static peergos.server.storage.S3BlockStorage.isRateLimitedException;
++import static peergos.shared.storage.DirectS3BlockStore.hashToKey;
++
++/** This can be used for direct (read-only) blockstore access when mirroring a server from S3 to glacier
++ *
++ */
++public class DirectS3Proxy implements ContentAddressedStorageProxy {
++
++    private static final Logger LOG = Logger.getGlobal();
++
++    private final String region, bucket, host, folder;
++    private final String accessKeyId, secretKey;
++    private final Optional<String> storageClass;
++    private final boolean useHttps;
++    private final Cid remoteId;
++    private final Hasher h;
++
++    public DirectS3Proxy(S3Config config, Cid remoteId, Hasher h) {
++        this.remoteId = remoteId;
++        this.h = h;
++        this.region = config.region;
++        this.bucket = config.bucket;
++        this.host = config.getHost();
++        this.useHttps = ! host.endsWith("localhost") && ! host.contains("localhost:");
++        this.folder = (useHttps ? "" : bucket + "/") + (config.path.isEmpty() || config.path.endsWith("/") ? config.path : config.path + "/");
++        this.storageClass = config.storageClass;
++        this.accessKeyId = config.accessKey;
++        this.secretKey = config.secretKey;
++    }
++
++    @Override
++    public CompletableFuture<Optional<byte[]>> getRaw(Multihash 

@@ -1,0 +1,96 @@
+@@ -18,7 +18,9 @@ from ctypes.util import find_library
+ import struct
+ import socket
+ import time
+-from threading import Thread, Event, Lock, Semaphore
++import traceback
++import heapq
++from threading import Thread, Event, Lock
+ 
+ from scapy.packet import Packet
+ from scapy.fields import BitField, FlagsField, StrLenField, \
+@@ -29,7 +31,7 @@ from scapy.layers.can import CAN
+ import scapy.modules.six as six
+ import scapy.automaton as automaton
+ import six.moves.queue as queue
+-from scapy.error import Scapy_Exception, warning, log_loading
++from scapy.error import Scapy_Exception, warning, log_loading, log_runtime
+ from scapy.supersocket import SuperSocket, SO_TIMESTAMPNS
+ from scapy.config import conf
+ from scapy.consts import LINUX
+@@ -596,23 +598,18 @@ class ISOTPSoftSocket(SuperSocket):
+     A thread is needed for receiving CAN frames in the background, and since
+     the lower layer CAN implementation is not guaranteed to have a functioning
+     POSIX select(), each ISOTP socket needs its own CAN receiver thread.
+-    Additionally, 2 timers are necessary to keep track of the timeouts and
+-    frame separation times, and each timer is implemented in its own thread.
+-    In total, each ISOTPSoftSocket spawns 3 background threads when
+-    constructed, which must be terminated afterwards by calling the close()
+-    method.
+     SuperSocket automatically calls the close() method when the GC destroys an
+     ISOTPSoftSocket. However, note that if any thread holds a reference to
+     an ISOTPSoftSocket object, it will not be collected by the GC.
+ 
+     The implementation of the ISOTP protocol, along with the necessary
+-    threads, are stored in the ISOTPSocketImplementation class, and therefore:
++    thread, are stored in the ISOTPSocketImplementation class, and therefore:
+ 
+     * There no reference from ISOTPSocketImplementation to ISOTPSoftSocket
+     * ISOTPSoftSocket can be normally garbage collected
+     * Upon destruction, ISOTPSoftSocket.close() will be called
+     * ISOTPSoftSocket.close() will call ISOTPSocketImplementation.close()
+-    * All background threads can be stopped by the garbage collector
++    * RX background thread can be stopped by the garbage collector
+     """
+ 
+     nonblocking_socket = True
+@@ -787,7 +784,8 @@ class CANReceiverThread(Thread):
+ 
+     def start(self):
+         Thread.start(self)
+-        self._thread_started.wait()
++        if not self._thread_started.wait(5):
++            raise Scapy_Exception("CAN RX thread not started in 5s.")
+ 
+     def run(self):
+         self._thread_started.set()
+@@ -813,82 +811,199 @@ class CANReceiverThread(Thread):
+         self.exiting = True
+ 
+ 
+-class TimeoutThread(Thread):
+-    """
+-    Utility class implementing a timer, useful for both timeouts and
+-    waiting between sent CAN frames.
+-    Contrary to the threading.Timer implementation, this timer thread can be
+-    reused for multiple timeouts. This avoids the overhead of creating a new
+-    pthread every time a timeout is planned.
+-    """
++class TimeoutScheduler:
++    """A timeout scheduler which uses a single thread for all timeouts, unlike
++    python's own Timer objects which use a thread each."""
++    VERBOSE = False
++    GRACE = .1
++    _mutex = Lock()
++    _event = Event()
++    _thread = None
++    _handles = []  # must use heapq functions!
+ 
+-    def __init__(self):
+-        Thread.__init__(self)
++    @staticmethod
++    def schedule(timeout, callback):
++        """Schedules the execution of a timeout.
++
++        The function `callback` will be called in `timeout` seconds.
++
++        Returns a handle that can be used to remove the timeout."""
++        when = TimeoutScheduler._time() + timeout
++        handle = TimeoutScheduler.Handle(when, callback)
++        handles = TimeoutScheduler._handles
++
++        with TimeoutScheduler._mutex:
++            # Add the handler to the heap, keeping the invariant
++            # Time complexity is O(log n)
++            heapq.heappush(handles, handle)
++           

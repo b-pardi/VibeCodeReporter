@@ -1,0 +1,128 @@
+@@ -1564,7 +1564,7 @@ static int cmd_l(void *data, const char *input) { // "l"
+ 	return 0;
+ }
+ 
+-#include "../../shlr/qjs/repl.c"
++#include "../../shlr/qjs/js_repl.c"
+ 
+ static int cmd_join(void *data, const char *input) { // "join"
+ 	RCore *core = (RCore *)data;
+@@ -1583,7 +1583,7 @@ static int cmd_join(void *data, const char *input) { // "join"
+ 			} else {
+ 				if (r_config_get_b (core->config, "scr.interactive")) {
+ 					if (r_lang_use (core->lang, "qjs")) {
+-						r_lang_run (core->lang, repl_qjs, strlen (repl_qjs));
++						r_lang_run (core->lang, js_repl_qjs, strlen (js_repl_qjs));
+ 					} else {
+ 						R_LOG_ERROR ("Requires lang.qjs");
+ 					}
+
+
+
+
+@@ -12,7 +12,7 @@
+ #define countof(x) (sizeof (x) / sizeof ((x)[0]))
+ 
+ #include "quickjs.h"
+-#include "../r2papi.c"
++#include "../js_r2papi.c"
+ 
+ typedef struct {
+ 	JSContext *ctx;
+@@ -77,7 +77,7 @@ static JSValue r2cmd(JSContext *ctx, JSValueConst this_val, int argc, JSValueCon
+ 	if (R_STR_ISNOTEMPTY (n)) {
+ 		ret = k->core->lang->cmd_str (k->core, n);
+ 	}
+-	JS_FreeValue (ctx, argv[0]);
++	// JS_FreeValue (ctx, argv[0]);
+ 	return JS_NewString (ctx, r_str_get (ret));
+ }
+ 
+@@ -119,9 +119,10 @@ static JSValue js_os_read_write(JSContext *ctx, JSValueConst this_val, int argc,
+ 	int ret;
+ 	uint8_t *buf;
+ 
+-	if (JS_ToInt32(ctx, &fd, argv[0]))
++	if (JS_ToInt32 (ctx, &fd, argv[0])) {
+ 		return JS_EXCEPTION;
+-	if (JS_ToIndex(ctx, &pos, argv[2]))
++	}
++	if (JS_ToIndex (ctx, &pos, argv[2]))
+ 		return JS_EXCEPTION;
+ 	if (JS_ToIndex(ctx, &len, argv[3]))
+ 		return JS_EXCEPTION;
+@@ -201,6 +202,7 @@ static void register_helpers(JSContext *ctx) {
+ 			JS_NewCFunction (ctx, js_flush, "flush", 1));
+ 	JS_SetPropertyStr (ctx, global_obj, "print", // write + newline
+ 			JS_NewCFunction (ctx, js_print, "print", 1));
++	eval (ctx, "setTimeout = (x,y) => x();");
+ 	eval (ctx, "function dir(x) {"
+ 		"console.log(JSON.stringify(x).replace(/,/g,',\\n '));"
+ 		"for (var i in x) {console.log(i);}}");
+@@ -208,7 +210,7 @@ static void register_helpers(JSContext *ctx) {
+ 	eval (ctx, "var r2 = { log:r2log, cmd:r2cmd, cmdj:(x)=>JSON.parse(r2cmd(x))};");
+ 	eval (ctx, "r2.call = (x) => r2.cmd('\"\"' + x);");
+ 	eval (ctx, "var global = globalThis; var G = globalThis;");
+-	eval (ctx, r2papi_qjs);
++	eval (ctx, js_r2papi_qjs);
+ 	eval (ctx, "G.R=new R2Api(r2);");
+ }
+ 
+@@ -240,8 +242,12 @@ static void eval_jobs(JSContext *ctx) {
+ }
+ 
+ static bool eval(JSContext *ctx, const char *code) {
++	if (R_STR_ISEMPTY (code)) {
++		return false;
++	}
+ 	// set raw console
+-			r_cons_set_raw (true);
++	// only for repl!
++	r_cons_set_raw (true);
+ 	JSValue v = JS_Eval (ctx, code, strlen (code), "-", 0);
+ 	if (JS_IsException (v)) {
+ 		js_std_dump_error (ctx);
+
+
+
+
+@@ -4,15 +4,56 @@
+ #include "r_core.h"
+ #include "r_lang.h"
+ 
++#include "../js_require.c"
++
++const char *const js_entrypoint_qjs = "Gmain(requirejs,global,{r2:r2})";
++#if 0
++	"requirejs (['asan'], function (foo) {\n"\
++	"  foo.main(r2);\n" \
++	"});\n"
++;
++#endif
++// console.log("foo", foo.main);
++
+ static bool lang_tsc_file(RLangSession *s, const char *file) {
+-	char *ofile = r_str_newf ("%s.qjs", file);
+-	int rc = r_sys_cmdf ("tsc --outFile %s %s", ofile, file);
++	if (!r_str_endswith (file, ".ts")) {
++		R_LOG_WARN ("expecting .ts extension");
++		return false;
++	}
++	if (!r_file_exists (file)) {
++		R_LOG_WARN ("file does tno exist");
++		return false;
++	}
++	char *js_ofile = strdup (file);
++	js_ofile = r_str_replace (js_ofile, ".ts", ".js", 0);
++	char *qjs_ofile = strdup (file);
++	qjs_ofile = r_str_replace (qjs_ofile, ".ts", ".qjs", 0);
++	int rc = 0;
++	/// check of ofile exists and its newer than file
++	if (!r_file_is_newer (qjs_ofile, file)) {
++		rc = r_sys_cmdf ("tsc --outFile %s --lib es2020,dom --moduleResolution node --module amd %s", js_ofile, file);
++		if (rc == 0) {
++			char *js_ifile = r_file_slurp (js_ofile, NULL);
++			RStrBuf *sb = r_strbuf_new ("var Gmain;");
++			r_strbuf_append (sb, js_require_qjs);
++			js_ifile = r_str_replace (js_ifile,
++				"function (require, exports, r

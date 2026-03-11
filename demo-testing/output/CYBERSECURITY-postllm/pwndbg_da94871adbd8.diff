@@ -1,0 +1,120 @@
+@@ -423,6 +423,7 @@ parser.add_argument(
+ parser.add_argument(
+     "-s", "--simple", action="store_true", help="Simply print malloc_chunk struct's contents."
+ )
++parser.add_argument("-d", "--dump", action="store_true", help="Print a hexdump of the chunk.")
+ 
+ parser.add_argument(
+     "-n", "--next", type=int, default=0, help="Print the next N chunks after the specified address."
+@@ -433,7 +434,7 @@ parser.add_argument(
+ @pwndbg.commands.OnlyWithResolvedHeapSyms
+ @pwndbg.commands.OnlyWhenHeapIsInitialized
+ @pwndbg.commands.OnlyWhenUserspace
+-def malloc_chunk(addr, fake=False, verbose=False, simple=False, next=0) -> None:
++def malloc_chunk(addr, fake=False, verbose=False, simple=False, next=0, dump=False) -> None:
+     """Print a malloc_chunk struct's contents."""
+     allocator = pwndbg.heap.current
+ 
+@@ -509,6 +510,12 @@ def malloc_chunk(addr, fake=False, verbose=False, simple=False, next=0) -> None:
+ 
+     print(" | ".join(headers_to_print) + "\n" + out_fields)
+ 
++    if dump:
++        print(C.banner("hexdump"))
++
++        ptr_size = pwndbg.gdblib.arch.ptrsize
++        pwndbg.commands.hexdump.hexdump(chunk.address, chunk.real_size + ptr_size)
++
+     if next:
+         print(C.banner(f"Next {next} chunk(s):"))
+         for _ in range(next):
+@@ -518,7 +525,8 @@ def malloc_chunk(addr, fake=False, verbose=False, simple=False, next=0) -> None:
+                 print("No next chunk found")
+                 break
+ 
+-            malloc_chunk(chunk.address, fake=fake, verbose=verbose, simple=simple)
++            print()  # extra newline for better readability
++            malloc_chunk(chunk.address, fake=fake, verbose=verbose, simple=simple, dump=dump)
+ 
+ 
+ parser = argparse.ArgumentParser(
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,25 @@
++#include <stdlib.h>
++#include <string.h>
++
++
++#define INTERNAL_SIZE_T size_t
++#define SIZE_SZ (sizeof (INTERNAL_SIZE_T))
++#define CHUNK_HDR_SZ (2 * SIZE_SZ)
++#define mem2chunk(mem) ((void*)(mem) - CHUNK_HDR_SZ)
++
++void break_here(void) {}
++
++void* test_chunk = NULL;
++
++int main() {
++    char* str = (char*)malloc(0x20);
++    strncpy(str, "This is a test string", 0x20);
++
++    test_chunk = mem2chunk(str);
++
++    break_here();
++
++    free(test_chunk);
++
++    return 0;
++}
+
+
+
+
+@@ -12,6 +12,7 @@ import tests
+ from pwndbg.heap.ptmalloc import SymbolUnresolvableError
+ 
+ HEAP_MALLOC_CHUNK = tests.binaries.get("heap_malloc_chunk.out")
++HEAP_MALLOC_CHUNK_DUMP = tests.binaries.get("heap_malloc_chunk_dump.out")
+ 
+ 
+ def generate_expected_malloc_chunk_output(chunks):
+@@ -235,6 +236,41 @@ def test_malloc_chunk_command_heuristic(start_binary):
+     assert results["large"] == expected["large"]
+ 
+ 
++def test_malloc_chunk_dump_command(start_binary):
++    start_binary(HEAP_MALLOC_CHUNK_DUMP)
++    gdb.execute("break break_here")
++    gdb.execute("continue")
++
++    chunk = pwndbg.gdblib.memory.poi(
++        pwndbg.heap.current.malloc_chunk, gdb.lookup_symbol("test_chunk")[0].value()
++    )
++    chunk_addr = chunk.address
++
++    malloc_chunk = gdb.execute(f"malloc_chunk {chunk_addr} -d", to_string=True)
++
++    size = int(
++        chunk[("mchunk_size" if "mchunk_size" in (f.name for f in chunk.type.fields()) else "size")]
++    )
++
++    real_size = size & (0xFFFFFFFFFFFFFFF - 0b111)
++
++    chunk_addr = int(chunk.address)
++    expected = [
++        "Allocated chunk | PREV_INUSE",
++        f"Addr: 0x{chunk_addr:x}",
++        f"Size: 0x{real_size:02x} (with flag bits: 0x{size:02x})",
++        "",
++        "hexdump",
++        f"+0000 0x{chunk_addr:x}  00 00 00 00 00 00 00 00  31 00 00 00 00 00 00 00  │........│1.......│",
++        f"+0010 0x{chunk_addr+0x10:x}  54 68 69 73 20 69 73 20  61 20 74 65 73 74 20 73  │This.is.│a.test.s│",
++        f"+0020 0x{chunk_addr+0x20:x}  74 72 69 6e 67 00 00 00  00 00 00 00 00 00 00 00  │tring...│........│",
++        f"+0030 0x{chunk_addr+0x30:x}  00 00 00 00 00 00 00 00                           │........│        │",
++    ]
++
++    # now just compare the output
++    assert malloc_chunk.splitlines() 

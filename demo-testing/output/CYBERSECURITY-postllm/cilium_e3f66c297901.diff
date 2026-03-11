@@ -1,0 +1,145 @@
+@@ -928,7 +928,7 @@ encap_redirect:
+ 	src_port = tunnel_gen_src_port_v6(&tuple);
+ 
+ 	ret = nodeport_add_tunnel_encap(ctx, IPV4_DIRECT_ROUTING, src_port,
+-					tunnel_endpoint, SECLABEL, dst_sec_identity,
++					tunnel_endpoint, REMOTE_NODE_ID, dst_sec_identity,
+ 					trace->reason, trace->monitor, &ifindex);
+ 	if (IS_ERR(ret))
+ 		return ret;
+@@ -2164,6 +2164,7 @@ nodeport_rev_dnat_ingress_ipv4(struct __ctx_buff *ctx, struct trace_ctx *trace,
+ 			info = lookup_ip4_remote_endpoint(ip4->daddr, 0);
+ 			if (info && info->tunnel_endpoint && !info->flag_skip_tunnel) {
+ 				tunnel_endpoint = info->tunnel_endpoint;
++				src_sec_identity = REMOTE_NODE_ID;
+ 				dst_sec_identity = info->sec_identity;
+ 			}
+ 		}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,328 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++
++#include <bpf/ctx/skb.h>
++#include "pktgen.h"
++
++/* Enable code paths under test */
++#define ENABLE_IPV4
++#define ENABLE_NODEPORT
++
++#define TUNNEL_PROTOCOL		TUNNEL_PROTOCOL_VXLAN
++#define ENCAP_IFINDEX		42
++#define TUNNEL_MODE
++
++#define DISABLE_LOOPBACK_LB
++
++#define CLIENT_IP		v4_pod_one
++#define CLIENT_PORT		__bpf_htons(111)
++#define CLIENT_SEC_IDENTITY	112233
++#define CLIENT_NODE_IP		v4_node_one
++
++#define FRONTEND_IP		v4_svc_one
++#define FRONTEND_PORT		tcp_svc_one
++
++#define LB_IP			v4_node_two
++#define IPV4_DIRECT_ROUTING	LB_IP
++
++#define BACKEND_IP		v4_pod_three
++#define BACKEND_PORT		__bpf_htons(8080)
++#define BACKEND_SEC_IDENTITY	223344
++#define BACKEND_NODE_IP		v4_node_three
++
++static volatile const __u8 *zero_mac = mac_zero;
++
++struct mock_settings {
++	__be16 nat_source_port;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(value_size, sizeof(struct mock_settings));
++	__uint(max_entries, 1);
++} settings_map __section_maps_btf;
++
++#include "node_config.h"
++
++#define ctx_redirect mock_ctx_redirect
++static __always_inline __maybe_unused int
++mock_ctx_redirect(const struct __ctx_buff *ctx __maybe_unused, int ifindex __maybe_unused,
++		  __u32 flags __maybe_unused)
++{
++	/* in this scenario, all traffic should flow through the overlay interface */
++	if (ifindex != ENCAP_IFINDEX)
++		return CTX_ACT_DROP;
++
++	return CTX_ACT_REDIRECT;
++}
++
++#define skb_get_tunnel_key mock_skb_get_tunnel_key
++int mock_skb_get_tunnel_key(__maybe_unused struct __sk_buff *skb,
++			    __maybe_unused struct bpf_tunnel_key *key,
++			    __maybe_unused __u32 size,
++			    __maybe_unused __u32 flags)
++{
++	/* hacky, this is actually only correct for the reply path. But
++	 * at least for now the datapath doesn't care about the
++	 * transported identity in the forward path.
++	 */
++	key->tunnel_id = BACKEND_SEC_IDENTITY;
++
++	return 0;
++}
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(value_size, sizeof(struct bpf_tunnel_key));
++	__uint(max_entries, 1);
++} tunnel_key_map __section_maps_btf;
++
++#define skb_set_tunnel_key mock_skb_set_tunnel_key
++int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
++			    __maybe_unused const struct bpf_tunnel_key *key,
++			    __maybe_unused __u32 size,
++			    __maybe_unused __u32 flags)
++{
++	__u32 map_key = 0;
++	struct bpf_tunnel_key *mock_key = map_lookup_elem(&tunnel_key_map, &map_key);
++
++	if (mock_key)
++		memcpy(mock_key, key, sizeof(*key));
++
++	return 0;
++}
++
++#include <bpf_overlay.c>
++
++#include "lib/ipcache.h"
++#include "lib/lb.h"
++
++#define FROM_OVERLAY	0
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 1);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[FROM_OVERLAY] = &cil_from_overlay,
++	},
++};
++
++/* Test that a SVC request to an intermediate LB node gets DNATed and SNATed,
++ * and flows back out on the overlay interface to a remote backend
++ * (with WORLD_ID security identity).
++ */
++PKTGEN("tc", "nodeport_overlay_nat_1_fwd")
++int nodeport_overlay_nat_1

@@ -1,0 +1,137 @@
+@@ -87,7 +87,8 @@ class NetworkInterface : public Checkpointable {
+ 
+ #ifdef HAVE_EBPF
+   /* eBPF */
+-  SPSCQueue *ebpfEvents;
++  u_int16_t next_insert_idx, next_remove_idx;
++  eBPFevent **ebpfEvents; 
+ #endif
+   
+   /* Live Capture */
+@@ -705,8 +706,9 @@ class NetworkInterface : public Checkpointable {
+   void makeTsPoint(NetworkInterfaceTsPoint *pt);
+   void tsLua(lua_State* vm);
+ #ifdef HAVE_EBPF
+-  inline void enqueueeBPFEvent(void *event)  { if(ebpfEvents) ebpfEvents->enqueue(event, true);        }
+-  inline bool dequeueeBPFEvent(void **event) { return(ebpfEvents ? ebpfEvents->dequeue(event) : false); }
++  inline bool iseBPFEventAvailable() { return((ebpfEvents && (ebpfEvents[next_remove_idx] != NULL)) ? true : false); }
++  bool enqueueeBPFEvent(eBPFevent *event);
++  bool dequeueeBPFEvent(eBPFevent **event);
+   void delivereBPFEvent(eBPFevent *event);
+ #endif
+ };
+
+
+
+
+@@ -893,6 +893,7 @@ inline struct ntopngLuaContext* getUserdata(lua_State *vm) {
+ 
+ #define MIN_NUM_HASH_WALK_ELEMS      512
+ 
++#define EBPF_QUEUE_LEN               1024
+ 
+ #ifdef NTOPNG_EMBEDDED_EDITION
+ #define DEFAULT_THREAD_POOL_SIZE     1
+
+
+
+
+@@ -349,8 +349,10 @@ void NetworkInterface::init() {
+        || is_traffic_mirrored
+        || isView())
+       ;
+-    else
+-      ebpfEvents = new SPSCQueue();
++    else {
++      ebpfEvents = (eBPFevent**)calloc(sizeof(eBPFevent*), EBPF_QUEUE_LEN);
++      next_insert_idx = next_remove_idx = 0;
++    }
+ #endif
+ }
+ 
+@@ -729,8 +731,13 @@ void NetworkInterface::deleteDataStructures() {
+   }
+ 
+ #ifdef HAVE_EBPF
+-  if(ebpfEvents)
++  if(ebpfEvents) {
++    for(u_int16_t i=0; i<EBPF_QUEUE_LEN; i++)
++      if(ebpfEvents[i])
++	delete ebpfEvents[i];
++    
+     delete ebpfEvents;
++  }
+ #endif
+ }
+ 
+@@ -2662,7 +2669,7 @@ void NetworkInterface::pollQueuedeBPFEvents() {
+   if(ebpfEvents) {
+     eBPFevent *event;
+ 
+-    if(dequeueeBPFEvent((void**)&event)) {
++    if(dequeueeBPFEvent(&event)) {
+       Flow *flow = NULL;
+       IpAddress src, dst;
+       bool src2dst_direction, new_flow;
+@@ -7017,6 +7024,30 @@ void NetworkInterface::reloadHostsBlacklist() {
+ 
+ #ifdef HAVE_EBPF
+ 
++bool NetworkInterface::enqueueeBPFEvent(eBPFevent *event) {
++  if(ebpfEvents[next_insert_idx] != (eBPFevent*)NULL)
++    return(false);
++
++  ebpfEvents[next_insert_idx] = event;
++  next_insert_idx = (next_insert_idx + 1) % EBPF_QUEUE_LEN;
++  return(true);
++}
++
++/* *************************************** */
++
++bool NetworkInterface::dequeueeBPFEvent(eBPFevent **event) {
++  if(ebpfEvents[next_remove_idx] != (eBPFevent*)NULL) {
++    *event = NULL;
++    return(false);
++  }
++
++  *event = ebpfEvents[next_remove_idx];
++  next_remove_idx = (next_remove_idx + 1) % EBPF_QUEUE_LEN;  
++  return(true);
++}
++
++/* *************************************** */
++
+ void NetworkInterface::delivereBPFEvent(eBPFevent *event) {
+   eBPFevent *tmp;
+ 
+@@ -7027,7 +7058,7 @@ void NetworkInterface::delivereBPFEvent(eBPFevent *event) {
+ 
+     // ntop->getTrace()->traceEvent(TRACE_ERROR, "%s()", __FUNCTION__);
+     
+-    if(!ebpfEvents->enqueue(tmp, false))
++    if(!enqueueeBPFEvent(tmp))
+       free(tmp); /* Not enough space */
+   }
+ }
+
+
+
+
+@@ -4770,7 +4770,7 @@ static int load_dll(struct mg_context *ctx, const char *dll_name,
+ }
+ #endif // NO_SSL_DL
+ 
+-#ifdef UNUSED_CODE
++// #ifdef UNUSED_CODE
+ 
+ static unsigned long ssl_id_callback(void) {
+   return (unsigned long) pthread_self();
+@@ -4788,7 +4788,7 @@ static void ssl_locking_callback(int mode, int mutex_num, const char *file,
+   }
+ }
+ 
+-#endif /* UNUSED_CODE */
++// #endif /* UNUSED_CODE */
+ 
+ // Dynamically load SSL library. Set up ctx->ssl_ctx pointer.
+ static int set_ssl_option(struct mg_context *ctx) {

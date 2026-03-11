@@ -1,0 +1,133 @@
+@@ -403,6 +403,36 @@ snat_v4_rev_nat_handle_mapping(struct __ctx_buff *ctx,
+ 
+ 	*state = __snat_lookup(map, tuple);
+ 
++	if (*state) {
++		struct ipv4_nat_entry *lookup_result;
++		struct ipv4_nat_entry ostate;
++		struct ipv4_ct_tuple otuple = {};
++		int ret;
++
++		/* Check for the original SNAT entry. If it is missing (e.g. due to LRU
++		 * eviction), it must be restored before returning.
++		 */
++		otuple.saddr = (*state)->to_daddr;
++		otuple.sport = (*state)->to_dport;
++		otuple.daddr = tuple->saddr;
++		otuple.dport = tuple->sport;
++		otuple.nexthdr = tuple->nexthdr;
++		otuple.flags = TUPLE_F_OUT;
++
++		lookup_result = __snat_lookup(map, &otuple);
++		if (!lookup_result) {
++			memset(&ostate, 0, sizeof(ostate));
++			ostate.to_saddr = tuple->daddr;
++			ostate.to_sport = tuple->dport;
++			ostate.common.needs_ct = (*state)->common.needs_ct;
++			ostate.common.created = bpf_mono_now();
++
++			ret = __snat_create(map, &otuple, &ostate);
++			if (ret < 0)
++				return DROP_NAT_NO_MAPPING;
++		}
++	}
++
+ 	if (*state && (*state)->common.needs_ct) {
+ 		struct ipv4_ct_tuple tuple_revsnat;
+ 		int ret;
+@@ -1363,6 +1393,36 @@ snat_v6_rev_nat_handle_mapping(struct __ctx_buff *ctx,
+ {
+ 	*state = snat_v6_lookup(tuple);
+ 
++	if (*state) {
++		struct ipv6_nat_entry *lookup_result;
++		struct ipv6_nat_entry ostate;
++		struct ipv6_ct_tuple otuple = {};
++		int ret;
++
++		/* Check for the original SNAT entry. If it is missing (e.g. due to LRU
++		 * eviction), it must be restored before returning.
++		 */
++		otuple.saddr = (*state)->to_daddr;
++		otuple.sport = (*state)->to_dport;
++		otuple.daddr = tuple->saddr;
++		otuple.dport = tuple->sport;
++		otuple.nexthdr = tuple->nexthdr;
++		otuple.flags = TUPLE_F_OUT;
++
++		lookup_result = snat_v6_lookup(&otuple);
++		if (!lookup_result) {
++			memset(&ostate, 0, sizeof(ostate));
++			ostate.to_saddr = tuple->daddr;
++			ostate.to_sport = tuple->dport;
++			ostate.common.needs_ct = (*state)->common.needs_ct;
++			ostate.common.created = bpf_mono_now();
++
++			ret = __snat_create(&cilium_snat_v6_external, &otuple, &ostate);
++			if (ret < 0)
++				return DROP_NAT_NO_MAPPING;
++		}
++	}
++
+ 	if (*state && (*state)->common.needs_ct) {
+ 		struct ipv6_ct_tuple tuple_revsnat;
+ 		int ret;
+
+
+
+
+@@ -1177,3 +1177,288 @@ int nodeport_nat_fwd_restore_reply_check(const struct __ctx_buff *ctx)
+ {
+ 	return check_reply(ctx);
+ }
++
++ /* The following three tests are checking the scenario where a Original NAT entry gets deleted:
++  * 1. The original packet gets ReSNATed when the entry is deleted.
++  * 2. The reply packet restores the Original NAT entry if it is deleted.
++  * 3. The original pakcket does not get ReSNATed. Because the Original NAT entry is restored.
++  *
++  *
++  * Test that source port is changed when the Original NAT entry is deleted.(ReSNATed)
++  */
++PKTGEN("tc", "tc_nodeport_nat_fwd_original_renated")
++int nodeport_nat_fwd_original_renated_pktgen(struct __ctx_buff *ctx)
++{
++	struct pktgen builder;
++	struct tcphdr *l4;
++	void *data;
++
++	/* Init packet builder */
++	pktgen__init(&builder, ctx);
++
++	l4 = pktgen__push_ipv4_tcp_packet(&builder,
++					  (__u8 *)client_mac, (__u8 *)lb_mac,
++					  CLIENT_IP, FRONTEND_IP_REMOTE,
++					  CLIENT_PORT, FRONTEND_PORT);
++	if (!l4)
++		return TEST_ERROR;
++
++	data = pktgen__push_data(&builder, default_data, sizeof(default_data));
++	if (!data)
++		return TEST_ERROR;
++
++	/* Calc lengths, set protocol fields and calc checksums */
++	pktgen__finish(&builder);
++
++	return 0;
++}
++
++SETUP("tc", "tc_nodeport_nat_fwd_original_renated")
++int nodeport_nat_fwd_original_renated_setup(struct __ctx_buff *ctx)
++{
++	__u16 revnat_id = 4;
++	struct ipv4_ct_tuple otuple = {};
++
++	lb_v4_add_service(FRONTEND_IP_REMOTE, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
++	lb_v4_add_backend(FRONTEND_IP_REMOTE, FRONTEND_PORT, 1, 124,
++			  BACKEND_IP_REMOTE, BACKEND_PORT, IPPROTO_TCP, 0);
++
++	ipcache_v4_add_entry(BACKEND_IP_REMOTE, 0, 112233, 0, 0);
++
++	otuple.flags = TUPLE_F_OUT;
++	otuple.saddr = CLIENT_IP;
++	otuple.daddr = BACKEND_IP_REMOTE

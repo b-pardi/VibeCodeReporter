@@ -1,0 +1,72 @@
+@@ -9,6 +9,7 @@ import peergos.server.util.Logging;
+ import peergos.shared.Crypto;
+ import peergos.shared.NetworkAccess;
+ import peergos.shared.corenode.HTTPCoreNode;
++import peergos.shared.crypto.hash.PublicKeyHash;
+ import peergos.shared.login.mfa.MultiFactorAuthMethod;
+ import peergos.shared.login.mfa.MultiFactorAuthRequest;
+ import peergos.shared.login.mfa.MultiFactorAuthResponse;
+@@ -17,6 +18,7 @@ import peergos.shared.social.HttpSocialNetwork;
+ import peergos.shared.storage.HttpSpaceUsage;
+ import peergos.shared.storage.UnauthedCachingStorage;
+ import peergos.shared.user.LinkProperties;
++import peergos.shared.user.Snapshot;
+ import peergos.shared.user.TrieNodeImpl;
+ import peergos.shared.user.UserContext;
+ import peergos.shared.user.fs.*;
+@@ -95,7 +97,9 @@ public class DirectorySync {
+                         Path remoteDir = PathUtil.get(linkPath);
+                         log("Syncing " + localDir + " to+from " + remoteDir);
+                         long t0 = System.currentTimeMillis();
+-                        syncDirs(local, localDir, remote, remoteDir, syncedState, maxDownloadParallelism, minFreeSpacePercent);
++                        String username = remoteDir.getName(0).toString();
++                        PublicKeyHash owner = network.coreNode.getPublicKeyHash(username).join().get();
++                        syncDirs(local, localDir, remote, remoteDir, owner, network, syncedState, maxDownloadParallelism, minFreeSpacePercent);
+                         long t1 = System.currentTimeMillis();
+                         log("Dir sync took " + (t1 - t0) / 1000 + "s");
+                     }
+@@ -164,7 +168,7 @@ public class DirectorySync {
+     }
+ 
+     public static void syncDirs(SyncFilesystem localFS, Path localDir,
+-                                SyncFilesystem remoteFS, Path remoteDir,
++                                SyncFilesystem remoteFS, Path remoteDir, PublicKeyHash owner, NetworkAccess network,
+                                 SyncState syncedVersions,
+                                 int maxParallelism,
+                                 int minPercentFreeSpace) throws IOException {
+@@ -181,12 +185,20 @@ public class DirectorySync {
+         buildDirState(localFS, localDir, localState, syncedVersions);
+         log("Found " + localState.filesByPath.size() + " local files");
+ 
+-        RamTreeState remoteState = new RamTreeState();
+-        buildDirState(remoteFS, remoteDir, remoteState, syncedVersions);
+-        log("Found " + remoteState.filesByPath.size() + " remote files");
++        Snapshot syncedVersion = syncedVersions.getSnapshot(remoteDir.toString());
++        Snapshot remoteVersion = network == null ?
++                new Snapshot(new HashMap<>()) :
++                Futures.reduceAll(syncedVersion.versions.keySet(),
++                        new Snapshot(new HashMap<>()),
++                        (v, w) -> v.withWriter(owner, w, network),
++                        (a, b) -> a.mergeAndOverwriteWith(b)).join();
++        SyncState remoteState = remoteVersion.equals(syncedVersion) && ! remoteVersion.versions.isEmpty() ? syncedVersions : new RamTreeState();
++        if (! remoteVersion.equals(syncedVersion) && ! syncedVersion.versions.isEmpty())
++            buildDirState(remoteFS, remoteDir, remoteState, syncedVersions);
++        log("Found " + remoteState.filesCount() + " remote files");
+ 
+         TreeSet<String> allPaths = new TreeSet<>(localState.filesByPath.keySet());
+-        allPaths.addAll(remoteState.filesByPath.keySet());
++        allPaths.addAll(remoteState.allFilePaths());
+         Set<String> doneFiles = Collections.synchronizedSet(new HashSet<>());
+ 
+         // upload new small files in a single bulk operation
+@@ -339,6 +351,8 @@ public class DirectorySync {
+                 }
+             }
+         }
++
++        syncedVersions.setSnapshot(remoteDir.toString(), remoteVersion);
+     }
+ 
+     private static void log(String msg) {
+@@ -349,7 +363,7 @@ public class DirectorySync {
+     public stat

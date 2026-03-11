@@ -1,0 +1,104 @@
+@@ -54,6 +54,9 @@
+ 
+ #define BATTLE_BUFFER_LINK_SIZE 0x1000
+ 
++// Special indicator value for shellBellDmg in SpecialStatus
++#define IGNORE_SHELL_BELL 0xFFFF
++
+ struct ResourceFlags
+ {
+     u32 flags[MAX_BATTLERS_COUNT];
+@@ -133,7 +136,7 @@ struct SpecialStatus
+     u32 ppNotAffectedByPressure:1;
+     u32 faintedHasReplacement:1;
+     u32 focusBanded:1;
+-    s32 dmg;
++    s32 shellBellDmg;
+     s32 physicalDmg;
+     s32 specialDmg;
+     u8 physicalBattlerId;
+@@ -445,9 +448,9 @@ struct BattleStruct
+ // The assert below is to ensure palaceFlags is large enough to store these flags without overlap.
+ STATIC_ASSERT(sizeof(((struct BattleStruct *)0)->palaceFlags) * 8 >= MAX_BATTLERS_COUNT + MAX_MON_MOVES, PalaceFlagsTooSmall)
+ 
+-#define F_DYNAMIC_TYPE_1 (1 << 6)
+-#define F_DYNAMIC_TYPE_2 (1 << 7)
+-#define DYNAMIC_TYPE_MASK (F_DYNAMIC_TYPE_1 - 1)
++#define DYNAMIC_TYPE_MASK                 ((1 << 6) - 1)
++#define F_DYNAMIC_TYPE_IGNORE_PHYSICALITY  (1 << 6) // If set, the dynamic type's physicality won't be used for certain move effects.
++#define F_DYNAMIC_TYPE_UNREAD              (1 << 7) // Set for Hidden Power and Weather Ball but never apparently checked.
+ 
+ #define GET_MOVE_TYPE(move, typeArg)                                  \
+ {                                                                     \
+@@ -647,7 +650,7 @@ extern u16 gChosenMove;
+ extern u16 gCalledMove;
+ extern s32 gBattleMoveDamage;
+ extern s32 gHpDealt;
+-extern s32 gTakenDmg[MAX_BATTLERS_COUNT];
++extern s32 gBideDmg[MAX_BATTLERS_COUNT];
+ extern u16 gLastUsedItem;
+ extern u8 gLastUsedAbility;
+ extern u8 gBattlerAttacker;
+@@ -673,7 +676,7 @@ extern u8 gLastHitBy[MAX_BATTLERS_COUNT];
+ extern u16 gChosenMoveByBattler[MAX_BATTLERS_COUNT];
+ extern u8 gMoveResultFlags;
+ extern u32 gHitMarker;
+-extern u8 gTakenDmgByBattler[MAX_BATTLERS_COUNT];
++extern u8 gBideTarget[MAX_BATTLERS_COUNT];
+ extern u8 gUnusedFirstBattleVar2;
+ extern u16 gSideStatuses[NUM_BATTLE_SIDES];
+ extern struct SideTimer gSideTimers[NUM_BATTLE_SIDES];
+
+
+
+
+@@ -168,7 +168,7 @@
+ 
+ // Not really sure what a "hitmarker" is.
+ #define HITMARKER_WAKE_UP_CLEAR         (1 << 4) // Cleared when waking up. Never set or checked.
+-#define HITMARKER_SKIP_DMG_TRACK        (1 << 5)
++#define HITMARKER_IGNORE_BIDE           (1 << 5)
+ #define HITMARKER_DESTINYBOND           (1 << 6)
+ #define HITMARKER_NO_ANIMATIONS         (1 << 7)
+ #define HITMARKER_IGNORE_SUBSTITUTE     (1 << 8)
+
+
+
+
+@@ -170,7 +170,7 @@ EWRAM_DATA u16 gChosenMove = 0;
+ EWRAM_DATA u16 gCalledMove = 0;
+ EWRAM_DATA s32 gBattleMoveDamage = 0;
+ EWRAM_DATA s32 gHpDealt = 0;
+-EWRAM_DATA s32 gTakenDmg[MAX_BATTLERS_COUNT] = {0};
++EWRAM_DATA s32 gBideDmg[MAX_BATTLERS_COUNT] = {0};
+ EWRAM_DATA u16 gLastUsedItem = 0;
+ EWRAM_DATA u8 gLastUsedAbility = 0;
+ EWRAM_DATA u8 gBattlerAttacker = 0;
+@@ -197,7 +197,7 @@ EWRAM_DATA u16 gChosenMoveByBattler[MAX_BATTLERS_COUNT] = {0};
+ EWRAM_DATA u8 gMoveResultFlags = 0;
+ EWRAM_DATA u32 gHitMarker = 0;
+ EWRAM_DATA static u8 sUnusedBattlersArray[MAX_BATTLERS_COUNT] = {0};
+-EWRAM_DATA u8 gTakenDmgByBattler[MAX_BATTLERS_COUNT] = {0};
++EWRAM_DATA u8 gBideTarget[MAX_BATTLERS_COUNT] = {0};
+ EWRAM_DATA u8 gUnusedFirstBattleVar2 = 0; // Never read
+ EWRAM_DATA u16 gSideStatuses[NUM_BATTLE_SIDES] = {0};
+ EWRAM_DATA struct SideTimer gSideTimers[NUM_BATTLE_SIDES] = {0};
+
+
+
+
+@@ -1836,6 +1836,7 @@ static void Cmd_healthbarupdate(void)
+     gBattlescriptCurrInstr += 2;
+ }
+ 
++// Update the active battler's HP and various HP trackers (Substitute, Bide, etc.)
+ static void Cmd_datahpupdate(void)
+ {
+     u32 moveType;
+@@ -1843,9 +1844,13 @@ static void Cmd_datahpupdate(void)
+     if (gBattleControllerExecFlags)
+         return;
+ 
++    // moveType will be used later to record for Counter/Mirror Coat whether this was physical or special damage.
++    // For moves with a dynamic type that have F_DYNAMIC_TYPE_IGNORE_PHYSICALITY set (in vanilla, just Hidden Power) this will ignore
++    // the dynamic type and use the move's base type instead, meaning (as a 

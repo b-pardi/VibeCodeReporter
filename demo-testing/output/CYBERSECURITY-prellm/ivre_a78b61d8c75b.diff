@@ -1,0 +1,149 @@
+@@ -40,7 +40,6 @@ DB_DATA = None  # specific: maxmind:///<ivre_share_path>/geoip
+ # Begin batch sizes
+ LOCAL_BATCH_SIZE = 10000      # used with --local-bulk
+ MONGODB_BATCH_SIZE = 100
+-NEO4J_BATCH_SIZE = 1000
+ POSTGRES_BATCH_SIZE = 10000
+ # End batch sizes
+ # specific: if no value is specified for *_PATH variables, they are
+
+
+
+
+@@ -3184,13 +3184,6 @@ class DBFlow(DB):
+         d["duration"] = precision
+         return d
+ 
+-    def dns2flow(self, bulk, rec):
+-        """Takes a parsed dns.log line entry and adds it to insert bulk.  It
+-        must be a separated method because of neo4j compatibility.
+-
+-        """
+-        return self.any2flow(bulk, 'dns', rec)
+-
+     def reduce_precision(self, new_precision, flt=None,
+                          before=None, after=None, current_precision=None):
+         """
+@@ -3534,7 +3527,6 @@ class MetaDB(object):
+             "tinydb": ("tiny", "TinyDBAgent"),
+         },
+         "flow": {
+-            "neo4j": ("neo4j", "Neo4jDBFlow"),
+             "mongodb": ("mongo", "MongoDBFlow"),
+             "postgresql": ("sql.postgres", "PostgresDBFlow"),
+             "tinydb": ("tiny", "TinyDBFlow"),
+
+deleted file mode 100644
+
+
+
+@@ -1,1563 +0,0 @@
+-#! /usr/bin/env python
+-# -*- coding: utf-8 -*-
+-
+-# This file is part of IVRE.
+-# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
+-#
+-# IVRE is free software: you can redistribute it and/or modify it
+-# under the terms of the GNU General Public License as published by
+-# the Free Software Foundation, either version 3 of the License, or
+-# (at your option) any later version.
+-#
+-# IVRE is distributed in the hope that it will be useful, but WITHOUT
+-# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+-# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+-# License for more details.
+-#
+-# You should have received a copy of the GNU General Public License
+-# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
+-
+-"""This sub-module contains functions to interact with the Neo4j
+-databases.
+-
+-"""
+-
+-# This module should disappear soon
+-# pylint: disable=redefined-outer-name
+-
+-from datetime import datetime, time as dtime
+-import operator
+-import random
+-import re
+-import time
+-import warnings
+-
+-
+-from future.utils import viewitems, viewvalues, with_metaclass
+-from past.builtins import basestring
+-from py2neo import Graph, Node, Relationship, GraphError
+-from py2neo import http
+-from py2neo.database import cypher_escape
+-from py2neo.database.status import TransientError
+-from py2neo.types import remote
+-
+-
+-from ivre.db import DBFlow
+-from ivre import config
+-from ivre import utils
+-from ivre import flow
+-
+-http.socket_timeout = 3600
+-# We are aware of that, let's just ignore it for now
+-warnings.filterwarnings(
+-    "ignore",
+-    "Map literals returned over the Neo4j REST interface are ambiguous.*",
+-    module="py2neo.database",
+-)
+-
+-FLOW_KEYS_TCP = {"dport": "{dport}", "proto": '"tcp"'}
+-FLOW_KEYS_UDP = {"dport": "{dport}", "proto": '"udp"'}
+-DEFAULT_FLOW_KEYS = FLOW_KEYS_TCP
+-DEFAULT_HOST_KEYS = {"addr": "{addr}"}
+-ALL_DESCS = {
+-    "dns": {
+-        "labels": ["DNS"],
+-        "flow_keys": {"dport": "{dport}", "proto": '{proto}'},
+-    },
+-
+-    "http": {
+-        "labels": ["HTTP"],
+-    },
+-
+-    "ssl": {
+-        "labels": ["SSL"],
+-    },
+-
+-    "ssh": {
+-        "labels": ["SSH"],
+-    },
+-
+-    "sip": {
+-        "labels": ["SIP"],
+-    },
+-
+-    "snmp": {
+-        "labels": ["SNMP"],
+-        "flow_keys": FLOW_KEYS_UDP,
+-    },
+-
+-    "modbus": {
+-        "labels": ["Modbus"],
+-    },
+-
+-    "rdp": {
+-        "labels": ["RDP"],
+-    },
+-}
+-
+-
+-# Associates a list of fields that must be present to the
+-# link attributes and the accumulators
+-FIELD_REQUEST_EXT = [
+-    (('sport', 'dport'), ('proto', 'dport'), {'sports': ('{sport}', 5)}),
+-    (('type', 'code'), ('proto', 'type'), {'codes': ('{code}', None)}),
+-    (('type'), ('proto', 'type'), {}),
+-]
+-
+-
+-class Neo4jDB(DBFlow):
+-    values = re.c

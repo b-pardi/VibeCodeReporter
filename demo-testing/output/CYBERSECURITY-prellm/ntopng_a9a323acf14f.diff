@@ -1,0 +1,95 @@
+@@ -48,7 +48,6 @@ class Flow : public GenericHashEntry {
+   u_int32_t srcAS, dstAS, prevAdjacentAS, nextAdjacentAS;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   u_int16_t cli_score[MAX_NUM_SCRIPT_CATEGORIES], srv_score[MAX_NUM_SCRIPT_CATEGORIES], flow_score;
+-  bool peers_score_accounted;
+   struct ndpi_flow_struct *ndpiFlow;
+   ndpi_risk ndpi_flow_risk_bitmap;
+   Bitmap status_map;              /* The bitmap of the possible problems on the flow */
+@@ -660,7 +659,6 @@ class Flow : public GenericHashEntry {
+   inline const u_int16_t * const getCliScore() const { return(cli_score);  };
+   inline const u_int16_t * const getSrvScore() const { return(srv_score);  };
+   inline const u_int16_t getScore()            const { return(flow_score); };
+-  inline void setPeersScoreAccounted()     { peers_score_accounted = true; };
+ 
+ #ifdef HAVE_NEDGE
+   inline void setLastConntrackUpdate(u_int32_t when) { last_conntrack_update = when; }
+
+
+
+
+@@ -22,34 +22,23 @@
+ #ifndef _NTOP_HOST_SCORE_H_
+ #define _NTOP_HOST_SCORE_H_
+ 
+-typedef struct {
+-  u_int16_t old_score, new_score;
+-
+-  /* Necessary to handle short idle flows */
+-  u_int16_t idle_flow_score;
+-} score_t;
+-
+ class HostScore {
+  private:
+-  score_t cli_score[MAX_NUM_SCRIPT_CATEGORIES], srv_score[MAX_NUM_SCRIPT_CATEGORIES];
+-  Mutex m;
++  u_int16_t cli_score[MAX_NUM_SCRIPT_CATEGORIES], srv_score[MAX_NUM_SCRIPT_CATEGORIES];
+ 
+-  static u_int32_t sumOldValues(const score_t score[MAX_NUM_SCRIPT_CATEGORIES]);
+-  static inline void refreshValue(score_t *score);
+-  void lua_breakdown(lua_State *vm, const score_t score[MAX_NUM_SCRIPT_CATEGORIES], const char * const key);
++  u_int32_t sumValues(const bool as_client) const;
++  void lua_breakdown(lua_State *vm, bool as_client) const;
+ 
+  public:
+   HostScore();
++
+   inline u_int32_t getValue()        const { return getClientValue() + getServerValue(); };
+-  inline u_int32_t getClientValue()  const { return sumOldValues(cli_score);             };
+-  inline u_int32_t getServerValue()  const { return sumOldValues(srv_score);             };
+-  void refreshValue();
++  inline u_int32_t getClientValue()  const { return sumValues(true  /* as client */);    };
++  inline u_int32_t getServerValue()  const { return sumValues(false /* as server */);    };
+ 
+-  void incValue(const u_int16_t score[MAX_NUM_SCRIPT_CATEGORIES], bool as_client);
+-  /* This call is not performed into the same thread as the incScore, so
+-   * it needs a separate counter to avoid contention. */
+-  void incIdleFlowScore(const u_int16_t score[MAX_NUM_SCRIPT_CATEGORIES], bool as_client);
+-  void lua_breakdown(lua_State *vm);
++  u_int16_t incValue(u_int16_t score, ScriptCategory script_category, bool as_client);
++  u_int16_t decValue(u_int16_t score, ScriptCategory script_category, bool as_client);
++  void lua_breakdown(lua_State *vm) const;
+ };
+ 
+ #endif
+
+
+
+
+@@ -824,7 +824,6 @@ class NetworkInterface : public AlertableEntity {
+   void getEngagedAlerts(lua_State *vm, int entity_type, const char *entity_value, AlertType alert_type,
+ 	    AlertLevel alert_severity, std::set<int> *entity_excludes, AddressTree *allowed_nets);
+   inline void incNumDroppedFlowScriptsCalls()             { num_dropped_flow_scripts_calls++; }
+-  void computeHostsScore();
+ 
+   /* unlockExternalAlertable must be called after use whenever a non-null reference is returned */
+   AlertableEntity* lockExternalAlertable(AlertEntity entity, const char *entity_val, bool create_if_missing);
+
+
+
+
+@@ -48,7 +48,6 @@ Flow::Flow(NetworkInterface *_iface,
+   alert_type = alert_none;
+   alert_level = alert_level_none;
+   alerted_status = status_normal;
+-  peers_score_accounted = false;
+   status_infos = NULL;
+   ndpi_flow_risk_bitmap = 0;
+   iec104_typeid_mask[0] = 0, iec104_typeid_mask[1] = 0;
+@@ -1447,13 +1446,6 @@ void Flow::hosts_periodic_stats_update(NetworkInterface *iface, Host *cli_host,
+ 				     cli_host->get_ip()->isBroadcastAddress());
+       }
+     }
+-
+-    if(!peers_score_accounted && idle()) {
+-      /

@@ -1,0 +1,122 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2019-2020 - pancake, thestr4ng3r */
++/* radare - LGPL - Copyright 2019-2021 - pancake, thestr4ng3r */
+ 
+ #include <r_anal.h>
+ #include <r_hash.h>
+@@ -272,11 +272,13 @@ R_API RAnalBlock *r_anal_block_split(RAnalBlock *bbi, ut64 addr) {
+ 	bb->jump = bbi->jump;
+ 	bb->fail = bbi->fail;
+ 	bb->parent_stackptr = bbi->stackptr;
++	bb->switch_op = bbi->switch_op;
+ 
+ 	// resize the first block
+ 	r_anal_block_set_size (bbi, addr - bbi->addr);
+ 	bbi->jump = addr;
+ 	bbi->fail = UT64_MAX;
++	bbi->switch_op = NULL;
+ 	r_anal_block_update_hash (bbi);
+ 
+ 	// insert the second block into the tree
+@@ -345,6 +347,14 @@ R_API bool r_anal_block_merge(RAnalBlock *a, RAnalBlock *b) {
+ 	a->size += b->size;
+ 	a->jump = b->jump;
+ 	a->fail = b->fail;
++	if (a->switch_op) {
++		r_anal_switch_op_free (a->switch_op);
++		if (a->anal->verbose) {
++			eprintf ("Dropping switch table at 0x%" PFMT64x " of block at 0x%" PFMT64x "\n", a->switch_op->addr, a->addr);
++		}
++	}
++	a->switch_op = b->switch_op;
++	b->switch_op = NULL;
+ 	r_anal_block_update_hash (a);
+ 
+ 	// kill b completely
+
+
+
+
+@@ -197,6 +197,9 @@ static bool is_delta_pointer_table(RAnal *anal, RAnalFunction *fcn, ut64 addr, u
+ 			isValid = true;
+ 			break;
+ 		}
++		if (aop->type == R_ANAL_OP_TYPE_JMP || aop->type == R_ANAL_OP_TYPE_CJMP) {
++			break;
++		}
+ 		if (aop->type == R_ANAL_OP_TYPE_MOV) {
+ 			omov_aop = mov_aop;
+ 			mov_aop = *aop;
+@@ -350,8 +353,15 @@ static void check_purity(HtUP *ht, RAnalFunction *fcn) {
+ typedef struct {
+ 	ut64 op_addr;
+ 	ut64 leaddr;
++	char *reg;
+ } leaddr_pair;
+ 
++static void free_leaddr_pair(void *pair) {
++	leaddr_pair *_pair = pair;
++	free (_pair->reg);
++	free (_pair);
++}
++
+ static RAnalBlock *bbget(RAnal *anal, ut64 addr, bool jumpmid) {
+ 	RList *intersecting = r_anal_get_blocks_in (anal, addr);
+ 	RListIter *iter;
+@@ -523,6 +533,7 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 	}
+ 	// TODO Store all this stuff in the heap so we save memory in the stack
+ 	RAnalOp *op = NULL;
++	char *movbasereg = NULL;
+ 	const bool continue_after_jump = anal->opt.afterjmp;
+ 	const int addrbytes = anal->iob.io ? anal->iob.io->addrbytes : 1;
+ 	char *last_reg_mov_lea_name = NULL;
+@@ -531,6 +542,7 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 	int ret = R_ANAL_RET_END, skip_ret = 0;
+ 	bool overlapped = false;
+ 	int oplen, idx = 0;
++	size_t lea_cnt = 0;
+ 	static ut64 cmpval = UT64_MAX; // inherited across functions, otherwise it breaks :?
+ 	bool varset = false;
+ 	struct {
+@@ -603,7 +615,7 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 	r_return_val_if_fail (bb, R_ANAL_RET_ERROR);
+ 
+ 	if (!anal->leaddrs) {
+-		anal->leaddrs = r_list_newf (free);
++		anal->leaddrs = r_list_newf (free_leaddr_pair);
+ 		if (!anal->leaddrs) {
+ 			eprintf ("Cannot create leaddr list\n");
+ 			gotoBeach (R_ANAL_RET_ERROR);
+@@ -627,7 +639,8 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 		}
+ 		r_list_free (list);
+ 	}
+-	ut64 movdisp = UT64_MAX; // used by jmptbl when coded as "mov reg,[R*4+B]"
++	ut64 movdisp = UT64_MAX; // used by jmptbl when coded as "mov Reg,[Reg*Scale+Disp]"
++	ut64 movscale = 0;
+ 	int maxlen = len * addrbytes;
+ 	if (is_dalvik) {
+ 		bool skipAnalysis = false;
+@@ -867,9 +880,14 @@ repeat:
+ 				}
+ 			}
+ 			// skip mov reg, reg
+-			if (anal->opt.jmptbl) {
+-				if (op->scale && op->ireg) {
+-					movdisp = op->disp;
++			if (anal->opt.jmptbl && op->scale && op->ireg) {
++				movdisp = op->disp;
++				movscale = op->scale;
++				if (op->src[0] && op->src[0]->reg) {
++					free (movbasereg);
++					movbasereg = strdup (op->src[0]->reg->name);
++				} else {
++					R_FREE (movbasereg);
+ 				}
+ 			}
+ 			if (anal->opt.hpskip && regs_exist (op->src[0], op->dst) && !strcmp (op->src[0]->reg->name, op->dst->reg->name)) {
+@@ -885,6 +903,7 @@ repeat:
+ 		case R_ANAL_OP_TYPE_LEA:
+ 			last_is_reg_mov_lea = false;
+ 			// if first byte in op->ptr

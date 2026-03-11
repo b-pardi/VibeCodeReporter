@@ -1,0 +1,129 @@
+@@ -6,6 +6,7 @@
+ #include "zeek/analyzer/Analyzer.h"
+ #include "zeek/analyzer/Manager.h"
+ #include "zeek/analyzer/protocol/pia/PIA.h"
++#include "zeek/packet_analysis/protocol/tcp/TCPSessionAdapter.h"
+ #include "zeek/analyzer/protocol/tcp/TCP.h"
+ 
+ #include "zeek/fuzzers/FuzzBuffer.h"
+
+
+
+
+@@ -5,11 +5,18 @@
+ #include "zeek/analyzer/protocol/pia/PIA.h"
+ #include "zeek/packet_analysis/protocol/tcp/TCPSessionAdapter.h"
+ 
++#include "zeek/analyzer/protocol/tcp/events.bif.h"
++#include "zeek/analyzer/protocol/tcp/types.bif.h"
++
++using namespace zeek;
+ using namespace zeek::packet_analysis::TCP;
+ using namespace zeek::packet_analysis::IP;
+ 
++constexpr int32_t TOO_LARGE_SEQ_DELTA = 1048576;
++
+ TCPAnalyzer::TCPAnalyzer() : IPBasedAnalyzer("TCP", TRANSPORT_TCP, TCP_PORT_MASK, false)
+ 	{
++	// TODO: remove once the other plugins are done
+ 	new_plugin = true;
+ 	}
+ 
+@@ -19,6 +26,7 @@ TCPAnalyzer::~TCPAnalyzer()
+ 
+ void TCPAnalyzer::Initialize()
+ 	{
++	ignored_nets = zeek::id::find_val<TableVal>("ignore_checksums_nets");
+ 	}
+ 
+ SessionAdapter* TCPAnalyzer::MakeSessionAdapter(Connection* conn)
+@@ -98,12 +106,877 @@ bool TCPAnalyzer::WantConnection(uint16_t src_port, uint16_t dst_port,
+ 	return true;
+ 	}
+ 
+-void TCPAnalyzer::DeliverPacket(Connection* c, double t, bool is_orig, int remaining, Packet* pkt)
++static int get_segment_len(int payload_len, analyzer::tcp::TCP_Flags flags)
++	{
++	int seg_len = payload_len;
++
++	if ( flags.SYN() )
++		// SYN consumes a byte of sequence space.
++		++seg_len;
++
++	if ( flags.FIN() )
++		// FIN consumes a bytes of sequence space.
++		++seg_len;
++
++	if ( flags.RST() )
++		// Don't include the data in the computation of
++		// the sequence space for this connection, as
++		// it's not in fact part of the TCP stream.
++		seg_len -= payload_len;
++
++	return seg_len;
++	}
++
++static void init_endpoint(analyzer::tcp::TCP_Endpoint* endpoint, analyzer::tcp::TCP_Flags flags,
++                          uint32_t first_seg_seq, uint32_t last_seq, double t)
++	{
++	switch ( endpoint->state ) {
++	case analyzer::tcp::TCP_ENDPOINT_INACTIVE:
++		if ( flags.SYN() )
++			{
++			endpoint->InitAckSeq(first_seg_seq);
++			endpoint->InitStartSeq(first_seg_seq);
++			}
++		else
++			{
++			// This is a partial connection - set up the initial sequence
++			// numbers as though we saw a SYN, to keep the relative byte
++			// numbering consistent.
++			endpoint->InitAckSeq(first_seg_seq - 1);
++			endpoint->InitStartSeq(first_seg_seq - 1);
++			// But ensure first packet is not marked duplicate
++			last_seq = first_seg_seq;
++			}
++
++		endpoint->InitLastSeq(last_seq);
++		endpoint->start_time = t;
++		break;
++
++	case analyzer::tcp::TCP_ENDPOINT_SYN_SENT:
++	case analyzer::tcp::TCP_ENDPOINT_SYN_ACK_SENT:
++		if ( flags.SYN() && first_seg_seq != endpoint->StartSeq() )
++			{
++			endpoint->Conn()->Weird("SYN_seq_jump");
++			endpoint->InitStartSeq(first_seg_seq);
++			endpoint->InitAckSeq(first_seg_seq);
++			endpoint->InitLastSeq(last_seq);
++			}
++		break;
++
++	case analyzer::tcp::TCP_ENDPOINT_ESTABLISHED:
++	case analyzer::tcp::TCP_ENDPOINT_PARTIAL:
++		if ( flags.SYN() )
++			{
++			if ( endpoint->Size() > 0 )
++				endpoint->Conn()->Weird("SYN_inside_connection");
++
++			if ( first_seg_seq != endpoint->StartSeq() )
++				endpoint->Conn()->Weird("SYN_seq_jump");
++
++			// Make a guess that somehow the connection didn't get established,
++			// and this SYN will be the one that actually sets it up.
++			endpoint->InitStartSeq(first_seg_seq);
++			endpoint->InitAckSeq(first_seg_seq);
++			endpoint->InitLastSeq(last_seq);
++			}
++		break;
++
++	case analyzer::tcp::TCP_ENDPOINT_RESET:
++		if ( flags.SYN() )
++			{
++			if ( endpoint->prev_state == analyzer::tcp::TCP_ENDPOINT_INACTIVE )
++				{
++				// Seq. numbers were initialized by a RST packet from this
++				// endpoint, but now that a SYN is seen from it, that could mean
++				// the earlier RST was spoofed/injected, so re-initialize.  This
++				// mostly just helps prevent misrepresentations of payload sizes
++				// that are based on bad initia

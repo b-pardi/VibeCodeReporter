@@ -1,0 +1,89 @@
+@@ -1,5 +1,6 @@
+ package peergos.server.corenode;
+ 
++import peergos.shared.cbor.*;
+ import peergos.shared.corenode.*;
+ import peergos.shared.crypto.*;
+ import peergos.shared.crypto.asymmetric.*;
+@@ -64,7 +65,23 @@ public class UserRepository implements CoreNode, SocialNetwork, MutablePointers
+     }
+ 
+     @Override
+-    public CompletableFuture<byte[]> getFollowRequests(PublicKeyHash owner) {
++    public CompletableFuture<byte[]> getFollowRequests(PublicKeyHash owner, byte[] signedTime) {
++        try {
++            Optional<PublicSigningKey> ownerOpt = ipfs.getSigningKey(owner).get();
++            if (! ownerOpt.isPresent())
++                throw new IllegalStateException("Couldn't retrieve owner key during getFollowRequests() call!");
++            byte[] raw = ownerOpt.get().unsignMessage(signedTime);
++            CborObject cbor = CborObject.fromByteArray(raw);
++            if (! (cbor instanceof CborObject.CborLong))
++                throw new IllegalStateException("Invalid cbor for getFollowRequests authorisation!");
++            long utcMillis = ((CborObject.CborLong) cbor).value;
++            long now = System.currentTimeMillis();
++            if (Math.abs(now - utcMillis) > 30_000)
++                throw new IllegalStateException("Stale auth in getFollowRequests, is this a replay attack?");
++            // This is a valid request
++        } catch (Exception e) {
++            throw new RuntimeException(e);
++        }
+         return store.getFollowRequests(owner);
+     }
+ 
+
+
+
+
+@@ -1,8 +1,9 @@
+ package peergos.server.social;
++import java.util.*;
++import java.util.function.*;
+ import java.util.logging.*;
+ 
+-import peergos.server.util.Args;
+-import peergos.server.util.Logging;
++import peergos.server.util.*;
+ 
+ import com.sun.net.httpserver.*;
+ import peergos.shared.cbor.*;
+@@ -20,11 +21,8 @@ public class HttpSocialNetworkServer  {
+ 	private static final Logger LOG = Logging.LOG();
+ 
+     private static final boolean LOGGING = true;
+-    private static final int CONNECTION_BACKLOG = 100;
+-    private static final int HANDLER_THREAD_COUNT = 100;
+ 
+     public static final String SOCIAL_URL = "social/";
+-    public static final int PORT = 7777;
+ 
+     public static class SocialHandler implements HttpHandler
+     {
+@@ -47,6 +45,8 @@ public class HttpSocialNetworkServer  {
+                 path = path.substring(1);
+             String[] subComponents = path.substring(SOCIAL_URL.length()).split("/");
+             String method = subComponents[0];
++            Map<String, List<String>> params = HttpUtil.parseQuery(exchange.getRequestURI().getQuery());
++            Function<String, String> last = key -> params.get(key).get(params.get(key).size() - 1);
+ //            LOG.info("social method "+ method +" from path "+ path);
+ 
+             try {
+@@ -56,7 +56,8 @@ public class HttpSocialNetworkServer  {
+                         followRequest(din, dout);
+                         break;
+                     case "getFollowRequests":
+-                        getFollowRequests(din, dout);
++                        byte[] signedTime = ArrayOps.hexToBytes(last.apply("auth"));
++                        getFollowRequests(din, dout, signedTime);
+                         break;
+                     case "removeFollowRequest":
+                         removeFollowRequest(din, dout);
+@@ -96,11 +97,11 @@ public class HttpSocialNetworkServer  {
+             boolean followRequested = social.sendFollowRequest(target, encodedSharingPublicKey).get();
+             dout.writeBoolean(followRequested);
+         }
+-        void getFollowRequests(DataInputStream din, DataOutputStream dout) throws Exception
++        void getFollowRequests(DataInputStream din, DataOutputStream dout, byte[] signedTime) throws Exception
+         {
+             byte[] encodedKey = Serialize.deserializeByteArray(din, PublicSigningKey.MAX_SIZE);
+             PublicKeyHash ownerPublicKey = PublicKeyHash.fromCbor(CborObject.fromByteArray(encodedKey));
+-            byte[] res = social

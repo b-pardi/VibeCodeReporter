@@ -1,0 +1,138 @@
+@@ -57,6 +57,7 @@ def serialize(obj):
+ class HttpDB(DB):
+ 
+     flt_empty = {}
++    no_limit = None
+ 
+     def __init__(self, url):
+         super().__init__()
+@@ -83,6 +84,7 @@ class HttpDB(DB):
+         )
+         if skip is None:
+             skip = 0
++        # TODO: sort
+         while True:
+             cururl = "%s%d" % (url, skip)
+             if limit is not None:
+@@ -111,6 +113,20 @@ class HttpDB(DB):
+                     rec[fld] = datetime.fromtimestamp(rec[fld])
+             yield rec
+ 
++    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
++        url = "%s/%s/distinct/%s?f=%s&format=ndjson&q=limit:%d" % (
++            self.baseurl,
++            self.route,
++            field,
++            self._output_filter(flt or {}),
++            limit or 0,
++        )
++        if skip is not None:
++            url += "%20skip:%d" % skip
++        # TODO: sort
++        for line in self.db.open(url):
++            yield json.loads(line)
++
+     def count(self, spec, **kargs):
+         url = "%s/%s/count?f=%s" % (self.baseurl, self.route, self._output_filter(spec))
+         req = self.db.open(url)
+@@ -220,7 +236,6 @@ class HttpDBView(HttpDBActive, DBView):
+ 
+ class HttpDBPassive(HttpDB, DBPassive):
+ 
+-    no_limit = None
+     route = "passive"
+ 
+ 
+
+
+
+
+@@ -506,7 +506,7 @@ class MongoDB(DB):
+             pipeline.append({"$sort": OrderedDict(sort)})
+         if skip is not None:
+             pipeline += [{"$skip": skip}]
+-        if limit is not None:
++        if limit:
+             pipeline += [{"$limit": limit}]
+         # hack to allow nested values as field
+         # see <http://stackoverflow.com/questions/13708857/
+
+
+
+
+@@ -474,6 +474,64 @@ def get_top(subdb, field):
+         yield "\n]);\n"
+ 
+ 
++@application.get("/<subdb:re:scans|view|passive>/distinct/<field:path>")
++@check_referer
++def get_distinct(subdb, field):
++    """Get distinct values from Nmap, View & Passive databases
++
++    :param str subdb: database to query (must be "scans" or "view")
++    :param str field: (pseudo-)field to get distinct values (e.g., "service")
++    :query str q: query (including limit/skip and sort)
++    :query str f: filter
++    :query str callback: callback to use for JSONP results
++    :query bool ipsasnumbers: to get IP addresses as numbers rather than as
++                             strings
++    :query bool datesasstrings: to get dates as strings rather than as
++                               timestamps
++    :query str format: "json" (the default) or "ndjson"
++    :status 200: no error
++    :status 400: invalid referer
++    :>jsonarr str label: field value
++    :>jsonarr int value: count for this value
++
++    """
++    subdb = {
++        "passive": db.passive,
++        "scans": db.nmap,
++        "view": db.view,
++    }[subdb]
++    flt_params = get_base(subdb)
++    cursor = subdb.distinct(
++        field,
++        flt=flt_params.flt,
++        sort=flt_params.sortby,
++        limit=flt_params.limit or subdb.no_limit,
++        skip=flt_params.skip,
++    )
++    if flt_params.fmt == "ndjson":
++        for rec in cursor:
++            yield "%s\n" % json.dumps(rec)
++        return
++    if flt_params.callback is None:
++        yield "[\n"
++    else:
++        yield "%s([\n" % flt_params.callback
++    # hack to avoid a trailing comma
++    cursor = iter(cursor)
++    try:
++        rec = next(cursor)
++    except StopIteration:
++        pass
++    else:
++        yield json.dumps(rec)
++        for rec in cursor:
++            yield ",\n%s" % json.dumps(rec)
++    if flt_params.callback is None:
++        yield "\n]\n"
++    else:
++        yield "\n]);\n"
++
++
+ @application.get("/<subdb:re:scans|view>")
+ @check_referer
+ def get_nmap(subdb):
+
+
+
+
+@@ -1680,6 +1680,16 @@ class IvreTests(unittest.TestCase):
+             self.assertFalse(err)
+             self.assertEqual(out1, out2)
+ 
++        for distinct in ["addr", "ports.port"]:
++            cmd = ["ivre", "scancli", "--distinct", distinct]
++            res, out1, err = RUN(cmd, env=newenv)

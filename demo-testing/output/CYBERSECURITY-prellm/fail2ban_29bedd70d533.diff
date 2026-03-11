@@ -1,0 +1,124 @@
+@@ -45,13 +45,13 @@ class CSocket:
+ 	def __del__(self):
+ 		self.close(False)
+ 	
+-	def send(self, msg):
++	def send(self, msg, nonblocking=False, timeout=None):
+ 		# Convert every list member to string
+ 		obj = dumps(map(
+ 			lambda m: str(m) if not isinstance(m, (list, dict, set)) else m, msg),
+ 		  HIGHEST_PROTOCOL)
+ 		self.__csock.send(obj + CSPROTO.END)
+-		return self.receive(self.__csock)
++		return self.receive(self.__csock, nonblocking, timeout)
+ 
+ 	def settimeout(self, timeout):
+ 		self.__csock.settimeout(timeout if timeout != -1 else self.__deftout)
+@@ -66,11 +66,13 @@ class CSocket:
+ 		self.__csock = None
+ 	
+ 	@staticmethod
+-	def receive(sock):
++	def receive(sock, nonblocking=False, timeout=None):
+ 		msg = CSPROTO.EMPTY
++		if nonblocking: sock.setblocking(0)
++		if timeout: sock.settimeout(timeout)
+ 		while msg.rfind(CSPROTO.END) == -1:
+-			chunk = sock.recv(6)
+-			if chunk == '':
++			chunk = sock.recv(512)
++			if chunk in ('', b''): # python 3.x may return b'' instead of ''
+ 				raise RuntimeError("socket connection broken")
+ 			msg = msg + chunk
+ 		return loads(msg)
+
+
+
+
+@@ -34,42 +34,70 @@ import unittest
+ from .utils import LogCaptureTestCase
+ 
+ from .. import protocol
+-from ..server.asyncserver import AsyncServer, AsyncServerException, loop
++from ..server.asyncserver import asyncore, RequestHandler, loop, AsyncServer, AsyncServerException
+ from ..server.utils import Utils
+ from ..client.csocket import CSocket
+ 
++from .utils import LogCaptureTestCase
++
++
++def TestMsgError(*args):
++	raise Exception('test unpickle error')
++class TestMsg(object):
++	def __init__(self, unpickle=(TestMsgError, ())):
++		self.unpickle = unpickle
++	def __reduce__(self):
++		return self.unpickle
++
+ 
+-class Socket(unittest.TestCase):
++class Socket(LogCaptureTestCase):
+ 
+ 	def setUp(self):
+ 		"""Call before every test case."""
++		LogCaptureTestCase.setUp(self)
+ 		super(Socket, self).setUp()
+ 		self.server = AsyncServer(self)
+ 		sock_fd, sock_name = tempfile.mkstemp('fail2ban.sock', 'socket')
+ 		os.close(sock_fd)
+ 		os.remove(sock_name)
+ 		self.sock_name = sock_name
++		self.serverThread = None
+ 
+ 	def tearDown(self):
+ 		"""Call after every test case."""
++		if self.serverThread:
++			self.server.stop(); # stop if not already stopped
++			self._stopServerThread()
++		LogCaptureTestCase.tearDown(self)
+ 
+ 	@staticmethod
+ 	def proceed(message):
+ 		"""Test transmitter proceed method which just returns first arg"""
+ 		return message
+ 
+-	def testStopPerCloseUnexpected(self):
++	def _createServerThread(self, force=False):
+ 		# start in separate thread :
+-		serverThread = threading.Thread(
+-			target=self.server.start, args=(self.sock_name, False))
++		self.serverThread = serverThread = threading.Thread(
++			target=self.server.start, args=(self.sock_name, force))
+ 		serverThread.daemon = True
+ 		serverThread.start()
+ 		self.assertTrue(Utils.wait_for(self.server.isActive, unittest.F2B.maxWaitTime(10)))
++		return serverThread
++	
++	def _stopServerThread(self):
++		serverThread = self.serverThread
++		# wait for end of thread :
++		Utils.wait_for(lambda: not serverThread.isAlive() 
++			or serverThread.join(Utils.DEFAULT_SLEEP_TIME), unittest.F2B.maxWaitTime(10))
++		self.serverThread = None
++
++	def testStopPerCloseUnexpected(self):
++		# start in separate thread :
++		serverThread = self._createServerThread()
+ 		# unexpected stop directly after start:
+ 		self.server.close()
+ 		# wait for end of thread :
+-		Utils.wait_for(lambda: not serverThread.isAlive() 
+-			or serverThread.join(Utils.DEFAULT_SLEEP_INTERVAL), unittest.F2B.maxWaitTime(10))
++		self._stopServerThread()
+ 		self.assertFalse(serverThread.isAlive())
+ 		# clean :
+ 		self.server.stop()
+@@ -83,30 +111,99 @@ class Socket(unittest.TestCase):
+ 			return None
+ 
+ 	def testSocket(self):
+-		serverThread = threading.Thread(
+-			target=self.server.start, args=(self.sock_name, False))
+-		serverThread.daemon = True
+-		serverThread.start()
+-		self.assertTrue(Utils.wait_for(self.server.isActive, unittest.F2B.maxWaitTime(10)))

@@ -1,0 +1,113 @@
+@@ -39,6 +39,7 @@ class FrequentStringItems {
+  public:
+   FrequentStringItems(u_int32_t _max_items, bool _thread_safe = true) { max_items =_max_items, max_items_threshold = 2*_max_items, thread_safe = _thread_safe; }
+   
++  inline u_int32_t getSize() { return q.size(); };
+   void add(char *key, u_int32_t value);
+   char* json();
+ };
+
+
+
+
+@@ -47,6 +47,8 @@ class LocalHostStats: public HostStats {
+   void saveOldSites();
+   void removeRedisSitesKey(Host *host);
+   void addRedisSitesKey(Host *host);
++  void getCurrentTime(struct tm *t_now);
++  void addRemoveRedisKey(Host *host, char *host_buf, struct tm *t_now, bool push);
+   
+  public:
+   LocalHostStats(Host *_host);
+
+
+
+
+@@ -25,7 +25,7 @@
+ 
+ LocalHostStats::LocalHostStats(Host *_host) : HostStats(_host) {
+   top_sites = new (std::nothrow) FrequentStringItems(HOST_SITES_TOP_NUMBER);
+-  old_sites = strdup("{}");
++  old_sites = NULL;
+   dns  = new (std::nothrow) DnsStats();
+   http = new (std::nothrow) HTTPstats(_host);
+   icmp = new (std::nothrow) ICMPstats();
+@@ -49,7 +49,7 @@ LocalHostStats::LocalHostStats(Host *_host) : HostStats(_host) {
+ 
+ LocalHostStats::LocalHostStats(LocalHostStats &s) : HostStats(s) {
+   top_sites = new (std::nothrow) FrequentStringItems(HOST_SITES_TOP_NUMBER);
+-  old_sites = strdup("{}");
++  old_sites = NULL;
+   dns = s.getDNSstats() ? new (std::nothrow) DnsStats(*s.getDNSstats()) : NULL;
+   http = NULL;
+   icmp = NULL;
+@@ -121,7 +121,8 @@ void LocalHostStats::updateStats(const struct timeval *tv) {
+           this->saveOldSites();
+ 	      free(old_sites);
+       }
+-      old_sites = top_sites->json();
++      if(top_sites->getSize())
++        old_sites = top_sites->json();
+     }
+ 
+     nextSitesUpdate = tv->tv_sec + HOST_SITES_REFRESH;
+@@ -154,13 +155,13 @@ void LocalHostStats::lua(lua_State* vm, bool mask_host, DetailsLevel details_lev
+   HostStats::lua(vm, mask_host, details_level);
+ 
+   if((!mask_host) && top_sites && ntop->getPrefs()->are_top_talkers_enabled()) {
+-    char *cur_sites = top_sites->json();
+-    
+-    if(strcmp(cur_sites, "{}") != 0)
++    if(top_sites) {
++      char *cur_sites = top_sites->json();
+       lua_push_str_table_entry(vm, "sites", cur_sites ? cur_sites : (char*)"{}");
+-    if(strcmp(old_sites, "{}") != 0)
++      if(cur_sites) free(cur_sites);
++    }
++    if(old_sites)
+       lua_push_str_table_entry(vm, "sites.old", old_sites ? old_sites : (char*)"{}");
+-    if(cur_sites) free(cur_sites);
+   }
+ 
+   if(details_level >= details_high) {
+@@ -301,28 +302,64 @@ void LocalHostStats::incStats(time_t when, u_int8_t l4_proto,
+ 
+ /* *************************************** */
+ 
++void LocalHostStats::getCurrentTime(struct tm *t_now) {
++  time_t now = time(NULL); 
++  memset(t_now, 0, sizeof(*t_now));
++  localtime_r(&now, t_now);
++}
++
++/* *************************************** */
++
++void LocalHostStats::addRemoveRedisKey(Host *host, char *host_buf, struct tm *t_now, bool push) {
++  char redis_hour_key[256], redis_daily_key[256];
++  int iface, vlan = host->get_vlan_id();
++
++  if(!host->getInterface())
++    return;
++
++  iface = host->getInterface()->get_id();
++
++  snprintf(redis_hour_key, sizeof(redis_hour_key), "%s@%u_%u_%d_%u", host_buf, vlan, iface, t_now->tm_mday, t_now->tm_hour);
++  snprintf(redis_daily_key, sizeof(redis_daily_key), "%s@%u_%u_%d", host_buf, vlan, iface, t_now->tm_mday);
++
++  if(push) {
++    ntop->getRedis()->lpush((char*) HASHKEY_LOCAL_HOSTS_TOP_SITES_HOUR_KEYS_PUSHED, redis_hour_key, 3600);
++    ntop->getRedis()->lpush((char*) HASHKEY_LOCAL_HOSTS_TOP_SITES_DAY_KEYS_PUSHED, redis_daily_key, 3600);
++  }
++  else {
++    ntop->getRedis()->lrem((char*) HASHKEY_LOCAL_HOSTS_TOP_SITES_HOUR_KEYS_PUSHED, redis_hour_key);
++    ntop->getRedis()->lrem((char*) HASHKEY_LOCAL_HOSTS_TOP_SITES_DAY_KEYS_PUSHED, redis_daily_key);
++  }
++}
++
++/* *************************************** */
++
+ void LocalHostStats::saveOldSites() {
+   char host_buf[128], redis_key[256];
++  u_int32_t iface, vlan = host->get_vlan_id();
+   int minute = 0;
+-  /* Us

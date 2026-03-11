@@ -1,0 +1,165 @@
+@@ -388,6 +388,12 @@ R_API int r_egg_run(REgg *egg) {
+ 	return res;
+ }
+ 
++R_API int r_egg_run_rop(REgg *egg) {
++	ut64 sz;
++	const ut8 *tmp = r_buf_data (egg->bin, &sz);
++	return r_sys_run_rop (tmp, sz);
++}
++
+ #define R_EGG_FILL_TYPE_TRAP
+ #define R_EGG_FILL_TYPE_NOP
+ #define R_EGG_FILL_TYPE_CHAR
+
+
+
+
+@@ -214,6 +214,7 @@ R_API RBuffer *r_egg_get_bin(REgg *egg);
+ R_API char *r_egg_get_assembly(REgg *egg);
+ R_API void r_egg_append(REgg *egg, const char *src);
+ R_API int r_egg_run(REgg *egg);
++R_API int r_egg_run_rop(REgg *egg);
+ R_API int r_egg_patch(REgg *egg, int off, const ut8 *b, int l);
+ R_API void r_egg_finalize(REgg *egg);
+ 
+
+
+
+
+@@ -41,6 +41,7 @@ R_API bool r_is_heap (void *p);
+ R_API bool r_sys_stop(void);
+ R_API char *r_sys_pid_to_path(int pid);
+ R_API int r_sys_run(const ut8 *buf, int len);
++R_API int r_sys_run_rop(const ut8 *buf, int len);
+ R_API int r_sys_getpid(void);
+ R_API int r_sys_crash_handler(const char *cmd);
+ R_API const char *r_sys_arch_str(int arch);
+
+
+
+
+@@ -42,6 +42,7 @@ static int usage(int v) {
+ 			" -v              show version\n"
+ 			" -w [off:hex]    patch hexpairs at given offset\n"
+ 			" -x              execute\n"
++			" -X [hexpairs]   execute rop chain, using the stack provided\n"
+ 			" -z              output in C string syntax\n");
+ 	}
+ 	return 1;
+@@ -122,7 +123,8 @@ R_API int r_main_ragg2(int argc, char **argv) {
+ 	const char *arch = R_SYS_ARCH;
+ 	const char *os = R_EGG_OS_NAME;
+ 	char *format = "raw";
+-	int show_execute = 0;
++	bool show_execute = false;
++	bool show_execute_rop = false;
+ 	int show_hex = 1;
+ 	int show_asm = 0;
+ 	int show_raw = 0;
+@@ -140,7 +142,7 @@ R_API int r_main_ragg2(int argc, char **argv) {
+ 	int c, i;
+ 	REgg *egg = r_egg_new ();
+ 
+-	while ((c = r_getopt (argc, argv, "n:N:he:a:b:f:o:sxrk:FOI:Li:c:p:P:B:C:vd:D:w:zq:S:")) != -1) {
++	while ((c = r_getopt (argc, argv, "n:N:he:a:b:f:o:sxXrk:FOI:Li:c:p:P:B:C:vd:D:w:zq:S:")) != -1) {
+ 		switch (c) {
+ 		case 'a':
+ 			arch = r_optarg;
+@@ -285,7 +287,12 @@ R_API int r_main_ragg2(int argc, char **argv) {
+ 			break;
+ 		case 'x':
+ 			// execute
++			show_execute = true;
++			break;
++		case 'X':
++			// execute rop chain
+ 			show_execute = 1;
++			show_execute_rop = 1;
+ 			break;
+ 		case 'L':
+ 			list (egg);
+@@ -520,7 +527,12 @@ R_API int r_main_ragg2(int argc, char **argv) {
+ 
+ 	if (show_raw || show_hex || show_execute) {
+ 		if (show_execute) {
+-			int r = r_egg_run (egg);
++			int r;
++			if (show_execute_rop) {
++				r = r_egg_run_rop (egg);
++			} else {
++				r = r_egg_run (egg);
++			}
+ 			r_egg_free (egg);
+ 			return r;
+ 		}
+
+
+
+
+@@ -75,6 +75,36 @@ extern char **environ;
+ 
+ R_LIB_VERSION(r_util);
+ 
++#ifdef __x86_64__
++# ifdef _MSC_VER
++#  define R_SYS_ASM_START_ROP() \
++	 eprintf ("r_sys_run_rop: Unsupported arch\n");
++# else
++#  define R_SYS_ASM_START_ROP() \
++	 __asm__ __volatile__ ("leaq %0, %%rsp; ret" \
++				: \
++				: "m" (*bufptr) \
++				:);
++# endif
++#elif __i386__
++# ifdef _MSC_VER
++#  define R_SYS_ASM_START_ROP() \
++	__asm { \
++		lea esp, bufptr \
++		ret \
++	}
++# else
++#  define R_SYS_ASM_START_ROP() \
++	__asm__ __volatile__ ("leal %0, %%esp; ret" \
++				: \
++				: "m" (*bufptr) \
++				:);
++# endif
++#else
++# define R_SYS_ASM_START_ROP() \
++	eprintf ("r_sys_run_rop: Unsupported arch\n");
++#endif
++
+ static const struct {const char* name; ut64 bit;} arch_bit_array[] = {
+     {"x86", R_SYS_ARCH_X86},
+     {"arm", R_SYS_ARCH_ARM},
+@@ -964,6 +994,56 @@ R_API int r_sys_run(const ut8 *buf, int len) {
+ 	return ret;
+ }
+ 
++R_API int r_sys_run_rop(const ut8 *buf, int len) {
++#if USE_FORK
++	int st;
++#endif
++	// TODO: define R_SYS_ALIGN_FORWARD in r_util.h
++	ut8 *bufptr = malloc (len);
++	if (!bufptr) {
++		eprintf ("r_sys_run_rop: Cannot allocate buffer\n");
++		return false;
++	}
++
++	if (!buf) {
++		eprintf ("r_sys_run_rop: Cannot execute empty rop chain\n");
++		free (bufptr);
++		return false;
++	}
++	memcpy (bufptr, buf, len);
++#if USE_FORK
++#if __UNIX__
++	pid_t pid = r_sys_fork ();
++#else
++	pid = -1;
++#endif
++	if (pid < 0) {
++		R_SYS_ASM_START_ROP ()

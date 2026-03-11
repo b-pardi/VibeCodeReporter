@@ -1,0 +1,96 @@
+@@ -5,8 +5,12 @@ import peergos.server.sql.*;
+ import peergos.server.util.Logging;
+ 
+ import peergos.shared.cbor.*;
++import peergos.shared.crypto.asymmetric.*;
+ import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.mutable.*;
+ import peergos.shared.social.*;
++import peergos.shared.storage.*;
+ import peergos.shared.util.*;
+ 
+ import java.sql.*;
+@@ -189,6 +193,26 @@ public class JdbcIpnsAndSocial {
+         }
+     }
+ 
++    public List<Multihash> getAllTargets(ContentAddressedStorage ipfs) {
++        try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM metadatablobs")) {
++            ResultSet rs = stmt.executeQuery();
++            List<Multihash> results = new ArrayList<>();
++            while (rs.next()) {
++                PublicKeyHash writerHash = PublicKeyHash.fromCbor(CborObject.fromByteArray(Base64.getDecoder().decode(rs.getString("writingKey"))));
++                PublicSigningKey writer = ipfs.getSigningKey(writerHash).join().get();
++                byte[] signedRawCas = Base64.getDecoder().decode(rs.getString(IPNS_TARGET_NAME));
++                byte[] bothHashes = writer.unsignMessage(signedRawCas);
++                HashCasPair cas = HashCasPair.fromCbor(CborObject.fromByteArray(bothHashes));
++                results.add(cas.updated.get());
++            }
++
++            return results;
++        } catch (SQLException sqe) {
++            LOG.log(Level.WARNING, sqe.getMessage(), sqe);
++            return Collections.emptyList();
++        }
++    }
++
+     public synchronized void close() {
+         if (isClosed)
+             return;
+
+
+
+
+@@ -4,12 +4,14 @@ import com.amazonaws.*;
+ import com.amazonaws.auth.*;
+ import com.amazonaws.services.s3.*;
+ import com.amazonaws.services.s3.model.*;
++import peergos.server.corenode.*;
+ import peergos.server.sql.*;
+ import peergos.server.util.*;
+ import peergos.shared.cbor.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.cid.*;
+ import peergos.shared.io.ipfs.multibase.binary.*;
++import peergos.shared.mutable.*;
+ import peergos.shared.storage.*;
+ import peergos.shared.io.ipfs.multihash.*;
+ import io.prometheus.client.Histogram;
+@@ -106,6 +108,36 @@ public class S3BlockStorage implements ContentAddressedStorage {
+         return Futures.errored(new IllegalStateException("S3 doesn't implement GC!"));
+     }
+ 
++    private void collectGarbage(JdbcIpnsAndSocial pointers) {
++        // TODO: do this more efficiently with a bloom filter, and streaming
++        List<Multihash> present = getFiles(Integer.MAX_VALUE);
++        List<Multihash> pending = transactions.getOpenTransactionBlocks();
++        // This pointers call must happen AFTER the previous two for correctness
++        List<Multihash> currentRoots = pointers.getAllTargets(this);
++        BitSet reachable = new BitSet(present.size());
++        for (Multihash root : currentRoots) {
++            markReachable(root, present, reachable);
++        }
++        for (Multihash additional : pending) {
++            int index = present.indexOf(additional);
++            if (index >= 0)
++                reachable.set(index);
++        }
++        for (int i=0; i < present.size(); i++)
++            if (! reachable.get(i))
++                delete(present.get(i));
++    }
++
++    private void markReachable(Multihash root, List<Multihash> present, BitSet reachable) {
++        int index = present.indexOf(root);
++        if (index >= 0)
++            reachable.set(index);
++        List<Multihash> links = getLinks(root).join();
++        for (Multihash link : links) {
++            markReachable(link, present, reachable);
++        }
++    }
++
+     @Override
+     public CompletableFuture<Optional<Integer>> getSize(Multihash hash) {
+         return Futures.of(map(hash, h -> {

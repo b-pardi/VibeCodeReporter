@@ -1,0 +1,121 @@
+@@ -289,6 +289,32 @@ class Flow : public GenericHashEntry {
+   float pkts_thpt_cli2srv, pkts_thpt_srv2cli;
+   ValueTrend bytes_thpt_trend, goodput_bytes_thpt_trend, pkts_thpt_trend;
+ 
++  enum MinorConnectionStates {
++    MINOR_NO_STATE = 0, /* Initial Flow State (just for constructor) */
++    S0,           /* Only SYN in src2dst_tcp_flags; no flags in dst2src_tcp_flags */
++    S1,           /* ... */
++    SF,
++    REJ,
++    S2,
++    S3,
++    RSTO,
++    RSTR,
++    RSTOS0,
++    RSTRH,
++    SH,
++    SHR,
++    OTH = 13
++  };
++
++  enum MajorConnectionStates {
++    MAJOR_NO_STATE = 0, 
++    ATTEMPTED,
++    ESTABLISHED,
++    CLOSED = 3
++  };
++  
++  MinorConnectionStates current_c_state; 
++  u_int counter = 0;
+   /*
+      IMPORTANT NOTE
+ 
+@@ -915,6 +941,7 @@ class Flow : public GenericHashEntry {
+   void lua_duration_info(lua_State *vm);
+   void lua_snmp_info(lua_State *vm);
+   void lua_device_protocol_allowed_info(lua_State *vm);
++  void lua_get_flow_connection_state(lua_State *vm);
+   void lua_get_tcp_stats(lua_State *vm) const;
+ 
+   void lua_get_unicast_info(lua_State *vm) const;
+@@ -1402,6 +1429,11 @@ class Flow : public GenericHashEntry {
+   inline int32_t getInterfaceIndex()      { return(iface_index); };
+   inline void setFlowSource(FlowSource n) { flow_source = n;     }
+   inline FlowSource getFlowSource()       { return(flow_source); }
++  inline MinorConnectionStates setCurrentConnectionState(u_int8_t new_state) { current_c_state = static_cast<MinorConnectionStates>(new_state); return(current_c_state);  };
++  inline MinorConnectionStates getCurrentConnectionState() { return(current_c_state); };
++  bool checkS1ConnState();
++  MinorConnectionStates calculateConnectionState();
++  MajorConnectionStates retrieveMajorConnState();
+ };
+ 
+ #endif /* _FLOW_H_ */
+
+
+
+
+@@ -559,6 +559,8 @@
+ #define FLOW_TIME NTOP_BASE_ID + 532
+ #define PROFILE NTOP_BASE_ID + 533
+ #define STATUS NTOP_BASE_ID + 534
++#define MAJOR_CONNECTION_STATE NTOP_BASE_ID + 535
++#define MINOR_CONNECTION_STATE NTOP_BASE_ID + 536
+ 
+ /* sFlow Counter Fields */
+ #define SFLOW_DEVICE_IP 0
+
+
+
+
+@@ -69,6 +69,7 @@ Flow::Flow(NetworkInterface *_iface,
+   cli2srv_tos = srv2cli_tos = 0;
+   src2dst_tcp_zero_window = dst2src_tcp_zero_window = 0;
+   swap_done = swap_requested = 0;
++  current_c_state = MINOR_NO_STATE;
+   
+ #ifdef HAVE_NEDGE
+   last_conntrack_update = 0;
+@@ -2875,6 +2876,8 @@ void Flow::lua(lua_State *vm, AddressTree *ptree, DetailsLevel details_level,
+     lua_get_dir_traffic(vm, true /* Client to Server */);
+     lua_get_dir_traffic(vm, false /* Server to Client */);
+ 
++    lua_get_flow_connection_state(vm);
++
+     luaScore(vm);
+ 
+     if (isICMP()) {
+@@ -4083,7 +4086,7 @@ void Flow::formatGenericFlow(json_object *my_object) {
+ 			 Utils::jsonLabel(L7_RISK_SCORE, "L7_RISK_SCORE",
+                                           jsonbuf, sizeof(jsonbuf)),
+                          json_object_new_int(getScore()));
+-
++  
+   if (isHTTP()) {
+     if (host_server_name && host_server_name[0] != '\0')
+       json_object_object_add(my_object,
+@@ -5289,6 +5292,8 @@ void Flow::updateTcpFlags(const struct bpf_timeval *when, u_int8_t flags,
+   else
+     dst2src_tcp_flags |= flags;
+ 
++  calculateConnectionState();
++
+   if (cumulative_flags) {
+     if (!twh_over) {
+       if ((src2dst_tcp_flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK) &&
+@@ -8538,3 +8543,140 @@ bool Flow::matchFlowVLAN(u_int16_t vlan_id) {
+ bool Flow::matchFlowDeviceIP(u_int32_t flow_device_ip) {
+   return(getFlowDeviceIP() == flow_device_ip ? true : false);
+ }
++
++/* **************************************************** */
++
++void Flow::lua_get_flow_connection_state(lua_State *vm) {
++  lua_push_uint64_table_entry(vm, "minor_conn_state", getCurrentConnectionState());
++  lua_push_uint64_table_entry(vm, "major_conn_state", retrieveMajorConnState());
++}
++
++/* **************************************************** */
++
++Flow::MajorConnectionStates Flow::retrieveMajorConnState() {
++  MajorConnectionStates major_conn_state = MAJOR

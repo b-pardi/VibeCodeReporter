@@ -1,0 +1,133 @@
+@@ -2229,7 +2229,7 @@ static int prot2perm(int x) {
+ 	return r;
+ }
+ 
+-static bool __isDataSection(RBinSection *sect) {
++static bool is_data_section(RBinSection *sect) {
+ 	if (strstr (sect->name, "_cstring")) {
+ 		return true;
+ 	}
+@@ -2302,7 +2302,10 @@ RList *MACH0_(get_segments)(RBinFile *bf) {
+ 			char *section_name = r_str_ndup (bin->sects[i].sectname, 16);
+ 			char *segment_name = r_str_newf ("%u.%s", (ut32)i, bin->segs[segment_index].segname);
+ 			s->name = r_str_newf ("%s.%s", segment_name, section_name);
+-			s->is_data = __isDataSection (s);
++			if (strstr (s->name, "__const")) {
++				s->format = r_str_newf ("Cd 4[%"PFMT64d"]", s->size / 4);
++			}
++			s->is_data = is_data_section (s);
+ 			if (strstr (section_name, "interpos") || strstr (section_name, "__mod_")) {
+ #if R_BIN_MACH064
+ 				const int ws = 8;
+
+
+
+
+@@ -104,6 +104,7 @@ struct MACH0_(SCategory) {
+ 	mach0_ut properties;
+ };
+ 
++static char *readstr(RBinFile *bf, ut64 addr);
+ static mach0_ut va2pa(mach0_ut p, ut32 *offset, ut32 *left, RBinFile *bf);
+ static void copy_sym_name_with_namespace(char *class_name, char *read_name, RBinSymbol *sym);
+ static void get_ivar_list_t(mach0_ut p, RBinFile *bf, RBinClass *klass);
+@@ -1213,41 +1214,139 @@ void MACH0_(get_class_t)(mach0_ut p, RBinFile *bf, RBinClass *klass, bool dupe,
+ 	}
+ }
+ 
++enum {
++	NCD_FLAGS = 0,
++	NCD_PARENT = 1,
++	NCD_NAME = 2,
++	NCD_ACCESSFCNPTR = 3,
++	NCD_FIELDS = 4,
++	NCD_SUPER = 5,
++	NCD_MEMBERS = 8,
++	NCD_NFIELDS = 9,
++	NCD_OFIELDS = 10
++};
++
++typedef struct {
++	bool valid;
++	ut64 name_addr;
++	ut64 addr;
++	ut64 fields;
++	ut64 members;
++	ut64 members_count;
++	// internal //
++	st32 *fieldmd;
++	ut64 fieldmd_addr;
++	size_t fieldmd_size;
++} SwiftType; 
++
++static SwiftType parse_type_entry(RBinFile *bf, ut64 typeaddr) {
++	SwiftType st = {0};
++	ut32 words[16] = {0};
++	st32 *swords = (st32*)&words;
++	if (r_buf_read_at (bf->buf, typeaddr, (ut8*)&words, sizeof (words)) < 1) {
++		eprintf ("Invalid pointers.\n");
++		return st;
++	}
+ #if 0
+-static RList *parse_swift_classes(RBinFile *bf) {
+-	bool is_swift = false;
+-	RBinString *str;
+-	RListIter *iter;
+-	RBinClass *cls;
+-	RList *ret;
+-	char *lib;
+-
+-	r_list_foreach (bf->o->libs, iter, lib) {
+-		if (strstr (lib, "libswift")) {
+-			is_swift = true;
+-			break;
++// struct NominalClassDescriptor
++ut32 flags
++st32 parent
++st32 name
++st32 accessfcnptr
++st32 fields
++st32 superklass
++ut32 ign;
++ut32 ign;
++ut32 members_count;
++ut32 fields_count;
++ut32 fields_offset;
++#endif
++#define NCD(x) (typeaddr + (x*4) + swords[x])
++	eprintf ("0x%08"PFMT64x " swift_type_entry:\n", typeaddr);
++	eprintf ("  flags:   0x%08x\n", words[0]);
++	eprintf ("  parent:  0x%08"PFMT64x"\n", NCD (NCD_PARENT));
++	ut64 typename_addr = NCD (NCD_NAME);
++	st.name_addr = typename_addr;
++	char *typename = readstr (bf, typename_addr);
++	eprintf ("  name:    0x%08"PFMT64x" (%s)\n", typename_addr, typename);
++	eprintf ("  access:  0x%08"PFMT64x"\n", bf->o->baddr + NCD (NCD_ACCESSFCNPTR));
++	eprintf ("  fields:  0x%08"PFMT64x"\n", NCD (NCD_FIELDS));
++	eprintf ("  super:   0x%08"PFMT64x"\n", NCD (NCD_SUPER));
++	eprintf ("  members: 0x%08"PFMT64x"\n", NCD (NCD_MEMBERS));
++	eprintf ("  fields:  0x%08"PFMT64x"\n", NCD (NCD_NFIELDS));
++	eprintf ("  fieldsat:0x%08"PFMT64x"\n", NCD (NCD_OFIELDS));
++	char * tn = r_name_filter2 (typename);
++	r_cons_printf ("f sym.swift.%s.init = 0x%08"PFMT64x"\n",
++		tn, bf->o->baddr + NCD (NCD_ACCESSFCNPTR));
++	free (tn);
++	st.valid = true;
++	st.fields = NCD (NCD_FIELDS);
++	st.members = NCD (NCD_MEMBERS);
++	st.members_count = NCD (NCD_MEMBERS);
++	free (typename);
++	return st;
++}
++
++static void parse_type(RBinFile *bf, SwiftType st) {
++	char *otypename = readstr (bf, st.name_addr);
++	char *typename = r_name_filter2 (otypename);
++	// eprintf ("methods:\n");
++	if (st.members != UT64_MAX) {
++		ut8 buf[512];
++		int i = 0;
++		r_buf_read_at (bf->buf, st.members, buf, sizeof (buf));
++		ut32 count = r_read_le32 (buf + 3);
++		for (i = 0; i < count && i < 16; i++) {
++			int pos = (i * 8) + 3 + 8 + 8;

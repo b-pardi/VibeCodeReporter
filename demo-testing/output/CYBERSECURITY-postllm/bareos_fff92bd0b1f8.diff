@@ -1,0 +1,115 @@
+@@ -614,6 +614,7 @@ class BareosDb : public BareosDbQueryEnum {
+   bool CreateClientRecord(JobControlRecord* jcr, ClientDbRecord* cr);
+   bool CreateFilesetRecord(JobControlRecord* jcr, FileSetDbRecord* fsr);
+   bool CreatePoolRecord(JobControlRecord* jcr, PoolDbRecord* pool_dbr);
++  int DeleteNullJobmediaRecords(JobControlRecord* jcr, std::uint32_t jobid);
+   bool CreateJobmediaRecord(JobControlRecord* jcr, JobMediaDbRecord* jr);
+   bool CreateCounterRecord(JobControlRecord* jcr, CounterDbRecord* cr);
+   bool CreateDeviceRecord(JobControlRecord* jcr, DeviceDbRecord* dr);
+
+
+
+
+@@ -125,6 +125,26 @@ static int DeleteHandler(void* ctx, int, char** row)
+   return 0;
+ }
+ 
++/**
++ * Delete all NullJobMedia records for this job
++ * Returns: -1 on failure
++ *          n>=0 on success,
++ *               where n is the number of rows affected
++ */
++int BareosDb::DeleteNullJobmediaRecords(JobControlRecord* jcr,
++                                        std::uint32_t jobid)
++{
++  DbLocker _{this};
++
++  Mmsg(cmd,
++       "DELETE FROM jobmedia WHERE jobid=%u AND firstindex=0 AND lastindex=0",
++       jobid);
++  Dmsg1(200, "DeleteNullJobmediaRecords: %s\n", cmd);
++
++  int numrows = DELETE_DB(jcr, cmd);
++
++  return numrows;
++}
+ 
+ /**
+  * This routine will purge (delete) all records
+
+
+
+
+@@ -74,6 +74,8 @@ static char Update_filelist[] = "Catreq Job=%127s UpdateFileList\n";
+ 
+ static char Update_jobrecord[]
+     = "Catreq Job=%127s UpdateJobRecord JobFiles=%lu JobBytes=%llu\n";
++static char Delete_nulljobmediarecord[]
++    = "CatReq Job=%127s DeleteNullJobmediaRecords jobid=%u\n";
+ 
+ // Responses sent to Storage daemon
+ static char OK_media[]
+@@ -84,6 +86,7 @@ static char OK_media[]
+       " VolWriteTime=%s EndFile=%u EndBlock=%u LabelType=%d"
+       " MediaId=%s EncryptionKey=%s MinBlocksize=%d MaxBlocksize=%d\n";
+ static char OK_create[] = "1000 OK CreateJobMedia\n";
++static char OK_delete[] = "1000 OK DeleteNullJobmediaRecords\n";
+ 
+ static int SendVolumeInfoToStorageDaemon(JobControlRecord* jcr,
+                                          BareosSocket* sd,
+@@ -122,6 +125,7 @@ void CatalogRequest(JobControlRecord* jcr, BareosSocket* bs)
+   uint64_t MediaId;
+   utime_t VolFirstWritten;
+   utime_t VolLastWritten;
++  std::uint32_t jobid;
+ 
+   // Request to find next appendable Volume for this Job
+   Dmsg1(100, "catreq %s", bs->msg);
+@@ -380,6 +384,14 @@ void CatalogRequest(JobControlRecord* jcr, BareosSocket* bs)
+            jcr->db->strerror());
+       bs->fsend(_("1992 Update job record error\n"));
+     }
++  } else if (sscanf(bs->msg, Delete_nulljobmediarecord, &Job, &jobid) == 2) {
++    int numrows = jcr->db->DeleteNullJobmediaRecords(jcr, jobid);
++    Dmsg1(400, "Deleted %d rows.\n", numrows);
++    if (numrows == -1) {
++      bs->fsend(_("1992 DeleteNullJobMediaRecords error\n"));
++    } else {
++      bs->fsend(OK_delete);
++    }
+   } else {
+     omsg = GetMemory(bs->message_length + 1);
+     PmStrcpy(omsg, bs->msg);
+
+
+
+
+@@ -110,6 +110,24 @@ static bool SaveFullyProcessedFilesAttributes(
+   return false;
+ }
+ 
++bool DeleteNullJobmediaRecords(JobControlRecord* jcr)
++{
++  Dmsg0(100, "Deleting null jobmedia records\n");
++  BareosSocket* dir = jcr->dir_bsock;
++  const char* delete_null_records
++      = "CatReq Job=%s DeleteNullJobmediaRecords jobid=%u";
++  dir->fsend(delete_null_records, jcr->Job, jcr->JobId);
++  if (dir->recv() <= 0) {
++    Dmsg0(100, "DeleteNullJobmediaRecords error BnetRecv\n");
++    Mmsg(jcr->errmsg,
++         _("Network error on BnetRecv in DeleteNullJobmediaRecords.\n"));
++    return false;
++  }
++  Dmsg1(100, ">dird %s", dir->msg);
++  if (strncmp(dir->msg, "1000", 4) == 0) { return true; }
++  return false;
++}
++
+ // Append Data sent from File daemon
+ bool DoAppendData(JobControlRecord* jcr, BareosSocket* bs, const char* what)
+ {
+@@ -412,6 +430,10 @@ bool DoAppendData(JobControlRecord* jcr, BareosSocket* bs, const char* what)
+   // Release the device -- and send final Vol info to DIR and unlock it.
+   ReleaseDevice(jcr->sd_impl->d

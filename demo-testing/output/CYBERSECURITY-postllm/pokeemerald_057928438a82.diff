@@ -1,0 +1,78 @@
+@@ -392,7 +392,7 @@ struct BattleStruct
+     u8 expGetterBattlerId;
+     u8 unused_5;
+     u8 absentBattlerFlags;
+-    u8 palaceFlags; // First 4 bits are "is < 50% HP and not asleep" for each battler, last 4 bits are selected moves to pass to AI
++    u8 palaceFlags; // First 4 bits are "is <= 50% HP and not asleep" for each battler, last 4 bits are selected moves to pass to AI
+     u8 field_93; // related to choosing pokemon?
+     u8 wallyBattleState;
+     u8 wallyMovesState;
+@@ -440,6 +440,11 @@ struct BattleStruct
+     u8 alreadyStatusedMoveAttempt; // As bits for battlers; For example when using Thunder Wave on an already paralyzed pokemon.
+ };
+ 
++// The palaceFlags member of struct BattleStruct contains 1 flag per move to indicate which moves the AI should consider,
++// and 1 flag per battler to indicate whether the battler is awake and at <= 50% HP (which affects move choice).
++// The assert below is to ensure palaceFlags is large enough to store these flags without overlap.
++STATIC_ASSERT(sizeof(((struct BattleStruct *)0)->palaceFlags) * 8 >= MAX_BATTLERS_COUNT + MAX_MON_MOVES, PalaceFlagsTooSmall)
++
+ #define F_DYNAMIC_TYPE_1 (1 << 6)
+ #define F_DYNAMIC_TYPE_2 (1 << 7)
+ #define DYNAMIC_TYPE_MASK (F_DYNAMIC_TYPE_1 - 1)
+
+
+
+
+@@ -121,9 +121,9 @@ u16 ChooseMoveAndTargetInBattlePalace(void)
+     #define selectedGroup percent
+     #define selectedMoves var2
+     #define moveTarget var1
+-    #define validMoveFlags var1
+-    #define numValidMoveGroups var2
+-    #define validMoveGroup var2
++    #define numMovesPerGroup var1
++    #define numMultipleMoveGroups var2
++    #define randSelectGroup var2
+ 
+     // If battler is < 50% HP and not asleep, use second set of move group likelihoods
+     // otherwise use first set
+@@ -172,32 +172,45 @@ u16 ChooseMoveAndTargetInBattlePalace(void)
+     {
+         if (unusableMovesBits != ALL_MOVES_MASK)
+         {
+-            validMoveFlags = 0, numValidMoveGroups = 0;
++            numMovesPerGroup = 0, numMultipleMoveGroups = 0;
+ 
+             for (i = 0; i < MAX_MON_MOVES; i++)
+             {
+-                // validMoveFlags is used here as a bitfield for which moves can be used for each move group type
+-                // first 4 bits are for attack (1 for each move), then 4 bits for defense, and 4 for support
++                // Count the number of usable moves the battler has in each move group.
++                // The totals will be stored separately in 3 groups of 4 bits each in numMovesPerGroup.
+                 if (GetBattlePalaceMoveGroup(moveInfo->moves[i]) == PALACE_MOVE_GROUP_ATTACK && !(gBitTable[i] & unusableMovesBits))
+-                    validMoveFlags += (1 << 0);
++                    numMovesPerGroup += (1 << 0);
+                 if (GetBattlePalaceMoveGroup(moveInfo->moves[i]) == PALACE_MOVE_GROUP_DEFENSE && !(gBitTable[i] & unusableMovesBits))
+-                    validMoveFlags += (1 << 4);
++                    numMovesPerGroup += (1 << 4);
+                 if (GetBattlePalaceMoveGroup(moveInfo->moves[i]) == PALACE_MOVE_GROUP_SUPPORT && !(gBitTable[i] & unusableMovesBits))
+-                    validMoveFlags += (1 << 8);
++                    numMovesPerGroup += (1 << 8);
+             }
+ 
+-            // Count the move groups the pokemon has
+-            if ((validMoveFlags & 0xF) > 1)
+-                numValidMoveGroups++;
+-            if ((validMoveFlags & 0xF0) > 0x1F)
+-                numValidMoveGroups++;
+-            if ((validMoveFlags & 0xF0) > 0x1FF)
+-                numValidMoveGroups++;
+-
+-
+-            // If more than 1 possible move group, or no possible move groups
+-            // then choose move randomly
+-            if (numValidMoveGroups > 1 || numValidMoveGroups == 0)
++            // Count the number of move groups for which the battler has at least 2 usable moves.
++            // This is a roundabout way to determine if there is a move group that should be
++            // preferred, because it has multiple move options and the others do not.
++         

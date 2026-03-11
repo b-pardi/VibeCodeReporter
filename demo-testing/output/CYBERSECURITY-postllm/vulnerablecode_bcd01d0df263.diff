@@ -1,0 +1,104 @@
+@@ -19,7 +19,6 @@ from vulnerabilities.importers import elixir_security
+ from vulnerabilities.importers import epss
+ from vulnerabilities.importers import fireeye
+ from vulnerabilities.importers import gentoo
+-from vulnerabilities.importers import github
+ from vulnerabilities.importers import github_osv
+ from vulnerabilities.importers import istio
+ from vulnerabilities.importers import mozilla
+@@ -38,6 +37,7 @@ from vulnerabilities.importers import ubuntu_usn
+ from vulnerabilities.importers import vulnrichment
+ from vulnerabilities.importers import xen
+ from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipeline
++from vulnerabilities.pipelines import github_importer
+ from vulnerabilities.pipelines import gitlab_importer
+ from vulnerabilities.pipelines import nginx_importer
+ from vulnerabilities.pipelines import npm_importer
+@@ -45,7 +45,6 @@ from vulnerabilities.pipelines import pypa_importer
+ 
+ IMPORTERS_REGISTRY = [
+     nvd.NVDImporter,
+-    github.GitHubAPIImporter,
+     pysec.PyPIImporter,
+     alpine_linux.AlpineImporter,
+     openssl.OpensslImporter,
+@@ -78,6 +77,7 @@ IMPORTERS_REGISTRY = [
+     npm_importer.NpmImporterPipeline,
+     nginx_importer.NginxImporterPipeline,
+     gitlab_importer.GitLabImporterPipeline,
++    github_importer.GitHubAPIImporterPipeline,
+ ]
+ 
+ IMPORTERS_REGISTRY = {
+
+
+
+
+@@ -31,7 +31,6 @@ from vulnerabilities.importers.curl import CurlImporter
+ from vulnerabilities.importers.debian import DebianImporter
+ from vulnerabilities.importers.debian_oval import DebianOvalImporter
+ from vulnerabilities.importers.elixir_security import ElixirSecurityImporter
+-from vulnerabilities.importers.github import GitHubAPIImporter
+ from vulnerabilities.importers.github_osv import GithubOSVImporter
+ from vulnerabilities.importers.istio import IstioImporter
+ from vulnerabilities.importers.oss_fuzz import OSSFuzzImporter
+@@ -42,6 +41,7 @@ from vulnerabilities.improver import Improver
+ from vulnerabilities.improver import Inference
+ from vulnerabilities.models import Advisory
+ from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipeline
++from vulnerabilities.pipelines.github_importer import GitHubAPIImporterPipeline
+ from vulnerabilities.pipelines.gitlab_importer import GitLabImporterPipeline
+ from vulnerabilities.pipelines.nginx_importer import NginxImporterPipeline
+ from vulnerabilities.pipelines.npm_importer import NpmImporterPipeline
+@@ -371,7 +371,7 @@ class GitLabBasicImprover(ValidVersionImprover):
+ 
+ 
+ class GitHubBasicImprover(ValidVersionImprover):
+-    importer = GitHubAPIImporter
++    importer = GitHubAPIImporterPipeline
+     ignorable_versions = frozenset(
+         [
+             "0.1-bulbasaur",
+
+
+
+
+@@ -89,7 +89,12 @@ class VulnerableCodeBaseImporterPipeline(VulnerableCodePipeline):
+ 
+     def collect_and_store_advisories(self):
+         collected_advisory_count = 0
+-        progress = LoopProgress(total_iterations=self.advisories_count(), logger=self.log)
++        estimated_advisory_count = self.advisories_count()
++
++        if estimated_advisory_count > 0:
++            self.log(f"Collecting {estimated_advisory_count:,d} advisories")
++
++        progress = LoopProgress(total_iterations=estimated_advisory_count, logger=self.log)
+         for advisory in progress.iter(self.collect_advisories()):
+             if _obj := insert_advisory(
+                 advisory=advisory,
+
+similarity index 56%
+rename from vulnerabilities/importers/github.py
+rename to vulnerabilities/pipelines/github_importer.py
+
+
+
+@@ -8,9 +8,14 @@
+ #
+ 
+ import logging
++from traceback import format_exc as traceback_format_exc
++from typing import Callable
+ from typing import Iterable
++from typing import List
+ from typing import Optional
+ 
++import requests
++from bs4 import BeautifulSoup
+ from cwe2.database import Database
+ from dateutil import parser as dateparser
+ from packageurl import PackageURL
+@@ -21,85 +26,120 @@ from vulnerabilities import severity_systems
+ from vulnerabilities import utils
+ from vulnerabilities.i

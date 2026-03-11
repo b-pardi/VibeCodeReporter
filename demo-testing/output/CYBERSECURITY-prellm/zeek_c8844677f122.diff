@@ -1,0 +1,161 @@
+@@ -28,11 +28,9 @@ uint64_t Connection::current_connections = 0;
+ Connection::Connection(const detail::ConnIDKey& k, double t,
+                        const ConnID* id, uint32_t flow, const Packet* pkt)
+ 	: Session(t, connection_timeout, connection_status_update,
+-	          detail::connection_status_update_interval)
++	          detail::connection_status_update_interval),
++	  key(k)
+ 	{
+-	key = k;
+-	key_valid = true;
+-
+ 	orig_addr = id->src_addr;
+ 	resp_addr = id->dst_addr;
+ 	orig_port = id->src_port;
+
+
+
+
+@@ -116,8 +116,6 @@ public:
+ 	const detail::ConnIDKey& Key() const	{ return key; }
+ 	detail::SessionKey SessionKey(bool copy) const override
+ 		{ return detail::SessionKey{&key, sizeof(key), copy}; }
+-	void ClearKey() override			{ key_valid = false; }
+-	bool IsKeyValid() const	override	{ return key_valid; }
+ 
+ 	const IPAddr& OrigAddr() const		{ return orig_addr; }
+ 	const IPAddr& RespAddr() const		{ return resp_addr; }
+@@ -271,7 +269,6 @@ protected:
+ 	std::shared_ptr<EncapsulationStack> encapsulation; // tunnels
+ 
+ 	detail::ConnIDKey key;
+-	bool key_valid;
+ 
+ 	unsigned int skip:1;
+ 	unsigned int weird:1;
+
+
+
+
+@@ -15,38 +15,43 @@
+ namespace zeek {
+ 
+ const IPAddr IPAddr::v4_unspecified = IPAddr(in4_addr{});
+-
+ const IPAddr IPAddr::v6_unspecified = IPAddr();
+ 
+-detail::ConnIDKey detail::BuildConnIDKey(const ConnID& id)
+-	{
+-	ConnIDKey key;
++namespace detail {
+ 
+-	// Lookup up connection based on canonical ordering, which is
++ConnIDKey::ConnIDKey(const IPAddr& src, const IPAddr& dst, uint16_t src_port,
++                     uint16_t dst_port, TransportProto t, bool one_way)
++	: transport(t)
++	{
++ 	// Lookup up connection based on canonical ordering, which is
+ 	// the smaller of <src addr, src port> and <dst addr, dst port>
+ 	// followed by the other.
+-	if ( id.is_one_way ||
+-	     addr_port_canon_lt(id.src_addr, id.src_port, id.dst_addr, id.dst_port)
++	if ( one_way ||
++	     addr_port_canon_lt(src, src_port, dst, dst_port)
+ 	   )
+ 		{
+-		key.ip1 = id.src_addr.in6;
+-		key.ip2 = id.dst_addr.in6;
+-		key.port1 = id.src_port;
+-		key.port2 = id.dst_port;
++		ip1 = src.in6;
++		ip2 = dst.in6;
++		port1 = src_port;
++		port2 = dst_port;
+ 		}
+ 	else
+ 		{
+-		key.ip1 = id.dst_addr.in6;
+-		key.ip2 = id.src_addr.in6;
+-		key.port1 = id.dst_port;
+-		key.port2 = id.src_port;
++		ip1 = dst.in6;
++		ip2 = src.in6;
++		port1 = dst_port;
++		port2 = src_port;
+ 		}
++	}
+ 
+-	key.transport = id.proto;
+-
+-	return key;
++detail::ConnIDKey::ConnIDKey(const ConnID& id)
++	: ConnIDKey(id.src_addr, id.dst_addr, id.src_port, id.dst_port,
++	            id.proto, id.is_one_way)
++	{
+ 	}
+ 
++} // namespace detail
++
+ IPAddr::IPAddr(const String& s)
+ 	{
+ 	Init(s.CheckString());
+
+
+
+
+@@ -28,12 +28,9 @@ struct ConnIDKey {
+ 	uint16_t port2;
+ 	TransportProto transport;
+ 
+-	ConnIDKey() : port1(0), port2(0), transport(TRANSPORT_UNKNOWN)
+-		{
+-		memset(&ip1, 0, sizeof(in6_addr));
+-		memset(&ip2, 0, sizeof(in6_addr));
+-		}
+-
++	ConnIDKey(const IPAddr& src, const IPAddr& dst, uint16_t src_port,
++	          uint16_t dst_port, TransportProto t, bool one_way);
++	ConnIDKey(const ConnID& conn);
+ 	ConnIDKey(const ConnIDKey& rhs)
+ 		{
+ 		*this = rhs;
+@@ -55,11 +52,6 @@ struct ConnIDKey {
+ 		}
+ };
+ 
+-/**
+- * Returns a map key for a given ConnID.
+- */
+-ConnIDKey BuildConnIDKey(const ConnID& id);
+-
+ } // namespace detail
+ 
+ /**
+@@ -398,8 +390,6 @@ public:
+ 	  */
+ 	void ConvertToThreadingValue(threading::Value::addr_t* v) const;
+ 
+-	friend detail::ConnIDKey detail::BuildConnIDKey(const ConnID& id);
+-
+ 	unsigned int MemoryAllocation() const { return padded_sizeof(*this); }
+ 
+ 	/**
+@@ -451,6 +441,7 @@ public:
+ 	static const IPAddr v6_unspecified;
+ 
+ private:
++	friend struct detail::ConnIDKey;
+ 	friend class IPPrefix;
+ 
+ 	/**
+
+
+
+
+@@ -118,6 +118,7 @@ Session::Session(double t,
+ 	  session_status_update_event(status_update_event),
+ 	  session_status_update_interval(status_update_interval)
+ 	{
++	in_session_table = true;
+ 	record_contents = record_packets = 1;
+ 	record_current_packet = record_current_cont

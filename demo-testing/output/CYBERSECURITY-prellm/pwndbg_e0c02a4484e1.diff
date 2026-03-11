@@ -1,0 +1,123 @@
+@@ -10,6 +10,7 @@ import re
+ import gdb
+ 
+ import pwndbg.arch
++import pwndbg.color.message as M
+ 
+ 
+ class ABI(object):
+@@ -136,6 +137,17 @@ def update():
+ 
+         linux = 'Linux' in abi
+ 
++    if not linux:
++        msg = M.warn(
++            "The bare metal debugging is enabled since the gdb's osabi is '%s' which is not 'GNU/Linux'.\n"
++            "Ex. the page resolving and memory de-referencing ONLY works on known pages.\n"
++            "This option is based ib gdb client compile arguments (by default) and will be corrected if you load an ELF which has the '.note.ABI-tag' section.\n"
++            "If you are debuging a program that runs on Linux ABI, please select the correct gdb client."
++            % abi
++        )
++        print(msg)
++
++
+ def LinuxOnly(default=None):
+     """Create a decorator that the function will be called when ABI is Linux.
+     Otherwise, return `default`.
+@@ -150,3 +162,7 @@ def LinuxOnly(default=None):
+         return caller
+ 
+     return decorator
++
++
++# Update when starting the gdb to show warning message for non-Linux ABI user.
++update()
+
+
+
+
+@@ -7,6 +7,7 @@ from __future__ import unicode_literals
+ 
+ import gdb
+ 
++import pwndbg.abi
+ import pwndbg.color.chain as C
+ import pwndbg.color.memory as M
+ import pwndbg.color.theme as theme
+@@ -20,7 +21,7 @@ LIMIT = pwndbg.config.Parameter('dereference-limit', 5, 'max number of pointers
+ 
+ def get(address, limit=LIMIT, offset=0, hard_stop=None, hard_end=0):
+     """
+-    Recursively dereferences an address.
++    Recursively dereferences an address. For bare metal, it will stop when the address is not in any of vmmap pages to avoid redundant dereference.
+ 
+     Arguments:
+         address(int): the first address to begin dereferencing
+@@ -33,7 +34,7 @@ def get(address, limit=LIMIT, offset=0, hard_stop=None, hard_end=0):
+         A list representing pointers of each ```address``` and reference
+     """
+     limit = int(limit)
+-    
++
+     result = [address]
+     for i in range(limit):
+         # Don't follow cycles, except to stop at the second occurrence.
+@@ -45,7 +46,14 @@ def get(address, limit=LIMIT, offset=0, hard_stop=None, hard_end=0):
+             break
+ 
+         try:
+-            address = int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, address + offset))
++            address = address + offset
++
++            # Avoid redundant dereferences in bare metal mode by checking
++            # if address is in any of vmmap pages
++            if not pwndbg.abi.linux and not pwndbg.vmmap.find(address):
++                break
++
++            address = int(pwndbg.memory.poi(pwndbg.typeinfo.ppvoid, address))
+             address &= pwndbg.arch.ptrmask
+             result.append(address)
+         except gdb.MemoryError:
+
+
+
+
+@@ -12,10 +12,13 @@ import argparse
+ 
+ import gdb
+ import six
++from elftools.elf.constants import SH_FLAGS
++from elftools.elf.elffile import ELFFile
+ 
+ import pwndbg.color.memory as M
+ import pwndbg.commands
+ import pwndbg.compat
++import pwndbg.elf
+ import pwndbg.vmmap
+ 
+ 
+@@ -54,3 +57,83 @@ def vmmap(pages_filter=None):
+     print(M.legend())
+     for page in pages:
+         print(M.get(page.vaddr, text=str(page)))
++
++
++parser = argparse.ArgumentParser()
++parser.description = 'Add Print virtual memory map page.'
++parser.add_argument('start', help='Starting virtual address')
++parser.add_argument('size', help='Size of the address space, in bytes')
++parser.add_argument('flags', nargs='?', type=str, default='', help='Flags set by the ELF file, see PF_X, PF_R, PF_W')
++parser.add_argument('offset', nargs='?', default=0, help='Offset into the original ELF file that the data is loaded from')
++
++@pwndbg.commands.ArgparsedCommand(parser)
++def vmmap_add(start, size, flags, offset):
++    page_flags = {
++        'r': pwndbg.elf.PF_R,
++        'w': pwndbg.elf.PF_W,
++        'x': pwndbg.elf.PF_X,
++    }
++    perm = 0
++    for flag in flags:
++        flag_val = page_flags.get(flag, None)
++        if flag_val is None:
++            print('Invalid page flag 

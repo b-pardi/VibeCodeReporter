@@ -1,0 +1,143 @@
+@@ -744,6 +744,11 @@ public:
+ 	// initialization can not be deferred, otherwise possible.
+ 	bool IsDeferrable() const;
+ 
++	// Whether values of this record type are equivalent upon initial
++	// creation, or might differ (e.g. due to function calls or changes
++	// to global state) - used for script optimization.
++	bool IdempotentCreation() const { return creation_inits.empty(); }
++
+ 	static void InitPostScript();
+ 
+ private:
+
+
+
+
+@@ -857,6 +857,10 @@ CSE_ValidityChecker::CSE_ValidityChecker(const std::vector<const ID*>& _ids, con
+ 	start_e = _start_e;
+ 	end_e = _end_e;
+ 
++	for ( auto i : ids )
++		if ( i->IsGlobal() || IsAggr(i->GetType()) )
++			sensitive_to_calls = true;
++
+ 	// Track whether this is a record assignment, in which case
+ 	// we're attuned to assignments to the same field for the
+ 	// same type of record.
+@@ -991,14 +995,11 @@ TraversalCode CSE_ValidityChecker::PreExpr(const Expr* e)
+ 			break;
+ 
+ 		case EXPR_CALL:
+-			{
+-			for ( auto i : ids )
+-				if ( i->IsGlobal() || IsAggr(i->GetType()) )
+-					{
+-					is_valid = false;
+-					return TC_ABORTALL;
+-					}
+-			}
++			if ( sensitive_to_calls )
++				{
++				is_valid = false;
++				return TC_ABORTALL;
++				}
+ 			break;
+ 
+ 		case EXPR_TABLE_CONSTRUCTOR:
+@@ -1007,8 +1008,26 @@ TraversalCode CSE_ValidityChecker::PreExpr(const Expr* e)
+ 			// so we don't want to traverse them.
+ 			return TC_ABORTSTMT;
+ 
+-		default:
+-			if ( in_aggr_mod_stmt && (t == EXPR_INDEX || t == EXPR_FIELD) )
++		case EXPR_RECORD_CONSTRUCTOR:
++			// If these have initializations done at construction
++			// time, those can include function calls.
++			if ( sensitive_to_calls )
++				{
++				auto& et = e->GetType();
++				if ( et->Tag() == TYPE_RECORD && ! et->AsRecordType()->IdempotentCreation() )
++					{
++					is_valid = false;
++					return TC_ABORTALL;
++					}
++				}
++			break;
++
++		case EXPR_INDEX:
++		case EXPR_FIELD:
++			// We treat these together because they both have
++			// to be checked when inside an "add" or "delete"
++			// statement.
++			if ( in_aggr_mod_stmt )
+ 				{
+ 				auto aggr = e->GetOp1();
+ 				auto aggr_id = aggr->AsNameExpr()->Id();
+@@ -1020,6 +1039,25 @@ TraversalCode CSE_ValidityChecker::PreExpr(const Expr* e)
+ 					}
+ 				}
+ 
++			if ( t == EXPR_INDEX && sensitive_to_calls )
++				{
++				// Unfortunately in isolation we can't
++				// statically determine whether this table
++				// has a &default associated with it.  In
++				// principle we could track all instances
++				// of the table type seen (across the
++				// entire set of scripts), and note whether
++				// any of those include an expression, but
++				// that's a lot of work for what might be
++				// minimal gain.
++
++				is_valid = false;
++				return TC_ABORTALL;
++				}
++
++			break;
++
++		default:
+ 			break;
+ 		}
+ 
+
+
+
+
+@@ -332,6 +332,10 @@ protected:
+ 	// renders the CSE unsafe.
+ 	const std::vector<const ID*>& ids;
+ 
++	// Whether the list of identifiers includes some that we should
++	// consider potentially altered by a function call.
++	bool sensitive_to_calls = false;
++
+ 	// Where in the AST to start our analysis.  This is the initial
+ 	// assignment expression.
+ 	const Expr* start_e;
+
+
+
+
+@@ -736,6 +736,12 @@ const ZAMStmt ZAMCompiler::CompileIndex(const NameExpr* n1, int n2_slot, const T
+ 				z = ZInstI(zop, Frame1Slot(n1, zop), n2_slot, c3);
+ 				}
+ 
++			// See the discussion in CSE_ValidityChecker::PreExpr
++			// regarding always needing to treat this as potentially
++			// modifying globals.
++			z.aux = new ZInstAux(0);
++			z.aux->can_change_non_locals = true;
++
+ 			return AddInst(z);
+ 			}
+ 		}
+@@ -1185,6 +1191,9 @@ const ZAMStmt ZAMCompiler::ConstructRecord(const NameExpr* n, const Expr* e)
+ 
+ 	z.t = e->GetType();
+ 
++	if ( ! rc->GetType<RecordType>()->IdempotentCreation() )
++		z.aux->can_change_non_locals = true;
++
+ 	return AddInst(z);
+ 	}

@@ -1,0 +1,84 @@
+@@ -25,7 +25,7 @@
+ #include "ntop_includes.h"
+ 
+ typedef struct {
+-  u_int32_t pktRetr, pktOOO, pktLost;
++  u_int32_t pktRetr, pktOOO, pktLost, pktKeepAlive;
+   u_int64_t last, next;
+ } TCPPacketStats;
+ 
+
+
+
+
+@@ -71,7 +71,7 @@ class Host : public GenericHost, public Checkpointable {
+   bool hidden_from_top;
+ 
+   struct {
+-    u_int32_t pktRetr, pktOOO, pktLost;
++    u_int32_t pktRetr, pktOOO, pktLost, pktKeepAlive;
+   } tcpPacketStats; /* Sent packets */
+ 
+   void initialize(Mac *_mac, u_int16_t _vlan_id, bool init_all);
+@@ -95,9 +95,10 @@ class Host : public GenericHost, public Checkpointable {
+   void incLowGoodputFlows(bool asClient);
+   void decLowGoodputFlows(bool asClient);
+ 
+-  inline void incRetransmittedPkts(u_int32_t num)   { tcpPacketStats.pktRetr += num; };
+-  inline void incOOOPkts(u_int32_t num)             { tcpPacketStats.pktOOO += num;  };
+-  inline void incLostPkts(u_int32_t num)            { tcpPacketStats.pktLost += num; };
++  inline void incRetransmittedPkts(u_int32_t num)   { tcpPacketStats.pktRetr += num;      };
++  inline void incOOOPkts(u_int32_t num)             { tcpPacketStats.pktOOO += num;       };
++  inline void incLostPkts(u_int32_t num)            { tcpPacketStats.pktLost += num;      };
++  inline void incKeepAlivePkts(u_int32_t num)       { tcpPacketStats.pktKeepAlive += num; };
+   inline int16_t get_local_network_id()             { return(local_network_id);      };
+   inline PacketStats* get_sent_stats()              { return(&sent_stats);           };
+   inline PacketStats* get_recv_stats()              { return(&recv_stats);           };
+
+
+
+
+@@ -673,6 +673,10 @@ char* Flow::print(char *buf, u_int buf_len) {
+     if((tcp_stats_s2d.pktRetr+tcp_stats_d2s.pktRetr) > 0)
+       len += snprintf(&tcp_buf[len], sizeof(tcp_buf)-len, "[Retr=%u/%u]",
+ 		      tcp_stats_s2d.pktRetr, tcp_stats_d2s.pktRetr);
++
++    if((tcp_stats_s2d.pktKeepAlive+tcp_stats_d2s.pktKeepAlive) > 0)
++      len += snprintf(&tcp_buf[len], sizeof(tcp_buf)-len, "[KeepAlive=%u/%u]",
++		      tcp_stats_s2d.pktKeepAlive, tcp_stats_d2s.pktKeepAlive);
+   }
+ 
+   snprintf(buf, buf_len,
+@@ -1535,9 +1539,11 @@ void Flow::lua(lua_State* vm, AddressTree * ptree,
+ 				(tcp_stats_s2d.pktRetr
+ 				 | tcp_stats_s2d.pktOOO
+ 				 | tcp_stats_s2d.pktLost
++				 | tcp_stats_s2d.pktKeepAlive
+ 				 | tcp_stats_d2s.pktRetr
+ 				 | tcp_stats_d2s.pktOOO
+-				 | tcp_stats_d2s.pktLost) ? true : false);
++				 | tcp_stats_d2s.pktLost
++				 | tcp_stats_d2s.pktKeepAlive) ? true : false);
+ 
+       lua_push_float_table_entry(vm, "tcp.nw_latency.client", toMs(&clientNwLatency));
+       lua_push_float_table_entry(vm, "tcp.nw_latency.server", toMs(&serverNwLatency));
+@@ -1548,9 +1554,11 @@ void Flow::lua(lua_State* vm, AddressTree * ptree,
+       lua_push_int_table_entry(vm, "cli2srv.retransmissions", tcp_stats_s2d.pktRetr);
+       lua_push_int_table_entry(vm, "cli2srv.out_of_order", tcp_stats_s2d.pktOOO);
+       lua_push_int_table_entry(vm, "cli2srv.lost", tcp_stats_s2d.pktLost);
++      lua_push_int_table_entry(vm, "cli2srv.keep_alive", tcp_stats_s2d.pktKeepAlive);
+       lua_push_int_table_entry(vm, "srv2cli.retransmissions", tcp_stats_d2s.pktRetr);
+       lua_push_int_table_entry(vm, "srv2cli.out_of_order", tcp_stats_d2s.pktOOO);
+       lua_push_int_table_entry(vm, "srv2cli.lost", tcp_stats_d2s.pktLost);
++      lua_push_int_table_entry(vm, "srv2cli.keep_alive", tcp_stats_d2s.pktKeepAlive);
+ 
+       lua_push_int_table_entry(vm, "cli2srv.tcp_flags", src2dst_tcp_flags);
+       lua_push_int_table_entry(vm, "srv2cli.tcp_flags", dst2src_tcp_flags);
+@@ -2335,27 +2343,35 @@ void Flow::updateTcpSeqNum(const struct bpf_timeval *when,
+ 
+   next_seq_num = getNextTcpSeq(flags, seq_num, payload_Len);
+ 
+-  if(debug) ntop->getTrace()->traceEvent(TRACE_WARNING, "[act: %u][ack: %u]", seq_num, ack_seq_num);
++  if(debug) ntop->getTrace()->traceEvent(TRACE_WARNING, "[act: %u][next: %u][next - act (in flight): %d][ack: %u]",
++					 seq_num, next_seq_num,
++					 next_seq_num - seq_num,

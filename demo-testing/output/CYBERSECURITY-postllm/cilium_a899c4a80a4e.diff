@@ -1,0 +1,148 @@
+@@ -14,6 +14,8 @@
+ #define EGRESS_IP2		IPV4(2, 3, 4, 5)
+ #define EGRESS_IP3		IPV4(3, 3, 4, 5)
+ 
++#include "egressgw_policy.h"
++
+ static volatile const __u8 *client_mac  = mac_one;
+ static volatile const __u8 *gateway_mac = mac_two;
+ static volatile const __u8 *ext_svc_mac = mac_three;
+@@ -45,36 +47,6 @@ static __always_inline __be16 client_port(__u16 t)
+ 	return CLIENT_PORT + bpf_htons(t);
+ }
+ 
+-#ifdef ENABLE_EGRESS_GATEWAY
+-static __always_inline void add_egressgw_policy_entry(__be32 saddr, __be32 daddr, __u8 cidr,
+-						      __be32 gateway_ip, __be32 egress_ip)
+-{
+-	struct egress_gw_policy_key in_key = {
+-		.lpm_key = { EGRESS_PREFIX_LEN(cidr), {} },
+-		.saddr   = saddr,
+-		.daddr   = daddr,
+-	};
+-
+-	struct egress_gw_policy_entry in_val = {
+-		.egress_ip  = egress_ip,
+-		.gateway_ip = gateway_ip,
+-	};
+-
+-	map_update_elem(&EGRESS_POLICY_MAP, &in_key, &in_val, 0);
+-}
+-
+-static __always_inline void del_egressgw_policy_entry(__be32 saddr, __be32 daddr, __u8 cidr)
+-{
+-	struct egress_gw_policy_key in_key = {
+-		.lpm_key = { EGRESS_PREFIX_LEN(cidr), {} },
+-		.saddr   = saddr,
+-		.daddr   = daddr,
+-	};
+-
+-	map_delete_elem(&EGRESS_POLICY_MAP, &in_key);
+-}
+-#endif /* ENABLE_EGRESS_GATEWAY */
+-
+ static __always_inline int egressgw_pktgen(struct __ctx_buff *ctx,
+ 					   struct egressgw_test_ctx test_ctx)
+ {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#ifdef ENABLE_EGRESS_GATEWAY
++static __always_inline void add_egressgw_policy_entry(__be32 saddr, __be32 daddr, __u8 cidr,
++						      __be32 gateway_ip, __be32 egress_ip)
++{
++	struct egress_gw_policy_key in_key = {
++		.lpm_key = { EGRESS_PREFIX_LEN(cidr), {} },
++		.saddr   = saddr,
++		.daddr   = daddr,
++	};
++
++	struct egress_gw_policy_entry in_val = {
++		.egress_ip  = egress_ip,
++		.gateway_ip = gateway_ip,
++	};
++
++	map_update_elem(&EGRESS_POLICY_MAP, &in_key, &in_val, 0);
++}
++
++static __always_inline void del_egressgw_policy_entry(__be32 saddr, __be32 daddr, __u8 cidr)
++{
++	struct egress_gw_policy_key in_key = {
++		.lpm_key = { EGRESS_PREFIX_LEN(cidr), {} },
++		.saddr   = saddr,
++		.daddr   = daddr,
++	};
++
++	map_delete_elem(&EGRESS_POLICY_MAP, &in_key);
++}
++#endif /* ENABLE_EGRESS_GATEWAY */
+
+
+
+
+@@ -10,12 +10,15 @@
+ #define ENABLE_IPV4
+ #define ENABLE_NODEPORT
+ #define ENABLE_HOST_ROUTING
++#define ENABLE_EGRESS_GATEWAY	1
++#define ENABLE_MASQUERADE_IPV4	1
+ 
+ #define DISABLE_LOOPBACK_LB
+ 
+ #define CLIENT_IP		v4_ext_one
+ #define CLIENT_PORT		__bpf_htons(111)
+ #define CLIENT_IP_2		v4_ext_two
++#define CLIENT_NODE_IP		v4_node_two
+ 
+ #define FRONTEND_IP_LOCAL	v4_svc_one
+ #define FRONTEND_IP_REMOTE	v4_svc_two
+@@ -31,6 +34,7 @@
+ #define DEFAULT_IFACE		24
+ #define BACKEND_IFACE		25
+ #define SVC_EGRESS_IFACE	26
++#define ENCAP_IFINDEX		42
+ 
+ #define BACKEND_EP_ID		127
+ 
+@@ -152,6 +156,7 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
+ 
+ #include "bpf_host.c"
+ 
++#include "lib/egressgw_policy.h"
+ #include "lib/endpoint.h"
+ #include "lib/ipcache.h"
+ #include "lib/lb.h"
+@@ -903,6 +908,36 @@ int nodeport_nat_fwd_reply_check(const struct __ctx_buff *ctx)
+ 	return check_reply(ctx);
+ }
+ 
++/* Test that the LB RevDNATs and RevSNATs a reply from the
++ * NAT remote backend, and sends it back to the client.
++ * Even when there's a catch-all EGW policy configured.
++ */
++PKTGEN("tc", "tc_nodeport_nat_fwd_reply2_egw")
++int nodeport_nat_fwd_reply2_egw_pktgen(struct __ctx_buff *ctx)
++{
++	return build_reply(ctx);
++}
++
++SETUP("tc", "tc_nodeport_nat_fwd_reply2_egw")
++int nodeport_nat_fwd_reply2_egw_setup(struct __ctx_buff *ctx)
++{
++	ipcache_v4_add_entry(CLIENT_IP, 0, 112200, CLIENT_NODE_IP, 0);
++	add_egressgw_policy_entry(CLIENT_IP, v4_all, 0, LB_IP, LB_IP);
++
++	/* Jump into the entrypoint */
++	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
++	/* Fail if we didn't jump */
++	return TEST_ERROR;
++}
++
++CHECK("tc", "tc_nodeport_nat_fwd_reply2_egw")
++int nodeport_nat_fwd_reply2_egw_check(const struct __ct

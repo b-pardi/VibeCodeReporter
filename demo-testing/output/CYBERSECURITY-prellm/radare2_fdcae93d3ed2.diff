@@ -1,0 +1,152 @@
+@@ -269,20 +269,21 @@ R_API bool r_anal_use(RAnal *anal, const char *name) {
+ 	if (anal) {
+ 		bool change = anal->cur && strcmp (anal->cur->name, name);
+ 		r_list_foreach (anal->plugins, it, h) {
+-			if (!strcmp (h->name, name)) {
++			if (!h->name || strcmp (h->name, name)) {
++				continue;
++			}
+ 	#if 0
+ 				// regression happening here for asm.emu
+ 				if (anal->cur && anal->cur == h) {
+ 					return true;
+ 				}
+ 	#endif
+-				anal->cur = h;
+-				r_anal_set_reg_profile (anal);
+-				if (change) {
+-					r_anal_set_fcnsign (anal, NULL);
+-				}
+-				return true;
++			anal->cur = h;
++			r_anal_set_reg_profile (anal);
++			if (change) {
++				r_anal_set_fcnsign (anal, NULL);
+ 			}
++			return true;
+ 		}
+ 	}
+ 	return false;
+
+
+
+
+@@ -228,8 +228,11 @@ RAnalPlugin r_anal_plugin_6502_cs = {
+ 	.arch = "6502",
+ 	.bits = 8,
+ };
++
++#ifndef CORELIB
+ R_API RLibStruct radare_plugin = {
+ 	.type = R_LIB_TYPE_ANAL,
+ 	.version = R2_VERSION
+ };
+ #endif
++#endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,622 @@
++/* radare2 - LGPL - Copyright 2013-2019 - pancake */
++
++#include <r_asm.h>
++#include <r_lib.h>
++
++#if CSNEXT
++
++#include <capstone/capstone.h>
++#include <capstone/riscv.h>
++
++// http://www.mrc.uidaho.edu/mrc/people/jff/digital/RISCVir.html
++
++#define OPERAND(x) insn->detail->riscv.operands[x]
++#define REGID(x) insn->detail->riscv.operands[x].reg
++#define REG(x) cs_reg_name (*handle, insn->detail->riscv.operands[x].reg)
++#define IMM(x) insn->detail->riscv.operands[x].imm
++#define MEMBASE(x) cs_reg_name(*handle, insn->detail->riscv.operands[x].mem.base)
++#define MEMINDEX(x) insn->detail->riscv.operands[x].mem.index
++#define MEMDISP(x) insn->detail->riscv.operands[x].mem.disp
++#define OPCOUNT() insn->detail->riscv.op_count
++// TODO scale and disp
++
++#define SET_VAL(op,i) \
++	if ((i)<OPCOUNT() && OPERAND(i).type == RISCV_OP_IMM) {\
++		(op)->val = OPERAND(i).imm;\
++	}
++
++#define CREATE_SRC_DST_3(op) \
++	(op)->src[0] = r_anal_value_new ();\
++	(op)->src[1] = r_anal_value_new ();\
++	(op)->dst = r_anal_value_new ();
++
++#define CREATE_SRC_DST_2(op) \
++	(op)->src[0] = r_anal_value_new ();\
++	(op)->dst = r_anal_value_new ();
++
++#define SET_SRC_DST_3_REGS(op) \
++	CREATE_SRC_DST_3 (op);\
++	(op)->dst->reg = r_reg_get (anal->reg, REG (0), R_REG_TYPE_GPR);\
++	(op)->src[0]->reg = r_reg_get (anal->reg, REG (1), R_REG_TYPE_GPR);\
++	(op)->src[1]->reg = r_reg_get (anal->reg, REG (2), R_REG_TYPE_GPR);
++
++#define SET_SRC_DST_3_IMM(op) \
++	CREATE_SRC_DST_3 (op);\
++	(op)->dst->reg = r_reg_get (anal->reg, REG (0), R_REG_TYPE_GPR);\
++	(op)->src[0]->reg = r_reg_get (anal->reg, REG (1), R_REG_TYPE_GPR);\
++	(op)->src[1]->imm = IMM (2);
++
++#define SET_SRC_DST_2_REGS(op) \
++	CREATE_SRC_DST_2 (op);\
++	(op)->dst->reg = r_reg_get (anal->reg, REG (0), R_REG_TYPE_GPR);\
++	(op)->src[0]->reg = r_reg_get (anal->reg, REG (1), R_REG_TYPE_GPR);
++
++#define SET_SRC_DST_3_REG_OR_IMM(op) \
++	if (OPERAND(2).type == RISCV_OP_IMM) {\
++		SET_SRC_DST_3_IMM (op);\
++	} else if (OPERAND(2).type == RISCV_OP_REG) {\
++		SET_SRC_DST_3_REGS (op);\
++	}
++
++
++// ESIL macros:
++
++// put the sign bit on the stack
++#define ES_IS_NEGATIVE(arg) "1,"arg",<<<,1,&"
++
++
++// call with delay slot
++#define ES_CALL_DR(ra, addr) "pc,4,+,"ra",=,"ES_J(addr)
++#define ES_CALL_D(addr) ES_CALL_DR("ra", addr)
++
++// call without delay slot
++#define ES_CALL_NDR(ra, addr) "pc,"ra",=,"ES_J(addr)
++#define ES_CALL_ND(addr) ES_CALL_NDR("ra", addr)
++
++#define USE_DS 0
++#if USE_DS
++// emit ERR trap if executed in a delay slot
++#define ES_TRAP_DS() "$ds,!,!,?{,$$,1,TRAP,BREAK,},"
++// jump to address
++#define ES_J(addr) addr",SETJT,1,SETD"
++#else
++#define ES_TRAP_DS() ""
++#define ES_J(addr) addr",pc,="
++#endif
++
++// sign extend 32 -> 64
++#define ES_SIGN_EXT64(arg) \
++	arg",0x80000000,&,0,<,?{,"\
++		"0xffffffff00000000,"arg",|=,"\
++	"}"
++
++#define PROTECT_ZERO() \
++	if (REG(0)[0]=='z'){\
++		r_strbuf_appendf (&op->esil, ",");\
++	} else
++
++#define ESIL_LOAD(size) \
++	PROTECT_ZERO () {\
++		r_strbuf_appendf (&op->esil, "%s,["size"],%s,=",\
++			ARG(1), RE

@@ -1,0 +1,100 @@
+@@ -7,21 +7,23 @@ class ec2_instance_managed_by_ssm(Check):
+     def execute(self):
+         findings = []
+         for instance in ec2_client.instances:
+-            if instance.state != "terminated":
+-                report = Check_Report_AWS(self.metadata())
+-                report.region = instance.region
+-                report.resource_arn = instance.arn
+-                report.resource_tags = instance.tags
+-                report.status = "PASS"
++            report = Check_Report_AWS(self.metadata())
++            report.region = instance.region
++            report.resource_arn = instance.arn
++            report.resource_tags = instance.tags
++            report.status = "PASS"
++            report.status_extended = (
++                f"EC2 Instance {instance.id} is managed by Systems Manager."
++            )
++            report.resource_id = instance.id
++            # instances not running should pass the check
++            if instance.state in ["pending", "terminated", "stopped"]:
++                report.status_extended = f"EC2 Instance {instance.id} is unmanaged by Systems Manager because it is {instance.state}."
++            elif not ssm_client.managed_instances.get(instance.id):
++                report.status = "FAIL"
+                 report.status_extended = (
+-                    f"EC2 Instance {instance.id} is managed by Systems Manager."
++                    f"EC2 Instance {instance.id} is not managed by Systems Manager."
+                 )
+-                report.resource_id = instance.id
+-                if not ssm_client.managed_instances.get(instance.id):
+-                    report.status = "FAIL"
+-                    report.status_extended = (
+-                        f"EC2 Instance {instance.id} is not managed by Systems Manager."
+-                    )
+-                findings.append(report)
++            findings.append(report)
+ 
+         return findings
+
+
+
+
+@@ -1,4 +1,5 @@
+ import json
++import time
+ from enum import Enum
+ from typing import Optional
+ 
+@@ -145,6 +146,10 @@ class SSM(AWSService):
+                         id=resource_id,
+                         region=regional_client.region,
+                     )
++                # boto3 does not properly handle throttling exceptions for
++                # ssm:DescribeInstanceInformation when there are large numbers of instances
++                # AWS support recommends manually reducing frequency of requests
++                time.sleep(0.1)
+ 
+         except Exception as error:
+             logger.error(
+
+
+
+
+@@ -157,3 +157,177 @@ class Test_ec2_instance_managed_by_ssm_test:
+                 == f"EC2 Instance {instance.id} is managed by Systems Manager."
+             )
+             assert result[0].resource_id == instance.id
++
++    @mock_aws
++    def test_ec2_instance_managed_by_ssm_running(self):
++        ec2 = resource("ec2", region_name=AWS_REGION_US_EAST_1)
++        instances_pending = ec2.create_instances(
++            ImageId=EXAMPLE_AMI_ID,
++            MinCount=2,
++            MaxCount=2,
++            UserData="This is some user_data",
++        )
++        instance_managed = ec2.Instance(instances_pending[0].id)
++        instance_unmanaged = ec2.Instance(instances_pending[1].id)
++        assert instance_managed.state["Name"] == "running"
++        assert instance_unmanaged.state["Name"] == "running"
++
++        ssm_client = mock.MagicMock
++        ssm_client.managed_instances = {
++            instance_managed.id: ManagedInstance(
++                arn=f"arn:aws:ec2:{AWS_REGION_US_EAST_1}:{AWS_ACCOUNT_NUMBER}:instance/{instance_managed.id}",
++                id=instance_managed.id,
++                region=AWS_REGION_US_EAST_1,
++            )
++        }
++
++        from prowler.providers.aws.services.ec2.ec2_service import EC2
++
++        aws_provider = set_mocked_aws_provider(
++            [AWS_REGION_EU_WEST_1, AWS_REGION_US_EAST_1]
++        )
++
++        with mock.patch(
++            "prowler.providers.common.provider.Provider.get_global_provider",
++   

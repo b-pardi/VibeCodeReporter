@@ -1,0 +1,109 @@
+@@ -12,9 +12,12 @@ import tempfile
+ from pwnlib.context import context
+ from pwnlib.elf import ELF
+ from pwnlib.log import getLogger
++from pwnlib.tubes.process import process
+ from pwnlib.util.fiddling import b64d
++from pwnlib.util.fiddling import enhex
+ from pwnlib.util.fiddling import hexdump
+ from pwnlib.util.misc import read
++from pwnlib.util.misc import which
+ from pwnlib.util.misc import write
+ from pwnlib.util.safeeval import const
+ from pwnlib.util.web import wget
+@@ -22,6 +25,7 @@ from pwnlib.util.web import wget
+ log = getLogger(__name__)
+ 
+ HASHES = ['build_id', 'sha1', 'sha256', 'md5']
++DEBUGINFOD_SERVERS = ['https://debuginfod.systemtap.org/']
+ 
+ # https://gitlab.com/libcdb/libcdb wasn't updated after 2019,
+ # but still is a massive database of older libc binaries.
+@@ -88,29 +92,13 @@ def provider_libc_rip(hex_encoded_id, hash_type):
+ 
+ PROVIDERS = [provider_libcdb, provider_libc_rip]
+ 
+-def search_by_hash(hex_encoded_id, hash_type='build_id'):
++def search_by_hash(hex_encoded_id, hash_type='build_id', unstrip=True):
+     assert hash_type in HASHES, hash_type
+ 
+     # Ensure that the libcdb cache directory exists
+-    cache_dir = os.path.join(context.cache_dir, 'libcdb', hash_type)
+-
+-    if not os.path.isdir(cache_dir):
+-        os.makedirs(cache_dir)
+-
+-    # If we already downloaded the file, and it looks even passingly like
+-    # a valid ELF file, return it.
+-    cache = os.path.join(cache_dir, hex_encoded_id)
+-
+-    if os.path.exists(cache):
+-        log.debug("Found existing cached libc at %r", cache)
+-
+-        data = read(cache)
+-        if data.startswith(b'\x7FELF'):
+-            log.info_once("Using cached data from %r", cache)
+-            return cache
+-        else:
+-            log.info_once("Skipping unavailable libc %s", hex_encoded_id)
+-            return None
++    cache, cache_valid = _check_elf_cache('libcdb', hex_encoded_id, hash_type)
++    if cache_valid:
++        return cache
+ 
+     # Run through all available libc database providers to see if we have a match.
+     for provider in PROVIDERS:
+@@ -128,16 +116,146 @@ def search_by_hash(hex_encoded_id, hash_type='build_id'):
+     if not data or not data.startswith(b'\x7FELF'):
+         return None
+ 
++    # Try to find debug info for this libc.
++    if unstrip:
++        unstrip_libc(cache)
++
++    return cache
++
++def _search_debuginfo_by_hash(base_url, hex_encoded_id):
++    # Deferred import because it's slow
++    import requests
++    from six.moves import urllib
++
++    # Check if we tried this buildid before.
++    cache, cache_valid = _check_elf_cache('libcdb_dbg', hex_encoded_id, 'build_id')
++    if cache_valid:
++        return cache
++
++    # Try to find separate debuginfo.
++    url  = '/buildid/{}/debuginfo'.format(hex_encoded_id)
++    url  = urllib.parse.urljoin(base_url, url)
++    data = b""
++    log.debug("Downloading data from debuginfod: %s", url)
++    try:
++        data = wget(url, timeout=20)
++    except requests.RequestException as e:
++        log.warn_once("Failed to fetch libc debuginfo for build_id %s from %s: %s", hex_encoded_id, base_url, e)
++    
++    # Save whatever we got to the cache
++    write(cache, data or b'')
++
++    # Return ``None`` if we did not get a valid ELF file
++    if not data or not data.startswith(b'\x7FELF'):
++        log.warn_once("Could not fetch libc debuginfo for build_id %s from %s", hex_encoded_id, base_url)
++        return None
++
+     return cache
+ 
++def _check_elf_cache(cache_type, hex_encoded_id, hash_type):
++    """
++    Check if there already is an ELF file for this hash in the cache.
++
++    >>> cache, _ = _check_elf_cache('libcdb', '2d1c5e0b85cb06ff47fa6fa088ec22cb6e06074e', 'build_id')
++    >>> os.unlink(cache) if os.path.exists(cache)
++    >>> filename = search_by_hash('2d1c5e0b85cb06ff47fa6fa088ec22cb6e06074e', 'build_id', unstrip=False)
++    >>> hex(ELF(filename).symbols.read)
++    '0xe56c0'
++    >>> filename == cache
++    True
++    """
++    # Ensure that the cache directory exists
++    cache_dir 

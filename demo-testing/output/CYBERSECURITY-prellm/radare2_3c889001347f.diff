@@ -1,0 +1,125 @@
+@@ -472,6 +472,8 @@ static const char *help_msg_dts[] = {
+ 	"Usage:", "dts[*]", "",
+ 	"dts+", "", "Start trace session",
+ 	"dts-", "", "Stop trace session",
++	"dtst", " [dir] ", "Save trace sessions to disk",
++	"dtsf", " [dir] ", "Read trace sessions from disk",
+ 	"dtsm", "", "List current memory map and hash",
+ 	NULL
+ };
+@@ -4886,7 +4888,7 @@ static int cmd_debug(void *data, const char *input) {
+ 					eprintf ("Session already started\n");
+ 					break;
+ 				}
+-				core->dbg->session = r_debug_session_new (core->dbg);
++				core->dbg->session = r_debug_session_new ();
+ 				r_debug_add_checkpoint (core->dbg);
+ 				break;
+ 			case '-': // "dts-"
+@@ -4897,6 +4899,21 @@ static int cmd_debug(void *data, const char *input) {
+ 				r_debug_session_free (core->dbg->session);
+ 				core->dbg->session = NULL;
+ 				break;
++			case 't': // "dtst"
++				if (!core->dbg->session) {
++					eprintf ("No session started\n");
++					break;
++				}
++				r_debug_session_save (core->dbg->session, input + 4);
++				break;
++			case 'f': // "dtsf"
++				if (core->dbg->session) {
++					r_debug_session_free (core->dbg->session);
++					core->dbg->session = NULL;
++				}
++				core->dbg->session = r_debug_session_new ();
++				r_debug_session_load (core->dbg, input + 4);
++				break;
+ 			case 'm': // "dtsm"
+ 				if (core->dbg->session) {
+ 					r_debug_session_list_memory (core->dbg);
+
+
+
+
+@@ -1,6 +1,11 @@
+ /* radare - LGPL - Copyright 2017 - rkx1209 */
+ 
+ #include <r_debug.h>
++#include <r_util/r_json.h>
++
++#define CMP_CNUM_REG(x, y) ((x) >= ((RDebugChangeReg *)y)->cnum ? 1 : -1)
++#define CMP_CNUM_MEM(x, y) ((x) >= ((RDebugChangeMem *)y)->cnum ? 1 : -1)
++#define CMP_CNUM_CHKPT(x, y) ((x) >= ((RDebugCheckpoint *)y)->cnum ? 1 : -1)
+ 
+ R_API void r_debug_session_free(RDebugSession *session) {
+ 	if (session) {
+@@ -13,6 +18,10 @@ R_API void r_debug_session_free(RDebugSession *session) {
+ 
+ static void r_debug_checkpoint_fini(void *element, void *user) {
+ 	RDebugCheckpoint *checkpoint = element;
++	size_t i;
++	for (i = 0; i < R_REG_TYPE_LAST; i++) {
++		r_reg_arena_free (checkpoint->arena[i]);
++	}
+ 	r_list_free (checkpoint->snaps);
+ }
+ 
+@@ -20,7 +29,7 @@ static void htup_vector_free(HtUPKv *kv) {
+ 	r_vector_free (kv->value);
+ }
+ 
+-R_API RDebugSession *r_debug_session_new(RDebug *dbg) {
++R_API RDebugSession *r_debug_session_new(void) {
+ 	RDebugSession *session = R_NEW0 (RDebugSession);
+ 	if (!session) {
+ 		return NULL;
+@@ -53,9 +62,11 @@ R_API bool r_debug_add_checkpoint(RDebug *dbg) {
+ 	// Save current registers arena iter
+ 	r_debug_reg_sync (dbg, R_REG_TYPE_ALL, 0);
+ 	for (i = 0; i < R_REG_TYPE_LAST; i++) {
+-		checkpoint.reg[i] = r_list_tail (dbg->reg->regset[i].pool);
++		RRegArena *a = dbg->reg->regset[i].arena;
++		RRegArena *b = r_reg_arena_new (a->size);
++		memcpy (b->bytes, a->bytes, b->size);
++		checkpoint.arena[i] = b;
+ 	}
+-	r_reg_arena_push (dbg->reg);
+ 
+ 	// Save current memory maps
+ 	checkpoint.snaps = r_list_newf ((RListFree)r_debug_snap_free);
+@@ -88,10 +99,10 @@ R_API bool r_debug_add_checkpoint(RDebug *dbg) {
+ static void _set_initial_registers(RDebug *dbg) {
+ 	size_t i;
+ 	for (i = 0; i < R_REG_TYPE_LAST; i++) {
+-		RListIter *iter = dbg->session->cur_chkpt->reg[i];
+-		RRegArena *arena = iter->data;
+-		if (dbg->reg->regset[i].arena->bytes) {
+-			memcpy (dbg->reg->regset[i].arena->bytes, arena->bytes, arena->size);
++		RRegArena *a = dbg->session->cur_chkpt->arena[i];
++		RRegArena *b = dbg->reg->regset[i].arena;
++		if (a && b && a->bytes && b->bytes) {
++			memcpy (b->bytes, a->bytes, a->size);
+ 		}
+ 	}
+ }
+@@ -231,3 +242,485 @@ R_API bool r_debug_session_add_mem_change(RDebugSession *session, ut64 addr, ut8
+ 	r_vector_push (vmem, &mem);
+ 	return true;
+ }
++
++/* Save and Load Session */
++
++// 0x<addr>=[<RDebugChangeReg>]
++static bool serialize_register_cb(void *db, const ut64 k, const void *v) {
++	RDebugChangeReg *reg;
++	RVector *vreg = (RVector *)v;
++	PJ *j = pj_new ();
++	if (!j) {
++		return false;
++	}
++	pj_a (j);
++
++	r_vector_foreach (vreg, reg) {
++		pj_o (j);
++		pj_k

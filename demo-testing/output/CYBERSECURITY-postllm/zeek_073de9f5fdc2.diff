@@ -1,0 +1,74 @@
+@@ -22,10 +22,12 @@
+ #include "zeek/Reporter.h"
+ #include "zeek/Val.h"
+ #include "zeek/cluster/Backend.h"
++#include "zeek/cluster/OnLoop.h"
+ #include "zeek/cluster/Serializer.h"
+ #include "zeek/cluster/backend/zeromq/Plugin.h"
+ #include "zeek/cluster/backend/zeromq/ZeroMQ-Proxy.h"
+ #include "zeek/telemetry/Manager.h"
++#include "zeek/util-types.h"
+ #include "zeek/util.h"
+ 
+ extern int signal_val;
+@@ -71,10 +73,25 @@ constexpr DebugFlag operator&(uint8_t x, DebugFlag y) { return static_cast<Debug
+ 
+ // NOLINTEND(cppcoreguidelines-macro-usage)
+ 
++std::unique_ptr<Backend> ZeroMQBackend::Instantiate(std::unique_ptr<EventSerializer> es,
++                                                    std::unique_ptr<LogSerializer> ls,
++                                                    std::unique_ptr<detail::EventHandlingStrategy> ehs) {
++    auto onloop_queue_hwm = zeek::id::find_val<zeek::CountVal>("Cluster::Backend::ZeroMQ::onloop_queue_hwm")->AsCount();
++    return std::make_unique<ZeroMQBackend>(std::move(es), std::move(ls), std::move(ehs), onloop_queue_hwm);
++}
++
+ ZeroMQBackend::ZeroMQBackend(std::unique_ptr<EventSerializer> es, std::unique_ptr<LogSerializer> ls,
+-                             std::unique_ptr<detail::EventHandlingStrategy> ehs)
+-    : ThreadedBackend("ZeroMQ", std::move(es), std::move(ls), std::move(ehs)),
+-      main_inproc(zmq::socket_t(ctx, zmq::socket_type::pair)) {}
++                             std::unique_ptr<detail::EventHandlingStrategy> ehs, zeek_uint_t onloop_queue_hwm)
++    : ThreadedBackend("ZeroMQ", std::move(es), std::move(ls), std::move(ehs),
++                      new zeek::detail::OnLoopProcess<ThreadedBackend, QueueMessage>(this, "ZeroMQ", onloop_queue_hwm)),
++      main_inproc(zmq::socket_t(ctx, zmq::socket_type::pair)),
++      // Counters for block and drop metrics.
++      total_xpub_drops(
++          zeek::telemetry_mgr->CounterInstance("zeek", "cluster_zeromq_xpub_drops", {},
++                                               "Number of published events dropped due to XPUB socket HWM.")),
++      total_onloop_drops(
++          zeek::telemetry_mgr->CounterInstance("zeek", "cluster_zeromq_onloop_drops", {},
++                                               "Number of received events dropped due to OnLoop queue full.")) {}
+ 
+ ZeroMQBackend::~ZeroMQBackend() {
+     try {
+@@ -114,11 +131,6 @@ void ZeroMQBackend::DoInitPostScript() {
+     event_unsubscription = zeek::event_registry->Register("Cluster::Backend::ZeroMQ::unsubscription");
+     event_subscription = zeek::event_registry->Register("Cluster::Backend::ZeroMQ::subscription");
+ 
+-    total_xpub_stalls =
+-        zeek::telemetry_mgr
+-            ->CounterInstance("zeek", "cluster_zeromq_xpub_stalls", {},
+-                              "Counter for how many times sending on the XPUB socket stalled due to EAGAIN.");
+-
+     // xpub/xsub hwm configuration
+     xpub_sndhwm = static_cast<int>(zeek::id::find_val<zeek::IntVal>("Cluster::Backend::ZeroMQ::xpub_sndhwm")->AsInt());
+     xpub_sndbuf = static_cast<int>(zeek::id::find_val<zeek::IntVal>("Cluster::Backend::ZeroMQ::xpub_sndbuf")->AsInt());
+@@ -471,43 +483,32 @@ void ZeroMQBackend::HandleInprocMessages(std::vector<MultipartMessage>& msgs) {
+                     flags = flags | zmq::send_flags::sndmore;
+ 
+                 zmq::send_result_t result;
+-                int tries = 0;
+-                do {
+-                    try {
+-                        result = xpub.send(part, flags);
+-                    } catch ( zmq::error_t& err ) {
+-                        if ( err.num() == ETERM )
+-                            return;
+-
+-                        // XXX: What other error can happen here? How should we react?
+-                        ZEROMQ_THREAD_PRINTF("xpub: Failed to publish with error %s (%d)\n", err.what(), err.num());
+-                        break;
+-                    }
++                try {
++                    result = xpub.send(part, flags);
++                } catch ( zmq::error_t& err ) {
++ 

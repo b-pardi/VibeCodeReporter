@@ -1,0 +1,121 @@
+@@ -87,6 +87,11 @@ ZEND_BEGIN_MODULE_GLOBALS(spx)
+     const char * http_trusted_proxies;
+     const char * http_ip_whitelist;
+     const char * http_ui_assets_dir;
++    const char * http_profiling_enabled;
++    const char * http_profiling_builtins;
++    const char * http_profiling_sampling_period;
++    const char * http_profiling_depth;
++    const char * http_profiling_metrics;
+ ZEND_END_MODULE_GLOBALS(spx)
+ 
+ ZEND_DECLARE_MODULE_GLOBALS(spx)
+@@ -126,6 +131,26 @@ PHP_INI_BEGIN()
+         "spx.http_ui_assets_dir", SPX_HTTP_UI_ASSETS_DIR, PHP_INI_SYSTEM,
+         OnUpdateString, http_ui_assets_dir, zend_spx_globals, spx_globals
+     )
++    STD_PHP_INI_ENTRY(
++        "spx.http_profiling_enabled", NULL, PHP_INI_SYSTEM,
++        OnUpdateString, http_profiling_enabled, zend_spx_globals, spx_globals
++    )
++    STD_PHP_INI_ENTRY(
++        "spx.http_profiling_builtins", NULL, PHP_INI_SYSTEM,
++        OnUpdateString, http_profiling_builtins, zend_spx_globals, spx_globals
++    )
++    STD_PHP_INI_ENTRY(
++        "spx.http_profiling_sampling_period", NULL, PHP_INI_SYSTEM,
++        OnUpdateString, http_profiling_sampling_period, zend_spx_globals, spx_globals
++    )
++    STD_PHP_INI_ENTRY(
++        "spx.http_profiling_depth", NULL, PHP_INI_SYSTEM,
++        OnUpdateString, http_profiling_depth, zend_spx_globals, spx_globals
++    )
++    STD_PHP_INI_ENTRY(
++        "spx.http_profiling_metrics", NULL, PHP_INI_SYSTEM,
++        OnUpdateString, http_profiling_metrics, zend_spx_globals, spx_globals
++    )
+ PHP_INI_END()
+ 
+ static PHP_MINIT_FUNCTION(spx);
+@@ -235,19 +260,25 @@ static PHP_RINIT_FUNCTION(spx)
+         spx_config_get(
+             &context.config,
+             context.cli_sapi,
++            SPX_CONFIG_SOURCE_INI,
+             SPX_CONFIG_SOURCE_HTTP_COOKIE,
+             SPX_CONFIG_SOURCE_HTTP_HEADER,
+             SPX_CONFIG_SOURCE_HTTP_QUERY_STRING,
+             -1
+         );
+-    }
+ 
+-    if (!context.config.ui_uri && !context.config.enabled) {
+-        return SUCCESS;
+-    }
+-
+-    if (!check_access()) {
+-        return SUCCESS;
++        if (!check_access()) {
++            /*
++                The access is not granted through HTTP request fragments, we then need to read the
++                config again from the INI source only.
++            */
++            spx_config_get(
++                &context.config,
++                context.cli_sapi,
++                SPX_CONFIG_SOURCE_INI,
++                -1
++            );
++        }
+     }
+ 
+     if (context.config.ui_uri) {
+@@ -256,10 +287,12 @@ static PHP_RINIT_FUNCTION(spx)
+         context.execution_handler = &profiling_handler;
+     }
+ 
+-    if (context.execution_handler) {
+-        context.execution_handler->init();
++    if (!context.execution_handler) {
++        return SUCCESS;
+     }
+ 
++    context.execution_handler->init();
++
+     return SUCCESS;
+ }
+ 
+
+
+
+
+@@ -16,9 +16,11 @@
+  */
+ 
+ 
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <string.h>
++#include <ctype.h>
+ 
+ #include "spx_config.h"
+ #include "spx_php.h"
+@@ -56,6 +58,7 @@ static void init_config(spx_config_t * config, int cli);
+ static void fix_config(spx_config_t * config, int cli);
+ static void source_data_get(source_data_t * source_data, source_handler_t handler);
+ static void source_data_to_config(const source_data_t * source_data, spx_config_t * config);
++static const char * source_handler_ini_http(const char * parameter);
+ static const char * source_handler_env(const char * parameter);
+ static const char * source_handler_http_cookie(const char * parameter);
+ static const char * source_handler_http_header(const char * parameter);
+@@ -74,6 +77,14 @@ void spx_config_get(spx_config_t * config, int cli, ...)
+         spx_config_source_t source = va_arg(ap, spx_config_source_t);
+         source_handler_t source_handler = NULL;
+         switch (source) {
++            case SPX_CONFIG_SOURCE_INI:
++                if (cli) {
++                    break;
++                }
++
++                source_handler =

@@ -1,0 +1,111 @@
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,41 @@
++from opendbc.can.packer import CANPacker
++from opendbc.car import Bus, apply_driver_steer_torque_limits, structs
++from opendbc.car.interfaces import CarControllerBase
++from opendbc.car.rivian.riviancan import create_lka_steering
++from opendbc.car.rivian.values import CarControllerParams
++
++LongCtrlState = structs.CarControl.Actuators.LongControlState
++
++
++class CarController(CarControllerBase):
++  def __init__(self, dbc_names, CP):
++    super().__init__(dbc_names, CP)
++    self.CP = CP
++    self.apply_steer_last = 0
++    self.packer = CANPacker(dbc_names[Bus.pt])
++
++  def update(self, CC, CS, now_nanos):
++    actuators = CC.actuators
++    can_sends = []
++
++    apply_steer = 0
++    if CC.latActive:
++      new_steer = int(round(CC.actuators.steer * CarControllerParams.STEER_MAX))
++      apply_steer = apply_driver_steer_torque_limits(new_steer, self.apply_steer_last,
++                                                     CS.out.steeringTorque, CarControllerParams)
++
++    # send steering command
++    self.apply_steer_last = apply_steer
++    can_sends.append(create_lka_steering(self.packer,  CS.acm_lka_hba_cmd, apply_steer, CC.latActive))
++
++    # # Longitudinal control
++    # if self.CP.openpilotLongitudinalControl:
++    #   stopping = actuators.longControlState == LongCtrlState.stopping
++    #   can_sends.append(create_longitudinal(self.packer, self.frame % 15, actuators.accel, CC.enabled, stopping))
++
++    new_actuators = actuators.as_builder()
++    new_actuators.steer = apply_steer / CarControllerParams.STEER_MAX
++    new_actuators.steerOutputCan = apply_steer
++
++    self.frame += 1
++    return new_actuators, can_sends
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,110 @@
++import copy
++from opendbc.can.parser import CANParser
++from opendbc.car import Bus, structs
++from opendbc.car.interfaces import CarStateBase
++from opendbc.car.rivian.values import DBC, GEAR_MAP
++from opendbc.car.common.conversions import Conversions as CV
++
++
++class CarState(CarStateBase):
++  def __init__(self, CP):
++    super().__init__(CP)
++    self.last_speed = 30
++
++    # Needed by carcontroller
++    self.acm_lka_hba_cmd = None
++
++  def update(self, can_parsers) -> structs.CarState:
++    cp = can_parsers[Bus.pt]
++    cp_cam = can_parsers[Bus.cam]
++    cp_adas = can_parsers[Bus.adas]
++    ret = structs.CarState()
++
++    # Vehicle speed
++    ret.vEgoRaw = cp.vl["ESP_Status"]["ESP_Vehicle_Speed"] * CV.KPH_TO_MS
++    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
++    ret.standstill = abs(ret.vEgoRaw) < 0.01
++
++    # Gas pedal
++    pedal_status = cp.vl["VDM_PropStatus"]["VDM_AcceleratorPedalPosition"]
++    ret.gas = pedal_status / 100.0
++    ret.gasPressed = (pedal_status > 0)
++
++    # Brake pedal
++    ret.brake = cp.vl["ESPiB3"]["ESPiB3_pMC1"] / 250.0 # pressure in Bar
++    ret.brakePressed = cp.vl["iBESP2"]["iBESP2_BrakePedalApplied"] == 1
++
++    # Steering wheel
++    ret.steeringAngleDeg = cp.vl["EPAS_AdasStatus"]["EPAS_InternalSas"]
++    ret.steeringRateDeg = cp.vl["EPAS_AdasStatus"]["EPAS_SteeringAngleSpeed"]
++    ret.steeringTorque = cp.vl["EPAS_SystemStatus"]["EPAS_TorsionBarTorque"]
++    ret.steeringPressed = abs(ret.steeringTorque) > 1.0
++
++    ret.steerFaultTemporary = cp.vl["EPAS_AdasStatus"]["EPAS_EacErrorCode"] != 0
++
++    # Cruise state
++    speed = min(int(cp_adas.vl["ACM_tsrCmd"]["ACM_tsrSpdDisClsMain"]), 85)
++    self.last_speed = speed if speed != 0 else self.last_speed
++    ret.cruiseState.enabled = cp_cam.vl["ACM_Status"]["ACM_FeatureStatus"] == 1
++    ret.cruiseState.speed = self.last_speed * CV.MPH_TO_MS  # detected speed limit
++    ret.cruiseState.available = True # cp.vl["VDM_AdasSts"]["VDM_AdasInterfaceStatus"] == 1
++    ret.cruiseState.standstill = cp.vl["VDM_AdasSts"]["VDM_AdasAccelRequestAcknowledged"] == 1
++    ret.accFaulted = cp_cam.vl["ACM_Status"]["ACM_FaultStatus"] == 1
++
++    # Gear
++    ret.gearShifter = GEAR_MAP[int(cp.vl["VDM_PropStatus"]["VDM_Prndl_Status"])]
++

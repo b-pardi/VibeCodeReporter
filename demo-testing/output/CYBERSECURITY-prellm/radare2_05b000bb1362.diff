@@ -1,0 +1,127 @@
+@@ -1188,6 +1188,7 @@ repeat:
+ 		if (reason == R_DEBUG_REASON_NEW_LIB ||
+ 			reason == R_DEBUG_REASON_EXIT_LIB ||
+ 			reason == R_DEBUG_REASON_NEW_TID ||
++			reason == R_DEBUG_REASON_NONE ||
+ 			reason == R_DEBUG_REASON_EXIT_TID ) {
+ 			goto repeat;
+ 		}
+
+
+
+
+@@ -450,6 +450,7 @@ static RDebugReasonType r_debug_native_wait(RDebug *dbg, int pid) {
+ 	// require switching to the event's thread that shouldn't bother the user
+ 	int orig_tid = dbg->tid;
+ 	bool restore_thread = false;
++	RIOW32Dbg *rio = dbg->user;
+ 
+ 	reason = w32_dbg_wait (dbg, pid);
+ 	if (reason == R_DEBUG_REASON_NEW_LIB) {
+@@ -495,7 +496,6 @@ static RDebugReasonType r_debug_native_wait(RDebug *dbg, int pid) {
+ 		} else {
+ 			r_cons_printf ("Unloading unknown library.\n");
+ 			r_cons_flush ();
+-
+ 		}
+ 		restore_thread = true;
+ 	} else if (reason == R_DEBUG_REASON_NEW_TID) {
+@@ -517,7 +517,9 @@ static RDebugReasonType r_debug_native_wait(RDebug *dbg, int pid) {
+ 
+ 			r_debug_info_free (r);
+ 		}
+-		restore_thread = true;
++		if (dbg->tid != orig_tid) {
++			restore_thread = true;
++		}
+ 	} else if (reason == R_DEBUG_REASON_DEAD) {
+ 		RDebugInfo *r = r_debug_native_info (dbg, "");
+ 		if (r && r->thread) {
+@@ -528,6 +530,23 @@ static RDebugReasonType r_debug_native_wait(RDebug *dbg, int pid) {
+ 		}
+ 		dbg->pid = -1;
+ 		dbg->tid = -1;
++	} else if (reason == R_DEBUG_REASON_USERSUSP && dbg->tid != orig_tid) {
++		RDebugInfo *r = r_debug_native_info (dbg, "");
++		if (r && r->thread) {
++			PTHREAD_ITEM item = r->thread;
++			r_cons_printf ("(%d) Created DebugBreak thread %d (start @ %p)\n", item->pid, item->tid, item->lpStartAddress);
++			r_cons_flush ();
++
++			r_debug_info_free (r);
++		}
++		// DebugProcessBreak creates a new thread that will trigger a breakpoint. We record the
++		// tid here to ignore it once the breakpoint is hit.
++		rio->break_tid = dbg->tid;
++		restore_thread = true;
++	} else if (reason == R_DEBUG_REASON_BREAKPOINT && dbg->tid == rio->break_tid) {
++		rio->break_tid = -2;
++		reason = R_DEBUG_REASON_NONE;
++		restore_thread = true;
+ 	}
+ 
+ 	if (restore_thread) {
+
+
+
+
+@@ -787,8 +787,10 @@ void w32_break_process(RDebug *dbg) {
+ 	} else {
+ 		if (!w32_DebugBreakProcess (rio->pi.hProcess)) {
+ 			r_sys_perror ("w32_break_process/DebugBreakProcess");
++			eprintf("Could not interrupt program, attempt to press Ctrl-C in the program's console.\n");
+ 		}
+ 	}
++
+ 	breaked = true;
+ }
+ 
+@@ -891,8 +893,8 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 		} while (!breaked);
+ 
+ 		if (breaked) {
+-			ret = R_DEBUG_REASON_NONE;
+-			goto end;
++			ret = R_DEBUG_REASON_USERSUSP;
++			breaked = false;
+ 		}
+ 
+ 		tid = de.dwThreadId;
+@@ -912,7 +914,9 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 			break;
+ 		case CREATE_THREAD_DEBUG_EVENT:
+ 			__r_debug_thread_add (dbg, pid, tid, de.u.CreateThread.hThread, de.u.CreateThread.lpThreadLocalBase, de.u.CreateThread.lpStartAddress, FALSE);
+-			ret = R_DEBUG_REASON_NEW_TID;
++			if (ret != R_DEBUG_REASON_USERSUSP) {
++				ret = R_DEBUG_REASON_NEW_TID;
++			}
+ 			next_event = 0;
+ 			break;
+ 		case EXIT_PROCESS_DEBUG_EVENT:
+@@ -1014,8 +1018,11 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 			dbg->reason.signum = de.u.Exception.ExceptionRecord.ExceptionCode;
+ 			break;
+ 		default:
+-			eprintf ("(%d) unknown event: %d\n", pid, de.dwDebugEventCode);
+-			ret = -1;
++			// This case might be reached if break doesn't trigger an event
++			if (ret != R_DEBUG_REASON_USERSUSP) {
++				eprintf ("(%d) unknown event: %d\n", pid, de.dwDebugEventCode);
++				ret = -1;
++			}
+ 			goto end;
+ 		}
+ 	} while (next_event);
+
+
+
+
+@@ -41,6 +41,8 @@ typedef struct {
+ 	ULONG_PTR winbase;
+ 	PROCESS_INFORMATION pi;
+ 	w32dbg_wrap_instance *inst;
++	// Stores the TID of the thread DebugBreakProcess creates to ignore it's breakpoint
++	DWORD break_tid;
+ } RIOW32Dbg;
+ 
+ #define w32dbgw_ret(inst) inst->params->ret

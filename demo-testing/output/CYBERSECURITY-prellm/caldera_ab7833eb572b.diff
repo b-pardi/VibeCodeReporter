@@ -1,0 +1,81 @@
+@@ -4,7 +4,7 @@ from aiohttp import web
+ 
+ from app.api.v2.handlers.base_object_api import BaseObjectApi
+ from app.api.v2.managers.operation_api_manager import OperationApiManager
+-from app.api.v2.responses import JsonHttpForbidden
++from app.api.v2.responses import JsonHttpForbidden, JsonHttpNotFound
+ from app.api.v2.schemas.base_schemas import BaseGetAllQuerySchema, BaseGetOneQuerySchema
+ from app.objects.c_operation import Operation, OperationSchema
+ 
+@@ -74,7 +74,7 @@ class OperationApi(BaseObjectApi):
+         report = await self._api_manager.get_operation_report(operation_id, access)
+         return web.json_response(report)
+ 
+-    '''Helpers'''
++    '''Overridden Methods'''
+     async def create_object(self, request: web.Request):
+         data = await request.json()
+         await self._error_if_object_with_id_exists(data.get(self.id_property))
+@@ -88,3 +88,10 @@ class OperationApi(BaseObjectApi):
+         if matched_obj and matched_obj.access not in access['access']:
+             raise JsonHttpForbidden(f'Cannot update {self.description} due to insufficient permissions: {obj_id}')
+         return await self._api_manager.create_object_from_schema(self.schema, data, access, matched_obj)
++
++    async def update_object(self, request: web.Request):
++        data, access, obj_id, query, search = await self._parse_common_data_from_request(request)
++        obj = await self._api_manager.find_and_update_object(self.ram_key, data, search)
++        if not obj:
++            raise JsonHttpNotFound(f'{self.description.capitalize()} not found: {obj_id}')
++        return obj
+
+
+
+
+@@ -1,6 +1,7 @@
+ import asyncio
+ 
+ from marshmallow.schema import SchemaMeta
++from typing import Any
+ 
+ from app.utility.base_world import BaseWorld
+ 
+@@ -23,7 +24,7 @@ class OperationApiManager(BaseApiManager):
+     async def create_object_from_schema(self, schema: SchemaMeta, data: dict,
+                                         access: BaseWorld.Access, existing_operation: Operation = None):
+         if data.get('state'):
+-            self.validate_operation_state(data, existing_operation)
++            await self.validate_operation_state(data, existing_operation)
+         obj_schema = schema()
+         operation = obj_schema.load(data)
+         await self.setup_operation(operation, access)
+@@ -31,6 +32,15 @@ class OperationApiManager(BaseApiManager):
+         asyncio.get_event_loop().create_task(operation.run(self.services))
+         return operation
+ 
++    async def find_and_update_object(self, ram_key: str, data: dict, search: dict = None):
++        for obj in self.find_objects(ram_key, search):
++            new_obj = await self.update_object(obj, data)
++            return new_obj
++
++    async def update_object(self, obj: Any, data: dict):
++        await self.validate_operation_state(data, obj)
++        return super().update_object(obj, data)
++
+     """Object Creation Helpers"""
+     async def get_operation_object(self, operation_id: str, access: dict):
+         try:
+@@ -44,7 +54,7 @@ class OperationApiManager(BaseApiManager):
+     async def setup_operation(self, operation: Operation, access: BaseWorld.Access):
+         """Applies default settings to an operation if data is missing."""
+         if not operation.planner:
+-            operation.planner = await self.services['data_svc'].locate('planners', match=dict(name='atomic'))
++            operation.planner = (await self.services['data_svc'].locate('planners', match=dict(name='atomic')))[0]
+         if not operation.adversary:
+             operation.adversary = Adversary.load(dict(adversary_id='ad-hoc', name='ad-hoc',
+                                                       description='an empty adversary profile',
+@@ -57,15 +67,15 @@ class OperationApiManager(BaseApiManager):
+         operation.access = self._get_allowed_from_access(access)
+         operation.set_start_details()
+ 
+-    def validate_operation_state(self, data: dict, existing: Operation = None):
++    async def validate_operation_state(self,

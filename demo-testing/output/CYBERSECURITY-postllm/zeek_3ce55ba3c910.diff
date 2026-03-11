@@ -1,0 +1,92 @@
+@@ -75,13 +75,13 @@ void DNS_Interpreter::ParseMessage(const u_char* data, int len, int is_query) {
+     auto opcode = static_cast<uint16_t>((flags & 0x7800) >> 11);
+ 
+     // NetBIOS registration and release messages look like regular DNS requests, so parse them as such
+-    if ( opcode != DNS_OP_QUERY && ! is_netbios ) {
++    if ( opcode != DNS_OP_QUERY && opcode != DNS_OP_DYNAMIC_UPDATE && ! is_netbios ) {
+         analyzer->Weird("DNS_unknown_opcode", util::fmt("%d", opcode));
+         analyzer->Conn()->CheckHistory(zeek::session::detail::HIST_UNKNOWN_PKT, 'X');
+         return;
+     }
+ 
+-    detail::DNS_MsgInfo msg(const_cast<detail::DNS_RawMsgHdr*>(hdr), is_query);
++    detail::DNS_MsgInfo msg(const_cast<DNS_RawMsgHdr*>(hdr), is_query, is_netbios);
+ 
+     if ( first_message && msg.QR && is_query == 1 ) {
+         is_query = 0;
+@@ -99,7 +99,7 @@ void DNS_Interpreter::ParseMessage(const u_char* data, int len, int is_query) {
+ 
+     // There is a great deal of non-DNS traffic that runs on port 53.
+     // This should weed out most of it.
+-    if ( zeek::detail::dns_max_queries > 0 && msg.qdcount > zeek::detail::dns_max_queries ) {
++    if ( zeek::detail::dns_max_queries > 0 && msg.qd_zo_count > zeek::detail::dns_max_queries ) {
+         analyzer->AnalyzerViolation("DNS_Conn_count_too_large");
+         analyzer->Weird("DNS_Conn_count_too_large");
+         EndMessage(&msg);
+@@ -111,26 +111,66 @@ void DNS_Interpreter::ParseMessage(const u_char* data, int len, int is_query) {
+     data += hdr_len;
+     len -= hdr_len;
+ 
+-    if ( ! ParseQuestions(&msg, data, len, msg_start) ) {
+-        EndMessage(&msg);
+-        return;
++    if ( msg.is_dynamic_update ) {
++        if ( msg.qd_zo_count != 1 ) {
++            // dynamic update events should only have a single zone in them.
++            analyzer->Weird("DNS_DU_invalid_zone_count", util::fmt("%d", msg.qd_zo_count));
++            EndMessage(&msg);
++            return;
++        }
++
++        // Dynamic update looks like this:
++        // 1. A single "zone" that is just the first three fields of an SOA RR. It's
++        //    required to be an SOA, so a weird is returned if not.
++        // 2. Zero or more "prerequisite" RRs that are required to be true in the zone
++        //    before updates take place.
++        // 3. Zero or more "update" RRs that are the updates to be made to the zone.
++        // 4. Zero or more "additional" RRs that are unrelated to the updates. These are
++        //    handled same to the other additional RRs with other op codes.
++        if ( ! ParseAnswerHeader(&msg, data, len, msg_start) ) {
++            EndMessage(&msg);
++            return;
++        }
++
++        if ( msg.atype != detail::TYPE_SOA ) {
++            analyzer->Weird("DNS_DU_incorrect_zone_type");
++            return;
++        }
++
++        msg.zclass = msg.aclass;
++
++        if ( ! ParseAnswers(&msg, msg.an_pr_count, detail::DNS_PREREQUISITES, data, len, msg_start) ) {
++            EndMessage(&msg);
++            return;
++        }
++
++        if ( ! ParseAnswers(&msg, msg.ns_up_count, detail::DNS_UPDATES, data, len, msg_start) ) {
++            EndMessage(&msg);
++            return;
++        }
+     }
++    else {
++        if ( ! ParseQuestions(&msg, data, len, msg_start) ) {
++            EndMessage(&msg);
++            return;
++        }
+ 
+-    if ( ! ParseAnswers(&msg, msg.ancount, detail::DNS_ANSWER, data, len, msg_start) ) {
+-        EndMessage(&msg);
+-        return;
++        if ( ! ParseAnswers(&msg, msg.an_pr_count, detail::DNS_ANSWER, data, len, msg_start) ) {
++            EndMessage(&msg);
++            return;
++        }
+     }
+ 
+     analyzer->AnalyzerConfirmation();
+ 
+     bool skip_auth = (zeek::detail::dns_skip_all_auth != 0);
+     bool skip_addl = (zeek::detail::dns_skip_all_addl != 0);
+-    if ( msg.ancount > 0 ) { // We did an answer, so can potentially skip auth/addl.
++    if ( msg.an_pr_count > 0 ) { // We did an answer, so can potentially skip auth/addl.
+         static auto dns_s

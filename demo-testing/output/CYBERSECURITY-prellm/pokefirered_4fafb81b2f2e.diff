@@ -1,0 +1,155 @@
+@@ -1,6 +1,7 @@
+ #ifndef GUARD_CONSTANTS_SONGS_H
+ #define GUARD_CONSTANTS_SONGS_H
+ 
++#define MUS_DUMMY 0
+ #define SE_STOP 0
+ #define SE_KAIFUKU 1
+ #define SE_PC_LOGON 2
+
+
+
+
+@@ -404,6 +404,10 @@ void SampleFreqSet(u32 freq);
+ void m4aSoundVSyncOn(void);
+ void m4aSoundVSyncOff(void);
+ 
++void m4aMPlayTempoControl(struct MusicPlayerInfo *mplayInfo, u16 tempo);
++void m4aMPlayVolumeControl(struct MusicPlayerInfo *mplayInfo, u16 trackBits, u16 volume);
++void m4aMPlayPitchControl(struct MusicPlayerInfo *mplayInfo, u16 trackBits, s16 pitch);
++void m4aMPlayPanpotControl(struct MusicPlayerInfo *mplayInfo, u16 trackBits, s8 pan);
+ void ClearModM(struct MusicPlayerTrack *track);
+ void m4aMPlayModDepthSet(struct MusicPlayerInfo *mplayInfo, u16 trackBits, u8 modDepth);
+ void m4aMPlayLFOSpeedSet(struct MusicPlayerInfo *mplayInfo, u16 trackBits, u8 lfoSpeed);
+
+
+
+
+@@ -11,10 +11,10 @@ void *gMPlayJumpTable[36];
+ struct CgbChannel gCgbChans[4];
+ struct MusicPlayerTrack gPokemonCryTracks[MAX_POKEMON_CRIES * 2];
+ struct PokemonCrySong gPokemonCrySong;
+-struct MusicPlayerInfo gMPlay_BGM;
+-struct MusicPlayerInfo gMPlay_SE1;
+-struct MusicPlayerInfo gMPlay_SE2;
+-struct MusicPlayerInfo gMPlay_SE3;
++struct MusicPlayerInfo gMPlayInfo_BGM;
++struct MusicPlayerInfo gMPlayInfo_SE1;
++struct MusicPlayerInfo gMPlayInfo_SE2;
++struct MusicPlayerInfo gMPlayInfo_SE3;
+ u8 gMPlayMemAccArea[0x10];
+ 
+ u32 MidiKeyToFreq(struct WaveData *wav, u8 key, u8 fineAdjust)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,628 @@
++#include "global.h"
++#include "gba/m4a_internal.h"
++#include "sound.h"
++#include "battle.h"
++#include "m4a.h"
++#include "main.h"
++#include "pokemon.h"
++#include "constants/songs.h"
++#include "task.h"
++
++struct Fanfare
++{
++    u16 songNum;
++    u16 duration;
++};
++
++// TODO: what are these
++extern u8 gUnknown_2031DD8;
++extern u8 gUnknown_203ADFA;
++extern u8 gUnknown_203F174;
++
++// ewram
++EWRAM_DATA struct MusicPlayerInfo* gMPlay_PokemonCry = NULL;
++EWRAM_DATA u8 gPokemonCryBGMDuckingCounter = 0;
++
++// iwram bss
++IWRAM_DATA static u16 sCurrentMapMusic;
++IWRAM_DATA static u16 sNextMapMusic;
++IWRAM_DATA static u8 sMapMusicState;
++IWRAM_DATA static u8 sMapMusicFadeInSpeed;
++IWRAM_DATA static u16 sFanfareCounter;
++
++// iwram common
++bool8 gDisableMusic;
++
++extern u32 gBattleTypeFlags;
++extern struct MusicPlayerInfo gMPlayInfo_BGM;
++extern struct MusicPlayerInfo gMPlayInfo_SE1;
++extern struct MusicPlayerInfo gMPlayInfo_SE2;
++extern struct MusicPlayerInfo gMPlayInfo_SE3;
++extern struct ToneData gCryTable[];
++extern struct ToneData gCryTable2[];
++extern const struct Fanfare sFanfares[];
++
++extern u16 SpeciesToCryId(u16);
++
++static void Task_Fanfare(u8 taskId);
++static void CreateFanfareTask(void);
++static void Task_DuckBGMForPokemonCry(u8 taskId);
++static void RestoreBGMVolumeAfterPokemonCry(void);
++
++#define CRY_VOLUME  120 // was 125 in R/S
++
++void InitMapMusic(void)
++{
++    gDisableMusic = FALSE;
++    ResetMapMusic();
++}
++
++void MapMusicMain(void)
++{
++    switch (sMapMusicState)
++    {
++    case 0:
++        break;
++    case 1:
++        sMapMusicState = 2;
++        PlayBGM(sCurrentMapMusic);
++        break;
++    case 2:
++    case 3:
++    case 4:
++        break;
++    case 5:
++        if (IsBGMStopped())
++        {
++            sNextMapMusic = 0;
++            sMapMusicState = 0;
++        }
++        break;
++    case 6:
++        if (IsBGMStopped() && IsFanfareTaskInactive())
++        {
++            sCurrentMapMusic = sNextMapMusic;
++            sNextMapMusic = 0;
++            sMapMusicState = 2;
++            PlayBGM(sCurrentMapMusic);
++        }
++        break;
++    case 7:
++        if (IsBGMStopped() && IsFanfareTaskInactive())
++        {
++            FadeInNewBGM(sNextMapMusic, sMapMusicFadeInSpeed);
++            sCurrentMapMusic = sNextMapMusic;
++            sNextMapMusic = 0;
++            sMapMusicState = 2;
++            sMapMusicFadeInSpeed = 0;
++        }
++        break;
++    }
++}
++
++void ResetMapMusic(void)
++{
++    sCurrentMapMusic = 0;
++    sNextMapMusic = 0;
++    sMapMus

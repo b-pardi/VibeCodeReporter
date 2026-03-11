@@ -1,0 +1,72 @@
+@@ -32,6 +32,7 @@
+ #include "lib/nodeport.h"
+ #include "lib/clustermesh.h"
+ #include "lib/wireguard.h"
++#include "lib/egress_gateway.h"
+ 
+ #ifdef ENABLE_VTEP
+ #include "lib/arp.h"
+@@ -387,6 +388,35 @@ skip_vtep:
+ not_esp:
+ #endif
+ 
++#if defined(ENABLE_EGRESS_GATEWAY_COMMON)
++	{
++		__be32 snat_addr, daddr;
++		int ret;
++		struct remote_endpoint_info *remote_ep;
++
++		remote_ep = lookup_ip4_remote_endpoint(ip4->daddr, 0);
++		/* If the packet is destined to an entity inside the cluster, either EP
++		 * or node, skip SNAT since only traffic leaving the cluster is supposed
++		 * to be masqueraded with an egress IP.
++		 */
++		if (remote_ep &&
++		    identity_is_cluster(remote_ep->sec_identity))
++			goto skip_egress_gateway;
++
++		daddr = ip4->daddr;
++		if (egress_gw_snat_needed_hook(ip4->saddr, daddr, &snat_addr)) {
++			ret = ipv4_l3(ctx, ETH_HLEN, NULL, NULL, ip4);
++			if (unlikely(ret != CTX_ACT_OK))
++				return ret;
++
++			/* to-netdev@bpf_host handles SNAT, so no need to do it here. */
++			return egress_gw_fib_lookup_and_redirect(ctx, snat_addr,
++								 daddr, ext_err);
++		}
++	}
++skip_egress_gateway:
++#endif /* ENABLE_EGRESS_GATEWAY_COMMON */
++
+ 	/* Deliver to local (non-host) endpoint: */
+ 	ep = lookup_ip4_endpoint(ip4);
+ 	if (ep && !(ep->flags & ENDPOINT_F_HOST))
+
+
+
+
+@@ -2415,10 +2415,10 @@ nodeport_rev_dnat_ingress_ipv4(struct __ctx_buff *ctx, struct trace_ctx *trace,
+ 			return ret;
+ 	}
+ 
+-#if defined(ENABLE_EGRESS_GATEWAY_COMMON) && !defined(IS_BPF_OVERLAY) && !defined(TUNNEL_MODE)
+-	/* If we are not using TUNNEL_MODE, the gateway node needs to manually steer
+-	 * any reply traffic for a remote pod into the tunnel (to avoid iptables
+-	 * potentially dropping the packets).
++#if defined(ENABLE_EGRESS_GATEWAY_COMMON) && !defined(IS_BPF_OVERLAY)
++	/* The gateway node needs to manually steer any reply traffic
++	 * for a remote pod into the tunnel (to avoid iptables potentially
++	 * dropping or accidentally SNATing the packets).
+ 	 */
+ 	if (egress_gw_reply_needs_redirect_hook(ip4, &tunnel_endpoint, &dst_sec_identity)) {
+ 		trace->reason = TRACE_REASON_CT_REPLY;
+@@ -2572,7 +2572,7 @@ int tail_nodeport_nat_ingress_ipv4(struct __ctx_buff *ctx)
+ 	 * CALL_IPV4_FROM_NETDEV in the code above.
+ 	 */
+ #if !defined(ENABLE_DSR) || (defined(ENABLE_DSR) && defined(ENABLE_DSR_HYBRID)) ||	\
+-    (defined(ENABLE_EGRESS_GATEWAY_COMMON) && !defined(IS_BPF_OVERLAY) && !defined(TUNNEL_MODE))
++    (defined(ENABLE_EGRESS_GATEWAY_COMMON) && !defined(IS_BPF_OVERLAY))
+ 
+ # if defined(ENABLE_HOST_FIREWALL) && defined(IS_BPF_HOST)
+ 	ret = ipv4_host_policy_ingress(ctx, &src_id, &trace, &ext_err);

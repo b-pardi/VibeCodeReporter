@@ -1,0 +1,192 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,282 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "ID.h"
++#include "Var.h"
++#include "Scope.h"
++#include "Expr.h"
++#include "Stmt.h"
++#include "Desc.h"
++#include "ProfileFunc.h"
++#include "Reporter.h"
++#include "zeek/script_opt/Reduce.h"
++#include "zeek/script_opt/TempVar.h"
++
++
++namespace zeek::detail {
++
++
++Reducer::Reducer(Scope* s)
++	{
++	scope = s;
++	}
++
++Reducer::~Reducer()
++	{
++	for ( int i = 0; i < temps.length(); ++i )
++		delete temps[i];
++	}
++
++ExprPtr Reducer::GenTemporaryExpr(const TypePtr& t, ExprPtr rhs)
++	{
++	auto e = make_intrusive<NameExpr>(GenTemporary(t, rhs));
++	e->SetLocationInfo(rhs->GetLocationInfo());
++	return e;
++	}
++
++NameExpr* Reducer::UpdateName(NameExpr* n)
++	{
++	if ( NameIsReduced(n) )
++		{
++		Ref(n);
++		return n;
++		}
++
++	return new NameExpr(FindNewLocal(n));
++	}
++
++bool Reducer::NameIsReduced(const NameExpr* n) const
++	{
++	auto id = n->Id();
++	return inline_block_level == 0 || id->IsGlobal() || IsTemporary(id) ||
++		IsNewLocal(n);
++	}
++
++void Reducer::UpdateIDs(IDPList* ids)
++	{
++	loop_over_list(*ids, i)
++		{
++		IDPtr id = {NewRef{}, (*ids)[i]};
++
++		if ( ! ID_IsReduced(id) )
++			(*ids)[i] = UpdateID(id).release();
++		}
++	}
++
++void Reducer::UpdateIDs(std::vector<IDPtr>& ids)
++	{
++	for ( auto& id : ids )
++		if ( ! ID_IsReduced(id) )
++			id = UpdateID(id);
++	}
++
++bool Reducer::IDsAreReduced(const IDPList* ids) const
++	{
++	for ( auto& id : *ids )
++		if ( ! ID_IsReduced(id) )
++			return false;
++
++	return true;
++	}
++
++bool Reducer::IDsAreReduced(const std::vector<IDPtr>& ids) const
++	{
++	for ( auto& id : ids )
++		if ( ! ID_IsReduced(id) )
++			return false;
++
++	return true;
++	}
++
++IDPtr Reducer::UpdateID(IDPtr id)
++	{
++	if ( ID_IsReduced(id) )
++		return id;
++
++	return FindNewLocal(id.get());
++	}
++
++bool Reducer::ID_IsReduced(const ID* id) const
++	{
++	return inline_block_level == 0 || id->IsGlobal() || IsTemporary(id) ||
++		IsNewLocal(id);
++	}
++
++NameExprPtr Reducer::GenInlineBlockName(IDPtr id)
++	{
++	return make_intrusive<NameExpr>(GenLocal(id.get()));
++	}
++
++NameExprPtr Reducer::PushInlineBlock(TypePtr type)
++	{
++	++inline_block_level;
++
++	if ( ! type || type->Tag() == TYPE_VOID )
++		return nullptr;
++
++	char buf[8192];
++	int n = new_locals.size();
++	snprintf(buf, sizeof buf, "@retvar");
++
++	IDPtr ret_id = install_ID(buf, "<internal>", false, false);
++	ret_id->SetType(type);
++
++	// Track this as a new local *if* we're in the outermost inlining
++	// block.  If we're recursively deeper into inlining, then this
++	// variable will get mapped to a local anyway, so no need.
++	if ( inline_block_level == 1 )
++		new_locals.insert(ret_id.get());
++
++	return GenInlineBlockName(ret_id);
++	}
++
++void Reducer::PopInlineBlock()
++	{
++	--inline_block_level;
++	}
++
++bool Reducer::SameVal(const Val* v1, const Val* v2) const
++	{
++	if ( is_atomic_val(v1) )
++		return same_atomic_val(v1, v2);
++	else
++		return v1 == v2;
++	}
++
++IDPtr Reducer::GenTemporary(const TypePtr& t, ExprPtr rhs)
++	{
++	if ( Optimizing() )
++		reporter->InternalError("Generating a new temporary while optimizing");
++
++	auto temp = new TempVar(temps.length(), t, rhs);
++	IDPtr temp_id = install_ID(temp->Name(), "<internal>", false, false);
++
++	temp->SetID(temp_id);
++	temp_id->SetType(t);
++
++	temps.append(temp);
++	ids_to_temps[temp_id.get()] = temp;
++
++	return temp_id;
++	}
++
++IDPtr Reducer::FindNewLocal(ID* id)
++	{
++	auto mapping = orig_to_new_locals.find(id);
++
++	if ( mapping != orig_to_new_locals.end() )
++		return mapping->second;
++
++	return GenLocal(id);
++	}
++
++IDPtr Reducer::GenLocal(ID* orig)
++	{
++	if ( Optimizing() )
++		reporter->InternalError("Generating a new local while optimizing");
++
++	char buf[8192];
++	int n = new_locals.size();
++	snprintf(buf, sizeof buf, "%s.%d", orig->Name(), n);
++
++	IDPtr local_id = install_ID(buf, "<internal>", false, false);
++	local_id->SetType(orig->GetType());
++
++	new_locals.insert(local_id.get());
++	orig_to_new_locals[orig] = local_id;
++
++	return

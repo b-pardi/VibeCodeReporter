@@ -1,0 +1,111 @@
+@@ -1114,6 +1114,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+ 
+   inline void setServerPort(bool isTCP, u_int16_t port, ndpi_protocol *proto)    { usedPorts.setServerPort(isTCP, port, proto);    };
+   void luaUsedPorts(lua_State* vm)                                       { usedPorts.lua(vm, this);                       };
++  void getProtocolFlowsStats(lua_State* vm);
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -1867,6 +1867,21 @@ static int ntop_interface_get_throughput(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_get_protocol_flows_stats(lua_State* vm) {
++  NetworkInterface *ntop_interface = getCurrentInterface(vm);
++
++  ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
++
++  if(!ntop_interface)
++    return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
++
++  ntop_interface->getProtocolFlowsStats(vm);
++  
++  return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_OK));
++}
++
++/* ****************************************** */
++
+ static int ntop_get_interface_anomalies(lua_State* vm) {
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+ 
+@@ -4802,7 +4817,8 @@ static luaL_Reg _ntop_interface_reg[] = {
+   { "serviceMapSetStatus",              ntop_interface_service_map_set_status },
+   { "serviceMapSetMultipleStatus",      ntop_interface_service_map_set_multiple_status },
+   { "getThroughput",                    ntop_interface_get_throughput },
+-
++  { "getProtocolFlowsStats",            ntop_get_protocol_flows_stats },
++  
+   /* Addresses */
+   { "getAddressInfo",                   ntop_get_address_info },
+ 
+
+
+
+
+@@ -10179,3 +10179,106 @@ bool NetworkInterface::resetHostTopSites(AddressTree *allowed_hosts,
+   else
+     return(false);
+ }
++
++/* **************************************************** */
++
++class FlowsStats {
++private:
++  std::set<const IpAddress*> clients, servers;
++  u_int32_t num_flows;
++  u_int64_t tot_sent, tot_rcvd;
++
++public:
++  FlowsStats(const IpAddress *c, const IpAddress *s, u_int64_t bytes_sent, u_int64_t bytes_rcvd) {
++    num_flows = 0, tot_sent = tot_rcvd = 0;
++    incFlowStats(c, s, bytes_sent, bytes_rcvd);
++  }
++
++  inline u_int32_t getNumClients() { return(clients.size()); }
++  inline u_int32_t getNumServers() { return(servers.size()); }
++  inline u_int32_t getNumFlows()   { return(num_flows);      }
++  inline u_int64_t getTotalSent()  { return(tot_sent);       }
++  inline u_int64_t getTotalRcvd()  { return(tot_rcvd);       }
++  inline void      incFlowStats(const IpAddress *c, const IpAddress *s, u_int64_t bytes_sent, u_int64_t bytes_rcvd) {
++    clients.insert(c), servers.insert(c), num_flows++, tot_sent += bytes_sent, tot_rcvd += bytes_rcvd;
++  }
++};
++
++/* **************************************************** */
++
++static bool compute_flow_stats(GenericHashEntry *node, void *user_data, bool *matched) {
++  Flow *f = (Flow*)node;
++  std::unordered_map<u_int32_t, FlowsStats*> *count = static_cast<std::unordered_map<u_int32_t, FlowsStats*>*>(user_data);
++  u_int32_t p;
++  ndpi_protocol detected_protocol = f->get_detected_protocol();
++  std::unordered_map<u_int32_t, FlowsStats*>::iterator it;
++
++  p = (((u_int32_t)detected_protocol.app_protocol) << 16) + (u_int32_t)detected_protocol.master_protocol;
++
++  it = count->find(p);
++  
++  if(it == count->end()) {
++    FlowsStats *fs = new (std::nothrow) FlowsStats(f->get_cli_ip_addr(), f->get_srv_ip_addr(),
++						   f->get_bytes_cli2srv(), f->get_bytes_srv2cli());
++
++    if(fs != NULL)
++      (*count)[p] = fs;
++  } else
++    it->second->incFlowStats(f->get_cli_ip_addr(), f->get_srv_ip_addr(),
++			     f->get_bytes_cli2srv(), f->get_bytes_srv2cli());
++  
++  *matched = true;
++
++  return(false); /* false = keep on walking */
++}
++
++/* **************************************************** */
++
++void NetworkInterface::getProtocolFlowsStats(lua_State* vm) {
++  u_int32_t begin_slot = 0;
++  std::unordered_map<u_int32_t /* l7 proto */, FlowsStats*> count;
++

@@ -1,0 +1,133 @@
+@@ -436,6 +436,7 @@ static RCoreHelpMessage help_detail_pf = {
+ 	" ", "e", "temporally swap endian",
+ 	" ", "E", "resolve enum name (see t?)",
+ 	" ", "f", "float value (4 bytes)",
++	" ", "g", "BF16 value (2 bytes)",
+ 	" ", "F", "double value (8 bytes)",
+ 	" ", "G", "long double value (16 bytes (10 with padding))",
+ 	" ", "i", "signed integer value (4 bytes) (see 'd' and 'x')",
+
+
+
+
+@@ -111,6 +111,8 @@ R_API size_t r_num_bit_clz64(ut64 val);
+ R_API size_t r_num_bit_ctz32(ut32 val);
+ R_API size_t r_num_bit_ctz64(ut64 val);
+ R_API double r_num_get_double(RNum *num, const char *str);
++R_API ut16 r_num_float_to_bf16(float f);
++R_API float r_num_bf16_to_float(ut16 b);
+ 
+ static inline st64 r_num_abs(st64 num) {
+ 	return num < 0 ? -num : num;
+
+
+
+
+@@ -121,7 +121,7 @@ static bool format_output(RNum *num, char mode, const char *s, RaxMode m, RaxAct
+ 	case 'f':
+ 		printf ("%.01lf\n", num->fvalue);
+ 		break;
+-	case 'l':
++		case 'l':
+ 		{
+ 			R_STATIC_ASSERT (sizeof (float) == 4);
+ 			float f = (float)num->fvalue;
+@@ -129,6 +129,20 @@ static bool format_output(RNum *num, char mode, const char *s, RaxMode m, RaxAct
+ 			printf ("Fx%08x\n", *p);
+ 		}
+ 		break;
++	case 'g':
++		{
++			R_STATIC_ASSERT (sizeof (float) == 4);
++			float f = (float)num->fvalue;
++			ut16 bf16 = r_num_float_to_bf16 (f);
++			printf ("Gx%04x\n", bf16);
++		}
++		break;
++	case 'G':
++		{
++			float f = r_num_bf16_to_float ((ut16)n);
++			printf ("%.9g\n", f);
++		}
++		break;
+ 	case 'O': printf ("0%" PFMT64o "\n", n); break;
+ 	case 'B':
+ 		if (n) {
+@@ -147,7 +161,7 @@ static bool format_output(RNum *num, char mode, const char *s, RaxMode m, RaxAct
+ 		}
+ 		break;
+ 	default:
+-		R_LOG_ERROR ("Unknown output mode %d", m.omode);
++		R_LOG_ERROR ("Unknown output mode %c", m.omode);
+ 		return false;
+ 	}
+ 	return true;
+@@ -169,6 +183,8 @@ static int help(void) {
+ 		"  ternary    ->  int              ;  rax2 1010dt\n"
+ 		"  float      ->  hex              ;  rax2 3.33f\n"
+ 		"  hex        ->  float            ;  rax2 Fx40551ed8\n"
++		"  BF16       ->  hex              ;  rax2 1.5g\n"
++		"  hex        ->  BF16             ;  rax2 Gx3f80\n"
+ 		"  oct        ->  hex              ;  rax2 35o\n"
+ 		"  hex        ->  oct              ;  rax2 Ox12 (O is a letter)\n"
+ 		"  bin        ->  hex              ;  rax2 1100011b\n"
+@@ -588,6 +604,7 @@ dotherax:
+ 		memcpy (&f, &n, sizeof (f));
+ 		memcpy (&d, &n, sizeof (d));
+ 		printf ("float   %ff\n", f);
++		printf ("bf16    Gx%04x\n", r_num_float_to_bf16 (f));
+ 		printf ("double  %lf\n", d);
+ 		printf ("binary  0b%s\n", out);
+ 
+@@ -647,6 +664,7 @@ dotherax:
+ 
+ 		pj_ks (*pj, "fvalue", r_strf ("%.1lf", num->fvalue));
+ 		pj_ks (*pj, "float", r_strf ("%ff", f));
++		pj_ks (*pj, "bf16", r_strf ("Gx%04x", r_num_float_to_bf16 (f)));
+ 		pj_ks (*pj, "double", r_strf ("%lf", d));
+ 		pj_ks (*pj, "binary", r_strf ("0b%s", out));
+ 		char b36str[16];
+@@ -756,6 +774,9 @@ dotherax:
+ 	} else if (r_str_startswith (str, "Bx")) {
+ 		out_mode = 'B';
+ 		*str = '0';
++	} else if (r_str_startswith (str, "Gx")) {
++		out_mode = 'G';
++		*str = '0';
+ 	} else if (r_str_startswith (str, "Tx")) {
+ 		out_mode = 'T';
+ 		*str = '0';
+@@ -768,6 +789,8 @@ dotherax:
+ 		// TODO: Move print into format_output
+ 	} else if (r_str_endswith (str, "f")) {
+ 		out_mode = 'l';
++	} else if (r_str_endswith (str, "g")) {
++		out_mode = 'g';
+ 	} else if (r_str_endswith (str, "dt")) {
+ 		out_mode = 'I';
+ 		str[strlen (str) - 2] = 't';
+
+
+
+
+@@ -3,6 +3,7 @@
+ #include <r_cons.h>
+ #include <r_util.h>
+ #include <r_util/r_print.h>
++#include <r_util/r_num.h>
+ #include <r_reg.h>
+ 
+ // W T F :D
+@@ -1038,6 +1039,63 @@ static void r_print_format_float(RPrintFormat *pf, const char *setval, ut64 seek
+ 	}
+ }
+ 
++static void r_print_format_bf16(RPrintFormat *pf, const char *setval, ut64 seeki, ut8 *buf, int i, int size) {
++	RPrint *p = pf->p;
++	const int endian = pf->endian;
++	const int mode = pf->mode;
++	ut64 addr = 0;
++	int elem = -1;
++	if (size >= ARRAYINDEX_COEF) {
++		elem = size / ARRAYINDEX_COEF - 1;
++		size %= ARRAYINDE

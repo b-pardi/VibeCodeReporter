@@ -1,0 +1,105 @@
+@@ -277,19 +277,39 @@ class AsyncRequester(BaseRequester):
+     def __init__(self):
+         super().__init__()
+ 
++        proxy = None
++        try:
++            proxy = self.parse_proxy(random.choice(options["proxies"]))
++        except IndexError:
++            pass
++
+         transport = httpx.AsyncHTTPTransport(
+-            # FIXME: max_connections != thread_count
++            verify=False,
++            cert=self._cert,
+             limits=httpx.Limits(max_connections=options["thread_count"]),
++            # FIXME: proxy will not change when retry request
++            proxy=proxy,
+             socket_options=self._socket_options,
+         )
+ 
+         self.session = httpx.AsyncClient(
+-            verify=False,
+-            cert=self._cert,
+             mounts={"http://": transport, "https://": transport},
+             timeout=httpx.Timeout(options["timeout"]),
+         )
+ 
++    def parse_proxy(self, proxy: str):
++        if not proxy:
++            return None
++
++        if not proxy.startswith(PROXY_SCHEMES):
++            proxy = f"http://{proxy}"
++
++        if self._proxy_cred and "@" not in proxy:
++            # socks5://localhost:9050 => socks5://[credential]@localhost:9050
++            proxy = proxy.replace("://", f"://{self._proxy_cred}@", 1)
++
++        return proxy
++
+     def set_auth(self, type: str, credential: str) -> None:
+         if type in ("bearer", "jwt"):
+             self.session.auth = HTTPXBearerAuth(credential)
+@@ -323,11 +343,8 @@ class AsyncRequester(BaseRequester):
+         # Why using a loop instead of max_retries argument? Check issue #1009
+         for _ in range(options["max_retries"] + 1):
+             try:
+-                try:
+-                    proxy = proxy or random.choice(options["proxies"])
+-                    self.set_proxy(proxy)
+-                except IndexError:
+-                    pass
++                # FIXME: set proxy here is not work
++                # https://github.com/encode/httpx/discussions/3183
+ 
+                 if self.agents:
+                     self.set_header("user-agent", random.choice(self.agents))
+
+
+
+
+@@ -305,20 +305,20 @@ class Controller:
+ 
+     async def _start_coroutines(self):
+         task = self.loop.create_task(self.fuzzer.start())
+-        done, _ = await asyncio.wait(
+-            [self.done_future, task],
+-            timeout=options["max_time"] if options["max_time"] > 0 else None,
+-            return_when=asyncio.FIRST_COMPLETED,
+-        )
++        max_time = options["max_time"] if options["max_time"] > 0 else None
++        try:
++            async with asyncio.timeout(max_time):
++                await asyncio.wait(
++                    [self.done_future, task],
++                    return_when=asyncio.FIRST_COMPLETED,
++                )
++        except asyncio.TimeoutError:
++            raise SkipTargetInterrupt("Runtime exceeded the maximum set by the user")
+ 
+         if self.done_future.done():
+             task.cancel()
+             await self.done_future  # propagate the exception, if raised
+ 
+-        # TODO: find a better way to catch TimeoutError
+-        if len(done) == 0:
+-            raise SkipTargetInterrupt("Runtime exceeded the maximum set by the user")
+-
+     def set_target(self, url):
+         # If no scheme specified, unset it first
+         if "://" not in url:
+@@ -497,7 +497,12 @@ class Controller:
+ 
+         if options["replay_proxy"]:
+             # Replay the request with new proxy
+-            self.requester.request(response.full_path, proxy=options["replay_proxy"])
++            if options["async_mode"]:
++                # FIXME: httpx does not currently allow setting proxies per-request
++                # self.loop.create_task(self.requester.request(response.full_path, proxy=options["replay_proxy"]))
++                pass
++            else:
++                self.requester.request(response.full_path, proxy=options["replay_proxy"])
+ 
+         if self.report:
+             self.results.append(response)

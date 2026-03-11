@@ -1,0 +1,114 @@
+@@ -126,12 +126,17 @@ TypePtr rt::create_record_type(const std::string& ns, const std::string& id,
+ 
+     auto decls = std::make_unique<type_decl_list>();
+ 
+-    for ( const auto& [id, type, optional] : fields ) {
++    for ( const auto& [id, type, optional, log] : fields ) {
+         auto attrs = make_intrusive<detail::Attributes>(nullptr, true, false);
+ 
+         if ( optional ) {
+             auto optional_ = make_intrusive<detail::Attr>(detail::ATTR_OPTIONAL);
+-            attrs->AddAttr(optional_);
++            attrs->AddAttr(std::move(optional_));
++        }
++
++        if ( log ) {
++            auto log_ = make_intrusive<detail::Attr>(detail::ATTR_LOG);
++            attrs->AddAttr(std::move(log_));
+         }
+ 
+         decls->append(new TypeDecl(util::copy_string(id.c_str()), type, std::move(attrs)));
+
+
+
+
+@@ -151,7 +151,7 @@ extern TypePtr create_enum_type(
+     const std::string& ns, const std::string& id,
+     const hilti::rt::Vector<std::tuple<std::string, hilti::rt::integer::safe<int64_t>>>& labels);
+ 
+-using RecordField = std::tuple<std::string, TypePtr, hilti::rt::Bool>; // (ID, type, optional)
++using RecordField = std::tuple<std::string, TypePtr, hilti::rt::Bool, hilti::rt::Bool>; // (ID, type, optional, &log)
+ extern TypePtr create_record_type(const std::string& ns, const std::string& id,
+                                   const hilti::rt::Vector<RecordField>& fields);
+ 
+
+
+
+
+@@ -224,8 +224,12 @@ std::vector<std::pair<TypeInfo, hilti::ID>> Driver::exportedTypes() const {
+ 
+     for ( const auto& i : _glue->exportedIDs() ) {
+         const auto& export_ = i.second;
+-        if ( auto t = _types.find(export_.spicy_id); t != _types.end() )
++        if ( auto t = _types.find(export_.spicy_id); t != _types.end() ) {
++            if ( ! export_.validate(t->second) )
++                continue;
++
+             result.emplace_back(t->second, export_.zeek_id);
++        }
+         else {
+             hilti::logger().error(hilti::rt::fmt("unknown type '%s' exported", export_.spicy_id));
+             continue;
+
+
+
+
+@@ -493,6 +493,9 @@ bool GlueCompiler::loadEvtFile(hilti::rt::filesystem::path& path) {
+ 
+             else if ( looking_at(*chunk, 0, "export") ) {
+                 auto export_ = parseExport(*chunk);
++                if ( _exports.find(export_.zeek_id) != _exports.end() )
++                    throw ParseError(hilti::util::fmt("export of '%s' already defined", export_.zeek_id));
++
+                 _exports[export_.zeek_id] = export_;
+             }
+ 
+@@ -514,6 +517,70 @@ bool GlueCompiler::loadEvtFile(hilti::rt::filesystem::path& path) {
+     return true;
+ }
+ 
++std::optional<glue::Export> GlueCompiler::exportForZeekID(const hilti::ID& id) const {
++    if ( auto i = _exports.find(id); i != _exports.end() )
++        return i->second;
++    else
++        return {};
++}
++
++GlueCompiler::ExportedField GlueCompiler::exportForField(const hilti::ID& zeek_id, const hilti::ID& field_id) const {
++    ExportedField field;
++
++    auto export_ = exportForZeekID(zeek_id);
++    if ( ! export_ )
++        // No `export` for this type, return defaults.
++        return field;
++
++    if ( export_->with.empty() ) {
++        // Include unless explicitly excluded.
++        if ( export_->without.find(field_id) != export_->without.end() )
++            field.skip = true;
++    }
++    else {
++        // Exclude unless explicitly included.
++        if ( export_->with.find(field_id) == export_->with.end() )
++            field.skip = true;
++    }
++
++    if ( export_->log_all )
++        field.log = true;
++
++    if ( export_->logs.find(field_id) != export_->logs.end() )
++        field.log = true;
++
++    return field;
++}
++
++
++bool glue::Export::validate(const TypeInfo& ti) const {
++    auto utype = ti.type.tryAs<::spicy::type::Unit>();
++    if ( ! utype )
++        return true;
++
++    auto check_field_names = [&](const auto& fields) {
++        for ( const auto& f : fields ) {
++            if ( ! utype->itemByName(f) ) {
++                hilti::logger().e

@@ -1,0 +1,128 @@
+@@ -97,9 +97,11 @@ from scapy.layers.kerberos import (
+     Kerberos,
+ )
+ from scapy.layers.gssapi import (
+-    GSS_S_COMPLETE,
+-    GSSAPI_BLOB_SIGNATURE,
+     GSSAPI_BLOB,
++    GSSAPI_BLOB_SIGNATURE,
++    GSS_S_COMPLETE,
++    GSS_S_FLAGS,
++    GSS_C_FLAGS,
+     SSP,
+ )
+ from scapy.layers.inet import TCP
+@@ -212,6 +214,12 @@ class DceRpc(Packet):
+                 return DceRpc5
+         return DceRpc5
+ 
++    @classmethod
++    def tcp_reassemble(cls, data, metadata, session):
++        if data[0:1] == b"\x05":
++            return DceRpc5.tcp_reassemble(data, metadata, session)
++        return DceRpc(data)
++
+ 
+ bind_bottom_up(TCP, DceRpc, sport=135)
+ bind_layers(TCP, DceRpc, dport=135)
+@@ -1612,32 +1620,38 @@ class NDRFullPointerField(_FieldContainer):
+     """
+     A NDR Full/Unique pointer field encapsulation.
+ 
+-    :param deferred: This pointer is deferred. This means that it's representation
+-                     will not appear after the pointer.
++    :param EMBEDDED: This pointer is embedded. This means that it's representation
++                     will not appear after the pointer (pointer deferral applies).
+                      See [C706] 14.3.12.3 - Algorithm for Deferral of Referents
+     """
+ 
+     EMBEDDED = False
++    EMBEDDED_REF = False
+ 
+-    def __init__(self, fld, deferred=False, fmt="I"):
++    def __init__(self, fld, ref=False, fmt="I"):
+         self.fld = fld
++        self.ref = ref
+         self.default = None
+-        self.deferred = deferred
+ 
+     def getfield(self, pkt, s):
+         fmt = _e(pkt.ndrendian) + ["I", "Q"][pkt.ndr64]
+         remain, referent_id = NDRAlign(Field("", 0, fmt=fmt), align=(4, 8)).getfield(
+             pkt, s
+         )
+-        if not self.EMBEDDED and referent_id == 0:
++
++        # No value
++        if referent_id == 0 and not self.EMBEDDED_REF:
+             return remain, None
+-        if self.deferred:
++
++        # With value
++        if self.EMBEDDED:
+             # deferred
+             ptr = NDRPointer(
+                 ndr64=pkt.ndr64, ndrendian=pkt.ndrendian, referent_id=referent_id
+             )
+             pkt.deferred_pointers.append((ptr, partial(self.fld.getfield, pkt)))
+             return remain, ptr
++
+         remain, val = self.fld.getfield(pkt, remain)
+         return remain, NDRPointer(
+             ndr64=pkt.ndr64, ndrendian=pkt.ndrendian, referent_id=referent_id, value=val
+@@ -1650,17 +1664,21 @@ class NDRFullPointerField(_FieldContainer):
+             )
+         fmt = _e(pkt.ndrendian) + ["I", "Q"][pkt.ndr64]
+         fld = NDRAlign(Field("", 0, fmt=fmt), align=(4, 8))
+-        if not self.EMBEDDED and val is None:
++
++        # No value
++        if val is None and not self.EMBEDDED_REF:
+             return fld.addfield(pkt, s, 0)
+-        else:
+-            _set_ctx_on(val.value, pkt)
+-            s = fld.addfield(pkt, s, val.referent_id)
+-        if self.deferred:
++
++        # With value
++        _set_ctx_on(val.value, pkt)
++        s = fld.addfield(pkt, s, val.referent_id)
++        if self.EMBEDDED:
+             # deferred
+             pkt.deferred_pointers.append(
+                 ((lambda s: self.fld.addfield(pkt, s, val.value)), val)
+             )
+             return s
++
+         return self.fld.addfield(pkt, s, val.value)
+ 
+     def any2i(self, pkt, x):
+@@ -1693,12 +1711,25 @@ class NDRFullPointerField(_FieldContainer):
+         return self.fld.valueof(pkt, x.value)
+ 
+ 
++class NDRFullEmbPointerField(NDRFullPointerField):
++    """
++    A NDR Embedded Full pointer.
++
++    Same as NDRFullPointerField with EMBEDDED = True.
++    """
++
++    EMBEDDED = True
++
++
+ class NDRRefEmbPointerField(NDRFullPointerField):
+     """
+-    A NDR Embedded Reference pointer
++    A NDR Embedded Reference pointer.
++
++    Same as NDRFullPointerField with EMBEDDED = True and EMBEDDED_REF = True.
+     """
+ 
+     EMBEDDED = True
++    EMBEDDED_REF = True
+ 
+ 
+ # Constructed types
+@@ -1738,7 +1769,7 @@ class NDRConstructedType(object):
+         # If we have a pointer, mark t

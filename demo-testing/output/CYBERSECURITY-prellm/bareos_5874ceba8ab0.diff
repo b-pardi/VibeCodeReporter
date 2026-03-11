@@ -1,0 +1,126 @@
+@@ -51,12 +51,69 @@
+ #include "lib/edit.h"
+ #include "lib/util.h"
+ #include "include/make_unique.h"
++#include "cats/sql.h"
++
++#include <algorithm>
++#include <vector>
++#include <string>
+ 
+ namespace directordaemon {
+ 
+ static const int dbglevel = 10;
+ 
+-static bool CreateBootstrapFile(JobControlRecord* jcr, char* jobids);
++static bool CreateBootstrapFile(JobControlRecord& jcr,
++                                const std::string& jobids);
++
++class JobConsistencyChecker {
++  enum
++  {
++    col_JobId = 0,
++    col_Type = 1,
++    col_ClientId = 2,
++    col_FilesetId = 3,
++    col_PurgedFiles = 4
++  };
++
++ public:
++  std::vector<std::string> JobList;
++  std::vector<std::string> JobsWithPurgedFiles;
++
++  bool operator()(int num_fields, char** row)
++  {
++    assert(num_fields == 5);
++    JobList.push_back(row[col_JobId]);
++    if (row[col_PurgedFiles][0] != '0') {
++      JobsWithPurgedFiles.push_back(row[col_JobId]);
++    }
++    return true;
++  }
++  bool CheckNumJobs(size_t t_NumJobs) { return JobList.size() == t_NumJobs; }
++  std::vector<std::string> JobListDiff(std::vector<std::string> FullJobList)
++  {
++    std::sort(FullJobList.begin(), FullJobList.end());
++    std::sort(JobList.begin(), JobList.end());
++    std::vector<std::string> diff;
++    std::set_difference(FullJobList.begin(), FullJobList.end(), JobList.begin(),
++                        JobList.end(), std::inserter(diff, diff.begin()));
++    return diff;
++  }
++  bool CheckPurgedFiles() { return JobsWithPurgedFiles.empty(); }
++};
++
++std::string GetVfJobids(JobControlRecord& jcr)
++{
++  // See if we already got a list of jobids to use.
++  if (jcr.impl->vf_jobids) {
++    Dmsg1(10, "jobids=%s\n", jcr.impl->vf_jobids);
++    return jcr.impl->vf_jobids;
++  } else {
++    db_list_ctx jobids_ctx;
++    jcr.db->AccurateGetJobids(&jcr, &jcr.impl->jr, &jobids_ctx);
++    Dmsg1(10, "consolidate candidates:  %s.\n",
++          jobids_ctx.GetAsString().c_str());
++    return jobids_ctx.GetAsString();
++  }
++}
+ 
+ // Called here before the job is run to do the job specific setup.
+ bool DoNativeVbackupInit(JobControlRecord* jcr)
+@@ -158,12 +215,6 @@ bool DoNativeVbackupInit(JobControlRecord* jcr)
+  */
+ bool DoNativeVbackup(JobControlRecord* jcr)
+ {
+-  char* p;
+-  BareosSocket* sd;
+-  char* jobids;
+-  char ed1[100];
+-  int JobLevel_of_first_job;
+-
+   if (!jcr->impl->res.read_storage_list) {
+     Jmsg(jcr, M_FATAL, 0, _("No storage for reading given.\n"));
+     return false;
+@@ -182,9 +233,8 @@ bool DoNativeVbackup(JobControlRecord* jcr)
+         ((StorageResource*)jcr->impl->res.write_storage_list->first())
+             ->resource_name_);
+ 
+-  // Print Job Start message
+-  Jmsg(jcr, M_INFO, 0, _("Start Virtual Backup JobId %s, Job=%s\n"),
+-       edit_uint64(jcr->JobId, ed1), jcr->Job);
++  Jmsg(jcr, M_INFO, 0, _("Start Virtual Backup JobId %lu, Job=%s\n"),
++       jcr->JobId, jcr->Job);
+ 
+   if (!jcr->accurate) {
+     Jmsg(jcr, M_WARNING, 0,
+@@ -192,46 +242,53 @@ bool DoNativeVbackup(JobControlRecord* jcr)
+            "backup.\n"));
+   }
+ 
+-  // See if we already got a list of jobids to use.
+-  if (jcr->impl->vf_jobids) {
+-    Dmsg1(10, "jobids=%s\n", jcr->impl->vf_jobids);
+-    jobids = strdup(jcr->impl->vf_jobids);
++  std::string jobids = GetVfJobids(*jcr);
++  std::vector<std::string> jobid_list = split_string(jobids, ',');
++  if (jobid_list.empty()) {
++    Jmsg(jcr, M_FATAL, 0, _("No previous Jobs found.\n"));
++    return false;
++  }
+ 
+-  } else {
+-    db_list_ctx jobids_ctx;
+-    jcr->db->AccurateGetJobids(jcr, &jcr->impl->jr, &jobids_ctx);
+-    Dmsg1(10, "consolidate candidates:  %s.\n",
+-          jobids_ctx.GetAsString().c_str());
++  using namespace std::string_literals;
++  JobConsistencyChecker cc;
++  std::string query = "SELECT JobId, Type, ClientId, FilesetId, PurgedFiles "s
++                      + "FROM Job WHERE JobId IN ("s + jobids + ")"s;
+ 
+-    if (jobids_ctx.empty()) {
+-      Jmsg(jcr, M_FATAL, 0, _("No previous Jobs found.\n"));
+-      return false;
+-    }
++  jcr->db->SqlQuery(que

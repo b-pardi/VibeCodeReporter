@@ -1,0 +1,109 @@
+@@ -398,6 +398,16 @@ class TableType : public IndexType
+ public:
+ 	TableType(TypeListPtr ind, TypePtr yield);
+ 
++	// Used by script compilation to update a "stub" table type
++	// (which is specified by using a nil "ind" value in the constructor)
++	// with its actual index & yield - necessary for dealing with
++	// recursive types.
++	void SetIndexAndYield(TypeListPtr ind, TypePtr yield)
++		{
++		ind = std::move(indices);
++		yield_type = std::move(yield);
++		}
++
+ 	/**
+ 	 * Assesses whether an &expire_func attribute's function type is compatible
+ 	 * with this table type.
+
+
+
+
+@@ -178,7 +178,6 @@ public:
+ 
+ 	// The same, for a single attribute.
+ 	std::shared_ptr<CPP_InitInfo> RegisterAttr(const AttrPtr& attr);
+-	int AttrOffset(const AttrPtr& attr) { return GI_Offset(RegisterAttr(attr)); }
+ 
+ 	// Returns a mapping of from Attr objects to their associated
+ 	// initialization information.  The Attr must have previously
+@@ -595,6 +594,10 @@ private:
+ 	// Maps function names to priorities, for hooks & event handlers.
+ 	std::unordered_map<std::string, int> body_priorities;
+ 
++	// Maps function names to script locations, for better-than-nothing
++	// error reporting.
++	std::unordered_map<std::string, const Location*> body_locs;
++
+ 	// Maps function names to events relevant to them.
+ 	std::unordered_map<std::string, std::vector<std::string>> body_events;
+ 
+
+
+
+
+@@ -103,6 +103,7 @@ void CPPCompile::CreateFunction(const FuncTypePtr& ft, const ProfileFunc* pf, co
+ 
+ 	body_hashes[fname] = pf->HashVal();
+ 	body_priorities[fname] = priority;
++	body_locs[fname] = body->GetLocationInfo();
+ 	body_names.emplace(body.get(), fname);
+ 	}
+ 
+@@ -136,13 +137,19 @@ void CPPCompile::DeclareSubclass(const FuncTypePtr& ft, const ProfileFunc* pf, c
+ 			}
+ 		}
+ 
+-	Emit("%s_cl(const char* name%s) : CPPStmt(name)%s { }", fname, addl_args, inits);
++	const Obj* stmts = pf->ProfiledBody();
++	if ( ! stmts )
++		stmts = pf->ProfiledExpr();
++
++	auto loc = stmts->GetLocationInfo();
++	auto loc_info = string("\"") + loc->filename + "\", " + Fmt(loc->first_line);
++	Emit("%s_cl(const char* name%s) : CPPStmt(name, %s)%s { }", fname, addl_args, loc_info, inits);
+ 
+ 	// An additional constructor just used to generate place-holder
+ 	// instances, due to the mis-design that lambdas are identified
+ 	// by their Func objects rather than their FuncVal objects.
+ 	if ( lambda_ids && lambda_ids->length() > 0 )
+-		Emit("%s_cl(const char* name) : CPPStmt(name) { }", fname);
++		Emit("%s_cl(const char* name) : CPPStmt(name, %s) { }", fname, loc_info);
+ 
+ 	Emit("ValPtr Exec(Frame* f, StmtFlowType& flow) override final");
+ 	StartBlock();
+@@ -178,7 +185,8 @@ void CPPCompile::DeclareDynCPPStmt()
+ 	Emit("class CPPDynStmt : public CPPStmt");
+ 	Emit("\t{");
+ 	Emit("public:");
+-	Emit("\tCPPDynStmt(const char* _name, void* _func, int _type_signature) : CPPStmt(_name), "
++	Emit("\tCPPDynStmt(const char* _name, void* _func, int _type_signature, const char* filename, "
++	     "int line_num) : CPPStmt(_name, filename, line_num), "
+ 	     "func(_func), type_signature(_type_signature) { }");
+ 	Emit("\tValPtr Exec(Frame* f, StmtFlowType& flow) override final;");
+ 	Emit("private:");
+
+
+
+
+@@ -274,9 +274,6 @@ shared_ptr<CPP_InitsInfo> CPPCompile::RegisterInitInfo(const char* tag, const ch
+ 
+ void CPPCompile::RegisterCompiledBody(const string& f)
+ 	{
+-	auto h = body_hashes[f];
+-	auto p = body_priorities[f];
+-
+ 	// Build up an initializer of the events relevant to the function.
+ 	string events;
+ 	auto be = body_events.find(f);
+@@ -293,8 +290,15 @@ void CPPCompile::RegisterCompiledBody(const string& f)
+ 	auto fi = func_index.find(f);
+ 	ASSERT(fi != func_index.end());
+ 	auto type_signature = casting_index[fi->second];
+-	Emit("\tCPP_RegisterBody(\"%s\", (void*) %s, %s, %s, %s, std::vector<std::string>(%s)),", f, f,
+-	     Fmt(type_signature), Fmt(p), Fmt(h), events);
++
++	auto h = body_hashes[f];
++	auto p = body_priorities[f];
++	auto loc = body_locs[f];
++	auto body_info = Fmt(p) + ", " + Fmt(h) + ", \"" + loc->filenam

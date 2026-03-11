@@ -1,0 +1,131 @@
+@@ -81,13 +81,11 @@ class NetworkInterface : public AlertableEntity {
+ 
+   /* Flows queues waiting to be dumped */
+   SPSCQueue<Flow *> *idleFlowsToDump, *activeFlowsToDump;
+-  u_int32_t idleFlowsToDump_drops, activeFlowsToDump_drops;
+ 
+   /* Queues for the execution of flow user scripts.
+      See scripts/plugins/examples/example/user_scripts/flow/example.lua for the callbacks
+    */
+   SPSCQueue<Flow *> *hookProtocolDetected, *hookPeriodicUpdate, *hookFlowEnd;
+-  u_int64_t hookProtocolDetected_drops, hookPeriodicUpdate_drops, hookFlowEnd_drops;
+ 
+   /*
+     Flag to indicate whether a flow JSON should be dumped along with the flow. Flow JSON contain
+@@ -539,6 +537,7 @@ class NetworkInterface : public AlertableEntity {
+ #endif
+   void lua_hash_tables_stats(lua_State* vm);
+   void lua_periodic_activities_stats(lua_State* vm);
++  virtual void lua_queues_stats(lua_State* vm);
+   void getnDPIProtocols(lua_State *vm, ndpi_protocol_category_t filter, bool skip_critical);
+ 
+   int getActiveHostsList(lua_State* vm,
+
+
+
+
+@@ -31,6 +31,7 @@
+ 
+ template <typename T> class SPSCQueue {
+  private:
++  char *name;
+   u_int64_t num_failed_enqueues; /* Counts the number of times the enqueue has failed (queue full) */
+   u_int64_t shadow_head;
+   volatile u_int64_t head;
+@@ -45,18 +46,19 @@ template <typename T> class SPSCQueue {
+    * Constructor
+    * @param size The queue size (rounded up to the next power of 2)
+    */
+-  SPSCQueue(u_int32_t size) {
++  SPSCQueue(u_int32_t size, const char * const _name) {
+     queue_size = Utils::pow2(size);
+     queue.reserve(queue_size);
+     tail = shadow_tail = queue_size-1;
+     head = shadow_head = 0;
+     num_failed_enqueues = 0;
++    name = strdup(_name ? _name : "");
+   }
+ 
+   /**
+    * Destructor
+    */
+-  ~SPSCQueue() { ; }
++  ~SPSCQueue() { if(name) free(name); }
+ 
+   /**
+    * Return true if there is at least one item in the queue
+@@ -126,6 +128,23 @@ template <typename T> class SPSCQueue {
+     return false; /* no room */
+   }
+ 
++  /**
++   * Return the number of failed enqueue attempts
++   */
++  inline u_int64_t get_num_failed_enqueues() const { return num_failed_enqueues; };
++
++  /**
++   * Writes queue stats in a table of the vm passed as parameter
++   */
++  inline void lua(lua_State *vm) const {
++    if(vm) {
++      lua_newtable(vm);
++      lua_push_uint64_table_entry(vm, "num_failed_enqueues", num_failed_enqueues);
++      lua_pushstring(vm, name ? name : "");
++      lua_insert(vm, -2);
++      lua_settable(vm, -3);
++    }
++  };
+ };
+ 
+ #endif /* _SPSC_QUEUE_H_ */
+
+
+
+
+@@ -91,6 +91,7 @@ class ViewInterface : public NetworkInterface {
+ 				u_int8_t l4_proto,
+ 				AddressTree *allowed_hosts) const;
+   void dumpFlowLoop();
++  virtual void lua_queues_stats(lua_State* vm);
+ };
+ 
+ #endif /* _VIEW_INTERFACE_H_ */
+
+
+
+
+@@ -299,12 +299,12 @@ using namespace std;
+ #include <radcli/radcli.h>
+ #endif
+ #include "Condvar.h"
+-#include "SPSCQueue.h"
+ #include "TimeseriesExporter.h"
+ #include "InfluxDBTimeseriesExporter.h"
+ #include "L4Stats.h"
+ #include "AlertsQueue.h"
+ #include "LuaEngine.h"
++#include "SPSCQueue.h"
+ #include "LuaReusableEngine.h"
+ #include "AlertCheckLuaEngine.h"
+ #include "FlowAlertCheckLuaEngine.h"
+
+
+
+
+@@ -49,8 +49,6 @@ NetworkInterface::NetworkInterface(const char *name,
+   init();
+   customIftype = custom_interface_type;
+   influxdb_ts_exporter = rrd_ts_exporter = NULL;
+-  idleFlowsToDump_drops = activeFlowsToDump_drops = 0;
+-  hookProtocolDetected_drops = hookPeriodicUpdate_drops = hookFlowEnd_drops = 0;
+   hooksEngine = NULL;
+   hooks_engine_reload = false;
+   hooks_engine_next_reload = 0;
+@@ -328,9 +326,9 @@ void NetworkInterface::init() {
+   /*
+     Initialize user-script queues
+   */
+-  hookProtocolDetected = new (std::nothrow) SPSCQueue<Flow *>(MAX_US_PROTOCOL_DETECTED_QUEUE_LEN);
+-  hookPeriodicUpdate   = new (std::nothrow) SPSCQueue<Flow *>(MAX_US_PERIODIC_UPDATE_QUEUE_LEN);
+-  hookFlowEnd          = new (std::nothrow) SPSCQueue<Flow *>(MAX_US_FLOW_END_QUEUE_LEN);
++  hookProtocolDetect

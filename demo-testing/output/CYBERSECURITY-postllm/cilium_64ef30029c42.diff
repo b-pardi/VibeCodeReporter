@@ -1,0 +1,122 @@
+@@ -114,7 +114,7 @@ encap_remap_v6_host_address(struct __ctx_buff *ctx __maybe_unused,
+ static __always_inline int
+ __encap_with_nodeid(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
+ 		    __u32 seclabel, __u32 dstid, __u32 vni __maybe_unused,
+-		    enum trace_reason ct_reason, __u32 monitor, __u32 *ifindex)
++		    enum trace_reason ct_reason, __u32 monitor, int *ifindex)
+ {
+ 	__u32 node_id;
+ 	int ret;
+@@ -143,7 +143,7 @@ __encap_and_redirect_with_nodeid(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
+ 				 __u32 seclabel, __u32 dstid, __u32 vni,
+ 				 const struct trace_ctx *trace)
+ {
+-	__u32 ifindex;
++	int ifindex;
+ 	int ret = 0;
+ 
+ #ifdef ENABLE_WIREGUARD
+@@ -202,7 +202,7 @@ __encap_and_redirect_lxc(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
+ 			 __u16 node_id __maybe_unused, __u32 seclabel,
+ 			 __u32 dstid, const struct trace_ctx *trace)
+ {
+-	__u32 ifindex __maybe_unused;
++	int ifindex __maybe_unused;
+ 	int ret __maybe_unused;
+ 
+ #ifdef ENABLE_IPSEC
+
+
+
+
+@@ -641,7 +641,7 @@ int tail_nodeport_nat_egress_ipv6(struct __ctx_buff *ctx)
+ 					  NOT_VTEP_DST,
+ 					  (enum trace_reason)CT_NEW,
+ 					  TRACE_PAYLOAD_LEN,
+-					  &fib_params.l.ifindex);
++					  (int *)&fib_params.l.ifindex);
+ 		if (IS_ERR(ret))
+ 			goto drop_err;
+ 
+@@ -900,28 +900,26 @@ nodeport_rev_dnat_fwd_ipv6(struct __ctx_buff *ctx, struct trace_ctx *trace)
+ 	return CTX_ACT_OK;
+ }
+ 
+-static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, __u32 *ifindex,
+-					    int *ext_err)
++static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, __s8 *ext_err)
+ {
++#ifdef ENABLE_NAT_46X64_GATEWAY
+ 	const bool nat_46x64_fib = nat46x64_cb_route(ctx);
+-	int ret, fib_ret, ret2, l4_off;
++#endif
++	int ret, ret2, l3_off = ETH_HLEN, l4_off;
++	struct csum_offset csum_off = {};
+ 	struct ipv6_ct_tuple tuple = {};
++	struct ct_state ct_state = {};
+ 	void *data, *data_end;
+ 	struct ipv6hdr *ip6;
+-	struct csum_offset csum_off = {};
+-	struct ct_state ct_state = {};
+-	struct bpf_fib_lookup fib_params = {};
+ 	__u32 monitor = 0;
+-	bool l2_hdr_required = true;
++	int ifindex;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+-
+ #ifdef ENABLE_NAT_46X64_GATEWAY
+ 	if (nat_46x64_fib)
+ 		goto skip_rev_dnat;
+ #endif
+-
+ 	ret = lb6_extract_tuple(ctx, ip6, &l4_off, &tuple);
+ 	if (ret < 0) {
+ 		if (ret == DROP_NO_SERVICE || ret == DROP_UNKNOWN_L4)
+@@ -936,19 +934,15 @@ static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, __u32 *ifind
+ 
+ 	ret = ct_lb_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off, CT_INGRESS,
+ 			    &ct_state, &monitor);
+-
+ 	if (ret == CT_REPLY && ct_state.node_port == 1 && ct_state.rev_nat_index != 0) {
+ 		ret2 = lb6_rev_nat(ctx, l4_off, &csum_off, ct_state.rev_nat_index,
+ 				   &tuple, REV_NAT_F_TUPLE_SADDR);
+ 		if (IS_ERR(ret2))
+ 			return ret2;
+-
+ 		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 			return DROP_INVALID;
+-
+ 		ctx_snat_done_set(ctx);
+-
+-		*ifindex = ct_state.ifindex;
++		ifindex = ct_state.ifindex;
+ #ifdef TUNNEL_MODE
+ 		{
+ 			union v6addr *dst = (union v6addr *)&ip6->daddr;
+@@ -960,68 +954,16 @@ static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, __u32 *ifind
+ 							   SECLABEL, info->sec_label,
+ 							   NOT_VTEP_DST,
+ 							   TRACE_REASON_CT_REPLY,
+-							   monitor, ifindex);
++							   monitor, &ifindex);
+ 			}
+ 		}
+ #endif
+ #ifdef ENABLE_NAT_46X64_GATEWAY
+ skip_rev_dnat:
+ #endif
+-		fib_params.family = AF_INET6;
+-		fib_params.ifindex = ctx_get_ifindex(ctx);
+-
+-		ipv6_addr_copy((union v6addr *)&fib_params.ipv6_src,
+-			       (union v6addr *)&ip6->saddr);
+-		ipv6_addr_copy((union v6addr *)&fib_params.ipv6_dst,
+-			       (union v6addr *)&ip6->daddr);
+-
+-		fib_ret = fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+-		/* See comment in rev_nodeport_lb4() on why we only set ifindex
+-		 * on successful fib_ret. In case no neighbor has been found, we
+-		 * still take the fib_params.ifindex for the NAT46x64 case since
+-		 * ct_state.ifindex is not set in this case a

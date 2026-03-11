@@ -1,0 +1,111 @@
+@@ -62,15 +62,21 @@ class MySQLDB : public DB {
+   char *escapeAphostrophes(const char *unescaped);
+   int flow2InsertValues(Flow *f, char *json, char *values_buf,
+                         size_t values_buf_len);
+-  int exec_sql_query(const char *sql, bool doReconnect = true,
++
++  virtual int exec_sql_query(const char *sql, bool doReconnect = true,
++                     bool ignoreErrors = false, bool doLock = true,
++                     db_result_row_callback *cb = NULL,
++                     void *cb_user_data = NULL);
++  int exec_sql_query_mysql(const char *sql, bool doReconnect = true,
+                      bool ignoreErrors = false, bool doLock = true,
+                      db_result_row_callback *cb = NULL,
+                      void *cb_user_data = NULL);
+-  int exec_sql_query(lua_State *vm, char *sql, bool limitRows,
++
++  virtual int exec_sql_query(lua_State *vm, char *sql, bool limitRows,
++                             bool wait_for_db_created);
++  int exec_sql_query_mysql(lua_State *vm, char *sql, bool limitRows,
+                      bool wait_for_db_created);
+-#if defined(NTOPNG_PRO) && defined(HAVE_CLICKHOUSE)
+-  int exec_sql_query_ch(lua_State *vm, char *sql, bool limitRows);
+-#endif
++
+   virtual bool startQueryLoop();
+   void shutdown();
+   int exec_single_query(lua_State *vm, char *sql);
+
+
+
+
+@@ -1002,13 +1002,21 @@ int MySQLDB::exec_single_query(lua_State *vm, char *sql) {
+ 
+ /* ******************************************* */
+ 
++int MySQLDB::exec_sql_query(const char *sql, bool doReconnect,
++                            bool ignoreErrors, bool doLock,
++                            db_result_row_callback *cb, void *cb_user_data) {
++  return exec_sql_query_mysql(sql, doReconnect, ignoreErrors, doLock, cb, cb_user_data);
++}
++
++/* ******************************************* */
++
+ /*
+   Locking is necessary when multiple queries are executed
+   simultaneously (e.g. via Lua)
+ */
+-int MySQLDB::exec_sql_query(const char *sql, bool doReconnect,
+-                            bool ignoreErrors, bool doLock,
+-                            db_result_row_callback *cb, void *cb_user_data) {
++int MySQLDB::exec_sql_query_mysql(const char *sql, bool doReconnect,
++                                  bool ignoreErrors, bool doLock,
++                                  db_result_row_callback *cb, void *cb_user_data) {
+   MYSQL *conn = &mysql;
+   MYSQL_RES *result;
+   struct timeval begin, end;
+@@ -1106,260 +1114,17 @@ int MySQLDB::exec_sql_query(const char *sql, bool doReconnect,
+ 
+   return (rc);
+ }
+-
+-/* ******************************************* */
+-
+-#if defined(NTOPNG_PRO) && defined(HAVE_CLICKHOUSE) && defined(HAVE_CLICKHOUSE_LIB)
+-
+-std::string uuid_to_string_ch(const std::pair<uint64_t, uint64_t>& uuid) {
+-    uint8_t bytes[16];
+-    std::memcpy(bytes, &uuid.first, 8);
+-    std::memcpy(bytes + 8, &uuid.second, 8);
+-
+-    std::ostringstream ss;
+-    ss << std::hex << std::setfill('0');
+-    for (int i = 0; i < 16; ++i) {
+-        ss << std::setw(2) << static_cast<int>(bytes[i]);
+-        if (i == 3 || i == 5 || i == 7 || i == 9) ss << "-";
+-    }
+-    return ss.str();
+-}
+-
+-/* ******************************************* */
+-
+-void result_to_lua_ch(lua_State *vm, const Block& block, bool limitRows, int& count) {
+-  size_t rows = block.GetRowCount();
+-  size_t cols = block.GetColumnCount();
+-  bool log_records = false;
+-
+-  if (count >= MYSQL_MAX_NUM_ROWS)
+-    return;
+-
+-  if (count + rows > MYSQL_MAX_NUM_ROWS) {
+-    static bool warning_shown = false;
+-    if (!warning_shown) {
+-      ntop->getTrace()->traceEvent(TRACE_WARNING,
+-            "Too many results returned from ClickHouse, reduce query result set");
+-      warning_shown = true;
+-    }
+-
+-    if (limitRows) rows = MYSQL_MAX_NUM_ROWS - count;
+-  }
+-
+-  for (size_t i = 0; i < rows; ++i) {
+-
+-    lua_newtable(vm);
+-
+-    if (log_records) {
+-      std::cout << "#" << i << " ";
+-    }
+-
+-    for (size_t j = 0; j < cols; ++j) {
+-      auto col = block[j];
+-      std::string value;

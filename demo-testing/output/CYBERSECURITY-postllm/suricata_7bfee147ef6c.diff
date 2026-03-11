@@ -1,0 +1,118 @@
+@@ -634,6 +634,10 @@ const struct DecodeEvents_ DEvents[] = {
+             "stream.3whs_syn_toclient_on_syn_recv",
+             STREAM_3WHS_SYN_TOCLIENT_ON_SYN_RECV,
+     },
++    {
++            "stream.3whs_syn_flood",
++            STREAM_3WHS_SYN_FLOOD,
++    },
+     {
+             "stream.3whs_wrong_seq_wrong_ack",
+             STREAM_3WHS_WRONG_SEQ_WRONG_ACK,
+
+
+
+
+@@ -235,6 +235,7 @@ enum {
+     STREAM_3WHS_SYNACK_FLOOD,
+     STREAM_3WHS_SYN_RESEND_DIFF_SEQ_ON_SYN_RECV,
+     STREAM_3WHS_SYN_TOCLIENT_ON_SYN_RECV,
++    STREAM_3WHS_SYN_FLOOD,
+     STREAM_3WHS_WRONG_SEQ_WRONG_ACK,
+     STREAM_3WHS_ACK_DATA_INJECT,
+     STREAM_4WHS_SYNACK_WITH_WRONG_ACK,
+
+
+
+
+@@ -31,7 +31,7 @@
+ #define STREAMTCP_QUEUE_FLAG_WS     0x02
+ #define STREAMTCP_QUEUE_FLAG_SACK   0x04
+ 
+-/** currently only SYN/ACK */
++/** Tracking SYNs and SYN/ACKs */
+ typedef struct TcpStateQueue_ {
+     uint8_t flags;
+     uint8_t wscale;
+
+
+
+
+@@ -1540,155 +1540,190 @@ static inline bool StateSynSentValidateTimestamp(TcpSession *ssn, Packet *p)
+     return true;
+ }
+ 
+-/**
+- *  \brief  Function to handle the TCP_SYN_SENT state. The function handles
+- *          SYN, SYN/ACK, RST packets and correspondingly changes the connection
+- *          state.
+- *
+- *  \param  tv      Thread Variable containing  input/output queue, cpu affinity
+- *  \param  p       Packet which has to be handled in this TCP state.
+- *  \param  stt     Strean Thread module registered to handle the stream handling
+- */
+-
+-static int StreamTcpPacketStateSynSent(
+-        ThreadVars *tv, Packet *p, StreamTcpThread *stt, TcpSession *ssn)
++static void TcpStateQueueInitFromSsnSyn(const TcpSession *ssn, TcpStateQueue *q)
+ {
+-    DEBUG_VALIDATE_BUG_ON(ssn == NULL);
++    BUG_ON(ssn->state != TCP_SYN_SENT); // TODO
++    memset(q, 0, sizeof(*q));
+ 
+-    SCLogDebug("ssn %p: pkt received: %s", ssn, PKT_IS_TOCLIENT(p) ?
+-               "toclient":"toserver");
++    /* SYN won't use wscale yet. So window should be limited to 16 bits. */
++    DEBUG_VALIDATE_BUG_ON(ssn->server.window > UINT16_MAX);
++    q->win = (uint16_t)ssn->server.window;
+ 
+-    /* check for bad responses */
+-    if (StateSynSentValidateTimestamp(ssn, p) == false) {
+-        StreamTcpSetEvent(p, STREAM_PKT_INVALID_TIMESTAMP);
+-        return -1;
++    q->pkt_ts = ssn->client.last_pkt_ts;
++
++    if (ssn->flags & STREAMTCP_FLAG_CLIENT_SACKOK) {
++        q->flags |= STREAMTCP_QUEUE_FLAG_SACK;
++    }
++    if (ssn->flags & STREAMTCP_FLAG_SERVER_WSCALE) {
++        q->flags |= STREAMTCP_QUEUE_FLAG_WS;
++        q->wscale = ssn->server.wscale;
++    }
++    if (ssn->client.flags & STREAMTCP_STREAM_FLAG_TIMESTAMP) {
++        q->flags |= STREAMTCP_QUEUE_FLAG_TS;
++        q->ts = ssn->client.last_ts;
+     }
+ 
+-    /* RST */
+-    if (p->tcph->th_flags & TH_RST) {
+-        if (!StreamTcpValidateRst(ssn, p))
+-            return -1;
++    SCLogDebug("ssn %p: state:%p, isn:%u/win:%u/has_ts:%s/tsval:%u", ssn, q, q->seq, q->win,
++            BOOL2STR(q->flags & STREAMTCP_QUEUE_FLAG_TS), q->ts);
++}
+ 
+-        if (PKT_IS_TOSERVER(p)) {
+-            if (SEQ_EQ(TCP_GET_SEQ(p), ssn->client.isn) &&
+-                    SEQ_EQ(TCP_GET_WINDOW(p), 0) &&
+-                    SEQ_EQ(TCP_GET_ACK(p), (ssn->client.isn + 1)))
+-            {
+-                SCLogDebug("ssn->server.flags |= STREAMTCP_STREAM_FLAG_RST_RECV");
+-                ssn->server.flags |= STREAMTCP_STREAM_FLAG_RST_RECV;
+-                StreamTcpCloseSsnWithReset(p, ssn);
+-            }
+-        } else {
+-            ssn->client.flags |= STREAMTCP_STREAM_FLAG_RST_RECV;
+-            SCLogDebug("ssn->client.flags |= STREAMTCP_STREAM_FLAG_RST_RECV");
+-            StreamTcpCloseSsnWithReset(p, ssn);
+-        }
++static void TcpStateQueueInitFromPktSyn(const Packet *p, TcpStateQueue *q)
++{
++#if defined(DEBUG_VALIDATION) || defined(DEBUG)
++    const TcpSession *ssn = p->flow->protoctx;
++    BUG_ON(ssn->state != TCP_SYN_SENT);
++#endif
++    memset(q, 0, sizeof(*q));
+ 
+-    /* FIN */
+-    } else if (p->tcph->th_flags & TH_FIN)

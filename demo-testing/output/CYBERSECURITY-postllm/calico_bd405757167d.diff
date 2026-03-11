@@ -1,0 +1,121 @@
+@@ -1,5 +1,5 @@
+ // Project Calico BPF dataplane programs.
+-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
++// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ 
+ #ifndef __CALI_BPF_H__
+@@ -321,6 +321,7 @@ extern const volatile struct cali_tc_preamble_globals __globals;
+ #define NATIN_IFACE	CALI_CONFIGURABLE(natin_idx)
+ #define PROFILING	CALI_CONFIGURABLE(profiling)
+ #define OVERLAY_TUNNEL_ID CALI_CONFIGURABLE(overlay_tunnel_id)
++#define EGRESS_DSCP CALI_CONFIGURABLE(dscp)
+ 
+ #define FLOWLOGS_ENABLED (GLOBAL_FLAGS & CALI_GLOBALS_FLOWLOGS_ENABLED)
+ #define INGRESS_PACKET_RATE_CONFIGURED (GLOBAL_FLAGS & CALI_GLOBALS_INGRESS_PACKET_RATE_CONFIGURED)
+
+
+
+
+@@ -26,6 +26,7 @@ struct name {                              \
+ 	__u8 iface_name[16];                   \
+ 	__u32 log_filter_jmp;                  \
+ 	__u32 jumps[40];                       \
++	__s8 dscp;                             \
+ }
+ 
+ DECLARE_TC_GLOBAL_DATA(cali_tc_global_data, ipv6_addr_t);
+
+
+
+
+@@ -6,6 +6,7 @@
+ #define __CALI_QOS_H__
+ 
+ #include "bpf.h"
++#include "skb.h"
+ #include "counters.h"
+ #include "ifstate.h"
+ 
+@@ -107,4 +108,39 @@ static CALI_BPF_INLINE int qos_enforce_packet_rate(struct cali_tc_ctx *ctx)
+ 	return TC_ACT_SHOT;
+ }
+ 
++static CALI_BPF_INLINE bool qos_set_dscp(struct cali_tc_ctx *ctx)
++{
++	// TODO (mazdak): set DSCP only if traffic is leaving cluster
++	__s8 dscp = EGRESS_DSCP;
++	CALI_DEBUG("setting dscp to %d", dscp);
++
++#ifdef IPVER6
++	// In IPv6, traffic class (8bits) equals to DSCP (6bits) + ECN (2bits). The 4 most significant bits of
++	// traffic class are stored in IPv6 priority field (4 bits), and the 4 least significant bits of it
++	// are stored in the 4 most significant bits of IPv6 flow_lbl[0] field. We must not change ECN bits here.
++	ip_hdr(ctx)->priority = (__u8) (dscp >> 2);
++	ip_hdr(ctx)->flow_lbl[0] = (__u8) (ip_hdr(ctx)->flow_lbl[0] & 0x3f) | (dscp << 6);
++#else
++	// In IPv4, DSCP (6bits) is located at the most significant bits of IPv4 TOS field.
++	// The 2 least significant bits are assigned to ECN and must not be touched.
++	ip_hdr(ctx)->tos = (__u8) ((ip_hdr(ctx)->tos & 0x03) | (dscp << 2));
++
++	ip_hdr(ctx)->check = 0;
++	__wsum ip_csum = bpf_csum_diff(0, 0, (__u32 *)ip_hdr(ctx), sizeof(struct iphdr), 0);
++	int ret = bpf_l3_csum_replace(ctx->skb, skb_iphdr_offset(ctx) + offsetof(struct iphdr, check), 0, ip_csum, 0);
++	if (ret) {
++		CALI_DEBUG("IP DSCP: set L3 csum failed");
++		deny_reason(ctx, CALI_REASON_CSUM_FAIL);
++		return false;
++	}
++
++	if (skb_refresh_validate_ptrs(ctx, UDP_SIZE)) {
++		CALI_DEBUG("Too short");
++		deny_reason(ctx, CALI_REASON_SHORT);
++		return false;
++	}
++#endif /* IPVER6 */
++	return true;
++}
++
+ #endif /* __CALI_QOS_H__ */
+
+
+
+
+@@ -1327,6 +1327,9 @@ int calico_tc_skb_accepted_entrypoint(struct __sk_buff *skb)
+ 		deny_reason(ctx, CALI_REASON_DROPPED_BY_QOS);
+ 		goto deny;
+ 	}
++	if ((CALI_F_FROM_WEP || CALI_F_TO_HEP) && EGRESS_DSCP >= 0 && !qos_set_dscp(ctx)) {
++		goto deny;
++	}
+ 	ctx->fwd = calico_tc_skb_accepted(ctx);
+ 	return forward_or_drop(ctx);
+ 
+
+
+
+
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
++// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+ //
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+@@ -277,7 +277,8 @@ void bpf_tc_set_globals(struct bpf_map *map,
+ 			uint overlay_tunnel_id,
+ 			uint log_filter_jmp,
+ 			uint *jumps,
+-			uint *jumps6)
++			uint *jumps6,
++			short dscp)
+ {
+ 	struct cali_tc_global_data v4 = {
+ 		.tunnel_mtu = tmtu,
+@@ -292,6 +293,7 @@ void bpf_tc_set_globals(struct bpf_map *map,
+ 		.natout_idx = natout,
+ 		.overlay_tunnel_id = overlay_tunnel_id,
+ 		.log_filter_jmp = log_filter_jmp,
++		.dscp = dscp,
+ 	};
+ 
+ 	strncpy(v4.iface_name, iface_name, sizeof(v4.iface_name));

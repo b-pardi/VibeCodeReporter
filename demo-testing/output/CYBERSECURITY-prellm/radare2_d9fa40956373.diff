@@ -1,0 +1,135 @@
+@@ -582,6 +582,8 @@ R_API int r_debug_detach(RDebug *dbg, int pid) {
+ }
+ 
+ R_API bool r_debug_select(RDebug *dbg, int pid, int tid) {
++	ut64 pc = 0;
++
+ 	if (pid < 0) {
+ 		return false;
+ 	}
+@@ -610,7 +612,16 @@ R_API bool r_debug_select(RDebug *dbg, int pid, int tid) {
+ 	dbg->pid = pid;
+ 	dbg->tid = tid;
+ 
+-	r_debug_reg_sync (dbg, R_REG_TYPE_GPR, false);
++	// Synchronize with the current thread's data
++	if (dbg->corebind.core) {
++		RCore *core = (RCore *)dbg->corebind.core;
++
++		r_reg_arena_swap (core->dbg->reg, true);
++		r_debug_reg_sync (dbg, R_REG_TYPE_ALL, false);
++
++		pc = r_debug_reg_get (dbg, "PC");
++		core->offset = pc;
++	}
+ 
+ 	return true;
+ }
+
+
+
+
+@@ -187,11 +187,13 @@ static int r_debug_native_detach (RDebug *dbg, int pid) {
+ #endif
+ }
+ 
++static int r_debug_native_select(RDebug *dbg, int pid, int tid) {
+ #if __WINDOWS__
+-static int r_debug_native_select (RDebug *dbg, int pid, int tid) {
+ 	return w32_select (dbg, pid, tid);
+-}
++#elif __linux__
++	return linux_select_thread (dbg, pid, tid);
+ #endif
++}
+ 
+ static int r_debug_native_continue_syscall (RDebug *dbg, int pid, int num) {
+ // XXX: num is ignored
+@@ -2112,7 +2114,7 @@ RDebugPlugin r_debug_plugin_native = {
+ 	.attach = &r_debug_native_attach,
+ 	.detach = &r_debug_native_detach,
+ // TODO: add native select for other platforms?
+-#if __WINDOWS__
++#if __WINDOWS__ || __linux__
+ 	.select = &r_debug_native_select,
+ #endif
+ 	.pids = &r_debug_native_pids,
+
+
+
+
+@@ -61,8 +61,9 @@ static void linux_add_and_attach_new_thread (RDebug *dbg, int tid);
+ static int linux_stop_process(int pid);
+ 
+ int linux_handle_signals (RDebug *dbg) {
++	int pid = dbg->tid;
+ 	siginfo_t siginfo = { 0 };
+-	int ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, dbg->pid, 0, (r_ptrace_data_t)(size_t)&siginfo);
++	int ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, pid, 0, (r_ptrace_data_t)(size_t)&siginfo);
+ 	if (ret == -1) {
+ 		/* ESRCH means the process already went away :-/ */
+ 		if (errno == ESRCH) {
+@@ -212,8 +213,9 @@ RDebugReasonType linux_ptrace_event (RDebug *dbg, int pid, int status) {
+ 
+ int linux_step(RDebug *dbg) {
+ 	int ret = false;
++	int pid = dbg->tid;
+ 	ut64 addr = r_debug_reg_get (dbg, "PC");
+-	ret = r_debug_ptrace (dbg, PTRACE_SINGLESTEP, dbg->pid, (void*)(size_t)addr, 0);
++	ret = r_debug_ptrace (dbg, PTRACE_SINGLESTEP, pid, (void*)(size_t)addr, 0);
+ 	//XXX(jjd): why?? //linux_handle_signals (dbg);
+ 	if (ret == -1) {
+ 		perror ("native-singlestep");
+@@ -284,6 +286,10 @@ static void linux_remove_thread (RDebug *dbg, int pid) {
+ 	}
+ }
+ 
++bool linux_select_thread(RDebug *dbg, int pid, int tid) {
++	return linux_attach (dbg, tid);
++}
++
+ void linux_attach_new_process (RDebug *dbg) {
+ 	linux_detach_all (dbg);
+ 
+@@ -301,7 +307,7 @@ void linux_attach_new_process (RDebug *dbg) {
+ 
+ RDebugReasonType linux_dbg_wait(RDebug *dbg, int my_pid) {
+ 	RDebugReasonType reason = R_DEBUG_REASON_UNKNOWN;
+-	int pid = (dbg->continue_all_threads && dbg->n_threads) ? -1 : dbg->main_pid;
++	int pid = dbg->tid;
+ 	int status, flags = __WALL;
+ 
+ 	if (pid == -1) {
+@@ -410,7 +416,7 @@ static int linux_stop_process(int pid) {
+ }
+ 
+ static bool linux_attach_single_pid(RDebug *dbg, int ptid) {
+-	siginfo_t sig = {0};
++	siginfo_t sig = { 0 };
+ 	// Safely check if the PID has already been attached to avoid printing errors.
+ 	// Attaching to a process that has already been started with PTRACE_TRACEME.
+ 	// sets errno to "Operation not permitted" which may be misleading.
+@@ -422,10 +428,10 @@ static bool linux_attach_single_pid(RDebug *dbg, int ptid) {
+ 			perror ("ptrace (PT_ATTACH)");
+ 			return false;
+ 		}
+-	}
+ 
+-	if (!linux_set_options (dbg, ptid)) {
+-		return false;
++		if (!linux_set_options (dbg, ptid)) {
++			return false;
++		}
+ 	}
+ 
+ 	return true;
+@@ -778,7 +784,7 @@ void print_fpu (void *f){
+ 
+ int linux_reg_read(RDebug *dbg, int type, ut8 *buf, int size) {
+ 	bool showfpu = false;
+-	int pid = dbg->pid;
++	int pid = dbg->tid;
+ 	int ret;
+ 	if (type < -1) {
+ 		showfpu = true;
+@@ -910,6 +916,8 @@ int linux_reg_read(RDebug *dbg, int 

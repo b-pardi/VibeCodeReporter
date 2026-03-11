@@ -1,0 +1,84 @@
+@@ -3,6 +3,7 @@ Get information about the GLibc
+ """
+ 
+ import functools
++import os
+ import re
+ 
+ import gdb
+@@ -60,16 +61,14 @@ def _get_version():
+ @pwndbg.lib.memoize.reset_on_start
+ @pwndbg.lib.memoize.reset_on_objfile
+ def get_got_plt_address():
+-    libc_filename = next(
+-        (
+-            objfile.filename
+-            for objfile in gdb.objfiles()
+-            if re.search(r"^libc(\.|-.+\.)so", objfile.filename.split("/")[-1])
+-        ),
+-        None,
+-    )
+-    if libc_filename:
+-        for line in pwndbg.gdblib.info.files().splitlines():
++    # Try every possible object file, to find which one has `.got.plt` section showed in `info files`
++    for libc_filename in (
++        objfile.filename
++        for objfile in gdb.objfiles()
++        if re.search(r"^libc(\.|-.+\.)so", os.path.basename(objfile.filename))
++    ):
++        out = pwndbg.gdblib.info.files()
++        for line in out.splitlines():
+             if libc_filename in line and ".got.plt" in line:
+                 return int(line.strip().split()[0], 16)
+     return 0
+
+
+
+
+@@ -1086,15 +1086,12 @@ class HeuristicHeap(Heap):
+                                 found = True
+                                 break
+                             tmp_arena = self.malloc_state(tmp_next)
+-                            try:
++                            if (
++                                pwndbg.gdblib.vmmap.find(tmp_arena.get_field_address("next"))
++                                is not None
++                            ):
+                                 tmp_next = int(tmp_arena["next"])
+-                            except (gdb.MemoryError, gdb.error, OverflowError):
+-                                # Since we are just guessing the correct address by reading every possible address, it has high possibility to get the following errors when reading an invalid address:
+-                                # 1) If we try to read unmapped memory, we will get `gdb.MemoryError`
+-                                # 2) `tmp_arena["next"]` will try to use `gdb.Value(tmp_next+offset)` during `pwndbg.gdblib.memory.poi`, but if `tmp_next+offset` >= 2 ** 64 which is too big for GDB, it will raise `OverflowError: int too big to convert`
+-                                # 3) Since GDB's Python API is buggy sometimes, to catch some weird things we missed, we also catch the `gdb.error` here :)
+-                                # (So `gdb.error` is not necessary, this can be removed if we are sure the above first two cases can cover all possible errors)
+-
++                            else:
+                                 # if `&tmp_arena->next` is not valid, the linked list is broken, break this while loop and try `addr+pwndbg.gdblib.arch.ptrsize` again
+                                 break
+                         if found:
+@@ -1514,7 +1511,7 @@ class HeuristicHeap(Heap):
+ 
+     @property
+     def mp(self):
+-        mp_via_config = int(str(pwndbg.gdblib.config.mp_), 0)
++        mp_via_config = int(str(pwndbg.gdblib.config.mp), 0)
+         mp_via_symbol = pwndbg.gdblib.symbol.static_linkage_symbol_address(
+             "mp_"
+         ) or pwndbg.gdblib.symbol.address("mp_")
+@@ -1634,24 +1631,28 @@ class HeuristicHeap(Heap):
+                 arena = self.main_arena
+             except SymbolUnresolvableError:
+                 arena = None
++            region = None
++            # Try to find heap region via `main_arena.top`
+             if self._main_arena_addr and arena:
+                 region = self.get_region(arena["top"])
+-            else:
+-                # If we can't find main_arena via heuristics, try to find it via vmmap
+-                region = next(p for p in pwndbg.gdblib.vmmap.get() if "heap]" in p.objfile)
+-            possible_sbrk_base = region.start
+-
+-            sbrk_offset = self.malloc_par(0).get_field_address("sbrk_base")
+-            # try to search sbrk_base in a part of libc page
+-            result = pwndbg.search.search(
+-                pwndbg.gdblib.arch.pack

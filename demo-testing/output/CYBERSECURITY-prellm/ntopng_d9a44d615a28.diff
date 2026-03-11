@@ -1,0 +1,105 @@
+@@ -54,8 +54,7 @@ class Flow : public GenericHashEntry {
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   u_int16_t alert_score;
+-  FlowStatus last_status;
+-  FlowStatusMap last_status_map;
++  FlowStatusMap last_notified_status_map;
+   struct ndpi_flow_struct *ndpiFlow;
+ 
+   /* When the interface isViewed(), the corresponding view needs to acknowledge the purge
+@@ -67,7 +66,7 @@ class Flow : public GenericHashEntry {
+     cli2srv_direction, twh_over, twh_ok, dissect_next_http_packet, passVerdict,
+     check_tor, l7_protocol_guessed, flow_alerted, flow_dropped_counts_increased,
+     good_low_flow_detected, good_ssl_hs, update_flow_port_stats,
+-    quota_exceeded, has_malicious_signature;
++    quota_exceeded, has_malicious_signature, lua_detection_notified;
+   u_int16_t diff_num_http_requests;
+ #ifdef NTOPNG_PRO
+   bool counted_in_aggregated_flow, status_counted_in_aggregated_flow;
+@@ -514,7 +513,7 @@ class Flow : public GenericHashEntry {
+ 
+   inline void setScore(u_int16_t score)    { alert_score = score; };
+   inline u_int16_t getScore()              { return(alert_score); };
+-  bool shouldRecheckScore();
++  const char* getLuaCallback();
+ 
+ #ifdef HAVE_NEDGE
+   inline void setLastConntrackUpdate(u_int32_t when) { last_conntrack_update = when; }
+
+
+
+
+@@ -48,9 +48,7 @@ Flow::Flow(NetworkInterface *_iface,
+     flow_alerted = flow_dropped_counts_increased = false, vrfId = 0;
+     alert_score = CONST_NO_SCORE_SET;
+ 
+-  last_status = status_normal;  
+-  last_status_map = Utils::bitmapSet(0, last_status);
+-
++  last_notified_status_map = Utils::bitmapSet(0, last_status);
+   purge_acknowledged_mark = detection_completed = update_flow_port_stats = false;
+   ndpiDetectedProtocol = ndpiUnknownProtocol;
+   doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
+@@ -68,6 +66,7 @@ Flow::Flow(NetworkInterface *_iface,
+     dissect_next_http_packet = false,
+     check_tor = false, host_server_name = NULL, diff_num_http_requests = 0,
+     bt_hash = NULL, community_id_flow_hash = NULL;
++  lua_detection_notified = false;
+ 
+   src2dst_tcp_flags = 0, dst2src_tcp_flags = 0, last_update_time.tv_sec = 0, last_update_time.tv_usec = 0,
+     bytes_thpt = 0, goodput_bytes_thpt = 0, top_bytes_thpt = 0, top_pkts_thpt = 0;
+@@ -4246,22 +4245,35 @@ void Flow::dissectSSL(char *payload, u_int16_t payload_len) {
+ 
+ /* ***************************************************** */
+ 
+-bool Flow::shouldRecheckScore() {
++/* Returns NULL if no LUA callback should be called. Otherwise returns the name
++ * of the flow.lua callback to call.
++ * See alerts_api.load_flow_check_modules() for an explanation.
++ */
++const char* Flow::getLuaCallback() {
+   FlowStatusMap status_map;
+-  FlowStatus status = getFlowStatus(&status_map);
++  getFlowStatus(&status_map);
+ 
+-  if(status_map != last_status_map) {
+-    last_status = status;
+-    last_status_map = status_map;
++  if(isDetectionCompleted()) {
++    const char *lua_callback = NULL;
++    bool update_status = false;
+ 
+-    if(cli_host) cli_host->setAnomalousFlowsStatusMap(status_map, true);
+-    if(srv_host) srv_host->setAnomalousFlowsStatusMap(status_map, false);
++    if(!lua_detection_notified) {
++      lua_detection_notified = true;
++      lua_callback = "protocolDetected";
++    } else if(status_map != last_notified_status_map)
++      lua_callback = "statusChanged";
+ 
+-    return(true);
+-  }
++    if(status_map != last_notified_status_map) {
++      /* Update the hosts status */
++      if(cli_host) cli_host->setAnomalousFlowsStatusMap(status_map, true);
++      if(srv_host) srv_host->setAnomalousFlowsStatusMap(status_map, false);
+ 
+-  if(isDetectionCompleted() && (alert_score != CONST_NO_SCORE_SET))
+-    return(true);
++      last_notified_status_map = status_map;
++    }
++
++    return lua_callback;
++  }
+ 
+-  return(false);
++  /* Nothing to call */
++  return(NULL);
+ }
+
+
+
+
+@@ -7737,12 +7737,13 @@ void NetworkInterface::checkInterfaceAlerts(ScriptPeriodicity p) {
+ static bool flow_ch

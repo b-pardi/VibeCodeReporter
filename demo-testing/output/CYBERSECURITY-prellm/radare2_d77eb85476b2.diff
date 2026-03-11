@@ -1,0 +1,152 @@
+@@ -225,34 +225,36 @@ static size_t consume_limits_r(RBuffer *b, ut64 bound, struct r_bin_wasm_resizab
+ }
+ 
+ // Utils
+-static RList *r_bin_wasm_get_sections_by_id(RList *sections, ut8 id) {
+-	RList *ret = r_list_newf (NULL);
+-	if (ret) {
+-		RBinWasmSection *sec;
+-		RListIter *iter;
+-		r_list_foreach (sections, iter, sec) {
+-			if (sec->id == id) {
+-				r_list_append (ret, sec);
++#define CUST_NAME_START "\x04name"
++#define CUST_NAME_START_LEN sizeof CUST_NAME_START - 1
++static inline RBinWasmSection *sections_first_custom_name(RBinWasmObj *bin) {
++	RBuffer *buf = bin->buf;
++	RListIter *iter;
++	RBinWasmSection *sec;
++	r_list_foreach (bin->g_sections, iter, sec) {
++		if (sec->id == R_BIN_WASM_SECTION_CUSTOM && sec->size > 6) {
++			ut8 _tmp[CUST_NAME_START_LEN] = {0};
++			if (r_buf_read_at (buf, sec->offset, _tmp, CUST_NAME_START_LEN) > 0) {
++				if (!memcmp (CUST_NAME_START, _tmp, CUST_NAME_START_LEN)) {
++					return sec;
++				}
+ 			}
+ 		}
+ 	}
+-	return ret;
++	return NULL;
+ }
++#undef CUST_NAME_START
++#undef CUST_NAME_START_LEN
+ 
+-static RBinWasmSection *section_by_id_unique(RList *sections, ut8 id) {
+-	RList *l = r_bin_wasm_get_sections_by_id (sections, id);
+-	RBinWasmSection *sec = NULL;
+-	if (l) {
+-		int len = r_list_length (l);
+-		if (len) {
+-			sec = r_list_first (l);
+-			if (sec && len > 1) {
+-				eprintf ("[wasm] Using first %s section of %d\n", sec->name, len);
+-			}
++static inline RBinWasmSection *section_first_with_id(RList *sections, ut8 id) {
++	RBinWasmSection *sec;
++	RListIter *iter;
++	r_list_foreach (sections, iter, sec) {
++		if (sec->id == id) {
++			return sec;
+ 		}
+ 	}
+-	r_list_free (l);
+-	return sec;
++	return NULL;
+ }
+ 
+ const char *r_bin_wasm_valuetype_to_string (r_bin_wasm_value_type_t type) {
+@@ -384,42 +386,30 @@ static void wasm_sec_free(RBinWasmSection *sec) {
+ 	}
+ }
+ 
+-static void wasm_custom_name_local_free(RBinWasmCustomNameLocalName *name) {
+-	if (name) {
+-		r_id_storage_free (name->names);
+-		R_FREE (name);
+-	}
++bool _store_free_cb(void *user, void *data, ut32 id) {
++	free (data);
++	return true;
+ }
+ 
+-static inline void wasm_custom_local_names_free(RBinWasmCustomNameLocalNames *local) {
+-	if (local) {
+-		r_list_free (local->locals);
+-		R_FREE (local);
++static inline void storage_deep_free(RIDStorage *store) {
++	if (store) {
++		r_id_storage_foreach (store, (RIDStorageForeachCb)_store_free_cb, NULL);
++		r_id_storage_free (store);
+ 	}
+ }
+ 
+-static void wasm_custom_name_free(RBinWasmCustomNameEntry *cust) {
+-	if (cust) {
+-		switch (cust->type) {
+-		case R_BIN_WASM_NAMETYPE_Module:
+-			R_FREE (cust->mod_name);
+-			break;
+-		case R_BIN_WASM_NAMETYPE_Function:
+-			if (cust->func) {
+-				r_id_storage_free (cust->func->names);
+-				R_FREE (cust->func);
+-			}
+-			break;
+-		case R_BIN_WASM_NAMETYPE_Local:
+-			wasm_custom_local_names_free (cust->local);
+-			break;
+-		case R_BIN_WASM_NAMETYPE_None:
+-			break;
+-		default:
+-			eprintf ("Unkown type: 0x%x\n", cust->type);
+-			r_warn_if_reached ();
+-		}
+-		R_FREE (cust);
++static bool _2d_store_free_cb(void *user, void *data, ut32 id) {
++	RIDStorage *store = (RIDStorage *)data;
++	storage_deep_free (store);
++	return true;
++}
++
++static inline void free_custom_names(RBinWasmCustomNames *names) {
++	if (names) {
++		free (names->mod.name);
++		storage_deep_free (names->funcs.store);
++		r_id_storage_foreach (names->locals.store, (RIDStorageForeachCb)_2d_store_free_cb, NULL);
++		free (names);
+ 	}
+ }
+ 
+@@ -649,136 +639,104 @@ beach:
+ 	return NULL;
+ }
+ 
+-static bool parse_namemap(RBuffer *b, ut64 bound, RIDStorage *map, ut32 *count) {
+-	size_t i;
+-	if (!consume_u32_r (b, bound, count)) {
+-		return false;
+-	}
+-
+-	for (i = 0; i < *count; i++) {
+-		ut32 idx;
+-		if (!consume_u32_r (b, bound, &idx)) {
+-			return false;
+-		}
+-
+-		char *name = NULL;
+-		if (!consume_encoded_name_new (b, bound, NULL, &name)) {
+-			R_FREE (name);
+-			return false;
+-		}
+-
+-		if (!r_id_storage_add (map, name, &idx)) {
+-			R_FREE (name);
+-			return false;
+-		};
+-	}
+-
+-	return true;
+-}
+-
+-static inline RBinWasmCu

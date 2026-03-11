@@ -1,0 +1,138 @@
+@@ -10,8 +10,8 @@ u8 CreateInvisibleSpriteWithCallback(void (*)(struct Sprite *));
+ void StoreWordInTwoHalfwords(u16 *, u32);
+ void LoadWordFromTwoHalfwords(u16 *, u32 *);
+ int CountTrailingZeroBits(u32 value);
+-u16 CalcCRC16(u8 *data, s32 length);
+-u16 CalcCRC16WithTable(u8 *data, u32 length);
++u16 CalcCRC16(const u8 *data, s32 length);
++u16 CalcCRC16WithTable(const u8 *data, u32 length);
+ u32 CalcByteArraySum(const u8* data, u32 length);
+ void BlendPalette(u16 palOffset, u16 numEntries, u8 coeff, u16 blendColor);
+ void DoBgAffineSet(struct BgAffineDstData *dest, u32 texX, u32 texY, s16 scrX, s16 scrY, s16 sx, s16 sy, u16 alpha);
+
+
+
+
+@@ -1 +1,211 @@
+ #include "global.h"
++#include "alloc.h"
++#include "decompress.h"
++#include "util.h"
++#include "link.h"
++#include "link_rfu.h"
++#include "overworld.h"
++#include "script.h"
++#include "battle_tower.h"
++#include "mystery_event_script.h"
++#include "mevent.h"
++#include "mevent_server_helpers.h"
++
++static u32 mevent_receive_func(struct mevent_srv_sub *);
++static u32 mevent_send_func(struct mevent_srv_sub *);
++
++u32 mevent_srv_sub_recv(struct mevent_srv_sub * svr)
++{
++    return svr->recvFunc(svr);
++}
++
++u32 mevent_srv_sub_send(struct mevent_srv_sub * svr)
++{
++    return svr->sendFunc(svr);
++}
++
++void mevent_srv_sub_init(struct mevent_srv_sub * svr, u32 sendPlayerNo, u32 recvPlayerNo)
++{
++    svr->sendPlayerNo = sendPlayerNo;
++    svr->recvPlayerNo = recvPlayerNo;
++    svr->seqno = 0;
++    svr->sendCRC = 0;
++    svr->sendSize = 0;
++    svr->sendCounter = 0;
++    svr->recvCRC = 0;
++    svr->recvSize = 0;
++    svr->recvCounter = 0;
++    svr->sendBfr = NULL;
++    svr->recvBfr = NULL;
++    svr->sendFunc = mevent_send_func;
++    svr->recvFunc = mevent_receive_func;
++}
++
++void mevent_srv_sub_init_send(struct mevent_srv_sub * svr, u32 ident, const void * src, u32 size)
++{
++    svr->seqno = 0;
++    svr->sendIdent = ident;
++    svr->sendCounter = 0;
++    svr->sendCRC = 0;
++    if (size != 0)
++        svr->sendSize = size;
++    else
++        svr->sendSize = ME_SEND_BUF_SIZE;
++    svr->sendBfr = src;
++}
++
++void mevent_srv_sub_init_recv(struct mevent_srv_sub * svr, u32 ident, void * dest)
++{
++    svr->seqno = 0;
++    svr->recvIdent = ident;
++    svr->recvCounter = 0;
++    svr->recvCRC = 0;
++    svr->recvSize = 0;
++    svr->recvBfr = dest;
++}
++
++static void mevent_recv_block(u32 recv_idx, void * dest, size_t size)
++{
++    memcpy(dest, gBlockRecvBuffer[recv_idx], size);
++}
++
++static bool32 mevent_has_received(u32 recv_idx)
++{
++    if ((GetBlockReceivedStatus() >> recv_idx) & 1)
++        return TRUE;
++    else
++        return FALSE;
++}
++
++static void mevent_reset_recv(u32 recv_idx)
++{
++    ResetBlockReceivedFlag(recv_idx);
++}
++
++static bool32 mevent_receive_func(struct mevent_srv_sub * svr)
++{
++    struct send_recv_header header;
++
++    switch (svr->seqno)
++    {
++        case 0:
++            if (mevent_has_received(svr->recvPlayerNo))
++            {
++                mevent_recv_block(svr->recvPlayerNo, &header, sizeof(header));
++                svr->recvSize = header.size;
++                svr->recvCRC = header.crc;
++                if (svr->recvSize > ME_SEND_BUF_SIZE)
++                {
++                    sub_8010198();
++                    return FALSE;
++                }
++                else if (svr->recvIdent != header.ident)
++                {
++                    sub_8010198();
++                    return FALSE;
++                }
++                else
++                {
++                    svr->recvCounter = 0;
++                    mevent_reset_recv(svr->recvPlayerNo);
++                    ++svr->seqno;
++                }
++            }
++            break;
++        case 1:
++            if (mevent_has_received(svr->recvPlayerNo))
++            {
++                size_t blocksiz = svr->recvCounter * 252;
++                if (svr->recvSize - blocksiz <= 252)
++                {
++                    mevent_recv_block(svr->recvPlayerNo, svr->recvBfr + blocksiz, svr->recvSize - blocksiz);
++       

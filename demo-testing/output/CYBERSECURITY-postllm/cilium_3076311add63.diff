@@ -1,0 +1,103 @@
+@@ -1553,12 +1553,10 @@ skip_host_firewall:
+ 		void *data, *data_end;
+ 		struct iphdr *ip4;
+ 		struct ipv4_ct_tuple tuple = {};
+-		struct ct_state ct_state = {};
+-		enum ct_status ct_status;
+-		bool has_l4_header = true;
+ 		int l4_off;
+ 		struct remote_endpoint_info *info;
+ 		struct endpoint_info *src_ep;
++		bool is_reply;
+ 
+ 		if (src_sec_identity == HOST_ID)
+ 			goto skip_egress_gateway;
+@@ -1580,7 +1578,7 @@ skip_host_firewall:
+ 
+ 		l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
+ 		ret = ct_extract_ports4(ctx, ip4, l4_off, CT_EGRESS, &tuple,
+-					&has_l4_header);
++					NULL);
+ 		if (IS_ERR(ret)) {
+ 			if (ret == DROP_CT_UNKNOWN_PROTO)
+ 				goto skip_egress_gateway;
+@@ -1588,16 +1586,10 @@ skip_host_firewall:
+ 			goto drop_err;
+ 		}
+ 
+-		__ipv4_ct_tuple_reverse(&tuple);
+-		ret = ct_lazy_lookup4(get_ct_map4(&tuple),
+-				      &tuple, ctx, ipv4_is_fragment(ip4),
+-				      l4_off, has_l4_header, CT_EGRESS,
+-				      SCOPE_FORWARD, CT_ENTRY_ANY,
+-				      &ct_state, &trace.monitor);
+-		if (IS_ERR(ret))
+-			goto drop_err;
+-
+-		ct_status = (enum ct_status)ret;
++		/* Only handle outbound connections: */
++		is_reply = ct_is_reply4(get_ct_map4(&tuple), &tuple);
++		if (is_reply)
++			goto skip_egress_gateway;
+ 
+ 		src_ep = __lookup_ip4_endpoint(ip4->saddr);
+ 		if (src_ep)
+@@ -1607,7 +1599,9 @@ skip_host_firewall:
+ 		if (info && info->sec_identity)
+ 			dst_sec_identity = info->sec_identity;
+ 
+-		ret = egress_gw_handle_packet(ctx, &tuple, ct_status,
++		/* lower-level code expects CT tuple to be flipped: */
++		__ipv4_ct_tuple_reverse(&tuple);
++		ret = egress_gw_handle_packet(ctx, &tuple,
+ 					      src_sec_identity, dst_sec_identity,
+ 					      &trace);
+ 		if (IS_ERR(ret))
+
+
+
+
+@@ -158,7 +158,6 @@ bool egress_gw_reply_matches_policy(struct iphdr *ip4 __maybe_unused)
+ 
+ /** Match a packet against EGW policy map, and return the gateway's IP.
+  * @arg rtuple		CT tuple for the packet
+- * @arg ct_status	CT result, to identify egressing connections
+  * @arg gateway_ip	returns the gateway node's IP
+  *
+  * Returns
+@@ -168,19 +167,8 @@ bool egress_gw_reply_matches_policy(struct iphdr *ip4 __maybe_unused)
+  */
+ static __always_inline int
+ egress_gw_request_needs_redirect_hook(struct ipv4_ct_tuple *rtuple,
+-				      enum ct_status ct_status,
+ 				      __be32 *gateway_ip)
+ {
+-	/* We lookup CT in forward direction at to-netdev and expect to
+-	 * get CT_ESTABLISHED for outbound connection as
+-	 * from_container should have already created a CT entry.
+-	 * If we get CT_NEW here, it's an indication that it's a reply
+-	 * for inbound connection or host-level outbound connection.
+-	 * We don't expect to receive any other ct_status here.
+-	 */
+-	if (ct_status != CT_ESTABLISHED)
+-		return CTX_ACT_OK;
+-
+ 	return egress_gw_request_needs_redirect(rtuple, gateway_ip);
+ }
+ 
+@@ -224,7 +212,6 @@ bool egress_gw_reply_needs_redirect_hook(struct iphdr *ip4, __u32 *tunnel_endpoi
+ static __always_inline
+ int egress_gw_handle_packet(struct __ctx_buff *ctx,
+ 			    struct ipv4_ct_tuple *tuple,
+-			    enum ct_status ct_status,
+ 			    __u32 src_sec_identity, __u32 dst_sec_identity,
+ 			    const struct trace_ctx *trace)
+ {
+@@ -240,7 +227,7 @@ int egress_gw_handle_packet(struct __ctx_buff *ctx,
+ 	if (identity_is_cluster(dst_sec_identity))
+ 		return CTX_ACT_OK;
+ 
+-	ret = egress_gw_request_needs_redirect_hook(tuple, ct_status, &gateway_ip);
++	ret = egress_gw_request_needs_redirect_hook(tuple, &gateway_ip);
+ 	if (IS_ERR(ret))
+ 		return ret;

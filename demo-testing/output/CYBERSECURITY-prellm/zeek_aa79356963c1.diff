@@ -1,0 +1,115 @@
+@@ -55,9 +55,9 @@ bool GTPv1_Analyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* pack
+ 	// but on the other hand we duplicate this work here. maybe this header could just be stored
+ 	// and reused in the IP analyzer somehow?
+ 	std::shared_ptr<IP_Hdr> inner = nullptr;
+-	int result = packet_analysis::IP::ParsePacket(len, data, next_header, inner);
++	auto result = packet_analysis::IP::ParsePacket(len, data, next_header, inner);
+ 
+-	if ( result == 0 )
++	if ( result == packet_analysis::IP::ParseResult::Ok )
+ 		{
+ 		cm_it->second->set_valid(packet->is_orig, true);
+ 
+@@ -72,13 +72,13 @@ bool GTPv1_Analyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* pack
+ 			gtp_hdr_val = nullptr;
+ 			}
+ 		}
+-	else if ( result == -2 )
++	else if ( result == packet_analysis::IP::ParseResult::BadProtocol )
+ 		{
+ 		AnalyzerViolation("Invalid IP version in wrapped packet", packet->session);
+ 		gtp_hdr_val = nullptr;
+ 		return false;
+ 		}
+-	else if ( result < 0 )
++	else if ( result == packet_analysis::IP::ParseResult::CaplenTooSmall )
+ 		{
+ 		AnalyzerViolation("Truncated GTPv1", packet->session);
+ 		gtp_hdr_val = nullptr;
+
+
+
+
+@@ -283,38 +283,38 @@ bool IPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet)
+ 	return return_val;
+ 	}
+ 
+-int zeek::packet_analysis::IP::ParsePacket(int caplen, const u_char* const pkt, int proto,
+-                                           std::shared_ptr<zeek::IP_Hdr>& inner)
++ParseResult zeek::packet_analysis::IP::ParsePacket(int caplen, const u_char* const pkt, int proto,
++                                                   std::shared_ptr<zeek::IP_Hdr>& inner)
+ 	{
+ 	if ( proto == IPPROTO_IPV6 )
+ 		{
+ 		if ( caplen < (int)sizeof(struct ip6_hdr) )
+-			return -1;
++			return ParseResult::CaplenTooSmall;
+ 
+ 		const struct ip6_hdr* ip6 = (const struct ip6_hdr*)pkt;
+ 		inner = std::make_shared<zeek::IP_Hdr>(ip6, false, caplen);
+ 		if ( (ip6->ip6_ctlun.ip6_un2_vfc & 0xF0) != 0x60 )
+-			return -2;
++			return ParseResult::BadProtocol;
+ 		}
+ 
+ 	else if ( proto == IPPROTO_IPV4 )
+ 		{
+ 		if ( caplen < (int)sizeof(struct ip) )
+-			return -1;
++			return ParseResult::BadProtocol;
+ 
+ 		const struct ip* ip4 = (const struct ip*)pkt;
+ 		inner = std::make_shared<zeek::IP_Hdr>(ip4, false);
+ 		if ( ip4->ip_v != 4 )
+-			return -2;
++			return ParseResult::BadProtocol;
+ 		}
+-
+ 	else
+ 		{
+-		return -2;
++		return ParseResult::BadProtocol;
+ 		}
+ 
+ 	if ( (uint32_t)caplen != inner->TotalLen() )
+-		return (uint32_t)caplen < inner->TotalLen() ? -1 : 1;
++		return (uint32_t)caplen < inner->TotalLen() ? ParseResult::CaplenTooSmall
++		                                            : ParseResult::CaplenTooLarge;
+ 
+-	return 0;
++	return ParseResult::Ok;
+ 	}
+
+
+
+
+@@ -35,6 +35,14 @@ private:
+ 	zeek::detail::Discarder* discarder = nullptr;
+ 	};
+ 
++enum class ParseResult
++	{
++	Ok = 0,
++	CaplenTooSmall = -1,
++	BadProtocol = -2,
++	CaplenTooLarge = 1
++	};
++
+ /**
+  * Returns a wrapper IP_Hdr object if \a pkt appears to be a valid IPv4
+  * or IPv6 header based on whether it's long enough to contain such a header,
+@@ -49,13 +57,17 @@ private:
+  * @param inner The inner IP packet wrapper pointer to be allocated/assigned
+  *        if \a pkt looks like a valid IP packet or at least long enough
+  *        to hold an IP header.
+- * @return 0 If the inner IP packet appeared valid, else -1 if \a caplen
+- *         is greater than the supposed IP packet's payload length field, -2
+- *         if the version of the inner header does not match proto or
+- *         1 if \a caplen is less than the supposed packet's payload length.
+- *         In the -1 case, \a inner may still be non-null if \a caplen was
+- *         long enough to be an IP header, and \a inner is always non-null
+- *         for other return values.
++ * @return ParseResult::Ok if the inner IP packet appeared valid.
++ *         ParseResult::CaplenTooSmall if \a caplen is greater than the
++ *         supposed packet's payload length field. \a inner may still be
++ *         non-null 

@@ -1,0 +1,171 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,2231 @@
++/* Capstone Disassembly Engine */
++/* By Yoshinori Sato, 2022 */
++
++#include <string.h>
++#include <stdarg.h>
++#include "../../cs_priv.h"
++#include "../../MCInst.h"
++#include "../../MCDisassembler.h"
++#include "../../capstone/utils.h"
++#include "SHDisassembler.h"
++
++#define regs_read(_detail, _reg)					\
++	if (_detail)							\
++		_detail->regs_read[_detail->regs_read_count++] = _reg
++#define regs_write(_detail, _reg)					\
++	if (_detail)							\
++		_detail->regs_write[_detail->regs_write_count++] = _reg
++
++enum direction {read, write};
++
++static void regs_rw(cs_detail *detail, enum direction rw, sh_reg reg)
++{
++	switch(rw) {
++	case read:
++		regs_read(detail, reg);
++		break;
++	case write:
++		regs_write(detail, reg);
++		break;
++	}
++}
++
++static void set_reg_n(sh_info *info, sh_reg reg, int pos,
++		      enum direction rw, cs_detail *detail)
++{
++	info->op.operands[pos].type = SH_OP_REG;
++	info->op.operands[pos].reg = reg;
++	regs_rw(detail, rw, reg);
++}
++
++static void set_reg(sh_info *info, sh_reg reg, enum direction rw,
++		    cs_detail *detail)
++{
++	set_reg_n(info, reg, info->op.op_count, rw, detail);
++	info->op.op_count++;
++}
++
++static void set_mem_n(sh_info *info, sh_op_mem_type address,
++		      sh_reg reg, uint32_t disp, int sz, int pos,
++		      cs_detail *detail)
++{
++	info->op.operands[pos].type = SH_OP_MEM;
++	info->op.operands[pos].mem.address = address;
++	info->op.operands[pos].mem.reg = reg;
++	info->op.operands[pos].mem.disp = disp;
++	if (sz > 0)
++		info->op.size = sz;
++	switch (address) {
++	case SH_OP_MEM_REG_POST:
++	case SH_OP_MEM_REG_PRE:
++		regs_write(detail, reg);
++		break;
++	case SH_OP_MEM_GBR_R0:
++		regs_read(detail, SH_REG_GBR);
++		regs_read(detail, SH_REG_R0);
++		break;
++	case SH_OP_MEM_REG_R0:
++		regs_read(detail, SH_REG_R0);
++		regs_read(detail, reg);
++		break;
++	case SH_OP_MEM_PCR:
++		break;
++	default:
++		regs_read(detail, reg);
++		break;
++	}
++}
++
++static void set_mem(sh_info *info, sh_op_mem_type address,
++		    sh_reg reg, uint32_t disp, int sz, cs_detail *detail)
++{
++	set_mem_n(info, address, reg, disp, sz, info->op.op_count, detail);
++	info->op.op_count++;
++}
++
++static void set_imm(sh_info *info, int sign, uint64_t imm)
++{
++	info->op.operands[info->op.op_count].type = SH_OP_IMM;
++	if (sign && imm >= 128)
++		imm = -256 + imm;
++	info->op.operands[info->op.op_count].imm = imm;
++	info->op.op_count++;
++}
++
++static void set_groups(cs_detail *detail, int n, ...)
++{
++	va_list g;
++	va_start(g, n);
++	while (n > 0) {
++		sh_insn_group grp;
++		grp = va_arg(g, sh_insn_group);
++		if (detail) {
++			detail->groups[detail->groups_count] = grp;
++			detail->groups_count++;
++		}
++		n--;
++	}
++	va_end(g);
++}
++
++enum {
++	ISA_ALL = 1,
++	ISA_SH2 = 2,
++	ISA_SH2A = 3,
++	ISA_SH3 = 4,
++	ISA_SH4 = 5,
++	ISA_SH4A = 6,
++	ISA_MAX = 7,
++};
++
++static int isalevel(cs_mode mode)
++{
++	int level;
++	mode >>= 1; /* skip endian */
++	for (level = 2; level < ISA_MAX; level++) {
++		if (mode & 1)
++			return level;
++		mode >>= 1;
++	}
++	return ISA_ALL;
++}
++
++enum co_processor {none, shfpu, shdsp};
++union reg_insn {
++	sh_reg reg;
++	sh_insn insn;
++};
++struct ri_list {
++	int no;
++	union reg_insn ri;
++	int level;
++	enum co_processor cp;
++};
++
++static const struct ri_list ldc_stc_regs[] = {
++		{0, SH_REG_SR, ISA_ALL, none},
++		{1, SH_REG_GBR, ISA_ALL, none},
++		{2, SH_REG_VBR, ISA_ALL, none},
++		{3, SH_REG_SSR, ISA_SH3, none},
++		{4, SH_REG_SPC, ISA_SH3, none},
++		{5, SH_REG_MOD, ISA_ALL, shdsp},
++		{6, SH_REG_RS, ISA_ALL, shdsp},
++		{7, SH_REG_RE, ISA_ALL, shdsp},
++		{8, SH_REG_R0_BANK, ISA_SH3, none},
++		{9, SH_REG_R1_BANK, ISA_SH3, none},
++		{10, SH_REG_R2_BANK, ISA_SH3, none},
++		{11, SH_REG_R3_BANK, ISA_SH3, none},
++		{12, SH_REG_R4_BANK, ISA_SH3, none},
++		{13, SH_REG_R5_BANK, ISA_SH3, none},
++		{14, SH_REG_R6_BANK, ISA_SH3, none},
++		{15, SH_REG_R7_BANK, ISA_SH3, none},
++		{-1, SH_REG_INVALID, ISA_ALL, none},
++};
++
++enum lookup_type {reg, insn};
++static union reg_insn lookup(enum lookup_type ri, const struct r

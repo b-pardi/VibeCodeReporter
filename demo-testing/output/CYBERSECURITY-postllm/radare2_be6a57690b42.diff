@@ -1,0 +1,84 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,560 @@
++/* radare - Copyright 2025 - pancake */
++
++#define R_LOG_ORIGIN "writedwarf"
++
++#include <r_core.h>
++
++typedef struct {
++	ut64 addr;
++	char *symbol;
++} SymEntry;
++
++typedef struct {
++	ut64 addr;
++	char *file;
++	int line;
++} LineEntry;
++
++// Create a Mach-O 64-bit object with minimal DWARF v2 debug info
++RBuffer *create_macho_with_dwarf(RList *lines, RList *symbols) {
++	RBuffer *buf = r_buf_new ();
++	if (!buf) {
++		return NULL;
++	}
++
++	// Macros for writing to RBuffer (little-endian)
++#define B(x,y)    r_buf_append_bytes (buf, (const ut8*)(x), (y))
++#define U8(x)     do { ut8 _v = (ut8)(x); r_buf_append_bytes (buf, &_v, 1); } while (0)
++#define U16(x)    r_buf_append_ut16 (buf, (ut16)(x))
++#define U32(x)    r_buf_append_ut32 (buf, (ut32)(x))
++#define U64(x)    do { ut64 _vv = (ut64)(x); r_buf_append_ut32 (buf, (ut32)_vv); r_buf_append_ut32 (buf, (ut32)(_vv >> 32)); } while (0)
++#define Z(n)      r_buf_append_nbytes (buf, (n))
++#define W(off, data, len)  r_buf_write_at (buf, (off), (const ut8*)(data), (len))
++
++	// Mach-O 64-bit Header (mach_header_64)
++	U32(0xFEEDFACF);                // magic MH_MAGIC_64 [oai_citation:0‡mikeash.com](https://www.mikeash.com/pyblog/friday-qa-2012-11-30-lets-build-a-mach-o-executable.html#:~:text=%2F,NXSwapInt%28MH_MAGIC_64%29)
++	U32(0x01000007);                // cputype (CPU_TYPE_X86_64 | CPU_ARCH_ABI64)
++	U32(0x80000003);                // cpusubtype (CPU_SUBTYPE_X86_64_ALL | CPU_SUBTYPE_LIB64)
++	U32(0x1);                       // filetype (MH_OBJECT)
++	U32(3);                         // ncmds = 3 (two LC_SEGMENT_64 + one LC_SYMTAB)
++	U32(152 + 312 + 24);            // sizeofcmds = 488 bytes (sum of all load commands)
++	U32(0x2000);                    // flags (MH_SUBSECTIONS_VIA_SYMBOLS)
++	U32(0);                        // reserved (unused in 64-bit header)
++
++	// Load Command 1: __TEXT segment (contains __text section)
++	U32(0x19);                     // LC_SEGMENT_64
++	U32(152);                      // cmdsize (72 bytes cmd + 80 bytes section)
++	B("__TEXT", 6); Z(10);         // segname[16] = "__TEXT"
++	U64(0x0);                      // vmaddr
++	U64(0x1);                      // vmsize (segment size in memory, 1 byte for code)
++	U64(0x210);                    // fileoff = 0x210 (528) where __text section starts in file
++	U64(0x1);                      // filesize = 1 (one byte of section data in file)
++	U32(0x05);                     // maxprot = VM_PROT_READ | VM_PROT_EXECUTE
++	U32(0x05);                     // initprot = VM_PROT_READ | VM_PROT_EXECUTE
++	U32(1);                        // nsects = 1
++	U32(0);                        // flags (none)
++				       // Section 1: __text
++	B("__text", 6); Z(10);         // sectname[16] = "__text"
++	B("__TEXT", 6); Z(10);         // segname[16]  = "__TEXT"
++	U64(0x0);                      // addr (0 since not linked)
++	U64(0x1);                      // size = 1 byte
++	U32(0x210);                    // offset = 528 (file offset of section)
++	U32(4);                        // align = 2^4 (16-byte alignment)
++	U32(0x0);                      // reloff (no relocations)
++	U32(0x0);                      // nreloc
++	U32(0x80000400);               // flags = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
++	U32(0x0);                      // reserved1
++	U32(0x0);                      // reserved2
++	U32(0x0);                      // reserved3
++
++	// Load Command 2: __DWARF segment (contains 3 debug sections)
++	U32(0x19);                     // LC_SEGMENT_64
++	U32(312);                      // cmdsize (72 + 3*80)
++	B("__DWARF", 7); Z(9);         // segname[16] = "__DWARF"
++	U64(0x0);                      // vmaddr
++	ut64 dwarf_vmsize_off = r_buf_size (buf);
++	U64(0x0);                      // vmsize (placeholder, to patch later)
++	U64(0x211);                    // fileoff = 0x211 (529) where first debug section starts
++	ut64 dwarf_filesz_off = r_buf_size (buf);
++	U64(0x0);                      // filesi

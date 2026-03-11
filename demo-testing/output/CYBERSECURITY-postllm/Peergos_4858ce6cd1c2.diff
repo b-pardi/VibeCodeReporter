@@ -1,0 +1,91 @@
+@@ -1,5 +1,6 @@
+ package peergos.server.storage;
+ 
++import peergos.shared.cbor.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.cid.*;
+ import peergos.shared.io.ipfs.multihash.*;
+@@ -69,8 +70,11 @@ public class MetadataCachingStorage extends DelegatingDeletableStorage {
+         Optional<BlockMetadata> meta = metadata.get(block);
+         if (meta.isPresent())
+             return Futures.of(meta.get());
+-        return target.getRaw(block, auth)
+-                .thenApply(dataOpt -> metadata.put(block, dataOpt.get()));
++        return target.getBlockMetadata(block, auth)
++                .thenApply(blockmeta -> {
++                    metadata.put(block, blockmeta);
++                    return blockmeta;
++                });
+     }
+ 
+     private void cacheBlockMetadata(byte[] block, boolean isRaw) {
+@@ -88,6 +92,14 @@ public class MetadataCachingStorage extends DelegatingDeletableStorage {
+         });
+     }
+ 
++    @Override
++    public CompletableFuture<Optional<CborObject>> get(Cid hash, Optional<BatWithId> bat) {
++        return target.get(hash, bat).thenApply(res -> {
++            res.ifPresent(cbor -> cacheBlockMetadata(cbor.toByteArray(), hash.isRaw()));
++            return res;
++        });
++    }
++
+     @Override
+     public CompletableFuture<Optional<byte[]>> getRaw(Cid hash, Optional<BatWithId> bat) {
+         return target.getRaw(hash, bat).thenApply(bopt -> {
+
+
+
+
+@@ -627,9 +627,18 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+         Optional<BlockMetadata> cached = blockMetadata.get(block);
+         if (cached.isPresent())
+             return Futures.of(cached.get());
+-        Optional<byte[]> data = getRaw(block, Optional.empty(), "", false, Optional.empty()).join();
++        Optional<byte[]> data = getRaw(block, block.isRaw() ?
++                Optional.of(new Pair<>(0, Bat.MAX_RAW_BLOCK_PREFIX_SIZE - 1)) :
++                Optional.empty(), "", false, Optional.empty()).join();
+         if (data.isEmpty())
+             throw new IllegalStateException("Block not present locally: " + block);
++        if (block.isRaw()) {
++            // we should avoid this by populated the metadata store, as it means two S3 calls, a ranged GET and a HEAD
++            int size = getSize(block).join().get();
++            BlockMetadata meta = new BlockMetadata(size, Collections.emptyList(), Bat.getRawBlockBats(data.get()));
++            blockMetadata.put(block, meta);
++            return Futures.of(meta);
++        }
+         return Futures.of(blockMetadata.put(block, data.get()));
+     }
+ 
+
+
+
+
+@@ -99,6 +99,12 @@ public class TransactionalIpfs extends DelegatingStorage implements DeletableCon
+                 );
+     }
+ 
++    @Override
++    public CompletableFuture<BlockMetadata> getBlockMetadata(Cid block, String auth) {
++        return getRaw(block, auth, false)
++                .thenApply(data -> BlockMetadataStore.extractMetadata(block, data.get()));
++    }
++
+     @Override
+     public CompletableFuture<List<byte[]>> getChampLookup(PublicKeyHash owner,
+                                                           Cid root,
+
+
+
+
+@@ -221,7 +221,8 @@ public class MultiNodeNetworkTests {
+         long usageVia2 = postMigration.getSpaceUsage().join();
+         // Note we currently don't remove the old pointer after changing password,
+         // so there is a 5kib reduction after migration per password change
+-        Assert.assertTrue(usageVia2 == usageVia1 || (nPasswordChanges > 0 && usageVia2 < usageVia1));
++        Assert.assertTrue("Usage after migrate: " + usageVia2 + ", usage before: " + usageVia1,
++                usageVia2 == usageVia1 || (nPasswordChanges > 0 && usageVia2 < usageVia1));
+ 
+         // check pending followRequest was transferred
+         List<FollowRequestWithCipherText> followRequests = postMigration.processFollowRequests().join();

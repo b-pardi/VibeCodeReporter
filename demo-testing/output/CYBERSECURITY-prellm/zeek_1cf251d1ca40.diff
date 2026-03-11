@@ -1,0 +1,164 @@
+@@ -306,7 +306,7 @@ public:
+ 
+ 	UID GetUID() const { return uid; }
+ 
+-	const EncapsulationStack* GetEncapsulation() const
++	EncapsulationStack* GetEncapsulation() const
+ 		{ return encapsulation; }
+ 
+ 	void CheckFlowLabel(bool is_orig, uint32_t flow_label);
+@@ -351,7 +351,7 @@ protected:
+ 	double start_time, last_time;
+ 	double inactivity_timeout;
+ 	RecordValPtr conn_val;
+-	const EncapsulationStack* encapsulation; // tunnels
++	EncapsulationStack* encapsulation; // tunnels
+ 	int suppress_event;	// suppress certain events to once per conn.
+ 
+ 	unsigned int installed_status_timer:1;
+
+
+
+
+@@ -297,6 +297,7 @@ void FragReassembler::BlockInserted(DataBlockMap::const_iterator /* it */)
+ 		struct ip* reassem4 = (struct ip*) pkt_start;
+ 		reassem4->ip_len = htons(frag_size + proto_hdr_len);
+ 		reassembled_pkt = new IP_Hdr(reassem4, true);
++		reassembled_pkt->reassembled = true;
+ 		DeleteTimer();
+ 		}
+ 
+@@ -306,6 +307,7 @@ void FragReassembler::BlockInserted(DataBlockMap::const_iterator /* it */)
+ 		reassem6->ip6_plen = htons(frag_size + proto_hdr_len - 40);
+ 		const IPv6_Hdr_Chain* chain = new IPv6_Hdr_Chain(reassem6, next_proto, n);
+ 		reassembled_pkt = new IP_Hdr(reassem6, true, n, chain);
++		reassembled_pkt->reassembled = true;
+ 		DeleteTimer();
+ 		}
+ 
+@@ -323,7 +325,7 @@ void FragReassembler::Expire(double t)
+ 	expire_timer->ClearReassembler();
+ 	expire_timer = nullptr;	// timer manager will delete it
+ 
+-	sessions->Remove(this);
++	fragment_mgr->Remove(this);
+ 	}
+ 
+ void FragReassembler::DeleteTimer()
+@@ -336,4 +338,56 @@ void FragReassembler::DeleteTimer()
+ 		}
+ 	}
+ 
++FragmentManager::~FragmentManager()
++	{
++	Clear();
++	}
++
++FragReassembler* FragmentManager::NextFragment(double t, const IP_Hdr* ip, const u_char* pkt)
++	{
++	uint32_t frag_id = ip->ID();
++	FragReassemblerKey key = std::make_tuple(ip->SrcAddr(), ip->DstAddr(), frag_id);
++
++	FragReassembler* f = nullptr;
++	auto it = fragments.find(key);
++	if ( it != fragments.end() )
++		f = it->second;
++
++	if ( ! f )
++		{
++		f = new FragReassembler(sessions, ip, pkt, key, t);
++		fragments[key] = f;
++		if ( fragments.size() > max_fragments )
++			max_fragments = fragments.size();
++		return f;
++		}
++
++	f->AddFragment(t, ip, pkt);
++	return f;
++	}
++
++void FragmentManager::Clear()
++	{
++	for ( const auto& entry : fragments )
++		Unref(entry.second);
++
++	fragments.clear();
++	}
++
++void FragmentManager::Remove(detail::FragReassembler* f)
++	{
++	if ( ! f )
++		return;
++
++	if ( fragments.erase(f->Key()) == 0 )
++		reporter->InternalWarning("fragment reassembler not in dict");
++
++	Unref(f);
++	}
++
++uint32_t FragmentManager::MemoryAllocation() const
++	{
++	return fragments.size() * (sizeof(FragmentMap::key_type) + sizeof(FragmentMap::value_type));
++	}
++
+ } // namespace zeek::detail
+
+
+
+
+@@ -32,7 +32,7 @@ public:
+ 	void DeleteTimer();
+ 	void ClearTimer()	{ expire_timer = nullptr; }
+ 
+-	const IP_Hdr* ReassembledPkt()	{ return reassembled_pkt; }
++	IP_Hdr* ReassembledPkt()	{ return reassembled_pkt; }
+ 	const FragReassemblerKey& Key() const	{ return key; }
+ 
+ protected:
+@@ -67,4 +67,40 @@ protected:
+ 	FragReassembler* f;
+ };
+ 
++class FragmentManager {
++public:
++
++	FragmentManager() = default;
++	~FragmentManager();
++
++	FragReassembler* NextFragment(double t, const IP_Hdr* ip, const u_char* pkt);
++	void Clear();
++	void Remove(detail::FragReassembler* f);
++
++	size_t Size() const	{ return fragments.size(); }
++	size_t MaxFragments() const 	{ return max_fragments; }
++	uint32_t MemoryAllocation() const;
++
++private:
++
++	using FragmentMap = std::map<detail::FragReassemblerKey, detail::FragReassembler*>;
++	FragmentMap fragments;
++	size_t max_fragments = 0;
++};
++
++extern FragmentManager* fragment_mgr;
++
++class FragReassemblerTracker {
++public:
++	FragReassemblerTracker(FragReassembler* f)
++		: frag_reassembler(f)
++		{ }
++
++	~FragReassemblerTracker()
++		{ fragment_mgr->Remove(frag_reassembler); }
++
++private:
++	FragReassembler* frag_reassembler;
++};
++
+ } // namespace zeek::detail
+
+
+
+
+@@ -554,6 +554,11 @@ public:
+ 	[[deprecated(

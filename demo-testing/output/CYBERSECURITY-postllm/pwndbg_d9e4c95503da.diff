@@ -1,0 +1,133 @@
+@@ -506,6 +506,8 @@ class ArgparsedCommand:
+         # We want to run all integer and otherwise-unspecified arguments
+         # through fix() so that GDB parses it.
+         for action in self.parser._actions:
++            if isinstance(action, argparse._SubParsersAction):
++                action.type = str
+             if action.dest == "help":
+                 continue
+             if action.type in (int, None):
+
+
+
+
+@@ -1,15 +1,31 @@
+ import argparse
++import sys
++from typing import Iterator
+ 
++import gdb
+ from tabulate import tabulate
+ 
++import pwndbg.color as C
++import pwndbg.color.message as M
+ import pwndbg.commands
+ import pwndbg.gdblib.kernel.slab
+ from pwndbg.commands import CommandCategory
++from pwndbg.gdblib.kernel import kconfig
++from pwndbg.gdblib.kernel import per_cpu
+ from pwndbg.gdblib.kernel.slab import oo_objects
+ from pwndbg.gdblib.kernel.slab import oo_order
+ 
+-parser = argparse.ArgumentParser(description="Prints information about the SLUB allocator.")
+-parser.add_argument(
++parser = argparse.ArgumentParser(description="Prints information about the SLUB allocator")
++subparsers = parser.add_subparsers(dest="command")
++
++# The command will still work on 3.6 and earlier, but the help won't be shown
++# when no subcommand is provided
++if (sys.version_info.major, sys.version_info.minor) >= (3, 7):
++    subparsers.required = True
++
++
++parser_list = subparsers.add_parser("list", prog="slab")
++parser_list.add_argument(
+     "filter_",
+     metavar="filter",
+     type=str,
+@@ -17,15 +33,204 @@ parser.add_argument(
+     help="Only show caches that contain the given filter string",
+ )
+ 
++# TODO: --cpu, --node, --partial, --active
++parser_info = subparsers.add_parser("info", prog="slab")
++parser_info.add_argument("names", metavar="name", type=str, nargs="+", help="")
++parser_info.add_argument("-v", "--verbose", action="store_true", help="")
++
++
++def swab(x):
++    return int(
++        ((x & 0x00000000000000FF) << 56)
++        | ((x & 0x000000000000FF00) << 40)
++        | ((x & 0x0000000000FF0000) << 24)
++        | ((x & 0x00000000FF000000) << 8)
++        | ((x & 0x000000FF00000000) >> 8)
++        | ((x & 0x0000FF0000000000) >> 24)
++        | ((x & 0x00FF000000000000) >> 40)
++        | ((x & 0xFF00000000000000) >> 56)
++    )
++
+ 
+ @pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.KERNEL)
+ @pwndbg.commands.OnlyWhenQemuKernel
+ @pwndbg.commands.OnlyWithKernelDebugSyms
+ @pwndbg.commands.OnlyWhenPagingEnabled
+-def slab(filter_=None) -> None:
++def slab(command, filter_=None, names=None, verbose=False) -> None:
++    if command == "list":
++        slab_list(filter_)
++    elif command == "info":
++        for name in names:
++            slab_info(name, verbose)
++
++
++_flags = {
++    "SLAB_DEBUG_FREE": 0x00000100,
++    "SLAB_RED_ZONE": 0x00000400,
++    "SLAB_POISON": 0x00000800,
++    "SLAB_HWCACHE_ALIGN": 0x00002000,
++    "SLAB_CACHE_DMA": 0x00004000,
++    "SLAB_STORE_USER": 0x00010000,
++    "SLAB_RECLAIM_ACCOUNT": 0x00020000,
++    "SLAB_PANIC": 0x00040000,
++    "SLAB_DESTROY_BY_RCU": 0x00080000,
++    "SLAB_MEM_SPREAD": 0x00100000,
++    "SLAB_TRACE": 0x00200000,
++    "SLAB_DEBUG_OBJECTS": 0x00400000,
++    "SLAB_NOLEAKTRACE": 0x00800000,
++    "SLAB_NOTRACK": 0x01000000,
++    "SLAB_FAILSLAB": 0x02000000,
++}
++
++
++def get_flags_list(flags: int):
++    flags_list = []
++
++    for flag_name, mask in _flags.items():
++        if flags & mask:
++            flags_list.append(flag_name)
++
++    return flags_list
++
++
++class IndentContextManager:
++    def __init__(self):
++        self.indent = 0
++
++    def __enter__(self):
++        self.indent += 1
++
++    def __exit__(self, exc_type, exc_value, exc_tb):
++        self.indent -= 1
++        assert self.indent >= 0
++
++    def print(self, *a, **kw):
++        print("    " * self.indent, *a, **kw)
++
++
++def walk_freelist(freelist, offset, random):
++    while freelist:
++        address = int(freelist)
++        yield address
++        freelist = pwndbg.gdblib.memory.pvoid(address + offset)
++   

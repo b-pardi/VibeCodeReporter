@@ -1,0 +1,171 @@
+@@ -13,8 +13,11 @@ Flare::Flare()
+ 	{
+ 	}
+ 
+-static void bad_pipe_op(const char* which)
++static void bad_pipe_op(const char* which, bool signal_safe)
+ 	{
++	if ( signal_safe )
++		abort();
++
+ 	char buf[256];
+ 	bro_strerror_r(errno, buf, sizeof(buf));
+ 
+@@ -27,7 +30,7 @@ static void bad_pipe_op(const char* which)
+ 		}
+ 	}
+ 
+-void Flare::Fire()
++void Flare::Fire(bool signal_safe)
+ 	{
+ 	char tmp = 0;
+ 
+@@ -49,14 +52,14 @@ void Flare::Fire()
+ 				// Interrupted: try again.
+ 				continue;
+ 
+-			bad_pipe_op("write");
++			bad_pipe_op("write", signal_safe);
+ 			}
+ 
+ 		// No error, but didn't write a byte: try again.
+ 		}
+ 	}
+ 
+-int Flare::Extinguish()
++int Flare::Extinguish(bool signal_safe)
+ 	{
+ 	int rval = 0;
+ 	char tmp[256];
+@@ -80,7 +83,7 @@ int Flare::Extinguish()
+ 			// Interrupted: try again.
+ 			continue;
+ 
+-		bad_pipe_op("read");
++		bad_pipe_op("read", signal_safe);
+ 		}
+ 
+ 	return rval;
+
+
+
+
+@@ -26,15 +26,19 @@ public:
+ 
+ 	/**
+ 	 * Put the object in the "ready" state.
++	 * @param signal_safe  whether to skip error-reporting functionality that
++	 * is not async-signal-safe
+ 	 */
+-	void Fire();
++	void Fire(bool signal_safe = false);
+ 
+ 	/**
+ 	 * Take the object out of the "ready" state.
++	 * @param signal_safe  whether to skip error-reporting functionality that
++	 * is not async-signal-safe
+ 	 * @return number of bytes read from the pipe, corresponds to the number
+ 	 * of times Fire() was called.
+ 	 */
+-	int Extinguish();
++	int Extinguish(bool signal_safe = false);
+ 
+ private:
+ 	Pipe pipe;
+
+
+
+
+@@ -65,6 +65,7 @@ struct Stem {
+ 
+ 	void LogError(const char* format, ...) const __attribute__((format(printf, 2, 3)));
+ 
++	int last_signal = -1;
+ 	std::unique_ptr<bro::Flare> signal_flare;
+ 	std::unique_ptr<bro::PipePair> pipe;
+ 	std::map<std::string, Supervisor::Node> nodes;
+@@ -77,13 +78,12 @@ static Stem* stem = nullptr;
+ 
+ static RETSIGTYPE stem_sig_handler(int signo)
+ 	{
+-	// TODO: signal safety
+-	DBG_STEM("Stem received signal: %d", signo);
++	stem->last_signal = signo;
+ 
+ 	if ( stem->shutting_down )
+ 		return RETSIGVAL;
+ 
+-	stem->signal_flare->Fire();
++	stem->signal_flare->Fire(true);
+ 
+ 	if ( signo == SIGTERM )
+ 		stem->shutting_down = true;
+@@ -93,9 +93,7 @@ static RETSIGTYPE stem_sig_handler(int signo)
+ 
+ static RETSIGTYPE supervisor_sig_handler(int signo)
+ 	{
+-	// TODO: signal safety
+-	DBG_LOG(DBG_SUPERVISOR, "received signal: %d", signo);
+-	supervisor->ObserveChildSignal();
++	supervisor->ObserveChildSignal(signo);
+ 	return RETSIGVAL;
+ 	}
+ 
+@@ -126,8 +124,8 @@ static std::string make_create_message(const Supervisor::NodeConfig& node)
+ 	}
+ 
+ Supervisor::Supervisor(Supervisor::Config cfg,
+-							 std::unique_ptr<bro::PipePair> pipe,
+-                             pid_t arg_stem_pid)
++                       std::unique_ptr<bro::PipePair> pipe,
++                       pid_t arg_stem_pid)
+ 	: config(std::move(cfg)), stem_pid(arg_stem_pid), stem_pipe(std::move(pipe))
+ 	{
+ 	DBG_LOG(DBG_SUPERVISOR, "forked stem process %d", stem_pid);
+@@ -171,9 +169,10 @@ Supervisor::~Supervisor()
+ 	while ( ProcessMessages() != 0 );
+ 	}
+ 
+-void Supervisor::ObserveChildSignal()
++void Supervisor::ObserveChildSignal(int signo)
+ 	{
+-	signal_flare.Fire();
++	last_signal = signo;
++	signal_flare.Fire(true);
+ 	}
+ 
+ void Supervisor::ReapStem()
+@@ -216,13 +215,19 @@ void Supervisor::ReapStem()
+ 
+ void Supervisor::HandleChildSignal()
+ 	{
++	if ( last_signal >= 0 )
++		{
++		DBG_LOG(DBG_SUPERVISOR, "Supervisor received signal %d", last_signal);
++		last_signal = -1;
++		}
++
+ 	bool had_child_signal = signal_flare.Extinguish();
+ 
+ 	if ( had_child_signal )
+ 		{
+ 		ReapStem();
+ 
+-		DBG_LOG(DBG_SUPERVISOR, "processed SIGCHLD %s",
++		DBG_LOG(DBG_SUPERVISOR, "Supervisor processed child signal %s",
+ 		        stem_pid ? "(spurious)" : "");
+ 		}
+ 
+@@ -657,6 +662,12 @@ std::optional<Supervisor::NodeConfig> Stem::Poll()
+ 			}
+ 		}
+ 
++	if ( last_signal >= 0 )
++		{
++		DBG_STEM("Stem received signal: %d", last_signal);
++		last_signal = -1;
++		}
++
+ 	if ( getppid() == 1 )
+ 		{
+ 		// TODO

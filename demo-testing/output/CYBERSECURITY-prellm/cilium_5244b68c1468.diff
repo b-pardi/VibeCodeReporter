@@ -1,0 +1,140 @@
+@@ -329,11 +329,10 @@ handle_ipv6(struct __ctx_buff *ctx, __u32 secctx, const bool from_host)
+ 	void *data, *data_end;
+ 	struct ipv6hdr *ip6;
+ 	union v6addr *dst;
+-	int ret, l3_off = ETH_HLEN, hdrlen;
+ 	__u32 __maybe_unused remoteID = WORLD_ID;
++	int ret, l3_off = ETH_HLEN, hdrlen;
+ 	bool skip_redirect = false;
+ 	struct endpoint_info *ep;
+-	__u8 nexthdr;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+@@ -360,18 +359,18 @@ handle_ipv6(struct __ctx_buff *ctx, __u32 secctx, const bool from_host)
+ 	}
+ #endif /* ENABLE_NODEPORT */
+ 
+-	nexthdr = ip6->nexthdr;
+-	hdrlen = ipv6_hdrlen(ctx, l3_off, &nexthdr);
+-	if (hdrlen < 0)
+-		return hdrlen;
++	if (!skip_redirect) {
++		__u8 nexthdr = ip6->nexthdr;
++		hdrlen = ipv6_hdrlen(ctx, ETH_HLEN, &nexthdr);
++		if (hdrlen < 0)
++			return hdrlen;
+ 
+-#ifdef HANDLE_NS
+-	if (!skip_redirect && unlikely(nexthdr == IPPROTO_ICMPV6)) {
+-		ret = icmp6_handle(ctx, ETH_HLEN, ip6, METRIC_INGRESS);
+-		if (IS_ERR(ret))
+-			return ret;
++		if (likely(nexthdr == IPPROTO_ICMPV6)) {
++			ret = icmp6_host_handle(ctx);
++			if (IS_ERR(ret))
++				return ret;
++		}
+ 	}
+-#endif
+ 
+ 	if (from_host && !skip_redirect) {
+ 		/* If we are attached to cilium_host at egress, this will
+@@ -491,6 +490,37 @@ int tail_handle_ipv6_from_netdev(struct __ctx_buff *ctx)
+ {
+ 	return tail_handle_ipv6(ctx, false);
+ }
++
++# ifdef ENABLE_HOST_FIREWALL
++static __always_inline int
++handle_to_netdev_ipv6(struct __ctx_buff *ctx)
++{
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++	int hdrlen, ret;
++	__u32 srcID = 0;
++	__u8 nexthdr;
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip6))
++		return DROP_INVALID;
++
++	nexthdr = ip6->nexthdr;
++	hdrlen = ipv6_hdrlen(ctx, ETH_HLEN, &nexthdr);
++	if (hdrlen < 0)
++		return hdrlen;
++
++	if (likely(nexthdr == IPPROTO_ICMPV6)) {
++		ret = icmp6_host_handle(ctx);
++		if (IS_ERR(ret))
++			return ret;
++	}
++
++	/* to-netdev is attached to the egress path of the native
++	 * device. */
++	srcID = ipcache_lookup_srcid6(ctx);
++	return ipv6_host_policy_egress(ctx, srcID);
++}
++# endif
+ #endif /* ENABLE_IPV6 */
+ 
+ #ifdef ENABLE_IPV4
+@@ -1223,10 +1253,7 @@ int to_netdev(struct __ctx_buff *ctx __maybe_unused)
+ # endif
+ # ifdef ENABLE_IPV6
+ 	case bpf_htons(ETH_P_IPV6):
+-		/* to-netdev is attached to the egress path of the native
+-		 * device. */
+-		srcID = ipcache_lookup_srcid6(ctx);
+-		ret = ipv6_host_policy_egress(ctx, srcID);
++		ret = handle_to_netdev_ipv6(ctx);
+ 		break;
+ # endif
+ # ifdef ENABLE_IPV4
+
+
+
+
+@@ -349,6 +349,7 @@ enum {
+ #define DROP_NAT_NOT_NEEDED	-173 /* Mapped as drop code, though drop not necessary. */
+ #define DROP_IS_CLUSTER_IP	-174
+ #define DROP_FRAG_NOT_FOUND	-175
++#define DROP_FORBIDDEN_ICMP6	-176
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ 
+
+
+
+
+@@ -15,6 +15,21 @@
+ #define ICMP6_ND_TARGET_OFFSET (sizeof(struct ipv6hdr) + sizeof(struct icmp6hdr))
+ #define ICMP6_ND_OPTS (sizeof(struct ipv6hdr) + sizeof(struct icmp6hdr) + sizeof(struct in6_addr))
+ 
++#define ICMP6_UNREACH_MSG_TYPE		1
++#define ICMP6_PARAM_ERR_MSG_TYPE	4
++#define ICMP6_ECHO_REQUEST_MSG_TYPE	128
++#define ICMP6_ECHO_REPLY_MSG_TYPE	129
++#define ICMP6_MULT_LIST_QUERY_TYPE	130
++#define ICMP6_NS_MSG_TYPE		135
++#define ICMP6_NA_MSG_TYPE		136
++#define ICMP6_RR_MSG_TYPE		138
++#define ICMP6_INV_NS_MSG_TYPE		141
++#define ICMP6_MULT_LIST_REPORT_V2_TYPE	143
++#define ICMP6_SEND_NS_MSG_TYPE		148
++#define ICMP6_SEND_NA_MSG_TYPE		149
++#define ICMP6_MULT_RA_MSG_TYPE		151
++#define ICMP6_MULT_RT_MSG_TYPE		153
++
+ /* If not specific action is specified, drop unknown neighbour solication
+  * messages */
+ #ifndef ACTION_UNKNOWN_ICMP6_NS
+@@ -392,7 +407,7 @@ static __always_inline int icmp6_handle(struct __ctx_buff *ctx, int nh_off,
+ 	BPF_V6(router_ip, ROUTER_IP);
+ 
+ 	switch(type) {
+-	case 135:
++	case ICMP6_NS_MSG_TYPE:
+ 		return icmp6_handle_ns(ctx, nh_off, direction);
+ 	case ICMPV6_ECHO_REQUEST:
+ 		if (!ipv6_addrcmp((union v6addr *) &ip6->daddr, &router_ip))
+@@ -406,4 +421,72 @@ static __always_inline int icmp6_handle(struct __ctx_buff

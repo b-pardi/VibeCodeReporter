@@ -1,0 +1,119 @@
+@@ -143,6 +143,7 @@ public:
+     // cohort associated with a given type.
+     int TypeOffset(const TypePtr& t) { return GI_Offset(RegisterType(t)); }
+     int TypeCohort(const TypePtr& t) { return GI_Cohort(RegisterType(t)); }
++    int TypeFinalCohort(const TypePtr& t) { return GI_FinalCohort(RegisterType(t)); }
+ 
+     // Tracks a Zeek ValPtr used as a constant value.  These occur
+     // in two contexts: directly as constant expressions, and indirectly
+@@ -963,6 +964,7 @@ private:
+     // associated with an initialization.
+     int GI_Offset(const std::shared_ptr<CPP_InitInfo>& gi) const { return gi ? gi->Offset() : -1; }
+     int GI_Cohort(const std::shared_ptr<CPP_InitInfo>& gi) const { return gi ? gi->InitCohort() : 0; }
++    int GI_FinalCohort(const std::shared_ptr<CPP_InitInfo>& gi) const { return gi ? gi->FinalInitCohort() : 0; }
+ 
+     // Generate code to initialize the mappings for record field
+     // offsets for field accesses into regions of records that
+
+
+
+
+@@ -166,7 +166,7 @@ void CPPCompile::InitializeConsts() {
+     StartBlock();
+ 
+     for ( const auto& c : consts )
+-        Emit("CPP_ValElem(%s, %s),", TypeTagName(c.first), Fmt(c.second));
++        Emit("{%s, %s},", TypeTagName(c.first), Fmt(c.second));
+ 
+     EndBlock(true);
+ }
+
+
+
+
+@@ -7,6 +7,7 @@
+ #include "zeek/ZeekString.h"
+ #include "zeek/script_opt/CPP/Attrs.h"
+ #include "zeek/script_opt/CPP/Compile.h"
++#include "zeek/script_opt/CPP/RuntimeInits.h"
+ 
+ using namespace std;
+ 
+@@ -38,6 +39,13 @@ void CPP_InitsInfo::GenerateInitializers(CPPCompile* c) {
+     c->Emit("%s %s = %s(%s, %s,", gt, InitializersName(), gt, base_name, Fmt(offset_set));
+ 
+     c->IndentUp();
++    GenerateCohorts(c);
++    c->IndentDown();
++
++    c->Emit(");");
++}
++
++void CPP_InitsInfo::GenerateCohorts(CPPCompile* c) {
+     c->Emit("{");
+ 
+     int n = 0;
+@@ -47,7 +55,7 @@ void CPP_InitsInfo::GenerateInitializers(CPPCompile* c) {
+         if ( ++n > 1 )
+             c->Emit("");
+ 
+-        if ( cohort.size() == 1 && ! IsCompound() )
++        if ( cohort.size() == 1 && ! UsesCompoundVectors() )
+             BuildCohort(c, cohort);
+         else {
+             c->Emit("{");
+@@ -57,8 +65,6 @@ void CPP_InitsInfo::GenerateInitializers(CPPCompile* c) {
+     }
+ 
+     c->Emit("}");
+-    c->IndentDown();
+-    c->Emit(");");
+ }
+ 
+ void CPP_InitsInfo::BuildOffsetSet(CPPCompile* c) {
+@@ -80,25 +86,25 @@ void CPP_InitsInfo::BuildOffsetSet(CPPCompile* c) {
+     offset_set = c->IndMgr().AddIndices(offsets_vec);
+ }
+ 
+-void CPP_InitsInfo::BuildCohort(CPPCompile* c, std::vector<std::shared_ptr<CPP_InitInfo>>& cohort) {
+-    int n = 0;
++static std::string describe_initializer(const Obj* o) {
++    auto od = obj_desc(o);
+ 
++    // Escape any embedded comment characters.
++    od = regex_replace(od, std::regex("/\\*"), "<<SLASH-STAR>>");
++    od = regex_replace(od, std::regex("\\*/"), "<<STAR-SLASH>>");
++
++    return od;
++}
++
++void CPP_InitsInfo::BuildCohort(CPPCompile* c, std::vector<std::shared_ptr<CPP_InitInfo>>& cohort) {
+     for ( auto& co : cohort ) {
+         vector<string> ivs;
+         auto o = co->InitObj();
+-        if ( o ) {
+-            auto od = obj_desc(o);
+-
+-            // Escape any embedded comment characters.
+-            od = regex_replace(od, std::regex("/\\*"), "<<SLASH-STAR>>");
+-            od = regex_replace(od, std::regex("\\*/"), "<<STAR-SLASH>>");
+-
+-            c->Emit("/* #%s: Initializing %s: */", Fmt(co->Offset()), od);
+-        }
++        if ( o )
++            c->Emit("/* #%s: Initializing %s: */", Fmt(co->Offset()), describe_initializer(o));
+ 
+         co->InitializerVals(ivs);
+         BuildCohortElement(c, co->InitializerType(), ivs);
+-        ++n;
+     }
+ }
+ 
+@@ -117,12 +123,50 @@ void CPP_InitsInfo::BuildCohortElement(CPPCompile* c, string init_type, vector<s
+     c->Emit("std::make_shared<%s>(%s),", init_type, full_init);
+ }
+ 
++void CPP_CompoundInitsInfo::GenerateInitializers(CPPCompile* c) {
++    c->Emit("");
++    c->Emit("static int %s_init[] = {", tag);
++    int n

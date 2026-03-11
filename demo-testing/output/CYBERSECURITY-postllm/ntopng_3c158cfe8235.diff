@@ -1,0 +1,115 @@
+@@ -81,9 +81,11 @@ class DB {
+   virtual bool isDbCreated() { return (true); };
+   virtual void shutdown();
+   virtual void flush(){};
+-  virtual void lua(lua_State *vm, bool since_last_checkpoint) const;
++  virtual void lua(lua_State *vm, bool since_last_checkpoint);
+   virtual int select_database(char *dbname) { return (-1); }
+   virtual void checkIdle(time_t when) { ; }
++  virtual void getStats(u_int64_t *flow_export_count, u_int64_t *flow_export_drops,
++			u_int64_t *flow_export_rate, bool since_last_checkpoint);  
+ };
+ 
+ #endif /* _DB_CLASS_H_ */
+
+
+
+
+@@ -42,16 +42,27 @@ void DB::shutdown() { running = false; }
+ 
+ /* ******************************************* */
+ 
+-void DB::lua(lua_State *vm, bool since_last_checkpoint) const {
+-  lua_push_uint64_table_entry(vm, "flow_export_count",
+-			      exportedFlows - (since_last_checkpoint ? checkpointExportedFlows : 0));
+-  lua_push_int32_table_entry(vm, "flow_export_drops",
+-			     getNumDroppedFlows() -
+-			     (since_last_checkpoint
+-			      ? (checkpointDroppedFlows + checkpointQueueDroppedFlows)
+-			      : 0));
+-  lua_push_float_table_entry(vm, "flow_export_rate",
+-                             exportRate >= 0 ? exportRate : 0);
++void DB::getStats(u_int64_t *flow_export_count,
++		  u_int64_t *flow_export_drops,
++		  u_int64_t *flow_export_rate,
++		  bool since_last_checkpoint) {
++
++  *flow_export_count = exportedFlows - (since_last_checkpoint ? checkpointExportedFlows : 0);
++  *flow_export_drops = getNumDroppedFlows() - (since_last_checkpoint  ? (checkpointDroppedFlows + checkpointQueueDroppedFlows) : 0);
++  *flow_export_rate  = exportRate >= 0 ? exportRate : 0;
++}
++
++/* ******************************************* */
++
++void DB::lua(lua_State *vm, bool since_last_checkpoint) {
++  u_int64_t a, b, c;
++
++  getStats(&a, &b, &c, since_last_checkpoint);
++
++  /* Keep in sync with ViewInterface::dumpDBStats() */
++  lua_push_uint64_table_entry(vm, "flow_export_count", a);
++  lua_push_int32_table_entry(vm, "flow_export_drops", b);
++  lua_push_float_table_entry(vm, "flow_export_rate", c);
+ }
+ 
+ /* ******************************************* */
+
+
+
+
+@@ -4820,12 +4820,13 @@ void Flow::housekeep(time_t t) {
+       detected state, don't break, continue so to execute detection completed
+       checks.
+     */
+-    if(get_state() != hash_entry_state_flow_protocoldetected) break;
++    if(get_state() != hash_entry_state_flow_protocoldetected)
++      break;
+ 
+   case hash_entry_state_flow_protocoldetected:
+     if(!is_swap_requested()) /* The flow will be swapped, hook execution will
+-				 occur on the swapped flow. */
+-        iface->execProtocolDetectedChecks(this);
++				occur on the swapped flow. */
++      iface->execProtocolDetectedChecks(this);
+     break;
+ 
+   case hash_entry_state_active:
+@@ -4844,8 +4845,8 @@ void Flow::housekeep(time_t t) {
+       this reason, the callbacks are executed on the original flow that should
+       have been swapped but actually it is not.
+     */
+-    if(getInterface()->read_from_pcap_dump_done() && is_swap_requested() &&
+-	!is_swap_done())
++    if(getInterface()->read_from_pcap_dump_done()
++       && is_swap_requested() && !is_swap_done())
+       iface->execProtocolDetectedChecks(this);
+     break;
+ 
+
+
+
+
+@@ -3495,20 +3495,10 @@ void NetworkInterface::incNumQueueDroppedFlows(u_int32_t num) {
+ */
+ u_int64_t NetworkInterface::dequeueFlowsForDump(u_int idle_flows_budget,
+                                                 u_int active_flows_budget) {
+-  /*
+-    For viewed interface, the dumper database is the one belonging to the
+-    overlying view interface.
+-  */
+-  DB *dumper;
++  DB *dumper = getDB();
+   u_int64_t idle_flows_done = 0, active_flows_done = 0;
+   time_t when = time(NULL);
+-
+-#ifdef NTOPNG_PRO
+-  dumper = isViewed() ? viewedBy()->getDB() : getDB();
+-#else
+-  dumper = getDB();
+-#endif
+-
++  
+ #ifdef HAVE_ZMQ
+ #ifndef HAVE_NEDGE
+   if (ntop->get_export_interface() == NULL)
+@@ -3633,7 +3623,7 @@ bool NetworkInterface::dumpFlowOut(DB *dumper, time_t

@@ -1,0 +1,107 @@
+@@ -2362,6 +2362,7 @@ static int AFPSetFlowStorage(Packet *p, int map_fd, void *key0, void* key1,
+     }
+ 
+     LiveDevAddBypassStats(p->livedev, 1, family);
++    LiveDevAddBypassSuccess(p->livedev, 1, family);
+     return 1;
+ }
+ 
+
+
+
+
+@@ -530,10 +530,8 @@ void LiveDevAddBypassStats(LiveDevice *dev, uint64_t cnt, int family)
+     if (bpfdata) {
+         if (family == AF_INET) {
+             SC_ATOMIC_ADD(bpfdata->ipv4_hash_count, cnt);
+-            SC_ATOMIC_ADD(bpfdata->ipv4_success, cnt);
+         } else if (family == AF_INET6) {
+             SC_ATOMIC_ADD(bpfdata->ipv6_hash_count, cnt);
+-            SC_ATOMIC_ADD(bpfdata->ipv6_success, cnt);
+         }
+     }
+ }
+@@ -576,7 +574,24 @@ void LiveDevAddBypassFail(LiveDevice *dev, uint64_t cnt, int family)
+     }
+ }
+ 
+-
++/**
++ * Increase number of currently succesfully bypassed flows for a protocol family
++ *
++ * \param dev pointer to LiveDevice to set stats for
++ * \param cnt number of flows to add
++ * \param family AF_INET to set IPv4 count or AF_INET6 to set IPv6 count
++ */
++void LiveDevAddBypassSuccess(LiveDevice *dev, uint64_t cnt, int family)
++{
++    BypassInfo *bpfdata = LiveDevGetStorageById(dev, g_bypass_storage_id);
++    if (bpfdata) {
++        if (family == AF_INET) {
++            SC_ATOMIC_ADD(bpfdata->ipv4_success, cnt);
++        } else if (family == AF_INET6) {
++            SC_ATOMIC_ADD(bpfdata->ipv6_success, cnt);
++        }
++    }
++}
+ 
+ #ifdef BUILD_UNIX_SOCKET
+ TmEcode LiveDeviceGetBypassedStats(json_t *cmd, json_t *answer, void *data)
+
+
+
+
+@@ -69,6 +69,7 @@ void LiveDevSetBypassStats(LiveDevice *dev, uint64_t cnt, int family);
+ void LiveDevAddBypassStats(LiveDevice *dev, uint64_t cnt, int family);
+ void LiveDevSubBypassStats(LiveDevice *dev, uint64_t cnt, int family);
+ void LiveDevAddBypassFail(LiveDevice *dev, uint64_t cnt, int family);
++void LiveDevAddBypassSuccess(LiveDevice *dev, uint64_t cnt, int family);
+ int LiveGetDeviceCount(void);
+ const char *LiveGetDeviceName(int number);
+ LiveDevice *LiveGetDevice(const char *dev);
+
+
+
+
+@@ -502,7 +502,7 @@ int EBPFSetupXDP(const char *iface, int fd, uint8_t flags)
+  * \return false (this create function never returns true)
+  */
+ static bool EBPFCreateFlowForKey(struct flows_stats *flowstats, LiveDevice *dev, void *key,
+-                                 FlowKey *flow_key, struct timespec *ctime,
++                                 size_t skey, FlowKey *flow_key, struct timespec *ctime,
+                                  uint64_t pkts_cnt, uint64_t bytes_cnt,
+                                  int mapfd, int cpus_count)
+ {
+@@ -513,7 +513,6 @@ static bool EBPFCreateFlowForKey(struct flows_stats *flowstats, LiveDevice *dev,
+     if (f == NULL)
+         return false;
+ 
+-    FlowUpdateState(f, FLOW_STATE_CAPTURE_BYPASSED);
+     /* set accounting, we can't know the direction, so let's just start to
+      * server then if we already have something in to server to client. We need
+      * these numbers as we will use it to see if we have new traffic coming
+@@ -522,32 +521,57 @@ static bool EBPFCreateFlowForKey(struct flows_stats *flowstats, LiveDevice *dev,
+     if (fc == NULL) {
+         fc = SCCalloc(sizeof(FlowBypassInfo), 1);
+         if (fc) {
++            FlowUpdateState(f, FLOW_STATE_CAPTURE_BYPASSED);
+             FlowSetStorageById(f, GetFlowBypassInfoID(), fc);
+             fc->BypassUpdate = EBPFBypassUpdate;
+             fc->BypassFree = EBPFBypassFree;
+             fc->todstpktcnt = pkts_cnt;
+             fc->todstbytecnt = bytes_cnt;
++            f->livedev = dev;
+             EBPFBypassData *eb = SCCalloc(1, sizeof(EBPFBypassData));
+             if (eb == NULL) {
+                 SCFree(fc);
+                 FLOWLOCK_UNLOCK(f);
+                 return false;
+             }
+-            eb->key[0] = key;
++            void *mkey = SCCalloc(1, skey);
++            if (mkey == NULL) {
++                SCFree(fc);
++                SCFree(eb);
++                FLOWLOCK_UNLOCK(f);
++                return false;
++            

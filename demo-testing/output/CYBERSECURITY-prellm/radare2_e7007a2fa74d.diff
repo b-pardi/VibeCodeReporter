@@ -1,0 +1,143 @@
+@@ -227,6 +227,13 @@ typedef struct {
+ 	uint64_t imagesTextCount;
+ } cache_hdr_t;
+ 
++typedef struct {
++	uint8_t uuid[16];
++	uint64_t loadAddress;
++	uint32_t textSegmentSize;
++	uint32_t pathOffset;
++} cache_text_info_t;
++
+ typedef struct {
+ 	uint64_t address;
+ 	uint64_t size;
+@@ -243,8 +250,7 @@ typedef struct {
+ 	uint32_t pad;
+ } cache_img_t;
+ 
+-typedef struct
+-{
++typedef struct {
+ 	uint32_t version;
+ 	uint32_t page_size;
+ 	uint32_t page_starts_count;
+@@ -272,8 +278,7 @@ typedef struct {
+ 	uint32_t entries_size;
+ } cache_slide1_t;
+ 
+-typedef struct
+-{
++typedef struct {
+ 	uint32_t version;
+ 	uint32_t imageExtrasCount;
+ 	uint32_t imagesExtrasOffset;
+@@ -293,8 +298,7 @@ typedef struct
+ 	uint64_t dyldSectionAddr;
+ } cache_accel_t;
+ 
+-typedef struct
+-{
++typedef struct {
+ 	uint64_t exportsTrieAddr;
+ 	uint64_t weakBindingsAddr;
+ 	uint32_t exportsTrieSize;
+@@ -303,8 +307,7 @@ typedef struct
+ 	uint32_t reExportsStartArrayIndex;
+ } cache_imgxtr_t;
+ 
+-typedef struct
+-{
++typedef struct {
+ 	uint32_t nlistOffset;
+ 	uint32_t nlistCount;
+ 	uint32_t stringsOffset;
+@@ -313,8 +316,7 @@ typedef struct
+ 	uint32_t entriesCount;
+ } cache_locsym_info_t;
+ 
+-typedef struct
+-{
++typedef struct {
+ 	uint32_t dylibOffset;
+ 	uint32_t nlistStartIndex;
+ 	uint32_t nlistCount;
+
+
+
+
+@@ -141,7 +141,7 @@ static void rebase_info_free(RDyldRebaseInfo *rebase_info) {
+ 
+ 	if (version == 1) {
+ 		rebase_info1_free ((RDyldRebaseInfo1*) rebase_info);
+-	} else if (version == 2) {
++	} else if (version == 2 || version == 4) {
+ 		rebase_info2_free ((RDyldRebaseInfo2*) rebase_info);
+ 	} else if (version == 3) {
+ 		rebase_info3_free ((RDyldRebaseInfo3*) rebase_info);
+@@ -568,7 +568,7 @@ static RDyldRebaseInfo *get_rebase_info(RBinFile *bf, RDyldCache *cache) {
+ 		}
+ 
+ 		return (RDyldRebaseInfo*) rebase_info;
+-	} else if (slide_info_version == 2) {
++	} else if (slide_info_version == 2 || slide_info_version == 4) {
+ 		cache_slide2_t slide_info;
+ 		ut64 size = sizeof (cache_slide2_t);
+ 		if (r_buf_fread_at (cache_buf, offset, (ut8*) &slide_info, "6i2l", 1) != size) {
+@@ -623,7 +623,7 @@ static RDyldRebaseInfo *get_rebase_info(RBinFile *bf, RDyldCache *cache) {
+ 			goto beach;
+ 		}
+ 
+-		rebase_info->version = 2;
++		rebase_info->version = slide_info_version;
+ 		rebase_info->start_of_data = start_of_data;
+ 		rebase_info->page_starts = (ut16*) tmp_buf_1;
+ 		rebase_info->page_starts_count = slide_info.page_starts_count;
+@@ -794,6 +794,72 @@ static int string_contains(const void *a, const void *b) {
+ 	return !strstr ((const char*) a, (const char*) b);
+ }
+ 
++static HtPP * create_path_to_index(RBuffer *cache_buf, cache_img_t *img, cache_hdr_t *hdr) {
++	HtPP *path_to_idx = ht_pp_new0 ();
++	if (!path_to_idx) {
++		return NULL;
++	}
++	size_t i;
++	for (i = 0; i != hdr->imagesCount; i++) {
++		char file[256];
++		if (r_buf_read_at (cache_buf, img[i].pathFileOffset, (ut8*) &file, sizeof (file)) != sizeof (file)) {
++			continue;
++		}
++		file[255] = 0;
++		const char *key = sdb_fmt ("%s", file);
++		ht_pp_insert (path_to_idx, key, (void*) i);
++	}
++
++	return path_to_idx;
++}
++
++static void carve_deps_at_address(RBuffer *cache_buf, cache_img_t *img, cache_hdr_t *hdr, cache_map_t *maps, HtPP *path_to_idx, ut64 address, int *deps) {
++	ut64 pa = va2pa (address, hdr, maps, cache_buf, 0, NULL, NULL);
++	if (pa == UT64_MAX) {
++		return;
++	}
++	struct MACH0_(mach_header) mh;
++	if (r_buf_fread_at (cache_buf, pa, (ut8*) &mh, "8i", 1) != sizeof (struct MACH0_(mach_header))) {
++		return;
++	}
++	if (mh.magic != MH_MAGIC_64 || mh.sizeofcmds == 0) {
++		return;
++	}
++	ut64 cmds_at = pa + sizeof (struct MACH0_(mach_header));
++	ut8 *cmds = malloc (mh.sizeofcmds + 1);
++	if (!cmds || r_buf_read_at (cache_buf, cmds_at, cmds, mh.sizeofcmds) != mh.sizeofcmds) {
++		goto beach;
++	}
++	cmds[mh.sizeofcmds] = 0;
++	ut8 *cursor = cmds;
++	ut8 *end = cmds + mh.sizeofcmds;
++	while (cursor < end) {
++		ut32 cmd = r_read_le32 (cursor);
++		ut32 cmdsize = r_read_le32 (cursor + sizeof (ut32));
++		if (cmd == LC_LOAD_DYLIB ||
++				cmd == LC_LOAD_WEAK_

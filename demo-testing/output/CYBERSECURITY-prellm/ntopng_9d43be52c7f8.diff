@@ -1,0 +1,85 @@
+@@ -73,7 +73,6 @@ class Prefs {
+   bool enable_tiny_flows_export;
+   bool enable_captive_portal, enable_informative_captive_portal, mac_based_captive_portal;
+   bool override_dst_with_post_nat_dst, override_src_with_post_nat_src;
+-  bool use_ports_to_determine_src_and_dst;
+   bool routing_mode_enabled, global_dns_forging_enabled;
+   bool device_protocol_policies_enabled, enable_vlan_trunk_bridge;
+   bool enable_arp_matrix_generation;
+@@ -351,7 +350,6 @@ class Prefs {
+ 
+   inline bool do_override_dst_with_post_nat_dst()     const { return(override_dst_with_post_nat_dst);     };
+   inline bool do_override_src_with_post_nat_src()     const { return(override_src_with_post_nat_src);     };
+-  inline bool do_use_ports_to_determine_src_and_dst() const { return(use_ports_to_determine_src_and_dst); };
+   inline bool are_device_protocol_policies_enabled()  const { return(device_protocol_policies_enabled);   };
+ 
+   inline bool isVLANTrunkModeEnabled()                const { return(enable_vlan_trunk_bridge);           }
+
+
+
+
+@@ -697,9 +697,6 @@
+ #define CONST_DEFAULT_OVERRIDE_SRC_WITH_POST_NAT    NTOPNG_PREFS_PREFIX".override_src_with_post_nat_src"
+ #define CONST_DEFAULT_OVERRIDE_DST_WITH_POST_NAT    NTOPNG_PREFS_PREFIX".override_dst_with_post_nat_dst"
+ 
+-/* SRC/DST selection using port numbers (heuristic) */
+-#define CONST_DEFAULT_USE_PORTS_TO_DETERMINE_SRC_AND_DST NTOPNG_PREFS_PREFIX".use_ports_to_determine_src_and_dst"
+-
+ /* Flow Lua Calls */
+ #define FLOW_LUA_CALL_PROTOCOL_DETECTED_FN_NAME  "protocolDetected"
+ #define FLOW_LUA_CALL_PERIODIC_UPDATE_FN_NAME    "periodicUpdate"
+
+
+
+
+@@ -5324,6 +5324,13 @@ void Flow::triggerZeroWindowAlert(bool *as_client, bool *as_server) {
+ /* *************************************** */
+ 
+ bool Flow::check_swap(u_int32_t tcp_flags) {
++  /*
++    Non-packet interfaces, i.e., ZMQ, have the swap checked earlier. This is possible as there is
++    information on both flow directions for those interfaces.
++   */
++  if(!getInterface()->isPacketInterface())
++    return false;
++
+   /*
+     This is the heuristic "For TCP flows for which the 3WH has not been observed..."
+     at https://github.com/ntop/ntopng/issues/5058
+
+
+
+
+@@ -47,8 +47,7 @@ Prefs::Prefs(Ntop *_ntop) {
+     enable_captive_portal = false, mac_based_captive_portal = false,
+     enable_arp_matrix_generation = false,
+     enable_informative_captive_portal = false,
+-    override_dst_with_post_nat_dst = false, override_src_with_post_nat_src = false,
+-    use_ports_to_determine_src_and_dst = false;
++    override_dst_with_post_nat_dst = false, override_src_with_post_nat_src = false;
+     hostMask = no_host_mask;
+   enable_mac_ndpi_stats = false;
+   auto_assigned_pool_id = NO_HOST_POOL_ID;
+@@ -616,7 +615,6 @@ void Prefs::reloadPrefsFromRedis() {
+ 
+     override_dst_with_post_nat_dst = getDefaultBoolPrefsValue(CONST_DEFAULT_OVERRIDE_DST_WITH_POST_NAT, false),
+     override_src_with_post_nat_src = getDefaultBoolPrefsValue(CONST_DEFAULT_OVERRIDE_SRC_WITH_POST_NAT, false),
+-    use_ports_to_determine_src_and_dst = getDefaultBoolPrefsValue(CONST_DEFAULT_USE_PORTS_TO_DETERMINE_SRC_AND_DST, false),
+ 
+     max_num_packets_per_tiny_flow = getDefaultPrefsValue(CONST_MAX_NUM_PACKETS_PER_TINY_FLOW,
+ 							 CONST_DEFAULT_MAX_NUM_PACKETS_PER_TINY_FLOW),
+
+
+
+
+@@ -1132,13 +1132,15 @@ bool ZMQParserInterface::preprocessFlow(ParsedFlow *flow) {
+ 	 && flow->event_type != ebpf_event_type_tcp_connect
+ 	 && ntohs(flow->src_port) < ntohs(flow->dst_port))
+ 	flow->swap();
+-    } else if(ntop->getPrefs()->do_use_ports_to_determine_src_and_dst()) {
++    } else if(ntohs(flow->src_port) < 1024
++	 && ntohs(flow->src_port) < ntohs(flow->dst_port)
++	 && flow->in_pkts && flow->out_pkts /* Make sure there's traffic in both directions */
++	      && (flow->l4_proto != IPPROTO_TCP  /* Not TCP or TCP but without 3WH (See https://github.com/ntop/ntopng/issues/5058) */
++	     || !((flow->tcp.server_tcp_flags | flow->tcp.server_tcp_flags | flow->tcp.tcp_flags) & TH_SYN)))
+       /* Attempt to deter

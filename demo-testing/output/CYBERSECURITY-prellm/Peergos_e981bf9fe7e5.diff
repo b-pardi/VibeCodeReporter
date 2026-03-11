@@ -1,0 +1,105 @@
+@@ -351,9 +351,18 @@ public class Main {
+             JavaPoster ipfsApi = new JavaPoster(ipfsApiAddress);
+             JavaPoster ipfsGateway = new JavaPoster(ipfsGatewayAddress);
+ 
+-            ContentAddressedStorage localDht = useIPFS ?
+-                    new CachingStorage(new ContentAddressedStorage.HTTP(ipfsApi, false), dhtCacheEntries, maxValueSizeToCache) :
+-                    new FileContentAddressedStorage(blockstorePath(a));
++            ContentAddressedStorage localDht;
++            if (useIPFS) {
++                boolean enableGC = a.getBoolean("enable-gc", false);
++                ContentAddressedStorage.HTTP ipfs = new ContentAddressedStorage.HTTP(ipfsApi, false);
++                if (enableGC) {
++                    GarbageCollector gced = new GarbageCollector(ipfs, a.getInt("gc.period.millis", 60 * 60 * 1000));
++                    gced.start();
++                    localDht = new CachingStorage(gced, dhtCacheEntries, maxValueSizeToCache);
++                } else
++                    localDht = new CachingStorage(ipfs, dhtCacheEntries, maxValueSizeToCache);
++            } else
++                localDht = new FileContentAddressedStorage(blockstorePath(a));
+ 
+             String hostname = a.getArg("domain");
+             Multihash nodeId = localDht.id().get();
+
+
+
+
+@@ -56,6 +56,11 @@ public class FileContentAddressedStorage implements ContentAddressedStorage {
+         return CompletableFuture.completedFuture(true);
+     }
+ 
++    @Override
++    public CompletableFuture<Boolean> gc() {
++        return CompletableFuture.completedFuture(true);
++    }
++
+     @Override
+     public CompletableFuture<List<Multihash>> put(PublicKeyHash owner,
+                                                   PublicKeyHash writer,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,146 @@
++package peergos.server.storage;
++
++import peergos.server.util.*;
++import peergos.shared.cbor.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.storage.*;
++
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.concurrent.atomic.*;
++import java.util.logging.*;
++
++public class GarbageCollector implements ContentAddressedStorage {
++
++    private static final long MAX_WAIT_FOR_TRANSACTION_MILLIS = 10_000;
++
++    private final ContentAddressedStorage target;
++    private final long gcPeriodMillis;
++    private final Object gcLock = new Object();
++    private final ConcurrentHashMap<PublicKeyHash, AtomicInteger> openTransactions = new ConcurrentHashMap<>();
++
++    public GarbageCollector(ContentAddressedStorage target, long gcPeriodMillis) {
++        this.target = target;
++        this.gcPeriodMillis = gcPeriodMillis;
++    }
++
++    public void start() {
++        new Thread(this::run).start();
++    }
++
++    private int openTransactions() {
++        int res = 0;
++        for (AtomicInteger open : openTransactions.values()) {
++            res += Math.max(0, open.get());
++        }
++        return res;
++    }
++
++    public void run() {
++        while (true) {
++            try {
++                synchronized (gcLock) {
++                    long start = System.nanoTime();
++                    while (openTransactions() > 0) {
++                        if ((System.nanoTime() - start) / 1000 > MAX_WAIT_FOR_TRANSACTION_MILLIS)
++                            openTransactions.clear();
++                        Thread.sleep(MAX_WAIT_FOR_TRANSACTION_MILLIS / 20);
++                    }
++                    long ready = System.nanoTime();
++                    target.gc().join();
++                    long done = System.nanoTime();
++                    Logging.LOG().info(String.format("GC took: %d ms waiting to start, %d ms in actual GC",
++                            (ready - start)/1000000, (done - ready)/1000000));
++                }
++                Thread.sleep(gcPeriodMillis);
++            } catch (Throwable t) {
++                Logging.LOG().log(Level.WARNING, t.getMessage(), t);
++            }
++        }
++  

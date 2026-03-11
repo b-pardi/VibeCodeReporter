@@ -1,0 +1,98 @@
+@@ -27,13 +27,25 @@ import java.util.ServiceLoader;
+ import java.util.SortedSet;
+ import java.util.TreeSet;
+ import java.util.zip.GZIPInputStream;
+-import java.util.zip.GZIPOutputStream;
+-import org.apache.commons.io.IOUtils;
++import net.jpountz.lz4.LZ4FrameInputStream;
++import net.jpountz.lz4.LZ4FrameOutputStream;
+ import org.batfish.common.BatfishException;
+ import org.batfish.common.util.BatfishObjectInputStream;
+ 
+ public abstract class PluginConsumer implements IPluginConsumer {
+ 
++  /** Supported formats we can deserialize from */
++  public enum Format {
++    JAVA_SERIALIZED,
++    LZ4,
++    GZIP,
++    UNKNOWN
++  }
++
++  public static final int DEFAULT_HEADER_LENGTH_BYTES = 4;
++
++  private static final int GZIP_HEADER_LENGTH_BYTES = 2;
++
+   /**
+    * A byte-array containing the first 4 bytes of the header for a file that is the output of java
+    * serialization
+@@ -42,6 +54,12 @@ public abstract class PluginConsumer implements IPluginConsumer {
+     (byte) 0xac, (byte) 0xed, (byte) 0x00, (byte) 0x05
+   };
+ 
++  private static final byte[] LZ4_MAGIC_BYTES = {
++    (byte) 0x04, (byte) 0x22, (byte) 0x4D, (byte) 0x18
++  };
++
++  private static final byte[] GZIP_MAGIC_BYTES = {(byte) 0x1f, (byte) 0x8b};
++
+   private ClassLoader _currentClassLoader;
+ 
+   private final boolean _serializeToText;
+@@ -51,43 +69,72 @@ public abstract class PluginConsumer implements IPluginConsumer {
+     _serializeToText = serializeToText;
+   }
+ 
++  /**
++   * Deserialize object from given bytes into and instance of {@link S}
++   *
++   * @deprecated in favor of {@link #deserializeObject(Path, Class)} or {@link
++   *     #deserializeObject(InputStream, Class, Format)}
++   */
++  @Deprecated
+   protected <S extends Serializable> S deserializeObject(byte[] data, Class<S> outputClass) {
+-    ByteArrayInputStream stream = new ByteArrayInputStream(data);
+-    return deserializeObject(stream, outputClass);
++    try (ByteArrayInputStream stream = new ByteArrayInputStream(data)) {
++      return deserializeObject(stream, outputClass, detectFormat(new PushbackInputStream(stream)));
++    } catch (IOException e) {
++      throw new BatfishException(
++          "Failed to deserialize object of type '" + outputClass.getCanonicalName() + "' from data",
++          e);
++    }
+   }
+ 
+-  protected <S extends Serializable> S deserializeObject(InputStream stream, Class<S> outputClass) {
++  private <S extends Serializable> S deserializeObject(
++      InputStream stream, Class<S> outputClass, Format format) throws IOException {
+     try {
+-      // Allows us to peek at the beginning of the stream and then push the bytes back in for
+-      // downstream consumers to read.
+-      PushbackInputStream pbstream =
+-          new PushbackInputStream(stream, JAVA_SERIALIZED_OBJECT_HEADER.length);
+-      boolean isJavaSerializationData = isJavaSerializationData(pbstream);
+       ObjectInputStream ois;
+-      if (!isJavaSerializationData) {
++      if (format != Format.JAVA_SERIALIZED) {
+         XStream xstream = new XStream(new DomDriver("UTF-8"));
+         xstream.setClassLoader(_currentClassLoader);
+-        ois = xstream.createObjectInputStream(pbstream);
++        ois = xstream.createObjectInputStream(stream);
+       } else {
+-        ois = new BatfishObjectInputStream(pbstream, _currentClassLoader);
++        ois = new BatfishObjectInputStream(stream, _currentClassLoader);
+       }
+       Object o = ois.readObject();
+       return outputClass.cast(o);
+-    } catch (IOException | ClassNotFoundException | ClassCastException e) {
++    } catch (ClassNotFoundException | ClassCastException e) {
+       throw new BatfishException(
+           "Failed to deserialize object of type '" + outputClass.getCanonicalName() + "' from data",
+           e);
+     }
+   }
+ 
++  /** Deserialize object from file, with support for different compression methods. */
+   protected <S extends Serializable> S deserializeObject(Path inputFile, Class<S> outputClass) {
+     try {
+       // Awkward nested try blocks req

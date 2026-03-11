@@ -1,0 +1,158 @@
+@@ -40,6 +40,18 @@ Attr::Attr(AttrTag t)
+ void Attr::SetAttrExpr(ExprPtr e)
+ 	{ expr = std::move(e); }
+ 
++std::string Attr::DeprecationMessage() const
++	{
++	if ( tag != ATTR_DEPRECATED )
++		return "";
++
++	if ( ! expr )
++		return "";
++
++	auto ce = static_cast<zeek::detail::ConstExpr*>(expr.get());
++	return ce->Value()->AsStringVal()->CheckString();
++	}
++
+ void Attr::Describe(ODesc* d) const
+ 	{
+ 	AddTag(d);
+
+
+
+
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <vector>
++#include <string>
+ 
+ #include "Obj.h"
+ #include "BroList.h"
+@@ -73,6 +74,12 @@ public:
+ 	void Describe(ODesc* d) const override;
+ 	void DescribeReST(ODesc* d, bool shorten = false) const;
+ 
++	/**
++	 * Returns the deprecation string associated with a &deprecated attribute
++	 * or an empty string if this is not such an attribute.
++	 */
++	std::string DeprecationMessage() const;
++
+ 	bool operator==(const Attr& other) const
+ 		{
+ 		if ( tag != other.tag )
+
+
+
+
+@@ -294,14 +294,7 @@ std::string ID::GetDeprecationWarning() const
+ 	const auto& depr_attr = GetAttr(ATTR_DEPRECATED);
+ 
+ 	if ( depr_attr )
+-		{
+-		auto expr = static_cast<zeek::detail::ConstExpr*>(depr_attr->GetExpr().get());
+-		if ( expr )
+-			{
+-			StringVal* text = expr->Value()->AsStringVal();
+-			result = text->CheckString();
+-			}
+-		}
++		result = depr_attr->DeprecationMessage();
+ 
+ 	if ( result.empty() )
+ 		return fmt("deprecated (%s)", Name());
+
+
+
+
+@@ -563,7 +563,7 @@ FuncType::FuncType(RecordTypePtr arg_args,
+ 		offsets[i] = i;
+ 		}
+ 
+-	prototypes.emplace_back(Prototype{false, args, std::move(offsets)});
++	prototypes.emplace_back(Prototype{false, "", args, std::move(offsets)});
+ 	}
+ 
+ TypePtr FuncType::ShallowClone()
+@@ -1120,14 +1120,7 @@ string RecordType::GetFieldDeprecationWarning(int field, bool has_check) const
+ 		{
+ 		string result;
+ 		if ( const auto& deprecation = decl->GetAttr(zeek::detail::ATTR_DEPRECATED) )
+-			{
+-			auto expr = static_cast<zeek::detail::ConstExpr*>(deprecation->GetExpr().get());
+-			if ( expr )
+-				{
+-				StringVal* text = expr->Value()->AsStringVal();
+-				result = text->CheckString();
+-				}
+-			}
++			result = deprecation->DeprecationMessage();
+ 
+ 		if ( result.empty() )
+ 			return fmt("deprecated (%s%s$%s)", GetName().c_str(), has_check ? "?" : "",
+
+
+
+
+@@ -427,6 +427,7 @@ public:
+ 	 */
+ 	struct Prototype {
+ 		bool deprecated;
++		std::string deprecation_msg;
+ 		RecordTypePtr args;
+ 		std::map<int, int> offsets;
+ 	};
+
+
+
+
+@@ -100,13 +100,23 @@ static bool add_prototype(const zeek::detail::IDPtr& id, zeek::Type* t,
+ 		}
+ 
+ 	auto deprecated = false;
++	std::string depr_msg;
+ 
+ 	if ( attrs )
+ 		for ( const auto& a : *attrs )
+ 			if ( a->Tag() == zeek::detail::ATTR_DEPRECATED )
++				{
+ 				deprecated = true;
++				depr_msg = a->DeprecationMessage();
++				break;
++				}
++
++	zeek::FuncType::Prototype p;
++	p.deprecated = deprecated;
++	p.deprecation_msg = std::move(depr_msg);
++	p.args = alt_args;
++	p.offsets = std::move(offsets);
+ 
+-	zeek::FuncType::Prototype p{deprecated, alt_args, std::move(offsets)};
+ 	canon_ft->AddPrototype(std::move(p));
+ 	return true;
+ 	}
+@@ -454,9 +464,19 @@ static std::optional<zeek::FuncType::Prototype> func_type_check(const zeek::Func
+ 
+ 	if ( rval )
+ 		for ( auto i = 0; i < rval->args->NumFields(); ++i )
+-			if ( rval->args->FieldDecl(i)->GetAttr(zeek::detail::ATTR_DEPRECATED) )
+-				impl->Warn(fmt("use of deprecated parameter '%s'",
+-				               rval->args->FieldName(i)), decl, true);
++			if ( auto ad = rval->args->FieldDecl(i)->GetAttr(zeek::detail::ATTR_DEPRECATED) )
++				{
++				auto msg = ad->DeprecationMessage();
++
++				if ( msg.empty() )
++					impl->Warn(fmt("use of deprecated parameter '%s'",
++				                   rval->args->FieldName(i)),
++				               decl, true);
++				else
++					impl->Warn(fmt("use of deprecated parameter '%s': %s",
++				                   rval->args->FieldName(i), msg.data()),
++				               decl, true);
++				}
+ 
+ 	return rval;
+ 	}
+@@ -531,8 +551,15 @@ void begin_func(zeek::detail::IDPtr id, const char* module_name

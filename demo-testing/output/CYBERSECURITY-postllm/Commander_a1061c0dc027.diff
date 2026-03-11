@@ -1,0 +1,89 @@
+@@ -65,13 +65,17 @@ VERIFY_SSL = bool(os.environ.get("VERIFY_SSL", "TRUE") == "TRUE")
+ import threading
+ _CONVERSATION_KEYS_LOCK = threading.Lock()
+ _GLOBAL_CONVERSATION_KEYS = {}  # conversationId -> symmetric_key mapping
+-_ACTIVE_WEBSOCKET_THREAD = None
+-_WEBSOCKET_THREAD_LOCK = threading.Lock()
+ 
+ # Global tunnel session management by tube_id
+ _TUNNEL_SESSIONS_LOCK = threading.Lock()
+ _GLOBAL_TUNNEL_SESSIONS = {}  # tube_id -> TunnelSession mapping
+ 
++# NOTE: Global WebSocket variables removed! Each tunnel now has its own dedicated WebSocket.
++# - _ACTIVE_WEBSOCKET_THREAD removed - each tunnel has tunnel_session.websocket_thread
++# - _WEBSOCKET_READY_EVENT removed - each tunnel has tunnel_session.websocket_ready_event
++# - _WEBSOCKET_THREAD_LOCK removed - no longer needed with dedicated WebSockets
++# - _WEBSOCKET_REGISTRATION_LOCK removed - no contention with dedicated WebSockets
++
+ 
+ class CloseConnectionReason:
+     """
+@@ -206,6 +210,10 @@ class TunnelSession:
+         self.buffered_ice_candidates = []
+         self.creation_time = time.time()
+         self.last_activity = time.time()
++        # Per-tunnel WebSocket management
++        self.websocket_thread = None
++        self.websocket_ready_event = None
++        self.websocket_stop_event = None
+     
+     def update_activity(self):
+         """Update last activity timestamp"""
+@@ -280,19 +288,21 @@ def clear_all_conversation_keys():
+ 
+ def get_conversation_status():
+     """Get current conversation key status for debugging (thread-safe)"""
+-    # Get conversation info first
+     with _CONVERSATION_KEYS_LOCK:
+         active_conversations = len(_GLOBAL_CONVERSATION_KEYS)
+         conversation_ids = list(_GLOBAL_CONVERSATION_KEYS.keys())
+     
+-    # Get websocket info separately to avoid nested locks
+-    with _WEBSOCKET_THREAD_LOCK:
+-        websocket_active = _ACTIVE_WEBSOCKET_THREAD is not None and _ACTIVE_WEBSOCKET_THREAD.is_alive()
++    # Get tunnel session info to count active WebSockets
++    with _TUNNEL_SESSIONS_LOCK:
++        active_websockets = sum(1 for session in _GLOBAL_TUNNEL_SESSIONS.values() 
++                               if session.websocket_thread and session.websocket_thread.is_alive())
++        total_tunnels = len(_GLOBAL_TUNNEL_SESSIONS)
+     
+     return {
+         "active_conversations": active_conversations,
+         "conversation_ids": conversation_ids,
+-        "websocket_thread_active": websocket_active
++        "active_websockets": active_websockets,
++        "total_tunnels": total_tunnels
+     }
+ 
+ 
+@@ -426,6 +436,8 @@ def find_open_port(tried_ports: list, start_port=49152, end_port=65535, preferre
+ def is_port_open(host: str, port: int) -> bool:
+     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+         try:
++            # Enable SO_REUSEADDR to allow binding to ports in TIME_WAIT state
++            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+             s.bind((host, port))
+             return True
+         except OSError:
+@@ -662,10 +674,19 @@ def resolve_pam_config(params, record_uid, pam_config_option):
+ 
+ 
+ # Direct WebSocket handler - no stored state
+-async def connect_websocket_with_fallback(ws_endpoint, headers, ssl_context, tube_registry, timeout):
++async def connect_websocket_with_fallback(ws_endpoint, headers, ssl_context, tube_registry, timeout, ready_event=None, stop_event=None):
+     """
+     Connect to WebSocket with backward compatibility for both websockets 15.0.1+ and 11.0.3
+     Handles parameter name differences between versions
++    
++    Args:
++        ws_endpoint: WebSocket URL
++        headers: Connection headers
++        ssl_context: SSL context for secure connections
++        tube_registry: PyTubeRegistry instance
++        timeout: Maximum time to listen for messages
++        ready_event: threading.Event to signal when connected
++        stop_event: threading.Event to signal when to close
+     """
+     # Base connection parameters that work across versions
+     base_kwargs = {
+@@ -68

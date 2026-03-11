@@ -1,0 +1,128 @@
+@@ -69,7 +69,8 @@ R_API RAnalFunction *r_anal_function_new(RAnal *anal) {
+ 	fcn->bp_frame = true;
+ 	fcn->is_noreturn = false;
+ 	fcn->meta._min = UT64_MAX;
+-	r_pvector_init (&fcn->vars, (RPVectorFree)r_anal_var_free);
++	r_pvector_init (&fcn->vars, NULL);
++	fcn->inst_vars = ht_up_new0 ();
+ 	return fcn;
+ }
+ 
+@@ -95,6 +96,8 @@ R_API void r_anal_function_free(void *_fcn) {
+ 		ht_pp_delete (anal->ht_name_fun, fcn->name);
+ 	}
+ 
++	ht_up_free (fcn->inst_vars);
++	fcn->inst_vars = NULL;
+ 	r_pvector_clear (&fcn->vars);
+ 
+ 	free (fcn->name);
+@@ -168,6 +171,17 @@ R_API RAnalFunction *r_anal_get_function_at(RAnal *anal, ut64 addr) {
+ 	return NULL;
+ }
+ 
++typedef struct {
++	HtUP *inst_vars_new;
++	st64 delta;
++} InstVarsRelocateCtx;
++
++static bool inst_vars_relocate_cb(void *user, const ut64 k, const void *v) {
++	InstVarsRelocateCtx *ctx = user;
++	ht_up_insert (ctx->inst_vars_new, k - ctx->delta, (void *)v);
++	return true;
++}
++
+ R_API bool r_anal_function_relocate(RAnalFunction *fcn, ut64 addr) {
+ 	if (fcn->addr == addr) {
+ 		return true;
+@@ -176,6 +190,27 @@ R_API bool r_anal_function_relocate(RAnalFunction *fcn, ut64 addr) {
+ 		return false;
+ 	}
+ 	ht_up_delete (fcn->anal->ht_addr_fun, fcn->addr);
++
++	// relocate the var accesses (their addrs are relative to the function addr)
++	st64 delta = (st64)addr - (st64)fcn->addr;
++	void **it;
++	r_pvector_foreach (&fcn->vars, it) {
++		RAnalVar *var = *it;
++		RAnalVarAccess *acc;
++		r_vector_foreach (&var->accesses, acc) {
++			acc->offset -= delta;
++		}
++	}
++	InstVarsRelocateCtx ctx = {
++		.inst_vars_new  = ht_up_new0 (),
++		.delta = delta
++	};
++	if (ctx.inst_vars_new) {
++		ht_up_foreach (fcn->inst_vars, inst_vars_relocate_cb, &ctx);
++		ht_up_free (fcn->inst_vars);
++		fcn->inst_vars = ctx.inst_vars_new;
++	}
++
+ 	fcn->addr = addr;
+ 	ht_up_insert (fcn->anal->ht_addr_fun, addr, fcn);
+ 	return true;
+
+
+
+
+@@ -7,20 +7,8 @@
+ 
+ #define DB a->sdb_fcns
+ 
+-struct VarType {
+-	bool isarg;
+-	char *type;
+-	int size;
+-	char *name;
+-	char *regname;
+-};
+-
+-#define SDB_VARTYPE_FMT "bzdzz"
++#define ACCESS_CMP(x, y) ((x) - ((RAnalVarAccess *)y)->offset)
+ 
+-#define EXISTS(x, ...) snprintf (key, sizeof (key) - 1, x, ## __VA_ARGS__), sdb_exists (DB, key)
+-#define SETKEY(x, ...) snprintf (key, sizeof (key) - 1, x, ## __VA_ARGS__);
+-#define SETKEY2(x, ...) snprintf (key2, sizeof (key) - 1, x, ## __VA_ARGS__);
+-#define SETVAL(x, ...) snprintf (val, sizeof (val) - 1, x, ## __VA_ARGS__);
+ R_API bool r_anal_var_display(RAnal *anal, int delta, char kind, const char *type) {
+ 	char *fmt = r_type_format (anal->sdb_types, type);
+ 	RRegItem *i;
+@@ -79,19 +67,14 @@ static const char *__int_type_from_size(int size) {
+ 	}
+ }
+ 
+-R_API bool r_anal_var_rebase(RAnal *a, RAnalFunction *fcn, ut64 diff) {
++R_API bool r_anal_function_rebase_vars(RAnal *a, RAnalFunction *fcn) {
+ 	r_return_val_if_fail (a && fcn, false);
+ 	RListIter *it;
+ 	RAnalVar *var;
+ 	RList *var_list = r_anal_var_all_list (a, fcn);
+ 	r_return_val_if_fail (var_list, false);
+ 
+-	ut64 from_addr = fcn->addr;
+-	ut64 to_addr = from_addr + diff;
+-
+ 	r_list_foreach (var_list, it, var) {
+-		const char *var_access = sdb_fmt ("var.0x%"PFMT64x ".%d.%d.access", from_addr, 1, var->delta);
+-		char *access = sdb_get (a->sdb_fcns, var_access, NULL);
+ 		// Resync delta in case the registers list changed
+ 		if (var->isarg && var->kind == 'r') {
+ 			RRegItem *reg = r_reg_get (a->reg, var->regname, -1);
+@@ -101,9 +84,6 @@ R_API bool r_anal_var_rebase(RAnal *a, RAnalFunction *fcn, ut64 diff) {
+ 				}
+ 			}
+ 		}
+-		var_access = sdb_fmt ("var.0x%"PFMT64x ".%d.%d.access", to_addr, 1, var->delta);
+-		sdb_set (a->sdb_fcns, var_access, access, 0);
+-		free (access);
+ 	}
+ 
+ 	r_list_free (var_list);
+@@ -112,8 +92,8 @@ R_API bool r_anal_var_rebase(RAnal *a, RAnalFunction *fcn, ut64 diff) {
+ 
+ // If the type of var is a struct,
+ // remove all other vars that are overlapped by var and are at the offset of one of its struct members
+-static void shadow_var_struct_members(RAnalFunction *fcn, RAnalVar *var) {
+-	Sdb *TDB

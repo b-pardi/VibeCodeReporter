@@ -1,0 +1,123 @@
+@@ -1129,6 +1129,8 @@ class Conf(ConfClass):
+     #: Windows SSPs for sniffing. This is used with
+     #: dcerpc_session_enable
+     winssps_passive = []
++    #: Disables auto-stripping of StrFixedLenField for debugging purposes
++    debug_strfixedlenfield = False
+ 
+     def __getattribute__(self, attr):
+         # type: (str) -> Any
+
+
+
+
+@@ -1865,7 +1865,7 @@ class StrFixedLenField(StrField):
+             name,  # type: str
+             default,  # type: Optional[bytes]
+             length=None,  # type: Optional[int]
+-            length_from=None,  # type: Optional[Callable[[Packet], int]]  # noqa: E501
++            length_from=None,  # type: Optional[Callable[[Packet], int]]
+     ):
+         # type: (...) -> None
+         super(StrFixedLenField, self).__init__(name, default)
+@@ -1879,7 +1879,7 @@ class StrFixedLenField(StrField):
+                v,  # type: bytes
+                ):
+         # type: (...) -> str
+-        if isinstance(v, bytes):
++        if isinstance(v, bytes) and not conf.debug_strfixedlenfield:
+             v = v.rstrip(b"\0")
+         return super(StrFixedLenField, self).i2repr(pkt, v)
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,498 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# This file is part of Scapy
++# See https://scapy.net/ for more information
++# Copyright (C) Gabriel Potter
++
++"""
++Forwarding machine.
++"""
++
++import enum
++import functools
++import os
++import select
++import socket
++import ssl
++import threading
++import traceback
++
++from scapy.asn1.asn1 import ASN1_OID
++from scapy.config import conf
++from scapy.data import MTU
++from scapy.packet import Packet
++from scapy.supersocket import StreamSocket, StreamSocketPeekless
++from scapy.themes import DefaultTheme
++from scapy.utils import get_temp_file
++from scapy.volatile import RandInt
++
++from scapy.layers.tls.all import (
++    Cert,
++    PrivKeyECDSA,
++)
++from scapy.layers.x509 import (
++    X509_AlgorithmIdentifier,
++)
++
++from cryptography.hazmat.primitives import serialization
++
++# Typing imports
++from typing import (
++    Type,
++    Optional,
++)
++
++
++class ForwardMachine:
++    """
++    Forward Machine
++
++    This binds a port and relay any connections from 'clients' to
++    their original destination a 'server'. Forwarding machine can be used in
++    two modes:
++
++    - SERVER: the server binds a port on its local IP and forwards packets to a
++        ``remote_address``.
++    - TPROXY: the server binds can intercept packets to any IP destination, provided
++        that they are routed through the local server, and some tweaking of the OS
++        routes;
++
++    The TPROXY mode is expected to be used on a router with FORWARDING and only a
++    specific set of nat rules set to -j TPROXY. A script called 'vethrelay.sh'
++    is provided in the documentation for setting this up.
++
++    ForwardMachine supports transparently proxifying TLS. By default, it will generate
++    lookalike self-signed certificates, but it's also possible to specify a certificate
++    by using crtfile and keyfile.
++
++    Parameters:
++
++    :param port: the port to listen on
++    :param cls: the scapy class to parse on that port
++    :param af: the address family to use (default AF_INET)
++    :param proto: the proto to use (default SOCK_STREAM)
++    :param remote_address: the IP to use in SERVER mode, or by default in TPROXY when
++        the destination is the local IP.
++    :param remote_af: (optional) if provided, use a different address family to connect
++        to the remote host.
++    :param bind_address: the IP to bind locally. "0.0.0.0" by default in SERVER mode,
++        but "2.2.2.2" by default in TPROXY (if you are using the provided
++        'vethrelay.sh' script).
++    :param tls: enable TLS (in both the server and client)
++    :param crtfile: (optional) if provided, uses a certificate instead of self signed
++        ones.
++    :param keyfile: (optional) path to the key file
++    :param timeout: the timeout before connecting to the real server (default 2)
++
++    Methods

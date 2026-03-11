@@ -1,0 +1,118 @@
+@@ -131,7 +131,6 @@
+ #include <stdlib.h>
+ #include <limits.h>
+ #include <list>
+-#include <vector>
+ 
+ extern NmapOps o;
+ 
+@@ -623,26 +622,51 @@ static void process_request(int action, info &reqinfo) {
+ 
+ // After processing a DNS response, we search through the IPs we're
+ // looking for and update their results as necessary.
+-static int process_result(const sockaddr_storage &ip, const std::string &result, int action, info &reqinfo)
++static bool process_result(const std::string &name, const DNS::Record *rr, info &reqinfo, bool already_matched)
+ {
+-  assert(action == ACTION_FINISHED);
+-  request *tpreq = reqinfo.tpreq;
+-
+-  if (!result.empty())
+-  {
+-    if (!sockaddr_storage_equal(&ip, &tpreq->targ->ss))
+-    {
+-      if (o.debugging)
+-        log_write(LOG_STDOUT, "mass_rdns: Mismatched record for ID %d\n", tpreq->id);
+-      return 0;
+-    }
+-
+-
+-    tpreq->targ->name = result;
+-    host_cache.add(tpreq->targ->ss, result);
++  DNS::Request *reqt = reqinfo.tpreq->targ;
++  const struct sockaddr_storage *ss = NULL;
++  const DNS::A_Record *a_rec = NULL;
++  sockaddr_storage ip;
++  ip.ss_family = AF_UNSPEC;
++  switch (reqt->type) {
++    case DNS::A:
++    case DNS::AAAA:
++      if (!already_matched && name != reqt->name) {
++        return false;
++      }
++      a_rec = static_cast<const DNS::A_Record *>(rr);
++      memcpy(&reqt->ss, &a_rec->value, sizeof(struct sockaddr_storage));
++      if (o.debugging >= TRACE_DEBUG_LEVEL)
++      {
++        log_write(LOG_STDOUT, "mass_dns: OK MATCHED <%s> to <%s>\n",
++            reqt->name.c_str(),
++            inet_ntop_ez(&a_rec->value, sizeof(struct sockaddr_storage)));
++      }
++      break;
++    case DNS::PTR:
++      ss = &reqt->ss;
++      if (!already_matched) {
++        if (!DNS::Factory::ptrToIp(name, ip) ||
++            !sockaddr_storage_equal(&ip, ss)) {
++          return false;
++        }
++      }
++      reqt->name = static_cast<const DNS::PTR_Record *>(rr)->value;
++      host_cache.add(*ss, reqt->name);
++      if (o.debugging >= TRACE_DEBUG_LEVEL)
++      {
++        log_write(LOG_STDOUT, "mass_dns: OK MATCHED <%s> to <%s>\n",
++            inet_ntop_ez(ss, sizeof(struct sockaddr_storage)),
++            reqt->name.c_str());
++      }
++      break;
++    default:
++      assert(false);
++      break;
+   }
+ 
+-  process_request(action, reqinfo);
++  process_request(ACTION_FINISHED, reqinfo);
+ 
+   do_possible_writes();
+ 
+@@ -717,6 +741,7 @@ static void read_evt_handler(nsock_pool nsp, nsock_event evt, void *) {
+   sockaddr_storage ip;
+   ip.ss_family = AF_UNSPEC;
+   std::string alias;
++  DNS::Request *reqt = reqinfo.tpreq->targ;
+ 
+   for(std::list<DNS::Answer>::const_iterator it = p.answers.begin();
+       it != p.answers.end() && !processing_successful; ++it )
+@@ -724,51 +749,27 @@ static void read_evt_handler(nsock_pool nsp, nsock_event evt, void *) {
+     const DNS::Answer &a = *it;
+     if(a.record_class == DNS::CLASS_IN)
+     {
+-      switch(a.record_type)
+-      {
+-        case DNS::PTR:
+-        {
+-          DNS::PTR_Record * ptr = static_cast<DNS::PTR_Record *>(a.record);
+-
+-          if(
+-            // If CNAME answer filled in ip with a matching alias
+-            (ip.ss_family != AF_UNSPEC && a.name == alias )
+-            // Or if we can get an IP from reversing the .arpa PTR address
+-            || DNS::Factory::ptrToIp(a.name, ip))
+-          {
+-            if ((processing_successful = process_result(ip, ptr->value, ACTION_FINISHED, reqinfo)))
+-            {
+-              if (o.debugging >= TRACE_DEBUG_LEVEL)
+-              {
+-                char ipstr[INET6_ADDRSTRLEN];
+-                sockaddr_storage_iptop(&ip, ipstr);
+-                log_write(LOG_STDOUT, "mass_rdns: OK MATCHED <%s> to <%s>\n",
+-                          ipstr,
+-                          ptr->value.c_str());
+-              }
+-              output_summary();
+-              stat_ok++;
+-            }
+-          }
+-          break;
++      if (reqt->type == a.record_type) {
++        processing_successful = process

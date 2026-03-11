@@ -1,0 +1,118 @@
+@@ -25,21 +25,6 @@ class GatherV2ClientHelloTest : public TlsConnectTestBase {
+   }
+ };
+ 
+-// Gather a 5-byte v3 record, with a zero fragment length. The empty handshake
+-// message should be ignored, and the connection will succeed afterwards.
+-TEST_F(TlsConnectTest, GatherEmptyV3Record) {
+-  DataBuffer buffer;
+-
+-  size_t idx = 0;
+-  idx = buffer.Write(idx, 0x16, 1);    // handshake
+-  idx = buffer.Write(idx, 0x0301, 2);  // record_version
+-  (void)buffer.Write(idx, 0U, 2);      // length=0
+-
+-  EnsureTlsSetup();
+-  client_->SendDirect(buffer);
+-  Connect();
+-}
+-
+ // Gather a 5-byte v3 record, with a fragment length exceeding the maximum.
+ TEST_F(TlsConnectTest, GatherExcessiveV3Record) {
+   DataBuffer buffer;
+
+
+
+
+@@ -309,4 +309,298 @@ auto kTrueFalse = ::testing::ValuesIn(kTrueFalseArr);
+ 
+ INSTANTIATE_TEST_SUITE_P(TlsPadding, TlsPaddingTest,
+                          ::testing::Combine(kContentSizes, kTrueFalse));
+-}  // namespace nss_test
++
++/* This filter modifies any application data record, changes its inner content
++ * type to the specified one (default handshake) and optionally add padding,
++ * to create records/fragments invalid in TLS 1.3.
++ *
++ * Implementations MUST NOT send Handshake and Alert records that have a
++ * zero-length TLSInnerPlaintext.content; if such a message is received,
++ * the receiving implementation MUST terminate the connection with an
++ * "unexpected_message" alert [RFC8446, Section 5.4].
++ *
++ * !!! TLS 1.3 ONLY !!! */
++class ZeroLengthInnerPlaintextCreatorFilter : public TlsRecordFilter {
++ public:
++  ZeroLengthInnerPlaintextCreatorFilter(
++      const std::shared_ptr<TlsAgent>& a,
++      SSLContentType contentType = ssl_ct_handshake, size_t padding = 0)
++      : TlsRecordFilter(a), contentType_(contentType), padding_(padding) {}
++
++ protected:
++  PacketFilter::Action FilterRecord(const TlsRecordHeader& header,
++                                    const DataBuffer& record, size_t* offset,
++                                    DataBuffer* output) override {
++    if (!header.is_protected()) {
++      return KEEP;
++    }
++
++    uint16_t protection_epoch;
++    uint8_t inner_content_type;
++    DataBuffer plaintext;
++    TlsRecordHeader out_header;
++    if (!Unprotect(header, record, &protection_epoch, &inner_content_type,
++                   &plaintext, &out_header)) {
++      return KEEP;
++    }
++
++    if (decrypting() && inner_content_type != ssl_ct_application_data) {
++      return KEEP;
++    }
++
++    DataBuffer ciphertext;
++    bool ok = Protect(spec(protection_epoch), out_header, contentType_,
++                      DataBuffer(0), &ciphertext, &out_header, padding_);
++    EXPECT_TRUE(ok);
++    if (!ok) {
++      return KEEP;
++    }
++
++    *offset = out_header.Write(output, *offset, ciphertext);
++    return CHANGE;
++  }
++
++ private:
++  SSLContentType contentType_;
++  size_t padding_;
++};
++
++/* Zero-length InnerPlaintext test class
++ *
++ * Parameter = Tuple of:
++ * - TLS variant (datagram/stream)
++ * - Content type to be set in zero-length inner plaintext record
++ * - Padding of record plaintext
++ */
++class ZeroLengthInnerPlaintextSetupTls13
++    : public TlsConnectTestBase,
++      public testing::WithParamInterface<
++          std::tuple<SSLProtocolVariant, SSLContentType, size_t>> {
++ public:
++  ZeroLengthInnerPlaintextSetupTls13()
++      : TlsConnectTestBase(std::get<0>(GetParam()),
++                           SSL_LIBRARY_VERSION_TLS_1_3),
++        contentType_(std::get<1>(GetParam())),
++        padding_(std::get<2>(GetParam())){};
++
++ protected:
++  SSLContentType contentType_;
++  size_t padding_;
++};
++
++/* Test correct rejection of TLS 1.3 encrypted handshake/alert records with
++ * zero-length inner plaintext content length with and without padding. */
++TEST_P(ZeroLengthInnerPlaintextSetupTls13, ZeroLengthInnerPlaintextRun) {
++  EnsureTlsSetup();
++
++  // Filter modifies record to be zero-length
++  auto filter = MakeTlsFilter<ZeroLengthInnerPlaintextCreatorFilter>(
++      client_, contentType

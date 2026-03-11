@@ -1,0 +1,113 @@
+@@ -70,17 +70,15 @@ vuln_lookup = {
+                        're-opened',
+                        'risk-accepted'
+                    ]},
+-        "tags": {"type": "tag", "replace": True, "append": True},
+     }
+ 
+ fields_lookup = {
+     "host": {
+         "description": {"type": "string", "replace": True, "append": False},
+-        "hostnames": {"type": "string", "replace": True, "append": True},
++        "hostnames": {"type": "hostnames", "replace": True, "append": True},
+         "ip": {"type": "string", "replace": True, "append": False},
+         "os": {"type": "string", "replace": True, "append": False},
+         "owned": {"type": "bool", "replace": True, "append": False},
+-        "tags": {"type": "tag", "replace": True, "append": True},
+     },
+     "vulnerability": vuln_lookup,
+     "vulnerability_web": vuln_lookup
+
+
+
+
+@@ -1,18 +1,19 @@
+ import logging
+ from datetime import datetime
++from functools import lru_cache
+ from queue import Empty, Queue
+ 
++import sqlalchemy
+ # Related third party imports
+ from marshmallow import Schema, fields
+ from sqlalchemy import inspect
+ from sqlalchemy.exc import IntegrityError
++from sqlalchemy.orm import joinedload, subqueryload
+ from sqlalchemy.orm.exc import NoResultFound, MultipleResultsFound
+ from gevent.event import Event
+ 
+ # Local application imports
+-from faraday.server.api.modules.comments import CommentSchema
+ from faraday.server.api.modules.workflow import (
+-    WorkflowExecutionSchema,
+     OPERATORS,
+     fields_lookup,
+     rules_attributes,
+@@ -24,7 +25,6 @@ from faraday.server.models import (
+     Service,
+     VulnerabilityGeneric,
+     Workflow,
+-    WorkflowExecution,
+     Workspace,
+     Pipeline,
+     TagObject,
+@@ -49,14 +49,55 @@ obj_table = {
+     # "service": Service
+ }
+ 
++run_all_obj_table = {
++    "vulnerability": VulnerabilityGeneric,
++    "host": Host,
++}
++
+ 
+ class BooleanSchema(Schema):
+     value = fields.Boolean(default=False)
+ 
+ 
+-def _get_obj_and_workspace(obj_type, obj_id, ws_id, fields=None, pipeline_id=None):
+-    logger.debug(f"Get object  {obj_type}-{obj_id} from ws {ws_id}")
+-    return_if_fail = False, False, False, False
++def _get_workspace(ws_id):
++    workspace = (db.session.query(Workspace)
++                 .options(joinedload(Workspace.pipelines)
++                          .subqueryload(Pipeline.jobs)
++                          .joinedload(Workflow.conditions, Workflow.actions))
++                 .filter(Workspace.id == ws_id).first())
++    if workspace is None:
++        logger.error(f"Workspace {ws_id} not found")
++        return None
++    return workspace
++
++
++def _get_pipeline(pipeline_id: int = None, workspace: Workspace = None, ws_id: int = None) -> Pipeline:
++    if pipeline_id is None:
++        # Get pipeline
++        if not workspace.pipelines:
++            logger.debug(f"Workspace {workspace.name} has no pipelines")
++            return None
++        else:
++            pipeline = next((x for x in workspace.pipelines if x.enabled is True), None)
++            if pipeline is None:
++                logger.warning("All pipelines disabled")
++                return None
++            return pipeline
++    else:
++        pipeline = (db.session.query(Pipeline)
++                    .options(subqueryload(Pipeline.jobs)
++                             .joinedload(Workflow.conditions, Workflow.actions))
++                    .filter(Workspace.id == ws_id, Pipeline.id == pipeline_id).first()) \
++                    if pipeline_id is not None else None
++        if pipeline is None:
++            logger.warning(f"Pipeline {pipeline_id} not found")
++            return None
++        return pipeline
++
++
++def _get_obj_and_workspace(obj_type, obj_ids, ws_id, fields=None, pipeline_id=None):
++    logger.debug(f"Get objects  {obj_type}-{obj_ids} from ws {ws_id}")
++    return_if_fail = False, False, False, False, False
+     obj_type = obj_type.lower()
+ 
+     obj_type = "vulnerability_web" if obj_type == "vulnerabilityweb" else obj_type
+@@ -65,9 +106,13 @@ def _

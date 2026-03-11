@@ -1,0 +1,96 @@
+@@ -92,6 +92,174 @@ void print_escaped(std::string& buf, std::string_view str) {
+     buf.push_back('"');
+ }
+ 
++// Track metrics for a given peering's send buffer.
++class PeerBufferState {
++public:
++    struct Stats {
++        // The rendered peer ID. Storing this here helps reuse.
++        // Note that we only ever touch this from Zeek's main thread, not
++        // any of Broker's.
++        zeek::StringValPtr peer_id;
++
++        // Whether Broker has removed the peer, and this instance still
++        // needs to be removed.
++        bool is_zombie = false;
++
++        // Number of messages queued locally in the send buffer.
++        uint32_t queued = 0;
++
++        // Maximum number queued in the last Broker::buffer_stats_reset_interval.
++        // This improces visibility into message bursts since instantaneous
++        // queueing (captured above) can be short-lived.
++        uint32_t max_queued_recently = 0;
++
++        // Number of times the buffer overflowed at send time.  For the
++        // "disconnect" overflow policy (via Broker::peer_overflow_policy), this
++        // count will at most be 1 since Broker will remove the peering upon
++        // overflow. The existing Zeek-level metric for tracking disconnects
++        // (see frameworks/broker/broker-backpressure.zeek) covers this one more
++        // permanently. For the "drop_newest" and "drop_oldest" policies it
++        // equals a count of the number of messages lost, since the peering
++        // continues.
++        uint64_t overflows = 0;
++
++        // When we last started a stats-tracking interval for this peering.
++        double last_interval = 0;
++    };
++
++    // For per-peering tracking, map endpoint IDs to the above state.
++    using EndpointMetricMap = std::unordered_map<broker::endpoint_id, Stats>;
++
++    PeerBufferState(size_t a_buffer_size, double a_stats_reset_interval)
++        : buffer_size(a_buffer_size), stats_reset_interval(a_stats_reset_interval) {
++        stats_table =
++            zeek::make_intrusive<zeek::TableVal>(zeek::id::find_type<zeek::TableType>("BrokerPeeringStatsTable"));
++        stats_record_type = zeek::id::find_type<zeek::RecordType>("BrokerPeeringStats");
++    }
++
++    void SetEndpoint(const broker::endpoint* a_endpoint) { endpoint = a_endpoint; }
++
++    // Update the peering's stats. This runs in Broker's execution context.
++    // Broker does not expose send-buffer/queue state explicitly, so track
++    // arrivals (a push, is_push == true) and departures (a pull, is_push ==
++    // false) as they happen. Note that this must not touch Zeek-side Vals.
++    void Observe(const broker::endpoint_id& peer, bool is_push) {
++        std::lock_guard<std::mutex> lock(mutex);
++        auto it = stats_map.find(peer);
++
++        if ( it == stats_map.end() ) {
++            stats_map.emplace(peer, Stats());
++            it = stats_map.find(peer);
++        }
++
++        auto& stats = it->second;
++
++        // Stick to Broker's notion of time here.
++        double now{0};
++        if ( endpoint != nullptr )
++            broker::convert(endpoint->now(), now);
++
++        if ( now - stats.last_interval > stats_reset_interval ) {
++            stats.last_interval = now;
++            stats.max_queued_recently = stats.queued;
++        }
++
++        if ( stats.queued == 0 ) {
++            // Watch for underflows. We could report somehow. Note that this
++            // runs in the context of Broker's threads.
++            assert(is_push);
++        }
++
++        if ( is_push && stats.queued == buffer_size )
++            stats.overflows += 1;
++        else {
++            stats.queued += is_push ? 1 : -1;
++            if ( stats.queued > stats.max_queued_recently )
++                stats.max_queued_recently = stats.queued;
++        }
++    }
++
++    // Updates the internal table[string] of BrokerPeeringStats and returns it.
++    const zeek::TableValPtr& GetPeeringStatsTable() {
++        std::lock_guard<std::mutex> lock(mutex);
++
++        for ( auto it = sta

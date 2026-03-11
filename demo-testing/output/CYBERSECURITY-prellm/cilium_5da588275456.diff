@@ -1,0 +1,126 @@
+@@ -1378,7 +1378,8 @@ int cil_from_host(struct __ctx_buff *ctx)
+  * to-netdev is attached as a tc egress filter to one or more physical devices
+  * managed by Cilium (e.g., eth0). This program is only attached when:
+  * - the host firewall is enabled, or
+- * - BPF NodePort is enabled
++ * - BPF NodePort is enabled, or
++ * - WireGuard encryption is enabled
+  */
+ __section_entry
+ int cil_to_netdev(struct __ctx_buff *ctx __maybe_unused)
+@@ -1484,6 +1485,18 @@ out:
+ 	else if (IS_ERR(ret))
+ 		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
+ 					      METRIC_EGRESS);
++
++	/* We disable the WireGuard strict mode if the tunnel mode is enabled,
++	 * since we have a check earlier in the datapath before encapsulation.
++	 * We chose this approach so that we don't have to decapsulate the
++	 * packet to check if the packet's original destination is allowed to
++	 * be sent unencrypted.
++	 */
++#if !defined(TUNNEL_MODE) && defined(ENCRYPTION_STRICT_MODE)
++	if (!strict_allow(ctx))
++		return send_drop_notify_error(ctx, 0, DROP_UNENCRYPTED_TRAFFIC,
++					      CTX_ACT_DROP, METRIC_EGRESS);
++#endif /* !TUNNEL_MODE && ENCRYPTION_STRICT_MODE */
+ #endif /* ENABLE_WIREGUARD */
+ 
+ #ifdef ENABLE_SRV6
+
+
+
+
+@@ -31,6 +31,7 @@
+ #include "lib/identity.h"
+ #include "lib/nodeport.h"
+ #include "lib/clustermesh.h"
++#include "lib/wireguard.h"
+ 
+ #ifdef ENABLE_VTEP
+ #include "lib/arp.h"
+@@ -674,6 +675,17 @@ int cil_to_overlay(struct __ctx_buff *ctx)
+ 	int ret = TC_ACT_OK;
+ 	__u32 cluster_id __maybe_unused = 0;
+ 
++	/* When WireGuard strict mode is enabled, we have additional information
++	 * regarding to which CIDRs packets must encrypted. We have to check the
++	 * packets against the CIDRs before encapsulation. If the packet is not
++	 * encrypted, we drop it.
++	 */
++	#if defined(TUNNEL_MODE) && defined(ENCRYPTION_STRICT_MODE)
++	if (!strict_allow(ctx))
++		return send_drop_notify_error(ctx, 0, DROP_UNENCRYPTED_TRAFFIC,
++					      CTX_ACT_DROP, METRIC_EGRESS);
++	#endif
++
+ #ifdef ENABLE_BANDWIDTH_MANAGER
+ 	/* In tunneling mode, we should do this as close as possible to the
+ 	 * phys dev where FQ runs, but the issue is that the aggregate state
+
+
+
+
+@@ -610,6 +610,7 @@ enum {
+ #define DROP_INVALID_CLUSTER_ID	-192
+ #define DROP_DSR_ENCAP_UNSUPP_PROTO	-193
+ #define DROP_NO_EGRESS_GATEWAY	-194
++#define DROP_UNENCRYPTED_TRAFFIC -195
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ #define NAT_NEEDED		CTX_ACT_OK
+
+
+
+
+@@ -107,6 +107,58 @@ out:
+ 	return CTX_ACT_OK;
+ }
+ 
++#ifdef ENCRYPTION_STRICT_MODE
++
++/* strict_allow checks whether the packet is allowed to pass through the strict mode. */
++static __always_inline bool
++strict_allow(struct __ctx_buff *ctx) {
++	struct remote_endpoint_info __maybe_unused *dest_info, __maybe_unused *src_info;
++	bool __maybe_unused in_strict_cidr = false;
++	void *data, *data_end;
++#ifdef ENABLE_IPV4
++	struct iphdr *ip4;
++#endif
++	__u16 proto = 0;
++
++	if (!validate_ethertype(ctx, &proto))
++		return true;
++
++	switch (proto) {
++#ifdef ENABLE_IPV4
++	case bpf_htons(ETH_P_IP):
++		if (!revalidate_data(ctx, &data, &data_end, &ip4))
++			return true;
++
++		/* Allow traffic that is sent from the node:
++		 * (1) When encapsulation is used and the destination is a remote pod.
++		 * (2) When the destination is a remote-node.
++		 */
++		if (ip4->saddr == IPV4_GATEWAY || ip4->saddr == IPV4_ENCRYPT_IFACE)
++			return true;
++
++		in_strict_cidr = ipv4_is_in_subnet(ip4->daddr,
++						   STRICT_IPV4_NET,
++						   STRICT_IPV4_NET_SIZE);
++		in_strict_cidr &= ipv4_is_in_subnet(ip4->saddr,
++						    STRICT_IPV4_NET,
++						    STRICT_IPV4_NET_SIZE);
++
++#if defined(TUNNEL_MODE) || defined(STRICT_IPV4_OVERLAPPING_CIDR)
++		/* Allow pod to remote-node communication */
++		dest_info = lookup_ip4_remote_endpoint(ip4->daddr, 0);
++		if (dest_info && dest_info->sec_identity &&
++		    identity_is_node(dest_info->sec_identity))
++			return true;
++#endif /* TUNNEL_MODE || STRICT_IPV4_OVERLAPPING_CIDR */
++		return !in_strict_cidr;
++#endif /* ENABLE_IPV4 */
++	default:
++		return tru

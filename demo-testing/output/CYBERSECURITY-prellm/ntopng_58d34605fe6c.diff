@@ -1,0 +1,143 @@
+@@ -29,12 +29,10 @@
+ class MySQLDB : public DB {
+  protected:
+   MYSQL mysql;
+-  MYSQL mysql_alt;
+-  bool db_operational, mysql_alt_connected;
++  bool db_operational;
+   FILE *log_fd;
+   u_int32_t mysqlEnqueuedFlows;
+   Mutex m;
+-  bool clickhouse_mode;
+   
+   volatile bool db_created;
+   pthread_t queryThreadLoop;
+@@ -51,7 +49,7 @@ class MySQLDB : public DB {
+   int exec_quick_sql_query(char *sql, char *out, u_int out_len);
+   
+  public:
+-  MySQLDB(NetworkInterface *_iface, bool _clickhouse_mode);
++  MySQLDB(NetworkInterface *_iface);
+   virtual ~MySQLDB();
+ 
+   virtual void* queryLoop();
+
+
+
+
+@@ -370,10 +370,6 @@ using namespace std;
+ #include "DnsHostMapping.h"
+ #include "TrafficShaper.h"
+ #include "L7Policer.h"
+-#ifdef HAVE_MYSQL
+-#include "BatchedMySQLDB.h"
+-#include "BatchedMySQLDBEntry.h"
+-#endif
+ #include "LuaHandler.h"
+ #ifdef HAVE_NEDGE
+ #include "HwBypass.h"
+
+
+
+
+@@ -1194,8 +1194,8 @@ static int handle_lua_request(struct mg_connection *conn) {
+       return(1);
+ #ifdef HAVE_MYSQL
+     } else if(!whitelisted /* e.g. login.lua */
+-        && ntop->getPrefs()->do_dump_flows_on_mysql()
+-        && !ntop->isDbCreated()
++	      && ntop->getPrefs()->do_dump_flows_on_mysql()
++	      && (!ntop->isDbCreated())
+ 	      && strcmp(request_info->uri, PLEASE_WAIT_URL)) {
+       redirect_to_please_wait(conn, request_info);
+       return(1);
+
+
+
+
+@@ -5929,7 +5929,7 @@ static int ntop_exec_single_sql_query(lua_State *vm) {
+ 
+ #ifdef HAVE_MYSQL
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+-  MySQLDB db(ntop_interface, false);
++  MySQLDB db(ntop_interface);
+ 
+   db.exec_single_query(vm, sql);
+ 
+
+
+
+
+@@ -51,7 +51,7 @@ void* MySQLDB::queryLoop() {
+     sleep(1);
+   }
+ 
+-  if(ntop->getGlobals()->isShutdown() || !mysql_alt_connected)
++  if(ntop->getGlobals()->isShutdown())
+     return(NULL);
+ 
+   while(isRunning() || queue_not_empty) {
+@@ -59,7 +59,7 @@ void* MySQLDB::queryLoop() {
+ 
+     if(rc == 0) {
+       queue_not_empty = true;
+-      try_exec_sql_query(&mysql_alt, sql);
++      try_exec_sql_query(&mysql, sql);
+     } else {
+       queue_not_empty = false;
+       _usleep(10000);
+@@ -445,25 +445,19 @@ bool MySQLDB::createDBSchema(bool set_db_created) {
+ 
+ /* ******************************************* */
+ 
+-MySQLDB::MySQLDB(NetworkInterface *_iface, bool _clickhouse_mode) : DB(_iface) {
+-  clickhouse_mode = _clickhouse_mode;
++MySQLDB::MySQLDB(NetworkInterface *_iface) : DB(_iface) {
+   mysqlEnqueuedFlows = 0;
+   log_fd = NULL;
+   open_log();
+   db_created = false;
+-  mysql_alt_connected = false;
+ 
+   connectToDB(&mysql, false);
+-
+-  if(!clickhouse_mode)
+-    mysql_alt_connected = connectToDB(&mysql_alt, true);
+ }
+ 
+ /* ******************************************* */
+ 
+ MySQLDB::~MySQLDB() {
+   shutdown();
+-  if(!clickhouse_mode) disconnectFromDB(&mysql_alt);
+   disconnectFromDB(&mysql);
+ 
+   if(log_fd) fclose(log_fd);
+@@ -674,7 +668,7 @@ bool MySQLDB::dumpFlow(time_t when, Flow *f, char *json) {
+      is not an issue and also avoids flows drops due to the redis queue 
+      maximum length
+     */
+-    if(mysql_alt_connected) try_exec_sql_query(&mysql_alt, sql);
++    try_exec_sql_query(&mysql, sql);
+   } else {
+     if (ntop->getRedis()->llen(CONST_SQL_QUEUE) < CONST_MAX_MYSQL_QUEUE_LEN) {
+       /* 
+@@ -716,7 +710,7 @@ MYSQL* MySQLDB::mysql_try_connect(MYSQL *conn, const char *dbname) {
+   if(!host)
+     return(NULL);
+ 
+-  if((!clickhouse_mode) && (host[0] == '/') /* Use socketD */)
++  if((!ntop->getPrefs()->useClickHouse()) && (host[0] == '/') /* Use socketD */)
+     rc = mysql_real_connect(conn,
+ 			    NULL, /* Host */
+ 			    user,
+@@ -954,9 +948,13 @@ int MySQLDB::exec_sql_query(lua_State *vm, char *sql, bool limitRows, bool wait_
+   MYSQL_RES *result;
+   int rc;
+   struct timeval begin, end;
+-  
+-  if((wait_for_db_created && !db_created /* Make sure the db exists before doing queries */))
+-    return(-2);
++
++  if(!ntop->getPrefs()->useClickHouse()) {
++    if(wait_for_db_created && (!db_created /* Make sure the db exis

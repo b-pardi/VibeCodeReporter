@@ -1,0 +1,114 @@
+@@ -1518,12 +1518,20 @@ SEC_PKCS12DecoderFinish(SEC_PKCS12DecoderContext *p12dcx)
+         if (safeContentsCtx) {
+             nested = safeContentsCtx->nestedSafeContentsCtx;
+             while (nested) {
++                if (nested->currentSafeBagA1Dcx) {
++                    SEC_ASN1DecoderFinish(nested->currentSafeBagA1Dcx);
++                    nested->currentSafeBagA1Dcx = NULL;
++                }
+                 if (nested->safeContentsA1Dcx) {
+                     SEC_ASN1DecoderFinish(nested->safeContentsA1Dcx);
+                     nested->safeContentsA1Dcx = NULL;
+                 }
+                 nested = nested->nestedSafeContentsCtx;
+             }
++            if (safeContentsCtx->currentSafeBagA1Dcx) {
++                SEC_ASN1DecoderFinish(safeContentsCtx->currentSafeBagA1Dcx);
++                safeContentsCtx->currentSafeBagA1Dcx = NULL;
++            }
+             if (safeContentsCtx->safeContentsA1Dcx) {
+                 SEC_ASN1DecoderFinish(safeContentsCtx->safeContentsA1Dcx);
+                 safeContentsCtx->safeContentsA1Dcx = NULL;
+
+
+
+
+@@ -66,6 +66,7 @@ sec_pkcs7_decoder_work_data(SEC_PKCS7DecoderContext *p7dcx,
+                             PRBool final)
+ {
+     unsigned char *buf = NULL;
++    PRBool freeBuf = PR_FALSE;
+     SECStatus rv;
+     int i;
+ 
+@@ -113,6 +114,7 @@ sec_pkcs7_decoder_work_data(SEC_PKCS7DecoderContext *p7dcx,
+ 
+         if (p7dcx->cb != NULL) {
+             buf = (unsigned char *)PORT_Alloc(buflen);
++            freeBuf = PR_TRUE;
+             plain = NULL;
+         } else {
+             unsigned long oldlen;
+@@ -145,7 +147,7 @@ sec_pkcs7_decoder_work_data(SEC_PKCS7DecoderContext *p7dcx,
+                               data, inlen, final);
+         if (rv != SECSuccess) {
+             p7dcx->error = PORT_GetError();
+-            return; /* XXX indicate error? */
++            goto cleanup; /* XXX indicate error? */
+         }
+         if (plain != NULL) {
+             PORT_Assert(final || outlen == buflen);
+@@ -170,10 +172,11 @@ sec_pkcs7_decoder_work_data(SEC_PKCS7DecoderContext *p7dcx,
+     if (p7dcx->cb != NULL) {
+         if (len)
+             (*p7dcx->cb)(p7dcx->cb_arg, (const char *)data, len);
+-        if (worker->decryptobj != NULL) {
+-            PORT_Assert(buf != NULL);
+-            PORT_Free(buf);
+-        }
++    }
++
++cleanup:
++    if (freeBuf && buf != NULL) {
++        PORT_Free(buf);
+     }
+ }
+ 
+@@ -298,6 +301,27 @@ sec_pkcs7_decoder_start_digests(SEC_PKCS7DecoderContext *p7dcx, int depth,
+     return SECSuccess;
+ }
+ 
++/* destroy any active digest contexts without harvesting results */
++static void
++sec_pkcs7_decoder_abort_digests(struct sec_pkcs7_decoder_worker *worker)
++{
++    int i;
++
++    if (!worker || worker->digcnt <= 0 || !worker->digcxs || !worker->digobjs) {
++        worker->digcnt = 0;
++        return;
++    }
++
++    for (i = 0; i < worker->digcnt; i++) {
++        if (worker->digcxs[i] && worker->digobjs[i]) {
++            (*worker->digobjs[i]->destroy)(worker->digcxs[i], PR_TRUE);
++        }
++        worker->digcxs[i] = NULL;
++    }
++
++    worker->digcnt = 0;
++}
++
+ /*
+  * Close out all of the digest contexts, storing the results in "digestsp".
+  */
+@@ -334,12 +358,7 @@ sec_pkcs7_decoder_finish_digests(SEC_PKCS7DecoderContext *p7dcx,
+      * was digested.
+      */
+     if (!worker->saw_contents) {
+-        for (int i = 0; i < worker->digcnt; i++) {
+-            void *digcx = worker->digcxs[i];
+-            const SECHashObject *digobj = worker->digobjs[i];
+-            (*digobj->destroy)(digcx, PR_TRUE);
+-        }
+-        worker->digcnt = 0;
++        sec_pkcs7_decoder_abort_digests(worker);
+         return SECSuccess;
+     }
+ 
+@@ -352,6 +371,7 @@ sec_pkcs7_decoder_finish_digests(SEC_PKCS7DecoderContext *p7dcx,
+         (SECItem **)PORT_ArenaZAlloc(poolp, (worker->digcnt + 1) * sizeof(SECItem *));
+     if (digests == NULL) {
+         p7dcx->error = PORT_GetError();
++        sec_pkcs7_decoder_abort_digests(worker);
+         PORT_ArenaRelease(poolp, mark);

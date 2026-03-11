@@ -1,0 +1,107 @@
+@@ -320,6 +320,46 @@ TEST_F(TlsConnectStreamTls13, PostHandshakeAuthConcurrent) {
+   EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
+ }
+ 
++TEST_F(TlsConnectStreamTls13, PostHandshakeAuthBeforeKeyUpdate) {
++  client_->SetupClientAuth();
++  EXPECT_EQ(SECSuccess, SSL_OptionSet(client_->ssl_fd(),
++                                      SSL_ENABLE_POST_HANDSHAKE_AUTH, PR_TRUE));
++  Connect();
++  // Send CertificateRequest.
++  EXPECT_EQ(SECSuccess, SSL_SendCertificateRequest(server_->ssl_fd()))
++      << "Unexpected error: " << PORT_ErrorToName(PORT_GetError());
++  // Send KeyUpdate.
++  EXPECT_EQ(SECFailure, SSL_KeyUpdate(server_->ssl_fd(), PR_TRUE));
++  EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
++}
++
++TEST_F(TlsConnectStreamTls13, PostHandshakeAuthDuringClientKeyUpdate) {
++  client_->SetupClientAuth();
++  EXPECT_EQ(SECSuccess, SSL_OptionSet(client_->ssl_fd(),
++                                      SSL_ENABLE_POST_HANDSHAKE_AUTH, PR_TRUE));
++  Connect();
++  CheckEpochs(3, 3);
++  // Send CertificateRequest from server.
++  EXPECT_EQ(SECSuccess, SSL_SendCertificateRequest(server_->ssl_fd()))
++      << "Unexpected error: " << PORT_ErrorToName(PORT_GetError());
++  // Send KeyUpdate from client.
++  EXPECT_EQ(SECSuccess, SSL_KeyUpdate(client_->ssl_fd(), PR_TRUE));
++  server_->SendData(50);   // server sends CertificateRequest
++  client_->SendData(50);   // client sends KeyUpdate
++  server_->ReadBytes(50);  // server receives KeyUpdate and defers response
++  CheckEpochs(4, 3);
++  client_->ReadBytes(50);  // client receives CertificateRequest
++  client_->SendData(
++      50);  // client sends Certificate, CertificateVerify, Finished
++  server_->ReadBytes(
++      50);  // server receives Certificate, CertificateVerify, Finished
++  client_->CheckEpochs(3, 4);
++  server_->CheckEpochs(4, 4);
++  server_->SendData(50);   // server sends KeyUpdate
++  client_->ReadBytes(50);  // client receives KeyUpdate
++  client_->CheckEpochs(4, 4);
++}
++
+ TEST_F(TlsConnectStreamTls13, PostHandshakeAuthMissingExtension) {
+   client_->SetupClientAuth();
+   Connect();
+
+
+
+
+@@ -3719,6 +3719,10 @@ ssl3_RestartHandshakeHashes(sslSocket *ss)
+         PK11_DestroyContext(ss->ssl3.hs.sha, PR_TRUE);
+         ss->ssl3.hs.sha = NULL;
+     }
++    if (ss->ssl3.hs.shaPostHandshake) {
++        PK11_DestroyContext(ss->ssl3.hs.shaPostHandshake, PR_TRUE);
++        ss->ssl3.hs.shaPostHandshake = NULL;
++    }
+ }
+ 
+ /*
+@@ -3778,6 +3782,24 @@ ssl3_UpdateHandshakeHashes(sslSocket *ss, const unsigned char *b, unsigned int l
+     return rv;
+ }
+ 
++SECStatus
++ssl3_UpdatePostHandshakeHashes(sslSocket *ss, const unsigned char *b, unsigned int l)
++{
++    SECStatus rv = SECSuccess;
++
++    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
++
++    PRINT_BUF(90, (ss, "post handshake hash input:", b, l));
++
++    PORT_Assert(ss->ssl3.hs.hashType == handshake_hash_single);
++    PORT_Assert(ss->version >= SSL_LIBRARY_VERSION_TLS_1_3);
++    rv = PK11_DigestOp(ss->ssl3.hs.shaPostHandshake, b, l);
++    if (rv != SECSuccess) {
++        PORT_SetError(SSL_ERROR_DIGEST_FAILURE);
++    }
++    return rv;
++}
++
+ SECStatus
+ ssl3_AppendHandshakeHeader(sslSocket *ss, SSLHandshakeType t, PRUint32 length)
+ {
+@@ -11623,7 +11645,8 @@ ssl3_FinishHandshake(sslSocket *ss)
+ SECStatus
+ ssl_HashHandshakeMessageInt(sslSocket *ss, SSLHandshakeType ct,
+                             PRUint32 dtlsSeq,
+-                            const PRUint8 *b, PRUint32 length)
++                            const PRUint8 *b, PRUint32 length,
++                            sslUpdateHandshakeHashes updateHashes)
+ {
+     PRUint8 hdr[4];
+     PRUint8 dtlsData[8];
+@@ -11636,7 +11659,7 @@ ssl_HashHandshakeMessageInt(sslSocket *ss, SSLHandshakeType ct,
+     hdr[2] = (PRUint8)(length >> 8);
+     hdr[3] = (PRUint8)(length);
+ 
+-    rv = ssl3_UpdateHandshakeHashes(ss, (unsigned char *)hdr, 4);
++    rv = updateHashes(ss, (unsigned char *)hdr, 4);
+     if (rv != SECSuccess)
+         return rv; /* err code already set. */
+ 
+@@ -11656,14 +11679,

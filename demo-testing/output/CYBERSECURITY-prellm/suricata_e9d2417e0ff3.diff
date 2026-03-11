@@ -1,0 +1,113 @@
+@@ -71,6 +71,8 @@
+ #include "output-flow.h"
+ #include "util-validate.h"
+ 
++#include "runmode-unix-socket.h"
++
+ /* Run mode selected at suricata.c */
+ extern int run_mode;
+ 
+@@ -481,22 +483,34 @@ static uint32_t FlowTimeoutHash(FlowManagerTimeoutThread *td,
+     return cnt;
+ }
+ 
+-static uint32_t FlowTimeoutHashInChunks(FlowManagerTimeoutThread *td,
+-        struct timeval *ts,
+-        const uint32_t hash_min, const uint32_t hash_max,
+-        FlowTimeoutCounters *counters, uint32_t iter, const uint32_t chunks)
++/** \internal
++ *  \brief handle timeout for a slice of hash rows
++ *  If we wrap around we call FlowTimeoutHash twice */
++static uint32_t FlowTimeoutHashInChunks(FlowManagerTimeoutThread *td, struct timeval *ts,
++        const uint32_t hash_min, const uint32_t hash_max, FlowTimeoutCounters *counters,
++        const uint32_t rows, uint32_t *pos)
+ {
+-    const uint32_t rows = hash_max - hash_min;
+-    const uint32_t chunk_size = rows / chunks;
+-
+-    const uint32_t min = iter * chunk_size + hash_min;
+-    uint32_t max = min + chunk_size;
+-    /* we start at beginning of hash at next iteration so let's check
+-     * hash till the end */
+-    if (iter + 1 == chunks) {
+-        max = hash_max;
++    uint32_t start = 0;
++    uint32_t end = 0;
++    uint32_t cnt = 0;
++    uint32_t rows_left = rows;
++
++again:
++    start = hash_min + (*pos);
++    if (start >= hash_max) {
++        start = hash_min;
++    }
++    end = start + rows_left;
++    if (end > hash_max) {
++        end = hash_max;
++    }
++    *pos = (end == hash_max) ? hash_min : end;
++    rows_left = rows_left - (end - start);
++
++    cnt += FlowTimeoutHash(td, ts, start, end, counters);
++    if (rows_left) {
++        goto again;
+     }
+-    const uint32_t cnt = FlowTimeoutHash(td, ts, min, max, counters);
+     return cnt;
+ }
+ 
+@@ -614,6 +628,9 @@ typedef struct FlowCounters_ {
+     uint16_t flow_bypassed_cnt_clo;
+     uint16_t flow_bypassed_pkts;
+     uint16_t flow_bypassed_bytes;
++
++    uint16_t memcap_pressure;
++    uint16_t memcap_pressure_max;
+ } FlowCounters;
+ 
+ typedef struct FlowManagerThreadData_ {
+@@ -648,6 +665,9 @@ static void FlowCountersInit(ThreadVars *t, FlowCounters *fc)
+     fc->flow_bypassed_cnt_clo = StatsRegisterCounter("flow_bypassed.closed", t);
+     fc->flow_bypassed_pkts = StatsRegisterCounter("flow_bypassed.pkts", t);
+     fc->flow_bypassed_bytes = StatsRegisterCounter("flow_bypassed.bytes", t);
++
++    fc->memcap_pressure = StatsRegisterCounter("memcap_pressure", t);
++    fc->memcap_pressure_max = StatsRegisterMaxCounter("memcap_pressure_max", t);
+ }
+ 
+ static TmEcode FlowManagerThreadInit(ThreadVars *t, const void *initdata, void **data)
+@@ -710,6 +730,42 @@ static uint32_t FlowTimeoutsMin(void)
+ 
+ //#define FM_PROFILE
+ 
++static void GetWorkUnitSizing(const uint32_t pass_in_sec, const uint32_t rows, const uint32_t mp,
++        const bool emergency, uint64_t *wu_sleep, uint32_t *wu_rows)
++{
++    if (emergency) {
++        *wu_rows = rows;
++        *wu_sleep = 250;
++        return;
++    }
++
++    uint32_t full_pass_in_ms = pass_in_sec * 1000;
++    float perc = MIN((((float)(100 - mp) / (float)100)), 1);
++    full_pass_in_ms *= perc;
++    full_pass_in_ms = MAX(full_pass_in_ms, 333);
++
++    uint32_t work_unit_ms = 999 * perc;
++    work_unit_ms = MAX(work_unit_ms, 250);
++
++    uint32_t wus_per_full_pass = full_pass_in_ms / work_unit_ms;
++
++    uint32_t rows_per_wu = MAX(1, rows / wus_per_full_pass);
++    uint32_t rows_process_cost = rows_per_wu / 1000; // est 1usec per row
++
++    int32_t sleep_per_wu = work_unit_ms - rows_process_cost;
++    sleep_per_wu = MAX(sleep_per_wu, 10);
++#if 0
++    float passes_sec = 1000.0/(float)full_pass_in_ms;
++    SCLogNotice("full_pass_in_ms %u perc %f rows %u "
++            "wus_per_full_pass %u rows_per_wu %u work_unit_ms %u sleep_per_wu %u => passes/s %f rows/s %u",
++            full_pass_in_ms, perc, rows,
++            wus_per_full_pass, rows_per_wu, work_unit_ms, (uint32_t)sleep_per_wu,
++            passes_sec, (uint32_t

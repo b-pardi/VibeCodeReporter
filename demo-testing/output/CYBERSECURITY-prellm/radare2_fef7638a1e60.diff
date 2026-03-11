@@ -1,0 +1,109 @@
+@@ -711,6 +711,15 @@ R_API RDebugReasonType r_debug_wait(RDebug *dbg, RBreakpointItem **bp) {
+ 			return R_DEBUG_REASON_DEAD;
+ 		}
+ 
++#if __linux__
++		// Letting other threads running after the debugger has breaked will cause
++		// ptrace commands to fail when writing the process memory to set/unset
++		// breakpoints and is problematic in Linux.
++		if (dbg->continue_all_threads) {
++			r_debug_stop (dbg);
++		}
++#endif
++
+ 		/* propagate errors from the plugin */
+ 		if (reason == R_DEBUG_REASON_ERROR) {
+ 			return R_DEBUG_REASON_ERROR;
+@@ -1292,14 +1301,8 @@ repeat:
+ 	}
+ #if __WINDOWS__
+ 	r_cons_break_pop ();
+-#elif __linux__
+-	// Letting threads continue after the debugger breaks is currently problematic in linux
+-	// Stop all threads when there is no user interrupt caused by statc_debug_stop
+-	// to prevent queueing duplicate SIGSTOP signals
+-	if (!r_cons_is_breaked () && dbg->continue_all_threads) {
+-		r_debug_stop (dbg);
+-	}
+ #endif
++
+ 	// Unset breakpoints before leaving
+ 	if (reason != R_DEBUG_REASON_BREAKPOINT) {
+ 		r_bp_restore (dbg->bp, false);
+
+
+
+
+@@ -207,8 +207,9 @@ static void interrupt_process(RDebug *dbg) {
+ 
+ static int r_debug_native_stop(RDebug *dbg) {
+ #if __linux__
+-	// Stop all running threads in the current process
+-	return linux_stop_threads (dbg);
++	// Stop all running threads except the current thread
++	// which is already stopped by linux_dbg_wait_break
++	return linux_stop_threads (dbg, dbg->tid);
+ #else
+ 	return 0;
+ #endif
+@@ -246,23 +247,21 @@ static int r_debug_native_continue(RDebug *dbg, int pid, int tid, int sig) {
+ 		r_sys_perror ("PTRACE_CONT");
+ 	}
+ 
+-	// Continue all threads that are stopped by the debugger only to keep other signals
+-	// for the next waitpid by checking the siginfo.si_pid:
+-	// - 0		= stopped by PTRACE_ATTACH or newly created tasks
+-	// - dbgpid = stopped by debugger
++	// Continue all threads that are stopped by the debugger only
++	// to keep other signals in the queue for the next waitpid
++	// by checking for SIGSTOP signals sent by the debugger
+ 	if (dbg->continue_all_threads && dbg->threads) {
+ 		RDebugPid *th;
+ 		RListIter *it;
+ 		pid_t dbgpid = getpid ();
+ 		r_list_foreach (dbg->threads, it, th) {
+-			// Check if the thread is already running
+ 			siginfo_t siginfo = { 0 };
+ 			ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, th->pid, 0, (r_ptrace_data_t)(size_t)&siginfo);
++			// Skip if the thread is already running
+ 			if (ret == -1) {
+ 				continue;
+ 			}
+-			if (siginfo.si_signo == SIGSTOP &&
+-				(siginfo.si_pid == dbgpid || siginfo.si_pid == 0)) {
++			if (siginfo.si_signo == SIGSTOP && siginfo.si_pid == dbgpid) {
+ 				ret = r_debug_ptrace (dbg, PTRACE_CONT, th->pid, 0, 0);
+ 				if (ret == -1) {
+ 					eprintf ("Error: %d is not traced or already running.\n", th->pid);
+
+
+
+
+@@ -63,15 +63,17 @@ char *linux_reg_profile (RDebug *dbg) {
+ #endif
+ }
+ 
+-static void linux_detach_all (RDebug *dbg);
+-static char *read_link (int pid, const char *file);
+-static bool linux_attach_single_pid (RDebug *dbg, int ptid);
+-static void linux_remove_thread (RDebug *dbg, int pid);
+-static void linux_add_new_thread (RDebug *dbg, int tid);
+-static bool linux_stop_thread(RDebug *dbg, int tid, bool dowait);
+-static bool linux_kill_thread (int tid, int signo);
+-
+-int linux_handle_signals (RDebug *dbg, int tid) {
++static void linux_detach_all(RDebug *dbg);
++static char *read_link(int pid, const char *file);
++static bool linux_attach_single_pid(RDebug *dbg, int ptid);
++static void linux_remove_thread(RDebug *dbg, int pid);
++static void linux_add_new_thread(RDebug *dbg, int tid);
++static bool linux_stop_thread(RDebug *dbg, int tid);
++static bool linux_kill_thread(int tid, int signo);
++static void linux_dbg_wait_break(RDebug *dbg);
++static RDebugReasonType linux_handle_new_task(RDebug *dbg, int tid);
++
++int linux_handle_signals(RDebug *dbg, int tid) {
+ 	siginfo_t siginfo = { 0 };
+ 	int ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, tid, 0, (r_ptrace_data_t)(size_t)&siginfo);
+ 	if (ret == -1) {
+@@ -85,6 +87

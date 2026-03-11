@@ -1,0 +1,118 @@
+@@ -51,6 +51,7 @@ const char* TimerNames[] = {
+     "UnknownProtocolExpire",
+     "LogDelayExpire",
+     "LogFlushWriteBufferTimer",
++    "StorageExpire",
+ };
+ 
+ const char* timer_type_to_string(TimerType type) { return TimerNames[type]; }
+
+
+
+
+@@ -58,8 +58,9 @@ enum TimerType : uint8_t {
+     TIMER_UNKNOWN_PROTOCOL_EXPIRE,
+     TIMER_LOG_DELAY_EXPIRE,
+     TIMER_LOG_FLUSH_WRITE_BUFFER,
++    TIMER_STORAGE_EXPIRE,
+ };
+-constexpr int NUM_TIMER_TYPES = int(TIMER_LOG_FLUSH_WRITE_BUFFER) + 1;
++constexpr int NUM_TIMER_TYPES = int(TIMER_STORAGE_EXPIRE) + 1;
+ 
+ extern const char* timer_type_to_string(TimerType type);
+ 
+
+
+
+
+@@ -14,7 +14,7 @@ ErrorResult Backend::Open(RecordValPtr options, TypePtr kt, TypePtr vt) {
+     return DoOpen(std::move(options));
+ }
+ 
+-ErrorResult Backend::Put(ValPtr key, ValPtr value, bool overwrite) {
++ErrorResult Backend::Put(ValPtr key, ValPtr value, bool overwrite, double expiration_time) {
+     // The intention for this method is to do some other heavy lifting in regard
+     // to backends that need to pass data through the manager instead of directly
+     // through the workers. For the first versions of the storage framework it
+@@ -26,7 +26,7 @@ ErrorResult Backend::Put(ValPtr key, ValPtr value, bool overwrite) {
+         return util::fmt("type of value passed (%s) does not match backend's value type (%s)",
+                          obj_desc_short(value->GetType().get()).c_str(), val_type->GetName().c_str());
+ 
+-    return DoPut(std::move(key), std::move(value), overwrite);
++    return DoPut(std::move(key), std::move(value), overwrite, expiration_time);
+ }
+ 
+ ValResult Backend::Get(ValPtr key) {
+
+
+
+
+@@ -32,10 +32,12 @@ public:
+      * @param key the key for the pair
+      * @param value the value for the pair
+      * @param overwrite whether an existing value for a key should be overwritten.
+-     * @return A result pair containing a bool with the success state, and a
+-     * possible error string if the operation failed.
++     * @param expiration_time the time when this entry should be automatically
++     * removed. Set to zero to disable expiration.
++     * @return An optional value potentially containing an error string if
++     * needed. Will be unset if the operation succeeded.
+      */
+-    ErrorResult Put(ValPtr key, ValPtr value, bool overwrite = true);
++    ErrorResult Put(ValPtr key, ValPtr value, bool overwrite = true, double expiration_time = 0);
+ 
+     /**
+      * Retrieve a value from the backend for a provided key.
+@@ -99,7 +101,7 @@ protected:
+     /**
+      * The workhorse method for Put().
+      */
+-    virtual ErrorResult DoPut(ValPtr key, ValPtr value, bool overwrite = true) = 0;
++    virtual ErrorResult DoPut(ValPtr key, ValPtr value, bool overwrite = true, double expiration_time = 0) = 0;
+ 
+     /**
+      * The workhorse method for Get().
+@@ -111,6 +113,12 @@ protected:
+      */
+     virtual ErrorResult DoErase(ValPtr key) = 0;
+ 
++    /**
++     * Removes any entries in the backend that have expired. Can be overridden by
++     * derived classes.
++     */
++    virtual void Expire() {}
++
+     TypePtr key_type;
+     TypePtr val_type;
+ 
+
+
+
+
+@@ -4,11 +4,24 @@
+ 
+ #include "zeek/Desc.h"
+ 
++#include "const.bif.netvar_h"
++
+ namespace zeek::storage {
+ 
++void detail::ExpirationTimer::Dispatch(double t, bool is_expire) {
++    if ( is_expire )
++        return;
++
++    storage_mgr->Expire();
++    storage_mgr->StartExpirationTimer();
++}
++
+ Manager::Manager() : plugin::ComponentManager<storage::Component>("Storage", "Backend") {}
+ 
+-void Manager::InitPostScript() { detail::backend_opaque = make_intrusive<OpaqueType>("Storage::Backend"); }
++void Manager::InitPostScript() {
++    detail::backend_opaque = make_intrusive<OpaqueType>("Storage::Backend");
++    StartExpirationTimer();
++}
+ 
+ zeek::expected<BackendPtr, std::string> Manager::OpenBackend(const Tag& type, RecordValPtr options, TypePtr key_type,
+                                                              TypePtr val_type) {
+@@ -40,20 +53,39 @@ ze

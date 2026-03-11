@@ -1,0 +1,154 @@
+@@ -115,8 +115,8 @@ Connection::Connection(NetSessions* s, const ConnIDKey& k, double t, const ConnI
+ 	++current_connections;
+ 	++total_connections;
+ 
+-	TimerMgr::Tag* tag = current_iosrc->GetCurrentTag();
+-	conn_timer_mgr = tag ? new TimerMgr::Tag(*tag) : 0;
++	std::string* tag = current_iosrc->GetCurrentTag();
++	conn_timer_mgr = tag ? new std::string(*tag) : nullptr;
+ 
+ 	if ( arg_encap )
+ 		encapsulation = new EncapsulationStack(*arg_encap);
+
+
+
+
+@@ -321,7 +321,7 @@ protected:
+ 	bool key_valid;
+ 
+ 	// Timer manager to use for this conn (or nil).
+-	TimerMgr::Tag* conn_timer_mgr;
++	std::string* conn_timer_mgr;
+ 	timer_list timers;
+ 
+ 	IPAddr orig_addr;
+
+
+
+
+@@ -1338,7 +1338,7 @@ bool NetSessions::WantConnection(uint16_t src_port, uint16_t dst_port,
+ 	return true;
+ 	}
+ 
+-TimerMgr* NetSessions::LookupTimerMgr(const TimerMgr::Tag* tag, bool create)
++TimerMgr* NetSessions::LookupTimerMgr(const std::string* tag, bool create)
+ 	{
+ 	if ( ! tag )
+ 		{
+
+
+
+
+@@ -104,7 +104,7 @@ public:
+ 	// Looks up timer manager associated with tag.  If tag is unknown and
+ 	// "create" is true, creates new timer manager and stores it.  Returns
+ 	// global timer manager if tag is nil.
+-	TimerMgr* LookupTimerMgr(const TimerMgr::Tag* tag, bool create = true);
++	TimerMgr* LookupTimerMgr(const std::string* tag, bool create = true);
+ 
+ 	void ExpireTimerMgrs();
+ 
+@@ -245,8 +245,8 @@ protected:
+ 	PacketProfiler* pkt_profiler;
+ 
+ 	// We may use independent timer managers for different sets of related
+-	// activity.  The managers are identified by an unique tag.
+-	typedef std::map<TimerMgr::Tag, TimerMgr*> TimerMgrMap;
++	// activity. The managers are identified by a unique tag.
++	typedef std::map<std::string, TimerMgr*> TimerMgrMap;
+ 	TimerMgrMap timer_mgrs;
+ };
+ 
+
+
+
+
+@@ -5,7 +5,11 @@
+ #include "util.h"
+ #include "Timer.h"
+ #include "Desc.h"
++#include "Net.h"
++#include "NetVar.h"
+ #include "broker/Manager.h"
++#include "iosource/Manager.h"
++#include "iosource/PktSrc.h"
+ 
+ // Names of timers in same order than in TimerType.
+ const char* TimerNames[] = {
+@@ -55,6 +59,17 @@ void Timer::Describe(ODesc* d) const
+ 
+ unsigned int TimerMgr::current_timers[NUM_TIMER_TYPES];
+ 
++TimerMgr::TimerMgr(const std::string& arg_tag)
++	{
++	t = 0.0;
++	num_expired = 0;
++	last_advance = last_timestamp = 0;
++	tag = arg_tag;
++
++	if ( iosource_mgr )
++		iosource_mgr->Register(this, true);
++	}
++
+ TimerMgr::~TimerMgr()
+ 	{
+ 	DBG_LOG(DBG_TM, "deleting timer mgr %p", this);
+@@ -74,8 +89,28 @@ int TimerMgr::Advance(double arg_t, int max_expire)
+ 	return DoAdvance(t, max_expire);
+ 	}
+ 
++void TimerMgr::Process()
++	{
++	// If we don't have a source, or the source is closed, or we're reading live (which includes
++	// pseudo-realtime), advance the timer here to the current time since otherwise it won't
++	// move forward and the timers won't fire correctly.
++	iosource::PktSrc* pkt_src = iosource_mgr->GetPktSrc();
++	if ( ! pkt_src || ! pkt_src->IsOpen() || reading_live )
++		net_update_time(current_time());
++
++	// Just advance the timer manager based on the current network time. This won't actually
++	// change the time, but will dispatch any timers that need dispatching.
++	current_dispatched += Advance(network_time, max_timer_expires - current_dispatched);
++	}
+ 
+-PQ_TimerMgr::PQ_TimerMgr(const Tag& tag) : TimerMgr(tag)
++void TimerMgr::InitPostScript()
++	{
++	if ( iosource_mgr )
++		iosource_mgr->Register(this, true);
++	}
++
++
++PQ_TimerMgr::PQ_TimerMgr(const std::string& tag) : TimerMgr(tag)
+ 	{
+ 	q = new PriorityQueue;
+ 	}
+@@ -145,3 +180,12 @@ void PQ_TimerMgr::Remove(Timer* timer)
+ 	--current_timers[timer->Type()];
+ 	delete timer;
+ 	}
++
++double PQ_TimerMgr::GetNextTimeout()
++	{
++	Timer* top = Top();
++	if ( top )
++		return std::max(0.0, top->Time() - ::network_time);
++
++	return -1;
++	}
+
+
+
+
+@@ -2,10 +2,9 @@
+ 
+ #pragma once
+ 
+-#include <string>
+-
+ #include <string>
+ #include "PriorityQueue.h"
++#include "iosource/IOSource.h"
+ 
+ // If you add a timer here, adjust TimerNames in Timer.cc.
+ enum TimerType : uint8_t {

@@ -1,0 +1,86 @@
+@@ -114,6 +114,22 @@ def peek(address):
+     return None
+ 
+ 
++@pwndbg.lib.memoize.reset_on_stop
++def is_readable_address(address):
++    """is_readable_address(address) -> bool
++
++    Check if the address can be read by GDB.
++
++    Arguments:
++        address(int): Address to read
++
++    Returns:
++        :class:`bool`: Whether the address is readable.
++    """
++    # We use vmmap to check before `peek()` because accessing memory for embedded targets might be slow and expensive.
++    return pwndbg.gdblib.vmmap.find(address) is not None and peek(address) is not None
++
++
+ def poke(address) -> bool:
+     """poke(address)
+ 
+
+
+
+
+@@ -12,6 +12,7 @@ import gdb
+ import pwndbg.disasm
+ import pwndbg.gdblib.config
+ import pwndbg.gdblib.events
++import pwndbg.gdblib.memory
+ import pwndbg.gdblib.symbol
+ import pwndbg.gdblib.tls
+ import pwndbg.gdblib.typeinfo
+@@ -323,7 +324,7 @@ class Chunk:
+             return None
+ 
+         next = Chunk(self.address + self.real_size, arena=self.arena)
+-        if pwndbg.gdblib.memory.peek(next.address):
++        if pwndbg.gdblib.memory.is_readable_address(next.address):
+             return next
+         else:
+             return None
+@@ -1381,7 +1382,7 @@ class HeuristicHeap(GlibcMemoryAllocator):
+                                 self._main_arena_addr = offset + instr.address + 4
+ 
+             # Try to search main_arena in .data of libc if we can't find it via above trick
+-            if not self._main_arena_addr or pwndbg.gdblib.vmmap.find(self._main_arena_addr) is None:
++            if not pwndbg.gdblib.memory.is_readable_address(self._main_arena_addr):
+                 start = pwndbg.gdblib.symbol.address("_IO_2_1_stdin_")
+                 end = pwndbg.gdblib.symbol.address("_IO_list_all")
+                 # If we didn't have these symbols, we try to find them in the possible page
+@@ -1398,11 +1399,16 @@ class HeuristicHeap(GlibcMemoryAllocator):
+                     for addr in range(start, end, pwndbg.gdblib.arch.ptrsize):
+                         found = False
+                         tmp_arena = self.malloc_state(addr)
+-                        tmp_next = int(tmp_arena["next"])
++                        try:
++                            tmp_next = int(tmp_arena["next"])
++                        except gdb.MemoryError:
++                            # the memory after tmp_arena is not valid, stop searching
++                            break
+                         # check if the `next` pointer of tmp_arena will point to the same address we guess
+                         # e.g. when our process is single-threaded, &tmp_arena->next == &main_arena
+                         # when our process is multi-threaded, &tmp_arena->next->...->next == &main_arena
+-                        while tmp_next > 0:
++                        while tmp_next > 0 and tmp_next % pwndbg.gdblib.arch.ptrsize == 0:
++                            # tmp_next should align with ptrsize
+                             if tmp_next == addr:
+                                 self._main_arena_addr = addr
+                                 found = True
+@@ -1410,16 +1416,19 @@ class HeuristicHeap(GlibcMemoryAllocator):
+                             tmp_arena = self.malloc_state(tmp_next)
+                             if (
+                                 pwndbg.gdblib.vmmap.find(tmp_arena.get_field_address("next"))
+-                                is not None
++                                is None
+                             ):
+-                                tmp_next = int(tmp_arena["next"])
+-                            else:
+                                 # if `&tmp_arena->next` is not valid, the linked list is broken, break this while loop and try `addr+pwndbg.gdblib.arch.ptrsize` again
++                                # Note: We use vmmap to check before accessing the memory because accessing memory for embedded targets might be slow and expensive.
++                                break
++                            try:
++                         

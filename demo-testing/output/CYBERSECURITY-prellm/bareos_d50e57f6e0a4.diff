@@ -1,0 +1,134 @@
+@@ -352,7 +352,7 @@ static void TerminateBtape(int status)
+   if (dev) { dev->term(); }
+ 
+ #if defined(HAVE_DYNAMIC_SD_BACKENDS)
+-  DevFlushBackends();
++  FlushAndCloseBackendDevices();
+ #endif
+ 
+   if (configfile) { free(configfile); }
+
+
+
+
+@@ -184,7 +184,7 @@ static inline Device* init_dev(JobControlRecord* jcr,
+    */
+   switch (device->dev_type) {
+     /*
+-     * When using dynamic loading use the init_backend_dev() function
++     * When using dynamic loading use the InitBackendDevice() function
+      * for any type of device not being of the type file.
+      */
+ #ifndef HAVE_DYNAMIC_SD_BACKENDS
+@@ -240,7 +240,7 @@ static inline Device* init_dev(JobControlRecord* jcr,
+ #endif
+     default:
+ #ifdef HAVE_DYNAMIC_SD_BACKENDS
+-      dev = init_backend_dev(jcr, device->dev_type);
++      dev = InitBackendDevice(jcr, device->dev_type);
+ #endif
+       break;
+   }
+
+
+
+
+@@ -27,219 +27,166 @@
+  * Dynamic loading of SD backend plugins.
+  */
+ 
+-
+ #include "include/bareos.h"
+-#include "stored/stored.h"
+ 
+ #if defined(HAVE_DYNAMIC_SD_BACKENDS)
+ 
++#include "stored/stored.h"
+ #include "sd_backends.h"
+-#include <dlfcn.h>
++#include "include/make_unique.h"
+ 
+-#ifndef RTLD_NOW
+-#define RTLD_NOW 2
+-#endif
++#include <cstdlib>
++#include <dlfcn.h>
++#include <map>
++#include <memory>
++#include <stdexcept>
++#include <vector>
+ 
+ namespace storagedaemon {
+ 
+-/**
+- * Known backend to interface mappings.
+- */
+-static struct backend_interface_mapping_t {
+-  DeviceType interface_type_id;
+-  const char* interface_name;
+-} backend_interface_mappings[] = {{DeviceType::B_FIFO_DEV, "fifo"},
+-                                  {DeviceType::B_TAPE_DEV, "tape"},
+-                                  {DeviceType::B_GFAPI_DEV, "gfapi"},
+-                                  {DeviceType::B_DROPLET_DEV, "droplet"},
+-                                  {DeviceType::B_RADOS_DEV, "rados"},
+-                                  {DeviceType::B_CEPHFS_DEV, "cephfs"},
+-                                  {DeviceType::B_ELASTO_DEV, "elasto"},
+-                                  {DeviceType::B_UNKNOWN_DEV, nullptr}};
++static std::map<DeviceType, const char*> device_type_to_name_mapping = {
++    {DeviceType::B_FIFO_DEV, "fifo"},
++    {DeviceType::B_TAPE_DEV, "tape"},
++    {DeviceType::B_GFAPI_DEV, "gfapi"},
++    {DeviceType::B_DROPLET_DEV, "droplet"},
++    {DeviceType::B_RADOS_DEV, "rados"},
++    {DeviceType::B_CEPHFS_DEV, "cephfs"},
++    {DeviceType::B_ELASTO_DEV, "elasto"},
++    {DeviceType::B_UNKNOWN_DEV, nullptr}};
+ 
+ 
+-/**
+- * All loaded backends.
+- */
+-static alist* loaded_backends = NULL;
+-static std::vector<std::string> backend_dirs;
++static std::vector<std::unique_ptr<BackendDeviceLibraryDescriptor>>
++    loaded_backends;
++static std::vector<std::string> backend_directories;
+ 
+-void SdSetBackendDirs(std::vector<std::string>&& new_backend_dirs)
++void SetBackendDeviceDirectories(
++    std::vector<std::string>&& new_backend_directories)
+ {
+-  backend_dirs = new_backend_dirs;
++  backend_directories = new_backend_directories;
+ }
+ 
+-static inline backend_interface_mapping_t* lookup_backend_interface_mapping(
+-    DeviceType device_type)
++static inline const char* get_dlerror()
+ {
+-  backend_interface_mapping_t* backend_interface_mapping;
+-
+-  for (backend_interface_mapping = backend_interface_mappings;
+-       backend_interface_mapping->interface_name != nullptr;
+-       backend_interface_mapping++) {
+-    /*
+-     * See if this is a match.
+-     */
+-    if (backend_interface_mapping->interface_type_id == device_type) {
+-      return backend_interface_mapping;
++  const char* error = dlerror();
++  return error != nullptr ? error : "";
++}
++
++Device* InitBackendDevice(JobControlRecord* jcr, DeviceType device_type)
++{
++  if (backend_directories.empty()) {
++    Jmsg(jcr, M_ERROR_TERM, 0, _("Catalog Backends Dir not configured.\n"));
++    // does not return
++  }
++
++  const char* interface_name = nullptr;
++
++  try {
++    interface_name = device_type_to_name_mapping.at(device_type);
++  } catch (cons

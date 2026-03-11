@@ -1,0 +1,79 @@
+@@ -708,6 +708,28 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+       exportConditions.add(ospf);
+     }
+ 
++    // Export EIGRP routes that should be redistributed.
++    List<RedistributionPolicy> eigrpPolicies =
++        ipv4af == null
++            ? ImmutableList.of()
++            : ipv4af.getRedistributionPolicies(NxosRoutingProtocol.EIGRP);
++    for (RedistributionPolicy eigrpPolicy : eigrpPolicies) {
++      /* TODO: how do we match on source tag (aka EIGRP process tag)? */
++      String routeMap = eigrpPolicy.getRouteMap();
++      RouteMap map = _routeMaps.get(routeMap);
++      List<BooleanExpr> conditions =
++          ImmutableList.of(
++              new Disjunction(
++                  new MatchProtocol(RoutingProtocol.EIGRP),
++                  new MatchProtocol(RoutingProtocol.EIGRP_EX)),
++              redistributeDefaultRoute,
++              bgpRedistributeWithEnvironmentExpr(
++                  map == null ? BooleanExprs.TRUE : new CallExpr(routeMap), OriginType.INCOMPLETE));
++      Conjunction eigrp = new Conjunction(conditions);
++      eigrp.setComment("Redistribute EIGRP routes into BGP");
++      exportConditions.add(eigrp);
++    }
++
+     // Now we add all the per-network export policies.
+     if (ipv4af != null) {
+       ipv4af
+
+
+
+
+@@ -5,8 +5,10 @@ import static com.google.common.collect.Maps.immutableEntry;
+ import static com.google.common.collect.MoreCollectors.onlyElement;
+ import static java.nio.charset.StandardCharsets.UTF_8;
+ import static org.batfish.common.util.Resources.readResource;
++import static org.batfish.datamodel.BgpRoute.DEFAULT_LOCAL_PREFERENCE;
+ import static org.batfish.datamodel.Interface.NULL_INTERFACE_NAME;
+ import static org.batfish.datamodel.IpWildcard.ipWithWildcardMask;
++import static org.batfish.datamodel.Names.generatedBgpCommonExportPolicyName;
+ import static org.batfish.datamodel.Route.UNSET_NEXT_HOP_INTERFACE;
+ import static org.batfish.datamodel.Route.UNSET_ROUTE_NEXT_HOP_IP;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.matchDscp;
+@@ -249,6 +251,7 @@ import org.batfish.datamodel.routing_policy.statement.If;
+ import org.batfish.datamodel.routing_policy.statement.Statements;
+ import org.batfish.datamodel.tracking.DecrementPriority;
+ import org.batfish.datamodel.vendor_family.cisco_nxos.NexusPlatform;
++import org.batfish.dataplane.protocols.BgpProtocolHelper;
+ import org.batfish.main.Batfish;
+ import org.batfish.main.BatfishTestUtils;
+ import org.batfish.main.ParserBatfishException;
+@@ -650,6 +653,9 @@ public final class CiscoNxosGrammarTest {
+           ipv4u.getRedistributionPolicy(RoutingProtocolInstance.ospf("OSPF_PROC2")),
+           equalTo(
+               new RedistributionPolicy(RoutingProtocolInstance.ospf("OSPF_PROC2"), "OSPF_MAP2")));
++      assertThat(
++          ipv4u.getRedistributionPolicy(RoutingProtocolInstance.eigrp("EIGRP")),
++          equalTo(new RedistributionPolicy(RoutingProtocolInstance.eigrp("EIGRP"), "EIGRP_MAP")));
+ 
+       BgpVrfIpv6AddressFamilyConfiguration ipv6u = vrf.getIpv6UnicastAddressFamily();
+       assertThat(ipv6u, notNullValue());
+@@ -754,6 +760,130 @@ public final class CiscoNxosGrammarTest {
+             .getDefaultOriginate());
+   }
+ 
++  @Test
++  public void testBgpRedistFromEigrpConversion() throws IOException {
++    // BGP redistributes EIGRP with route-map redist_eigrp, which permits 5.5.5.0/24
++    Configuration c = parseConfig("nxos_bgp_eigrp_redistribution");
++    RoutingPolicy bgpExportPolicy =
++        c.getRoutingPolicies().get(generatedBgpCommonExportPolicyName(DEFAULT_VRF_NAME));
++    int ebgpAdmin = RoutingProtocol.BGP.getDefaultAdministrativeCost(c.getConfigurationFormat());
++    int ibgpAdmin = RoutingProtocol.IBGP.getDefaultAdministrativeCost(c.getConfigurationFormat());
++    Prefix matchRm = Prefix.parse("5.5.5.0/24");
++    Prefix noMatchRm = Prefix.parse("5.5.5.0/30");
++    Ip bgpRouterId = Ip.parse("1.1.1.1");
++    Ip bgpPeerId = Ip.parse("2.2.2.2");
++    Ip nextHopIp = Ip.parse

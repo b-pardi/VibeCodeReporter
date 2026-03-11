@@ -1,0 +1,116 @@
+@@ -45,6 +45,7 @@ class Ntop {
+   bool purgeLoop_started; /* Flag that indicates whether the purgeLoop has been started */
+   bool flowChecksReloadInProgress, hostChecksReloadInProgress;
+   bool hostPoolsReloadInProgress;
++  bool interfacesShuttedDown;
+   bool offline;
+   Bloom *resolvedHostsBloom; /* Used by all redis class instances */
+   AddressTree local_interface_addresses;
+
+
+
+
+@@ -1367,7 +1367,7 @@ char* Flow::print(char *buf, u_int buf_len) const {
+ 
+ bool Flow::dump(time_t t, bool last_dump_before_free) {
+   bool rc = false;
+-
++    
+   if(!ntop->getPrefs()->is_tiny_flows_export_enabled() && isTiny()) {
+ #ifdef TINY_FLOWS_DEBUG
+     ntop->getTrace()->traceEvent(TRACE_NORMAL,
+@@ -1980,6 +1980,7 @@ void Flow::periodic_stats_update(const struct timeval *tv) {
+ /* *************************************** */
+ 
+ void Flow::dumpCheck(time_t t, bool last_dump_before_free) {
++
+   if((ntop->getPrefs()->is_flows_dump_enabled()
+ #ifndef HAVE_NEDGE
+       || ntop->get_export_interface()
+
+
+
+
+@@ -255,7 +255,7 @@ void NetworkInterface::init(const char *interface_name) {
+     last_remote_pps = 0, last_remote_bps = 0,
+     has_vlan_packets = false,
+     cpu_affinity = -1 /* no affinity */,
+-    inline_interface = false, running = false, interfaceStats = NULL,
++    inline_interface = false, interfaceStats = NULL,
+     has_too_many_hosts = has_too_many_flows = false,
+     flow_dump_disabled = false,
+     numL2Devices = 0, numHosts = 0, numLocalHosts = 0,
+@@ -3087,7 +3087,7 @@ void NetworkInterface::flowAlertsDequeueLoop() {
+     }
+   }
+ 
+-  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Flow dump thread completed for %s", get_name());
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Flow alerts dump thread terminated for %s", get_name());
+ }
+ 
+ /* **************************************************** */
+@@ -3124,7 +3124,7 @@ void NetworkInterface::hostAlertsDequeueLoop() {
+     }
+   }
+ 
+-  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Host dump thread completed for %s", get_name());
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Host alerts dump thread terminated for %s", get_name());
+ }
+ 
+ /* **************************************************** */
+@@ -3159,7 +3159,7 @@ void NetworkInterface::dumpFlowLoop() {
+     }
+   }
+ 
+-  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Flow dump loop completed for %s", get_name());
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Flow dump thread completed for %s", get_name());
+ }
+ 
+ /* **************************************************** */
+@@ -3270,8 +3270,15 @@ void NetworkInterface::shutdown() {
+     purgeIdle(time(NULL), true, true);
+ 
+     /* Make sure all alerts have been dequeued and processed */
+-    dequeueFlowAlertsFromChecks(0 /* unlimited budget */),
+-      dequeueHostAlertsFromChecks(0 /* unlimited budged */);
++    dequeueFlowAlertsFromChecks(0 /* unlimited budget */);
++    dequeueHostAlertsFromChecks(0 /* unlimited budged */);
++
++    /* Make sure all flows have been dumper */
++    dequeueFlowsForDump(0 /* Unlimited budget for idle flows */,
++		        0 /* Unlimited budged for active flows */);
++  
++    if(db)
++      db->flush();
+   }
+ }
+ 
+@@ -6032,9 +6039,9 @@ u_int NetworkInterface::purgeIdleFlows(bool force_idle, bool full_scan) {
+ 
+   pollQueuedeCompanionEvents();
+ 
+-  if(!force_idle && !full_scan && last_packet_time < next_idle_flow_purge)
++  if(!force_idle && !full_scan && last_packet_time < next_idle_flow_purge) {
+     return(0); /* Too early */
+-  else {
++  } else {
+     /* Time to purge flows */
+     const struct timeval tv = periodicUpdateInitTime();
+ 
+
+
+
+
+@@ -100,6 +100,7 @@ Ntop::Ntop(const char *appName) {
+   cpu_load = 0;
+   system_interface = NULL;
+   purgeLoop_started = false;
++  interfacesShuttedDown = false;
+ #ifndef WIN32
+   cping = NULL, default_ping = NULL;
+ #endif
+@@ -2824,8 +2825,17 @@ void Ntop::checkShutdownWhenDone() {
+     /* One extra housekeeping before executing tests (this assumes all flows have been walked) */
+     runHousekeepingTasks();
+ 
++    /* Perform shutdown opera

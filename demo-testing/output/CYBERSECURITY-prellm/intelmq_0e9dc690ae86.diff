@@ -1,0 +1,116 @@
+@@ -557,6 +557,13 @@ class Bot(object):
+                                              path_permissive=path_permissive)
+ 
+     def receive_message(self):
++        """
++
++
++        If the bot is reloaded when waiting for an incoming message, the received message
++        will be rejected to the pipeline in the first place to get to a clean state.
++        Then, after reloading, the message will be retrieved again.
++        """
+         if self.__current_message:
+             self.logger.debug("Reusing existing current message as incoming.")
+             return self.__current_message
+@@ -567,11 +574,16 @@ class Bot(object):
+             message = self.__source_pipeline.receive()
+             if not message:
+                 self.logger.warning('Empty message received. Some previous bot sent invalid data.')
++                self.__handle_sighup()
+                 continue
+ 
+-        # handle a sighup which happened during blocking read
+-        # TODO: quickfix for https://github.com/certtools/intelmq/issues/1438
+-#        self.__handle_sighup()
++        # * handle a sighup which happened during blocking read
++        # * re-queue the message before reloading
++        #   https://github.com/certtools/intelmq/issues/1438
++        if self.__sighup.is_set():
++            self.__source_pipeline.reject_message()
++            self.__handle_sighup()
++            return self.receive_message()
+ 
+         try:
+             self.__current_message = libmessage.MessageFactory.unserialize(message,
+
+
+
+
+@@ -143,6 +143,15 @@ class Pipeline(object):
+     def nonempty_queues(self) -> set:
+         raise NotImplementedError
+ 
++    def reject_message(self):
++        if not self._has_message:
++            raise exceptions.PipelineError("No message to acknowledge.")
++        self._reject_message()
++        self._has_message = False
++
++    def _reject_message(self):
++        raise NotImplementedError
++
+ 
+ class Redis(Pipeline):
+     has_internal_queues = True
+@@ -280,6 +289,11 @@ class Redis(Pipeline):
+             self.connect()
+         return {queue.decode() for queue in self.pipe.keys()}
+ 
++    def _reject_message(self):
++        """
++        Rejecting is a no-op as the message is in the internal queue anyway.
++        """
++
+ # Algorithm
+ # ---------
+ # [Receive]     B RPOP LPUSH   source_queue ->  internal_queue
+@@ -364,6 +378,11 @@ class Pythonlist(Pipeline):
+         """ Empties given queue. """
+         self.state[queue] = []
+ 
++    def _reject_message(self):
++        """
++        No-op because of the internal queue
++        """
++
+ 
+ class Amqp(Pipeline):
+     queue_args = {'x-queue-mode': 'lazy'}
+@@ -549,3 +568,6 @@ class Amqp(Pipeline):
+     def nonempty_queues(self) -> set:
+         result = self._get_queues()
+         return {name for name, count in result.items() if count}
++
++    def _reject_message(self):
++        self.channel.basic_nack(delivery_tag=self.delivery_tag, requeue=True)
+
+
+
+
+@@ -98,6 +98,18 @@ class TestPythonlist(unittest.TestCase):
+         self.assertEqual(self.pipe.count_queued_messages('test-bot-input', 'test-bot-output'),
+                          {'test-bot-input': 1, 'test-bot-output': 2})
+ 
++    def test_has_message(self):
++        self.assertFalse(self.pipe._has_message)
++        self.pipe.state['test-bot-input'] = [SAMPLES['normal'][0]]
++        self.pipe.receive()
++        self.assertTrue(self.pipe._has_message)
++
++    def test_reject(self):
++        self.pipe.state['test-bot-input'] = [SAMPLES['normal'][0]]
++        self.pipe.receive()
++        self.pipe.reject_message()
++        self.assertEqual(SAMPLES['normal'][1], self.pipe.receive())
++
+     def tearDown(self):
+         self.pipe.state = {}
+ 
+@@ -142,6 +154,18 @@ class TestRedis(unittest.TestCase):
+         self.pipe.send(SAMPLES['unicode'][0])
+         self.assertEqual(self.pipe.count_queued_messages('test'), {'test': 3})
+ 
++    def test_has_message(self):
++        self.assertFalse(self.pipe._has_message)
++        self.pipe.send(SAMPLES['normal'][0])
++        s

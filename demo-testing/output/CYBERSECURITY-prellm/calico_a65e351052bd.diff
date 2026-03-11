@@ -1,0 +1,120 @@
+@@ -142,7 +142,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(
+ 	ct_value.type = type;
+ 	ct_value.orig_dst = orig_dst;
+ 	ct_value.orig_port = orig_dport;
+-	struct calico_ct_leg *our_dir, *oth_dir;
++	struct calico_ct_leg *src_to_dst, *dst_to_src;
+ 	bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
+ 	if (srcLTDest) {
+ 		*k = (struct calico_ct_key) {
+@@ -150,27 +150,27 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(
+ 			.addr_a = ip_src, .port_a = sport,
+ 			.addr_b = ip_dst, .port_b = dport,
+ 		};
+-		our_dir = &ct_value.a_to_b;
+-		oth_dir = &ct_value.b_to_a;
++		src_to_dst = &ct_value.a_to_b;
++		dst_to_src = &ct_value.b_to_a;
+ 	} else  {
+ 		*k = (struct calico_ct_key) {
+ 			.protocol = ip_proto,
+ 			.addr_a = ip_dst, .port_a = dport,
+ 			.addr_b = ip_src, .port_b = sport,
+ 		};
+-		our_dir = &ct_value.b_to_a;
+-		oth_dir = &ct_value.a_to_b;
++		src_to_dst = &ct_value.b_to_a;
++		dst_to_src = &ct_value.a_to_b;
+ 	}
+ 
+ 	dump_ct_key(k, flags);
+ 
+-	our_dir->seqno = seq;
+-	our_dir->syn_seen = syn;
+-	our_dir->opener = 1;
++	src_to_dst->seqno = seq;
++	src_to_dst->syn_seen = syn;
++	src_to_dst->opener = 1;
+ 	if (flags & CALI_TC_INGRESS) {
+-		oth_dir->ingress_whitelisted = 1;
++		dst_to_src->ingress_whitelisted = 1;
+ 	} else {
+-		our_dir->egress_whitelisted = 1;
++		src_to_dst->egress_whitelisted = 1;
+ 	}
+ 	int err = bpf_map_update_elem(&calico_ct_map_v4, k, &ct_value, 0);
+ 	CALI_VERB("CT-ALL Create result: %d.\n", err);
+@@ -379,7 +379,7 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_tcp_lookup(
+ 	__u64 now = bpf_ktime_get_ns();
+ 	v->last_seen = now;
+ 
+-	struct calico_ct_leg *our_dir, *oth_dir;
++	struct calico_ct_leg *src_to_dst, *dst_to_src;
+ 
+ 	struct calico_ct_value *tracking_v;
+ 	switch (v->type) {
+@@ -396,13 +396,13 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_tcp_lookup(
+ 		tracking_v->last_seen = now;
+ 
+ 		if (ip_src == v->nat_rev_key.addr_a && sport == v->nat_rev_key.port_a) {
+-			our_dir = &tracking_v->a_to_b;
+-			oth_dir = &tracking_v->b_to_a;
++			src_to_dst = &tracking_v->a_to_b;
++			dst_to_src = &tracking_v->b_to_a;
+ 			result.nat_ip = v->nat_rev_key.addr_b;
+ 			result.nat_port = v->nat_rev_key.port_b;
+ 		} else {
+-			our_dir = &tracking_v->b_to_a;
+-			oth_dir = &tracking_v->a_to_b;
++			src_to_dst = &tracking_v->b_to_a;
++			dst_to_src = &tracking_v->a_to_b;
+ 			result.nat_ip = v->nat_rev_key.addr_a;
+ 			result.nat_port = v->nat_rev_key.port_a;
+ 		}
+@@ -419,14 +419,14 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_tcp_lookup(
+ 		CALI_DEBUG("CT-TCP Hit! NAT REV entry.\n");
+ 
+ 		if (srcLTDest) {
+-			our_dir = &v->a_to_b;
+-			oth_dir = &v->b_to_a;
++			src_to_dst = &v->a_to_b;
++			dst_to_src = &v->b_to_a;
+ 		} else {
+-			our_dir = &v->b_to_a;
+-			oth_dir = &v->a_to_b;
++			src_to_dst = &v->b_to_a;
++			dst_to_src = &v->a_to_b;
+ 		}
+ 
+-		if (oth_dir->opener) {
++		if (dst_to_src->opener) {
+ 			// The destination of the packet was the opener of the NAT session,
+ 			// need to SNAT the traffic back to its original request.
+ 			result.rc =	CALI_CT_ESTABLISHED_SNAT;
+@@ -461,11 +461,11 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_tcp_lookup(
+ 		result.rc =	CALI_CT_ESTABLISHED;
+ 
+ 		if (srcLTDest) {
+-			our_dir = &v->a_to_b;
+-			oth_dir = &v->b_to_a;
++			src_to_dst = &v->a_to_b;
++			dst_to_src = &v->b_to_a;
+ 		} else {
+-			our_dir = &v->b_to_a;
+-			oth_dir = &v->a_to_b;
++			src_to_dst = &v->b_to_a;
++			dst_to_src = &v->a_to_b;
+ 		}
+ 
+ 		break;
+@@ -474,62 +474,65 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_tcp_lookup(
+ 		goto out_lookup_fail;
+ 	}
+ 
+-	// TODO Update once host endpoints come along.
+-	// Packet towards a workload.
+-	if (our_dir->ingress_whitelisted || our_dir->egress_whitelisted) {
+-		// Packet was whitelisted by the policy attached to this workload.
+-		CALI_DEBUG("CT-TCP Packet whitelisted by this workload's policy.\n");
+-	} else if (oth_dir->ingress_whitelisted) {
+-		// Traffic between two workload

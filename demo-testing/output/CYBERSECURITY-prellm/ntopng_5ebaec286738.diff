@@ -1,0 +1,121 @@
+@@ -78,10 +78,9 @@ class LuaEngine {
+    */
+   int handle_script_request(struct mg_connection *conn,
+ 			    const struct mg_request_info *request_info, 
+-			    char *script_path);
++			    char *script_path, bool *attack_attempt);
+ 
+-
+-  void setParamsTable(lua_State* vm,
++  bool setParamsTable(lua_State* vm,
+ 		      const char* table_name,
+ 		      const char* query) const;
+ 
+
+
+
+
+@@ -63,7 +63,7 @@ class Utils {
+   static char* sanitizeHostName(char *str);
+   static char* urlDecode(const char *src, char *dst, u_int dst_len);
+   static bool isUserAdministrator(lua_State* vm);
+-  static void purifyHTTPparam(char *param, bool strict, bool allowURL, bool allowDots);
++  static bool purifyHTTPparam(char *param, bool strict, bool allowURL, bool allowDots);
+   static char* stripHTML(const char * const str);
+   static bool postHTTPJsonData(char *username, char *password, char *url, char *json, HTTPTranferStats *stats);
+   static bool postHTTPForm(char *username, char *password, char *url, char *form_data);
+
+
+
+
+@@ -28,7 +28,7 @@ GenericHash::GenericHash(NetworkInterface *_iface, u_int _num_hashes,
+   num_hashes = _num_hashes, max_hash_size = _max_hash_size, current_size = 0;
+   purge_step = max_val(num_hashes / PURGE_FRACTION, 1);
+   name = strdup(_name ? _name : "???");
+-		
++
+   iface = _iface;
+   table = new GenericHashEntry*[num_hashes];
+   for(u_int i = 0; i < num_hashes; i++)
+@@ -226,7 +226,7 @@ u_int GenericHash::purgeIdle() {
+     ntop->getTrace()->traceEvent(TRACE_NORMAL, "[%s @ %s] Begin purgeIdle() [begin index: %u][purge step: %u]",
+ 				 name, iface->get_name(), last_purged_hash, purge_step);
+ #endif
+-    
++
+   disablePurge();
+ 
+   for(u_int j = 0; j < purge_step; j++) {
+@@ -275,12 +275,12 @@ u_int GenericHash::purgeIdle() {
+   enablePurge();
+ 
+ #if WALK_DEBUG
+-  if((num_purged > 0) && (!strcmp(name, "FlowHash")))
++  if(/* (num_purged > 0) && */ (!strcmp(name, "FlowHash")))
+     ntop->getTrace()->traceEvent(TRACE_NORMAL,
+-				 "[%s @ %s] purgeIdle() [num_purged: %u][num_checked: %u][end index: %u][purge step: %u]",
+-				 name, iface->get_name(), num_purged, buckets_checked, last_purged_hash, purge_step);
++				 "[%s @ %s] purgeIdle() [num_purged: %u][num_checked: %u][end index: %u][current_size: %u]",
++				 name, iface->get_name(), num_purged, buckets_checked, last_purged_hash, current_size);
+ #endif
+-     
++
+   return(num_purged);
+ }
+ 
+
+
+
+
+@@ -863,7 +863,18 @@ static int handle_lua_request(struct mg_connection *conn) {
+ 	return(send_error(conn, 500 /* Internal server error */,
+ 			  "Internal server error", "%s", "Unable to start Lua interpreter"));
+       } else {
+-	l->handle_script_request(conn, request_info, path);
++	bool attack_attempt;
++	
++	l->handle_script_request(conn, request_info, path, &attack_attempt);
++
++	if(attack_attempt) {
++	  char buf[32];
++	  
++	  ntop->getTrace()->traceEvent(TRACE_WARNING, "[HTTP] Potential attack from %s on %s",
++				       Utils::intoaV4((unsigned int)conn->request_info.remote_ip, buf, sizeof(buf)),
++				       request_info->uri);
++	}
++
+ 	delete l;
+ 	return(1); /* Handled */
+       }
+
+
+
+
+@@ -8143,13 +8143,14 @@ void LuaEngine::setInterface(const char *user) {
+ 
+ /* ****************************************** */
+ 
+-void LuaEngine::setParamsTable(lua_State* vm, const char* table_name,
++bool LuaEngine::setParamsTable(lua_State* vm, const char* table_name,
+ 			       const char* query) const {
+   char outbuf[FILENAME_MAX];
+   char *where;
+   char *tok;
+   char *query_string = query ? strdup(query) : NULL;
+-
++  bool ret = false;
++  
+   lua_newtable(L);
+ 
+   if(query_string) {
+@@ -8174,16 +8175,23 @@ void LuaEngine::setParamsTable(lua_State* vm, const char* table_name,
+ 	// ntop->getTrace()->traceEvent(TRACE_WARNING, "%s = %s", tok, _equal);
+ 
+         if((decoded_buf = (char*)malloc(len+1)) != NULL) {
++	  bool rsp = false;
++	  FILE *fd;
++	  
+           Utils::urlDecode(_equal, decoded_buf, len+1);
+ 
+ 	  /* Allow multiple dots in password fields */
+ 	  bool allow_dots = (strstr(tok, "password"

@@ -1,0 +1,146 @@
+@@ -37,6 +37,7 @@ static const char *help_msg_d[] = {
+ 	"dw", " <pid>", "Block prompt until pid dies",
+ #if __WINDOWS__
+ 	"dW", "", "List process windows",
++	"dWi", "", "Identify window under cursor",
+ #endif
+ 	"dx", "[?]", "Inject and run code on target process (See gs)",
+ 	NULL
+@@ -5319,7 +5320,11 @@ static int cmd_debug(void *data, const char *input) {
+ 		break;
+ #if __WINDOWS__
+ 	case 'W': // "dW"
+-		r_w32_print_windows (core->dbg);
++		if (input[1] == 'i') {
++			r_w32_identify_window ();
++		} else {
++			r_w32_print_windows (core->dbg);
++		}
+ 		break;
+ #endif
+ 	case 'w': // "dw"
+
+
+
+
+@@ -252,32 +252,93 @@ void __free_window (void *ptr) {
+ 	free (win);
+ }
+ 
+-static BOOL CALLBACK __enum_childs(
+-	_In_ HWND   hwnd,
+-	_In_ LPARAM lParam
+-) {
+-	RList *windows = lParam;
++static window *__window_from_handle(HANDLE hwnd) {
++	r_return_val_if_fail (hwnd, NULL);
+ 	window *win = R_NEW0 (window);
+ 	if (!win) {
+-		r_list_free (windows);
+-		return false;
++		return NULL;
+ 	}
+-	win->tid = GetWindowThreadProcessId (hwnd, NULL);
+ 	win->h = hwnd;
++	win->tid = GetWindowThreadProcessId (hwnd, &win->pid);
++	win->proc = GetClassLongPtrW (hwnd, GCLP_WNDPROC);
+ 	const size_t sz = MAX_CLASS_NAME * sizeof (WCHAR);
+-	char *tmp = malloc (sz);
++	wchar_t *tmp = malloc (sz);
+ 	if (!tmp) {
+-		r_list_free (windows);
+ 		free (win);
+-		return false;
++		return NULL;
+ 	}
+ 	GetClassNameW (hwnd, tmp, MAX_CLASS_NAME);
+-	win->proc = GetClassLongPtrW (hwnd, GCLP_WNDPROC);
+ 	win->name = r_utf16_to_utf8 (tmp);
++	free (tmp);
+ 	if (!win->name) {
+ 		win->name = strdup ("");
+ 	}
+-	free (tmp);
++	return win;
++}
++
++static RTable *__create_window_table(void) {
++	RTable *tbl = r_table_new ();
++	if (!tbl) {
++		return NULL;
++	}
++	r_table_add_column (tbl, r_table_type ("number"), "Handle", ST32_MAX);
++	r_table_add_column (tbl, r_table_type ("number"), "PID", ST32_MAX);
++	r_table_add_column (tbl, r_table_type ("number"), "TID", ST32_MAX);
++	r_table_add_column (tbl, r_table_type ("string"), "Class Name", ST32_MAX);
++	return tbl;
++}
++
++static void __add_window_to_table(RTable *tbl, window *win) {
++	r_return_if_fail (tbl && win);
++	char *handle = r_str_newf ("0x%08"PFMT64x"", win->h);
++	char *pid = r_str_newf ("%"PFMT32u"", win->pid);
++	char *tid = r_str_newf ("%"PFMT32u"", win->tid);
++	r_table_add_row (tbl, handle, pid, tid, win->name, NULL);
++	free (handle);
++	free (tid);
++	free (pid);
++}
++
++R_API void r_w32_identify_window(void) {
++	while (!r_cons_yesno ('y', "Move cursor to the window to be identified. Ready?"));
++	POINT p;
++	GetCursorPos (&p);
++	HANDLE hwnd = WindowFromPoint (p);
++	window *win = NULL;
++	if (hwnd) {
++		if (r_cons_yesno ('y', "Try to get the child?")) {
++			HANDLE child = ChildWindowFromPoint (hwnd, p);
++			hwnd = child ? child : hwnd;
++		}
++		win = __window_from_handle (hwnd);
++	} else {
++		eprintf ("No window found\n");
++		return;
++	}
++	if (!win) {
++		eprintf ("Error trying to get information from 0x%08"PFMT64x"\n", (ut64)hwnd);
++		return;
++	}
++	RTable *tbl = __create_window_table ();
++	if (!tbl) {
++		return;
++	}
++	__add_window_to_table (tbl, win);
++	char *tbl_str = r_table_tofancystring (tbl);
++	r_cons_print (tbl_str);
++	free (tbl_str);
++	r_table_free (tbl);
++}
++
++static BOOL CALLBACK __enum_childs(
++	_In_ HWND   hwnd,
++	_In_ LPARAM lParam
++) {
++	RList *windows = (RList *)lParam;
++	window *win = __window_from_handle (hwnd);
++	if (!win) {
++		return false;
++	}
+ 	r_list_push (windows, win);
+ 	return true;
+ }
+@@ -288,37 +349,20 @@ static RList *__get_windows(RDebug *dbg) {
+ 	do {
+ 		hCurWnd = FindWindowEx (NULL, hCurWnd, NULL, NULL);
+ 		DWORD dwProcessID = 0;
+-		int tid = GetWindowThreadProcessId (hCurWnd, &dwProcessID);
++		GetWindowThreadProcessId (hCurWnd, &dwProcessID);
+ 		if (dbg->pid == dwProcessID) {
+-			EnumChildWindows (hCurWnd, __enum_childs, windows);
+-			window *win = R_NEW0 (window);
++			EnumChildWindows (hCurWnd, __enum_childs, (LPARAM)windows);
++			window *win = __window_from_handle (hCurWnd);
+ 			if (!win) {
+ 				r_list_free (windows);
+ 				return NULL

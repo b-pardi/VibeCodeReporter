@@ -1,0 +1,98 @@
+@@ -1,4 +1,4 @@
+-# SPDX-FileCopyrightText: 2019 Sebastian Wagner
++# SPDX-FileCopyrightText: 2019 Sebastian Wagner, 2024 CERT.at GmbH
+ #
+ # SPDX-License-Identifier: AGPL-3.0-or-later
+ 
+@@ -10,21 +10,25 @@ from pathlib import Path
+ from uuid import uuid4
+ 
+ from intelmq import VAR_STATE_PATH
+-import pymisp
+ 
+ from intelmq.lib.bot import OutputBot
+ from intelmq.lib.exceptions import MissingDependencyError
+-from ....lib.message import MessageFactory
++from intelmq.lib.message import Event, Message, MessageFactory
+ from intelmq.lib.mixins import CacheMixin
+ from intelmq.lib.utils import parse_relative
+ 
+ try:
+-    from pymisp import MISPEvent, MISPObject, MISPOrganisation, MISPTag, NewAttributeError
++    from pymisp import (
++        MISPEvent,
++        MISPObject,
++        MISPOrganisation,
++        MISPTag,
++        MISPObjectAttribute,
++        NewAttributeError,
++    )
+     from pymisp.tools import feed_meta_generator
+ except ImportError:
+-    # catching SyntaxError because of https://github.com/MISP/PyMISP/issues/501
+     MISPEvent = None
+-    import_fail_reason = "import"
+ 
+ DEFAULT_KEY = "default"
+ 
+@@ -33,18 +37,42 @@ class MISPFeedOutputBot(OutputBot, CacheMixin):
+     """Generate an output in the MISP Feed format"""
+ 
+     interval_event: str = "1 hour"
+-    bulk_save_count: int = None
+     misp_org_name = None
+     misp_org_uuid = None
+     output_dir: str = f"{VAR_STATE_PATH}mispfeed-output"  # TODO: should be path
+-    _is_multithreadable: bool = False
+-    attribute_mapping: dict = None
+-    event_separator: str = None
++    # Enables regenerating the MISP feed after collecting given number of messages
++    bulk_save_count: int = None
++
++    # Additional information to be added to the MISP event description
+     additional_info: str = None
++
++    # An optional field used to create multiple MISP events from incoming messages
++    event_separator: str = None
++
++    # Optional non-standard mapping of message fields to MISP object attributes
++    # The structure is like:
++    # {<IDF_field_name = MIPS_object_relation>: {<dict of additional parameters for MISPObjectAttribute>}}
++    # For example:
++    #   {"source.ip": {"comment": "This is the source of the event"}}
++    #        will include only the "source.ip" field in the MISP object attributes,
++    #        and set the comment
++    attribute_mapping: dict = None
++
++    # Optional definition to add tags to the MISP event. It should be a dict where keys are
++    # '__all__' (to add tags for every event) or, if the event_separator is used, the separator
++    # values. For each key, there should be a list of dicts defining parameters for the MISPTag
++    # object, but only the "name" is required to set.
++    # For example:
++    #   {"__all__": [{"name": "tag1"}, {"name": "tag2"}]}
++    #       will add two tags to every event
++    #   {"infostealer": [{"name": "type:infostealer"}], "__all__": [{"name": "tag1"}]}
++    #       will add two tags to every event separated by "infostealer", and
++    #       one tag to every other event
+     tagging: dict = None
+-    # A structure like:
+-    # __all__: list of tag kwargs for all events
+-    # <key>: list of tag kwargs per separator key
++
++    # Delaying reloading would delay saving eventually long-awaiting messages
++    _sighup_delay = False
++    _is_multithreadable: bool = False
+ 
+     @staticmethod
+     def check_output_dir(dirname):
+@@ -112,11 +140,13 @@ class MISPFeedOutputBot(OutputBot, CacheMixin):
+                     tag = MISPTag()
+                     tag.from_dict(**kw)
+                     self._tagging_objects[key].append(tag)
+-            self.logger.debug("Generated tags: %r.", self._tagging_objects)
+ 
+-        if self.current_events and self.cache_length():
+-            # Ensure we do generate feed on reload / restart
+-            self._generate_feed()
++        # Ensure we do generate feed on reload / restart, so awaiting messages won't wait forever
++        if self.cache_length() and not getattr(self, "testing",

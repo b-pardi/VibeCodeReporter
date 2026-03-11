@@ -1,0 +1,154 @@
+@@ -46,6 +46,15 @@
+ #define CONDITIONAL_PREALLOC BPF_F_NO_PREALLOC
+ #endif
+ 
++#if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY)
++#define HAVE_ENCAP
++
++/* NOT_VTEP_DST is passed to an encapsulation function when the
++ * destination of the tunnel is not a VTEP.
++ */
++#define NOT_VTEP_DST 0
++#endif
++
+ /* TODO: ipsec v6 tunnel datapath still needs separate fixing */
+ #ifndef ENABLE_IPSEC
+ # ifdef ENABLE_IPV6
+@@ -990,12 +999,12 @@ static __always_inline int redirect_ep(struct __ctx_buff *ctx __maybe_unused,
+ 	if (needs_backlog || !is_defined(ENABLE_HOST_ROUTING)) {
+ 		return ctx_redirect(ctx, ifindex, 0);
+ 	} else {
+-# ifdef ENCAP_IFINDEX
++# ifdef HAVE_ENCAP
+ 		/* When coming from overlay, we need to set packet type
+ 		 * to HOST as otherwise we might get dropped in IP layer.
+ 		 */
+ 		ctx_change_type(ctx, PACKET_HOST);
+-# endif /* ENCAP_IFINDEX */
++# endif /* HAVE_ENCAP */
+ 		return ctx_redirect_peer(ctx, ifindex, 0);
+ 	}
+ }
+
+
+
+
+@@ -9,11 +9,7 @@
+ #include "trace.h"
+ #include "l3.h"
+ 
+-#ifdef ENCAP_IFINDEX
+-/* NOT_VTEP_DST is passed to an encapsulation function when the
+- * destination of the tunnel is not a VTEP.
+- */
+-#define NOT_VTEP_DST 0
++#ifdef HAVE_ENCAP
+ #ifdef ENABLE_IPSEC
+ static __always_inline int
+ encap_and_redirect_nomark_ipsec(struct __ctx_buff *ctx, __u32 tunnel_endpoint,
+@@ -121,7 +117,6 @@ __encap_with_nodeid(struct __ctx_buff *ctx, __u32 tunnel_endpoint,
+ 		    __u32 seclabel, __u32 dstid, __u32 vni __maybe_unused,
+ 		    enum trace_reason ct_reason, __u32 monitor)
+ {
+-	struct bpf_tunnel_key key = {};
+ 	__u32 node_id;
+ 	int ret;
+ 
+@@ -133,20 +128,12 @@ __encap_with_nodeid(struct __ctx_buff *ctx, __u32 tunnel_endpoint,
+ 		seclabel = LOCAL_NODE_ID;
+ 
+ 	node_id = bpf_htonl(tunnel_endpoint);
+-#ifdef ENABLE_VTEP
+-	if (vni != NOT_VTEP_DST)
+-		key.tunnel_id = vni;
+-	else
+-#endif /* ENABLE_VTEP */
+-		key.tunnel_id = seclabel;
+-	key.remote_ipv4 = node_id;
+-	key.tunnel_ttl = IPDEFTTL;
+ 
+ 	cilium_dbg(ctx, DBG_ENCAP, node_id, seclabel);
+ 
+-	ret = ctx_set_tunnel_key(ctx, &key, sizeof(key), BPF_F_ZERO_CSUM_TX);
++	ret = ctx_set_encap_info(ctx, node_id, seclabel, dstid, vni);
+ 	if (unlikely(ret < 0))
+-		return DROP_WRITE_ERROR;
++		return ret;
+ 
+ 	send_trace_notify(ctx, TRACE_TO_OVERLAY, seclabel, dstid, 0, ENCAP_IFINDEX,
+ 			  ct_reason, monitor);
+@@ -262,5 +249,5 @@ encap_and_redirect_netdev(struct __ctx_buff *ctx, struct endpoint_key *k,
+ 	return __encap_and_redirect_with_nodeid(ctx, tunnel->ip4, seclabel,
+ 						0, NOT_VTEP_DST, trace);
+ }
+-#endif /* ENCAP_IFINDEX */
++#endif /* HAVE_ENCAP */
+ #endif /* __LIB_ENCAP_H_ */
+
+
+
+
+@@ -99,7 +99,7 @@ struct bpf_elf_map __section_maps CALLS_MAP = {
+ };
+ #endif /* SKIP_CALLS_MAP */
+ 
+-#ifdef ENCAP_IFINDEX
++#ifdef HAVE_ENCAP
+ 
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_HASH);
+
+
+
+
+@@ -4,6 +4,8 @@
+ #ifndef __LIB_OVERLOADABLE_SKB_H_
+ #define __LIB_OVERLOADABLE_SKB_H_
+ 
++#include "linux/ip.h"
++
+ static __always_inline __maybe_unused void
+ bpf_clear_meta(struct __sk_buff *ctx)
+ {
+@@ -156,4 +158,30 @@ ctx_change_head(struct __sk_buff *ctx, __u32 head_room, __u64 flags)
+ 	return skb_change_head(ctx, head_room, flags);
+ }
+ 
++#ifdef HAVE_ENCAP
++static __always_inline __maybe_unused int
++ctx_set_encap_info(struct __sk_buff *ctx, __u32 node_id, __u32 seclabel,
++		   __u32 dstid __maybe_unused, __u32 vni __maybe_unused)
++{
++	struct bpf_tunnel_key key = {};
++	int ret;
++
++#ifdef ENABLE_VTEP
++	if (vni != NOT_VTEP_DST)
++		key.tunnel_id = vni;
++	else
++#endif /* ENABLE_VTEP */
++		key.tunnel_id = seclabel;
++
++	key.remote_ipv4 = node_id;
++	key.tunnel_ttl = IPDEFTTL;
++
++	ret = ctx_set_tunnel_key(ctx, &key, sizeof(key), BPF_F_ZERO_CSUM_TX);
++	if (unlikely(ret < 0))
++		return DROP_WRITE_ERROR;
++
++	return 0;
++}
++#endif /* HAVE_ENCAP */
++
+ #endif /* __LIB_OVERLOADABLE_SKB_H_ */
+
+
+
+
+@@ -97,4 +97,16 @@ ctx_change_head(struct xdp_md *ctx __maybe_unused,
+ 	return 0; /* Only intended for SKB context. */
+ }
+ 
++#ifdef HAVE_ENCAP
++static __always_inline __maybe_unused int
++ctx_set_encap_info(struct xdp_md *ctx __m

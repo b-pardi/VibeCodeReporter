@@ -1,0 +1,105 @@
+@@ -149,15 +149,6 @@ int NAME(struct __ctx_buff *ctx)						\
+ 	return ret;								\
+ }
+ 
+-#if defined(ENABLE_IPV4) || defined(ENABLE_IPV6)
+-static __always_inline bool
+-redirect_to_proxy(int proxy_port, enum ct_status status)
+-{
+-	return proxy_port > 0 &&
+-	       (status == CT_NEW || status == CT_ESTABLISHED ||  status == CT_REOPENED);
+-}
+-#endif
+-
+ #ifdef ENABLE_CUSTOM_CALLS
+ /* Encode return value and identity into cb buffer. This is used before
+  * executing tail calls to custom programs. "ret" is the return value supposed
+@@ -232,7 +223,6 @@ static __always_inline int handle_ipv6_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	bool __maybe_unused dst_remote_ep = false;
+ 	__u16 proxy_port = 0;
+ 	bool from_l7lb = false;
+-	bool emit_policy_verdict = false;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+@@ -304,11 +294,15 @@ static __always_inline int handle_ipv6_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	}
+ #endif /* ENABLE_L7_LB */
+ 
+-	/* Check it this is return traffic to an ingress proxy. */
+-	if ((ct_status == CT_REPLY || ct_status == CT_RELATED) &&
+-	    ct_state->proxy_redirect) {
+-		/* Stack will do a socket match and deliver locally. */
+-		return ctx_redirect_to_proxy6(ctx, tuple, 0, false);
++	/* Skip policy enforcement for return traffic. */
++	if (ct_status == CT_REPLY || ct_status == CT_RELATED) {
++		/* Check if this is return traffic to an ingress proxy. */
++		if (ct_state->proxy_redirect) {
++			/* Stack will do a socket match and deliver locally. */
++			return ctx_redirect_to_proxy6(ctx, tuple, 0, false);
++		}
++		/* proxy_port remains 0 in this case */
++		goto skip_policy_enforcement;
+ 	}
+ 
+ 	/* When an endpoint connects to itself via service clusterIP, we need
+@@ -317,24 +311,24 @@ static __always_inline int handle_ipv6_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	 * want to execute the conntrack logic so that replies can be correctly
+ 	 * matched.
+ 	 */
+-	if (hairpin_flow) {
++	if (hairpin_flow)
+ 		goto skip_policy_enforcement;
+-	}
+ 
+ 	/* If the packet is in the establishing direction and it's destined
+ 	 * within the cluster, it must match policy or be dropped. If it's
+ 	 * bound for the host/outside, perform the CIDR policy check.
+ 	 */
+-	emit_policy_verdict = true;
+ 	verdict = policy_can_egress6(ctx, tuple, SECLABEL, *dst_id,
+ 				     &policy_match_type, &audited, ext_err, &proxy_port);
+ 
+-	if (ct_status != CT_REPLY && ct_status != CT_RELATED && verdict < 0) {
++	/* Emit verdict if drop or if allow for CT_NEW or CT_REOPENED. */
++	if (verdict < 0 || ct_status != CT_ESTABLISHED)
+ 		send_policy_verdict_notify(ctx, *dst_id, tuple->dport,
+ 					   tuple->nexthdr, POLICY_EGRESS, 1,
+ 					   verdict, proxy_port, policy_match_type, audited);
++
++	if (verdict < 0)
+ 		return verdict;
+-	}
+ 
+ skip_policy_enforcement:
+ #if defined(ENABLE_L7_LB)
+@@ -342,10 +336,6 @@ skip_policy_enforcement:
+ #endif
+ 	switch (ct_status) {
+ 	case CT_NEW:
+-		if (emit_policy_verdict)
+-			send_policy_verdict_notify(ctx, *dst_id, tuple->dport,
+-						   tuple->nexthdr, POLICY_EGRESS, 1,
+-						   verdict, proxy_port, policy_match_type, audited);
+ ct_recreate6:
+ 		/* New connection implies that rev_nat_index remains untouched
+ 		 * to the index provided by the loadbalancer (if it applied).
+@@ -361,10 +351,6 @@ ct_recreate6:
+ 		break;
+ 
+ 	case CT_REOPENED:
+-		if (emit_policy_verdict)
+-			send_policy_verdict_notify(ctx, *dst_id, tuple->dport,
+-						   tuple->nexthdr, POLICY_EGRESS, 1,
+-						   verdict, proxy_port, policy_match_type, audited);
+ 	case CT_ESTABLISHED:
+ 		/* Did we end up at a stale non-service entry? Recreate if so. */
+ 		if (unlikely(ct_state->rev_nat_index != ct_state_new.rev_nat_index))
+@@ -426,7 +412,7 @@ ct_recreate6:
+ 	/* L7 LB does L7 policy enforcement, so we only redirect packets
+ 	 * NOT from L7 LB.
+ 	 */
+-	if (!from_l7lb && redirect_to_proxy(proxy_port, ct_status)) {
++	if (!from_l7lb && proxy_port > 0) {
+ 		/* Trace the packet before it is forwarded to proxy */
+ 		send_trace_notify(ctx, TRACE_TO

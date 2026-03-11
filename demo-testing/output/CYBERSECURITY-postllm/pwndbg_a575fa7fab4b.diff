@@ -1,0 +1,161 @@
+@@ -208,6 +208,20 @@ def OnlyWithFile(function):
+     return _OnlyWithFile
+ 
+ 
++def OnlyWhenQemuKernel(function):
++    @functools.wraps(function)
++    def _OnlyWhenQemuKernel(*a, **kw):
++        if pwndbg.gdblib.qemu.is_qemu_kernel():
++            return function(*a, **kw)
++        else:
++            print(
++                "%s: This command may only be run when debugging the Linux kernel in QEMU."
++                % function.__name__
++            )
++
++    return _OnlyWhenQemuKernel
++
++
+ def OnlyWithArch(arch_names: List[str]):
+     """Decorates function to work only with the specified archictectures."""
+ 
+@@ -485,6 +499,7 @@ def load_commands():
+     import pwndbg.commands.ida
+     import pwndbg.commands.ignore
+     import pwndbg.commands.ipython_interactive
++    import pwndbg.commands.kconfig
+     import pwndbg.commands.leakfind
+     import pwndbg.commands.memoize
+     import pwndbg.commands.misc
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,35 @@
++import argparse
++
++import pwndbg.color.message as M
++import pwndbg.commands
++import pwndbg.gdblib.kernel
++
++parser = argparse.ArgumentParser(description="Outputs the kernel config (requires CONFIG_IKCONFIG)")
++
++parser.add_argument("config_name", nargs="?", type=str, help="A config name to search for")
++
++
++@pwndbg.commands.ArgparsedCommand(parser)
++@pwndbg.commands.OnlyWhenQemuKernel
++def kconfig(config_name=None):
++    kconfig_ = pwndbg.gdblib.kernel.kconfig()
++
++    if len(kconfig_) == 0:
++        print(
++            M.warn(
++                "No kernel configuration found, make sure the kernel was built with CONFIG_IKCONFIG"
++            )
++        )
++        return
++
++    if config_name:
++        key = kconfig_.get_key(config_name)
++        if key:
++            val = kconfig_[config_name]
++            print(f"{key} = {val}")
++        else:
++            key = pwndbg.lib.kernel.kconfig.config_to_key(config_name)
++            print(f"Config {key} not set")
++    else:
++        for name, val in kconfig_.items():
++            print(f"{name} = {val}")
+
+
+
+
+@@ -22,6 +22,7 @@ def load_gdblib():
+     import pwndbg.gdblib.events
+     import pwndbg.gdblib.functions
+     import pwndbg.gdblib.hooks
++    import pwndbg.gdblib.kernel
+     import pwndbg.gdblib.memory
+     import pwndbg.gdblib.prompt
+     import pwndbg.gdblib.regs
+
+
+
+
+@@ -27,6 +27,11 @@ def update_arch():
+     arch_mod.update()
+ 
+ 
++@pwndbg.gdblib.events.new_objfile
++def reset_config():
++    pwndbg.gdblib.kernel._kconfig = None
++
++
+ @pwndbg.gdblib.events.stop
+ @pwndbg.gdblib.events.mem_changed
+ @pwndbg.gdblib.events.reg_changed
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,23 @@
++import pwndbg.gdblib.memory
++import pwndbg.gdblib.symbol
++import pwndbg.lib.kernel.kconfig
++import pwndbg.lib.memoize
++
++_kconfig = None
++
++
++def load_kconfig():
++    config_start = pwndbg.gdblib.symbol.address("kernel_config_data")
++    config_end = pwndbg.gdblib.symbol.address("kernel_config_data_end")
++    config_size = config_end - config_start
++
++    compressed_config = pwndbg.gdblib.memory.read(config_start, config_size)
++    return pwndbg.lib.kernel.kconfig.Kconfig(compressed_config)
++
++
++@pwndbg.lib.memoize.reset_on_start
++def kconfig():
++    global _kconfig
++    if _kconfig is None:
++        _kconfig = load_kconfig()
++    return _kconfig
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,57 @@
++import zlib
++from collections import UserDict
++from typing import Dict
++from typing import Optional
++
++
++def parse_config(config_text: str) -> Dict[str, str]:
++    res = {}
++
++    for line in config_text.split(b"\n"):
++        if b"=" in line:
++            config_name, config_val = line.split(b"=", 1)
++            res[config_name.decode("ascii")] = config_val.decode("ascii")
++
++    return res
++
++
++def parse_compresed_config(compressed_config: bytes) -> Dict[str, str]:
++    config_text = zlib.decompress(compressed_config, 16)
++    return parse_config(config_text)
++
++
++def config_to_key(name: str) -> str:
++    return "CONFIG_" + name.upper()
++
++
++class Kconfig(UserDict):
++    def __init__(se

@@ -1,0 +1,137 @@
+@@ -827,7 +827,15 @@ struct ct_entry {
+ 	__u32 last_rx_report;
+ };
+ 
+-#define IPPROTO_ANY	0	/* For service lookup with ANY L4 protocol */
++/* We previously tolerated services with no specified L4 protocol (IPPROTO_ANY).
++ *
++ * This was deprecated, and we now re-purpose IPPROTO_ANY such that when combined with
++ * a zero L4 Destination Port, we can encode a wild-card service entry. This informs
++ * the data path to drop flows towards IPs we know about, but on services we don't.
++ */
++#define IPPROTO_ANY	0
++#define LB_SVC_WILDCARD_PROTO IPPROTO_ANY
++#define LB_SVC_WILDCARD_DPORT 0
+ 
+ struct lb6_key {
+ 	union v6addr address;	/* Service virtual IPv6 address */
+
+
+
+
+@@ -657,20 +657,40 @@ static __always_inline
+ struct lb6_service *lb6_lookup_service(struct lb6_key *key,
+ 				       const bool scope_switch)
+ {
+-	__u8 orig_proto = key->proto;
+ 	struct lb6_service *svc;
+ 
+ 	key->backend_slot = 0;
+ 
+ 	key->scope = LB_LOOKUP_SCOPE_EXT;
+ 	svc = __lb6_lookup_service(key);
+-	if (!svc)
++	if (!svc) {
++		__u8 orig_proto = key->proto;
++		__u16 orig_dport = key->dport;
++
++		key->dport = LB_SVC_WILDCARD_DPORT;
++		key->proto = LB_SVC_WILDCARD_PROTO;
++
++		svc = __lb6_lookup_service(key);
++
++		/* If wildcard lookup was successful, we return the wildcard service while
++		 * leaving the modified dport/proto values in the key. A wildcard service
++		 * entry will have no backends and so caller should trigger a drop.
++		 */
++		if (svc)
++			return svc;
++
++		key->dport = orig_dport;
++		key->proto = orig_proto;
++
++		/* If we have no external scope for this, it's safe to return NULL here
++		 * because there can't be an internal scope. (For now.)
++		 */
+ 		return NULL;
++	}
+ 
+ 	if (!scope_switch || !lb6_svc_is_two_scopes(svc))
+ 		return svc;
+ 
+-	key->proto = orig_proto;
+ 	key->scope = LB_LOOKUP_SCOPE_INT;
+ 	return __lb6_lookup_service(key);
+ }
+@@ -1369,20 +1389,40 @@ static __always_inline
+ struct lb4_service *lb4_lookup_service(struct lb4_key *key,
+ 				       const bool scope_switch)
+ {
+-	__u8 orig_proto = key->proto;
+ 	struct lb4_service *svc;
+ 
+ 	key->backend_slot = 0;
+ 
+ 	key->scope = LB_LOOKUP_SCOPE_EXT;
+ 	svc = __lb4_lookup_service(key);
+-	if (!svc)
++	if (!svc) {
++		__u8 orig_proto = key->proto;
++		__u16 orig_dport = key->dport;
++
++		key->dport = LB_SVC_WILDCARD_DPORT;
++		key->proto = LB_SVC_WILDCARD_PROTO;
++
++		svc = __lb4_lookup_service(key);
++
++		/* If wildcard lookup was successful, we return the wildcard service while
++		 * leaving the modified dport/proto values in the key. A wildcard service
++		 * entry will have no backends and so caller should trigger a drop.
++		 */
++		if (svc)
++			return svc;
++
++		key->dport = orig_dport;
++		key->proto = orig_proto;
++
++		/* If we have no external scope for this, it's safe to return NULL here
++		 * because there can't be an internal scope. (For now.)
++		 */
+ 		return NULL;
++	}
+ 
+ 	if (!scope_switch || !lb4_svc_is_two_scopes(svc))
+ 		return svc;
+ 
+-	key->proto = orig_proto;
+ 	key->scope = LB_LOOKUP_SCOPE_INT;
+ 	return __lb4_lookup_service(key);
+ }
+
+
+
+
+@@ -1480,6 +1480,16 @@ static __always_inline int nodeport_lb6(struct __ctx_buff *ctx,
+ 
+ 	svc = lb6_lookup_service(&key, false);
+ 	if (svc) {
++		/* Check if the identified service is a wildcard entry. This means
++		 * we have no protocol-level service entry, meaning we should drop
++		 * the traffic to avoid it being punted back to the network and re-
++		 * delivered to is in a loop.
++		 */
++		if (key.dport == LB_SVC_WILDCARD_DPORT) {
++			ctx_set_xfer(ctx, XFER_PKT_NO_SVC);
++			return DROP_NO_SERVICE;
++		}
++
+ 		return nodeport_svc_lb6(ctx, &tuple, svc, &key, ip6, l3_off,
+ 					fraginfo, l4_off, src_sec_identity,
+ 					punt_to_stack, ext_err);
+@@ -2839,6 +2849,16 @@ static __always_inline int nodeport_lb4(struct __ctx_buff *ctx,
+ 
+ 	svc = lb4_lookup_service(&key, false);
+ 	if (svc) {
++		/* Check if the identified service is a wildcard entry. This means
++		 * we have no protocol-level service entry, meaning we should drop
++		 * the traffic to avoid it being punted b

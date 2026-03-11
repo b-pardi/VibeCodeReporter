@@ -1,0 +1,135 @@
+@@ -1,128 +1,166 @@
+ /* radare - LGPL - Copyright 2015-2018 nodepad, pancake */
+ 
+ #include "mz.h"
+-#include <btree.h>
++#include <r_list.h>
+ 
+-static ut64 r_bin_mz_seg_to_paddr (const struct r_bin_mz_obj_t *bin, const ut16 segment) {
+-	return (bin->dos_header->header_paragraphs + segment) << 4;
++static ut64 r_bin_mz_va_to_la(const ut16 segment, const ut16 offset) {
++	return (segment << 4) + offset;
+ }
+ 
+-int r_bin_mz_get_entrypoint (const struct r_bin_mz_obj_t *bin) {
+-#if 0
+-	ut16 cs = r_read_ble16 (buf + 0x16, false);
+-	ut16 ip = r_read_ble16 (buf + 0x14, false);
+-	ut16 pa = ((r_read_ble16 (buf + 8 , false) + cs) << 4) + ip;
+-#endif
++static ut64 r_bin_mz_la_to_pa(const struct r_bin_mz_obj_t *bin, ut64 la) {
++	return la + (bin->dos_header->header_paragraphs << 4);
++}
++
++RBinAddr *r_bin_mz_get_entrypoint (const struct r_bin_mz_obj_t *bin) {
++	const MZ_image_dos_header *mz;
++	ut64 la;
++	RBinAddr *entrypoint;
++
+ 	if (!bin || !bin->dos_header) {
+-		return -1;
++		return NULL;
++	}
++
++	mz = bin->dos_header;
++	la = r_bin_mz_va_to_la (mz->cs, mz->ip);
++	la &= 0xfffff;
++	if (la >= bin->load_module_size) {
++		eprintf ("Error: entry point outside load module\n");
++		return NULL;
+ 	}
+-	/* Value of CS in DOS header may be negative */
+-	const short cs = bin->dos_header->cs;
+-	ut32 pa = bin->dos_header->header_paragraphs + cs;
+-	const ut32 paddr = (pa<<4) + bin->dos_header->ip;
+-	if (paddr < bin->dos_file_size) {
+-		return paddr;
++	entrypoint = R_NEW0 (RBinAddr);
++	if (entrypoint) {
++		entrypoint->vaddr = la;
++		entrypoint->paddr = r_bin_mz_la_to_pa (bin, la);
+ 	}
+-	return -1;
++
++	return entrypoint;
+ }
+ 
+-// This function reads from the file buffer,
+-// thus using endian-agnostic functions
+-int cmp_segs(const void *a, const void *b) {
+-	const ut16 * const ma = (const ut16 * const)a;
+-	const ut16 * const mb = (const ut16 * const)b;
+-	if (!ma || !mb) {
+-		return 0;
+-	}
+-	return (int)(r_read_le16 (ma) - r_read_le16 (mb));
++static int cmp_sections(const void *a, const void *b) {
++	const RBinSection *s_a, *s_b;
++
++	s_a = a;
++	s_b = b;
++
++	return s_a->vaddr - s_b->vaddr;
+ }
+ 
+-// This function reads from the file buffer,
+-// thus using endian-agnostic functions
+-static void trv_segs (const void *seg, const void *segs) {
+-	const ut8 * const mseg = (const ut8 * const)seg;
+-	ut16 ** const msegs = (ut16 **)segs;
+-	if (mseg && msegs && *msegs) {
+-		r_write_le16 (*msegs, r_read_le16 (mseg));
+-		*msegs = *msegs + 1;
++static RBinSection *r_bin_mz_init_section(const struct r_bin_mz_obj_t *bin,
++					  ut64 laddr) {
++	RBinSection *section;
++
++	section = R_NEW0 (RBinSection);
++	if (section) {
++		section->vaddr = laddr;
+ 	}
++
++	return section;
+ }
+ 
+-struct r_bin_mz_segment_t * r_bin_mz_get_segments(const struct r_bin_mz_obj_t *bin) {
+-	struct btree_node *tree;
+-	struct r_bin_mz_segment_t *ret;
+-	// ut16 *segments, 
+-	int i, num_segs;
+-	ut64 paddr;
+-	const ut16 first_segment = 0;
++RList *r_bin_mz_get_segments (const struct r_bin_mz_obj_t *bin) {
++	RList *seg_list;
++	RListIter *iter;
++	RBinSection *section;
++	MZ_image_relocation_entry *relocs;
++	int i, num_relocs, section_number;
++	ut16 ss;
++
+ 	if (!bin || !bin->dos_header) {
+ 		return NULL;
+ 	}
+-	const ut16 stack_segment = bin->dos_header->ss;
+-	const MZ_image_relocation_entry * const relocs = bin->relocation_entries;
+-	const int num_relocs = bin->dos_header->num_relocs;
+-	const ut64 last_parag = ((bin->dos_file_size + 0xF) >> 4) - \
+-		bin->dos_header->header_paragraphs;
+ 
+-	btree_init (&tree);
+-	for (i = 0; i < num_relocs; i++) {
+-		paddr = r_bin_mz_seg_to_paddr (bin, relocs[i].segment) + relocs[i].offset;
+-		if ((paddr + 2) < bin->dos_file_size) {
+-			int left;
+-			ut16 *curr_seg = (ut16 *)r_buf_get_at (bin->b, paddr, &left);
+-			/* Add segment only if it's located inside dos executable data */
+-			if (left >= 2 && r_read_le16 (curr_seg) <= last_parag) {
+-				btree_add (&tree, curr_seg, cmp_segs);
+-			}
+-		}
++	seg_list = r_list_newf (free);
++	if (!seg_list) {
++		return NULL;
+ 	}
+ 
+-	/* Add segment address o

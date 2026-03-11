@@ -1,0 +1,125 @@
+@@ -88,7 +88,10 @@ class NetworkInterface : public Checkpointable {
+   Mutex active_captures_lock;
+   u_int8_t num_live_captures;
+   struct ntopngLuaContext *live_captures[MAX_NUM_PCAP_CAPTURES];
+-  static bool matchLiveCapture(struct ntopngLuaContext * const luactx, Flow * const f);
++  static bool matchLiveCapture(struct ntopngLuaContext * const luactx,
++			       const struct pcap_pkthdr * const h,
++			       const u_char * const packet,
++			       Flow * const f);
+   void deliverLiveCapture(const struct pcap_pkthdr * const h, const u_char * const packet, Flow * const f);
+   
+   string ip_addresses;
+
+
+
+
+@@ -103,6 +103,11 @@
+ 
+ extern "C" {
+ #include "pcap.h"
++
++#ifndef __linux__
++#include <pcap/bpf.h> /* Used for bpf_filter() */
++#endif
++
+ #include "ndpi_main.h"
+ #ifdef DONT_USE_LUAJIT
+ #include "lua.h"
+
+
+
+
+@@ -466,7 +466,6 @@ struct ntopngLuaContext {
+     
+     /* Status */
+     bool pcaphdr_sent;
+-    bool done;
+     bool stopped;
+   } live_capture;
+ };
+
+
+
+
+@@ -130,7 +130,7 @@ LuaEngine::~LuaEngine() {
+ 	pthread_join(ctx->pkt_capture.captureThreadLoop, NULL);
+       }
+ 
+-      if(ctx->iface != NULL)
++      if((ctx->iface != NULL) && ctx->live_capture.pcaphdr_sent)
+ 	ctx->iface->deregisterLiveCapture(ctx);
+ 
+       free(ctx);
+@@ -2863,8 +2863,9 @@ static int ntop_checkpoint_host(lua_State* vm) {
+ 
+   checkpoint_id = (u_int8_t)lua_tointeger(vm, 3);
+ 
+-  if(!iface || iface->isView() || !iface->checkPointHostCounters(vm,
+-								 checkpoint_id, host_ip, vlan_id, details_level)){
++  if(!iface || iface->isView() ||
++     !iface->checkPointHostCounters(vm,
++				    checkpoint_id, host_ip, vlan_id, details_level)){
+     lua_pushnil(vm);
+     return(CONST_LUA_ERROR);
+   } else
+@@ -2893,7 +2894,8 @@ static int ntop_checkpoint_host_talker(lua_State* vm) {
+ 
+   if(lua_type(vm, 3) == LUA_TBOOLEAN) save_checkpoint = lua_toboolean(vm, 3);
+ 
+-  if(!iface || iface->isView() || !iface->checkPointHostTalker(vm, host_ip, vlan_id, save_checkpoint))
++  if(!iface || iface->isView()
++     || !iface->checkPointHostTalker(vm, host_ip, vlan_id, save_checkpoint))
+     return(CONST_LUA_ERROR);
+   else
+     return(CONST_LUA_OK);
+@@ -2921,8 +2923,9 @@ static int ntop_checkpoint_network(lua_State* vm) {
+   network_id = (u_int8_t)lua_tointeger(vm, 2);
+   checkpoint_id = (u_int8_t)lua_tointeger(vm, 3);
+ 
+-  if(!iface || iface->isView() || !iface->checkPointNetworkCounters(vm,
+-								    checkpoint_id, network_id, details_level))
++  if(!iface || iface->isView()
++     || !iface->checkPointNetworkCounters(vm,
++					  checkpoint_id, network_id, details_level))
+     return(CONST_LUA_ERROR);
+   else
+     return(CONST_LUA_OK);
+@@ -2946,8 +2949,9 @@ static int ntop_checkpoint_interface(lua_State* vm) {
+   iface = ntop->getInterfaceById(ifid);
+   checkpoint_id = (u_int8_t)lua_tointeger(vm, 2);
+ 
+-  if(!iface || iface->isView() || !iface->checkPointInterfaceCounters(vm,
+-								      checkpoint_id, details_level))
++  if(!iface || iface->isView() ||
++     !iface->checkPointInterfaceCounters(vm,
++					 checkpoint_id, details_level))
+     return(CONST_LUA_ERROR);
+   else
+     return(CONST_LUA_OK);
+@@ -3658,11 +3662,15 @@ static int ntop_interface_dump_live_captures(lua_State* vm) {
+ static int ntop_interface_live_capture(lua_State* vm) {
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+   struct ntopngLuaContext *c;
+-  int capture_id;
+-
++  int capture_id, duration;
++  char *bpf = NULL;
++  NetworkInterface *iface = getCurrentInterface(vm);
++ 
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(!Utils::isUserAdministrator(vm)) return(CONST_LUA_ERROR);
++  
++  if(!iface) return(CONST_LUA_ERROR);
+ 
+ #ifdef DONT_USE_LUAJIT
+   lua_getglobal(vm, "userdata");
+@@ -3674,7 +3682,7 @@ static int ntop_interface_live_capture(lua_State* vm) {
+   if((!ntop_interface) || (!c))
+     return(CONST_LUA_ERROR);
+ 
+-  if(lua_type(vm, 1) == LUA_TSTRING) /* Optional */ {
++  if(lua_type(vm, 1) == LUA_TSTRING) /* Host */ {
+     Host *h;
+     char h

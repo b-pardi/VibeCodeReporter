@@ -1,0 +1,87 @@
+@@ -2,6 +2,7 @@ package org.batfish.common.bdd;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static org.batfish.common.bdd.BDDUtils.isAssignment;
++import static org.batfish.common.util.CommonUtil.toImmutableMap;
+ import static org.batfish.datamodel.acl.SourcesReferencedByIpAccessLists.SOURCE_ORIGINATING_FROM_DEVICE;
+ import static org.batfish.datamodel.acl.SourcesReferencedByIpAccessLists.referencedSources;
+ 
+@@ -11,10 +12,13 @@ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Sets;
+ import com.google.common.math.LongMath;
+ import java.math.RoundingMode;
++import java.util.Arrays;
++import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Function;
+ import net.sf.javabdd.BDD;
+ import org.batfish.common.util.CommonUtil;
+ import org.batfish.datamodel.Configuration;
+@@ -23,39 +27,73 @@ import org.batfish.datamodel.IpAccessList;
+ /**
+  * Manages BDD variables to track a packet's source: which interface it entered the node through, if
+  * any. If it didn't enter through any node, it originated from the device itself.
++ *
++ * <p>To minize to the number of BDD variables used, we consider which sources are active and which
++ * are referenced by ACLs on the node. If a source is active and referenced, then we assign it a
++ * unique identifier. All inactive interface sources are assigned the same identifier. We allocate
++ * enough BDD variables to distinguish between the unique identifiers.
++ *
++ * <p>We need these identifiers in two contexts: to record the source of a packet as it enters a
++ * node, and to check the source of a packet when an ACL includes a {@link
++ * org.batfish.datamodel.acl.MatchSrcInterface} or {@link
++ * org.batfish.datamodel.acl.OriginatingFromDevice} expression.
+  */
+ public final class BDDSourceManager {
+   private static final String VAR_NAME = "PacketSource";
+ 
+   private final BDD _falseBDD;
+ 
+-  private final BDD _isSane;
++  private final BDD _isValidValue;
+ 
+   private final Map<String, BDD> _sourceBDDs;
+ 
+-  /**
+-   * Create a {@link BDDSourceManager} for a specified set of possible sources. To include the
+-   * device as a source, use {@link
+-   * org.batfish.datamodel.acl.SourcesReferencedByIpAccessLists#SOURCE_ORIGINATING_FROM_DEVICE}.
+-   */
+-  @VisibleForTesting
+-  BDDSourceManager(BDDPacket pkt, Set<String> sources) {
+-    ImmutableMap.Builder<String, BDD> sourceBDDs = ImmutableMap.builder();
+-
+-    // add sourceBDD entries for active sources and initialize _isSane constraint
+-    if (!sources.isEmpty()) {
+-      int bitsRequired = LongMath.log2(sources.size(), RoundingMode.CEILING);
+-      BDDInteger var = pkt.allocateBDDInteger(VAR_NAME, bitsRequired, false);
+-      sourceBDDs.putAll(computeMatchSourceBDDs(var, sources));
+-      // _isSane constrains var to be one of the values assigned to sources.
+-      _isSane = var.leq(sources.size() - 1);
+-    } else {
+-      // no source var, so don't need a sane constraint
+-      _isSane = pkt.getFactory().one();
++  private final BDD _sourceVarBits;
++
++  private BDDSourceManager(BDD isValidValue, Map<String, BDD> sourceBDDs, BDD sourceVarBits) {
++    _isValidValue = isValidValue;
++    _sourceBDDs = ImmutableMap.copyOf(sourceBDDs);
++    _sourceVarBits = sourceVarBits;
++    _falseBDD = isValidValue.getFactory().zero();
++  }
++
++  private static BDDSourceManager forNoReferencedSources(
++      BDDPacket pkt, Set<String> activeButNotReferenced) {
++    return new BDDSourceManager(
++        pkt.getFactory().one(),
++        toImmutableMap(activeButNotReferenced, Function.identity(), src -> pkt.getFactory().one()),
++        pkt.getFactory().zero());
++  }
++
++  /** Allocates a variable for the sources and initializes SANE. */
++  private static BDDSourceManager forSourcesInternal(
++      BDDPacket pkt, Set<String> activeAndReferenced, Set<String> activeButNotReferenced) {
++    if (activeAndReferenced.isEmpty()) {

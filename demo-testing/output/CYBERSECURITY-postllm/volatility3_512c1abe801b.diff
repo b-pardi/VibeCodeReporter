@@ -1,0 +1,125 @@
+@@ -347,3 +347,9 @@ class PT_FLAGS(Flag):
+ MODULE_MAXIMUM_CORE_SIZE = 20000000
+ MODULE_MAXIMUM_CORE_TEXT_SIZE = 20000000
+ MODULE_MINIMUM_SIZE = 4096
++
++# VMCOREINFO
++VMCOREINFO_MAGIC = b"VMCOREINFO\x00"
++# Aligned to 4 bytes. See storenote() in kernels < 4.19 or append_kcore_note() in kernels >= 4.19
++VMCOREINFO_MAGIC_ALIGNED = VMCOREINFO_MAGIC + b"\x00"
++OSRELEASE_TAG = b"OSRELEASE="
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,49 @@
++# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
++# which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
++#
++
++from typing import List
++
++from volatility3.framework import renderers, interfaces
++from volatility3.framework.configuration import requirements
++from volatility3.framework.interfaces import plugins
++from volatility3.framework.symbols import linux
++from volatility3.framework.renderers import format_hints
++
++
++class VMCoreInfo(plugins.PluginInterface):
++    """Enumerate VMCoreInfo tables"""
++
++    _required_framework_version = (2, 11, 0)
++    _version = (1, 0, 0)
++
++    @classmethod
++    def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
++        return [
++            requirements.TranslationLayerRequirement(
++                name="primary", description="Memory layer to scan"
++            ),
++            requirements.VersionRequirement(
++                name="VMCoreInfo", component=linux.VMCoreInfo, version=(1, 0, 0)
++            ),
++        ]
++
++    def _generator(self):
++        layer_name = self.config["primary"]
++        for (
++            vmcoreinfo_offset,
++            vmcoreinfo,
++        ) in linux.VMCoreInfo.search_vmcoreinfo_elf_note(
++            context=self.context,
++            layer_name=layer_name,
++        ):
++            for key, value in vmcoreinfo.items():
++                yield 0, (format_hints.Hex(vmcoreinfo_offset), key, value)
++
++    def run(self):
++        headers = [
++            ("Offset", format_hints.Hex),
++            ("Key", str),
++            ("Value", str),
++        ]
++        return renderers.TreeGrid(headers, self._generator())
+
+
+
+
+@@ -2,15 +2,18 @@
+ # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
+ #
+ import math
++import string
+ import contextlib
+ from abc import ABC, abstractmethod
+-from typing import Iterator, List, Tuple, Optional, Union
++from typing import Iterator, List, Tuple, Optional, Union, Dict
+ 
+ from volatility3 import framework
+ from volatility3.framework import constants, exceptions, interfaces, objects
+ from volatility3.framework.objects import utility
+ from volatility3.framework.symbols import intermed
+ from volatility3.framework.symbols.linux import extensions
++from volatility3.framework.layers import scanners
++from volatility3.framework.constants import linux as linux_constants
+ 
+ 
+ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+@@ -832,3 +835,100 @@ class PageCache(object):
+             page = self.vmlinux.object("page", offset=page_addr, absolute=True)
+             if page:
+                 yield page
++
++
++class VMCoreInfo(interfaces.configuration.VersionableInterface):
++    _required_framework_version = (2, 11, 0)
++
++    _version = (1, 0, 0)
++
++    @staticmethod
++    def _vmcoreinfo_data_to_dict(
++        vmcoreinfo_data,
++    ) -> Optional[Dict[str, str]]:
++        """Converts the input VMCoreInfo data buffer into a dictionary"""
++
++        # Ensure the whole buffer is printable
++        if not all(c in string.printable.encode() for c in vmcoreinfo_data):
++            # Abort, we are in the wrong place
++            return None
++
++        vmcoreinfo_dict = dict()
++        for line in vmcoreinfo_data.decode().splitlines():
++            if not line:
++                break
++
++            key, value = line.split("=", 1)
++            vmcoreinfo_dict[key] = value
++
++        return vmcoreinfo_dict
++
++    @classmethod
++    def search_vmcoreinfo_elf_note(
++        cls,
++        context: int

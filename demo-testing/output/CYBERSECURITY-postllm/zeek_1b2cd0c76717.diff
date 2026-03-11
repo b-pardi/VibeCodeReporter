@@ -1,0 +1,164 @@
+@@ -205,7 +205,7 @@ void get_first_statement(Stmt* list, Stmt*& first, Location& loc)
+ 	while ( first->Tag() == STMT_LIST )
+ 		{
+ 		if ( first->AsStmtList()->Stmts()[0] )
+-			first = first->AsStmtList()->Stmts()[0];
++			first = first->AsStmtList()->Stmts()[0].get();
+ 		else
+ 			break;
+ 		}
+
+
+
+
+@@ -777,8 +777,8 @@ StmtPtr ScriptFunc::AddInits(StmtPtr body, const std::vector<IDPtr>& inits)
+ 		return body;
+ 
+ 	auto stmt_series = make_intrusive<StmtList>();
+-	stmt_series->Stmts().push_back(new InitStmt(inits));
+-	stmt_series->Stmts().push_back(body.release());
++	stmt_series->Stmts().push_back(make_intrusive<InitStmt>(inits));
++	stmt_series->Stmts().push_back(std::move(body));
+ 
+ 	return stmt_series;
+ 	}
+
+
+
+
+@@ -576,12 +576,12 @@ static StmtTag get_last_stmt_tag(const Stmt* stmt)
+ 		return stmt->Tag();
+ 
+ 	const StmtList* stmts = stmt->AsStmtList();
+-	int len = stmts->Stmts().length();
++	auto len = stmts->Stmts().size();
+ 
+ 	if ( len == 0 )
+ 		return STMT_LIST;
+ 
+-	return get_last_stmt_tag(stmts->Stmts()[len - 1]);
++	return get_last_stmt_tag(stmts->Stmts()[len - 1].get());
+ 	}
+ 
+ class FallthroughFinder : public TraversalCallback
+@@ -1668,26 +1668,19 @@ void ReturnStmt::StmtDescribe(ODesc* d) const
+ 	DescribeDone(d);
+ 	}
+ 
+-StmtList::StmtList() : Stmt(STMT_LIST)
+-	{
+-	stmts = new StmtPList;
+-	}
+-
+-StmtList::~StmtList()
+-	{
+-	for ( const auto& stmt : Stmts() )
+-		Unref(stmt);
++StmtList::StmtList() : Stmt(STMT_LIST) { }
+ 
+-	delete stmts;
+-	}
++StmtList::~StmtList() { }
+ 
+ ValPtr StmtList::Exec(Frame* f, StmtFlowType& flow)
+ 	{
+ 	RegisterAccess();
+ 	flow = FLOW_NEXT;
+ 
+-	for ( const auto& stmt : Stmts() )
++	for ( const auto& stmt_ptr : Stmts() )
+ 		{
++		auto stmt = stmt_ptr.get();
++
+ 		f->SetNextStmt(stmt);
+ 
+ 		if ( ! pre_execute_stmt(stmt, f) )
+@@ -1720,10 +1713,10 @@ void StmtList::StmtDescribe(ODesc* d) const
+ 	if ( ! d->IsReadable() )
+ 		{
+ 		AddTag(d);
+-		d->AddCount(stmts->length());
++		d->AddCount(stmts.size());
+ 		}
+ 
+-	if ( stmts->length() == 0 )
++	if ( stmts.empty() )
+ 		DescribeDone(d);
+ 
+ 	else
+@@ -2209,7 +2202,7 @@ void WhenInfo::BuildInvokeElems()
+ 	invoke_timeout = make_intrusive<ListExpr>(three_const);
+ 	}
+ 
+-WhenStmt::WhenStmt(WhenInfo* arg_wi) : Stmt(STMT_WHEN), wi(arg_wi)
++WhenStmt::WhenStmt(std::shared_ptr<WhenInfo> arg_wi) : Stmt(STMT_WHEN), wi(std::move(arg_wi))
+ 	{
+ 	wi->Build(ThisPtr());
+ 
+@@ -2231,11 +2224,6 @@ WhenStmt::WhenStmt(WhenInfo* arg_wi) : Stmt(STMT_WHEN), wi(arg_wi)
+ 		}
+ 	}
+ 
+-WhenStmt::~WhenStmt()
+-	{
+-	delete wi;
+-	}
+-
+ ValPtr WhenStmt::Exec(Frame* f, StmtFlowType& flow)
+ 	{
+ 	RegisterAccess();
+
+
+
+
+@@ -464,8 +464,8 @@ public:
+ 
+ 	ValPtr Exec(Frame* f, StmtFlowType& flow) override;
+ 
+-	const StmtPList& Stmts() const { return *stmts; }
+-	StmtPList& Stmts() { return *stmts; }
++	const auto& Stmts() const { return stmts; }
++	auto& Stmts() { return stmts; }
+ 
+ 	void StmtDescribe(ODesc* d) const override;
+ 
+@@ -481,23 +481,18 @@ public:
+ 	bool NoFlowAfter(bool ignore_break) const override;
+ 
+ 	// Idioms commonly used in reduction.
+-	StmtList(StmtPtr s1, Stmt* s2);
+ 	StmtList(StmtPtr s1, StmtPtr s2);
+ 	StmtList(StmtPtr s1, StmtPtr s2, StmtPtr s3);
+ 
+ protected:
+ 	bool IsPure() const override;
+ 
+-	StmtPList* stmts;
++	std::vector<StmtPtr> stmts;
+ 
+ 	// Optimization-related:
+-	bool ReduceStmt(int& s_i, StmtPList* f_stmts, Reducer* c);
++	bool ReduceStmt(int& s_i, std::vector<StmtPtr>& f_stmts, Reducer* c);
+ 
+-	void ResetStmts(StmtPList* new_stmts)
+-		{
+-		delete stmts;
+-		stmts = new_stmts;
+-		}
++	void ResetStmts(std::vector<StmtPtr> new_stmts) { stmts = std::move(new_stmts); }
+ 	};
+ 
+ class InitStmt final : public Stmt
+@@ -690,9 +685,7 @@ private:
+ class WhenStmt final : public Stmt
+ 	{
+ public:
+-	// The constructor takes ownership of the WhenInfo object.
+-	WhenStmt(WhenInfo* wi);
+-	~WhenStmt() override;
++	WhenStmt(std::shared_ptr<WhenInfo> wi);
+ 
+ 	ValPtr Exec(Frame* f, StmtFlowType& flow) override;
+ 	bool IsPure() const override;
+@@ -703,7 +696,7 @@ public:
+ 	StmtPtr TimeoutBody() const { return wi->Timeo

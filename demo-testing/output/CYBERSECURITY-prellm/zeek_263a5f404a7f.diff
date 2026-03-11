@@ -1,0 +1,162 @@
+@@ -732,6 +732,11 @@ Supervisor::Node Supervisor::Node::FromRecord(const RecordVal* node)
+ 	if ( directory_val )
+ 		rval.directory = directory_val->AsString()->CheckString();
+ 
++	auto affinity_val = node->Lookup("cpu_affinity");
++
++	if ( affinity_val )
++		rval.cpu_affinity = affinity_val->AsInt();
++
+ 	auto scripts_val = node->Lookup("scripts")->AsVectorVal();
+ 
+ 	for ( auto i = 0; i < scripts_val->Size(); ++i )
+@@ -779,7 +784,10 @@ Supervisor::Node Supervisor::Node::FromJSON(std::string_view json)
+ 		rval.interface = *it;
+ 
+ 	if ( auto it = j.find("directory"); it != j.end() )
+-		rval.directory= *it;
++		rval.directory = *it;
++
++	if ( auto it = j.find("cpu_affinity"); it != j.end() )
++		rval.cpu_affinity = *it;
+ 
+ 	auto scripts = j["scripts"];
+ 
+@@ -833,6 +841,9 @@ IntrusivePtr<RecordVal> Supervisor::Node::ToRecord() const
+ 	if ( directory )
+ 		rval->Assign(rt->FieldOffset("directory"), new StringVal(*directory));
+ 
++	if ( cpu_affinity )
++		rval->Assign(rt->FieldOffset("cpu_affinity"), val_mgr->GetInt(*cpu_affinity));
++
+ 	auto st = BifType::Record::Supervisor::Node->FieldType("scripts");
+ 	auto scripts_val = new VectorVal(st->AsVectorType());
+ 	rval->Assign(rt->FieldOffset("scripts"), scripts_val);
+
+
+
+
+@@ -47,6 +47,7 @@ public:
+ 		std::string name;
+ 		std::optional<std::string> interface;
+ 		std::optional<std::string> directory;
++		std::optional<int> cpu_affinity;
+ 		std::vector<std::string> scripts;
+ 		std::map<std::string, ClusterEndpoint> cluster;
+ 
+
+
+
+
+@@ -78,6 +78,8 @@ extern "C" {
+ #include "setsignal.h"
+ };
+ 
++#include "zeek-affinity.h"
++
+ #ifdef USE_PERFTOOLS_DEBUG
+ HeapLeakChecker* heap_checker = 0;
+ int perftools_leaks = 0;
+@@ -944,7 +946,7 @@ int main(int argc, char** argv)
+ 			{
+ 			if ( setenv("CLUSTER_NODE", node_name.data(), true) == -1 )
+ 				{
+-				fprintf(stderr, "cluster node %s failed to setenv: %s\n",
++				fprintf(stderr, "node '%s' failed to setenv: %s\n",
+ 				        node_name.data(), strerror(errno));
+ 				exit(1);
+ 				}
+@@ -954,7 +956,7 @@ int main(int argc, char** argv)
+ 			{
+ 			if ( chdir(zeek::supervised_node->directory->data()) )
+ 				{
+-				fprintf(stderr, "supervised node %s failed to chdir to %s: %s\n",
++				fprintf(stderr, "node '%s' failed to chdir to %s: %s\n",
+ 				        node_name.data(),
+ 				        zeek::supervised_node->directory->data(),
+ 				        strerror(errno));
+@@ -962,6 +964,15 @@ int main(int argc, char** argv)
+ 				}
+ 			}
+ 
++		if ( zeek::supervised_node->cpu_affinity )
++			{
++			auto res = zeek::set_affinity(*zeek::supervised_node->cpu_affinity);
++
++			if ( ! res )
++				fprintf(stderr, "node '%s' failed to set CPU affinity: %s\n",
++				        node_name.data(), strerror(errno));
++			}
++
+ 		for ( const auto& s : zeek::supervised_node->scripts )
+ 			options.scripts_to_load.emplace_back(s);
+ 		}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,51 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#if defined(__linux__)
++
++#if !defined(_GNU_SOURCE)
++#define _GNU_SOURCE
++#endif
++
++#include <sched.h>
++
++namespace zeek {
++bool set_affinity(int core_number)
++	{
++	cpu_set_t cpus;
++	CPU_ZERO(&cpus);
++	CPU_SET(core_number, &cpus);
++	auto res = sched_setaffinity(0, sizeof(cpus), &cpus);
++	return res == 0;
++	}
++} // namespace zeek
++
++#elif defined(__FreeBSD__)
++
++#include <sys/param.h>
++#include <sys/cpuset.h>
++
++namespace zeek {
++bool set_affinity(int core_number)
++	{
++	cpuset_t cpus;
++	CPU_ZERO(&cpus);
++	CPU_SET(core_number, &cpus);
++	auto res = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1,
++	                              sizeof(cpus), &cpus);
++	return res == 0;
++	}
++} // namespace zeek
++
++#else
++
++#include <cerrno>
++
++namespace zeek {
++bool set_affinity(int core_number)
++	{
++	errno = ENOTSUP;
++	return false;
++	}
++} // namespace zeek
++
++#endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,15 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++namespace zeek {
++
++/**
++ * Set the process affinity to a given CPU.  Currently only supporte

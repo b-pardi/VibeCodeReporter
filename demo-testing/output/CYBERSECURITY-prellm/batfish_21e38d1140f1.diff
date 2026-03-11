@@ -1,0 +1,92 @@
+@@ -17,6 +17,7 @@ import io.opentracing.util.GlobalTracer;
+ import java.io.Serializable;
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -619,6 +620,28 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+                         routesByNextVrfEntry.getValue() /* routes */, matchingIps)));
+   }
+ 
++  @VisibleForTesting
++  static IpSpace routableSpace(Fib fib) {
++    Set<FibEntry> entries = fib.allEntries();
++    if (entries.isEmpty()) {
++      return EmptyIpSpace.INSTANCE;
++    }
++    Set<Prefix> seen = new HashSet<>();
++    ImmutableSet.Builder<IpWildcard> ret = ImmutableSet.builder();
++    for (FibEntry entry : entries) {
++      Prefix network = entry.getTopLevelRoute().getNetwork();
++      if (network.equals(Prefix.ZERO)) {
++        // Default route -> all IPs are routable. Skip processing the rest.
++        return UniverseIpSpace.INSTANCE;
++      }
++      if (seen.add(network)) {
++        // Only convert networks once.
++        ret.add(IpWildcard.create(network));
++      }
++    }
++    return IpWildcardSetIpSpace.create(ImmutableSet.of(), ret.build());
++  }
++
+   @VisibleForTesting
+   static Map<String, Map<String, IpSpace>> computeRoutableIps(Map<String, Map<String, Fib>> fibs) {
+     Span span = GlobalTracer.get().buildSpan("ForwardingAnalysisImpl.computeRoutableIps").start();
+@@ -631,14 +654,7 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+               toImmutableMap(
+                   nodeEntry.getValue(),
+                   Entry::getKey, // vrf
+-                  vrfEntry ->
+-                      IpWildcardSetIpSpace.create(
+-                          ImmutableSet.of(),
+-                          vrfEntry.getValue().allEntries().stream()
+-                              .map(fibEntry -> fibEntry.getTopLevelRoute().getNetwork())
+-                              .distinct()
+-                              .map(IpWildcard::create)
+-                              .collect(ImmutableSet.toImmutableSet()))));
++                  vrfEntry -> routableSpace(vrfEntry.getValue())));
+     } finally {
+       span.finish();
+     }
+
+
+
+
+@@ -22,11 +22,13 @@ import static org.batfish.datamodel.ForwardingAnalysisImpl.computeRoutesWithDest
+ import static org.batfish.datamodel.ForwardingAnalysisImpl.computeRoutesWithNextHopIpArpFalseForInterface;
+ import static org.batfish.datamodel.ForwardingAnalysisImpl.computeRoutesWithNextHopIpArpTrue;
+ import static org.batfish.datamodel.ForwardingAnalysisImpl.computeSomeoneReplies;
++import static org.batfish.datamodel.ForwardingAnalysisImpl.routableSpace;
+ import static org.batfish.datamodel.ForwardingAnalysisImpl.union;
+ import static org.batfish.datamodel.matchers.AclIpSpaceMatchers.hasLines;
+ import static org.batfish.datamodel.matchers.AclIpSpaceMatchers.isAclIpSpaceThat;
+ import static org.batfish.datamodel.matchers.IpSpaceMatchers.containsIp;
+ import static org.batfish.specifier.LocationInfoUtils.computeLocationInfo;
++import static org.hamcrest.Matchers.allOf;
+ import static org.hamcrest.Matchers.contains;
+ import static org.hamcrest.Matchers.containsInAnyOrder;
+ import static org.hamcrest.Matchers.equalTo;
+@@ -761,6 +763,47 @@ public class ForwardingAnalysisImplTest {
+     assertThat(result, not(containsIp(P2.getEndIp())));
+   }
+ 
++  private static FibEntry mockFibEntry(Prefix network) {
++    return new FibEntry(
++        new FibForward(Ip.ZERO, "iface"),
++        ImmutableList.of(
++            StaticRoute.testBuilder().setAdministrativeCost(1).setNetwork(network).build()));
++  }
++
++  @Test
++  public void testRoutableIpSpace() {
++    Fib hasDefault =
++        MockFib.builder()
++            .setFibEntries(
++                ImmutableMap.of(
++                    Ip.ZERO,
++                    ImmutableSet.of(
++                        mockFibEntry(Prefix.parse("1.2.3.0/24")), mockFibEntry(Prefix.ZERO))))
++            .bui

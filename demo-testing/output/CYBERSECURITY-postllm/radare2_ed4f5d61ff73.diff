@@ -1,0 +1,140 @@
+@@ -118,7 +118,10 @@ static inline bool parse_instruction(RBpfSockFilter *f, BPFAsmParser *p, ut64 pc
+ 		if (TOKEN_EQ (mnemonic, "rsh64")) { ALU64 (0x77, 0x7f); }
+ 		if (TOKEN_EQ (mnemonic, "xor64")) { ALU64 (0xa7, 0xaf); }
+ 		if (TOKEN_EQ (mnemonic, "mod64")) { ALU64 (0x97, 0x9f); }
+-		if (TOKEN_EQ (mnemonic, "add")) { ALU32 (0x04, 0x0c); }
++		if (TOKEN_EQ (mnemonic, "add")) {
++			if (opc == 1) { immv = strtoul (op[0], NULL, 0); EMIT (0x04, 0, 0, 0, immv); }
++			ALU32 (0x04, 0x0c);
++		}
+ 		if (TOKEN_EQ (mnemonic, "sub")) { ALU32 (0x14, 0x1c); }
+ 		if (TOKEN_EQ (mnemonic, "mul")) { ALU32 (0x24, 0x2c); }
+ 		if (TOKEN_EQ (mnemonic, "div")) { ALU32 (0x34, 0x3c); }
+
+
+
+
+@@ -395,12 +395,12 @@ static int disassemble(RAnalOp *r_op, const ut8 *buf, int len) {
+ static RBpfDialect get_bpf_dialect(RArchSession *s) {
+ 	const char *cpu = s && s->config ? s->config->cpu : NULL;
+ 	if (cpu) {
+-		if (!strcmp (cpu, "classic") || !strcmp (cpu, "cbpf") || !strcmp (cpu, "cBPF")) {
+-			return R_BPF_DIALECT_CLASSIC;
+-		}
+ 		if (!strcmp (cpu, "extended") || !strcmp (cpu, "ebpf") || !strcmp (cpu, "eBPF") || !strcmp (cpu, "64")) {
+ 			return R_BPF_DIALECT_EXTENDED;
+ 		}
++		if (!strcmp (cpu, "classic") || !strcmp (cpu, "cbpf") || !strcmp (cpu, "cBPF")) {
++			return R_BPF_DIALECT_CLASSIC;
++		}
+ 	}
+ 	if (s && s->config && s->config->bits == 64) {
+ 		return R_BPF_DIALECT_EXTENDED;
+@@ -458,8 +458,12 @@ static const char *trim_input(const char *p) {
+ 	return NULL;
+ }
+ 
++static int g_bpf_ext_tokens = 0;
+ static inline bool is_single_char_token(char c) {
+-	return c == '(' || c == ')' || c == '[' || c == ']' || c == ',';
++	if (g_bpf_ext_tokens) {
++		return c == '(' || c == ')' || c == '[' || c == ']' || c == ',';
++	}
++	return c == '(' || c == ')' || c == '[' || c == ']';
+ }
+ 
+ static inline bool is_arithmetic(char c) {
+@@ -810,7 +814,10 @@ static bool encode(RArchSession *s, RAnalOp *op, ut32 mask) {
+ 	ut8 ebuf[16] = {0};
+ 	int elen = 0;
+ 
++	int prev = g_bpf_ext_tokens;
++	g_bpf_ext_tokens = (dialect == R_BPF_DIALECT_EXTENDED);
+ 	bool ret = parse_instruction (&f, &p, op->addr, dialect, ebuf, &elen);
++	g_bpf_ext_tokens = prev;
+ 	token_fini (&p);
+ 	if (ret) {
+ 		if (dialect == R_BPF_DIALECT_EXTENDED) {
+
+
+
+
+@@ -5,6 +5,7 @@
+ #include <r_lib.h>
+ 
+ #include <capstone/capstone.h>
++#include "../bpf/bpf.h"
+ 
+ #if CS_API_MAJOR >= 5
+ 
+@@ -41,6 +42,309 @@ static char *mnemonics(RArchSession *s, int id, bool json) {
+ 	return r_arch_cs_mnemonics (s, cpd->cs_handle, id, json);
+ }
+ 
++/* Assembler integration (classic + extended via shared parser) */
++
++#define TOKEN_MAX_LEN 15
++typedef char bpf_token[TOKEN_MAX_LEN + 1];
++
++#define TOKEN_EQ(x, s) (strcmp ((x), (s)) == 0)
++
++#define PARSE_NEED_TOKEN(x) \
++	if (x == NULL) { \
++		return false; \
++	}
++#define PARSE_NEED(x) \
++	if (!(x)) { \
++		return false; \
++	}
++#define PARSE_STR(x, s) PARSE_NEED (TOKEN_EQ (x, s))
++
++typedef struct bpf_asm_parser {
++	const char *str;
++	RStrBuf *token;
++} BPFAsmParser;
++
++static void token_fini(BPFAsmParser *t) {
++	if (t->token) {
++		r_strbuf_free (t->token);
++		t->token = NULL;
++	}
++}
++
++static const char *trim_input(const char *p) {
++	while (*p) {
++		switch (*p) {
++			case ' ': case '\t': p++; continue;
++			case ';': return NULL;
++			default: return p;
++		}
++	}
++	return NULL;
++}
++
++static inline bool is_single_char_token(char c) {
++	return c == '(' || c == ')' || c == '[' || c == ']' || c == ',';
++}
++
++static inline bool is_arithmetic(char c) {
++	return c == '+' || c == '-';
++}
++
++static const char *token_next(BPFAsmParser *t) {
++	token_fini (t);
++	t->str = trim_input (t->str);
++	if (!t->str) {
++		return NULL;
++	}
++	RStrBuf *token = r_strbuf_new (NULL);
++	if (!r_strbuf_reserve (token, TOKEN_MAX_LEN + 1)) {
++		r_strbuf_free (token);
++		return NULL;
++	}
++	t->token = token;
++	if (is_single_char_token (t->str[0])) {
++		r_strbuf_append_n (token, t->str++, 1);
++		return r_strbuf_get (token);
++	}
++	int i;
++	for (i = 0; i < TOKEN_MAX_LEN; i++) {
++		if (!isgraph (t->str[0]) || is_single_char_token (t->str[

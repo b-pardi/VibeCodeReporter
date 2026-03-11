@@ -1,0 +1,154 @@
+@@ -34,17 +34,28 @@
+ 
+ /* ******************************* */
+ 
++#ifdef HAVE_LIBSNMP
++class SNMPSession {
++ public:
++  struct snmp_session session;
++  void *session_ptr;
++
++  SNMPSession();
++  ~SNMPSession();
++};
++#endif
++
+ class SNMP {
+  private:
+   u_int snmp_version;
+-  int udp_sock;
+-  u_int32_t request_id;
+ #ifdef HAVE_LIBSNMP
+-  struct snmp_session session, *ss;
+-  void *session_ptr;
++  std::vector<SNMPSession*> sessions;
+   /* Variables below are used for the async callback */
+   lua_State* vm;
+   bool add_sender_ip;
++#else
++  int udp_sock;
++  u_int32_t request_id;
+ #endif
+ 
+   int _get(char *agentIP, char *community, char *oid, u_int8_t snmp_version);
+@@ -57,7 +68,7 @@ class SNMP {
+   ~SNMP();
+ 
+ #ifdef HAVE_LIBSNMP
+-  void handle_async_response(struct snmp_pdu *pdu);
++  void handle_async_response(struct snmp_pdu *pdu, const char *agent_ip);
+   void send_snmp_request_netsnmp(char *agent_host, char *community, bool isGetNext,
+ 				 char *oid[SNMP_MAX_NUM_OIDS], u_int version);
+ #endif  
+
+
+
+
+@@ -35,9 +35,37 @@ extern "C" {
+ /* ******************************* */
+ /* ******************************* */
+ 
++/* ******************************* */
++
++SNMPSession::SNMPSession() {
++  session_ptr = NULL;
++}
++
++/* ******************************* */
++
++SNMPSession::~SNMPSession() {
++  if(session_ptr)
++    snmp_sess_close(session_ptr);
++}
++
++/* ******************************* */
++
++SNMP::SNMP() {  
++  init_snmp("ntopng");
++}
++
++/* ******************************* */
++
++SNMP::~SNMP() {
++  for(unsigned int i=0; i<sessions.size(); i++)
++    delete sessions.at(i);  
++}
++
++/* ******************************* */
++
+ /* http://www.net-snmp.org/docs/README.thread.html */
+ 
+-void SNMP::handle_async_response(struct snmp_pdu *pdu) {
++void SNMP::handle_async_response(struct snmp_pdu *pdu, const char *agent_ip) {
+   netsnmp_variable_list *vp = pdu->variables;
+   bool table_added = false;
+ 
+@@ -45,13 +73,26 @@ void SNMP::handle_async_response(struct snmp_pdu *pdu) {
+     /* OID */
+     char rsp_oid[128];
+     int offset = 0;
+-    
+-    for(u_int i=0; i<vp->name_length; i++) {
+-      int rc = snprintf(&rsp_oid[offset], sizeof(rsp_oid)-offset, "%s%d", (offset > 0) ? "." : "", (int)vp->name_loc[i]);
+-      
+-      if(rc > 0) offset += rc; else break;
++
++    if(add_sender_ip)
++      snprintf(rsp_oid, sizeof(rsp_oid), "%s", agent_ip);
++    else {
++      for(u_int i=0; i<vp->name_length; i++) {
++	int rc = snprintf(&rsp_oid[offset], sizeof(rsp_oid)-offset, "%s%d", (offset > 0) ? "." : "", (int)vp->name_loc[i]);
++	
++	if(rc > 0) offset += rc; else break;
++      }
+     }
+ 
++    switch(vp->type) {
++    case SNMP_NOSUCHOBJECT:
++    case SNMP_NOSUCHINSTANCE:
++    case SNMP_ENDOFMIBVIEW:
++      vp = vp->next_variable;
++      continue; /* Error found */
++      break;
++    }
++    
+     if(!table_added)
+       lua_newtable(vm), table_added = true;
+     
+@@ -63,7 +104,7 @@ void SNMP::handle_async_response(struct snmp_pdu *pdu) {
+       // ntop->getTrace()->traceEvent(TRACE_WARNING, "%s = %d", rsp_oid, vp->val.integer);
+       lua_push_int32_table_entry(vm, rsp_oid, (u_int32_t)*vp->val.integer);
+       break;
+-      
++
+     case ASN_OCTET_STR:
+       {
+       // ntop->getTrace()->traceEvent(TRACE_WARNING, "%s = %s", rsp_oid, vp->val.string);
+@@ -95,10 +136,14 @@ void SNMP::handle_async_response(struct snmp_pdu *pdu) {
+ 
+     default:
+       ntop->getTrace()->traceEvent(TRACE_WARNING, "Missing %d type handler", vp->type);
++      
+     }
+     
+     vp = vp->next_variable;
+   } /* while */
++
++  if(!table_added)
++    lua_pushnil(vm);
+ }
+ 
+ /* ******************************* */
+@@ -108,37 +153,59 @@ int asynch_response(int operation, struct snmp_session *sp, int reqid,
+   SNMP *s = (SNMP*)magic;
+ 
+   if(operation == NETSNMP_CALLBACK_OP_RECEIVED_MESSAGE)
+-    s->handle_async_response(pdu);
++    s->handle_async_response(pdu, sp->peername);
+      
+   return(0);
+ }
+ 
+ /* ******************************* */
+   
+-void SNMP::send_snmp_request_netsnmp(char *agent_host, char *community

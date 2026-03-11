@@ -1,0 +1,112 @@
+@@ -223,7 +223,7 @@ class TlsRecordExpander : public TlsRecordFilter {
+ };
+ 
+ // Tweak the plaintext of server records so that they exceed the client's limit.
+-TEST_P(TlsConnectTls13, RecordSizePlaintextExceed) {
++TEST_F(TlsConnectStreamTls13, RecordSizePlaintextExceed) {
+   EnsureTlsSetup();
+   auto server_expand = MakeTlsFilter<TlsRecordExpander>(server_, 1);
+   server_expand->EnableDecryption();
+@@ -247,7 +247,7 @@ TEST_P(TlsConnectTls13, RecordSizePlaintextExceed) {
+ // This requires a much larger expansion than for plaintext to trigger the
+ // guard, which runs before decryption (current allowance is 320 octets,
+ // see MAX_EXPANSION in ssl3con.c).
+-TEST_P(TlsConnectTls13, RecordSizeCiphertextExceed) {
++TEST_F(TlsConnectStreamTls13, RecordSizeCiphertextExceed) {
+   EnsureTlsSetup();
+ 
+   client_->SetOption(SSL_RECORD_SIZE_LIMIT, 64);
+@@ -329,7 +329,7 @@ class TlsRecordPadder : public TlsRecordFilter {
+   size_t padding_;
+ };
+ 
+-TEST_P(TlsConnectTls13, RecordSizeExceedPad) {
++TEST_F(TlsConnectStreamTls13, RecordSizeExceedPad) {
+   EnsureTlsSetup();
+   auto server_max = std::make_shared<TlsRecordMaximum>(server_);
+   auto server_expand = std::make_shared<TlsRecordPadder>(server_, 1);
+@@ -494,4 +494,233 @@ TEST_F(RecordSizeDefaultsTest, RecordSizeGetValue) {
+   EXPECT_EQ(3000, v);
+ }
+ 
+-}  // namespace nss_test
++class TlsCtextResizer : public TlsRecordFilter {
++ public:
++  TlsCtextResizer(const std::shared_ptr<TlsAgent>& a, size_t size)
++      : TlsRecordFilter(a), size_(size) {}
++
++ protected:
++  virtual PacketFilter::Action FilterRecord(const TlsRecordHeader& header,
++                                            const DataBuffer& data,
++                                            DataBuffer* changed) {
++    // allocate and initialise buffer
++    changed->Allocate(size_);
++
++    // copy record data (partially)
++    changed->Write(0, data.data(),
++                   ((data.len() >= size_) ? size_ : data.len()));
++
++    return CHANGE;
++  }
++
++ private:
++  size_t size_;
++};
++
++/* (D)TLS overlong record test for maximum default record size of
++ * 2^14 + (256 (TLS 1.3) OR 2048 (TLS <= 1.2)
++ * [RFC8446, Section 5.2; RFC5246 , Section 6.2.3].
++ * This should fail the first size check in ssl3gthr.c/ssl3_GatherData().
++ * DTLS Record errors are dropped silently. [RFC6347, Section 4.1.2.7]. */
++TEST_P(TlsConnectGeneric, RecordGatherOverlong) {
++  EnsureTlsSetup();
++
++  size_t max_ctext = MAX_FRAGMENT_LENGTH;
++  if (version_ >= SSL_LIBRARY_VERSION_TLS_1_3) {
++    max_ctext += TLS_1_3_MAX_EXPANSION;
++  } else {
++    max_ctext += TLS_1_2_MAX_EXPANSION;
++  }
++
++  Connect();
++
++  MakeTlsFilter<TlsCtextResizer>(server_, max_ctext + 1);
++  // Dummy record will be overwritten
++  server_->SendData(0xf0);
++
++  /* Drop DTLS Record Errors silently [RFC6347, Section 4.1.2.7]. */
++  if (variant_ == ssl_variant_datagram) {
++    size_t received = client_->received_bytes();
++    client_->ReadBytes(max_ctext + 1);
++    ASSERT_EQ(received, client_->received_bytes());
++  } else {
++    client_->ExpectSendAlert(kTlsAlertRecordOverflow);
++    client_->ReadBytes(max_ctext + 1);
++    server_->ExpectReceiveAlert(kTlsAlertRecordOverflow);
++    server_->Handshake();
++  }
++}
++
++/* (D)TLS overlong record test with recordSizeLimit Extension and plus RFC
++ * specified maximum Expansion: 2^14 + (256 (TLS 1.3) OR 2048 (TLS <= 1.2)
++ * [RFC8446, Section 5.2; RFC5246 , Section 6.2.3].
++ * DTLS Record errors are dropped silently. [RFC6347, Section 4.1.2.7]. */
++TEST_P(TlsConnectGeneric, RecordSizeExtensionOverlong) {
++  EnsureTlsSetup();
++
++  // Set some boundary
++  size_t max_ctext = 1000;
++
++  client_->SetOption(SSL_RECORD_SIZE_LIMIT, max_ctext);
++
++  if (version_ >= SSL_LIBRARY_VERSION_TLS_1_3) {
++    // The record size limit includes the inner content type byte
++    max_ctext += TLS_1_3_MAX_EXPANSION - 1;
++  } else {
++    max_ctext += TLS_1_2_MAX_EXPANSION;
++  }
++
++  Connect();
++
++  MakeTlsFilter<TlsCtextResizer>(server_, max_ctext + 1);
++  // Dummy record will be o

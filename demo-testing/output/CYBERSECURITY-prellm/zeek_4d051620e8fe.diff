@@ -1,0 +1,169 @@
+@@ -28,16 +28,6 @@
+ namespace zeek::detail
+ 	{
+ 
+-static bool init_tag_check(const Expr* expr, const char* name, TypeTag expect_tag, TypeTag init_tag)
+-	{
+-	if ( expect_tag == init_tag )
+-		return true;
+-
+-	auto msg = util::fmt("unexpected use of %s in '%s' initialization", name, type_name(init_tag));
+-	expr->Error(msg);
+-	return false;
+-	}
+-
+ const char* expr_name(BroExprTag t)
+ 	{
+ 	static const char* expr_names[int(NUM_EXPRS)] = {
+@@ -265,11 +255,6 @@ bool Expr::InvertSense()
+ 	return false;
+ 	}
+ 
+-void Expr::EvalIntoAggregate(const TypePtr& /* t */, ValPtr /* aggr */, Frame* /* f */) const
+-	{
+-	Internal("Expr::EvalIntoAggregate called");
+-	}
+-
+ void Expr::Assign(Frame* /* f */, ValPtr /* v */)
+ 	{
+ 	Internal("Expr::Assign called");
+@@ -413,25 +398,6 @@ bool Expr::IsRecordElement(TypeDecl* /* td */) const
+ 	return false;
+ 	}
+ 
+-bool Expr::IsPure() const
+-	{
+-	return true;
+-	}
+-
+-ValPtr Expr::InitVal(const TypePtr& t, ValPtr aggr) const
+-	{
+-	if ( aggr )
+-		{
+-		Error("bad initializer");
+-		return nullptr;
+-		}
+-
+-	if ( IsError() )
+-		return nullptr;
+-
+-	return check_and_promote(Eval(nullptr), t, true);
+-	}
+-
+ bool Expr::IsError() const
+ 	{
+ 	return type && type->Tag() == TYPE_ERROR;
+@@ -584,11 +550,6 @@ void NameExpr::Assign(Frame* f, ValPtr v)
+ 		f->SetElement(id, std::move(v));
+ 	}
+ 
+-bool NameExpr::IsPure() const
+-	{
+-	return id->IsConst();
+-	}
+-
+ TraversalCode NameExpr::Traverse(TraversalCallback* cb) const
+ 	{
+ 	TraversalCode tc = cb->PreExpr(this);
+@@ -840,17 +801,28 @@ void BinaryExpr::ExprDescribe(ODesc* d) const
+ 
+ ValPtr BinaryExpr::Fold(Val* v1, Val* v2) const
+ 	{
+-	InternalTypeTag it = v1->GetType()->InternalType();
++	auto& t1 = v1->GetType();
++	InternalTypeTag it = t1->InternalType();
+ 
+ 	if ( it == TYPE_INTERNAL_STRING )
+ 		return StringFold(v1, v2);
+ 
+-	if ( v1->GetType()->Tag() == TYPE_PATTERN )
++	if ( t1->Tag() == TYPE_PATTERN )
+ 		return PatternFold(v1, v2);
+ 
+-	if ( v1->GetType()->IsSet() )
++	if ( t1->IsSet() )
+ 		return SetFold(v1, v2);
+ 
++	if ( t1->IsTable() )
++		return TableFold(v1, v2);
++
++	if ( t1->Tag() == TYPE_VECTOR )
++		{
++		// We only get here when using a matching vector on the RHS.
++		v2->AsVectorVal()->AddTo(v1, false);
++		return {NewRef{}, v1};
++		}
++
+ 	if ( it == TYPE_INTERNAL_ADDR )
+ 		return AddrFold(v1, v2);
+ 
+@@ -1145,6 +1117,19 @@ ValPtr BinaryExpr::SetFold(Val* v1, Val* v2) const
+ 			reporter->InternalError("confusion over canonicalization in set comparison");
+ 			break;
+ 
++		case EXPR_ADD_TO:
++			// Avoid doing the AddTo operation if tv2 is empty,
++			// because then it might not type-check for trivial
++			// reasons.
++			if ( tv2->Size() > 0 )
++				tv2->AddTo(tv1, false);
++			return {NewRef{}, tv1};
++
++		case EXPR_REMOVE_FROM:
++			if ( tv2->Size() > 0 )
++				tv2->RemoveFrom(tv1);
++			return {NewRef{}, tv1};
++
+ 		default:
+ 			BadTag("BinaryExpr::SetFold", expr_name(tag));
+ 			return nullptr;
+@@ -1153,6 +1138,33 @@ ValPtr BinaryExpr::SetFold(Val* v1, Val* v2) const
+ 	return val_mgr->Bool(res);
+ 	}
+ 
++ValPtr BinaryExpr::TableFold(Val* v1, Val* v2) const
++	{
++	TableVal* tv1 = v1->AsTableVal();
++	TableVal* tv2 = v2->AsTableVal();
++
++	switch ( tag )
++		{
++		case EXPR_ADD_TO:
++			// Avoid doing the AddTo operation if tv2 is empty,
++			// because then it might not type-check for trivial
++			// reasons.
++			if ( tv2->Size() > 0 )
++				tv2->AddTo(tv1, false);
++			return {NewRef{}, tv1};
++
++		case EXPR_REMOVE_FROM:
++			if ( tv2->Size() > 0 )
++				tv2->RemoveFrom(tv1);
++			return {NewRef{}, tv1};
++
++		default:
++			BadTag("BinaryExpr::TableFold", expr_name(tag));
++		}
++
++	return nullptr;
++	}
++
+ ValPtr BinaryExpr::AddrFold(Val* v1, Val* v2) const
+ 	{
+ 	IPAddr a1 = v1->AsAddr();
+@@ -1267,6 +1279,90 @@ void BinaryExpr::CheckScalarAggOp() const
+ 		}
+ 	}
+ 
++bool BinaryExpr::CheckForRHSList()
++	{
++	if ( op2->Tag() != EXPR_LIST )
++		return false;
++
++	auto lhs_t = op1->GetType();
++	auto rhs = cast_intrusive<ListExpr>(op2);
++	auto& rhs_exprs = rhs->Exprs();
++
++	if ( lhs_t->Tag() == TYPE_TABLE )
++		{
++		

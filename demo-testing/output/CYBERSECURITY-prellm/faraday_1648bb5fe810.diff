@@ -1,0 +1,109 @@
+@@ -9,6 +9,7 @@ from sqlalchemy.inspection import inspect
+ from sqlalchemy import func
+ from marshmallow import Schema
+ from marshmallow.compat import with_metaclass
++from marshmallow.validate import Length
+ from marshmallow_sqlalchemy import ModelConverter
+ from marshmallow_sqlalchemy.schema import ModelSchemaMeta, ModelSchemaOpts
+ from webargs.flaskparser import FlaskParser, parser, abort
+@@ -643,6 +644,23 @@ class ReadWriteWorkspacedView(CreateWorkspacedMixin,
+     pass
+ 
+ 
++class CustomModelConverter(ModelConverter):
++    """
++    Model converter that automatically sets minimum length
++    validators to not blankable fields
++    """
++    def _add_column_kwargs(self, kwargs, column):
++        super(CustomModelConverter, self)._add_column_kwargs(kwargs, column)
++        if not column.info.get('allow_blank', True):
++            kwargs['validate'].append(Length(min=1))
++
++
++class CustomModelSchemaOpts(ModelSchemaOpts):
++    def __init__(self, *args, **kwargs):
++        super(CustomModelSchemaOpts, self).__init__(*args, **kwargs)
++        self.model_converter = CustomModelConverter
++
++
+ class AutoSchema(with_metaclass(ModelSchemaMeta, Schema)):
+     """
+     A Marshmallow schema that does field introspection based on
+@@ -650,7 +668,7 @@ class AutoSchema(with_metaclass(ModelSchemaMeta, Schema)):
+     Unlike the marshmallow_sqlalchemy ModelSchema, it doesn't change
+     the serialization and deserialization proccess.
+     """
+-    OPTIONS_CLASS = ModelSchemaOpts
++    OPTIONS_CLASS = CustomModelSchemaOpts
+ 
+ 
+ class FilterAlchemyModelConverter(ModelConverter):
+
+
+
+
+@@ -12,7 +12,7 @@ from flask import request
+ from flask import Blueprint
+ from flask_classful import route
+ from marshmallow import Schema, fields, post_load, ValidationError
+-from marshmallow.validate import OneOf
++from marshmallow.validate import OneOf, Length
+ from sqlalchemy.orm import aliased, joinedload, selectin_polymorphic, undefer
+ from sqlalchemy.orm.exc import NoResultFound
+ 
+@@ -96,7 +96,8 @@ class VulnerabilitySchema(AutoSchema):
+     owned = fields.Boolean(dump_only=True, default=False)
+     owner = PrimaryKeyRelatedField('username', dump_only=True, attribute='creator')
+     impact = SelfNestedField(ImpactSchema())
+-    desc = fields.String(attribute='description')
++    desc = fields.String(attribute='description', validate=Length(min=1))
++    description = fields.String(dump_only=True)
+     policyviolations = fields.List(fields.String,
+                                    attribute='policy_violations')
+     refs = fields.List(fields.String(), attribute='references')
+
+
+
+
+@@ -3,6 +3,7 @@
+ # See the file 'doc/LICENSE' for the license information
+ import operator
+ from datetime import datetime
++from functools import partial
+ 
+ from sqlalchemy import (
+     Boolean,
+@@ -44,6 +45,9 @@ from flask_security import (
+ )
+ from server.utils.database import BooleanToIntColumn
+ 
++NonBlankColumn = partial(Column, nullable=False,
++                         info={'allow_blank': False})
++
+ OBJECT_TYPES = [
+     'vulnerability',
+     'host',
+@@ -387,9 +391,9 @@ class VulnerabilityABC(Metadata):
+     id = Column(Integer, primary_key=True)
+ 
+     data = Column(Text, nullable=True)
+-    description = Column(Text, nullable=False)
++    description = NonBlankColumn(Text)
+     ease_of_resolution = Column(Enum(*EASE_OF_RESOLUTIONS, name='vulnerability_ease_of_resolution'), nullable=True)
+-    name = Column(Text, nullable=False)
++    name = NonBlankColumn(Text, nullable=False)
+     resolution = Column(Text, nullable=True)
+     severity = Column(Enum(*SEVERITIES, name='vulnerability_severity'), nullable=False)
+     risk = Column(Float(3, 1), nullable=True)
+
+
+
+
+@@ -252,6 +252,42 @@ class TestListVulnerabilityView(ReadOnlyAPITests):  # TODO migration: use read w
+         assert res.json['description'] == 'helloworld'
+         assert res.json['severity'] == 'low'
+ 
++    def test_create_cannot_create_vuln_with_empty_name(
++            self, host, session, test_client):
++        # I'm using 

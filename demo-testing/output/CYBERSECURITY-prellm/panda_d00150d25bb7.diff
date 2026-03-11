@@ -1,0 +1,94 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,437 @@
++#!/usr/bin/python3
++from datetime import datetime, timedelta
++import argparse
++import sys
++import time
++import os
++import collections
++
++# Assumes you've installed pandelephant package with setup.py
++import pandelephant
++
++# PLogReader from pandare package is easiest to import,
++# but if it's unavailable, fallback to searching PYTHONPATH
++# which users should add panda/panda/scripts to
++try:
++    from plog_reader import PLogReader
++except ImportError:
++    try:
++        from pandare.plog_reader import PLogReader
++    except ImportError:
++        import PLogReader
++    except ImportError:
++        print("Unable to locate PLogReader")
++        sys.exit(-1)
++
++"""
++USAGE: plog_to_pandelephant.py db_url plog
++"""
++
++DEBUG_VERBOSE = False
++
++# HasField will raise an exception if that isnt a possible field name
++# so this version translates that into a False
++def hasfield(msg, field_name):
++    try:
++        if msg.HasField(field_name):
++            return True
++        else:
++            return False
++    except:
++        return False
++
++CollectedThread = collections.namedtuple('CollectedThread', ['ProcessId', 'ParentProcessId', 'ThreadId', 'CreateTime'])
++CollectedProcess = collections.namedtuple('CollectedProcess', ['ProcessId', 'ParentProcessId'])
++CollectedThreadSlice = collections.namedtuple('CollectedThreadSlice', ['FirstInstructionCount', 'LastInstructionCount', 'Thread'])
++CollectedMappingSlice = collections.namedtuple('CollectedMappingSlice', ['InstructionCount', 'AddressSpaceId', 'Mappings'])
++CollectedMapping = collections.namedtuple('CollectedMapping', ['Name', 'File', 'BaseAddress', 'Size'])
++BetterCollectedMapping = collections.namedtuple('BetterCollectedMapping', ['AddressSpaceId', 'Process', 'Name', 'File', 'BaseAddress', 'Size'])
++CollectedCodePoint = collections.namedtuple('CollectedCodePoint', ['Mapping', 'Offset'])
++CollectedSyscall = collections.namedtuple('CollectedSyscall', ['Name', 'Thread', 'InstructionCount', 'Arguments'])
++CollectedSyscallArgument = collections.namedtuple('CollectedSyscallArgument', ['Type', 'Value'])
++CollectedTaintFlow = collections.namedtuple('CollectedTaintFlow', ['IsStore', 'SourceCodePoint', 'SourceThread', 'SourceInstructionCount', 'SinkCodePoint', 'SinkThread', 'SinkInstructionCount'])
++
++def CollectThreadsAndProcesses(pandalog):
++    # Why don't we just gather these on the fly?
++    # Because there are multiple sources for this information
++    # and they have to be reconciled.
++    # It's oddly tricky to get a consistent view out of a replay
++    # of the set of threads and processes and their names.
++    # One could check at every basic block (by invoking Osi)
++    # but that would be very slow.  So we check at a few std
++    # temporal points (syscall, every 100 bb, asid_info logging points)
++    # and reconcile.
++    # Better would be if we had callback on after-scheduler-changes-proc
++    #  s.t. we could obtain proc/thread.
++
++    # thread is (pid, ppid, tid, create_time)
++    # process is (pid, ppid)
++    processes = set()
++    threads = set()
++    thread_slices = set()
++    thread_names = {}
++    def CollectFrom_asid_libraries(msg):
++        thread = CollectedThread(ProcessId=msg.pid, ParentProcessId=msg.ppid, ThreadId=msg.tid, CreateTime=msg.create_time)
++        # there might be several names for a tid
++        if thread in thread_names.keys():
++            thread_names[thread].add(msg.proc_name)
++        else:
++            thread_names[thread] = set([msg.proc_name])
++        threads.add(thread)
++        processes.add(CollectedProcess(ProcessId=msg.pid, ParentProcessId=msg.ppid))
++    def CollectFrom_asid_info(msg):
++        for tid in msg.tids:
++            thread = CollectedThread(ProcessId=msg.pid, ParentProcessId=msg.ppid, ThreadId=tid, CreateTime=msg.create_time)
++            if thread in thread_names.keys():
++                for name in msg.names:
++                    thread_names[thread].add(name)
++            else:
++   

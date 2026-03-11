@@ -1,0 +1,144 @@
+@@ -103,6 +103,7 @@ R_API RAnal *r_anal_new(void) {
+ 	anal->cxxabi = R_ANAL_CPP_ABI_ITANIUM;
+ 	anal->opt.depth = 32;
+ 	anal->opt.noncode = false; // do not analyze data by default
++	anal->lock = r_th_lock_new (true);
+ 	r_spaces_init (&anal->meta_spaces, "CS");
+ 	r_event_hook (anal->meta_spaces.event, R_SPACE_EVENT_UNSET, meta_unset_for, NULL);
+ 	r_event_hook (anal->meta_spaces.event, R_SPACE_EVENT_COUNT, meta_count_for, NULL);
+@@ -166,6 +167,7 @@ R_API void r_anal_free(RAnal *a) {
+ 	ht_pp_free (a->ht_name_fun);
+ 	set_u_free (a->visited);
+ 	r_anal_hint_storage_fini (a);
++       r_th_lock_free (a->lock);
+ 	r_interval_tree_fini (&a->meta);
+ 	r_unref (a->config);
+ 	free (a->zign_path);
+
+
+
+
+@@ -640,7 +640,7 @@ static int decompile_ps(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int le
+ 	char buf_asm[64] = {0};
+ 	libps_snprint (buf_asm, sizeof (buf_asm), addr, &instr);
+ 	op->mnemonic = strdup (buf_asm);
+-	eprintf ("Mnemonic (%s)\n", buf_asm);
++	// eprintf ("Mnemonic (%s)\n", buf_asm);
+ 	return op->size;
+ }
+ 
+
+
+
+
+@@ -1421,9 +1421,13 @@ R_API RList *r_anal_function_get_var_fields(RAnalFunction *fcn, int kind) {
+ 	if (kind < 1) {
+ 		kind = R_ANAL_VAR_KIND_BPV; // by default show vars
+ 	}
++	R_CRITICAL_ENTER (fcn->anal);
+ 	void **it;
+ 	r_pvector_foreach (&fcn->vars, it) {
+ 		RAnalVar *var = *it;
++		if (!var) {
++			break;
++		}
+ 		if (var->kind != kind) {
+ 			continue;
+ 		}
+@@ -1443,6 +1447,7 @@ R_API RList *r_anal_function_get_var_fields(RAnalFunction *fcn, int kind) {
+ 		field->delta = var->delta;
+ 		r_list_push (list, field);
+ 	}
++	R_CRITICAL_LEAVE (fcn->anal);
+ 	return list;
+ }
+ 
+
+
+
+
+@@ -220,7 +220,7 @@ R_API ut64 r_core_anal_address(RCore *core, ut64 addr) {
+ 		RListIter *iter;
+ 		r_list_foreach (rs->regs, iter, r) {
+ 			if (r->type == R_REG_TYPE_GPR) {
+-				ut64 val = r_reg_getv(core->dbg->reg, r->name);
++                               ut64 val = r_reg_getv (core->dbg->reg, r->name);
+ 				if (addr == val) {
+ 					types |= R_ANAL_ADDR_TYPE_REG;
+ 					break;
+@@ -4850,6 +4850,9 @@ static ut64 delta_for_access(RAnalOp *op, RAnalVarAccessType type) {
+ }
+ 
+ static void handle_var_stack_access(RAnalEsil *esil, ut64 addr, RAnalVarAccessType type, int len) {
++       if (!esil || !esil->user) {
++               return;
++       }
+ 	EsilBreakCtx *ctx = esil->user;
+ 	const char *regname = reg_name_for_access (ctx->op, type);
+ 	if (ctx->fcn && regname) {
+@@ -4960,7 +4963,7 @@ static bool esilbreak_mem_read(RAnalEsil *esil, ut64 addr, ut8 *buf, int len) {
+ }
+ 
+ static bool esilbreak_reg_write(RAnalEsil *esil, const char *name, ut64 *val) {
+-	if (!esil) {
++       if (!esil || !esil->anal || !esil->user) {
+ 		return false;
+ 	}
+ 	RAnal *anal = esil->anal;
+
+
+
+
+@@ -524,8 +524,11 @@ R_API int r_core_shift_block(RCore *core, ut64 addr, ut64 b_size, st64 dist) {
+ }
+ 
+ R_API int r_core_block_read(RCore *core) {
++	int res = -1;
++	R_CRITICAL_ENTER (core);
+ 	if (core && core->block) {
+-		return r_io_read_at (core->io, core->offset, core->block, core->blocksize);
++		res = r_io_read_at (core->io, core->offset, core->block, core->blocksize);
+ 	}
+-	return -1;
++	R_CRITICAL_LEAVE (core);
++	return res;
+ }
+
+
+
+
+@@ -2984,6 +2984,7 @@ R_API bool r_core_init(RCore *core) {
+ 	}
+ 	core->chan = NULL;
+ 	r_core_setenv (core);
++       core->lock = r_th_lock_new (true);
+ 	core->in_log_process = false;
+ 	core->rfs = r_fs_shell_new ();
+ 	core->ev = r_event_new (core);
+@@ -3553,6 +3554,7 @@ R_API int r_core_seek_size(RCore *core, ut64 addr, int bsize) {
+ 		r_cons_eprintf ("Block size %d is too big\n", bsize);
+ 		return false;
+ 	}
++	R_CRITICAL_ENTER (core);
+ 	core->offset = addr;
+ 	if (bsize < 1) {
+ 		bsize = 1;
+@@ -3572,6 +3574,7 @@ R_API int r_core_seek_size(RCore *core, ut64 addr, int bsize) {
+ 		memset (core->block, 0xff, core->blocksize);
+ 		r_core_block_read (core);
+ 	}
++	R_CRITICAL_LEAVE (core);
+ 	return ret;
+ }
+ 
+
+
+
+
+@@ -235,6 +235,7 @@ R_API RFlag *r_flag_new(void) {
+ 		r_flag_free (f);
+ 		return NULL;
+ 	}
++	f->lock = r_th_lock_new (true);
+ 	f->base = 0;
+ 	f->cb_printf 

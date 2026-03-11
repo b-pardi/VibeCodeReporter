@@ -1,0 +1,115 @@
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include "suricata-common.h"
++#include "pcre.h"
+ #include "debug.h"
+ #include "decode.h"
+ #include "detect.h"
+@@ -70,15 +71,41 @@
+ static int pcre_match_limit = 0;
+ static int pcre_match_limit_recursion = 0;
+ 
+-static pcre *parse_regex;
+-static pcre_extra *parse_regex_study;
+-static pcre *parse_capture_regex;
+-static pcre_extra *parse_capture_regex_study;
++static DetectParseRegex parse_regex;
++static DetectParseRegex parse_capture_regex;
+ 
+ #ifdef PCRE_HAVE_JIT
+ static int pcre_use_jit = 1;
+ #endif
+ 
++#ifdef PCRE_HAVE_JIT_EXEC
++#define PCRE_JIT_MIN_STACK 32*1024
++#define PCRE_JIT_MAX_STACK 512*1024
++
++static int g_jitstack_thread_ctx_id = -1;
++
++#endif
++
++/* \brief Helper function for using pcre_exec with/without JIT
++ */
++static int DetectPcreExec(DetectEngineThreadCtx *det_ctx, DetectParseRegex *regex, const char *str, const size_t strlen,
++                            int start_offset, int options,  int *ovector, int ovector_size)
++{
++#ifdef PCRE_HAVE_JIT_EXEC
++    if (det_ctx && g_jitstack_thread_ctx_id != -1) {
++        pcre_jit_stack *jit_stack = (pcre_jit_stack *)
++            DetectThreadCtxGetKeywordThreadCtx(det_ctx, g_jitstack_thread_ctx_id);
++        if (jit_stack) {
++            return pcre_jit_exec(regex->regex, regex->study, str, strlen,
++                                start_offset, options, ovector, ovector_size,
++                                jit_stack);
++        }
++    }
++#endif
++    return pcre_exec(regex->regex, regex->study, str, strlen,
++                     start_offset, options, ovector, ovector_size);
++}
++
+ static int DetectPcreSetup (DetectEngineCtx *, Signature *, const char *);
+ static void DetectPcreFree(void *);
+ static void DetectPcreRegisterTests(void);
+@@ -124,24 +151,11 @@ void DetectPcreRegister (void)
+         }
+     }
+ 
+-    DetectSetupParseRegexes(PARSE_REGEX, &parse_regex, &parse_regex_study);
++    DetectSetupParseRegexes(PARSE_REGEX, &parse_regex);
+ 
+     /* setup the capture regex, as it needs PCRE_UNGREEDY we do it manually */
+-    const char *eb;
+-    int eo;
+     int opts = PCRE_UNGREEDY; /* pkt_http_ua should be pkt, http_ua, for this reason the UNGREEDY */
+-
+-    parse_capture_regex = pcre_compile(PARSE_CAPTURE_REGEX, opts, &eb, &eo, NULL);
+-    if (parse_capture_regex == NULL)
+-    {
+-        FatalError(SC_ERR_PCRE_COMPILE, "pcre compile of \"%s\" failed at offset %" PRId32 ": %s", PARSE_CAPTURE_REGEX, eo, eb);
+-    }
+-
+-    parse_capture_regex_study = pcre_study(parse_capture_regex, 0, &eb);
+-    if(eb != NULL)
+-    {
+-        FatalError(SC_ERR_PCRE_STUDY, "pcre study failed: %s", eb);
+-    }
++    DetectSetupParseRegexesOpts(PARSE_CAPTURE_REGEX, &parse_capture_regex, opts);
+ 
+ #ifdef PCRE_HAVE_JIT
+     if (PageSupportsRWX() == 0) {
+@@ -150,7 +164,6 @@ void DetectPcreRegister (void)
+     }
+ #endif
+ 
+-    DetectParseRegexAddToFreeList(parse_capture_regex, parse_capture_regex_study);
+     return;
+ }
+ 
+@@ -173,7 +186,6 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+                            const uint8_t *payload, uint32_t payload_len)
+ {
+     SCEnter();
+-#define MAX_SUBSTRINGS 30
+     int ret = 0;
+     int ov[MAX_SUBSTRINGS];
+     const uint8_t *ptr = NULL;
+@@ -196,7 +208,7 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+     }
+ 
+     /* run the actual pcre detection */
+-    ret = pcre_exec(pe->re, pe->sd, (char *)ptr, len, start_offset, 0, ov, MAX_SUBSTRINGS);
++    ret = DetectPcreExec(det_ctx, &pe->parse_regex, (char *) ptr, len, start_offset, 0, ov, MAX_SUBSTRINGS);
+     SCLogDebug("ret %d (negating %s)", ret, (pe->flags & DETECT_PCRE_NEGATE) ? "set" : "not set");
+ 
+     if (ret == PCRE_ERROR_NOMATCH) {
+@@ -334,7 +346,6 @@ static DetectPcreData *DetectPcreParse (DetectEngineCtx *de_ctx,
+     int opts = 0;
+     DetectPcreData *pd = NULL;
+     char *op = NULL;
+-#define MAX_SUBSTRINGS 30
+     int ret = 0, res = 0;
+     int ov[MAX_SUBSTRINGS];
+     int check_host_header = 0;
+@@ -381,8 +

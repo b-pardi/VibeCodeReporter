@@ -1,0 +1,132 @@
+@@ -3,22 +3,52 @@
+ # Copyright (C) Gabriel Potter
+ # This program is published under a GPLv2 license
+ 
+-"""
++r"""
+ Kerberos V5
+ 
+-Implements parts of
++Implements parts of:
+ - Kerberos Network Authentication Service (V5): RFC4120
+ - Kerberos Version 5 GSS-API: RFC1964, RFC4121
++- Kerberos Pre-Authentication: RFC6113 (FAST)
++
++Example decryption:
++
++>>> from scapy.libs.rfc3961 import Key, EncryptionType
++>>> pkt = Ether(hex_bytes("525400695813525400216c2b08004500015da71840008006dc\
++83c0a87a9cc0a87a11c209005854f6ab2392c25bd650182014b6e00000000001316a8201\
++2d30820129a103020105a20302010aa3633061304ca103020102a24504433041a0030201\
++12a23a043848484decb01c9b62a1cabfbc3f2d1ed85aa5e093ba8358a8cea34d4393af93\
++bf211e274fa58e814878db9f0d7a28d94e7327660db4f3704b3011a10402020080a20904\
++073005a0030101ffa481b73081b4a00703050040810010a1123010a003020101a1093007\
++1b0577696e3124a20e1b0c444f4d41494e2e4c4f43414ca321301fa003020102a1183016\
++1b066b72627467741b0c444f4d41494e2e4c4f43414ca511180f32303337303931333032\
++343830355aa611180f32303337303931333032343830355aa7060204701cc5d1a8153013\
++0201120201110201170201180202ff79020103a91d301b3019a003020114a11204105749\
++4e31202020202020202020202020"))
++>>> enc = pkt[Kerberos].root.padata[0].padataValue
++>>> k = Key(enc.etype.val, key=hex_bytes("7fada4e566ae4fb270e2800a23a\
++e87127a819d42e69b5e22de0ddc63da80096d"))
++>>> enc.decrypt(k)
+ """
+ 
+-from scapy.asn1.asn1 import ASN1_SEQUENCE, ASN1_Class_UNIVERSAL, ASN1_Codecs
++import struct
++
++import scapy.asn1.mib  # noqa: F401
++from scapy.asn1.asn1 import (
++    ASN1_SEQUENCE,
++    ASN1_STRING,
++    ASN1_Class_UNIVERSAL,
++    ASN1_Codecs,
++)
+ from scapy.asn1.ber import BERcodec_SEQUENCE
+ from scapy.asn1fields import (
++    ASN1F_BOOLEAN,
+     ASN1F_CHOICE,
+     ASN1F_FLAGS,
+     ASN1F_GENERAL_STRING,
+     ASN1F_GENERALIZED_TIME,
+     ASN1F_INTEGER,
++    ASN1F_OID,
+     ASN1F_PACKET,
+     ASN1F_SEQUENCE,
+     ASN1F_SEQUENCE_OF,
+@@ -31,6 +61,7 @@ from scapy.fields import (
+     ByteField,
+     FlagsField,
+     LEIntField,
++    LenField,
+     LEShortEnumField,
+     LEShortField,
+     PadField,
+@@ -38,11 +69,10 @@ from scapy.fields import (
+     StrFixedLenEnumField,
+     XStrFixedLenField,
+ )
++from scapy.layers.inet import TCP, UDP
+ from scapy.packet import Packet, bind_bottom_up, bind_layers
+ from scapy.volatile import GeneralizedTime
+ 
+-from scapy.layers.inet import UDP
+-
+ # kerberos APPLICATION
+ 
+ 
+@@ -62,6 +92,7 @@ class BERcodec_GSSAPI_APPLICATION(BERcodec_SEQUENCE):
+ class ASN1F_KRB_APPLICATION(ASN1F_SEQUENCE):
+     ASN1_tag = ASN1_Class_KRB.APPLICATION
+ 
++
+ # sect 5.2
+ 
+ 
+@@ -74,13 +105,23 @@ UInt32 = ASN1F_INTEGER
+ class PrincipalName(ASN1_Packet):
+     ASN1_codec = ASN1_Codecs.BER
+     ASN1_root = ASN1F_SEQUENCE(
+-        Int32("nameType", 0, explicit_tag=0xa0),
+-        ASN1F_SEQUENCE_OF(
+-            "nameString",
+-            [],
+-            KerberosString,
+-            explicit_tag=0xa1
+-        )
++        ASN1F_enum_INTEGER(
++            "nameType",
++            0,
++            {
++                0: "NT-UNKNOWN",
++                1: "NT-PRINCIPAL",
++                2: "NT-SRV-INST",
++                3: "NT-SRV-HST",
++                4: "NT-SRV-XHST",
++                5: "NT-UID",
++                6: "NT-X500-PRINCIPAL",
++                7: "NT-SMTP-NAME",
++                10: "NT-ENTERPRISE",
++            },
++            explicit_tag=0xA0,
++        ),
++        ASN1F_SEQUENCE_OF("nameString", [], KerberosString, explicit_tag=0xA1),
+     )
+ 
+ 
+@@ -91,86 +132,587 @@ Microseconds = ASN1F_INTEGER
+ class HostAddress(ASN1_Packet):
+     ASN1_codec = ASN1_Codecs.BER
+     ASN1_root = ASN1F_SEQUENCE(
+-        Int32("addrType", 0, explicit_tag=0xa0),
+-        ASN1F_STRING("address", "", explicit_tag=0xa1)
++        ASN1F_enum_INTEGER(
++            "addrType",
++            0,
++            {
++                # RFC4120 sect 7.5.3
++                2: "IPv4",
++                3: "Directional",
++                5: "ChaosNet",
++                6: "XNS",
++              

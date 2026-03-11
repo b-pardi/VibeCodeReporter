@@ -1,0 +1,117 @@
+@@ -36,6 +36,7 @@ import app.nzyme.core.ethernet.socks.db.SocksTunnelEntryMapper;
+ import app.nzyme.core.ethernet.ssh.db.SSHSessionEntryMapper;
+ import app.nzyme.core.ethernet.l4.tcp.db.TcpSessionEntryMapper;
+ import app.nzyme.core.ethernet.l4.udp.db.UdpConversationEntryMapper;
++import app.nzyme.core.ethernet.time.ntp.db.NTPTransactionEntryMapper;
+ import app.nzyme.core.events.db.EventActionEntryMapper;
+ import app.nzyme.core.events.db.EventEntryMapper;
+ import app.nzyme.core.events.db.SubscriptionEntryMapper;
+@@ -218,7 +219,8 @@ public class DatabaseImpl implements Database {
+                 .registerRowMapper(new L4AddressDataAddressNumberNumberAggregationResultMapper())
+                 .registerRowMapper(new DHCPStatisticsBucketMapper())
+                 .registerRowMapper(new GNSSElevationMaskAzimuthBucketMapper())
+-                .registerRowMapper(new GNSSPRNTrackPointMapper());
++                .registerRowMapper(new GNSSPRNTrackPointMapper())
++                .registerRowMapper(new NTPTransactionEntryMapper());
+ 
+         if (configuration.slowQueryLogThreshold().isPresent()) {
+             LOG.info("Slow query log enabled with threshold <{}ms>.", configuration.slowQueryLogThreshold().get());
+
+
+
+
+@@ -8,6 +8,7 @@ import app.nzyme.core.ethernet.l4.L4;
+ import app.nzyme.core.ethernet.socks.SOCKS;
+ import app.nzyme.core.ethernet.ssh.SSH;
+ import app.nzyme.core.ethernet.l4.tcp.TCP;
++import app.nzyme.core.ethernet.time.ntp.NTP;
+ 
+ public class Ethernet {
+ 
+@@ -20,6 +21,7 @@ public class Ethernet {
+     private final DNS dns;
+     private final SSH ssh;
+     private final SOCKS socks;
++    private final NTP ntp;
+ 
+     public Ethernet(NzymeNode nzyme) {
+         this.nzyme = nzyme;
+@@ -31,6 +33,7 @@ public class Ethernet {
+         this.dns = new DNS(this);
+         this.ssh = new SSH(this);
+         this.socks = new SOCKS(this);
++        this.ntp = new NTP(this);
+     }
+ 
+     public NzymeNode getNzyme() {
+@@ -65,4 +68,8 @@ public class Ethernet {
+         return socks;
+     }
+ 
++    public NTP ntp() {
++        return ntp;
++    }
++
+ }
+
+
+
+
+@@ -20,6 +20,10 @@ public class TCP {
+     public Optional<TcpSessionEntry> findSessionBySessionKey(String sessionKey,
+                                                              DateTime sessionStartTime,
+                                                              List<UUID> taps) {
++        if (sessionKey == null || sessionStartTime == null || taps.isEmpty()) {
++            return Optional.empty();
++        }
++
+         return nzyme.getDatabase().withHandle(handle ->
+             handle.createQuery("SELECT * FROM l4_sessions WHERE session_key = :session_key " +
+                             "AND start_time >= :tr_from AND start_time <= :tr_to AND tap_uuid IN (<taps>) " +
+@@ -29,7 +33,7 @@ public class TCP {
+                     .bind("tr_to", sessionStartTime.plusMinutes(1))
+                     .bindList("taps", taps)
+                     .mapTo(TcpSessionEntry.class)
+-                    .findOne() // In case of the sane session recorded by multiple taps, we take the most recent one.
++                    .findOne() // In case of the same session recorded by multiple taps, we take the most recent one.
+         );
+     }
+ 
+
+
+
+
+@@ -5,7 +5,7 @@ public enum TcpSessionState {
+     /*
+      * Other places to consider when making any changes here:
+      *
+-     * * EthernetConnectionCleaner
++     * * L4ConnectionCleaner
+      */
+ 
+     SYNSENT,
+@@ -17,6 +17,9 @@ public enum TcpSessionState {
+     CLOSEDRST,
+     CLOSEDTIMEOUT,
+     CLOSEDTIMEOUTNODE,
+-    REFUSED
++    CLOSEDNODE,
++    REFUSED,
++    ACTIVE,
++    CLOSED
+ 
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,172 @@
++package app.nzyme.core.ethernet.time.ntp;
++
++import app.nzyme.core.NzymeNode;
++import app.nzyme.core.database.OrderDirection;
++import app.nzyme.core.ethernet.Ethernet;
++import app.nzyme.core.ethernet.time.ntp.db.NTPTransactionEntry;
++import app.nzyme.core.shared.db.GenericIntegerHistogramEntry;
++import app.nzyme.core.util.Buck

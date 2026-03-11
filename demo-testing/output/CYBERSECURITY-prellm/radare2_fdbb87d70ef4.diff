@@ -1,0 +1,122 @@
+@@ -170,6 +170,7 @@ R_API RAnal *r_anal_new() {
+ 	anal->sdb_fmts = sdb_ns (anal->sdb, "spec", 1);
+ 	anal->sdb_cc = sdb_ns (anal->sdb, "cc", 1);
+ 	anal->sdb_zigns = sdb_ns (anal->sdb, "zigns", 1);
++	anal->sdb_classes = sdb_ns (anal->sdb, "classes", 1);
+ 	anal->zign_path = strdup ("");
+ 	anal->cb_printf = (PrintfCallback) printf;
+ 	(void)r_anal_pin_init (anal);
+@@ -483,6 +484,7 @@ R_API int r_anal_purge (RAnal *anal) {
+ 	sdb_reset (anal->sdb_hints);
+ 	sdb_reset (anal->sdb_types);
+ 	sdb_reset (anal->sdb_zigns);
++	sdb_reset (anal->sdb_classes);
+ 	r_list_free (anal->fcns);
+ 	anal->fcns = r_anal_fcn_list_new ();
+ 	anal->fcn_tree = NULL;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1103 @@
++/* radare - LGPL - Copyright 2018 - thestr4ng3r */
++
++#include <r_anal.h>
++#include <r_vector.h>
++#include "../include/r_anal.h"
++
++#define CLASSES_FLAGSPACE "classes"
++
++
++static void r_anal_class_base_delete_class(RAnal *anal, const char *class_name);
++static void r_anal_class_method_delete_class(RAnal *anal, const char *class_name);
++static void r_anal_class_vtable_delete_class(RAnal *anal, const char *class_name);
++static void r_anal_class_base_rename_class(RAnal *anal, const char *class_name_old, const char *class_name_new);
++static void r_anal_class_method_rename_class(RAnal *anal, const char *old_class_name, const char *new_class_name);
++static void r_anal_class_vtable_rename_class(RAnal *anal, const char *old_class_name, const char *new_class_name);
++
++
++static const char *key_classes = "classes";
++
++static char *key_class(const char *name) {
++	return sdb_fmt ("class.%s", name);
++}
++
++static char *key_attr_types(const char *name) {
++	return sdb_fmt ("attrtypes.%s", name);
++}
++
++static char *key_attr_type_attrs(const char *class_name, const char *attr_type) {
++	return sdb_fmt ("attr.%s.%s", class_name, attr_type);
++}
++
++static char *key_attr_content(const char *class_name, const char *attr_type, const char *attr_id) {
++	return sdb_fmt ("attr.%s.%s.%s", class_name, attr_type, attr_id);
++}
++
++static char *key_attr_content_specific(const char *class_name, const char *attr_type, const char *attr_id) {
++	return sdb_fmt ("attr.%s.%s.%s.specific", class_name, attr_type, attr_id);
++}
++
++typedef enum {
++	R_ANAL_CLASS_ATTR_TYPE_METHOD,
++	R_ANAL_CLASS_ATTR_TYPE_VTABLE,
++	R_ANAL_CLASS_ATTR_TYPE_BASE
++} RAnalClassAttrType;
++
++static const char *attr_type_id(RAnalClassAttrType attr_type) {
++	switch (attr_type) {
++	case R_ANAL_CLASS_ATTR_TYPE_METHOD:
++		return "method";
++	case R_ANAL_CLASS_ATTR_TYPE_VTABLE:
++		return "vtable";
++	case R_ANAL_CLASS_ATTR_TYPE_BASE:
++		return "base";
++	default:
++		return NULL;
++	}
++}
++
++
++R_API void r_anal_class_create(RAnal *anal, const char *name) {
++	char *name_sanitized = r_str_sanitize_sdb_key (name);
++	if (!name_sanitized) {
++		return;
++	}
++	sdb_array_add (anal->sdb_classes, key_classes, name_sanitized, 0);
++	char *key = key_class (name_sanitized);
++	free (name_sanitized);
++	if (!sdb_exists (anal->sdb_classes, key)) {
++		sdb_set (anal->sdb_classes, key, "c", 0);
++	}
++}
++
++
++R_API void r_anal_class_delete(RAnal *anal, const char *name) {
++	char *class_name_sanitized = r_str_sanitize_sdb_key (name);
++	if (!class_name_sanitized) {
++		return;
++	}
++
++	r_anal_class_base_delete_class (anal, class_name_sanitized);
++	r_anal_class_method_delete_class (anal, class_name_sanitized);
++	r_anal_class_vtable_delete_class (anal, class_name_sanitized);
++
++	if (!sdb_array_remove (anal->sdb_classes, key_classes, class_name_sanitized, 0)) {
++		free (class_name_sanitized);
++		return;
++	}
++
++	char *key = key_attr_types (class_name_sanitized);
++	char *attr_type_array = sdb_get (anal->sdb_classes, key, 0);
++
++	sdb_array_remove (anal->sdb_classes, key_classes, class_name_sanitized, 0);
++
++	char *attr_type;
++	sdb_aforeach (attr_type, attr_type_array) {
++		key = key_attr_type_attrs (class_name_sanitized, attr_type);
++		char *attr_id_array = sdb_get (anal->sdb_classes, key, 0);
++		sdb_remove (anal->sdb_classes, key, 0);
++		if (attr_id_array) {
++			char *attr

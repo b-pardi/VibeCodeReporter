@@ -1,0 +1,112 @@
+@@ -18,7 +18,7 @@ enum CALICO_CT_TYPE {
+ 	CALICO_CT_TYPE_NAT_REV = 2, // "Reverse" entry for a NATted flow, contains NAT + tracking information.
+ };
+ 
+-struct calico_ct_tcp_state {
++struct calico_ct_leg {
+ 	__u32 seqno;
+ 
+ 	__u32 syn_seen:1;
+@@ -43,8 +43,8 @@ struct calico_ct_value {
+ 	union {
+ 		// CALICO_CT_TYPE_NORMAL and CALICO_CT_TYPE_NAT_REV.
+ 		struct {
+-			struct calico_ct_tcp_state a_to_b; // 8
+-			struct calico_ct_tcp_state b_to_a; // 16
++			struct calico_ct_leg a_to_b; // 8
++			struct calico_ct_leg b_to_a; // 16
+ 
+ 			// CALICO_CT_TYPE_NAT_REV only.
+ 			__u32 orig_dst;                    // 20
+@@ -74,12 +74,13 @@ static CALICO_BPF_INLINE void dump_ct_key(struct calico_ct_key *k, enum calico_t
+ 	CALICO_DEBUG_AT("CT-TCP   key B=%x:%d size=%d\n", be32_to_host(k->addr_b), k->port_b, (int)sizeof(struct calico_ct_key));
+ }
+ 
+-static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
++static CALICO_BPF_INLINE int calico_ct_v4_create_tracking(
+ 		struct __sk_buff *skb,
++		__u8 ip_proto,
+ 		struct calico_ct_key *k, enum CALICO_CT_TYPE type,
+ 		__be32 ip_src, __be32 ip_dst, __u16 sport, __u16 dport,
+ 		__be32 orig_dst, __u16 orig_dport,
+-		struct tcphdr *tcp_header, enum calico_tc_flags flags) {
++		__be32 seq, bool syn, enum calico_tc_flags flags) {
+ 
+ 	if ((skb->mark & CALICO_SKB_MARK_FROM_WORKLOAD_MASK) == CALICO_SKB_MARK_FROM_WORKLOAD) {
+ 		// Packet already marked as being from another workload, which will
+@@ -90,13 +91,13 @@ static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
+ 		bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
+ 		if (srcLTDest) {
+ 			*k = (struct calico_ct_key) {
+-				.protocol = IPPROTO_TCP,
++				.protocol = ip_proto,
+ 				.addr_a = ip_src, .port_a = sport,
+ 				.addr_b = ip_dst, .port_b = dport,
+ 			};
+ 		} else  {
+ 			*k = (struct calico_ct_key) {
+-				.protocol = IPPROTO_TCP,
++				.protocol = ip_proto,
+ 				.addr_a = ip_dst, .port_a = dport,
+ 				.addr_b = ip_src, .port_b = sport,
+ 			};
+@@ -109,16 +110,16 @@ static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
+ 		}
+ 		CALICO_DEBUG_AT("CT-TCP Found expected create entry, updating...\n");
+ 		if (srcLTDest) {
+-			ct_value->a_to_b.seqno = tcp_header->seq;
+-			ct_value->a_to_b.syn_seen = 1;
++			ct_value->a_to_b.seqno = seq;
++			ct_value->a_to_b.syn_seen = syn;
+ 			if (flags & CALICO_TC_INGRESS) {
+ 				ct_value->b_to_a.ingress_whitelisted = 1;
+ 			} else {
+ 				ct_value->a_to_b.egress_whitelisted = 1;
+ 			}
+ 		} else  {
+-			ct_value->b_to_a.seqno = tcp_header->seq;
+-			ct_value->b_to_a.syn_seen = 1;
++			ct_value->b_to_a.seqno = seq;
++			ct_value->b_to_a.syn_seen = syn;
+ 			if (flags & CALICO_TC_INGRESS) {
+ 				ct_value->a_to_b.ingress_whitelisted = 1;
+ 			} else {
+@@ -139,11 +140,11 @@ static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
+ 	ct_value.type = type;
+ 	ct_value.orig_dst = orig_dst;
+ 	ct_value.orig_port = orig_dport;
+-	struct calico_ct_tcp_state *our_dir, *oth_dir;
++	struct calico_ct_leg *our_dir, *oth_dir;
+ 	bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
+ 	if (srcLTDest) {
+ 		*k = (struct calico_ct_key) {
+-			.protocol = IPPROTO_TCP,
++			.protocol = ip_proto,
+ 			.addr_a = ip_src, .port_a = sport,
+ 			.addr_b = ip_dst, .port_b = dport,
+ 		};
+@@ -151,7 +152,7 @@ static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
+ 		oth_dir = &ct_value.b_to_a;
+ 	} else  {
+ 		*k = (struct calico_ct_key) {
+-			.protocol = IPPROTO_TCP,
++			.protocol = ip_proto,
+ 			.addr_a = ip_dst, .port_a = dport,
+ 			.addr_b = ip_src, .port_b = sport,
+ 		};
+@@ -161,8 +162,8 @@ static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
+ 
+ 	dump_ct_key(k, flags);
+ 
+-	our_dir->seqno = tcp_header->seq;
+-	our_dir->syn_seen = 1;
++	our_dir->seqno = seq;
++	our_dir->syn_seen = syn;
+ 	if (flags & CALICO_TC_INGRESS) {
+ 		oth_dir->ingress_whitelisted = true;
+ 	} else {
+@@ -173,7 +174,8 @@ static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
+ 	return err;
+ }
+ 
+-static CALICO

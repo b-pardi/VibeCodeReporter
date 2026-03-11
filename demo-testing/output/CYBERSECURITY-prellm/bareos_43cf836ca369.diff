@@ -1,0 +1,106 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,682 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++import os
++import stat
++import glob
++import re
++import uuid
++import subprocess
++import bareosfd
++import BareosFdPluginBaseclass
++from lockfile import LockFile
++
++
++class BareosFdPluginVz7CtFs(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
++    '''
++    Bareos FD Plugin to backup Virtuozzo container filesystems and metadata
++    '''
++
++    def __init__(self, plugindef):
++        bareosfd.DebugMessage(
++            100,
++            "Constructor called in module %s with plugindef=%s\n" %
++            (__name__, plugindef))
++        events = []
++        events.append(bareosfd.bEventEndRestoreJob)
++        bareosfd.RegisterEvents(events)
++        # Last argument of super constructor is a list of mandatory arguments
++        # using mandatory options in python constructor is not working cause options are merged inside plugin_option_parser
++        # and not on directzor side
++        super(BareosFdPluginVz7CtFs, self).__init__(plugindef)
++        self.files = []
++        # Filled during start_backup_job
++        self.cnf_default_excludes = []
++        self.excluded_backup_paths = []
++        self.prepared = False
++        self.disk_descriptor = ""
++        self.config_path = ""
++        self.fs_path = ""
++        self.mount_basedir = "/mnt/bareos"
++        self.job_mount_point = ""
++        self.base_image = []
++        self.verbose = False
++        self.snapshot_uuid = ""
++        self.snapshot_created = False
++        self.blocker = ""
++        self.mounted = False
++        # default is the restore of a whole container
++        self.restore = "ct"
++
++    def handle_plugin_event(self, event):
++        '''
++        call appropiate function for triggered event
++        '''
++        if event == bareosfd.bEventEndRestoreJob:
++            bareosfd.DebugMessage(
++                100,
++                "handle_plugin_event called with bareosfd.bEventEndRestoreJob\n")
++            return self.end_restore_job()
++        elif event == bareosfd.bEventEndBackupJob:
++            bareosfd.DebugMessage(
++                100,
++                "handle_plugin_event called with bareosfd.bEventEndBackupJob\n")
++            return self.end_backup_job()
++        elif event == bareosfd.bEventStartBackupJob:
++            bareosfd.DebugMessage(
++                100, "handle_plugin_event() called with bareosfd.bEventStartBackupJob\n")
++            return self.start_backup_job()
++        elif event == bareosfd.bEventStartRestoreJob:
++            bareosfd.DebugMessage(
++                100,
++                "handle_plugin_event() called with bareosfd.bEventStartRestoreJob\n")
++            return self.start_restore_job()
++        else:
++            bareosfd.DebugMessage(
++                100,
++                "handle_plugin_event called with noop event %s\n" % (event))
++        return bareosfd.bRC_OK
++
++    def check_plugin_options(self):
++        '''
++        Checks uuid and container name in options, sets some variables
++        '''
++        if 'name' not in self.options or 'uuid' not in self.options:
++            return False
++        if 'lockfile' in self.options:
++            self.lock = LockFile(self.options['lockfile'])
++            self.lock.acquire()
++        if 'blocker' in self.options:
++            self.blocker = self.options['blocker']
++        if not os.path.exists(self.mount_basedir):
++            os.mkdir(self.mount_basedir)
++        if 'restore' in self.options:
++            self.restore = self.options['restore']
++        self.job_mount_point = os.path.join(
++            self.mount_basedir, self.options['uuid'])
++        self.config_path = os.path.join("/vz/private", self.options['uuid'])
++        self.disk_descriptor = os.path.join(
++            self.config_path, "root.hdd", "DiskDescriptor.xml")
++        self.fs_path = os.path.join("/vz/root", self.options['uuid'])
++        if 'excluded_backup_paths' in self.options:
++            relative_excludes =

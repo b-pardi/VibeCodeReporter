@@ -1,0 +1,116 @@
+@@ -618,11 +618,16 @@ public:
+ 
+     const detail::AttrPtr& GetAttr(detail::AttrTag a) const { return attrs ? attrs->Find(a) : detail::Attr::nil; }
+ 
++    const detail::Location* GetLocationInfo() const { return &loc; }
++
+     void DescribeReST(ODesc* d, bool roles_only = false) const;
+ 
+     TypePtr type;
+     detail::AttributesPtr attrs;
+     const char* id = nullptr;
++
++private:
++    detail::Location loc = detail::GetCurrentLocation();
+ };
+ 
+ using type_decl_list = PList<TypeDecl>;
+
+
+
+
+@@ -544,7 +544,8 @@ void FuncTypeInfo::AddInitializerVals(std::vector<std::string>& ivs) const {
+     ivs.emplace_back(Fmt(static_cast<int>(expressionless_return_okay)));
+ }
+ 
+-RecordTypeInfo::RecordTypeInfo(CPPCompile* _c, TypePtr _t) : AbstractTypeInfo(_c, std::move(_t)) {
++RecordTypeInfo::RecordTypeInfo(CPPCompile* _c, TypePtr _t, int _addl_fields)
++    : AbstractTypeInfo(_c, std::move(_t)), addl_fields(_addl_fields) {
+     // Note, we leave init_cohort at 0 because the skeleton of this type
+     // is built in the first cohort.
+     auto r = t->AsRecordType()->Types();
+@@ -574,6 +575,7 @@ RecordTypeInfo::RecordTypeInfo(CPPCompile* _c, TypePtr _t) : AbstractTypeInfo(_c
+ 
+ void RecordTypeInfo::AddInitializerVals(std::vector<std::string>& ivs) const {
+     ivs.emplace_back(Fmt(c->TrackString(t->GetName())));
++    ivs.emplace_back(Fmt(addl_fields));
+ 
+     auto n = field_names.size();
+ 
+
+
+
+
+@@ -644,11 +644,15 @@ private:
+ 
+ class RecordTypeInfo : public AbstractTypeInfo {
+ public:
+-    RecordTypeInfo(CPPCompile* c, TypePtr _t);
++    RecordTypeInfo(CPPCompile* c, TypePtr _t, int _addl_fields);
+ 
+     void AddInitializerVals(std::vector<std::string>& ivs) const override;
+ 
+ private:
++    // If non-zero, where additional fields begin. Only used for standalone
++    // compilation.
++    int addl_fields;
++
+     std::vector<std::string> field_names;
+     std::vector<TypePtr> field_types;
+     std::vector<int> field_attrs;
+
+
+
+
+@@ -383,11 +383,18 @@ TypePtr CPP_TypeInits::BuildRecordType(InitsManager* im, ValElemVec& init_vals,
+     auto r = cast_intrusive<RecordType>(inits_vec[offset]);
+     ASSERT(r);
+ 
+-    if ( r->NumFields() == 0 ) {
++    auto addl_fields = init_vals[2];
++
++    if ( addl_fields > 0 || r->NumFields() == 0 ) {
++        // We shouldn't be adding fields if the record doesn't have any
++        // existing fields - that would reflect an initialization botch.
++        if ( addl_fields > 0 && r->NumFields() == 0 )
++            reporter->InternalError("record unexpectedly empty when adding fields");
++
+         type_decl_list tl;
+ 
+         auto n = init_vals.size();
+-        auto i = 2U;
++        auto i = 3U + addl_fields * 3;
+ 
+         while ( i < n ) {
+             auto s = im->Strings(init_vals[i++]);
+
+
+
+
+@@ -189,9 +189,43 @@ shared_ptr<CPP_InitInfo> CPPCompile::RegisterType(const TypePtr& tp) {
+ 
+     processed_types[t] = nullptr;
+ 
++    // When doing standalone compilation, if the type is a record *and*
++    // (1) it's not one that we're fully generating (i.e., it's not solely
++    // defined in the scripts that we're compiling-to-standalone), and (2) the
++    // scripts we're compiling extend the record using "redef += record ...",
++    // then we need to track the offset where those record extensions start,
++    // so that when initializing the standalone code, we can add in those
++    // record fields.
++    //
++    // If any of those conditions don't hold, then this variable will remain 0.
++    int addl_fields = 0;
++
++    bool type_init_needed = standalone && obj_matches_opt_files(tp);
++
++    if ( standalone && ! type_init_needed ) {
++        if ( tp->Tag() == TYPE_RECORD ) {
++            auto tr = tp->AsRecordType();
++            for ( auto i = tr->NumOrigFields(); i < tr->NumFields(); ++i ) {
++                auto fd = tr->FieldDecl(i);
++                if ( filename_matches_opt_files(fd->GetLocationInfo()->filename) ) {
++                    if ( addl_fields == 0 )
++                        addl_fields = i;
++                }
++

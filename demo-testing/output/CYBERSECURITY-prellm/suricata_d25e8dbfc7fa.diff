@@ -1,0 +1,104 @@
+@@ -393,6 +393,14 @@ static void *ParseAFPConfig(const char *iface)
+                         aconf->iface);
+             aconf->ebpf_t_config.flags |= EBPF_PINNED_MAPS;
+         }
++        const char *pinned_maps_name;
++        if (ConfGetChildValueWithDefault(if_root, if_default,
++                    "pinned-maps-name",
++                    &pinned_maps_name) != 1) {
++            aconf->ebpf_t_config.pinned_maps_name = pinned_maps_name;
++        } else {
++            aconf->ebpf_t_config.pinned_maps_name = NULL;
++        }
+     }
+ #endif
+ 
+@@ -401,7 +409,7 @@ static void *ParseAFPConfig(const char *iface)
+     if (aconf->ebpf_lb_file && cluster_type == PACKET_FANOUT_EBPF) {
+         int ret = EBPFLoadFile(aconf->iface, aconf->ebpf_lb_file, "loadbalancer",
+                                &aconf->ebpf_lb_fd,
+-                               aconf->ebpf_t_config.flags);
++                               &aconf->ebpf_t_config);
+         if (ret != 0) {
+             SCLogWarning(SC_ERR_INVALID_VALUE, "Error when loading eBPF lb file");
+         }
+@@ -441,7 +449,7 @@ static void *ParseAFPConfig(const char *iface)
+ #ifdef HAVE_PACKET_EBPF
+         int ret = EBPFLoadFile(aconf->iface, aconf->ebpf_filter_file, "filter",
+                                &aconf->ebpf_filter_fd,
+-                               aconf->ebpf_t_config.flags);
++                               &aconf->ebpf_t_config);
+         if (ret != 0) {
+             SCLogWarning(SC_ERR_INVALID_VALUE,
+                          "Error when loading eBPF filter file");
+@@ -505,7 +513,7 @@ static void *ParseAFPConfig(const char *iface)
+ #ifdef HAVE_PACKET_XDP
+         int ret = EBPFLoadFile(aconf->iface, aconf->xdp_filter_file, "xdp",
+                                &aconf->xdp_filter_fd,
+-                               aconf->ebpf_t_config.flags);
++                               &aconf->ebpf_t_config);
+         if (ret != 0) {
+             SCLogWarning(SC_ERR_INVALID_VALUE,
+                          "Error when loading XDP filter file");
+
+
+
+
+@@ -47,6 +47,7 @@
+ #define AFP_MODE_XDP_BYPASS 1
+ #define AFP_MODE_EBPF_BYPASS 2
+ struct ebpf_timeout_config {
++    const char *pinned_maps_name;
+     uint16_t cpus_count;
+     uint8_t mode;
+     uint8_t flags;
+
+
+
+
+@@ -170,10 +170,20 @@ static int EBPFLoadPinnedMapsFile(LiveDevice *livedev, const char *file)
+     return bpf_obj_get(pinnedpath);
+ }
+ 
+-static int EBPFLoadPinnedMaps(LiveDevice *livedev, uint8_t flags)
++static int EBPFLoadPinnedMaps(LiveDevice *livedev, struct ebpf_timeout_config *config)
+ {
+     int fd_v4 = -1, fd_v6 = -1;
+ 
++    /* First try to load the eBPF check map and return if found */
++    if (config->pinned_maps_name) {
++        int ret = -1;
++        ret = EBPFLoadPinnedMapsFile(livedev, config->pinned_maps_name);
++        if (ret == 0) {
++            /* pinned maps found, let's just exit as XDP filter is in place */
++            return ret;
++        }
++    }
++
+     /* Get flow v4 table */
+     fd_v4 = EBPFLoadPinnedMapsFile(livedev, "flow_table_v4");
+     if (fd_v4 < 0) {
+@@ -200,6 +210,8 @@ static int EBPFLoadPinnedMaps(LiveDevice *livedev, uint8_t flags)
+     bpf_map_data->array[1].fd = fd_v6;
+     bpf_map_data->array[1].name = SCStrdup("flow_table_v6");
+     bpf_map_data->last = 2;
++    /* Attach the bpf_maps_info to the LiveDevice via the device storage */
++    LiveDevSetStorageById(livedev, g_livedev_storage_id, bpf_map_data);
+ 
+     return 0;
+ }
+@@ -217,7 +229,7 @@ static int EBPFLoadPinnedMaps(LiveDevice *livedev, uint8_t flags)
+  * \return -1 in case of error and 0 in case of success
+  */
+ int EBPFLoadFile(const char *iface, const char *path, const char * section,
+-                 int *val, uint8_t flags)
++                 int *val, struct ebpf_timeout_config *config)
+ {
+     int err, pfd;
+     bool found = false;
+@@ -231,9 +243,9 @@ int EBPFLoadFile(const char *iface, const char *path, const char * section,
+     if (livedev == NULL)
+         return -1;
+ 
+-    if (flags & EBPF_XDP_CODE) {
++    if (config->flags

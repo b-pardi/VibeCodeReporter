@@ -1,0 +1,146 @@
+@@ -72,4 +72,9 @@ void DTLS_Analyzer::SendHandshake(uint16_t raw_tls_version, uint8_t msg_type, ui
+ 		}
+ 	}
+ 
++bool DTLS_Analyzer::TryDecryptApplicationData(int len, const u_char* data, bool is_orig, uint8_t content_type, uint16_t raw_tls_version)
++	{
++		// noop for now as DTLS decryption is currently not supported
++	}
++
+ } // namespace zeek::analyzer::dtls
+
+
+
+
+@@ -27,6 +27,8 @@ public:
+ 	static analyzer::Analyzer* Instantiate(Connection* conn)
+ 		{ return new DTLS_Analyzer(conn); }
+ 
++	bool TryDecryptApplicationData(int len, const u_char* data, bool is_orig, uint8_t content_type, uint16_t raw_tls_version);
++
+ protected:
+ 	binpac::DTLS::SSL_Conn* interp;
+ 	binpac::TLSHandshake::Handshake_Conn* handshake_interp;
+
+
+
+
+@@ -1,5 +1,6 @@
+ #include "zeek/analyzer/protocol/ssl/SSL.h"
+ 
++#include "zeek/analyzer/Manager.h"
+ #include "zeek/analyzer/protocol/tcp/TCP_Reassembler.h"
+ #include "zeek/Reporter.h"
+ #include "zeek/util.h"
+@@ -8,6 +9,73 @@
+ #include "zeek/analyzer/protocol/ssl/ssl_pac.h"
+ #include "zeek/analyzer/protocol/ssl/tls-handshake_pac.h"
+ 
++#include <arpa/inet.h>
++#include <openssl/evp.h>
++#include <openssl/kdf.h>
++
++#define MSB(a) ((a>>8)&0xff)
++#define LSB(a) (a&0xff)
++
++static void fmt_seq(uint32_t num, u_char* buf)
++	{
++	memset(buf, 0, 8);
++	uint32_t netnum = htonl(num);
++	memcpy(buf+4, &netnum, 4);
++	}
++
++static void print_hex(std::string name, u_char* data, int len)
++	{
++	int i = 0;
++	printf("%s (%d): ", name.c_str(), len);
++	if (len > 0)
++		printf("0x%02x", data[0]);
++
++	for (i = 1; i < len; i++)
++		{
++		printf(" 0x%02x", data[i]);
++		}
++	printf("\n");
++	}
++
++static bool tls1_prf(const u_char *secret, int secret_len, const char* label,
++		const u_char* rnd1, int rnd1_len, const u_char* rnd2, int rnd2_len, u_char* out, size_t out_len)
++	{
++	// alloc buffers
++	EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_TLS1_PRF, NULL);
++	size_t seed_len = strlen(label) + rnd1_len + rnd2_len;
++	u_char *seed = (u_char*) malloc(seed_len);
++	u_char *ptr = seed;
++
++	// seed = label + rnd1 + rnd2
++	memcpy(ptr, label, strlen(label));
++	ptr += strlen(label);
++	memcpy(ptr, rnd1, rnd1_len);
++	ptr += rnd1_len;
++	memcpy(ptr, rnd2, rnd2_len);
++	ptr += rnd2_len;
++
++	if (EVP_PKEY_derive_init(pctx) <= 0)
++		goto abort; /* Error */
++	// FIXME: sha384 should not be hardcoded
++	if (EVP_PKEY_CTX_set_tls1_prf_md(pctx, EVP_sha384()) <= 0)
++		goto abort; /* Error */
++	if (EVP_PKEY_CTX_set1_tls1_prf_secret(pctx, secret, secret_len) <= 0)
++		goto abort; /* Error */
++	if (EVP_PKEY_CTX_add1_tls1_prf_seed(pctx, seed, seed_len) <= 0)
++		goto abort; /* Error */
++	if (EVP_PKEY_derive(pctx, out, &out_len) <= 0)
++		goto abort; /* Error */
++
++	EVP_PKEY_CTX_free(pctx);
++	free(seed);
++	return true;
++
++abort:
++	EVP_PKEY_CTX_free(pctx);
++	free(seed);
++	return false;
++	}
++
+ namespace zeek::analyzer::ssl {
+ 
+ SSL_Analyzer::SSL_Analyzer(Connection* c)
+@@ -16,12 +84,20 @@ SSL_Analyzer::SSL_Analyzer(Connection* c)
+ 	interp = new binpac::SSL::SSL_Conn(this);
+ 	handshake_interp = new binpac::TLSHandshake::Handshake_Conn(this);
+ 	had_gap = false;
++	c_seq = 0;
++	s_seq = 0;
++	// FIXME: should this be initialized to nullptr?
++	secret = new zeek::StringVal(0, "");
++	keys = new zeek::StringVal(0, "");
++	pia = nullptr;
+ 	}
+ 
+ SSL_Analyzer::~SSL_Analyzer()
+ 	{
+ 	delete interp;
+ 	delete handshake_interp;
++	delete secret;
++	delete keys;
+ 	}
+ 
+ void SSL_Analyzer::Done()
+@@ -98,4 +174,166 @@ void SSL_Analyzer::Undelivered(uint64_t seq, int len, bool orig)
+ 	interp->NewGap(orig, len);
+ 	}
+ 
++void SSL_Analyzer::SetSecret(const u_char* data, int len)
++	{
++	// FIXME: Is this the proper way to initialize a zeek::StringVal?
++	//        the alternative requires a cast: new zeek::StringVal(len, data)
++	secret = new zeek::StringVal(new zeek::String(data, len, true));
++	}
++
++void SSL_Analyzer::SetKeys(const u_char* data, int len)
++	{
++	keys = new zeek::StringVal(new zeek::String(data, len, true));
++	}
++
++bool SSL_Analyzer::TryDecryptApplicationData(int len, const u_char* data, bool is_orig, ui

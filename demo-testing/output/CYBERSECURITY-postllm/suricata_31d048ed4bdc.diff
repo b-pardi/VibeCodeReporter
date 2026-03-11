@@ -1,0 +1,106 @@
+@@ -33,6 +33,7 @@
+ #define ACTION_REJECT_BOTH  0x10
+ #define ACTION_PASS         0x20
+ #define ACTION_CONFIG       0x40
++#define ACTION_ACCEPT       0x80 /**< firewall 'accept' rule */
+ 
+ #define ACTION_REJECT_ANY   (ACTION_REJECT|ACTION_REJECT_DST|ACTION_REJECT_BOTH)
+ 
+@@ -42,6 +43,8 @@ enum ActionScope {
+     ACTION_SCOPE_AUTO = 0,
+     ACTION_SCOPE_PACKET, /**< apply action to packet */
+     ACTION_SCOPE_FLOW,   /**< apply drop/pass/accept action to flow */
++    ACTION_SCOPE_HOOK,   /**< apply action to current hook */
++    ACTION_SCOPE_TX,     /**< apply action to current tx */
+ };
+ 
+ #endif /* SURICATA_ACTION_GLOBALS_H */
+
+
+
+
+@@ -55,6 +55,8 @@
+ /** is tx fully inspected? */
+ #define APP_LAYER_TX_INSPECTED_TS BIT_U8(2)
+ #define APP_LAYER_TX_INSPECTED_TC BIT_U8(3)
++/** accept is applied to entire tx */
++#define APP_LAYER_TX_ACCEPT BIT_U8(4)
+ 
+ /** parser has successfully processed in the input, and has consumed
+  *  all of it. */
+
+
+
+
+@@ -906,6 +906,10 @@ const char *PacketDropReasonToString(enum PacketDropReason r)
+             return "nfq error";
+         case PKT_DROP_REASON_INNER_PACKET:
+             return "tunnel packet drop";
++        case PKT_DROP_REASON_DEFAULT_PACKET_POLICY:
++            return "default packet policy";
++        case PKT_DROP_REASON_DEFAULT_APP_POLICY:
++            return "default app policy";
+         case PKT_DROP_REASON_NOT_SET:
+         case PKT_DROP_REASON_MAX:
+             return NULL;
+@@ -948,6 +952,10 @@ static const char *PacketDropReasonToJsonString(enum PacketDropReason r)
+             return "ips.drop_reason.nfq_error";
+         case PKT_DROP_REASON_INNER_PACKET:
+             return "ips.drop_reason.tunnel_packet_drop";
++        case PKT_DROP_REASON_DEFAULT_PACKET_POLICY:
++            return "ips.drop_reason.default_packet_policy";
++        case PKT_DROP_REASON_DEFAULT_APP_POLICY:
++            return "ips.drop_reason.default_app_policy";
+         case PKT_DROP_REASON_NOT_SET:
+         case PKT_DROP_REASON_MAX:
+             return NULL;
+
+
+
+
+@@ -262,7 +262,9 @@ typedef struct PacketAlert_ {
+ /** alert is in a frame, frame_id set */
+ #define PACKET_ALERT_FLAG_FRAME 0x20
+ /** alert in a tx was forced */
+-#define PACKET_ALERT_FLAG_TX_GUESSED 0x040
++#define PACKET_ALERT_FLAG_TX_GUESSED 0x40
++/** accept should be applied to packet */
++#define PACKET_ALERT_FLAG_APPLY_ACTION_TO_PACKET 0x80
+ 
+ extern uint16_t packet_alert_max;
+ #define PACKET_ALERT_MAX 15
+@@ -376,8 +378,10 @@ enum PacketDropReason {
+     PKT_DROP_REASON_STREAM_MIDSTREAM,
+     PKT_DROP_REASON_STREAM_REASSEMBLY,
+     PKT_DROP_REASON_STREAM_URG,
+-    PKT_DROP_REASON_NFQ_ERROR,    /**< no nfq verdict, must be error */
+-    PKT_DROP_REASON_INNER_PACKET, /**< drop issued by inner (tunnel) packet */
++    PKT_DROP_REASON_NFQ_ERROR,             /**< no nfq verdict, must be error */
++    PKT_DROP_REASON_INNER_PACKET,          /**< drop issued by inner (tunnel) packet */
++    PKT_DROP_REASON_DEFAULT_PACKET_POLICY, /**< drop issued by default packet policy */
++    PKT_DROP_REASON_DEFAULT_APP_POLICY,    /**< drop issued by default app policy */
+     PKT_DROP_REASON_MAX,
+ };
+ 
+
+
+
+
+@@ -154,8 +154,14 @@ int PacketAlertCheck(Packet *p, uint32_t sid)
+ 
+ static inline void RuleActionToFlow(const uint8_t action, Flow *f)
+ {
++    if (action & ACTION_ACCEPT) {
++        f->flags |= FLOW_ACTION_ACCEPT;
++        SCLogDebug("setting flow action pass");
++    }
++
++    // TODO pass and accept could be set at the same time?
+     if (action & (ACTION_DROP | ACTION_REJECT_ANY | ACTION_PASS)) {
+-        if (f->flags & (FLOW_ACTION_DROP | FLOW_ACTION_PASS)) {
++        if (f->flags & (FLOW_ACTION_DROP | FLOW_ACTION_PASS | FLOW_ACTION_ACCEPT)) {
+             /* drop or pass already set. First to set wins. */
+             SCLogDebug("not setting %s flow already set to %s",
+                     (action & ACTION_PASS) ? "pass" : "drop",
+@@ -205,13 +211,22 @@ static void PacketApplySignatureActions(Packet *p, const Signature *s, const Pac
+         if (pa->action & ACTIO

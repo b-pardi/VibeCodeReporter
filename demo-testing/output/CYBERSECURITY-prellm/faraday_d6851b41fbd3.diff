@@ -1,0 +1,105 @@
+@@ -32,6 +32,7 @@ from faraday.server.api.modules import (
+ )
+ from faraday.server.api.base import AutoSchema, GenericWorkspacedView
+ from faraday.server.api.modules.websocket_auth import require_agent_token
++from faraday.server.utils.bulk_create import add_creator
+ 
+ bulk_create_api = flask.Blueprint('bulk_create_api', __name__)
+ 
+@@ -403,14 +404,7 @@ class BulkCreateView(GenericWorkspacedView):
+         else:
+             workspace = self._get_workspace(workspace_name)
+             creator_user = flask.g.user
+-            for host in data["hosts"]:
+-                host["creator"] = creator_user
+-                for service in host["services"]:
+-                    service["creator"] = creator_user
+-                for vuln in host["vulnerabilities"]:
+-                    vuln["creator"] = creator_user
+-                for cred in host["credentials"]:
+-                    cred["creator"] = creator_user
++            data = add_creator(data,creator_user)
+ 
+         bulk_create(workspace, data, True)
+         return "Created", 201
+
+
+
+
+@@ -15,6 +15,7 @@ from flask import (
+     jsonify,
+     Blueprint,
+ )
++import flask
+ 
+ from flask_wtf.csrf import validate_csrf
+ from werkzeug.utils import secure_filename
+@@ -66,7 +67,7 @@ def file_upload(workspace=None):
+                 "Upload reports in WEB-UI not configurated, run Faraday client and try again...")
+             abort(make_response(jsonify(message="Upload reports not configurated: Run faraday client and start Faraday server again"), 500))
+         else:
+-            REPORTS_QUEUE.put((workspace, file_path))
++            REPORTS_QUEUE.put((workspace, file_path, flask.g.user))
+             return make_response(jsonify(message="ok"), 200)
+     else:
+         abort(make_response(jsonify(message="Missing report file"), 400))
+
+
+
+
+@@ -5,8 +5,8 @@ import time
+ import os
+ from faraday_plugins.plugins.manager import PluginsManager, ReportAnalyzer
+ from faraday.server.api.modules.bulk_create import bulk_create
+-
+ from faraday.server.models import Workspace
++from faraday.server.utils.bulk_create import add_creator
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -33,7 +33,7 @@ class ReportsManager(Thread):
+             ws = Workspace.query.filter_by(name=workspace_name).one()
+             bulk_create(ws, report_json, False)
+ 
+-    def process_report(self, workspace, file_path):
++    def process_report(self, workspace, file_path, user):
+         report_analyzer = ReportAnalyzer(self.plugins_manager)
+         plugin = report_analyzer.get_plugin(file_path)
+         if plugin:
+@@ -41,6 +41,7 @@ class ReportsManager(Thread):
+                 logger.info("Processing report [%s] with plugin [%s]", file_path, plugin.id)
+                 plugin.processReport(file_path)
+                 vulns_data = plugin.get_data()
++                vulns_data = add_creator(vulns_data, user)
+             except Exception as e:
+                 logger.error("Processing Error: %s", e)
+                 logger.exception(e)
+@@ -58,10 +59,10 @@ class ReportsManager(Thread):
+         logger.debug("Start Reports Manager")
+         while not self._must_stop:
+             try:
+-                workspace, file_path = self.upload_reports_queue.get(False, timeout=0.1)
++                workspace, file_path, user = self.upload_reports_queue.get(False, timeout=0.1)
+                 logger.info("Processing raw report %s", file_path)
+                 if os.path.isfile(file_path):
+-                    self.process_report(workspace, file_path)
++                    self.process_report(workspace, file_path, user)
+                 else:
+                     logger.warning("Report file [%s] don't exists", file_path)
+             except Empty:
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,20 @@
++# Faraday Penetration Test IDE
++# Copyright (C) 2020  Infobyte LLC (http://www.infobytesec.com/)
++# See the file 'doc/LICENSE' for the license information
++
++import logging
++
++logger = logging.getLogger(__name__)
++
++
++def add_creator(vuln_data, creator_user):

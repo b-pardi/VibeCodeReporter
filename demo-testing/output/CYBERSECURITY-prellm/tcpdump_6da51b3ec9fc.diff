@@ -1,0 +1,132 @@
+@@ -144,3 +144,46 @@ nd_smi_version_string(void)
+ 	return (NULL);
+ #endif
+ }
++
++
++int
++nd_push_buffer(netdissect_options *ndo, u_char *new_buffer,
++    const u_char *new_packetp, const u_char *new_snapend)
++{
++	struct netdissect_saved_info *ndsi;
++
++	ndsi = (struct netdissect_saved_info *)malloc(sizeof(struct netdissect_saved_info));
++	if (ndsi == NULL)
++		return (0);	/* fail */
++	ndsi->ndsi_buffer = new_buffer;
++	ndsi->ndsi_packetp = ndo->ndo_packetp;
++	ndsi->ndsi_snapend = ndo->ndo_snapend;
++	ndsi->ndsi_prev = ndo->ndo_buffer_stack;
++
++	ndo->ndo_packetp = new_packetp;
++	ndo->ndo_snapend = new_snapend;
++	ndo->ndo_buffer_stack = ndsi;
++
++	return (1);	/* success */
++}
++
++void
++nd_pop_buffer(netdissect_options *ndo)
++{
++	struct netdissect_saved_info *ndsi;
++
++	ndsi = ndo->ndo_buffer_stack;
++	ndo->ndo_packetp = ndsi->ndsi_packetp;
++	ndo->ndo_snapend = ndsi->ndsi_snapend;
++	ndo->ndo_buffer_stack = ndsi->ndsi_prev;
++
++	free(ndsi->ndsi_buffer);
++	free(ndsi);
++}
++
++void
++nd_pop_all_buffers(netdissect_options *ndo)
++{
++	while (ndo->ndo_buffer_stack != NULL)
++		nd_pop_buffer(ndo);
++}
+
+
+
+
+@@ -168,6 +168,26 @@ typedef struct netdissect_options netdissect_options;
+ 
+ typedef u_int (*if_printer) IF_PRINTER_ARGS;
+ 
++/*
++ * In case the data in a buffer needs to be processed by being decrypted,
++ * decompressed, etc. before it's dissected, we can't process it in place,
++ * we have to allocate a new buffer for the processed data.
++ *
++ * We keep a stack of those buffers; when we allocate a new buffer, we
++ * push the current one onto a stack, and when we're done with the new
++ * buffer, we free the current buffer and pop the previous one off the
++ * stack.
++ *
++ * A buffer has a beginnning and end pointer, and a link to the previous
++ * buffer on the stack.
++ */
++struct netdissect_saved_info {
++  u_char *ndsi_buffer;				/* pointer to allocated buffer data */
++  const u_char *ndsi_packetp;			/* saved beginning of data */
++  const u_char *ndsi_snapend;			/* saved end of data */
++  struct netdissect_saved_info *ndsi_prev;	/* previous buffer on the stack */
++};
++
+ struct netdissect_options {
+   int ndo_bflag;		/* print 4 byte ASes in ASDOT notation */
+   int ndo_eflag;		/* print ethernet header */
+@@ -208,6 +228,9 @@ struct netdissect_options {
+   const u_char *ndo_packetp;
+   const u_char *ndo_snapend;
+ 
++  /* stack of saved buffer information */
++  struct netdissect_saved_info *ndo_buffer_stack;
++
+   /* pointer to the if_printer function */
+   if_printer ndo_if_printer;
+ 
+@@ -230,6 +253,11 @@ struct netdissect_options {
+ 		      PRINTFLIKE_FUNCPTR(2, 3);
+ };
+ 
++extern int nd_push_buffer(netdissect_options *, u_char *, const u_char *,
++    const u_char *);
++extern void nd_pop_buffer(netdissect_options *);
++extern void nd_pop_all_buffers(netdissect_options *);
++
+ #define PT_VAT		1	/* Visual Audio Tool */
+ #define PT_WB		2	/* distributed White Board */
+ #define PT_RPC		3	/* Remote Procedure Call */
+
+
+
+
+@@ -179,7 +179,16 @@ set_cipher_parameters(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *cipher,
+ #endif
+ 
+ /*
+- * this will adjust ndo_packetp and ndo_snapend to new buffer!
++ * This will allocate a new buffer containing the decrypted data.
++ * It returns 1 on success and 0 on failure.
++ *
++ * It will push the new buffer and the values of ndo->ndo_packetp and
++ * ndo->ndo_snapend onto the buffer stack, and change ndo->ndo_packetp
++ * and ndo->ndo_snapend to refer to the new buffer.
++ *
++ * Our caller must pop the buffer off the stack when it's finished
++ * dissecting anything in it and before it does any dissection of
++ * anything in the old buffer.  That will free the new buffer.
+  */
+ USES_APPLE_DEPRECATED_API
+ int esp_print_decrypt_buffer_by_ikev2(netdissect_options *ndo,
+@@ -190,10 +199,12 @@ int esp_print_decrypt_buffer_by_ikev2(netdissect_options *ndo,
+ {
+ 	struct sa_list *sa;
+ 	const u_char *iv;
++	const u_char *ct;
+ 	unsigned int len;
+ 	EVP_CIPHER_CTX *ctx;
+ 	unsigned int block_size, buffer_size;
+ 	u_char *input_buffer, *output_buffer;
++	const u_cha

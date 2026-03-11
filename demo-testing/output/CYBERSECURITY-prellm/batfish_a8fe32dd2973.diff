@@ -1,0 +1,86 @@
+@@ -9,6 +9,7 @@ import com.google.common.collect.HashBasedTable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Sets;
+ import com.google.common.collect.Table;
+ import io.opentracing.ActiveSpan;
+ import io.opentracing.util.GlobalTracer;
+@@ -20,7 +21,6 @@ import java.util.IdentityHashMap;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Set;
+-import java.util.stream.Collectors;
+ import org.batfish.datamodel.AclIpSpace;
+ import org.batfish.datamodel.ConcreteInterfaceAddress;
+ import org.batfish.datamodel.Configuration;
+@@ -48,6 +48,9 @@ public final class IpOwners {
+   /** Mapping from hostname to interface name to IpSpace owned by that interface */
+   private final Map<String, Map<String, IpSpace>> _hostToInterfaceToIpSpace;
+ 
++  /** Mapping from hostname to VRF name to interface name to IpSpace owned by that interface */
++  private final Map<String, Map<String, Map<String, IpSpace>>> _hostToVrfToInterfaceToIpSpace;
++
+   /**
+    * Mapping from hostname to interface name to host IP subnet.
+    *
+@@ -58,8 +61,6 @@ public final class IpOwners {
+   /** Mapping from an IP to hostname to set of VRFs that own that IP. */
+   private final Map<Ip, Map<String, Set<String>>> _ipVrfOwners;
+ 
+-  private final Map<String, Map<String, IpSpace>> _vrfOwnedIpSpaces;
+-
+   public IpOwners(Map<String, Configuration> configurations) {
+     /* Mapping from a hostname to a set of all (including inactive) interfaces that node owns */
+     Map<String, Set<Interface>> allInterfaces =
+@@ -71,35 +72,31 @@ public final class IpOwners {
+     }
+ 
+     {
+-      _hostToInterfaceToIpSpace =
+-          ImmutableMap.copyOf(computeInterfaceOwnedIpSpaces(_activeDeviceOwnedIps));
+-      _allInterfaceHostIps = computeInterfaceHostSubnetIps(configurations, false);
++      Map<Ip, Map<String, Map<String, Set<String>>>> ipIfaceOwners =
++          computeIpIfaceOwners(allInterfaces, _activeDeviceOwnedIps);
++      _ipVrfOwners = computeIpVrfOwners(ipIfaceOwners);
++      _hostToVrfToInterfaceToIpSpace = computeIfaceOwnedIpSpaces(ipIfaceOwners);
+     }
+ 
+     {
+-      _ipVrfOwners = computeIpVrfOwners(allInterfaces, _activeDeviceOwnedIps);
+-      _vrfOwnedIpSpaces = computeVrfOwnedIpSpaces(_ipVrfOwners);
++      _hostToInterfaceToIpSpace = computeInterfaceOwnedIpSpaces(_hostToVrfToInterfaceToIpSpace);
++      _allInterfaceHostIps = computeInterfaceHostSubnetIps(configurations, false);
+     }
+   }
+ 
+   /**
+-   * Invert a mapping from {@link Ip} to owner interfaces (Ip -&gt; hostname -&gt; interface name)
+-   * and convert the set of owned Ips into an IpSpace.
++   * Computes a map of hostname -&gt; interface name -&gt; {@link IpSpace} from a map of hostname
++   * -&gt; vrf name -&gt; interface name -&gt; {@link IpSpace}.
+    */
+   private static Map<String, Map<String, IpSpace>> computeInterfaceOwnedIpSpaces(
+-      Map<Ip, Map<String, Set<String>>> ipInterfaceOwners) {
++      Map<String, Map<String, Map<String, IpSpace>>> ipOwners) {
+     return toImmutableMap(
+-        computeInterfaceOwnedIps(ipInterfaceOwners),
++        ipOwners,
+         Entry::getKey, /* host */
+         hostEntry ->
+-            toImmutableMap(
+-                hostEntry.getValue(),
+-                Entry::getKey, /* interface */
+-                ifaceEntry ->
+-                    AclIpSpace.union(
+-                        ifaceEntry.getValue().stream()
+-                            .map(Ip::toIpSpace)
+-                            .collect(Collectors.toList()))));
++            hostEntry.getValue().values().stream() /* Skip VRF keys */
++                .flatMap(ifaceMap -> ifaceMap.entrySet().stream())
++                .collect(ImmutableMap.toImmutableMap(Entry::getKey, Entry::getValue)));
+   }
+ 
+   @VisibleForTesting
+@@ -286,58 +283,89 @@ public final class IpOwners {
+    * Compute a mapping of IP addresses to the VRFs that "own" this IP (e.g., as a network 

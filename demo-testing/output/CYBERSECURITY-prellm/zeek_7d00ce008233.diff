@@ -1,0 +1,167 @@
+@@ -110,10 +110,13 @@ const char* expr_name(BroExprTag t)
+ 	return expr_names[int(t)];
+ 	}
+ 
++int Expr::num_exprs = 0;
++
+ Expr::Expr(BroExprTag arg_tag) : tag(arg_tag), paren(false), type(nullptr)
+ 	{
+ 	SetLocationInfo(&start_location, &end_location);
+ 	opt_info = new ExprOptInfo();
++	++num_exprs;
+ 	}
+ 
+ Expr::~Expr()
+
+
+
+
+@@ -406,6 +406,12 @@ public:
+ 	// this statement.
+ 	ExprOptInfo* GetOptInfo() const { return opt_info; }
+ 
++	// Returns the number of expressions created since the last reset.
++	static int GetNumExprs() { return num_exprs; }
++
++	// Clears the number of expressions created.
++	static void ResetNumExprs() { num_exprs = 0; }
++
+ 	~Expr() override;
+ 
+ protected:
+@@ -441,6 +447,9 @@ protected:
+ 	// Information associated with the Expr for purposes of
+ 	// script optimization.
+ 	ExprOptInfo* opt_info;
++
++	// Number of expressions created thus far.
++	static int num_exprs;
+ 	};
+ 
+ class NameExpr final : public Expr
+
+
+
+
+@@ -59,6 +59,8 @@ const char* stmt_name(StmtTag t)
+ 	return stmt_names[int(t)];
+ 	}
+ 
++int Stmt::num_stmts = 0;
++
+ Stmt::Stmt(StmtTag arg_tag)
+ 	{
+ 	tag = arg_tag;
+@@ -69,6 +71,8 @@ Stmt::Stmt(StmtTag arg_tag)
+ 	opt_info = new StmtOptInfo();
+ 
+ 	SetLocationInfo(&start_location, &end_location);
++
++	++num_stmts;
+ 	}
+ 
+ Stmt::~Stmt()
+
+
+
+
+@@ -177,6 +177,12 @@ public:
+ 	// this statement.
+ 	StmtOptInfo* GetOptInfo() const { return opt_info; }
+ 
++	// Returns the number of statements created since the last reset.
++	static int GetNumStmts() { return num_stmts; }
++
++	// Clears the number of statements created.
++	static void ResetNumStmts() { num_stmts = 0; }
++
+ protected:
+ 	explicit Stmt(StmtTag arg_tag);
+ 
+@@ -203,6 +209,9 @@ protected:
+ 	// Information associated with the Stmt for purposes of
+ 	// script optimization.
+ 	StmtOptInfo* opt_info;
++
++	// Number of statements created thus far.
++	static int num_stmts;
+ 	};
+ 
+ 	} // namespace detail
+
+
+
+
+@@ -718,6 +718,10 @@ void begin_func(IDPtr id, const char* module_name, FunctionFlavor flavor, bool i
+ 
+ 	if ( Attr* depr_attr = find_attr(current_scope()->Attrs().get(), ATTR_DEPRECATED) )
+ 		current_scope()->GetID()->MakeDeprecated(depr_attr->GetExpr());
++
++	// Reset the AST node statistics to track afresh for this function.
++	Stmt::ResetNumStmts();
++	Expr::ResetNumExprs();
+ 	}
+ 
+ class OuterIDBindingFinder : public TraversalCallback
+@@ -804,7 +808,10 @@ void end_func(StmtPtr body, bool free_of_conditionals)
+ 		// by duplicating can itself be correctly duplicated.
+ 		body = body->Duplicate()->Duplicate();
+ 
+-	body->GetOptInfo()->is_free_of_conditionals = free_of_conditionals;
++	auto oi = body->GetOptInfo();
++	oi->is_free_of_conditionals = free_of_conditionals;
++	oi->num_stmts = Stmt::GetNumStmts();
++	oi->num_exprs = Expr::GetNumExprs();
+ 
+ 	auto ingredients = std::make_unique<function_ingredients>(pop_scope(), std::move(body));
+ 
+
+
+
+
+@@ -2329,6 +2329,10 @@ ExprPtr CallExpr::Inline(Inliner* inl)
+ 	{
+ 	auto new_me = inl->CheckForInlining({NewRef{}, this});
+ 
++	if ( ! new_me )
++		// All done with inlining.
++		return ThisPtr();
++
+ 	if ( new_me.get() != this )
+ 		return new_me;
+ 
+
+
+
+
+@@ -5,6 +5,7 @@
+ #include "zeek/Desc.h"
+ #include "zeek/script_opt/ProfileFunc.h"
+ #include "zeek/script_opt/ScriptOpt.h"
++#include "zeek/script_opt/StmtOptInfo.h"
+ 
+ namespace zeek::detail
+ 	{
+@@ -139,8 +140,15 @@ void Inliner::InlineFunction(FuncInfo* f)
+ 	// particular body.
+ 	curr_frame_size = f->Scope()->Length();
+ 
++	auto oi = f->Body()->GetOptInfo();
++	num_stmts = oi->num_stmts;
++	num_exprs = oi->num_exprs;
++
+ 	f->Body()->Inline(this);
+ 
++	oi->num_stmts = num_stmts;
++	oi->num_exprs = num_exprs;
++
+ 	int new_frame_size = curr_frame_size + max_inlined_frame_size;
+ 
+ 	if ( new_frame_size > f->Func()->FrameSize() )
+@@ -175,9 +183,20 @@ ExprPtr Inliner::CheckForInlining(CallExprPtr c)
+ 	if ( inline_ables.count(func_vf) == 0 )
+ 		return c;
+ 
+-	ListExprPtr args = {NewRef{}, c->Args()};
++	// We're going to inline the body, unless it's too large.
+ 	auto body = func_vf->GetBodies()[0].stmts; // th

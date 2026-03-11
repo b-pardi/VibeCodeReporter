@@ -1,0 +1,147 @@
+@@ -27,11 +27,13 @@
+ #include "suricata-common.h"
+ #include "suricata.h"
+ #include "decode.h"
++#include "rust.h"
+ 
+ #include "detect.h"
+ #include "detect-parse.h"
+ #include "detect-engine-prefilter.h"
+ #include "detect-engine-prefilter-common.h"
++#include "detect-engine-uint.h"
+ 
+ #include "flow-var.h"
+ #include "decode-events.h"
+@@ -46,27 +48,6 @@
+ #include "host.h"
+ #include "util-profiling.h"
+ 
+-/**
+- *  Regex
+- *  fragbits: [!+*](MDR)
+- */
+-#define PARSE_REGEX "^(?:([\\+\\*!]))?\\s*([MDR]+)"
+-
+-/**
+- * FragBits args[0] *(3) +(2) !(1)
+- *
+- */
+-
+-#define MODIFIER_NOT  1
+-#define MODIFIER_PLUS 2
+-#define MODIFIER_ANY  3
+-
+-#define FRAGBITS_HAVE_MF    0x01
+-#define FRAGBITS_HAVE_DF    0x02
+-#define FRAGBITS_HAVE_RF    0x04
+-
+-static DetectParseRegex parse_regex;
+-
+ static int DetectFragBitsMatch (DetectEngineThreadCtx *, Packet *,
+         const Signature *, const SigMatchCtx *);
+ static int DetectFragBitsSetup (DetectEngineCtx *, Signature *, const char *);
+@@ -95,35 +76,7 @@ void DetectFragBitsRegister (void)
+ #endif
+     sigmatch_table[DETECT_FRAGBITS].SetupPrefilter = PrefilterSetupFragBits;
+     sigmatch_table[DETECT_FRAGBITS].SupportsPrefilter = PrefilterFragBitsIsPrefilterable;
+-
+-    DetectSetupParseRegexes(PARSE_REGEX, &parse_regex);
+-}
+-
+-static inline int
+-FragBitsMatch(const uint8_t pbits, const uint8_t modifier,
+-              const uint8_t dbits)
+-{
+-    switch (modifier) {
+-        case MODIFIER_ANY:
+-            if ((pbits & dbits) > 0)
+-                return 1;
+-            return 0;
+-
+-        case MODIFIER_PLUS:
+-            if (((pbits & dbits) == dbits) && (((pbits - dbits) > 0)))
+-                return 1;
+-            return 0;
+-
+-        case MODIFIER_NOT:
+-            if ((pbits & dbits) != dbits)
+-                return 1;
+-            return 0;
+-
+-        default:
+-            if (pbits == dbits)
+-                return 1;
+-    }
+-    return 0;
++    sigmatch_table[DETECT_FRAGBITS].flags = SIGMATCH_INFO_UINT16 | SIGMATCH_INFO_BITFLAGS_UINT;
+ }
+ 
+ /**
+@@ -146,130 +99,9 @@ static int DetectFragBitsMatch (DetectEngineThreadCtx *det_ctx,
+     if (!ctx || !PacketIsIPv4(p))
+         return 0;
+ 
+-    uint8_t fragbits = 0;
+-    const DetectFragBitsData *de = (const DetectFragBitsData *)ctx;
+     const IPV4Hdr *ip4h = PacketGetIPv4(p);
+-    if (IPV4_GET_RAW_FLAG_MF(ip4h))
+-        fragbits |= FRAGBITS_HAVE_MF;
+-    if (IPV4_GET_RAW_FLAG_DF(ip4h))
+-        fragbits |= FRAGBITS_HAVE_DF;
+-    if (IPV4_GET_RAW_FLAG_RF(ip4h))
+-        fragbits |= FRAGBITS_HAVE_RF;
+-
+-    return FragBitsMatch(fragbits, de->modifier, de->fragbits);
+-}
+-
+-/**
+- * \internal
+- * \brief This function is used to parse fragbits options passed via fragbits: keyword
+- *
+- * \param rawstr Pointer to the user provided fragbits options
+- *
+- * \retval de pointer to DetectFragBitsData on success
+- * \retval NULL on failure
+- */
+-static DetectFragBitsData *DetectFragBitsParse (const char *rawstr)
+-{
+-    DetectFragBitsData *de = NULL;
+-    int found = 0, res = 0;
+-    size_t pcre2_len;
+-    const char *str_ptr = NULL;
+-    char *args[2] = { NULL, NULL};
+-    char *ptr;
+-    int i;
+-    pcre2_match_data *match = NULL;
+-
+-    int ret = DetectParsePcreExec(&parse_regex, &match, rawstr, 0, 0);
+-    if (ret < 1) {
+-        SCLogError("pcre_exec parse error, ret %" PRId32 ", string %s", ret, rawstr);
+-        goto error;
+-    }
+-
+-    for (i = 0; i < (ret - 1); i++) {
+-        res = SC_Pcre2SubstringGet(match, i + 1, (PCRE2_UCHAR8 **)&str_ptr, &pcre2_len);
+-        if (res < 0) {
+-            SCLogError("pcre2_substring_get_bynumber failed %d", res);
+-            goto error;
+-        }
+-
+-        args[i] = (char *)str_ptr;
+-    }
+-
+-    if (args[1] == NULL) {
+-        SCLogError("invalid value");
+-        goto error;
+-    }
+-
+-    de = SCCalloc(1, sizeof(DetectFragBitsData));
+-    if (unlikely(de == NULL))
+-        goto error;
+-
+-    /** First parse args[0] */
+-
+-    if (args[0] && strlen(args[0])) {
+-        ptr = args[0];
+-        switch (*ptr) {
+-

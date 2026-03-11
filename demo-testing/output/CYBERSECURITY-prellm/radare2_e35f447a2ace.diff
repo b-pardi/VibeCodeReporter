@@ -1,0 +1,169 @@
+@@ -1060,7 +1060,9 @@ static int r_debug_gdb_breakpoint (RBreakpoint *bp, RBreakpointItem *b, bool set
+ static bool r_debug_gdb_kill(RDebug *dbg, int pid, int tid, int sig) {
+ 	// TODO kill based on pid and signal
+ 	if (sig != 0) {
+-		return gdbr_kill (desc);
++		if (gdbr_kill (desc) < 0) {
++			return false;
++		}
+ 	}
+ 	return true;
+ }
+
+
+
+
+@@ -209,8 +209,8 @@ static int __gettid(RIODesc *fd) {
+ 	return desc ? desc->tid : -1;
+ }
+ 
+-int send_msg(libgdbr_t* g, const char* command);
+-int read_packet(libgdbr_t* instance);
++extern int send_msg(libgdbr_t *g, const char *command);
++extern int read_packet(libgdbr_t *instance);
+ 
+ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
+ 	if (!desc) {
+@@ -265,16 +265,16 @@ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
+ 		return NULL;
+ 	}
+ 	if (r_str_startswith (cmd, "pkt ")) {
+-		if (send_msg (desc, cmd + 4) == -1) {
+-			return NULL;
+-		}
+-		(void)read_packet (desc);
+-		desc->data[desc->data_len] = '\0';
+-		io->cb_printf ("reply:\n%s\n", desc->data);
+-		if (!desc->no_ack) {
+-			eprintf ("[waiting for ack]\n");
++		gdbr_lock_enter (desc);
++		if (send_msg (desc, cmd + 4) >= 0) {
++			(void)read_packet (desc);
++			desc->data[desc->data_len] = '\0';
++			io->cb_printf ("reply:\n%s\n", desc->data);
++			if (!desc->no_ack) {
++				eprintf ("[waiting for ack]\n");
++			}
+ 		}
+-		// return r >= 0;
++		gdbr_lock_leave (desc);
+ 		return NULL;
+ 	}
+ 	if (r_str_startswith (cmd, "pid")) {
+
+
+
+
+@@ -5,6 +5,16 @@
+ #include "r_types_base.h"
+ #include <r_util.h>
+ 
++/*!
++ * \brief Acquires the gdbr lock and sets up breaking
++ * \returns true on success, false on failure
++ */
++bool gdbr_lock_enter(libgdbr_t *g);
++
++/*!
++ * \brief Releases the gdbr lock
++ */
++void gdbr_lock_leave(libgdbr_t *g);
+ 
+ /*!
+  * \brief Function connects to a gdbserver instance
+@@ -68,8 +78,8 @@ int gdbr_detach_pid(libgdbr_t *g, int pid);
+  * \param pid of the process to detach from (only the multiprocess/pid variant)
+  * \retuns a failure code (currently -1) or 0 if call successfully
+  */
+-bool gdbr_kill(libgdbr_t *g);
+-bool gdbr_kill_pid(libgdbr_t *g, int pid);
++int gdbr_kill(libgdbr_t *g);
++int gdbr_kill_pid(libgdbr_t *g, int pid);
+ 
+ // Commands
+ int gdbr_continue(libgdbr_t *g, int pid, int tid, int sig);
+
+
+
+
+@@ -10,6 +10,7 @@ typedef unsigned int ssize_t;
+ #include "arch.h"
+ #include "r_types_base.h"
+ #include "r_socket.h"
++#include "r_th.h"
+ 
+ #define MSG_OK 0
+ #define MSG_NOT_SUPPORTED -1
+@@ -186,6 +187,8 @@ typedef struct libgdbr_t {
+ 	bool get_baddr;
+ 	libgdbr_stop_reason_t stop_reason;
+ 
++	RThreadLock *gdbr_lock;
++
+ 	// parsed from target
+ 	struct {
+ 		char *regprofile;
+
+
+
+
+@@ -9,6 +9,8 @@
+ #include "gdbr_common.h"
+ #include "packet.h"
+ #include "r_util/r_strbuf.h"
++#include "r_cons.h"
++#include "r_debug.h"
+ 
+ #if __UNIX__
+ #include <errno.h>
+@@ -23,10 +25,10 @@
+ 
+ #define QSUPPORTED_MAX_RETRIES 5
+ 
+-extern char hex2char(char *hex);
++extern char hex2char (char *hex);
+ 
+ #if 0
+-static int set_interface_attribs (int fd, int speed, int parity) {
++static int set_interface_attribs(int fd, int speed, int parity) {
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #pragma message("gdbclient/core.c: set_interface_attribs not implemented")
+ #else
+@@ -67,7 +69,7 @@ static int set_interface_attribs (int fd, int speed, int parity) {
+ #endif
+ 
+ static struct {
+-	ut8  *buf;
++	ut8 *buf;
+ 	ut64 buflen, maxlen;
+ 	bool valid, init;
+ } reg_cache;
+@@ -82,20 +84,52 @@ static void reg_cache_init(libgdbr_t *g) {
+ 	}
+ }
+ 
++static bool _isbreaked = false;
++
++static void gdbr_break_process(libgdbr_t *g) {
++	_isbreaked = true;
++}
++
++bool gdbr_lock_enter(libgdbr_t *g) {
++	r_cons_break_push (gdbr_break_process, g);
++	void *bed = r_cons_sleep_begin ();
++	r_th_lock_enter (g->gdbr_lock);
++	r_cons_sleep_end (bed);
++	if (_isbreaked) {
++		return false;
++	}
++	return true;
++}
++
++void gdbr_lock_leave(libgdbr_t *g) {
++	r_cons_break_pop ();
++	r_th_lock_leave (g->gdbr_lock);
++}
++
+ static int gdbr_connect_lldb(libgdbr_t *g) {
++	int ret = -1;
++	if (!gdbr

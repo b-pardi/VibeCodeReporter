@@ -1,0 +1,159 @@
+@@ -63,6 +63,7 @@
+ #include <bpf_lxc.c>
+ 
+ #include "lib/ipcache.h"
++#include "lib/policy.h"
+ 
+ /*
+  * Tests
+@@ -180,18 +181,7 @@ int overlay_to_lxc_syn_setup(struct __ctx_buff *ctx)
+ 	 * Apply policy based on the remote "real"
+ 	 * identity instead of remote-node identity.
+ 	 */
+-	struct policy_key policy_key = {
+-		.sec_label = CLIENT_IDENTITY,
+-		.dport = BACKEND_PORT,
+-		.protocol = IPPROTO_TCP,
+-		.egress = 0,
+-	};
+-
+-	struct policy_entry policy_value = {
+-		.deny = 0,
+-	};
+-
+-	map_update_elem(&POLICY_MAP, &policy_key, &policy_value, BPF_ANY);
++	policy_add_ingress_allow_entry(CLIENT_IDENTITY, IPPROTO_TCP, BACKEND_PORT);
+ 
+ 	/* Emulate metadata filled by ipv4_local_delivery on bpf_overlay */
+ 	ctx_store_meta(ctx, CB_SRC_LABEL, CLIENT_IDENTITY);
+
+
+
+
+@@ -67,6 +67,7 @@
+ 
+ #include "lib/ipcache.h"
+ #include "lib/lb.h"
++#include "lib/policy.h"
+ 
+ /*
+  * Tests
+@@ -189,19 +190,7 @@ int lxc_to_overlay_syn_setup(struct __ctx_buff *ctx)
+ 	ipcache_v4_add_entry(BACKEND_IP, BACKEND_CLUSTER_ID, BACKEND_IDENTITY,
+ 			     BACKEND_NODE_IP, 0);
+ 
+-	struct policy_key policy_key = {
+-		/* Policy enforcement is identity based. So, if above ipcache
+-		 * lookup work correctly, this should work as well.
+-		 */
+-		.sec_label = BACKEND_IDENTITY,
+-		.dport = BACKEND_PORT,
+-		.protocol = IPPROTO_TCP,
+-		.egress = 1,
+-	};
+-	struct policy_entry policy_value = {
+-		.deny = 0,
+-	};
+-	map_update_elem(&POLICY_MAP, &policy_key, &policy_value, BPF_ANY);
++	policy_add_egress_allow_entry(BACKEND_IDENTITY, IPPROTO_TCP, BACKEND_PORT);
+ 
+ 	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+ 
+
+
+
+
+@@ -20,6 +20,7 @@
+ #include "bpf_lxc.c"
+ 
+ #include "lib/ipcache.h"
++#include "lib/policy.h"
+ 
+ #define FROM_CONTAINER 0
+ 
+@@ -79,10 +80,7 @@ int ipv4_from_lxc_no_node_id_pktgen(struct __ctx_buff *ctx)
+ SETUP("tc", "01_ipv4_from_lxc_no_node_id")
+ int ipv4_from_lxc_no_node_id_setup(struct __ctx_buff *ctx)
+ {
+-	struct policy_key policy_key = { .egress = 1 };
+-	struct policy_entry policy_value = {};
+-
+-	map_update_elem(&POLICY_MAP, &policy_key, &policy_value, BPF_ANY);
++	policy_add_egress_allow_all_entry();
+ 
+ 	ipcache_v4_add_entry(v4_pod_two, 0, 233, v4_node_two, ENCRYPT_KEY);
+ 
+@@ -342,10 +340,7 @@ int ipv6_from_lxc_encrypt_pktgen(struct __ctx_buff *ctx)
+ SETUP("tc", "05_ipv6_from_lxc_encrypt")
+ int ipv6_from_lxc_encrypt_setup(struct __ctx_buff *ctx)
+ {
+-	struct policy_key policy_key = { .egress = 1 };
+-	struct policy_entry policy_value = {};
+-
+-	map_update_elem(&POLICY_MAP, &policy_key, &policy_value, BPF_ANY);
++	policy_add_egress_allow_all_entry();
+ 
+ 	ipcache_v6_add_entry((union v6addr *)v6_pod_two, 0, 233, v4_node_two, ENCRYPT_KEY);
+ 
+
+
+
+
+@@ -68,29 +68,6 @@ static __always_inline void del_egressgw_policy_entry(__be32 saddr, __be32 daddr
+ 	map_delete_elem(&EGRESS_POLICY_MAP, &in_key);
+ }
+ 
+-#ifndef SKIP_POLICY_MAP
+-static __always_inline void add_allow_all_egress_policy(void)
+-{
+-	struct policy_key policy_key = {
+-		.egress = 1,
+-	};
+-	struct policy_entry policy_value = {
+-		.deny = 0,
+-	};
+-
+-	map_update_elem(&POLICY_MAP, &policy_key, &policy_value, BPF_ANY);
+-}
+-
+-static __always_inline void del_allow_all_egress_policy(void)
+-{
+-	struct policy_key policy_key = {
+-		.egress = 1,
+-	};
+-
+-	map_delete_elem(&POLICY_MAP, &policy_key);
+-}
+-#endif
+-
+ static __always_inline int egressgw_pktgen(struct __ctx_buff *ctx,
+ 					   struct egressgw_test_ctx test_ctx)
+ {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#ifndef SKIP_POLICY_MAP
++static __always_inline void
++policy_add_entry(bool egress, __u32 sec_label, __u8 protocol, __u16 dport, bool deny)
++{
++	struct policy_key key = {
++		.sec_label = sec_label,
++		.egress = egress,
++		.protocol = protocol,
++		.dport = dport,
++	};
++	struct policy_entry value = {
++		.deny = deny,
++	};
++
++	map_update_elem(&POLICY_MAP, &key, &value, BPF_ANY);
++}
++
++static __always_inline void
++policy_add_ingress_allow_entry(__u32 sec_label, __u8 protocol,

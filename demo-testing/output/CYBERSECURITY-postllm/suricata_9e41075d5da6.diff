@@ -1,0 +1,86 @@
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2021 Open Information Security Foundation
++/* Copyright (C) 2021-2023 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -40,12 +40,38 @@
+ #include "util-validate.h"
+ #include "util-print.h"
+ 
+-static InspectionBuffer *DetectFrame2InspectBuffer(DetectEngineThreadCtx *det_ctx,
+-        const DetectEngineTransforms *transforms, Packet *p, const Frames *frames,
+-        const Frame *frame, const int list_id, const uint32_t idx, const bool first);
++struct FrameStreamData {
++    // shared between prefilter and inspect
++    DetectEngineThreadCtx *det_ctx;
++    const DetectEngineTransforms *transforms;
++    const Frame *frame;
++    int list_id;
++    uint32_t idx; /**< multi buffer idx, incremented for each stream chunk */
++
++    // inspection only
++    const DetectEngineFrameInspectionEngine *inspect_engine;
++    const Signature *s;
++    int inspect_result; // DETECT_ENGINE_INSPECT_SIG_MATCH / DETECT_ENGINE_INSPECT_SIG_NO_MATCH
++    Packet *p;
++
++    // prefilter only
++    const MpmCtx *mpm_ctx;
++
++    uint64_t requested_stream_offset;
++};
++
++static bool SetupStreamCallbackData(struct FrameStreamData *dst, const TcpSession *ssn,
++        const TcpStream *stream, DetectEngineThreadCtx *det_ctx,
++        const DetectEngineTransforms *transforms, const Frames *_frames, const Frame *frame,
++        const int list_id, const bool eof);
++
++static bool BufferSetup(struct FrameStreamData *fsd, InspectionBuffer *buffer, const uint8_t *input,
++        const uint32_t input_len, const uint64_t input_offset);
++static void BufferSetupUdp(InspectionBuffer *buffer, const Frame *frame, const Packet *p,
++        const DetectEngineTransforms *transforms);
+ 
+ void DetectRunPrefilterFrame(DetectEngineThreadCtx *det_ctx, const SigGroupHead *sgh, Packet *p,
+-        const Frames *frames, const Frame *frame, const AppProto alproto, const uint32_t idx)
++        const Frames *frames, const Frame *frame, const AppProto alproto)
+ {
+     SCLogDebug("pcap_cnt %" PRIu64, p->pcap_cnt);
+     PrefilterEngine *engine = sgh->frame_engines;
+@@ -54,7 +80,7 @@ void DetectRunPrefilterFrame(DetectEngineThreadCtx *det_ctx, const SigGroupHead
+         if (engine->alproto == alproto && engine->ctx.frame_type == frame->type) {
+             SCLogDebug("frame %p engine %p", frame, engine);
+             PREFILTER_PROFILING_START(det_ctx);
+-            engine->cb.PrefilterFrame(det_ctx, engine->pectx, p, frames, frame, idx);
++            engine->cb.PrefilterFrame(det_ctx, engine->pectx, p, frames, frame);
+             PREFILTER_PROFILING_END(det_ctx, engine->gid);
+         }
+         if (engine->is_last)
+@@ -72,6 +98,41 @@ typedef struct PrefilterMpmFrameCtx {
+     const DetectEngineTransforms *transforms;
+ } PrefilterMpmFrameCtx;
+ 
++static int FrameStreamDataPrefilterFunc(
++        void *cb_data, const uint8_t *input, const uint32_t input_len, const uint64_t input_offset)
++{
++    struct FrameStreamData *fsd = cb_data;
++    SCLogDebug("prefilter: fsd %p { det_ctx:%p, transforms:%p, frame:%p, list_id:%d, idx:%u, "
++               "data_offset:%" PRIu64 "}, input: %p, input_len:%u, input_offset:%" PRIu64,
++            fsd, fsd->det_ctx, fsd->transforms, fsd->frame, fsd->list_id, fsd->idx,
++            fsd->requested_stream_offset, input, input_len, input_offset);
++    // PrintRawDataFp(stdout, input, input_len);
++
++    InspectionBuffer *buffer =
++            InspectionBufferMultipleForListGet(fsd->det_ctx, fsd->list_id, fsd->idx++);
++    if (buffer == NULL) {
++        return 0;
++    }
++    SCLogDebug("buffer %p idx %u", buffer, fsd->idx);
++
++    const int more_chunks = BufferSetup(fsd, buffer, input, input_len, input_offset);
++
++    const uint32_t data_len = buffer->inspect_len;
++    const uint8_t *data = buffer->inspect;
++    DetectEngineThreadCtx *det_ctx = fsd->det_ctx;
++    const MpmCtx *mpm_ctx = fsd->mpm_ctx;
++

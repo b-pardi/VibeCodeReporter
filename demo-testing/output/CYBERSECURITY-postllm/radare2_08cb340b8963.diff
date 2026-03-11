@@ -1,0 +1,126 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2024 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2025 - pancake */
+ 
+ #include <r_core.h>
+ #include <r_vec.h>
+@@ -76,6 +76,24 @@ R_API RList *r_sign_fcn_xrefs(RAnal *a, RAnalFunction *fcn) {
+ 	return ret;
+ }
+ 
++static RFlagItem *get_sym_flag_at(RCore *core, ut64 addr) {
++	if (!core || !core->flags) {
++		return NULL;
++	}
++	const RList *list = r_flag_get_list (core->flags, addr);
++	if (!list) {
++		return NULL;
++	}
++	RListIter *it;
++	RFlagItem *fi;
++	r_list_foreach (list, it, fi) {
++		if (fi && fi->name && r_str_startswith (fi->name, "sym.")) {
++			return fi;
++		}
++	}
++	return NULL;
++}
++
+ R_API RList *r_sign_fcn_refs(RAnal *a, RAnalFunction *fcn) {
+ 	R_RETURN_VAL_IF_FAIL (a && fcn, NULL);
+ 	RAnalRef *refi = NULL;
+@@ -270,6 +288,18 @@ R_API bool r_sign_deserialize(RAnal *a, RSignItem *it, const char *k, const char
+ 		}
+ 		RSignType st = (RSignType)*word;
+ 		switch (st) {
++		case R_SIGN_RAWNAME: {
++			DBL_VAL_FAIL (it->rawname, R_SIGN_RAWNAME);
++			char *dec = (char *)r_base64_decode_dyn (token, -1, NULL);
++			it->rawname = dec? dec: strdup (token);
++			break;
++		}
++		case R_SIGN_DEMANGLED: {
++			DBL_VAL_FAIL (it->demangled, R_SIGN_DEMANGLED);
++			char *dec = (char *)r_base64_decode_dyn (token, -1, NULL);
++			it->demangled = dec? dec: strdup (token);
++			break;
++		}
+ 		case R_SIGN_NAME:
+ 			DBL_VAL_FAIL (it->realname, R_SIGN_NAME);
+ 			it->realname = strdup (token);
+@@ -353,6 +383,14 @@ R_API bool r_sign_deserialize(RAnal *a, RSignItem *it, const char *k, const char
+ 			break;
+ 		}
+ 	}
++
++	// Legacy mapping: if only legacy realname is present, assume
++	// name=mangled and realname=demangled (as previously produced
++	// when zign.mangled=false)
++	if (!it->rawname && !it->demangled && it->realname) {
++		it->rawname = strdup (it->name);
++		it->demangled = strdup (it->realname);
++	}
+ out:
+ 	free (k2);
+ 	free (v2);
+@@ -411,6 +449,12 @@ static inline size_t serial_val_reserv(RSignItem *it) {
+ 	if (it->realname) {
+ 		reserve += 0x10;
+ 	}
++	if (it->rawname) {
++		reserve += strlen (it->rawname) * 2 + 0x10; // base64
++	}
++	if (it->demangled) {
++		reserve += strlen (it->demangled) * 2 + 0x10; // base64
++	}
+ 	if (it->next) {
+ 		reserve += 0x20;
+ 	}
+@@ -496,6 +540,29 @@ static char *serialize_value(RSignItem *it) {
+ 		FreeRet_on_fail (r_strbuf_appendf (sb, "|%c:%s", R_SIGN_COMMENT, it->comment), sb);
+ 	}
+ 
++	if (it->rawname) {
++		char *b64 = r_base64_encode_dyn ((const ut8 *)it->rawname, -1);
++		bool ok = b64 && r_strbuf_appendf (sb, "|%c:%s", R_SIGN_RAWNAME, b64);
++		free (b64);
++		FreeRet_on_fail (ok, sb);
++	}
++
++	/* Only serialize demangled if it provides additional information
++	 * different from the rawname. Avoids emitting redundant demangled
++	 * entries when the value equals the rawname (e.g. non-mangled names). */
++	if (it->demangled) {
++		bool emit_demangled = true;
++		if (it->rawname && it->demangled && !strcmp (it->demangled, it->rawname)) {
++			emit_demangled = false;
++		}
++		if (emit_demangled) {
++			char *b64 = r_base64_encode_dyn ((const ut8 *)it->demangled, -1);
++			bool ok = b64 && r_strbuf_appendf (sb, "|%c:%s", R_SIGN_DEMANGLED, b64);
++			free (b64);
++			FreeRet_on_fail (ok, sb);
++		}
++	}
++
+ 	if (it->realname && !strchr (it->realname, '|')) {
+ 		FreeRet_on_fail (r_strbuf_appendf (sb, "|%c:%s", R_SIGN_NAME, it->realname), sb);
+ 	}
+@@ -567,6 +634,8 @@ static inline void merge_item_clobber(RSignItem *dst, RSignItem *src) {
+ 	// strings
+ 	quick_merge (comment, free);
+ 	quick_merge (realname, free);
++	quick_merge (rawname, free);
++	quick_merge (demangled, free);
+ 	quick_merge (next, free);
+ 	quick_merge (types, free);
+ 
+@@ -857,6 +926,8 @@ static RSignHash *r_sign_fcn_bbhash(RAnal *a, RAnalFunction *fcn) {
+ 	return hash;
+ }
+ 
++static char *real_function_name(RAnal *a, RAnalFunction *fcn);
++
+ static RSignItem *item_from_func(RAnal *a, RAnalFunction *fcn, const char *name) {
+ 	if (r_list_empty (fcn->bbs)) {
+ 		R_LOG_WARN ("Function with no basic blocks at 0x%08"PFMT64x,

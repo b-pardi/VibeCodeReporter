@@ -1,0 +1,109 @@
+@@ -38,7 +38,7 @@ OutputJsonThreadCtx *CreateEveThreadCtx(ThreadVars *t, OutputJsonCtx *ctx)
+         goto error;
+     }
+ 
+-    thread->file_ctx = LogFileEnsureExists(ctx->file_ctx, t->id);
++    thread->file_ctx = LogFileEnsureExists(ctx->file_ctx);
+     if (!thread->file_ctx) {
+         goto error;
+     }
+@@ -104,7 +104,7 @@ TmEcode JsonLogThreadInit(ThreadVars *t, const void *initdata, void **data)
+     }
+ 
+     thread->ctx = ((OutputCtx *)initdata)->data;
+-    thread->file_ctx = LogFileEnsureExists(thread->ctx->file_ctx, t->id);
++    thread->file_ctx = LogFileEnsureExists(thread->ctx->file_ctx);
+     if (!thread->file_ctx) {
+         goto error_exit;
+     }
+
+
+
+
+@@ -344,7 +344,7 @@ static TmEcode JsonStatsLogThreadInit(ThreadVars *t, const void *initdata, void
+     /* Use the Output Context (file pointer and mutex) */
+     aft->statslog_ctx = ((OutputCtx *)initdata)->data;
+ 
+-    aft->file_ctx = LogFileEnsureExists(aft->statslog_ctx->file_ctx, t->id);
++    aft->file_ctx = LogFileEnsureExists(aft->statslog_ctx->file_ctx);
+     if (!aft->file_ctx) {
+         goto error_exit;
+     }
+
+
+
+
+@@ -372,6 +372,7 @@ bool SCLogOpenThreadedFile(
+         }
+ 
+         parent_ctx->threads->slot_count = slot_count;
++        parent_ctx->threads->last_slot = 0;
+         parent_ctx->threads->lf_slots = SCCalloc(slot_count, sizeof(LogFileCtx *));
+         if (!parent_ctx->threads->lf_slots) {
+             SCLogError("Unable to allocate thread slots");
+@@ -682,61 +683,102 @@ LogFileCtx *LogFileNewCtx(void)
+     return lf_ctx;
+ }
+ 
++/** \brief LogFileThread2Slot() Return a file slot
++ * \retval int file slot for caller
++ *
++ * This function returns the file slot for the calling thread.
++ * Each thread -- identified by its operating system thread-id -- has its
++ * own slot that includes a file pointer.
++ */
++static int LogFileThread2Slot(LogThreadedFileCtx *parent)
++{
++    ThreadSlotHashEntry thread_hash_entry;
++
++    /* Check hash table for thread id*/
++    thread_hash_entry.thread_id = SCGetThreadIdLong();
++    ThreadSlotHashEntry *ent =
++            HashTableLookup(parent->ht, &thread_hash_entry, sizeof(thread_hash_entry));
++
++    if (ent) {
++        return ent->slot;
++    }
++
++    ent = SCCalloc(1, sizeof(*ent));
++    if (!ent) {
++        FatalError("Unable to allocate thread/slot entry");
++    }
++    ent->thread_id = thread_hash_entry.thread_id;
++    ent->slot = ++parent->last_slot;
++    SCLogDebug("Trying to add thread %ld to slot %d", ent->thread_id, ent->slot);
++    if (0 != HashTableAdd(parent->ht, ent, 0)) {
++        FatalError("Unable to add thread/slot mapping");
++    }
++    return ent->slot;
++}
++
+ /** \brief LogFileEnsureExists() Ensure a log file context for the thread exists
+  * \param parent_ctx
+- * \param thread_id
+  * \retval LogFileCtx * pointer if successful; NULL otherwise
+  */
+-LogFileCtx *LogFileEnsureExists(LogFileCtx *parent_ctx, int thread_id)
++LogFileCtx *LogFileEnsureExists(LogFileCtx *parent_ctx)
+ {
+     /* threaded output disabled */
+     if (!parent_ctx->threaded)
+         return parent_ctx;
+ 
+-    SCLogDebug("Adding reference %d to file ctx %p", thread_id, parent_ctx);
+     SCMutexLock(&parent_ctx->threads->mutex);
+-    /* are there enough context slots already */
+-    if (thread_id < parent_ctx->threads->slot_count) {
+-        /* has it been opened yet? */
+-        if (!parent_ctx->threads->lf_slots[thread_id]) {
+-            SCLogDebug("Opening new file for %d reference to file ctx %p", thread_id, parent_ctx);
+-            LogFileNewThreadedCtx(parent_ctx, parent_ctx->filename, parent_ctx->threads->append, thread_id);
+-        }
+-        SCMutexUnlock(&parent_ctx->threads->mutex);
+-        SCLogDebug("Existing file for %d reference to file ctx %p", thread_id, parent_ctx);
+-        return parent_ctx->threads->lf_slots[thread_id];
+-    }
+-
+-    /* ensure there's a slot for the caller */
+-    int new_size = MAX(parent_ctx->threads->slot_count << 1, thread_id + 1);
+-    SCLogDebug("Increasing slot count; current %d, try

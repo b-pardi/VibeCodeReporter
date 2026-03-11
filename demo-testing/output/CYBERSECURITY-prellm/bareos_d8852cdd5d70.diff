@@ -1,0 +1,105 @@
+@@ -129,7 +129,11 @@ struct plugin_ctx {
+    char *basedir;                     /* Basedir to start backup in */
+    char flags[FOPTS_BYTES];           /* Bareos internal flags */
+    int32_t type;                      /* FT_xx for this file */
++#if HAVE_CEPHFS_CEPH_STATX_H
++   struct ceph_statx statx;           /* Stat struct for next file to save */
++#else
+    struct stat statp;                 /* Stat struct for next file to save */
++#endif
+    bool processing_xattr;             /* Set when we are processing a xattr list */
+    char *next_xattr_name;             /* Next xattr name to process */
+    POOLMEM *cwd;                      /* Current Working Directory */
+@@ -171,7 +175,11 @@ static plugin_argument plugin_arguments[] = {
+  * a stack so we can pop it after we have processed the subdir.
+  */
+ struct dir_stack_entry {
++#if HAVE_CEPHFS_CEPH_STATX_H
++   struct ceph_statx statx;           /* Stat struct of directory */
++#else
+    struct stat statp;                 /* Stat struct of directory */
++#endif
+    struct ceph_dir_result *cdir;      /* CEPHFS directory handle */
+ };
+ 
+@@ -450,7 +458,11 @@ static bRC get_next_file_to_backup(bpContext *ctx)
+           * Pop the previous directory handle and continue processing that.
+           */
+          entry = (struct dir_stack_entry *)p_ctx->dir_stack->pop();
++#if HAVE_CEPHFS_CEPH_STATX_H
++         memcpy(&p_ctx->statx, &entry->statx, sizeof(p_ctx->statx));
++#else
+          memcpy(&p_ctx->statp, &entry->statp, sizeof(p_ctx->statp));
++#endif
+          p_ctx->cdir = entry->cdir;
+          free(entry);
+       } else {
+@@ -469,17 +481,28 @@ static bRC get_next_file_to_backup(bpContext *ctx)
+     * Loop until we know what file is next or when we are done.
+     */
+    while (1) {
+-      int stmask = 0;
+ 
++#if HAVE_CEPHFS_CEPH_STATX_H
++      unsigned int stmask = 0;
++      memset(&p_ctx->statx, 0, sizeof(p_ctx->statx));
++      status = ceph_readdirplus_r(p_ctx->cmount, p_ctx->cdir, &p_ctx->de, &p_ctx->statx, stmask, CEPH_STATX_ALL_STATS, NULL);
++#else
++      int stmask = 0;
+       memset(&p_ctx->statp, 0, sizeof(p_ctx->statp));
+-      memset(&p_ctx->de, 0, sizeof(p_ctx->de));
+       status = ceph_readdirplus_r(p_ctx->cmount, p_ctx->cdir, &p_ctx->de, &p_ctx->statp, &stmask);
++#endif
++
++      memset(&p_ctx->de, 0, sizeof(p_ctx->de));
+ 
+       /*
+        * No more entries in this directory ?
+        */
+       if (status == 0) {
++#if HAVE_CEPHFS_CEPH_STATX_H
++         status = ceph_statx(p_ctx->cmount, p_ctx->cwd, &p_ctx->statx, CEPH_STATX_MODE, 0);
++#else
+          status = ceph_stat(p_ctx->cmount, p_ctx->cwd, &p_ctx->statp);
++#endif
+          if (status < 0) {
+             berrno be;
+ 
+@@ -521,7 +544,11 @@ static bRC get_next_file_to_backup(bpContext *ctx)
+       /*
+        * Determine the FileType.
+        */
++#if HAVE_CEPHFS_CEPH_STATX_H
++      switch (p_ctx->statx.stx_mode & S_IFMT) {
++#else
+       switch (p_ctx->statp.st_mode & S_IFMT) {
++#endif
+       case S_IFREG:
+          p_ctx->type = FT_REG;
+          break;
+@@ -549,8 +576,13 @@ static bRC get_next_file_to_backup(bpContext *ctx)
+          p_ctx->type = FT_SPEC;
+          break;
+       default:
++#if HAVE_CEPHFS_CEPH_STATX_H
++         Jmsg(ctx, M_FATAL, "cephfs-fd: Unknown filetype encountered %ld for %s\n",
++              p_ctx->statx.stx_mode & S_IFMT, p_ctx->next_filename);
++#else
+          Jmsg(ctx, M_FATAL, "cephfs-fd: Unknown filetype encountered %ld for %s\n",
+               p_ctx->statp.st_mode & S_IFMT, p_ctx->next_filename);
++#endif
+          return bRC_Error;
+       }
+ 
+@@ -562,8 +594,11 @@ static bRC get_next_file_to_backup(bpContext *ctx)
+       sp.pkt_end = sizeof(sp);
+       sp.fname = p_ctx->next_filename;
+       sp.type = p_ctx->type;
++#if HAVE_CEPHFS_CEPH_STATX_H
++      memcpy(&sp.statp, &p_ctx->statx, sizeof(sp.statp));
++#else
+       memcpy(&sp.statp, &p_ctx->statp, sizeof(sp.statp));
+-
++#endif
+       if (bfuncs->AcceptFile(ctx, &sp) == bRC_Skip) {
+          Dmsg(ctx, debuglevel, "cephfs-fd: file %s skipped d

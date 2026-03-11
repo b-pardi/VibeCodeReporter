@@ -1,0 +1,169 @@
+@@ -2,6 +2,7 @@
+ 
+ #include <r_util.h>
+ #include <r_anal.h>
++#include <r_reg.h>
+ #include <sdb.h>
+ 
+ typedef struct r_anal_esil_dfg_filter_t {
+@@ -10,6 +11,7 @@ typedef struct r_anal_esil_dfg_filter_t {
+ 	Sdb *results;
+ } RAnalEsilDFGFilter;
+ 
++
+ // TODO: simple const propagation - use node->type of srcs to propagate consts of pushed vars
+ 
+ R_API RAnalEsilDFGNode *r_anal_esil_dfg_node_new(RAnalEsilDFG *edf, const char *c) {
+@@ -26,12 +28,387 @@ void _dfg_node_free (RAnalEsilDFGNode *free_me) {
+ 	free (free_me);
+ }
+ 
+-static bool _edf_reg_set(RAnalEsilDFG *edf, const char *reg, RGraphNode *node) {
+-	return edf ? !sdb_ptr_set (edf->latest_nodes, reg, node, 0) : false;
++typedef struct esil_dfg_reg_var_t {
++	ut32 from;
++	ut32 to;
++	RGraphNode *node;
++} EsilDFGRegVar;
++
++
++static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
++	EsilDFGRegVar *rv_incoming = (EsilDFGRegVar *)incoming;
++	EsilDFGRegVar *rv_in = (EsilDFGRegVar *)in;
++
++	// first handle the simple cases without intersection
++	if (rv_incoming->to < rv_in->from) {
++		return -1;
++	}
++	if (rv_in->to < rv_incoming->from) {
++		return 1;
++	}
++	if (rv_in->from == rv_incoming->from && rv_in->to == rv_incoming->to) {
++		return 0;
++	}
++	RAnalEsilDFG *dfg = (RAnalEsilDFG *)user;
++
++	/*
++	the following cases are about intersection, here some ascii-art, so you understand what I do
++
++	     =incoming=
++	=========in=========
++
++	split in into 2 and reinsert the second half (in2)
++	shrink first half (in1)
++
++	     =incoming=
++	=in1=          =in2=
++	*/
++
++	if (rv_in->from < rv_incoming->from && rv_incoming->to < rv_in->to) {
++		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		rv[0] = rv_in[0];
++		rv_in->to = rv_incoming->from - 1;
++		rv->from = rv_incoming->to + 1;
++		dfg->insert = rv;
++		return 1;
++	}
++
++	/*
++	   =incoming=
++	      =in=
++
++	enqueue the non-intersecting ends in the todo-queue
++	*/
++
++	if (rv_incoming->from < rv_in->from && rv_in->to < rv_incoming->to) {
++		// lower part
++		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		rv[0] = rv_incoming[0];
++		rv->to = rv_in->from - 1;
++		r_queue_enqueue (dfg->todo, rv);
++		// upper part
++		rv = R_NEW (EsilDFGRegVar);
++		rv[0] = rv_incoming[0];
++		rv->from = rv_in->to + 1;
++		r_queue_enqueue (dfg->todo, rv);
++		return 0;
++	}
++
++	/*
++	   =incoming=
++	   =in=
++
++	similar to the previous case, but this time only enqueue 1 half
++	*/
++
++	if (rv_incoming->from == rv_in->from && rv_in->to < rv_incoming->to) {
++		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		rv[0] = rv_incoming[0];
++		rv->from = rv_in->to + 1;
++		r_queue_enqueue (dfg->todo, rv);
++		return 0;
++	}
++
++	/*
++	   =incoming=
++	         =in=
++	*/
++
++	if (rv_incoming->from < rv_in->from && rv_in->to == rv_incoming->to) {
++		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		rv[0] = rv_incoming[0];
++		rv->to = rv_in->from - 1;
++		r_queue_enqueue (dfg->todo, rv);
++		return 0;
++	}
++
++	/*
++	    =incoming=
++	===in===
++
++	shrink in
++
++	    =incoming=
++	=in=
++	*/
++
++	if (rv_in->to <= rv_incoming->to) {
++		rv_in->to = rv_incoming->from - 1;
++		return 1;
++	}
++
++	/*
++	  =incoming=
++        ===in===
++
++	up-shrink in
++
++	  =incoming=
++	  ==in==
++	*/
++
++	rv_in->from = rv_incoming->to + 1;
++	return -1;
++}
++
++static int _rv_ins_cmp (void *incoming, void *in, void *user) {
++	EsilDFGRegVar *rv_incoming = (EsilDFGRegVar *)incoming;
++	EsilDFGRegVar *rv_in = (EsilDFGRegVar *)in;
++	return rv_incoming->from - rv_in->from;
++}
++
++static bool _edf_reg_set (RAnalEsilDFG *dfg, const char *reg, RGraphNode *node) {
++	r_return_val_if_fail (dfg && reg, false);
++	const ut32 _reg_strlen = 4 + strlen (reg);
++	char *_reg = R_NEWS0 (char, _reg_strlen + 1);
++	if (!_reg) {
++		// no need for assert here, it's not a bug if malloc fails
++		return false;
++	}
++	strncat (_reg, "reg.", _reg_strlen);
++	strncat (_reg, reg, _reg_strlen);
++	if (!sdb_num_exists (dfg->regs, _reg)) {
++		//no assert to prevent memleaks
++		free (_reg);
++		return false;
++	}
++	EsilDFGRegVar *rv = R_NEW0 (EsilDFGRegVar);
++	if (!rv) {
++		return false;

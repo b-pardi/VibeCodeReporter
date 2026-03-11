@@ -1,0 +1,140 @@
+@@ -323,6 +323,8 @@ class ReportParser(object):
+             # this will work since recon-ng is the first plugin to use json.
+             # we need to add json detection here!
+             result = 'reconng'
++        elif report_type == 'fpr':
++            result = 'fortify'
+         else:
+ 
+             try:
+@@ -398,6 +400,8 @@ class ReportParser(object):
+             return "Lynis"
+         elif tag == "reconng":
+             return "Reconng"
++        elif tag == "fortify":
++            return "Fortify"
+         elif tag == "document":
+             if re.search("SSLyzeVersion", output) is not None:
+                 return "Sslyze"
+
+
+
+
+@@ -196,7 +196,7 @@ def _unsafe_io_with_server(server_io_function, server_expected_responses,
+     Return the response from the server.
+     """
+     answer = None
+-    logger.debug('Sending request to api endpoint {0}'.format(server_url))
++    #logger.debug('Sending request to api endpoint {0}'.format(server_url))
+     try:
+         answer = server_io_function(server_url, **payload)
+         if answer.status_code == 409:
+
+
+
+
+@@ -72,7 +72,7 @@ def get_host_properties(host):
+                 #In case of dup hostnames
+                 host_dict['hostnames'] = list(set(host_dict['hostnames']))
+             except socket.gaierror as e:
+-                logger.error('Couldn\'t resolve hostname %s', ip)
++                logger.warning('Couldn\'t resolve hostname %s', ip)
+         host_dict['ip'] = ip
+     return host_dict
+ 
+
+
+
+
+@@ -65,7 +65,7 @@ class PluginCommiter(Thread):
+         try:
+             self.output_queue.join()
+             self.commit()
+-            if os.path.isfile(self.output):
++            if '\0' not in self.output and os.path.isfile(self.output):
+                 # sometimes output is a filepath
+                 name = os.path.basename(self.output)
+                 os.rename(self.output,
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,187 @@
++import io
++import re
++import string
++from HTMLParser import HTMLParser
++from zipfile import ZipFile
++from lxml import objectify, etree
++from faraday.client.plugins import core
++
++
++class FortifyPlugin(core.PluginBase):
++    """
++    Example plugin to parse nmap output.
++    """
++
++    def __init__(self):
++        core.PluginBase.__init__(self)
++        self.id = "Fortify"
++        self.name = "Fortify XML Output Plugin"
++        self.plugin_version = "0.0.1"
++        #self.version = "6.40"
++        #self.framework_version = "1.0.0"
++        #self.options = None
++        #self._current_output = None
++
++    def parseOutputString(self, output, debug=False):
++        #import pdb; pdb.set_trace()
++        fp = FortifyParser(output)
++
++        for host in fp.hosts.keys():
++            fp.hosts[host] = self.createAndAddHost(host)
++
++        for vuln in fp.vulns.keys():
++            #import pdb; pdb.set_trace()
++            self.createAndAddVulnToHost(
++                host_id=fp.hosts[fp.vulns[vuln]['host']],
++                name=str(vuln),
++                desc="", 
++                ref=[],
++                severity="", 
++                resolution="", 
++                data="", 
++                external_id=None
++            )
++        return True
++
++
++
++class FortifyParser():
++
++
++    remove_extra_chars = re.compile(r'&amp;(\w*);')
++    replacements_fmt = re.compile(r'<Replace key="(.*?)"[\s\/].*?>')
++
++    def __init__(self, output):
++        self.vulns = {}
++        self.hosts = {}
++        self.fvdl = None
++        self.audit = None
++        self.suppressed = []
++        self.descriptions = {}
++
++        self._uncompress_fpr(output)
++        self._extract_vulns()
++        self._prepare_description_templates()
++
++    def _uncompress_fpr(self, output):
++        with ZipFile(io.BytesIO(output)) as fprcontent:
++            self.fvdl = objectify.fromstring(fprcontent.read('audit.fvdl'))
++            self.audit = objectify.fromstring(fprcontent.read('audit.xml'))
++
++    def _extract_vulns(self):
++
++
++        #make list of false positi

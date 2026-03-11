@@ -1,0 +1,95 @@
+@@ -10,4 +10,4 @@
+ # Contact: ops@keepersecurity.com
+ #
+ 
+-__version__ = '16.9.11'
++__version__ = '16.9.12'
+
+
+
+
+@@ -884,8 +884,9 @@ def update_records_v3(params, rec_list, **kwargs):   # type: (KeeperParams, List
+     record_rq_by_uid = {}
+     for rec in rec_list:
+         record_rq = get_pb2_record_update(params, rec, **kwargs)
+-        record_rq_by_uid[rec.record_uid] = record_rq
+-        rq.records.append(record_rq['pb2_record_update'])
++        if record_rq:
++            record_rq_by_uid[rec.record_uid] = record_rq
++            rq.records.append(record_rq['pb2_record_update'])
+ 
+     return get_record_v3_response(params, rq, 'vault/records_update', record_rq_by_uid)
+ 
+@@ -1278,7 +1279,7 @@ def query_enterprise(params, force=False):
+         if share_account_expired:
+             params.enterprise = None
+         else:
+-            logging.warning(e)
++            logging.warning(e, exc_info=True)
+ 
+ 
+ def login_and_get_mc_params_login_v3(params: KeeperParams, mc_id):
+
+
+
+
+@@ -196,6 +196,11 @@ def is_json_value_field(obj):
+ WORDS_TO_CAPITALIZE = {'Id', 'Uid', 'Ip', 'Url', 'Scim'}
+ 
+ 
++def fields_to_titles(fields): # type: (List[str]) -> Optional[List[str]]
++    titles = [field_to_title(f) for f in fields]
++    return titles
++
++
+ def field_to_title(field):   # type: (str) -> str
+     words = field.split('_')
+     words = [x.capitalize() for x in words if x]
+
+
+
+
+@@ -25,7 +25,8 @@ from urllib.parse import urlunparse
+ from tabulate import tabulate
+ 
+ from . import base
+-from .base import dump_report_data, field_to_title, raise_parse_exception, suppress_exit, Command, GroupCommand, FolderMixin
++from .base import dump_report_data, field_to_title, fields_to_titles, raise_parse_exception, suppress_exit, Command, \
++    GroupCommand, FolderMixin
+ from .helpers.record import get_record_uids
+ from .helpers.timeout import parse_timeout
+ from .record import RecordRemoveCommand
+@@ -35,6 +36,7 @@ from ..error import KeeperApiError, CommandError, Error
+ from ..params import KeeperParams
+ from ..proto import APIRequest_pb2, folder_pb2, record_pb2, enterprise_pb2
+ from ..shared_record import SharePermissions, get_shared_records, SharedRecord
++from ..sox.sox_types import Record
+ from ..subfolder import BaseFolderNode, SharedFolderNode, SharedFolderFolderNode, try_resolve_path, get_folder_path, \
+     get_folder_uids, get_contained_record_uids
+ from ..loginv3 import LoginV3API
+@@ -165,7 +167,14 @@ dry_run_help = 'Simulate removing duplicates (with this flog, no records are eve
+ find_duplicate_parser.add_argument('-n', '--dry-run', action='store_true', help=dry_run_help)
+ find_duplicate_parser.add_argument('-q', '--quiet', action='store_true',
+                                    help='Suppress screen output, valid only w/ --force flag')
+-
++scope_help = 'The scope of the search (limited to current vault if not specified)'
++find_duplicate_parser.add_argument('-s', '--scope', action='store', choices=['vault', 'enterprise'], default='vault',
++                                   help=scope_help)
++refresh_help = 'Populate local cache with latest compliance data . Valid only w/ --scope=enterprise option.'
++find_duplicate_parser.add_argument('-r', '--refresh-data', action='store_true', help=refresh_help)
++find_duplicate_parser.add_argument('--format', action='store', choices=['table', 'csv', 'json'], default='table',
++                                   help='output format.')
++find_duplicate_parser.add_argument('--output', action='store', help='output file name. (ignored for table format)')
+ find_duplicate_parser.error = raise_parse_exception
+ find_duplicate_parser.exit = suppress_exit
+ 
+@@ -1601,6 +1610,68 @@ class FindDuplicateCommand(Command):
+         return find_duplicate_parser
+ 
+     def execute(self, params, **kwargs):  # type: (KeeperParams, any) -> any
++        out_fmt = kwargs.get('format', 'table')
++        out_dst = kwargs.get('output')
++
++        def scan_enterprise_vaults():
++            cmd = self.get_parser().prog
++            if not para

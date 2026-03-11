@@ -1,0 +1,162 @@
+@@ -43,6 +43,9 @@ static void object_delete_items(RBinObject *o) {
+ 	r_list_free (o->strings);
+ 	ht_up_free (o->strings_db);
+ 
++	if (!RVecRBinImport_empty (&o->imports_vec)) {
++		RVecRBinImport_fini (&o->imports_vec);
++	}
+ 	if (!RVecRBinSymbol_empty (&o->symbols_vec)) {
+ 		RVecRBinSymbol_fini (&o->symbols_vec);
+ 		if (o->symbols) {
+@@ -422,12 +425,12 @@ R_API int r_bin_object_set_items(RBinFile *bf, RBinObject *bo) {
+ 	}
+ 	if (bin->filter_rules & (R_BIN_REQ_RELOCS | R_BIN_REQ_IMPORTS)) {
+ 		if (p->relocs) {
+-			const RList *l = p->relocs (bf); // XXX this is an internal list (should be a vector), and shouldnt be freed by the caller
++			RList *l = (RList *)p->relocs (bf); // XXX this is an internal list (should be a vector), and shouldnt be freed by the caller
+ 			if (l) {
+ 				REBASE_PADDR (bo, l, RBinReloc);
+ 				bo->relocs = list2rbtree ((RList*)l);
+-				// l->free = NULL;
+-				// r_list_free (l);
++				l->free = NULL;
++				r_list_free (l);
+ 			}
+ 		}
+ 	}
+
+
+
+
+@@ -71,6 +71,7 @@ static bool r_bin_bflt_init(RBinBfltObj *obj, RBuffer *buf) {
+ 
+ R_IPI void r_bin_bflt_free(RBinBfltObj *o) {
+ 	if (o) {
++		r_list_free (o->relocs_list);
+ 		R_FREE (o->hdr);
+ 		r_buf_free (o->b);
+ 		free (o);
+
+
+
+
+@@ -39,6 +39,7 @@ typedef struct r_bin_bflt_obj {
+ 	RBinBfltHeader *hdr;
+ 	RBinBfltReloc *reloc_table;
+ 	RBinBfltReloc *got_table;
++	RList *relocs_list;
+ 	RBuffer *b;
+ 	ut8 endian;
+ 	size_t size;
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2008-2024 pancake, inisider */
++/* radare - LGPL - Copyright 2008-2025 pancake, inisider */
+ 
+ #include <r_util.h>
+ #include "coff.h"
+
+
+
+
+@@ -4919,6 +4919,19 @@ void Elf_(free)(ELFOBJ* eo) {
+ 	if (!eo) {
+ 		return;
+ 	}
++	r_list_free (eo->relocs_list);
++	if (eo->imports_by_ord) {
++		int i;
++		for (i = 0; i < eo->imports_by_ord_size; i++) {
++			RBinImport *imp = eo->imports_by_ord[i];
++			if (imp) {
++				r_bin_import_free (eo->imports_by_ord[i]);
++				eo->imports_by_ord[i] = NULL;
++			}
++		}
++		eo->imports_by_ord_size = 0;
++		R_FREE (eo->imports_by_ord);
++	}
+ 	free (eo->osabi);
+ 	free (eo->phdr);
+ 	free (eo->shdr);
+@@ -4947,8 +4960,8 @@ void Elf_(free)(ELFOBJ* eo) {
+ 		eo->phdr_symbols_vec = NULL;
+ 	}
+ 	// causes double free in g_symbols_vec.free() 2 lines below
+-	// RVecRBinElfSymbol_free (eo->phdr_symbols_vec);
+-	// RVecRBinElfSymbol_free (eo->phdr_imports_vec);
++	RVecRBinElfSymbol_free (eo->phdr_symbols_vec);
++	RVecRBinElfSymbol_free (eo->phdr_imports_vec);
+ 	RVecRBinElfSymbol_free (eo->g_symbols_vec);
+ 	RVecRBinElfSymbol_free (eo->g_imports_vec);
+ #if 0
+
+
+
+
+@@ -159,6 +159,7 @@ struct Elf_(obj_t) {
+ 	ut32 g_reloc_num;
+ 	bool relocs_loaded;
+ 	RVector g_relocs;  // RBinElfReloc
++	RList *relocs_list;
+ 	bool sections_loaded;
+ 	bool sections_cached;
+ #if R2_590
+
+
+
+
+@@ -1174,8 +1174,10 @@ fail:
+ 	free (section);
+ fail2:
+ 	free (prefix);
+-	free (symbol->name);
+-	free (symbol);
++	if (symbol) {
++		free (symbol->name);
++		free (symbol);
++	}
+ 	return false;
+ }
+ 
+
+
+
+
+@@ -119,7 +119,11 @@ static ut32 get_ngot_entries(struct r_bin_bflt_obj *obj) {
+ 
+ static RList *relocs(RBinFile *bf) {
+ 	struct r_bin_bflt_obj *obj = (struct r_bin_bflt_obj *) bf->bo->bin_obj;
++	if (obj->relocs_list) {
++		return r_list_clone (obj->relocs_list, NULL);
++	}
+ 	RList *list = r_list_newf ((RListFree) free);
++	obj->relocs_list = list;
+ 	ut32 i, len, n_got, amount;
+ 	if (!list || !obj) {
+ 		r_list_free (list);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2014-2024 - Fedor Sakharov */
++/* radare - LGPL - Copyright 2014-2025 - Fedor Sakharov */
+ 
+ #include <r_bin.h>
+ #include <sdb/ht_uu.h>
+@@ -499,70 +499,60 @@ static ut16 _read_le16(RBin *rbin, ut64 addr) {
+ 	return r_read_le16 (data);
+ }
+ 
+-#define BYTES_PER_IMP_RELOC		8
++#define BYTES_PER_IMP_RELOC 8
+ 
+-static RList *_relocs_list(RBin *rbin, struct r_bin_coff_obj *bin, bool patch, ut64 imp_map) {
+-	R_RETURN_VAL_IF_FAIL (bin, NULL);
+-	if (!bin->scn_hdrs) {
++static RList *_relocs_list(RBin *rbin, struct r_bin_coff_obj *co, bool patch, ut64 imp_map) {
++	R_RETURN_VAL_IF_FAIL (rbin && co, N

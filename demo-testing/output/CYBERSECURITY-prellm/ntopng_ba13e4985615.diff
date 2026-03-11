@@ -1,0 +1,88 @@
+@@ -216,9 +216,11 @@ class Flow : public GenericHashEntry {
+   static void updatePacketStats(InterarrivalStats *stats, const struct timeval *when, bool update_iat);
+   bool isReadyToBeMarkedAsIdle();
+   char* printTCPflags(u_int8_t flags, char * const buf, u_int buf_len) const;
+-  void update_pools_stats(const struct timeval *tv,
++  void update_pools_stats(NetworkInterface *iface,
++			  Host *cli_host, Host *srv_host,
++			  const struct timeval *tv,
+ 			  u_int64_t diff_sent_packets, u_int64_t diff_sent_bytes,
+-			  u_int64_t diff_rcvd_packets, u_int64_t diff_rcvd_bytes);
++			  u_int64_t diff_rcvd_packets, u_int64_t diff_rcvd_bytes) const;
+   void periodic_dump_check(const struct timeval *tv);
+   void updateCliJA3();
+   void updateSrvJA3();
+
+
+
+
+@@ -155,8 +155,8 @@ class Host : public GenericHashEntry, public AlertableEntity {
+     if(keep_alive_pkts) stats->incKeepAliveRcvd(keep_alive_pkts);
+   }
+ 
+-  inline void incSentStats(u_int pkt_len)           { stats->incSentStats(pkt_len);          };
+-  inline void incRecvStats(u_int pkt_len)           { stats->incRecvStats(pkt_len);          };
++  inline void incSentStats(u_int num_pkts, u_int pkt_len)  { stats->incSentStats(num_pkts, pkt_len); };
++  inline void incRecvStats(u_int num_pkts, u_int pkt_len)  { stats->incRecvStats(num_pkts, pkt_len); };
+   
+   virtual int16_t get_local_network_id() const = 0;
+   virtual HTTPstats* getHTTPstats()           const { return(NULL);                  };
+
+
+
+
+@@ -62,8 +62,8 @@ class HostStats: public TimeseriesStats {
+ 
+   virtual void computeAnomalyIndex(time_t when) {};
+ 
+-  inline void incSentStats(u_int pkt_len)           { sent_stats.incStats(pkt_len);       };
+-  inline void incRecvStats(u_int pkt_len)           { recv_stats.incStats(pkt_len);       };
++  inline void incSentStats(u_int num_pkts, u_int pkt_len) { sent_stats.incStats(num_pkts, pkt_len); };
++  inline void incRecvStats(u_int num_pkts, u_int pkt_len) { recv_stats.incStats(num_pkts, pkt_len); };
+   inline void incnDPIFlows(u_int16_t l7_protocol)   { if(ndpiStats) ndpiStats->incFlowsStats(l7_protocol); };
+   inline u_int32_t getTotalNumFlowsAsClient() const { return(total_num_flows_as_client);  };
+   inline u_int32_t getTotalNumFlowsAsServer() const { return(total_num_flows_as_server);  };
+
+
+
+
+@@ -385,7 +385,7 @@ class NetworkInterface : public AlertableEntity {
+     ndpiStats->incStats(when, ndpi_proto, 0, 0, num_pkts, pkt_len);
+     // Note: here we are not currently interested in packet direction, so we tell it is receive
+     ndpiStats->incCategoryStats(when, ndpi_category, 0 /* see above comment */, pkt_len);
+-    pktStats.incStats(pkt_len);
++    pktStats.incStats(1, pkt_len);
+     l4Stats.incStats(when, l4proto,
+       ingressPacket ? num_pkts : 0, ingressPacket ? pkt_len : 0,
+       !ingressPacket ? num_pkts : 0, !ingressPacket ? pkt_len : 0);
+
+
+
+
+@@ -37,7 +37,7 @@ class PacketStats {
+ 
+   void resetStats();
+   void incFlagStats(u_int8_t flags);
+-  void incStats(u_int pkt_len);
++  void incStats(u_int num_pkts, u_int pkt_len);
+   char* serialize();
+   void deserialize(json_object *o);
+   json_object* getJSONObject();
+
+
+
+
+@@ -978,6 +978,114 @@ void Flow::incFlowDroppedCounters() {
+ /* *************************************** */
+ 
+ void Flow::hosts_periodic_stats_update(NetworkInterface *iface, Host *cli_host, Host *srv_host, PartializableFlowTrafficStats *partial, bool first_partial, const struct timeval *tv) const {
++  update_pools_stats(iface, cli_host, srv_host, tv, partial->get_cli2srv_packets(), partial->get_cli2srv_bytes(),
++		     partial->get_srv2cli_packets(), partial->get_srv2cli_bytes());
++ 
++if(cli_host && srv_host) {
++    bool cli_and_srv_in_same_subnet = false;
++    bool cli_and_srv_in_same_country = false;
++    Vlan *vl;
++    int16_t cli_network_id = cli_host->get_local_network_id();
++    int16_t srv_network_id = srv_host->get_local_network_id();
++    int16_t stats_protocol = getStatsProtocol(); /* The protocol (among ndpi master_ and app_) that is chosen to i

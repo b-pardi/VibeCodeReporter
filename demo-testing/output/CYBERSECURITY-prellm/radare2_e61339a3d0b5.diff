@@ -1,0 +1,128 @@
+@@ -39,10 +39,29 @@ typedef struct {
+ 
+ typedef struct vtable_info_t {
+ 	ut64 saddr; //starting address
+-	int methods;
+-	RList* functions;
++	int method_count;
++	RList* methods;
+ } vtable_info;
+ 
++typedef struct vtable_method_info_t {
++	ut64 addr;           // addr of the function
++	ut64 vtable_offset;  // offset inside the vtable
++} vtable_method_info;
++
++
++static void vtable_info_fini(vtable_info *vtable) {
++	RListIter* iter;
++	vtable_method_info *method;
++	r_list_foreach (vtable->methods, iter, method) {
++		free (method);
++	}
++	r_list_free (vtable->methods);
++}
++
++static ut64 vtable_info_get_size(VTableContext *context, vtable_info *vtable) {
++	return (ut64)vtable->method_count * context->wordSize;
++}
++
+ 
+ static bool vtable_begin(RAnal *anal, VTableContext *context) {
+ 	context->anal = anal;
+@@ -73,19 +92,24 @@ static RList* vtable_get_methods(VTableContext *context, vtable_info *table) {
+ 		r_list_free (vtableMethods);
+ 		return NULL;
+ 	}
++
+ 	int curMethod = 0;
+-	int totalMethods = table->methods;
++	int totalMethods = table->method_count;
+ 	ut64 startAddress = table->saddr;
+ 	while (curMethod < totalMethods) {
+ 		ut64 curAddressValue;
+-		if (context->read_addr (context->anal, startAddress, &curAddressValue)) {
+-			RAnalFunction *curFunction = r_anal_get_fcn_in (anal, curAddressValue, 0);
+-			r_list_append (vtableMethods, curFunction);
++		vtable_method_info *methodInfo;
++		if (context->read_addr (context->anal, startAddress, &curAddressValue)
++			&& (methodInfo = (vtable_method_info *)malloc (sizeof (vtable_method_info)))) {
++			methodInfo->addr = curAddressValue;
++			methodInfo->vtable_offset = startAddress - table->saddr;
++			r_list_append (vtableMethods, methodInfo);
+ 		}
+ 		startAddress += context->wordSize;
+ 		curMethod++;
+ 	}
+-	table->functions = vtableMethods;
++
++	table->methods = vtableMethods;
+ 	return vtableMethods;
+ }
+ 
+@@ -135,12 +159,13 @@ static int vtable_is_addr_vtable_start(VTableContext *context, ut64 curAddress)
+ 
+ 			RAnalOp analop = { 0 };
+ 			r_anal_op (context->anal, &analop, xref->addr, buf, sizeof(buf));
+-			r_anal_op_fini (&analop);
+ 
+ 			if (analop.type == R_ANAL_OP_TYPE_MOV
+ 				|| analop.type == R_ANAL_OP_TYPE_LEA) {
+ 				return true;
+ 			}
++
++			r_anal_op_fini (&analop);
+ 		}
+ 	}
+ 	return false;
+@@ -184,7 +209,7 @@ RList* vtable_search(VTableContext *context) {
+ 					noOfMethods++;
+ 					startAddress += context->wordSize;
+ 				}
+-				vtable->methods = noOfMethods;
++				vtable->method_count = noOfMethods;
+ 				r_list_append (vtables, vtable);
+ 				continue;
+ 			}
+@@ -201,21 +226,23 @@ RList* vtable_search(VTableContext *context) {
+ 	return vtables;
+ }
+ 
+-R_API void r_anal_list_vtables(RAnal *anal, bool printJson) {
++R_API void r_anal_list_vtables(RAnal *anal, int rad) {
+ 	VTableContext context;
+-	vtable_begin ((RAnal *)anal, &context);
+-	RList* vtables = vtable_search (&context);
++	vtable_begin (anal, &context);
++
+ 	RList *vtableMethods;
+ 	const char *noMethodName = "No Name found";
+ 	RListIter* vtableMethodNameIter;
+-	RAnalFunction *curMethod;
++	vtable_method_info *curMethod;
+ 	RListIter* vtableIter;
+ 	vtable_info* table;
+ 
++	RList* vtables = vtable_search (&context);
+ 	if (!vtables) {
+ 		return;
+ 	}
+-	if (printJson) {
++
++	if (rad == 'j') {
+ 		bool isFirstElement = true;
+ 		r_cons_print ("[");
+ 		r_list_foreach (vtables, vtableIter, table) {
+@@ -225,65 +252,59 @@ R_API void r_anal_list_vtables(RAnal *anal, bool printJson) {
+ 			bool isFirstMethod = true;
+ 			r_cons_printf ("{\"offset\":%"PFMT64d",\"methods\":[", table->saddr);
+ 			vtableMethods = vtable_get_methods (&context, table);
+-			if(vtableMethods)
+-				r_list_foreach (vtableMethods, vtableMethodNameIter, curMethod) {
++			r_list_foreach (vtableMethods, vtableMethodNameIter, curMethod) {
+ 				if(!isFirstMethod)
+ 					r_cons_print (",");
+-				const char* const name = curMethod->name;
++				RAnalFunction *fcn = r_anal_get_fcn_in (anal, curMethod->addr, 0);
++				const char* const name = fcn ? fcn->name : NULL;
+ 				r_cons_printf ("{\"offset\"

@@ -1,0 +1,125 @@
+@@ -30,6 +30,104 @@ using namespace std;
+ 
+ namespace zeek::logging {
+ 
++namespace detail {
++using DelayTokenType = zeek_uint_t;
++
++class DelayInfo;
++
++using DelayInfoPtr = std::shared_ptr<DelayInfo>;
++
++constexpr zeek::TypeTag ZeekDelayTokenTypeTag = TYPE_COUNT;
++DelayTokenType to_internal_delay_token(const ValPtr& val) {
++    assert(val->GetType()->Tag() == ZeekDelayTokenTypeTag);
++    return val->AsCount();
++}
++
++using DelayWriteMap = std::map<WriteContext, DelayInfoPtr>;
++using DelayTokenMap = std::unordered_map<DelayTokenType, DelayInfoPtr>;
++using DelayQueue = std::list<DelayInfoPtr>;
++
++// DelayInfo tracks information of Log::write() operation that was
++// delayed during execution of the Log::log_stream_policy hook.
++class DelayInfo {
++public:
++    static const DelayInfoPtr nil;
++
++    explicit DelayInfo(const WriteContext& ctx, const zeek::ValPtr token_val, double expire_time)
++        : ctx(ctx), token_val(token_val), expire_time(expire_time) {}
++
++    // No copy or assignment of DelayInfo itself, should
++    // always be managed through a shared pointer.
++    DelayInfo(const DelayInfo&) = delete;
++    DelayInfo& operator=(const DelayInfo&) = delete;
++
++    void IncDelayRefs() { ++delay_refs; };
++    void DecDelayRefs() {
++        assert(delay_refs > 0);
++        --delay_refs;
++    };
++    int DelayRefs() const { return delay_refs; };
++    bool HasDelayRefs() const { return delay_refs > 0; };
++
++    const RecordValPtr& Record() const { return ctx.record; }
++    const EnumValPtr& StreamId() const { return ctx.id; }
++    const WriteContext& Context() const { return ctx; }
++
++    const ValPtr& TokenVal() const { return token_val; }
++    double ExpireTime() const { return expire_time; }
++
++    // The position in the delay queue for efficient removal.
++    DelayQueue::const_iterator QueuePosition() const { return queue_position; }
++    bool IsInQueue() const { return enqueued; }
++    void SetQueuePosition(DelayQueue::const_iterator pos) {
++        queue_position = pos;
++        enqueued = true;
++    }
++
++    const std::vector<FuncPtr>& PostDelayCallbacks() const { return post_delay_callbacks; }
++    void AppendPostDelayCallback(FuncPtr f) { post_delay_callbacks.emplace_back(std::move(f)); }
++
++private:
++    // ActiveWrite information
++    WriteContext ctx;
++
++    // References - number of Log::delay() calls.
++    int delay_refs = 1;
++
++    // Token for this delay.
++    ValPtr token_val;
++
++    // Stamped on the first Log::delay() call during
++    // Log::log_stream_policy execution.
++    double expire_time = 0.0;
++
++    // Callbacks to invoke when all references were released, or the delay expired.
++    std::vector<FuncPtr> post_delay_callbacks;
++
++    // Has this DelayInfo object been enqueued?
++    bool enqueued = false;
++
++    // Iterator pointing this instance in the delay_queue.
++    DelayQueue::const_iterator queue_position;
++};
++
++const DelayInfoPtr DelayInfo::nil = nullptr;
++
++// Helper class for dealing with nested Write() calls.
++class ActiveWriteScope {
++public:
++    ActiveWriteScope(std::vector<WriteContext>& active_writes, WriteContext w) : active_writes{active_writes} {
++        active_writes.push_back(std::move(w));
++    }
++    ~ActiveWriteScope() { active_writes.pop_back(); }
++
++private:
++    std::vector<WriteContext>& active_writes;
++};
++
++} // namespace detail
++
++
+ struct Manager::Filter {
+     Val* fval = nullptr;
+     string name;
+@@ -96,9 +194,42 @@ struct Manager::Stream {
+ 
+     std::optional<telemetry::IntCounter> total_writes; // Initialized on first write.
+ 
++    // State about delayed writes for this Stream.
++    detail::DelayQueue delay_queue;
++    detail::DelayTokenMap delay_tokens;
++    detail::DelayWriteMap delayed_writes;
++    detail::WriteIdx write_idx = 0;
++
++    Manager::LogDelayExpiredTimer* delay_timer = nullptr;
++    double max_delay_interval = 0.0;
++    zeek_uint_t max_delay_queue_size = 1;
++    bool evicting = false;
++
++
+     ~Stream();
++
++
++    const detail::DelayInfoPtr& GetDelayIn

@@ -1,0 +1,121 @@
+@@ -202,33 +202,7 @@ def is_kaslr_enabled() -> bool:
+ 
+ @pwndbg.lib.cache.cache_until("start")
+ def kbase() -> int | None:
+-    arch_name = pwndbg.aglib.arch.name
+-
+-    address = 0
+-
+-    if arch_name == "x86-64":
+-        address = get_idt_entries()[0].offset
+-    elif arch_name == "aarch64":
+-        address = pwndbg.aglib.regs.vbar
+-    else:
+-        return None
+-
+-    mappings = pwndbg.aglib.vmmap.get()
+-    for mapping in mappings:
+-        # TODO: Check alignment
+-
+-        # only search in kernel mappings:
+-        # https://www.kernel.org/doc/html/v5.3/arm64/memory.html
+-        if mapping.vaddr & (0xFFFF << 48) == 0:
+-            continue
+-
+-        if not mapping.execute:
+-            continue
+-
+-        if address in mapping:
+-            return mapping.vaddr
+-
+-    return None
++    return pwndbg.aglib.kernel.paging.kbase()
+ 
+ 
+ def get_idt_entries() -> List[pwndbg.lib.kernel.structs.IDTEntry]:
+
+
+
+
+@@ -15,7 +15,7 @@ ENTRYMASK = ~((1 << 12) - 1) & ((1 << 51) - 1)
+ 
+ @pwndbg.lib.cache.cache_until("start", "stop")
+ def get_memory_map_raw() -> Tuple[pwndbg.lib.memory.Page, ...]:
+-    return pwndbg.aglib.kernel.vmmap.kernel_vmmap()
++    return pwndbg.aglib.kernel.vmmap.kernel_vmmap(False)
+ 
+ 
+ def find_kbase(pages) -> int | None:
+@@ -32,7 +32,7 @@ def find_kbase(pages) -> int | None:
+ 
+     mappings = pages
+     for mapping in mappings:
+-        # TODO: Check alignment
++        # should be page aligned -- either from pt-dump or info mem
+ 
+         # only search in kernel mappings:
+         # https://www.kernel.org/doc/html/v5.3/arm64/memory.html
+@@ -68,11 +68,11 @@ guess_physmap = config.add_param(
+ 
+ 
+ def physmap_base() -> int:
+-    if pwndbg.aglib.kernel.has_debug_syms():
++    if pwndbg.aglib.kernel.has_debug_syms() and pwndbg.aglib.arch.name == "x86-64":
+         result = pwndbg.aglib.symbol.lookup_symbol_value("page_offset_base")
+         if result is not None:
+             return result
+-    if guess_physmap:
++    if guess_physmap or pwndbg.aglib.arch.name == "aarch64":
+         result = guess_physmap_base()
+         if result is not None:
+             return result
+
+
+
+
+@@ -18,13 +18,161 @@ from pt.pt_x86_64_parse import PT_x86_64_Backend
+ import pwndbg
+ import pwndbg.aglib.arch
+ import pwndbg.aglib.kernel
++import pwndbg.aglib.kernel.paging
+ import pwndbg.aglib.qemu
+ import pwndbg.aglib.regs
++import pwndbg.aglib.vmmap
+ import pwndbg.color.message as M
+ import pwndbg.lib.cache
+ import pwndbg.lib.memory
+ 
+ 
++class KernelVmmap:
++    USERLAND = "userland"
++    KERNELLAND = "kernel [.text]"
++    KERNELRO = "kernel [.rodata]"
++    KERNELBSS = "kernel [.bss]"
++    KERNELDRIVER = "kernel [.driver .bpf]"
++    ESPSTACK = "%esp fixup"
++
++    def __init__(self, pages: Tuple[pwndbg.lib.memory.Page, ...]):
++        self.pages = pages
++        self.sections = None
++        if not pwndbg.aglib.kernel.has_debug_syms():
++            return
++        self.kbase = kbase = pwndbg.aglib.kernel.paging.find_kbase(pages)
++        if pwndbg.aglib.arch.name == "x86-64":
++            # https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt
++            # works for v5.x and v6.x
++            physmap = pwndbg.aglib.kernel.paging.physmap_base()
++            vmalloc = pwndbg.aglib.symbol.lookup_symbol_value("vmalloc_base")
++            vmemmap = pwndbg.aglib.symbol.lookup_symbol_value("vmemmap_base")
++            self.sections = (
++                (self.USERLAND, 0),
++                (None, 0x8000000000000000),
++                ("physmap", physmap),
++                ("vmalloc", vmalloc),
++                ("vmemmap", vmemmap),
++                # TODO: find better ways to handle the following constants
++                #   I cound not find kernel symbols that reference their values
++                #   the actual region base may differ but the region always falls within the below range
++                #   even if KASLR is enabled
++                ("cpu entry", 0xFFFFFE0000000000),
++                ("rand cpu entry", 0xFFFFFE0000001000),
++    

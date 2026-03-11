@@ -1,0 +1,108 @@
+@@ -96,7 +96,10 @@ class Flow : public GenericHashEntry {
+   void *cli_id, *srv_id;
+   char *json_info, *host_server_name, *bt_hash;
+   bool dump_flow_traffic;
+-
++#ifdef HAVE_NEDGE
++  u_int32_t last_conntrack_update; 
++#endif
++  
+   union {
+     struct {
+       char *last_url, *last_method;
+@@ -456,7 +459,10 @@ class Flow : public GenericHashEntry {
+   inline u_int32_t getFlowDeviceIp()       { return flow_device.device_ip; };
+   inline u_int16_t getFlowDeviceInIndex()  { return flow_device.in_index;  };
+   inline u_int16_t getFlowDeviceOutIndex() { return flow_device.out_index; };
+-
++#ifdef HAVE_NEDGE
++  inline void setLastConntrackUpdate(u_int32_t when) { last_conntrack_update = when; }
++#endif
++  
+ #ifdef NTOPNG_PRO
+ 
+ #ifdef HAVE_NETFILTER
+
+
+
+
+@@ -89,18 +89,18 @@ class GenericHashEntry {
+   inline void set_next(GenericHashEntry *n) { hash_next = n;     };
+   void updateSeen();
+   void updateSeen(time_t _last_seen);
+-  bool equal(GenericHashEntry *b)    { return((this == b) ? true : false); };  
+-  inline NetworkInterface* getInterface() { return(iface); };
++  bool equal(GenericHashEntry *b)         { return((this == b) ? true : false); };  
++  inline NetworkInterface* getInterface() { return(iface);                      };
+   virtual bool idle();
+-  virtual void set_to_purge()          { will_be_purged = true; };
+-  virtual void housekeep()             { return;                };
+-  inline bool is_ready_to_be_purged() { return(will_be_purged); };
+-  inline u_int get_duration()         { return((u_int)(1+last_seen-first_seen)); };
+-  virtual u_int32_t key()             { return(0);         };  
++  virtual void set_to_purge()          { will_be_purged = true;  };
++  virtual void housekeep()             { return;                 };
++  inline bool is_ready_to_be_purged()  { return(will_be_purged); };
++  inline u_int get_duration()          { return((u_int)(1+last_seen-first_seen)); };
++  virtual u_int32_t key()              { return(0);         };  
+   virtual char* get_string_key(char *buf, u_int buf_len) { buf[0] = '\0'; return(buf); };
+-  void incUses()      { num_uses++;      }
+-  void decUses()      { num_uses--;      }
+-  u_int16_t getUses() { return num_uses; }
++  void incUses()                       { num_uses++;      }
++  void decUses()                       { num_uses--;      }
++  u_int16_t getUses()                  { return num_uses; }
+ };
+ 
+ #endif /* _GENERIC_HASH_ENTRY_H_ */
+
+
+
+
+@@ -878,7 +878,7 @@ inline struct ntopngLuaContext* getUserdata(lua_State *vm) {
+ #endif
+ 
+ #define MIN_TIME_SPAWN_THREAD_POOL        10 /* sec */
+-
++#define DONT_NOT_EXPIRE_BEFORE_SEC        30 /* sec */
+ #define MAX_NDPI_IDLE_TIME_BEFORE_GUESS   5 /* sec */
+ #define MAX_NUM_PCAP_CAPTURES             4
+ 
+
+
+
+
+@@ -43,8 +43,11 @@ Flow::Flow(NetworkInterface *_iface,
+     flow_packets_head = flow_packets_tail = NULL,
+     dump_flow_traffic = false,
+     memset(&ndpiDetectedProtocol, 0, sizeof(ndpiDetectedProtocol));
+-    doNotExpireBefore = iface->getTimeLastPktRcvd() + 30 /* sec */;
+-
++  doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
++#ifdef HAVE_NEDGE
++  last_conntrack_update = 0;
++#endif
++  
+   memset(&cli2srvStats, 0, sizeof(cli2srvStats)), memset(&srv2cliStats, 0, sizeof(srv2cliStats));
+ 
+   ndpiFlow = NULL, cli_id = srv_id = NULL, client_proc = server_proc = NULL;
+@@ -1726,24 +1729,45 @@ u_int32_t Flow::key(Host *_cli, u_int16_t _cli_port,
+ 
+ /* *************************************** */
+ 
+-bool Flow::isReadyToPurge() {
+-  u_int8_t tcp_flags;
+-
+-  if(!iface->is_purge_idle_interface()) return(false);
++bool Flow::isReadyToPurge() 
++{
++#ifdef HAVE_NEDGE
++  if(iface->getIfType() == interface_type_NETFILTER) {
++    /* 
++       Note that on netfilter interfaces we never observe the 
++       FIN/RST flags as they have been offloaded to kernel
+ 
+-  tcp_flags = src2dst_tcp_flags | dst2src_tcp_flags;
++       Hence on netfilter interfaces flows are purged only for
++       inactivity based on lastSeen updates
++    *

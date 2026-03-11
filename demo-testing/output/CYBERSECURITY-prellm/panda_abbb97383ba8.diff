@@ -1,0 +1,98 @@
+@@ -145,7 +145,7 @@ class Panda():
+         if self.expect_prompt:
+             self.serial_file = NamedTemporaryFile(prefix="pypanda_s").name
+             self.serial_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+-            self.serial_console = Expect(expectation=self.expect_prompt, quiet=True, consume_first=False)
++            self.serial_console = Expect('serial', expectation=self.expect_prompt, quiet=True, consume_first=False)
+             self.panda_args.extend(['-serial', 'unix:{},server,nowait'.format(self.serial_file)])
+         else:
+             self.serial_file = None
+@@ -157,7 +157,7 @@ class Panda():
+         self.monitor_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+         self.raw_monitor = raw_monitor
+         if not self.raw_monitor:
+-            self.monitor_console = Expect(expectation=rb"(qemu)", quiet=True, consume_first=True)
++            self.monitor_console = Expect('monitor', expectation=rb"(qemu)", quiet=True, consume_first=True)
+             self.panda_args.extend(['-monitor', 'unix:{},server,nowait'.format(self.monitor_file)])
+ 
+         self.running = threading.Event()
+
+
+
+
+@@ -13,14 +13,18 @@ from colorama import Fore, Style
+ class TimeoutExpired(Exception): pass
+ 
+ class Expect(object):
+-    def __init__(self, filelike=None, expectation=None, logfile=None, quiet=False, consume_first=False):
++    def __init__(self, name, filelike=None, expectation=None, logfile=None, quiet=False, consume_first=False):
++
++        self.name = name
++
++        if logfile is None: logfile = os.devnull
++        self.logfile = open(logfile, "wb")
++
+         if filelike is None: # Must later use connect(filelike)
+             self.fd = None
+         else:
+             self.connect(filelike)
+ 
+-        if logfile is None: logfile = os.devnull
+-        self.logfile = open(logfile, "wb")
+         self.quiet = quiet
+         self.sofar = ''
+         self.last_msg = None
+@@ -34,8 +38,11 @@ class Expect(object):
+             self.consumed_first = False
+ 
+     def update_expectation(self, expectation):
++        if isinstance(expectation, bytes):
++            expectation = expectation.decode()
++        self.last_prompt = expectation # approximation
+         self.expectation_re = re.compile(expectation)
+-        self.expectation_ends_re = re.compile(rb'.*' + expectation)
++        self.expectation_ends_re = re.compile(r'.*' + expectation)
+ 
+     def connect(self, filelike):
+         if type(filelike) == int:
+@@ -54,6 +61,224 @@ class Expect(object):
+     def abort(self):
+         self.running = False
+ 
++    def unansi(self, msg):
++        '''
++        Given a string with ansi control codes, emulate behavior to generate the resulting string. 
++
++        First we split input into a list of ('fn', [args]) / ('text', ['foo']) ansi commands then
++        evaluate the commands to render real text output
++
++        See https://notes.burke.libbey.me/ansi-escape-codes/ and
++        http://ascii-table.com/ansi-escape-sequences-vt-100.php for ansi escape code details
++        '''
++
++        if b'\x1b' not in msg:
++            text = "".join([chr(x) for x in msg])
++            return text
++
++        start_args = re.compile(br"^(\d+);")
++        last_arg = re.compile(rb"^(\d+)")
++
++        last_text = ""
++        reformatted = []
++        idx = 0 # XXX: mutates during loop
++        while idx < len(msg):
++            if msg[idx] != 0x1b:
++                last_text += chr(msg[idx])
++            else:
++                if len(last_text):
++                    reformatted.append(('text', [last_text]))
++                    last_text = ""
++
++                if idx+3 <= len(msg) and msg[idx+1] == ord('['):
++                    args = []
++                    shift = idx+2
++                    arg_s = msg[shift:]
++                    while start_args.match(arg_s):
++                        arg = start_args.match(arg_s).groups()[0].decode()
++                        args.append(arg)
++                        shift += len(arg)+1 #

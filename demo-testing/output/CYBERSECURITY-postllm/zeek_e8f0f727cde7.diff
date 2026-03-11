@@ -1,0 +1,126 @@
+@@ -18,13 +18,11 @@ namespace zeek {
+ 
+ static int msg_count = 0;
+ static double msg_suppression_time = 0;
+-static bool did_loc_db_error = false;
+-static bool did_asn_db_error = false;
+ static constexpr int msg_limit = 20;
+ static constexpr double msg_suppression_duration = 300;
+ 
+-static std::unique_ptr<MMDB> mmdb_loc;
+-static std::unique_ptr<MMDB> mmdb_asn;
++LocDB mmdb_loc;
++AsnDB mmdb_asn;
+ 
+ static void report_msg(const char* format, ...) {
+     if ( zeek::run_state::network_time > msg_suppression_time + msg_suppression_duration ) {
+@@ -45,16 +43,87 @@ static void report_msg(const char* format, ...) {
+     zeek::reporter->Info("%s", msg.data());
+ }
+ 
+-MMDB::MMDB(const char* filename, struct stat info)
+-    : file_info(info), lookup_error{false}, last_check{zeek::run_state::network_time} {
+-    int status = MMDB_open(filename, MMDB_MODE_MMAP, &mmdb);
++static zeek::ValPtr mmdb_getvalue(MMDB_entry_data_s* entry_data, int status, int data_type) {
++    switch ( status ) {
++        case MMDB_SUCCESS:
++            if ( entry_data->has_data ) {
++                switch ( data_type ) {
++                    case MMDB_DATA_TYPE_UTF8_STRING:
++                        return zeek::make_intrusive<zeek::StringVal>(entry_data->data_size, entry_data->utf8_string);
++                        break;
++
++                    case MMDB_DATA_TYPE_DOUBLE:
++                        return zeek::make_intrusive<zeek::DoubleVal>(entry_data->double_value);
++                        break;
++
++                    case MMDB_DATA_TYPE_UINT32: return zeek::val_mgr->Count(entry_data->uint32);
++
++                    default: break;
++                }
++            }
++            break;
++
++        case MMDB_LOOKUP_PATH_DOES_NOT_MATCH_DATA_ERROR:
++            // key doesn't exist, nothing to do
++            break;
++
++        default: report_msg("MaxMind DB error [%s]", MMDB_strerror(status)); break;
++    }
++
++    return nullptr;
++}
++
++MMDB::MMDB() : mmdb{}, file_info{}, reported_error{false}, last_check{zeek::run_state::network_time} {}
++
++MMDB::~MMDB() { Close(); }
++
++bool MMDB::OpenFile(const char* a_filename) {
++    filename = a_filename;
++    Close();
++
++    if ( 0 != stat(a_filename, &file_info) ) {
++        return false;
++    }
++
++    int status = MMDB_open(a_filename, MMDB_MODE_MMAP, &mmdb);
+ 
+     if ( MMDB_SUCCESS != status ) {
+-        throw std::runtime_error(MMDB_strerror(status));
++        memset(&mmdb, 0, sizeof(mmdb));
++        report_msg("Failed to open MaxMind DB: %s [%s]", filename.data(), MMDB_strerror(status));
++        return false;
+     }
++
++    return true;
+ }
+ 
+-MMDB::~MMDB() { MMDB_close(&mmdb); }
++void MMDB::Close() {
++    if ( IsOpen() ) {
++        MMDB_close(&mmdb);
++        memset(&mmdb, 0, sizeof(mmdb));
++        reported_error = false;
++    }
++}
++
++bool MMDB::EnsureLoaded() {
++    bool res = true;
++
++    if ( filename.empty() )
++        res = OpenFromScriptConfig();
++    else if ( ! IsOpen() )
++        res = OpenFile(filename.data());
++    else if ( IsStaleDB() ) {
++        report_msg("Closing stale MaxMind DB [%s]", filename.data());
++        if ( ! OpenFile(filename.data()) )
++            res = false;
++    }
++
++    if ( ! res && ! reported_error ) {
++        reported_error = true;
++        zeek::emit_builtin_error(zeek::util::fmt("Failed to open %s", Description()));
++    }
++
++    return res;
++}
+ 
+ bool MMDB::Lookup(const zeek::IPAddr& addr, MMDB_lookup_result_s& result) {
+     struct sockaddr_storage ss = {0};
+@@ -70,36 +139,24 @@ bool MMDB::Lookup(const zeek::IPAddr& addr, MMDB_lookup_result_s& result) {
+         addr.CopyIPv6(&sa->sin6_addr);
+     }
+ 
+-    try {
+-        result = Lookup((struct sockaddr*)&ss);
+-    } catch ( const std::exception& e ) {
+-        report_msg("MaxMind DB lookup location error [%s]", e.what());
+-        return false;
+-    }
+-
+-    return result.found_entry;
+-}
+-
+-MMDB_lookup_result_s MMDB::Lookup(const struct sockaddr* const sa) {
+     int mmdb_error;
+-    MMDB_lookup_result_s result = MMDB_lookup_sockad

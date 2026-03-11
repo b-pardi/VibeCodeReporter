@@ -1,0 +1,86 @@
+@@ -25,7 +25,7 @@
+ #
+ # It is implemented as a Neutron/ML2 mechanism driver.
+ import contextlib
+-from datetime import datetime
++from datetime import datetime, timedelta
+ import os
+ import re
+ import threading
+@@ -1125,14 +1125,21 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
+                 if self.elector.master():
+                     LOG.info("I am master: monitoring periodic resync")
+ 
+-                    time_delta = datetime.now() - self.last_resync_time
++                    curr_time = datetime.now()
++                    time_delta = curr_time - self.last_resync_time
+                     if time_delta.seconds > cfg.CONF.calico.resync_max_interval_secs:
+                         LOG.error(
+                             "The time since the last resync completion has surpassed"
+                             f" {cfg.CONF.calico.resync_max_interval_secs} seconds"
+                         )
+ 
+-                    eventlet.sleep(cfg.CONF.calico.resync_max_interval_secs / 5)
++                    deadline = self.last_resync_time + timedelta(
++                        seconds=cfg.CONF.calico.resync_max_interval_secs
++                    )
++                    time_left = (deadline - curr_time).seconds
++                    polling_rate = cfg.CONF.calico.resync_max_interval_secs / 5
++                    sleep_time = time_left if deadline > curr_time else polling_rate
++                    eventlet.sleep(sleep_time)
+                 else:
+                     LOG.debug("I am not master")
+                     eventlet.sleep(MASTER_CHECK_INTERVAL_SECS)
+
+
+
+
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-# Copyright (c) 2025 Tigera, Inc. All rights reserved.
++# Copyright (c) 2026 Tigera, Inc. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -55,13 +55,18 @@ class TestResyncMonitorThread(lib.Lib, unittest.TestCase):
+         self.sleep_patcher.stop()
+         super(TestResyncMonitorThread, self).tearDown()
+ 
+-    def simulate_epoch_progression(self, init_epoch):
+-        return lambda _: setattr(self.driver, "_epoch", init_epoch + 1)
++    def simulate_epoch_progression(self, expected_sleep_time=None):
++        def increment_epoch(actual_sleep_time):
++            if expected_sleep_time is not None:
++                assert expected_sleep_time == actual_sleep_time
++            self.driver._epoch += 1
++
++        return increment_epoch
+ 
+     def test_monitor_does_nothing_when_not_master(self):
+         """Test that a driver that is not master does not monitor."""
+         self.driver.elector.master.return_value = False
+-        self.mock_sleep.side_effect = self.simulate_epoch_progression(INITIAL_EPOCH)
++        self.mock_sleep.side_effect = self.simulate_epoch_progression()
+ 
+         self.driver.resync_monitor_thread(INITIAL_EPOCH)
+ 
+@@ -74,7 +79,7 @@ class TestResyncMonitorThread(lib.Lib, unittest.TestCase):
+         self.driver.elector.master.return_value = True
+         fake_resync_time = datetime.now() - timedelta(seconds=TEST_MAX_INTERVAL + 1)
+         self.driver.last_resync_time = fake_resync_time
+-        self.mock_sleep.side_effect = self.simulate_epoch_progression(INITIAL_EPOCH)
++        self.mock_sleep.side_effect = self.simulate_epoch_progression()
+ 
+         self.driver.resync_monitor_thread(INITIAL_EPOCH)
+ 
+@@ -88,7 +93,7 @@ class TestResyncMonitorThread(lib.Lib, unittest.TestCase):
+         """If interval is below max, no error should be logged."""
+         lib.m_oslo_config.cfg.CONF.calico.resync_max_interval_secs = TEST_MAX_INTERVAL
+         self.driver.elector.master.return_value = True
+-        self.mock_sleep.side_effect = self.simulate_epoch_progression(INITIAL_EPOCH)
++        self.mock_sleep.side_effect = self.simulate_epoch_progression()
+ 
+         self.driver.resync_monitor_thread(INITIAL_EPOCH)
+ 
+@@ -114,11 +119,9 @@ class TestResyncMonitorThread(lib.Lib, unittest.TestCase):
+        

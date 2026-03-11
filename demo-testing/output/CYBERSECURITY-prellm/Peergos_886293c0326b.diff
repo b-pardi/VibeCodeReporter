@@ -1,0 +1,81 @@
+@@ -174,8 +174,9 @@ public class JdbcUsageStore implements UsageStore {
+              PreparedStatement writerSelect = conn.prepareStatement("SELECT id FROM writers WHERE key_hash = ?;")) {
+             writerSelect.setBytes(1, writer.toBytes());
+             ResultSet writerRes = writerSelect.executeQuery();
+-            writerRes.next();
+-            return writerRes.getInt(1);
++            if (writerRes.next())
++                return writerRes.getInt(1);
++            throw new IllegalStateException("Writer not present on this server: " + writer);
+         } catch (SQLException sqe) {
+             LOG.log(Level.WARNING, sqe.getMessage(), sqe);
+             throw new RuntimeException(sqe);
+
+
+
+
+@@ -112,14 +112,15 @@ public class NetworkAccess {
+     }
+ 
+     public static CompletableFuture<ContentAddressedStorage> buildDirectS3Blockstore(ContentAddressedStorage localDht,
++                                                                                     CoreNode core,
+                                                                                      HttpPoster direct,
+                                                                                      boolean isPeergosServer) {
+         if (! isPeergosServer)
+             return Futures.of(localDht);
+         return localDht.blockStoreProperties()
+-                .thenApply(bp -> bp.useDirectBlockStore() ?
+-                        new DirectS3BlockStore(bp, direct, localDht) :
+-                        localDht);
++                .thenCompose(bp -> bp.useDirectBlockStore() ?
++                        localDht.id().thenApply(id -> new DirectS3BlockStore(bp, direct, localDht, id, core)) :
++                        Futures.of(localDht));
+     }
+ 
+     @JsMethod
+@@ -132,9 +133,7 @@ public class NetworkAccess {
+ 
+         return isPeergosServer(relative)
+                 .thenApply(isPeergosServer -> new Pair<>(isPeergosServer ? relative : absolute, isPeergosServer))
+-                .thenCompose(p ->
+-                        buildDirectS3Blockstore(buildLocalDht(p.left, true), relative, p.right)
+-                                .thenCompose(dht -> build(p.left, p.left, pkiServerNodeId, dht, new ScryptJS(), true)))
++                .thenCompose(p -> build(p.left, p.left, pkiServerNodeId, buildLocalDht(p.left, p.right), new ScryptJS(), true))
+                 .thenApply(e -> e.withMutablePointerCache(7_000));
+     }
+ 
+@@ -166,7 +165,8 @@ public class NetworkAccess {
+                 .thenAccept(usernames -> {
+                     // We are on a Peergos server
+                     CoreNode core = direct;
+-                    build(core, localDht, apiPoster, p2pPoster, usernames, true, isJavascript)
++                    buildDirectS3Blockstore(localDht, core, apiPoster, true)
++                            .thenCompose(dht -> build(core, dht, apiPoster, p2pPoster, usernames, true, isJavascript))
+                             .thenApply(result::complete)
+                             .exceptionally(t -> {
+                                 result.completeExceptionally(t);
+
+
+
+
+@@ -1,6 +1,7 @@
+ package peergos.shared.storage;
+ 
+ import peergos.shared.cbor.*;
++import peergos.shared.corenode.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.cid.*;
+ import peergos.shared.io.ipfs.multibase.binary.*;
+@@ -18,14 +19,23 @@ public class DirectS3BlockStore implements ContentAddressedStorage {
+     private final Optional<String> baseUrl;
+     private final HttpPoster direct;
+     private final ContentAddressedStorage fallback;
+-
+-    public DirectS3BlockStore(BlockStoreProperties blockStoreProperties, HttpPoster direct, ContentAddressedStorage fallback) {
++    private final Multihash nodeId;
++    private final LRUCache<PublicKeyHash, Multihash> storageNodeByOwner = new LRUCache<>(100);
++    private final CoreNode core;
++
++    public DirectS3BlockStore(BlockStoreProperties blockStoreProperties,
++                              HttpPoster direct,
++                              Cont

@@ -1,0 +1,84 @@
+@@ -81,6 +81,30 @@ public class DeleteBenchmark {
+         System.err.printf("DELETE("+names.size()+") duration: %d mS\n", duration);
+     }
+ 
++    // DELETE_FILE(200) duration: 7445 mS
++    // DELETE_FILE(200) duration: 3058 mS
++    @Test
++    public void deleteLargeFile() throws Exception {
++        String username = generateUsername();
++        String password = "test01";
++        UserContext context = ensureSignedUp(username, password, network, crypto);
++        FileWrapper userRoot = context.getUserRoot().get();
++        int size = 200*1024*1024;
++        byte[] data = new byte[size];
++        random.nextBytes(data);
++
++        String filename = "file.bin";
++        userRoot.uploadFileJS(filename, AsyncReader.build(data), 0, size, false,
++                userRoot.mirrorBatId(), context.network, crypto, x -> {}, context.getTransactionService(), f -> Futures.of(false)).join();
++        Path filePath = PathUtil.get(username, filename);
++        FileWrapper file = context.getByPath(filePath).join().get();
++
++        long start = System.currentTimeMillis();
++        file.remove(context.getUserRoot().join(), filePath, context).join();
++        long duration = System.currentTimeMillis() - start;
++        System.err.printf("DELETE_FILE("+(size/1024/1024)+") duration: %d mS\n", duration);
++    }
++
+     private static String randomString() {
+         return UUID.randomUUID().toString();
+     }
+
+
+
+
+@@ -568,15 +568,14 @@ public class NetworkAccess {
+                                                             Committer committer,
+                                                             PublicKeyHash owner,
+                                                             SigningPrivateKeyAndPublicHash writer,
+-                                                            byte[] mapKey) {
++                                                            byte[] mapKey,
++                                                            TransactionId tid) {
+         CommittedWriterData version = current.get(writer);
+         return tree.get(version.props, owner, writer.publicKeyHash, mapKey)
+                 .thenCompose(valueHash ->
+                         ! valueHash.isPresent() ? CompletableFuture.completedFuture(current) :
+-                                IpfsTransaction.call(owner,
+-                                        tid -> tree.remove(version.props, owner, writer, mapKey, valueHash, tid)
+-                                                .thenCompose(wd -> committer.commit(owner, writer, wd, version, tid)),
+-                                        dhtClient))
++                                tree.remove(version.props, owner, writer, mapKey, valueHash, tid)
++                                        .thenCompose(wd -> committer.commit(owner, writer, wd, version, tid)))
+                 .thenApply(committed -> current.withVersion(writer.publicKeyHash, committed.get(writer)));
+     }
+ 
+
+
+
+
+@@ -126,7 +126,7 @@ public class FileProperties implements Cborable {
+         return (int) (size >> 32);
+     }
+ 
+-    public int getNumberOfChunks() {
++    public int chunkCount() {
+         return FileWrapper.getNumberOfChunks(size);
+     }
+ 
+
+
+
+
+@@ -1820,23 +1820,28 @@ public class FileWrapper {
+                             if (! mOpt.isPresent()) {
+                                 return CompletableFuture.completedFuture(current);
+                             }
+-                            SigningPrivateKeyAndPublicHash ourSigner = mOpt.get()
++                            CryptreeNode chunk = mOpt.get();
++                            SigningPrivateKeyAndPublicHash ourSigner = chunk
+                                     .getSigner(currentCap.rBaseKey, currentCap.wBaseKey.get(), Optional.of(signer));
+-                            return network.deleteChunk(current, committer, mOpt.get(), currentCap.owner,
+-                                    currentCap.getMapKey(), ourSigner, tid)
+-                                    .thenCompose(deletedVersion -> {
+-           

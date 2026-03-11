@@ -1,0 +1,84 @@
+@@ -86,17 +86,17 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+     """
+     Bareos-FD-Plugin-Class for PostgreSQL online (Hot) backup of cluster
+     files and database transaction logs (WAL) archiving to allow incremental
+-    backups and point-in-time (pitr) recovery.
++    backups and point-in-time recovery (pitr).
+     If the cluster use tablespaces, the backup will also backup and restore those
+-    (both symlinks in `pg_tblspc`, and real external location data)
+-    The plugin job will fail if previous job was not done on same PG major version
++    (both symlinks in `pg_tblspc`, and real external location data).
++    If the cluster detect a debian like system, it will try to add all instance configuration.
++    The plugin job will fail if previous job was not done on same PG major version.
+     """
+ 
+     def __init__(self, plugindef):
+         bareosfd.DebugMessage(
+             100, f"Constructor called in module {__name__} with plugindef={plugindef}\n"
+         )
+-
+         bareosfd.DebugMessage(
+             100,
+             (
+@@ -104,10 +104,29 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+                 f".{version_info.micro}\n"
+             ),
+         )
+-
+         # Last argument of super constructor is a list of mandatory arguments
+-        super().__init__(plugindef, ["postgresql_data_dir", "wal_archive_dir"])
+-
++        super().__init__(plugindef, ["wal_archive_dir"])
++
++        # The global list of cluster configuration parameter we will search for.
++        # To improve plugin robustness we will not allow backup of a cluster that have
++        # archive_mode = off or have archive_command = '' (cluster misconfigured)
++        self.cluster_configuration_parameters = dict(
++            [
++                ("data_directory", ""),
++                ("log_directory", ""),
++                ("config_file", ""),
++                ("hba_file", ""),
++                ("ident_file", ""),
++                ("ssl_ca_file", ""),
++                ("ssl_cert_file", ""),
++                ("ssl_crl_file", ""),
++                ("ssl_dh_params_file", ""),
++                ("ssl_key_file", ""),
++                ("ssl_crl_dir", ""),
++                ("archive_mode", ""),
++                ("archive_command", ""),
++            ]
++        )
+         # The *contents* of the directories pg_dynshmem/, pg_notify/, pg_serial/, pg_snapshots/,
+         # pg_stat_tmp/, and pg_subtrans/ can be omitted from the backup as they will be initialized
+         # on postmaster startup.
+@@ -145,6 +164,7 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         self.switch_wal = True
+         self.switch_wal_timeout = 60
+ 
++        # virtual files populates when using pg_backup_stop()
+         self.virtual_files = []
+         self.backup_label_filename = None
+         self.backup_label_data = None
+@@ -152,6 +172,8 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         self.tablespace_map_data = None
+         self.recovery_filename = None
+         self.recovery_data = None
++        # Store items given by `pg_backup_stop()` for virtual backup_label file
++        self.label_items = {}
+ 
+         # Needed to transfer Data to virtual files
+         self.data_stream = None
+@@ -168,8 +190,6 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         # This will be set to True between select pg_backup_start() and pg_backup_stop().
+         # We backup the cluster files during that time
+         self.full_backup_running = False
+-        # Store items given by `pg_backup_stop()` for virtual backup_label file
+-        self.label_items = {}
+         # We will store the `starttime` from `backup_label` here
+         self.backup_start_time = None
+         # PostgreSQL last backup stop time
+@@ -207,74 +227,206 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         The deque is reversed, so files appear first, and directories at the end.
+         

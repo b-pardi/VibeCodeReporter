@@ -1,0 +1,81 @@
+@@ -195,7 +195,7 @@ public class Builder {
+             if (b.codec == Cid.Codec.Raw) {
+                 if (legacyRawBlocks.hasBlock(b))
+                     return Futures.of(true);
+-                Bat bat = Bat.deriveFromRawBlock(d);
++                Bat bat = Bat.deriveFromRawBlock(d, hasher).join();
+                 if (!auth.isEmpty() && BlockRequestAuthoriser.isValidAuth(BlockAuth.fromString(auth), b, s, bat, hasher))
+                     return Futures.of(true);
+                 if (instanceBat.isPresent()) {
+
+
+
+
+@@ -126,7 +126,7 @@ public class Main extends Builder {
+                     new Command.Arg("pki.node.ipaddress", "IP address of the pki node", true, "172.104.157.121"),
+                     new Command.Arg("ipfs-api-address", "IPFS API port", false, "/ip4/127.0.0.1/tcp/5001"),
+                     new Command.Arg("ipfs-gateway-address", "IPFS Gateway port", false, "/ip4/127.0.0.1/tcp/8080"),
+-                    new Command.Arg("allow-target", "Local address to listen on for IPFS allow calls", false, "http://localhost:8001"),
++                    new Command.Arg("allow-target", "Local address to listen on for IPFS allow calls", false, "http://localhost:8002"),
+                     new Command.Arg("pki.node.swarm.port", "Swarm port of the pki node", true, "5001"),
+                     new Command.Arg("domain", "Domain name to bind to", false, "localhost"),
+                     new Command.Arg("public-domain", "The public domain name for this server (required if TLS is managed upstream)", false),
+
+
+
+
+@@ -128,11 +128,11 @@ public class FragmentedPaddedCipherText implements Cborable {
+                     List<Cid> hashes = frags.stream()
+                             .map(f -> f.hash.get())
+                             .collect(Collectors.toList());
+-                    List<Bat> bats = frags.stream()
+-                            .map(f -> Bat.deriveFromRawBlock(f.fragment.data))
++                    List<CompletableFuture<Bat>> bats = frags.stream()
++                            .map(f -> Bat.deriveFromRawBlock(f.fragment.data, hasher))
+                             .collect(Collectors.toList());
+                     return Futures.combineAllInOrder(bats.stream()
+-                            .map(b -> b.calculateId(hasher).thenApply(id -> new BatWithId(b, id.id)))
++                            .map(fut -> fut.thenCompose(b -> b.calculateId(hasher).thenApply(id -> new BatWithId(b, id.id))))
+                             .collect(Collectors.toList()))
+                             .thenApply(batsAndIds -> new Pair<>(new FragmentedPaddedCipherText(nonce, header, hashes, batsAndIds, Optional.empty()), frags));
+                 });
+
+
+
+
+@@ -3,8 +3,10 @@ package peergos.shared.crypto.hash;
+ import peergos.shared.crypto.*;
+ import peergos.shared.io.ipfs.cid.*;
+ import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.storage.auth.*;
+ import peergos.shared.user.*;
+ import peergos.shared.user.fs.*;
++import peergos.shared.util.*;
+ 
+ import java.nio.charset.*;
+ import java.util.concurrent.CompletableFuture;
+@@ -33,6 +35,15 @@ public interface Hasher {
+                 .thenApply(h -> new Multihash(Multihash.Type.sha2_256, h));
+     }
+ 
++    byte[] hmacInfo = ArrayOps.concat("peergos".getBytes(StandardCharsets.UTF_8), new byte[]{1});
++
++    default CompletableFuture<Bat> hkdfKey(byte[] data) {
++        byte[] salt = new byte[32];
++        return hmacSha256(salt, data)
++                .thenCompose(prk -> hmacSha256(prk, hmacInfo))
++                .thenApply(Bat::new);
++    }
++
+     default Cid identityHash(byte[] input, boolean isRaw) {
+         if (input.length > Multihash.MAX_IDENTITY_HASH_SIZE)
+             throw new IllegalStateException("Exceeded maximum size for identity multihashes!");
+
+
+
+
+@@ -81,17 +81,8 @@ public class Bat implements Cborable {
+                 .thenApply(signature -> new BlockAuth(ArrayOps.hexToBytes(signature), expirySeconds, datetime, batId));
+     }
+ 
+-    public static Bat deriveFromRawB

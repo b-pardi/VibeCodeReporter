@@ -1,0 +1,124 @@
+@@ -25,31 +25,23 @@ active (nmap & view) purposes.
+ import json
+ import os
+ import re
+-from bisect import bisect_left
+-from collections import Counter
+ from datetime import datetime
+ from itertools import chain
+ from textwrap import wrap
+-from typing import (
+-    Any,
+-    Callable,
+-    Dict,
+-    Generator,
+-    Iterable,
+-    List,
+-    Optional,
+-    Set,
+-    Tuple,
+-    TypeVar,
+-    Union,
+-    cast,
+-)
++from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union, cast
+ from urllib.parse import urlparse
+ 
+ from ivre.active.cpe import add_cpe_values
+-from ivre.config import DATA_PATH, VIEW_MAX_HOSTNAMES_COUNT, VIEW_SYNACK_HONEYPOT_COUNT
+-from ivre.data.abuse_ch.sslbl import SSLBL_CERTIFICATES, SSLBL_JA3
++from ivre.config import VIEW_MAX_HOSTNAMES_COUNT, VIEW_SYNACK_HONEYPOT_COUNT
+ from ivre.data.microsoft.exchange import EXCHANGE_BUILDS
++from ivre.tags import TAG_CDN, TAG_HONEYPOT, add_tags
++from ivre.tags.active import (
++    has_toomany_hostnames,
++    is_real_service_port,
++    is_synack_honeypot,
++    set_auto_tags,
++    set_openports_attribute,
++)
+ from ivre.types import NmapServiceMatch, ParsedCertificate, Tag
+ from ivre.types.active import (
+     HttpHeader,
+@@ -62,16 +54,11 @@ from ivre.types.active import (
+ from ivre.utils import (
+     IPV4ADDR,
+     LOGGER,
+-    TORCERT_SUBJECT,
+     decode_b64,
+     encode_b64,
+-    get_addr_type,
+     get_cert_info,
+     get_domains,
+-    ip2int,
+     key_sort_dom,
+-    make_range_tables,
+-    net2range,
+     nmap_encode_data,
+     ports2nmapspec,
+ )
+@@ -177,10 +164,6 @@ ALIASES_TABLE_ELEMS = {
+ }
+ 
+ 
+-BIG_IP_ERROR_BANNER = re.compile("^BIG-IP: \\[0x[0-9a-f]{7}:[0-9]{1,5}\\] ")
+-SONICWALL_ERROR_BANNER = re.compile("^\\(Ref.Id: \\?.*\\?\\)$")
+-
+-
+ def create_ssl_output(info: ParsedCertificate) -> List[str]:
+     out = []
+     for key, name in [("subject_text", "Subject"), ("issuer_text", "Issuer")]:
+@@ -270,611 +253,6 @@ def add_cert_hostnames(cert: ParsedCertificate, hostnames: List[NmapHostname]) -
+             add_hostname(netloc, "cert-san-uri", hostnames)
+ 
+ 
+-def is_real_service_port(port: NmapPort) -> bool:
+-    """Decides whether a port has a "real" service (=> True) or if it is
+-    **possibly** a SYN-ACK "honeypot" (=> False).
+-
+-    The idea is that a port is "real" if it has a reason that is not
+-    "syn-ack" (or similar), or if it has a service_name, or if it has a
+-    least one script.
+-
+-    Host scripts (port == -1) are also considered True.
+-
+-    """
+-    if port.get("port") == -1:
+-        return True
+-    if port.get("state_reason") and not (
+-        # might be "syn-ack" but might as
+-        # well be "syn-ack-cwr" or
+-        # "syn-psh-ack"
+-        port["state_reason"].startswith("syn-")
+-        or port["state_reason"] == "passive"
+-    ):
+-        return True
+-    if port.get("service_name") and port["service_name"] != "tcpwrapped":
+-        return True
+-    if port.get("scripts"):
+-        # Ports with scripts usually are "real" service ports, **but**
+-        # when a port only has a banner script, the output of which
+-        # matches a known SYN-ACK responder answser, we consider it is
+-        # **possibly** a SYN-ACK "honeypot" (or responder) and return
+-        # False
+-        if len(port["scripts"]) == 1 and port["scripts"][0]["id"] == "banner":
+-            banner = port["scripts"][0]["output"]
+-            if banner == "\n":
+-                return False
+-            if BIG_IP_ERROR_BANNER.search(banner):
+-                return False
+-            if SONICWALL_ERROR_BANNER.search(banner):
+-                return False
+-        return True
+-    return False
+-
+-
+-def set_openports_attribute(host: NmapHost) -> None:
+-    """This function sets the "openports" value in the `host` record,
+-    based on the elements of the "ports" list. This is used in MongoDB to
+-    speed up queries based on open ports.
+-
+-    """
+-    openports = host["openports"] = {"count": 0}
+-    for port in host.get("ports", []):
+-        if port.get("

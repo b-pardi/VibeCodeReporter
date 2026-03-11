@@ -1,0 +1,128 @@
+@@ -1,36 +1,55 @@
+ /* PANDABEGINCOMMENT
+- * 
+- * Authors:
+- *  Laura L. Mann
+- * 
+- * This work is licensed under the terms of the GNU GPL, version 2. 
+- * See the COPYING file in the top-level directory. 
+- * 
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2.
++ * See the COPYING file in the top-level directory.
++ *
+ PANDAENDCOMMENT */
+ // This needs to be defined before anything is included in order to get
+ // the PRIx64 macro
+ #define __STDC_FORMAT_MACROS
+ 
+ #include <iostream>
++#include <set>
++#include <cstring>
++#include <stdint.h>
+ 
+ #include "panda/plugin.h"
+ #include "panda/network.h"
+ #include "taint2/taint2.h"
+ 
+-extern "C" {
++extern "C"
++{
+ #include "qemu/cutils.h"
+ #include "taint2/taint2_ext.h"
+-}
++#include "ida_taint2/ida_taint2_ext.h"
+ 
+ // These need to be extern "C" so that the ABI is compatible with
+ // QEMU/PANDA, which is written in C
+-extern "C" {
+-bool init_plugin(void *);
+-void uninit_plugin(void *);
+-int on_replay_handle_packet(CPUState *env, uint8_t *buf, int size, uint8_t
+-    direction, uint64_t old_buf_addr);
++bool init_plugin(void *self);
++void uninit_plugin(void *self);
++int on_replay_handle_packet(CPUState *env, uint8_t *buf, int packet_size,
++    uint8_t direction, uint64_t old_buf_addr);
+ }
+ 
++const std::string PLUGIN_NM = std::string("tainted_net");
++
++// Delimiter for options that specify sets of integer ranges
++const std::string DELIM = std::string(":");
++
++// Default value for options that specify sets of integer ranges
++const std::string DEFAULT_ALL = std::string("all");
++
++// IPV4/Ethernet constants
++
++constexpr int MAC_HEADER_SIZE = 14;
++constexpr int ETHERTYPE_OCTET = 12;
++constexpr int IPV4_HEADER_MIN_SIZE = 19;
++constexpr int IPV4_VERSION_OCTET = (MAC_HEADER_SIZE+0);
++constexpr int IPV4_VERSION_MASK = (1 << 6);
++constexpr int IPV4_PROTOCOL_OCTET = (MAC_HEADER_SIZE+9);
++constexpr int IPV4_SOURCE_IP_OCTET = (MAC_HEADER_SIZE+12);
++constexpr int IPV4_DEST_IP_OCTET = (MAC_HEADER_SIZE+16);
++
+ // buffer for getting labels on transmitted packets
+ uint32_t *taint_labels = NULL;
+ size_t cur_max_labels = 10;
+@@ -38,195 +57,481 @@ size_t cur_max_labels = 10;
+ // Configuration
+ bool label_incoming_network_traffic = false;
+ bool query_outgoing_network_traffic = false;
+-bool positional_tainting = false;
++bool semantic_labels = false;
+ const char *tx_filename = NULL;
+ 
+ bool firstOpen = true;
+ 
++// File that semantic label data is written to.
++FILE *semantic_labels_file = NULL;
+ 
+-// a packet has come in over the network, or is about to go out over the network
+-int on_replay_handle_packet(CPUState *env, uint8_t *buf, int size, uint8_t
+-    direction, uint64_t old_buf_addr) {
++// Counter for each incoming network packet.  Allows for tainting only specific
++// packet numbers.
++uint32_t packet_count = 0;
++
++// Label counter.  Used when semantic labelling is enabled.
++uint32_t label_count = 0;
++
++// Set of packet numbers that will be tainted.
++std::set<uint32_t> packets_to_taint;
++
++// Set of IPV4 protocol numbers to taint.  Only packets with protocol numbers
++// in this set will be tainted.
++std::set<uint32_t> protocols_to_taint;
++
++// Set of byte offsets in packets to taint.
++std::set<uint32_t> bytes_to_taint;
++
++// If non-zero, only taint packets that arrive from this source ip.
++uint32_t source_ip=0;
++
++// If non-zero, only taint packets with this destination ip.
++uint32_t dest_ip=0;
++
++// If non-zero, only taint packets with this ethertype protocol number.
++uint16_t ethertype=0;
++
++static void output_message(const std::string &message)
++{
++    std::cerr << PANDA_MSG << message << std::endl;
++}
++
++// Called when a packet received passes all filtering criteria.
++// Data within the packet should be tainted.
++// User-specified options may limit the data that is tainted (e.g. only taint
++// bytes 56-60.)
++
++void taint_network_data(int packet_size, uint64_t old_buf_addr)
++{
++    // Counts number of labels applied to this packet.
++    int num_labels_applied = 0;
++
++    // Default labe

@@ -1,0 +1,118 @@
+@@ -183,6 +183,12 @@ int DetectEngineContentModifierBufferSetup(DetectEngineCtx *de_ctx,
+                    sigmatch_table[sm_type].name);
+         goto end;
+     }
++    if (cd->flags & DETECT_CONTENT_REPLACE) {
++        SCLogError(SC_ERR_INVALID_SIGNATURE, "%s rule can not "
++                   "be used with the replace rule keyword",
++                   sigmatch_table[sm_type].name);
++        goto end;
++    }
+     if (cd->flags & (DETECT_CONTENT_WITHIN | DETECT_CONTENT_DISTANCE)) {
+         SigMatch *pm = DetectGetLastSMByListPtr(s, sm->prev,
+             DETECT_CONTENT, DETECT_PCRE, -1);
+@@ -1543,7 +1549,7 @@ SigMatchData* SigMatchList2DataArray(SigMatch *head)
+ static int SigValidate(DetectEngineCtx *de_ctx, Signature *s)
+ {
+     uint32_t sig_flags = 0;
+-    SigMatch *sm, *pm;
++    SigMatch *sm;
+     const int nlists = s->init_data->smlists_array_size;
+ 
+     SCEnter();
+@@ -1656,15 +1662,6 @@ static int SigValidate(DetectEngineCtx *de_ctx, Signature *s)
+     }
+ 
+     if (s->flags & SIG_FLAG_REQUIRE_PACKET) {
+-        pm = DetectGetLastSMFromLists(s, DETECT_REPLACE, -1);
+-        if (pm != NULL && SigMatchListSMBelongsTo(s, pm) != DETECT_SM_LIST_PMATCH) {
+-            SCLogError(SC_ERR_INVALID_SIGNATURE, "Signature has"
+-                " replace keyword linked with a modified content"
+-                " keyword (http_*, dce_*). It only supports content on"
+-                " raw payload");
+-            SCReturnInt(0);
+-        }
+-
+         for (int i = 0; i < nlists; i++) {
+             if (s->init_data->smlists[i] == NULL)
+                 continue;
+
+
+
+
+@@ -62,16 +62,31 @@ extern int run_mode;
+ static int DetectReplaceSetup(DetectEngineCtx *, Signature *, const char *);
+ void DetectReplaceRegisterTests(void);
+ 
++static int DetectReplacePostMatch(ThreadVars *tv,
++        DetectEngineThreadCtx *det_ctx,
++        Packet *p, const Signature *s, const SigMatchCtx *ctx);
++
+ void DetectReplaceRegister (void)
+ {
+     sigmatch_table[DETECT_REPLACE].name = "replace";
+-    sigmatch_table[DETECT_REPLACE].Match = NULL;
++    sigmatch_table[DETECT_REPLACE].Match = DetectReplacePostMatch;
+     sigmatch_table[DETECT_REPLACE].Setup = DetectReplaceSetup;
+     sigmatch_table[DETECT_REPLACE].Free  = NULL;
+     sigmatch_table[DETECT_REPLACE].RegisterTests = DetectReplaceRegisterTests;
+     sigmatch_table[DETECT_REPLACE].flags = (SIGMATCH_QUOTES_MANDATORY|SIGMATCH_HANDLE_NEGATION);
+ }
+ 
++static int DetectReplacePostMatch(ThreadVars *tv,
++        DetectEngineThreadCtx *det_ctx,
++        Packet *p, const Signature *s, const SigMatchCtx *ctx)
++{
++    if (det_ctx->replist) {
++        DetectReplaceExecuteInternal(p, det_ctx->replist);
++        det_ctx->replist = NULL;
++    }
++    return 1;
++}
++
+ int DetectReplaceSetup(DetectEngineCtx *de_ctx, Signature *s, const char *replacestr)
+ {
+     uint8_t *content = NULL;
+@@ -139,7 +154,17 @@ int DetectReplaceSetup(DetectEngineCtx *de_ctx, Signature *s, const char *replac
+      */
+     s->flags |= SIG_FLAG_REQUIRE_PACKET;
+     SCFree(content);
++    content = NULL;
+ 
++    SigMatch *sm = SigMatchAlloc();
++    if (unlikely(sm == NULL)) {
++        SCFree(ud->replace);
++        ud->replace = NULL;
++        goto error;
++    }
++    sm->type = DETECT_REPLACE;
++    sm->ctx = NULL;
++    SigMatchAppendSMToList(s, sm, DETECT_SM_LIST_POSTMATCH);
+     return 0;
+ 
+ error:
+
+
+
+
+@@ -30,14 +30,6 @@ DetectReplaceList * DetectReplaceAddToList(DetectReplaceList *replist, uint8_t *
+ void DetectReplaceExecuteInternal(Packet *p, DetectReplaceList *replist);
+ void DetectReplaceFreeInternal(DetectReplaceList *replist);
+ 
+-static inline void DetectReplaceExecute(Packet *p, DetectEngineThreadCtx *det_ctx)
+-{
+-    if (p == NULL || det_ctx->replist == NULL)
+-        return;
+-    DetectReplaceExecuteInternal(p, det_ctx->replist);
+-    det_ctx->replist = NULL;
+-}
+-
+ static inline void DetectReplaceFree(DetectEngineThreadCtx *det_ctx)
+ {
+     if (det_ctx->replist) {
+
+
+
+
+@@ -165,8 +165,6 @@ static void DetectRunPostMatch(ThreadVars *tv,
+     

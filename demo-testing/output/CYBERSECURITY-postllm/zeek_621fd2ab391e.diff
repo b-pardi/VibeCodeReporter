@@ -1,0 +1,127 @@
+@@ -961,6 +961,38 @@ void Manager::HookUnprocessedPacket(const Packet* packet) const {
+         MetaHookPost(HOOK_UNPROCESSED_PACKET, args, HookArgument());
+ }
+ 
++bool Manager::HookPublishEvent(zeek::cluster::Backend& backend, const std::string& topic,
++                               zeek::cluster::detail::Event& event) const {
++    HookArgumentList args;
++
++    if ( HavePluginForHook(META_HOOK_PRE) ) {
++        args.emplace_back(&backend);
++        args.emplace_back(topic);
++        args.emplace_back(&event);
++        MetaHookPre(HOOK_PUBLISH_EVENT, args);
++    }
++
++    hook_list* l = hooks[HOOK_PUBLISH_EVENT];
++
++    bool result = true;
++
++    if ( l ) {
++        for ( hook_list::iterator i = l->begin(); i != l->end(); ++i ) {
++            Plugin* p = (*i).second;
++
++            if ( ! p->HookPublishEvent(backend, topic, event) ) {
++                result = false;
++                break;
++            }
++        }
++    }
++
++    if ( HavePluginForHook(META_HOOK_POST) )
++        MetaHookPost(HOOK_PUBLISH_EVENT, args, HookArgument(result));
++
++    return result;
++}
++
+ void Manager::MetaHookPre(HookType hook, const HookArgumentList& args) const {
+     if ( hook_list* l = hooks[META_HOOK_PRE] )
+         for ( const auto& [hook_type, plugin] : *l )
+
+
+
+
+@@ -13,6 +13,15 @@
+ #include "zeek/plugin/Plugin.h"
+ 
+ namespace zeek {
++
++namespace cluster {
++class Backend;
++
++namespace detail {
++class Event;
++}
++} // namespace cluster
++
+ namespace plugin {
+ 
+ // Macros that trigger plugin hooks. We put this into macros to short-cut the
+@@ -427,6 +436,28 @@ public:
+      */
+     void HookUnprocessedPacket(const Packet* packet) const;
+ 
++    /**
++     * Hook for intercepting remote event publish operations.
++     *
++     * This hook is invoked when Cluster::publish(), Cluster::publish_hrw() or
++     * Cluster::publish_rr() is used in the scripting layer to publish a remote
++     * event to a topic. It is also invoked when calling PublishEvent() on the
++     * active cluster backend directly from C++ plugins. This hook can be used
++     * for metrics collection, modifying or redirecting events to a different
++     * topic. It's event possible to translate an event to another one. A plugin
++     * should return false if it took responsibility of publishing the event, or
++     * the verdict is to skip the publish operation.
++     *
++     * @param backend The backend publishing this event
++     * @param topic The topic to which to publish this event
++     * @param event The event itself
++     *
++     * @return true if event should be published, false if the publish
++     *         operation should be skipped.
++     */
++    bool HookPublishEvent(zeek::cluster::Backend& backend, const std::string& topic,
++                          zeek::cluster::detail::Event& event) const;
++
+     /**
+      * Internal method that registers a freshly instantiated plugin with
+      * the manager.
+
+
+
+
+@@ -9,6 +9,7 @@
+ #include "zeek/Event.h"
+ #include "zeek/Func.h"
+ #include "zeek/Val.h"
++#include "zeek/cluster/Backend.h"
+ #include "zeek/input.h"
+ #include "zeek/plugin/Component.h"
+ #include "zeek/plugin/Manager.h"
+@@ -31,6 +32,7 @@ const char* hook_name(HookType h) {
+         "Reporter",
+         "UnprocessedPacket",
+         "ObjDtor",
++        "PublishEvent",
+         // MetaHooks
+         "MetaHookPre",
+         "MetaHookPost",
+@@ -214,6 +216,23 @@ void HookArgument::Describe(ODesc* d) const {
+         }
+ 
+         case PACKET: d->Add("<packet>"); break;
++
++        case CLUSTER_BACKEND: {
++            d->Add("<cluster backend ");
++            d->Add(arg.cluster_backend->Name());
++            d->Add(">");
++            break;
++        }
++
++        case CLUSTER_EVENT: {
++            auto* ce = arg.cluster_event;
++            d->Add("<cluster event ");
++            d->AddN(ce->HandlerName().data(), static_cast<int>(ce->HandlerName().size()));
++            d->Add(", ");
++            d->Add(static_cast<uint64_t>(ce->Args().size()));
++            d->Add(util::fmt(" argument

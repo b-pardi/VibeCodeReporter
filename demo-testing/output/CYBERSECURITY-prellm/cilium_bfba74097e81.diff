@@ -1,0 +1,152 @@
+@@ -1055,6 +1055,7 @@ static __always_inline
+ handle_srv6(struct __ctx_buff *ctx)
+ {
+ 	__u32 *vrf_id, dst_id, tunnel_ep = 0;
++	struct srv6_ipv6_2tuple *outer_ips;
+ 	struct iphdr *ip4 __maybe_unused;
+ 	struct remote_endpoint_info *ep;
+ 	void *data, *data_end;
+@@ -1070,6 +1071,12 @@ handle_srv6(struct __ctx_buff *ctx)
+ 		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 			return DROP_INVALID;
+ 
++		outer_ips = srv6_lookup_state_entry6(ip6);
++		if (outer_ips) {
++			ep_tail_call(ctx, CILIUM_CALL_SRV6_REPLY);
++			return DROP_MISSED_TAIL_CALL;
++		}
++
+ 		ep = lookup_ip6_remote_endpoint((union v6addr *)&ip6->daddr);
+ 		if (ep) {
+ 			tunnel_ep = ep->tunnel_endpoint;
+@@ -1098,6 +1105,12 @@ handle_srv6(struct __ctx_buff *ctx)
+ 		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+ 			return DROP_INVALID;
+ 
++		outer_ips = srv6_lookup_state_entry4(ip4);
++		if (outer_ips) {
++			ep_tail_call(ctx, CILIUM_CALL_SRV6_REPLY);
++			return DROP_MISSED_TAIL_CALL;
++		}
++
+ 		ep = lookup_ip4_remote_endpoint(ip4->daddr);
+ 		if (ep) {
+ 			tunnel_ep = ep->tunnel_endpoint;
+
+
+
+
+@@ -99,7 +99,8 @@
+ #define CILIUM_CALL_IPV6_CT_EGRESS		32
+ #define CILIUM_CALL_SRV6_ENCAP			33
+ #define CILIUM_CALL_SRV6_DECAP			34
+-#define CILIUM_CALL_SIZE			35
++#define CILIUM_CALL_SRV6_REPLY			35
++#define CILIUM_CALL_SIZE			36
+ 
+ typedef __u64 mac_t;
+ 
+@@ -482,6 +483,7 @@ enum {
+ #define DROP_INVALID_VNI	-183
+ #define DROP_INVALID_TC_BUFFER  -184
+ #define DROP_NO_SID		-185
++#define DROP_MISSING_SRV6_STATE	-186
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ #define NAT_46X64_RECIRC	100
+
+
+
+
+@@ -209,6 +209,64 @@ srv6_decapsulation(struct __ctx_buff *ctx)
+ 	return 0;
+ }
+ 
++static __always_inline int
++srv6_create_state_entry(struct __ctx_buff *ctx)
++{
++	struct srv6_ipv6_2tuple *outer_ips;
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip6))
++		return DROP_INVALID;
++
++	outer_ips = (struct srv6_ipv6_2tuple *)&ip6->saddr;
++
++	switch (ip6->nexthdr) {
++	case IPPROTO_IPV6: {
++		struct ipv6hdr *inner = ip6 + 1;
++		struct srv6_ipv6_2tuple *inner_ips;
++
++		if ((void *)inner + sizeof(*inner) > data_end)
++			return DROP_INVALID;
++		inner_ips = (struct srv6_ipv6_2tuple *)&inner->saddr;
++
++		if (map_update_elem(&SRV6_STATE_MAP6, inner_ips, outer_ips, 0) < 0)
++			return DROP_INVALID;
++	}
++#  ifdef ENABLE_IPV4
++	case IPPROTO_IPIP: {
++		struct iphdr *inner = (struct iphdr *)(ip6 + 1);
++		struct srv6_ipv4_2tuple *inner_ips;
++
++		if ((void *)inner + sizeof(*inner) > data_end)
++			return DROP_INVALID;
++		inner_ips = (struct srv6_ipv4_2tuple *)&inner->saddr;
++
++		if (map_update_elem(&SRV6_STATE_MAP4, inner_ips, outer_ips, 0) < 0)
++			return DROP_INVALID;
++	}
++#  endif /* ENABLE_IPV4 */
++	}
++
++	return 0;
++}
++
++#  ifdef ENABLE_IPV4
++static __always_inline struct srv6_ipv6_2tuple *
++srv6_lookup_state_entry4(struct iphdr *ip4)
++{
++	return map_lookup_elem(&SRV6_STATE_MAP4,
++			       (struct srv6_ipv4_2tuple *)&ip4->saddr);
++}
++#  endif /* ENABLE_IPV4 */
++
++static __always_inline struct srv6_ipv6_2tuple *
++srv6_lookup_state_entry6(struct ipv6hdr *ip6)
++{
++	return map_lookup_elem(&SRV6_STATE_MAP6,
++			       (struct srv6_ipv6_2tuple *)&ip6->saddr);
++}
++
+ static __always_inline int
+ srv6_handling4(struct __ctx_buff *ctx, union v6addr *src_sid,
+ 	       struct in6_addr *dst_sid)
+@@ -314,6 +372,46 @@ srv6_handling(struct __ctx_buff *ctx, __u32 vrf_id, struct in6_addr *dst_sid)
+ 	}
+ }
+ 
++static __always_inline int
++srv6_reply(struct __ctx_buff *ctx)
++{
++	struct srv6_ipv6_2tuple *outer_ips;
++	struct iphdr *ip4 __maybe_unused;
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++	__u16 proto;
++
++	if (!validate_ethertype(ctx, &proto))
++		return DROP_UNSUPPORTED_L2;
++
++	switch (proto) {
++	case bpf_htons(ETH_P_IPV6):
++		if (!revalidate_data(ctx, &data, &data_end, &ip6))
++			return DROP_INVALID;
++
++		outer_ips = srv6_lookup_state_entry6(ip6);
++		if (!outer_ips)
++			return DROP_MISSING_SRV6_STATE;
++
++		return srv6_handling6(ctx, &outer_ips->src,
++				      (struct in6_addr

@@ -1,0 +1,123 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,22 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/plugin/Plugin.h"
++
++#include "zeek/storage/Component.h"
++#include "zeek/storage/backend/redis/Redis.h"
++
++namespace zeek::storage::backend::redis {
++
++class Plugin : public plugin::Plugin {
++public:
++    plugin::Configuration Configure() override {
++        AddComponent(new storage::Component("REDIS", backend::redis::Redis::Instantiate));
++
++        plugin::Configuration config;
++        config.name = "Zeek::Storage_Backend_Redis";
++        config.description = "Redis backend for storage framework";
++        return config;
++    }
++} plugin;
++
++} // namespace zeek::storage::backend::redis
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,412 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/storage/backend/redis/Redis.h"
++
++#include "zeek/Func.h"
++#include "zeek/RunState.h"
++#include "zeek/Val.h"
++#include "zeek/iosource/Manager.h"
++
++#include "hiredis/async.h"
++#include "hiredis/hiredis.h"
++
++// Anonymous callback handler methods for the hiredis async API.
++namespace {
++
++class Tracer {
++public:
++    Tracer(const std::string& where) : where(where) { /*printf("%s\n", where.c_str());*/ }
++    ~Tracer() { /* printf("%s done\n", where.c_str()); */ }
++    std::string where;
++};
++
++void redisOnConnect(const redisAsyncContext* ctx, int status) {
++    auto t = Tracer("connect");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    backend->OnConnect(status);
++}
++
++void redisOnDisconnect(const redisAsyncContext* ctx, int status) {
++    auto t = Tracer("disconnect");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    backend->OnDisconnect(status);
++}
++
++void redisPut(redisAsyncContext* ctx, void* reply, void* privdata) {
++    auto t = Tracer("put");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    auto callback = static_cast<zeek::storage::ErrorResultCallback*>(privdata);
++    backend->HandlePutResult(static_cast<redisReply*>(reply), callback);
++}
++
++void redisGet(redisAsyncContext* ctx, void* reply, void* privdata) {
++    auto t = Tracer("get");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    auto callback = static_cast<zeek::storage::ValResultCallback*>(privdata);
++    backend->HandleGetResult(static_cast<redisReply*>(reply), callback);
++}
++
++void redisErase(redisAsyncContext* ctx, void* reply, void* privdata) {
++    auto t = Tracer("erase");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    auto callback = static_cast<zeek::storage::ErrorResultCallback*>(privdata);
++    backend->HandleEraseResult(static_cast<redisReply*>(reply), callback);
++}
++
++void redisAddRead(void* privdata) {
++    auto t = Tracer("addread");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
++    backend->OnAddRead();
++}
++void redisDelRead(void* privdata) {
++    auto t = Tracer("delread");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
++    backend->OnDelRead();
++}
++void redisAddWrite(void* privdata) {
++    auto t = Tracer("addwrite");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
++    backend->OnAddWrite();
++}
++void redisDelWrite(void* privdata) {
++    auto t = Tracer("delwrite");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
++    backend->OnDelWrite();
++}
++
++} // namespace
++
++namespace zeek::storage::backend::redis {
++
++storage::BackendPtr Redis::Instantiate(std::string_view tag) { return make_intrusive<Redis>(tag); }
++
++/**
++ * Called by the manager system to open the backend.
++ *
++ * Derived classes must implement this method. If successful, the
++ * implementation must call \a Opened(); if not, it must call Error()
++ * with a corresponding message.
++ */
++ErrorResult Redi

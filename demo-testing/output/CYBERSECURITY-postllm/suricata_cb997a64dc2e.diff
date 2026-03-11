@@ -1,0 +1,95 @@
+@@ -42,6 +42,7 @@
+ #include "util-device.h"
+ #include "util-dpdk.h"
+ #include "util-dpdk-bonding.h"
++#include "util-dpdk-common.h"
+ #include "util-dpdk-i40e.h"
+ #include "util-dpdk-ice.h"
+ #include "util-dpdk-ixgbe.h"
+@@ -333,10 +334,7 @@ static void DPDKDerefConfig(void *conf)
+     DPDKIfaceConfig *iconf = (DPDKIfaceConfig *)conf;
+ 
+     if (SC_ATOMIC_SUB(iconf->ref, 1) == 1) {
+-        if (iconf->pkt_mempool != NULL) {
+-            rte_mempool_free(iconf->pkt_mempool);
+-        }
+-
++        DPDKDeviceResourcesDeinit(iconf->pkt_mempools);
+         SCFree(iconf);
+     }
+     SCReturn;
+@@ -350,7 +348,6 @@ static void ConfigInit(DPDKIfaceConfig **iconf)
+     if (ptr == NULL)
+         FatalError("Could not allocate memory for DPDKIfaceConfig");
+ 
+-    ptr->pkt_mempool = NULL;
+     ptr->out_port_id = -1; // make sure no port is set
+     SC_ATOMIC_INIT(ptr->ref);
+     (void)SC_ATOMIC_ADD(ptr->ref, 1);
+@@ -501,6 +498,12 @@ static int ConfigSetTxQueues(DPDKIfaceConfig *iconf, uint16_t nb_queues, uint16_
+     SCReturnInt(0);
+ }
+ 
++static uint32_t MempoolSizeCalculate(
++        uint32_t rx_queues, uint32_t rx_desc, uint32_t tx_queues, uint32_t tx_desc)
++{
++    return rx_queues * rx_desc + tx_queues * tx_desc;
++}
++
+ static int ConfigSetMempoolSize(DPDKIfaceConfig *iconf, const char *entry_str)
+ {
+     SCEnter();
+@@ -525,8 +528,8 @@ static int ConfigSetMempoolSize(DPDKIfaceConfig *iconf, const char *entry_str)
+             SCReturnInt(-EINVAL);
+         }
+ 
+-        iconf->mempool_size =
+-                iconf->nb_rx_queues * iconf->nb_rx_desc + iconf->nb_tx_queues * iconf->nb_tx_desc;
++        iconf->mempool_size = MempoolSizeCalculate(
++                iconf->nb_rx_queues, iconf->nb_rx_desc, iconf->nb_tx_queues, iconf->nb_tx_desc);
+         SCReturnInt(0);
+     }
+ 
+@@ -536,6 +539,18 @@ static int ConfigSetMempoolSize(DPDKIfaceConfig *iconf, const char *entry_str)
+         SCReturnInt(-EINVAL);
+     }
+ 
++    if (MempoolSizeCalculate(
++                iconf->nb_rx_queues, iconf->nb_rx_desc, iconf->nb_tx_queues, iconf->nb_tx_desc) >
++            iconf->mempool_size + 1) { // +1 to mask mempool size advice given in Suricata 7.0.x -
++                                       // mp_size should be n = (2^q - 1)
++        SCLogError("%s: mempool size is likely too small for the number of descriptors and queues, "
++                   "set to \"auto\" or adjust to the value of \"%" PRIu32 "\"",
++                iconf->iface,
++                MempoolSizeCalculate(iconf->nb_rx_queues, iconf->nb_rx_desc, iconf->nb_tx_queues,
++                        iconf->nb_tx_desc));
++        SCReturnInt(-ERANGE);
++    }
++
+     if (iconf->mempool_size == 0) {
+         SCLogError("%s: mempool size requires a positive integer", iconf->iface);
+         SCReturnInt(-ERANGE);
+@@ -544,22 +559,27 @@ static int ConfigSetMempoolSize(DPDKIfaceConfig *iconf, const char *entry_str)
+     SCReturnInt(0);
+ }
+ 
++static uint32_t MempoolCacheSizeCalculate(uint32_t mp_sz)
++{
++    // It is advised to have mempool cache size lower or equal to:
++    //   RTE_MEMPOOL_CACHE_MAX_SIZE (by default 512) and "mempool-size / 1.5"
++    // and at the same time "mempool-size modulo cache_size == 0".
++    uint32_t max_cache_size = MIN(RTE_MEMPOOL_CACHE_MAX_SIZE, mp_sz / 1.5);
++    return GreatestDivisorUpTo(mp_sz, max_cache_size);
++}
++
+ static int ConfigSetMempoolCacheSize(DPDKIfaceConfig *iconf, const char *entry_str)
+ {
+     SCEnter();
+     if (entry_str == NULL || entry_str[0] == '\0' || strcmp(entry_str, "auto") == 0) {
+         // calculate the mempool size based on the mempool size (it needs to be already filled in)
+-        // It is advised to have mempool cache size lower or equal to:
+-        //   RTE_MEMPOOL_CACHE_MAX_SIZE (by default 512) and "mempool-size / 1.5"
+-        // and at the same time "mempool-size modulo cache_size == 0".
+         if (iconf->mempool_size == 0) {
+             SCLogError("%s: cannot calculate mempool cache size of a mempool with size %d",
+                     ic

@@ -1,0 +1,133 @@
+@@ -89,6 +89,9 @@ extern const char *netdb_protoname (const uint8_t);
+ #ifndef IPPROTO_AH
+ #define	IPPROTO_AH		51		/* SIPP Auth Header */
+ #endif
++#ifndef IPPROTO_NHRP
++#define IPPROTO_NHRP		54		/* Next Hop Resolution */
++#endif
+ #ifndef IPPROTO_MOBILE
+ #define IPPROTO_MOBILE		55
+ #endif
+
+
+
+
+@@ -697,6 +697,7 @@ extern void netbeui_print(netdissect_options *, u_short, const u_char *, u_int);
+ extern void nfsreply_noaddr_print(netdissect_options *, const u_char *, u_int, const u_char *);
+ extern void nfsreply_print(netdissect_options *, const u_char *, u_int, const u_char *);
+ extern void nfsreq_noaddr_print(netdissect_options *, const u_char *, u_int, const u_char *);
++extern void nhrp_print(netdissect_options *, const u_char *, u_int);
+ extern void nsh_print(netdissect_options *, const u_char *, u_int);
+ extern void ntp_print(netdissect_options *, const u_char *, u_int);
+ extern void oam_print(netdissect_options *, const u_char *, u_int, u_int);
+
+
+
+
+@@ -85,6 +85,7 @@ static const struct tok gre_flag_values[] = {
+  * Ethertype values used for GRE (but not elsewhere?).
+  */
+ #define GRE_CDP			0x2000	/* Cisco Discovery Protocol */
++#define GRE_NHRP		0x2001	/* Next Hop Resolution Protocol */
+ #define GRE_WCCP		0x883e	/* Web Cache C* Protocol */
+ 
+ struct wccp_redirect {
+@@ -310,6 +311,9 @@ gre_print_0(netdissect_options *ndo, const u_char *bp, u_int length)
+ 	case GRE_CDP:
+ 		cdp_print(ndo, bp, len);
+ 		break;
++	case GRE_NHRP:
++		nhrp_print(ndo, bp, len);
++		break;
+ 	default:
+ 		ND_PRINT("gre-proto-0x%x", prot);
+ 	}
+
+
+
+
+@@ -216,6 +216,10 @@ again:
+ 		}
+ 		break;
+ 
++	case IPPROTO_NHRP:
++		nhrp_print(ndo, bp, length);
++		break;
++
+ 	case IPPROTO_NONE:
+ 		ND_PRINT("no next header");
+ 		break;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,454 @@
++/*	$OpenBSD: print-nhrp.c,v 1.2 2022/12/28 21:30:19 jmc Exp $ */
++
++/*
++ * Copyright (c) 2020 Remi Locherer <remi@openbsd.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/* \summary: NHRP printer */
++
++/*
++ * RFC 2332 NBMA Next Hop Resolution Protocol (NHRP)
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "netdissect-stdinc.h"
++
++#define ND_LONGJMP_FROM_TCHECK
++#include "netdissect.h"
++#include "addrtoname.h"
++#include "af.h"
++#include "ethertype.h"
++#include "interface.h"
++#include "extract.h"
++
++#define NHRP_VER_RFC2332		1
++
++#define NHRP_PKT_RESOLUTION_REQUEST	1
++#define NHRP_PKT_RESOLUTION_REPLY	2
++#define NHRP_PKT_REGISTRATION_REQUEST	3
++#define NHRP_PKT_REGISTRATION_REPLY	4
++#define NHRP_PKT_PURGE_REQUEST		5
++#define NHRP_PKT_PURGE_REPLY		6
++#define NHRP_PKT_ERROR_INDICATION	7
++
++static const struct tok pkt_types[] = {
++	{ NHRP_PKT_RESOLUTION_REQUEST,   "res request" },
++	{ NHRP_PKT_RESOLUTION_REPLY,     "res reply" },
++	{ NHRP_PKT_REGISTRATION_REQUEST, "reg request" },
++	{ NHRP_PKT_REGISTRATION_REPLY,   "reg reply" },
++	{ NHRP_PKT_PURGE_REQUEST,        "purge request" },
++	{ NHRP_PKT_PURGE_REPLY,          "purge reply" },
++	{ NHRP_PKT_ERROR_INDICATION,     "error indication" },
++	{ 0, NULL }
++};
++
++/*
++ * Fixed header part.
++ */
++struct nhrp_fixed_header {
++	nd_uint16_t	afn;		/* link layer address */
++	nd_uint16_t	pro_type;	/* protocol type (short form) */
++	nd_uint8_t	pro_snap[5];	/* protocol type (long form) */
++	nd_uint8_t	hopcnt;		/* hop count */
++	nd_uint16_t	pktsz;		/* length 

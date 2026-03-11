@@ -1,0 +1,149 @@
+@@ -150,7 +150,7 @@ skip_service_lookup:
+ 		if (info != NULL && info->sec_label) {
+ 			*dstID = info->sec_label;
+ 			tunnel_endpoint = info->tunnel_endpoint;
+-			encrypt_key = info->key;
++			encrypt_key = get_min_encrypt_key(info->key);
+ 		} else {
+ 			*dstID = WORLD_ID;
+ 		}
+@@ -340,11 +340,13 @@ pass_to_stack:
+ 			  forwarding_reason, monitor);
+ 
+ 	cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, 0);
++#ifndef ENCAP_IFINDEX
+ #ifdef ENABLE_IPSEC
+ 	if (*dstID > WORLD_ID && encrypt_key) {
+ 		set_encrypt_key(skb, encrypt_key);
+ 		set_identity(skb, SECLABEL);
+ 	}
++#endif
+ #endif
+ 	return TC_ACT_OK;
+ }
+@@ -475,7 +477,7 @@ skip_service_lookup:
+ 		if (info != NULL && info->sec_label) {
+ 			*dstID = info->sec_label;
+ 			tunnel_endpoint = info->tunnel_endpoint;
+-			encrypt_key = info->key;
++			encrypt_key = get_min_encrypt_key(info->key);
+ 		} else {
+ 			*dstID = WORLD_ID;
+ 		}
+@@ -666,11 +668,13 @@ pass_to_stack:
+ 
+ 	send_trace_notify(skb, TRACE_TO_STACK, SECLABEL, *dstID, 0, 0,
+ 			  forwarding_reason, monitor);
++#ifndef ENCAP_IFINDEX
+ #ifdef ENABLE_IPSEC
+ 	if (*dstID > WORLD_ID && encrypt_key) {
+ 		set_encrypt_key(skb, encrypt_key);
+ 		set_identity(skb, SECLABEL);
+ 	}
++#endif
+ #endif
+ 	cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, 0);
+ 	return TC_ACT_OK;
+
+
+
+
+@@ -286,7 +286,9 @@ static inline int handle_ipv6(struct __sk_buff *skb, __u32 src_identity)
+ 	dst = (union v6addr *) &ip6->daddr;
+ 	info = ipcache_lookup6(&IPCACHE_MAP, dst, V6_CACHE_KEY_LEN);
+ 	if (secctx > WORLD_ID && info && info->key) {
+-		set_encrypt_key(skb, info->key);
++		__u8 key = get_min_encrypt_key(info->key);
++
++		set_encrypt_key(skb, key);
+ 		set_identity(skb, secctx);
+ 	}
+ #endif
+@@ -491,7 +493,9 @@ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ #ifdef ENABLE_IPSEC
+ 	info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr, V4_CACHE_KEY_LEN);
+ 	if (secctx > WORLD_ID && info && info->key) {
+-		set_encrypt_key(skb, info->key);
++		__u8 key = get_min_encrypt_key(info->key);
++
++		set_encrypt_key(skb, key);
+ 		set_identity(skb, secctx);
+ 	}
+ #endif
+
+
+
+
+@@ -358,6 +358,19 @@ static inline void __inline__ set_identity(struct __sk_buff *skb, __u32 identity
+ 	skb->mark |= ((identity & 0xFFFF) << 16) | ((identity & 0xFF0000) >> 16);
+ }
+ 
++/* We cap key index at 4 bits because mark value is used to map skb to key */
++#define MAX_KEY_INDEX 15
++
++/* encrypt_key is the index into the encrypt map */
++struct encrypt_key {
++	__u32 ctx;
++} __attribute__((packed));
++
++/* encrypt_config is the current encryption context on the node */
++struct encrypt_config {
++	__u8 encrypt_key;
++} __attribute__((packed));
++
+ /**
+  * or_encrypt_key - mask and shift key into encryption format
+  */
+
+
+
+
+@@ -138,16 +138,18 @@ encap_and_redirect(struct __sk_buff *skb, struct endpoint_key *k,
+ 
+ #ifdef ENABLE_IPSEC
+ 	if (tunnel->key) {
++		__u8 key = get_min_encrypt_key(tunnel->key);
++
+ 		if (from_host)
+ 			return enacap_and_redirect_nomark_ipsec(skb,
+ 								tunnel->ip4,
+-								tunnel->key,
++								key,
+ 							        seclabel,
+ 								monitor);
+ 		else
+ 			return encap_and_redirect_ipsec(skb,
+ 							tunnel->ip4,
+-							tunnel->key,
++							key,
+ 							seclabel,
+ 							monitor);
+ 	}
+
+
+
+
+@@ -135,4 +135,35 @@ static inline int __inline__ ipv4_local_delivery(struct __sk_buff *skb, int l3_o
+ 	return DROP_MISSED_TAIL_CALL;
+ }
+ 
++static inline __u8 __inline__ get_encrypt_key(__u32 ctx)
++{
++	struct encrypt_key key = {.ctx = ctx};
++	struct encrypt_config *cfg;
++
++	cfg = map_lookup_elem(&ENCRYPT_MAP, &key);
++	/* Having no key info for a context is the same as no encryption */
++	if (!cfg)
++		return 0;
++	return cfg->encrypt_key;
++}
++
++static inline __u8 __inline__ get_min_encrypt_key(__u8 peer_key)
++{
++	__u8 local_key = get_encrypt_key(0);
++
++	/* If both ends can encrypt/decrypt use smaller of the two this
++	 * way both ends will have keys installed assuming key IDs are
++	 * always increasing. However, we have to handle roll-over case
++	 * and to do this safely we assume keys are no more than o

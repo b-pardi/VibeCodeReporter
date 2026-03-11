@@ -1,0 +1,109 @@
+@@ -80,12 +80,18 @@ deny:
+ 	return TC_ACT_SHOT;
+ }
+ 
+-static CALI_BPF_INLINE int calico_tc_skb_accepted(
+-	struct __sk_buff *skb,
+-	struct iphdr *ip_header,
+-	struct cali_tc_state *state,
+-	struct calico_nat_dest *nat_dest
+-);
++struct fwd {
++	int res;
++	uint32_t fib_flags;
++	uint32_t mark;
++	enum calico_reason reason;
++	bool fib;
++};
++
++static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct __sk_buff *skb,
++							 struct iphdr *ip_header,
++							 struct cali_tc_state *state,
++							 struct calico_nat_dest *nat_dest);
+ 
+ static CALI_BPF_INLINE bool skb_too_short(struct __sk_buff *skb)
+ {
+@@ -133,46 +139,113 @@ static CALI_BPF_INLINE int skb_nat_l4_csum_ipv4(struct __sk_buff *skb, size_t of
+ 	return ret;
+ }
+ 
+-static CALI_BPF_INLINE int calico_try_fib(struct __sk_buff *skb, struct cali_tc_state *state,
+-					  struct bpf_fib_lookup *fib_params, uint32_t fib_flags)
++static CALI_BPF_INLINE int forward_or_drop(struct __sk_buff *skb,
++					   struct cali_tc_state *state,
++					   struct fwd *fwd)
+ {
+-	CALI_DEBUG("Traffic is towards the host namespace, doing Linux FIB lookup\n");
+-	fib_params->l4_protocol = state->ip_proto;
+-	int rc = bpf_fib_lookup(skb, fib_params, sizeof(fib_params), fib_flags);
+-	if (rc == 0) {
+-		CALI_DEBUG("FIB lookup succeeded\n");
+-		// Update the MACs.  NAT may have invalidated pointer into the packet so need to
+-		// revalidate.
+-		if ((void *)(long)skb->data + sizeof(struct ethhdr) > (void *)(long)skb->data_end) {
+-			CALI_DEBUG("BUG: packet got shorter?\n");
+-			return TC_ACT_SHOT;
++	int rc = fwd->res;
++	enum calico_reason reason = fwd->reason;
++
++	if (rc == TC_ACT_SHOT) {
++		goto deny;
++	}
++
++	// Try a short-circuit FIB lookup.
++	if (!CALI_F_L3 && CALI_FIB_LOOKUP_ENABLED && CALI_F_TO_HOST && fwd->fib) {
++		/* XXX we might include the tot_len in the fwd, set it once when
++		 * we get the ip_header the first time and only adjust the value
++		 * when we modify the packet - to avoid geting the header here
++		 * again - it is simpler though.
++		 */
++		if (skb_too_short(skb)) {
++			reason = CALI_REASON_SHORT;
++			CALI_DEBUG("Too short\n");
++			goto deny;
+ 		}
+-		struct ethhdr *eth_hdr = (void *)(long)skb->data;
+-		__builtin_memcpy(&eth_hdr->h_source, &fib_params->smac, sizeof(eth_hdr->h_source));
+-		__builtin_memcpy(&eth_hdr->h_dest, &fib_params->dmac, sizeof(eth_hdr->h_dest));
+-
+-		// Redirect the packet.
+-		CALI_DEBUG("Got Linux FIB hit, redirecting to iface %d.\n", fib_params->ifindex);
+-		return bpf_redirect(fib_params->ifindex, 0);
+-	} else if (rc < 0) {
+-		CALI_DEBUG("FIB lookup failed (bad input): %d.\n", rc);
+-	} else {
+-		CALI_DEBUG("FIB lookup failed (FIB problem): %d.\n", rc);
++		struct iphdr *ip_header = skb_iphdr(skb);
++		struct bpf_fib_lookup fib_params = {
++			.family = 2, /* AF_INET */
++			.tot_len = be16_to_host(ip_header->tot_len),
++			.ifindex = skb->ingress_ifindex,
++			.l4_protocol = state->ip_proto,
++			.sport = state->sport,
++			.dport = state->dport,
++		};
++
++		/* set the ipv4 here, otherwise the ipv4/6 unions do not get
++		 * zeroed properly
++		 */
++		fib_params.ipv4_src = state->ip_src;
++		fib_params.ipv4_dst = state->ip_dst;
++
++		CALI_DEBUG("Traffic is towards the host namespace, doing Linux FIB lookup\n");
++		rc = bpf_fib_lookup(skb, &fib_params, sizeof(fib_params), fwd->fib_flags);
++		if (rc == 0) {
++			CALI_DEBUG("FIB lookup succeeded\n");
++			// Update the MACs.  NAT may have invalidated pointer into the packet so need to
++			// revalidate.
++			if ((void *)(long)skb->data + sizeof(struct ethhdr) > (void *)(long)skb->data_end) {
++				reason = CALI_REASON_SHORT;
++				goto deny;
++			}
++			struct ethhdr *eth_hdr = (void *)(long)skb->data;
++			__builtin_memcpy(&eth_hdr->h_source, fib_params.smac, sizeof(eth_hdr->h_source));
++			__builtin_memcpy(&eth_hdr->h_dest, fib_params.dmac, sizeof(eth_hdr->h_dest));
++
++			// Redirect the packet.
++			CALI_DEBUG("Got Linux FIB hit, redirecting to iface %d.\n", fib_params.ifindex);
++			rc = bpf_redirect(fib_params.ifindex, 0);
++		} else i

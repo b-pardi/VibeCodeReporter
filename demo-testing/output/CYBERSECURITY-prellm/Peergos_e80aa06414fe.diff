@@ -1,0 +1,94 @@
+@@ -259,7 +259,7 @@ public class MessagingTests {
+                 .mapToObj(i -> SigningKeyPair.random(crypto.random, crypto.signer))
+                 .map(p -> new PrivateChatState(new SigningPrivateKeyAndPublicHash(
+                         ContentAddressedStorage.hashKey(p.publicSigningKey), p.secretSigningKey),
+-                        p.publicSigningKey))
++                        p.publicSigningKey, Collections.emptySet()))
+                 .collect(Collectors.toList());
+     }
+ }
+
+
+
+
+@@ -1795,9 +1795,7 @@ public class PeergosNetworkUtils {
+         MessageEnvelope fromA = messages.get(messages.size() - 1);
+         Assert.assertEquals(fromA.payload, msg1);
+ 
+-        // C leaves and deletes their mirror
+-        controllerC = msgC.mergeAllUpdates(controllerC, c.getSocialState().join()).join();
+-        controllerC = msgC.removeMember(controllerC, c.username).join();
++        // C deletes their mirror
+         msgC.deleteChat(controllerC).join();
+ 
+         // B sends a message
+@@ -1810,6 +1808,7 @@ public class PeergosNetworkUtils {
+         List<MessageEnvelope> recentA = controllerA.getRecent();
+         Assert.assertEquals(recentA.get(recentA.size() - 1).payload, msg2);
+         Assert.assertEquals(controllerA.getMemberNames(), Stream.of(a.username, b.username).collect(Collectors.toSet()));
++        Assert.assertTrue(controllerA.deletedMemberNames().contains(c.username));
+     }
+ 
+     public static void editMessage(NetworkAccess network, Random random) {
+
+
+
+
+@@ -17,8 +17,8 @@ public class ChatController {
+ 
+     public final String chatUuid;
+     public final MessageStore store;
++    public final PrivateChatState privateChatState;
+     private final Chat state;
+-    private final PrivateChatState privateChatState;
+     private final LRUCache<MessageRef, MessageEnvelope> cache;
+     private final Hasher hasher;
+     private final Function<Chat, CompletableFuture<Boolean>> committer;
+@@ -62,6 +62,7 @@ public class ChatController {
+     public Set<String> getMemberNames() {
+         return state.members.values().stream()
+                 .filter(m -> !m.removed)
++                .filter(m -> ! privateChatState.deletedMembers.contains(m.username))
+                 .map(m -> m.username)
+                 .collect(Collectors.toSet());
+     }
+@@ -75,6 +76,15 @@ public class ChatController {
+                 .collect(Collectors.toSet());
+     }
+ 
++    public ChatController with(PrivateChatState priv) {
++        return new ChatController(chatUuid, state, store, priv, cache, hasher, committer, mediaCopier, ipfs);
++    }
++
++    @JsMethod
++    public Set<String> deletedMemberNames() {
++        return privateChatState.deletedMembers;
++    }
++
+     @JsMethod
+     public List<MessageEnvelope> getRecent() {
+         return state.getRecent();
+
+
+
+
+@@ -55,7 +55,7 @@ public class Messenger {
+         PublicKeyHash preHash = ContentAddressedStorage.hashKey(chatIdentity.publicSigningKey);
+         SigningPrivateKeyAndPublicHash chatIdWithHash =
+                 new SigningPrivateKeyAndPublicHash(preHash, chatIdentity.secretSigningKey);
+-        return new PrivateChatState(chatIdWithHash, chatIdentity.publicSigningKey);
++        return new PrivateChatState(chatIdWithHash, chatIdentity.publicSigningKey, Collections.emptySet());
+     }
+ 
+     @JsMethod
+@@ -160,9 +160,19 @@ public class Messenger {
+                         .thenCompose(controller -> controller.join(context.signer)));
+     }
+ 
++    private CompletableFuture<ChatController> updatePrivateState(PrivateChatState state, ChatController current) {
++        Path chatPath = getChatPath(context.username, current.chatUuid);
++        byte[] rawPrivateChatState = state.serialize();
++        return context.getByPath(chatPath)
++                .thenCompose(dopt -> dopt.get().uploadOrReplaceFile(PRIVATE_CHAT_STATE,
++                                                AsyncReader.build(rawPrivateChatState), rawPrivateChatState.length, network,
++                                                crypt

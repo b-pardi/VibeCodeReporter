@@ -1,0 +1,93 @@
+@@ -34,6 +34,8 @@ class ParserInterface : public NetworkInterface {
+  private:
+   struct FlowFieldMap *map;
+   bool once;
++  time_t latest_flow_collection_drops_check;
++  u_int32_t latest_flow_collection_drops;
+   u_int64_t zmq_initial_bytes, zmq_initial_pkts,
+     zmq_remote_initial_exported_flows;
+   ZMQ_RemoteStats *zmq_remote_stats, *zmq_remote_stats_shadow;
+@@ -59,6 +61,7 @@ class ParserInterface : public NetworkInterface {
+   u_int8_t parseCounter(const char * const payload, int payload_size, u_int8_t source_id, void *data);
+   u_int8_t parseOption(const char * const payload, int payload_size, u_int8_t source_id, void *data);
+ 
++  void checkRemoteStats();
+   virtual void setRemoteStats(ZMQ_RemoteStats *zrs);
+ #ifdef NTOPNG_PRO
+   virtual bool getCustomAppDetails(u_int32_t remapped_app_id, u_int32_t *const pen, u_int32_t *const app_field, u_int32_t *const app_id);
+
+
+
+
+@@ -480,6 +480,7 @@
+ #define CONST_INFLUXDB_MAX_DUMP_SIZE       4194304 /* 4 MB */
+ #define CONST_ALERT_MSG_QUEUE              "ntopng.alert_queue"
+ #define CONST_ALERT_MAC_IP_QUEUE           "ntopng.alert_mac_ip_queue"
++#define CONST_ALERT_ZMQ_COLL_DROPS_QUEUE   "ntopng.alert_zmq_flow_collection_drops"
+ #define CONST_ALERT_NFQ_FLUSHED            "ntopng.alert_nfq_flushed_queue"
+ #define CONST_ALERT_HOST_REMOTE_TO_REMOTE  "ntopng.alert_host_remote_to_remote"
+ #define CONST_REMOTE_TO_REMOTE_MAX_QUEUE   32
+
+
+
+
+@@ -31,6 +31,8 @@ ParserInterface::ParserInterface(const char *endpoint, const char *custom_interf
+   zmq_remote_stats = zmq_remote_stats_shadow = NULL;
+   zmq_remote_initial_exported_flows = 0;
+   map = NULL, once = false;
++  latest_flow_collection_drops_check = 0;
++  latest_flow_collection_drops = 0;
+ #ifdef NTOPNG_PRO
+   custom_app_maps = NULL;
+ #endif
+@@ -1280,6 +1282,41 @@ u_int8_t ParserInterface::parseOption(const char * const payload, int payload_si
+ 
+ /* **************************************** */
+ 
++void ParserInterface::checkRemoteStats() {
++  time_t now;
++  int32_t delta_flow_collection_drops;
++  json_object *jobject;
++
++  if(!zmq_remote_stats)
++    return;
++
++  now = time(NULL);
++  delta_flow_collection_drops = zmq_remote_stats->flow_collection_drops - latest_flow_collection_drops;
++
++  if(delta_flow_collection_drops < 0)
++    /* nProbe has been restarted, let's do a reset */
++    latest_flow_collection_drops = latest_flow_collection_drops_check = 0;
++  else if(delta_flow_collection_drops > 0
++	  && (latest_flow_collection_drops_check == 0 /* First check */
++	      || latest_flow_collection_drops_check + CONST_ALERT_GRACE_PERIOD < now /* Additional check after grace period */)) {
++    latest_flow_collection_drops_check = now;
++    latest_flow_collection_drops = zmq_remote_stats->flow_collection_drops;
++
++    /* Add the issue to an alerts queue */
++    if((jobject = json_object_new_object()) != NULL) {
++      json_object_object_add(jobject, "ifname", json_object_new_string(get_name()));
++      json_object_object_add(jobject, "ifid", json_object_new_int(id));
++      json_object_object_add(jobject, "delta_flow_collection_drops", json_object_new_int(delta_flow_collection_drops));
++
++      ntop->getRedis()->rpush(CONST_ALERT_ZMQ_COLL_DROPS_QUEUE, json_object_to_json_string(jobject), 0 /* No trim */);
++
++      json_object_put(jobject);
++    }
++  }
++}
++
++/* **************************************** */
++
+ void ParserInterface::setRemoteStats(ZMQ_RemoteStats *zrs) {
+   if(!zrs) return;
+ 
+@@ -1297,6 +1334,8 @@ void ParserInterface::setRemoteStats(ZMQ_RemoteStats *zrs) {
+      || zrs->num_flow_exports < zmq_remote_initial_exported_flows) /* nProbe has been restarted */
+     zmq_remote_initial_exported_flows = zrs->num_flow_exports;
+ 
++  checkRemoteStats();
++
+   if(zmq_remote_stats_shadow) free(zmq_remote_stats_shadow);
+   zmq_remote_stats_shadow = zmq_remote_stats;
+   zmq_remote_stats = zrs;

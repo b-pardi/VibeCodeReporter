@@ -1,0 +1,120 @@
+@@ -104,7 +104,11 @@ R_API void r_th_set_running(RThread *th, bool b) {
+ }
+ 
+ R_API int r_th_push_task(RThread *th, void *user) {
++	// Push a new task into the thread safely
++	R_RETURN_VAL_IF_FAIL (th, false);
+ 	int ret = true;
++	// Protect user pointer with lock
++	r_th_lock_enter (th->lock);
+ 	th->user = user;
+ 	r_th_lock_leave (th->lock);
+ 	return ret;
+@@ -277,7 +281,10 @@ R_API RThread *r_th_new(RThreadFunction fun, void *user, ut32 delay) {
+ 	return th;
+ }
+ 
++// Signal the thread to stop at the next opportunity
+ R_API void r_th_break(RThread *th) {
++	R_RETURN_IF_FAIL (th);
++	// Set break flag without acquiring thread lock to avoid deadlock
+ 	th->breaked = true;
+ }
+ 
+@@ -286,7 +293,10 @@ R_API bool r_th_kill(RThread *th, bool force) {
+ 		return false;
+ 	}
+ 	// First set breaked flag to signal thread to stop
++	// Protect break flag with lock to ensure visibility
++	r_th_lock_enter (th->lock);
+ 	th->breaked = true;
++	r_th_lock_leave (th->lock);
+ 	// If force is true, kill the thread immediately
+ 	if (force) {
+ #if HAVE_PTHREAD
+@@ -336,8 +346,14 @@ R_API int r_th_wait(struct r_th_t *th) {
+ 	return ret;
+ }
+ 
++// Check if a thread is still running without blocking
+ R_API int r_th_wait_async(struct r_th_t *th) {
+-	return th->running;
++	R_RETURN_VAL_IF_FAIL (th, false);
++	// Safely read the running flag
++	r_th_lock_enter (th->lock);
++	bool running = th->running;
++	r_th_lock_leave (th->lock);
++	return running;
+ }
+ 
+ R_API void *r_th_free(struct r_th_t *th) {
+
+
+
+
+@@ -35,7 +35,7 @@ R_API RThreadChannel *r_th_channel_new(RThreadFunction consumer, void *user) {
+ 		free (tc);
+ 		return NULL;
+ 	}
+-	// Create consumer thread
++	// Create consumer thread (caller must call r_th_start to launch)
+ 	tc->consumer = r_th_new (consumer, user, 0);
+ 	if (!tc->consumer) {
+ 		r_list_free (tc->stack);
+@@ -72,7 +72,8 @@ R_API RThreadChannelMessage *r_th_channel_message_new(RThreadChannel *tc, const
+ 		cm->id = tc->nextid;
+ 		cm->msg = r_mem_dup (msg, len);
+ 		cm->len = len;
+-		cm->sem = r_th_sem_new (1);
++		// Initialize message semaphore to 0 so readers block until posted
++		cm->sem = r_th_sem_new (0);
+ 		// r_th_sem_wait (cm->sem); // busy because stack is empty
+ 		cm->lock = r_th_lock_new (false); // locked here
+ 	}
+@@ -82,46 +83,36 @@ R_API RThreadChannelMessage *r_th_channel_message_new(RThreadChannel *tc, const
+ R_API RThreadChannelMessage *r_th_channel_message_read(RThreadChannel *tc, RThreadChannelMessage *cm) {
+ 	R_LOG_DEBUG ("r_th_channel_message_read");
+ 	if (cm) {
+-		eprintf ("wait\n");
+ 		r_th_sem_wait (cm->sem);
+-		eprintf ("waited\n");
+ 	} else {
+-		eprintf ("not waited\n");
+ 		// Don't create a dangling reference
+ 	}
+ 	return cm;
+ }
+ 
+ R_API RThreadChannelMessage *r_th_channel_promise_wait(RThreadChannelPromise *promise) {
+-	// wait for a message to be delivered, find one with the same promise id
+-	// RThreadChannelMessage *message = r_th_channel_message_new (promise->tc, "x", 0);
+-	// append message into the queue
+-	if (!promise || !promise->tc) {
+-		R_LOG_ERROR ("Invalid promise or thread channel in r_th_channel_promise_wait");
++	if (!promise || !promise->tc || !promise->message) {
++		R_LOG_ERROR("Invalid promise or thread channel in r_th_channel_promise_wait");
+ 		return NULL;
+ 	}
+-
+-	while (true) {
++	RThreadChannel *tc = promise->tc;
++	RThreadChannelMessage *cm = promise->message;
++	// Wait for the consumer to signal the response
++	r_th_sem_wait(cm->sem);
++	// Remove the message from the responses list to avoid double-free
++	if (tc->responses) {
++		r_th_lock_enter(tc->lock);
+ 		RListIter *iter;
+ 		RThreadChannelMessage *res;
+-		if (!r_th_lock_enter (promise->tc->lock)) {
+-			R_LOG_ERROR ("Failed to acquire lock in r_th_channel_promise_wait");
+-			break;
+-		}
+-		if (promise->tc->responses) {
+-			r_list_foreach (promise->tc->responses, iter, res) {
+-				if (res && res->id == promise->id) {
+-					r_list_split_iter (promise->tc->responses, iter);
+-					r_th_lock_leave (promise->tc->lock);
+-					return res;
+-				}
++		r_list_foreach(tc->res

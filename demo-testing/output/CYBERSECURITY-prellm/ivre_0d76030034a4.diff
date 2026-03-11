@@ -1,0 +1,118 @@
+@@ -25,6 +25,7 @@ active (nmap & view) purposes.
+ from bisect import bisect_left
+ from datetime import datetime
+ from itertools import chain
++import json
+ import os
+ import re
+ from textwrap import wrap
+@@ -47,9 +48,17 @@ from ivre.active.cpe import add_cpe_values
+ from ivre.config import DATA_PATH, VIEW_SYNACK_HONEYPOT_COUNT
+ from ivre.data.microsoft.exchange import EXCHANGE_BUILDS
+ from ivre.data.abuse_ch.sslbl import SSLBL_CERTIFICATES, SSLBL_JA3
+-from ivre.types import ParsedCertificate, Tag
+-from ivre.types.active import HttpHeader, NmapAddress, NmapHost, NmapPort, NmapScript
++from ivre.types import NmapServiceMatch, ParsedCertificate, Tag
++from ivre.types.active import (
++    HttpHeader,
++    NmapAddress,
++    NmapHost,
++    NmapHostname,
++    NmapPort,
++    NmapScript,
++)
+ from ivre.utils import (
++    IPV4ADDR,
+     LOGGER,
+     TORCERT_SUBJECT,
+     get_domains,
+@@ -1301,6 +1310,193 @@ def merge_host_docs(rec1: NmapHost, rec2: NmapHost) -> NmapHost:
+     return rec
+ 
+ 
++_EXPR_INDEX_OF = re.compile(
++    b"<title[^>]*> *(?:index +of|directory +listing +(?:of|for))",
++    re.I,
++)
++_EXPR_FILES = [
++    re.compile(
++        b'<a href="(?P<filename>[^"]+)">[^<]+</a></td><td[^>]*> *'
++        b"(?P<time>[0-9]+-[a-z0-9]+-[0-9]+ [0-9]+:[0-9]+) *"
++        b"</td><td[^>]*> *(?P<size>[^<]+)</td>",
++        re.I,
++    ),
++    re.compile(
++        b'<a href="(?P<filename>[^"]+)">[^<]+</a> *'
++        b"(?P<time>[0-9]+-[a-z0-9]+-[0-9]+ [0-9]+:[0-9]+) *"
++        b"(?P<size>[^ \r\n]+)",
++        re.I,
++    ),
++    re.compile(b'<li><a href="(?P<filename>[^"]+)">(?P=filename)</a>'),
++]
++
++
++def create_http_ls(data: bytes, volname: str = "???") -> Optional[NmapScript]:
++    """Produces an http-ls script output (both structured and human
++    readable) from the content of an HTML page. Used for Zgrab and Masscan
++    results.
++
++    """
++    match = _EXPR_INDEX_OF.search(data)
++    if match is None:
++        return None
++    files = []
++    for pattern in _EXPR_FILES:
++        for match in pattern.finditer(data):
++            files.append(
++                {
++                    key: nmap_encode_data(value)
++                    for key, value in match.groupdict().items()
++                }
++            )
++    if not files:
++        return None
++    output = []
++    output.append("Volume %s" % volname)
++    title = ["size", "time", "filename"]
++    column_width = [len(t) for t in title[:-1]]
++    for fobj in files:
++        for i, t in enumerate(title[:-1]):
++            column_width[i] = max(column_width[i], len(fobj.get(t, "-")))
++    line_fmt = "%%(size)-%ds  %%(time)-%ds  %%(filename)s" % tuple(column_width)
++    output.append(line_fmt % dict((t, t.upper()) for t in title))
++    for fobj in files:
++        output.append(line_fmt % dict({"size": "-", "time": "-"}, **fobj))
++    output.append("")
++    return {
++        "id": "http-ls",
++        "output": "\n".join(output),
++        "ls": {"volumes": [{"volume": volname, "files": files}]},
++    }
++
++
++def create_elasticsearch_service(data: bytes) -> Optional[NmapServiceMatch]:
++    """Produces the service_* attributes from the (JSON) content of an
++    HTTP response. Used for Zgrab and Masscan results.
++
++    """
++    try:
++        data_p = json.loads(data)
++    except (json.JSONDecodeError, UnicodeDecodeError):
++        return None
++    if not isinstance(data_p, dict):
++        return None
++    if "tagline" not in data_p:
++        if "error" not in data_p:
++            return None
++        error = data_p["error"]
++        if isinstance(error, str):
++            if data_p.get("status") == 401 and error.startswith(
++                "AuthenticationException"
++            ):
++                return {
++                    "service_name": "http",
++                    "service_product": "Elasticsearch REST API",
++                    "service_extrainfo": "Authentication required",
++                    "cpe": ["cpe:/a:elasticsearch:elasticsearch"],
++                }
++            return None

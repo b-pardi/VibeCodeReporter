@@ -1,0 +1,158 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#ifndef __LIB_NEIGH_H_
++#define __LIB_NEIGH_H_
++
++#include <bpf/ctx/ctx.h>
++#include <bpf/api.h>
++
++#include "common.h"
++#include "eth.h"
++
++#ifdef ENABLE_NODEPORT
++#ifdef ENABLE_IPV6
++struct {
++	__uint(type, BPF_MAP_TYPE_LRU_HASH);
++	__type(key, union v6addr);	/* ipv6 addr */
++	__type(value, union macaddr);	/* hw addr */
++	__uint(pinning, LIBBPF_PIN_BY_NAME);
++	__uint(max_entries, NODEPORT_NEIGH6_SIZE);
++} NODEPORT_NEIGH6 __section_maps_btf;
++
++static __always_inline int neigh_record_ip6(struct __ctx_buff *ctx)
++{
++	union macaddr smac = {}, *mac;
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip6))
++		return DROP_INVALID;
++	if (eth_load_saddr(ctx, smac.addr, 0) < 0)
++		return DROP_INVALID;
++
++	mac = map_lookup_elem(&NODEPORT_NEIGH6, &ip6->saddr);
++	if (!mac || eth_addrcmp(mac, &smac)) {
++		int ret = map_update_elem(&NODEPORT_NEIGH6, &ip6->saddr,
++					  &smac, 0);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
++static __always_inline union macaddr *neigh_lookup_ip6(const union v6addr *addr)
++{
++	return map_lookup_elem(&NODEPORT_NEIGH6, addr);
++}
++#endif /* ENABLE_IPV6 */
++
++#ifdef ENABLE_IPV4
++struct {
++	__uint(type, BPF_MAP_TYPE_LRU_HASH);
++	__type(key, __be32);		/* ipv4 addr */
++	__type(value, union macaddr);	/* hw addr */
++	__uint(pinning, LIBBPF_PIN_BY_NAME);
++	__uint(max_entries, NODEPORT_NEIGH4_SIZE);
++} NODEPORT_NEIGH4 __section_maps_btf;
++
++static __always_inline int neigh_record_ip4(struct __ctx_buff *ctx)
++{
++	union macaddr smac = {}, *mac;
++	void *data, *data_end;
++	struct iphdr *ip4;
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip4))
++		return DROP_INVALID;
++	if (eth_load_saddr(ctx, smac.addr, 0) < 0)
++		return DROP_INVALID;
++
++	mac = map_lookup_elem(&NODEPORT_NEIGH4, &ip4->saddr);
++	if (!mac || eth_addrcmp(mac, &smac)) {
++		int ret = map_update_elem(&NODEPORT_NEIGH4, &ip4->saddr,
++					  &smac, 0);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
++static __always_inline union macaddr *neigh_lookup_ip4(const __be32 *addr)
++{
++	return map_lookup_elem(&NODEPORT_NEIGH4, addr);
++}
++#endif /* ENABLE_IPV4 */
++#endif /* ENABLE_NODEPORT */
++#endif /* __LIB_NEIGH_H_ */
+
+
+
+
+@@ -25,29 +25,11 @@
+ #include "host_firewall.h"
+ #include "stubs.h"
+ #include "proxy_hairpin.h"
++#include "neigh.h"
+ 
+ #define CB_SRC_IDENTITY	0
+ 
+ #ifdef ENABLE_NODEPORT
+-#ifdef ENABLE_IPV4
+-struct {
+-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+-	__type(key, __be32);	/* ipv4 addr */
+-	__type(value, union macaddr);	/* hw addr */
+-	__uint(pinning, LIBBPF_PIN_BY_NAME);
+-	__uint(max_entries, NODEPORT_NEIGH4_SIZE);
+-} NODEPORT_NEIGH4 __section_maps_btf;
+-#endif /* ENABLE_IPV4 */
+-
+-#ifdef ENABLE_IPV6
+-struct {
+-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+-	__type(key, union v6addr);	/* ipv6 addr */
+-	__type(value, union macaddr);	/* hw addr */
+-	__uint(pinning, LIBBPF_PIN_BY_NAME);
+-	__uint(max_entries, NODEPORT_NEIGH6_SIZE);
+-} NODEPORT_NEIGH6 __section_maps_btf;
+-
+ /* The IPv6 extension should be 8-bytes aligned */
+ struct dsr_opt_v6 {
+ 	__u8 nexthdr;
+@@ -58,7 +40,6 @@ struct dsr_opt_v6 {
+ 	__be16 port;
+ 	__u16 pad;
+ };
+-#endif /* ENABLE_IPV6 */
+ 
+ static __always_inline bool nodeport_uses_dsr(__u8 nexthdr __maybe_unused)
+ {
+@@ -924,11 +905,8 @@ skip_service_lookup:
+ 	backend_local = __lookup_ip6_endpoint(&tuple.daddr);
+ 	if (!backend_local && lb6_svc_is_hostport(svc))
+ 		return DROP_INVALID;
+-
+ 	if (backend_local || !nodeport_uses_dsr6(&tuple)) {
+ 		struct ct_state ct_state = {};
+-		union macaddr smac = {0};
+-		union macaddr *mac;
+ 
+ 		ret = ct_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off,
+ 				 CT_EGRESS, &ct_state, &monitor);
+@@ -954,19 +932,9 @@ redo:
+ 			return DROP_UNKNOWN_CT;
+ 		}
+ 
+-		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+-			return DROP_INVALID;
+-		if (eth_load_saddr(ctx, smac.addr, 0) < 0)
+-			return DROP_INVALID;
+-
+-		mac = map_lookup

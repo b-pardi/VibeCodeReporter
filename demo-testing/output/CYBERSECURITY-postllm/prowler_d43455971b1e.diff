@@ -1,0 +1,108 @@
+@@ -383,9 +383,13 @@ def _process_finding_micro_batch(
+     mappings_to_create = []
+     dirty_resources = {}
+     resource_denormalized_data = []  # (finding_instance, resource_instance) pairs
++    skipped_findings_count = 0  # Track findings skipped due to UID length
+ 
+     # Prefetch last statuses for all findings in this batch
+-    finding_uids = [f.uid for f in findings_batch if f is not None]
++    # TEMPORARY WORKAROUND: Filter out UIDs > 300 chars to avoid query errors
++    finding_uids = [
++        f.uid for f in findings_batch if f is not None and len(f.uid) <= 300
++    ]
+     with rls_transaction(tenant_id, using=READ_REPLICA_ALIAS):
+         last_statuses = {
+             item["uid"]: (item["status"], item["first_seen_at"])
+@@ -485,6 +489,20 @@ def _process_finding_micro_batch(
+ 
+         # Prepare finding data
+         finding_uid = finding.uid
++
++        # TEMPORARY WORKAROUND: Skip findings with UID > 300 chars
++        # TODO: Remove this after implementing text field migration for finding.uid
++        if len(finding_uid) > 300:
++            skipped_findings_count += 1
++            logger.warning(
++                f"Skipping finding with UID exceeding 300 characters. "
++                f"Length: {len(finding_uid)}, "
++                f"Check: {finding.check_id}, "
++                f"Resource: {finding.resource_name}, "
++                f"UID: {finding_uid}"
++            )
++            continue
++
+         last_status, last_first_seen_at = last_status_cache.get(
+             finding_uid, (None, None)
+         )
+@@ -606,6 +624,13 @@ def _process_finding_micro_batch(
+             batch_size=1000,
+         )
+ 
++    # Log skipped findings summary
++    if skipped_findings_count > 0:
++        logger.warning(
++            f"Scan {scan_instance.id}: Skipped {skipped_findings_count} finding(s) "
++            f"due to UID length exceeding 300 characters in this micro-batch."
++        )
++
+ 
+ def perform_prowler_scan(
+     tenant_id: str,
+
+
+
+
+@@ -1543,6 +1543,108 @@ class TestProcessFindingMicroBatch:
+         assert resource_cache[finding.resource_uid].service == finding.service_name
+         assert tag_cache.keys() == {("team", "devsec")}
+ 
++    def test_process_finding_micro_batch_skips_long_uid(
++        self, tenants_fixture, scans_fixture
++    ):
++        """Test that findings with UID > 300 chars are skipped (temporary workaround)."""
++        tenant = tenants_fixture[0]
++        scan = scans_fixture[0]
++        provider = scan.provider
++
++        # Create a finding with UID > 300 chars
++        long_uid = (
++            "prowler-aws-ec2_instance_public_ip-123456789012-us-east-1-" + "x" * 250
++        )
++        assert len(long_uid) > 300
++
++        finding_with_long_uid = FakeFinding(
++            uid=long_uid,
++            status=StatusChoices.FAIL,
++            status_extended="public instance",
++            severity=Severity.high,
++            check_id="ec2_instance_public_ip",
++            resource_uid="arn:aws:ec2:us-east-1:123456789012:instance/i-long",
++            resource_name="i-long-uid-instance",
++            region="us-east-1",
++            service_name="ec2",
++            resource_type="instance",
++            resource_tags={},
++            resource_metadata={},
++            resource_details={},
++            partition="aws",
++            raw={},
++            compliance={},
++            metadata={},
++            muted=False,
++        )
++
++        # Create a normal finding that should be processed
++        normal_finding = FakeFinding(
++            uid="finding-normal",
++            status=StatusChoices.PASS,
++            status_extended="all good",
++            severity=Severity.low,
++            check_id="s3_bucket_encryption",
++            resource_uid="arn:aws:s3:::bucket-normal",
++            resource_name="bucket-normal",
++            region="us-east-1",
++            service_name="s3",
++            resource_type="bucket",
++            resource_tags={},
++            resource_metadata={},
++            

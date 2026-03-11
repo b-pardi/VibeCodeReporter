@@ -1,0 +1,184 @@
+@@ -243,4 +243,50 @@ typedef struct {
+ 	uint32_t pad;
+ } cache_img_t;
+ 
++typedef struct {
++	uint32_t version;
++	uint32_t page_size;
++	uint32_t page_starts_offset;
++	uint32_t page_starts_count;
++	uint32_t page_extras_offset;
++	uint32_t page_extras_count;
++	uint64_t delta_mask;
++	uint64_t value_add;
++} cache_slide2_t;
++
++typedef struct
++{
++	uint32_t version;
++	uint32_t imageExtrasCount;
++	uint32_t imagesExtrasOffset;
++	uint32_t bottomUpListOffset;
++	uint32_t dylibTrieOffset;
++	uint32_t dylibTrieSize;
++	uint32_t initializersOffset;
++	uint32_t initializersCount;
++	uint32_t dofSectionsOffset;
++	uint32_t dofSectionsCount;
++	uint32_t reExportListOffset;
++	uint32_t reExportCount;
++	uint32_t depListOffset;
++	uint32_t depListCount;
++	uint32_t rangeTableOffset;
++	uint32_t rangeTableCount;
++	uint64_t dyldSectionAddr;
++} cache_accel_t;
++
++typedef struct
++{
++	uint64_t exportsTrieAddr;
++	uint64_t weakBindingsAddr;
++	uint32_t exportsTrieSize;
++	uint32_t weakBindingsSize;
++	uint32_t dependentsStartArrayIndex;
++	uint32_t reExportsStartArrayIndex;
++} cache_imgxtr_t;
++
++#define DYLD_CACHE_SLIDE_PAGE_ATTRS 0xC000
++#define DYLD_CACHE_SLIDE_PAGE_ATTR_EXTRA 0x8000
++#define DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE 0x4000
++#define DYLD_CACHE_SLIDE_PAGE_ATTR_END 0x8000
+ #endif
+
+
+
+
+@@ -4,29 +4,386 @@
+ #include <r_util.h>
+ #include <r_lib.h>
+ #include <r_bin.h>
++#include <r_core.h>
++#include <r_io.h>
+ // #include "../format/mach0/mach0_defines.h"
+ #define R_BIN_MACH064 1
+ #include "../format/mach0/mach0.h"
++#include "objc/mach0_classes.h"
+ 
+-static ut64 va2pa(uint64_t addr, cache_hdr_t *hdr, RBuffer *cache_buf) {
++typedef struct {
++	ut64 start_of_data;
++	ut16 *page_starts;
++	ut32 page_starts_count;
++	ut16 *page_extras;
++	ut32 page_extras_count;
++	ut64 delta_mask;
++	ut64 value_mask;
++	ut32 delta_shift;
++	ut64 value_add;
++	ut32 page_size;
++	ut64 slide;
++	ut8 *one_page_buf;
++} RDyldRebaseInfo;
++
++typedef struct _r_dyldcache {
++	ut8 magic[8];
++	RList *bins;
++	RBuffer *buf;
++	int (*original_io_read)(RIO *io, RIODesc *fd, ut8 *buf, int count);
++	RDyldRebaseInfo *rebase_info;
++	cache_hdr_t *hdr;
++	cache_map_t *maps;
++	cache_accel_t *accel;
++} RDyldCache;
++
++typedef struct _r_bin_image {
++	char *file;
++	ut64 header_at;
++} RDyldBinImage;
++
++static void free_bin(RDyldBinImage *bin) {
++	if (!bin) {
++		return;
++	}
++
++	if (bin->file) {
++		free (bin->file);
++		bin->file = NULL;
++	}
++
++	R_FREE (bin);
++}
++
++static void rebase_info_free(RDyldRebaseInfo *rebase_info) {
++	if (!rebase_info) {
++		return;
++	}
++
++	if (rebase_info->page_starts) {
++		free (rebase_info->page_starts);
++		rebase_info->page_starts = NULL;
++	}
++
++	if (rebase_info->page_extras) {
++		free (rebase_info->page_extras);
++		rebase_info->page_extras = NULL;
++	}
++
++	if (rebase_info->one_page_buf) {
++		free (rebase_info->one_page_buf);
++		rebase_info->one_page_buf = NULL;
++	}
++
++	R_FREE (rebase_info);
++}
++
++static void r_dyldcache_free(RDyldCache *cache) {
++	if (!cache) {
++		return;
++	}
++
++	if (cache->bins) {
++		r_list_free (cache->bins);
++		cache->bins = NULL;
++	}
++
++	if (cache->buf) {
++		r_buf_free (cache->buf);
++		cache->buf = NULL;
++	}
++
++	if (cache->rebase_info) {
++		rebase_info_free (cache->rebase_info);
++		cache->rebase_info = NULL;
++	}
++
++	if (cache->hdr) {
++		free (cache->hdr);
++		cache->hdr = NULL;
++	}
++
++	if (cache->maps) {
++		free (cache->maps);
++		cache->maps = NULL;
++	}
++
++	if (cache->accel) {
++		free (cache->accel);
++		cache->accel = NULL;
++	}
++
++	R_FREE (cache);
++}
++
++static ut64 va2pa(uint64_t addr, cache_hdr_t *hdr, cache_map_t *maps, RBuffer *cache_buf, ut64 slide, ut32 *offset, ut32 *left) {
+ 	ut64 res = UT64_MAX;
+ 	uint32_t i;
+ 
+-	cache_map_t *map = R_NEWS0 (cache_map_t, hdr->mappingCount);
+-	r_buf_read_at (cache_buf, hdr->mappingOffset, (ut8*)map, sizeof (cache_map_t) * hdr->mappingCount);
++	addr -= slide;
+ 
+ 	for (i = 0; i < hdr->mappingCount; ++i) {
+-		if (addr >= map[i].address && addr < map[i].address + map[i].size) {
+-			res = map[i].fileOffset + addr - map[i].address;
++		if (addr >= maps

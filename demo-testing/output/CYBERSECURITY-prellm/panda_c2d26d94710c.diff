@@ -1,0 +1,180 @@
+@@ -3,7 +3,7 @@
+ 
+ #ifdef CONFIG_CAPSTONE
+ 
+-#include <capstone.h>
++#include <capstone/capstone.h>
+ 
+ #else
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,673 @@
++/* PANDABEGINCOMMENT
++ *
++ * Authors:
++ *  Michael Bel            bellma@ornl.gov
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2.
++ * See the COPYING file in the top-level directory.
++ *
++PANDAENDCOMMENT */
++// This needs to be defined before anything is included in order to get
++// the PRIx64 macro
++#define __STDC_FORMAT_MACROS
++
++#include <list>
++#include <string>
++#include <map>
++#include <memory>
++#include <unordered_set>
++#include <sstream>
++
++#include "panda/plugin.h"
++#include "osi/osi_types.h"
++#include "osi/osi_ext.h"
++#include "syscalls2/syscalls_ext_typedefs.h"
++#include "syscalls2/syscalls2_info.h"
++#include "syscalls2/syscalls2_ext.h"
++
++
++#include "hooks2.h"
++
++extern "C" {
++bool init_plugin(void *);
++void uninit_plugin(void *);
++}
++
++#if defined(TARGET_ARM) || defined(TARGET_I386) || defined(TARGET_X86_64)
++
++extern "C" {
++PPP_PROT_REG_CB(on_prog_start);
++PPP_PROT_REG_CB(on_prog_end);
++}
++
++PPP_CB_BOILERPLATE(on_prog_start);
++PPP_CB_BOILERPLATE(on_prog_end);
++
++
++struct HashableOsiThread {
++    target_pid_t pid;
++    target_pid_t tid;
++
++    bool operator==(const HashableOsiThread &p) const
++    {
++         return pid == p.pid && tid == p.tid;
++    }
++};
++
++template<> struct std::hash<HashableOsiThread>
++{
++    inline size_t operator()(const HashableOsiThread &thread) const
++    {
++        std::hash<int> hasher;
++        return (hasher(thread.pid) ^ hasher(thread.tid));
++    }
++};
++
++
++struct callback_info {
++    panda_cb_type type;
++    panda_cb cb;
++};
++
++struct hook_cfg {
++    bool is_kernel;
++    std::shared_ptr<std::string> procname;
++    std::shared_ptr<std::string> libname;
++    target_ulong trace_start;
++    target_ulong trace_stop;
++    target_ulong range_begin;
++    target_ulong range_end;
++    hooks2_func_t hook_func;
++    void *cb_data;
++
++    int index;
++    bool active;
++    bool enabled;
++};
++
++struct active_trace {
++    std::shared_ptr<struct hook_cfg> cfg;
++    std::unordered_set<HashableOsiThread> active_threads;
++    bool resolved;
++    target_ulong resolved_trace_start;
++    target_ulong resolved_trace_stop;
++    target_ulong resolved_range_begin;
++    target_ulong resolved_range_end;
++};
++
++struct global_hooks2_data {
++    /* Configuration */
++    bool disable_chaining;
++    std::list<std::shared_ptr<struct hook_cfg> > hook_cfg;
++    int hook_idx;
++
++    /* Dynamic */
++    struct callback_info cb_tracing;
++    struct callback_info cb_pend_procname;
++    struct callback_info cb_asid_changed;
++
++    void *self;
++    std::list< std::shared_ptr<struct hook_cfg> > kernel_traces;
++    std::map<target_ulong, std::list< std::shared_ptr<struct active_trace> >> map_active_utraces;
++
++    std::map<target_pid_t, std::string> pid_map;
++};
++
++static struct global_hooks2_data plugin;
++
++
++static void
++register_callback(struct callback_info &cb)
++{
++    panda_register_callback(plugin.self, cb.type, cb.cb);
++}
++
++static void
++enable_callback(struct callback_info &cb)
++{
++    if (!panda_is_callback_enabled(plugin.self, cb.type, cb.cb)) {
++        panda_enable_callback(plugin.self, cb.type, cb.cb);
++    }
++}
++
++static void
++disable_callback(struct callback_info &cb)
++{
++    if (panda_is_callback_enabled(plugin.self, cb.type, cb.cb)) {
++        panda_disable_callback(plugin.self, cb.type, cb.cb);
++    }
++}
++
++static bool
++traces_empty()
++{
++    for (auto &element : plugin.map_active_utraces) {
++        if (!element.second.empty())
++            return false;
++    }
++    return true;
++}
++
++static bool
++in_range(TranslationBlock *tb, target_ulong value)
++{
++    return ((value >= tb->pc) && (value < (tb->pc + tb->size)));
++}
++
++static void
++handle_userspace_traces(
++    CPUState *cpu,
++    TranslationBlock *tb,
++    std::shared_ptr<struct active_trace> &trace)
++{
++
++    OsiThread *pThread = get_current_thread(cpu);
++    if (pThread == NULL

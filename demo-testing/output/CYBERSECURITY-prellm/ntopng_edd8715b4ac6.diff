@@ -1,0 +1,163 @@
+@@ -34,6 +34,8 @@ extern "C" {
+ #include "rrd.h"
+ };
+ 
++#include "../third-party/speedtest.c"
++
+ struct keyval string_to_replace[MAX_NUM_HTTP_REPLACEMENTS] = { { NULL, NULL } }; /* TODO remove */
+ static int live_extraction_num = 0;
+ static Mutex live_extraction_num_lock;
+@@ -2871,6 +2873,20 @@ static int ntop_script_get_deadline(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_speedtest(lua_State* vm) {
++  json_object *rc = speedtest();
++
++  if(rc) {
++    lua_pushstring(vm, json_object_to_json_string(rc));
++    json_object_put(rc);
++  } else
++    lua_pushnil(vm);
++  
++  return(CONST_LUA_OK);
++}
++
++/* ****************************************** */
++
+ /* curl -i -XPOST "http://localhost:8086/write?precision=s&db=ntopng" --data-binary 'profile:traffic,ifid=0,profile=a profile bytes=2506351 1559634840' */
+ static int ntop_append_influx_db(lua_State* vm) {
+   bool rv = false;
+@@ -11860,6 +11876,9 @@ static const luaL_Reg ntop_reg[] = {
+   { "isDeadlineApproaching",     ntop_script_is_deadline_approaching },
+   { "getDeadline",               ntop_script_get_deadline            },
+ 
++  /* Speedtest */
++  { "speedtest",                 ntop_speedtest                      },
++  
+   { NULL,          NULL}
+ };
+ 
+
+
+
+
+@@ -33,7 +33,8 @@ bool SerializableElement::serializeToRedis() {
+     serialize(my_obj, details_max);
+ 
+     rc = ntop->getRedis()->set(getSerializationKey(key, sizeof(key)),
+-      json_object_to_json_string(my_obj), ntop->getPrefs()->get_local_host_cache_duration());
++      json_object_to_json_string(my_obj),
++			       ntop->getPrefs()->get_local_host_cache_duration());
+ 
+     json_object_put(my_obj);
+     return(rc == 0);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,800 @@
++/* 
++   Code taken from
++   https://github.com/compex-systems/speedtest-cli 
++*/
++
++#ifdef HAVE_EXPAT
++
++#include <float.h>
++#include <math.h>
++#include "expat.h"
++
++#define URL_LENGTH_MAX       255
++#define THREAD_NUM_MAX       10
++#define UPLOAD_EXT_LENGTH_MAX 5
++#define SPEEDTEST_TIME_MAX   10
++#define CUNTRY_NAME_MAX      64
++#define UPLOAD_EXTENSION_TAG "upload_extension"
++#define LATENCY_TXT_URL "/speedtest/latency.txt"
++
++#define INIT_DOWNLOAD_FILE_RESOLUTION 750
++#define FILE_350_SIZE                 245388
++
++#define MAX_ISP_NAME         255
++#define MAX_IPADDRESS_STRLEN 48
++#define MAX_CLOSEST_SERVER_NUM 5
++
++#define RECORED_EVERY_SEC    0.2
++#define PRINT_RECORED_NUM    2
++
++#define PI                      3.1415926
++#define EARTH_RADIUS            6378.137
++
++#define UPLOAD_CHRUNK_SIZE_MAX  512000 // Max upload chunk size 512K
++
++#define OK  0
++#define NOK 1
++
++#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
++
++struct thread_para
++{
++  pthread_t    tid;
++  char         url[URL_LENGTH_MAX + 32];
++  long         result;
++  long         upload_size;
++  long         chunk_size;
++  double       now;
++  char         finish;
++  pthread_mutex_t lock;
++};
++
++
++struct web_buffer
++{
++  char *data;
++  int   size;
++};
++
++struct client_info
++{
++  char   ip[MAX_IPADDRESS_STRLEN];
++  double lat;
++  double lon;
++  char   isp[MAX_ISP_NAME];
++};
++
++struct server_info
++{
++  char   url[URL_LENGTH_MAX];
++  double lat;
++  double lon;
++  char   country[CUNTRY_NAME_MAX];
++  int    id;
++  double distance;
++};
++
++int depth;
++struct client_info client;
++struct server_info servers[MAX_CLOSEST_SERVER_NUM];
++
++static int calc_past_time(struct timeval* start, struct timeval* end)
++{
++  return (end->tv_sec - start->tv_sec) * 1000 + (end->tv_usec - start->tv_usec)/1000;
++}
++
++static size_t write_data(void* ptr, size_t size, size_t nmemb, void *stream)
++{
++  struct thread_para *p_thread = (struct thread_para*)stream;
++  if (p_thread) {
++    //p_thread->data++;
++    pthread_mutex_lock(&p_thread->lock);
++    p_thread->now += size * nmemb;
++    pthread_mutex_unlock(&p_thread->lock);
++  }
++  return size * nmemb;
++}
++
++
++#if 1
++void *myrealloc(void *ptr, size_t size)
++{
++  /* There might be a realloc() out there that doesn't like reallocing
++     NULL

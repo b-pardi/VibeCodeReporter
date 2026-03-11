@@ -1,0 +1,153 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,627 @@
++/* radare - LGPL - Copyright 2019 - GustavoLCR */
++
++#include "le.h"
++#include <r_bin.h>
++
++const char *__get_module_type(r_bin_le_obj_t *bin) {
++	switch (bin->header->mflags & M_TYPE_MASK) {
++	case M_TYPE_EXE: return "Program module (EXE)";
++	case M_TYPE_DLL: return "Library module (DLL)";
++	case M_TYPE_PDD: return "Physical Device Driver";
++	case M_TYPE_VDD: return "Virtual Device Driver";
++	default: return "Unknown";
++	}
++}
++
++const char *__get_os_type(r_bin_le_obj_t *bin) {
++	switch (bin->header->os) {
++	case 1: return "OS/2";
++	case 2: return "Windows";
++	case 3: return "DOS 4.x";
++	case 4: return "Windows 386";
++	case 5: return "IBM Microkernel Personality Neutral";
++	default: return "Unknown";
++	}
++}
++
++const char *__get_cpu_type(r_bin_le_obj_t *bin) {
++	switch (bin->header->cpu) {
++	case 1: return "80286";
++	case 2: return "80386";
++	case 3: return "80486";
++	case 0x20: return "N10";
++	case 0x21: return "N11";
++	case 0x40: return "R3000";
++	case 0x41: return "R6000";
++	case 0x42: return "R4000";
++	default: return "Unknown";
++	}
++}
++
++const char *__get_arch(r_bin_le_obj_t *bin) {
++	switch (bin->header->cpu) {
++	case 1:
++	case 2:
++	case 3:
++		return "x86";
++	case 0x20:
++	case 0x21:
++		return "i860";
++	case 0x40:
++	case 0x41:
++	case 0x42:
++		return "mips";
++	default:
++		return "Unknown";
++	}
++}
++
++static char *__read_nonnull_str_at(RBuffer *buf, ut64 *offset) {
++	ut8 size = r_buf_read8_at (buf, *offset);
++	size &= 0x7F; // Max is 127
++	if (!size) {
++		return NULL;
++	}
++	(*offset)++;
++	char *str = calloc ((ut64)size + 1, sizeof (char));
++	r_buf_read_at (buf, *offset, (ut8 *)str, size);
++	*offset += size;
++	return str;
++}
++
++static RBinSymbol *__get_symbol(r_bin_le_obj_t *bin, ut64 *offset) {
++	RBinSymbol *sym = R_NEW0 (RBinSymbol);
++	if (!sym) {
++		return NULL;
++	}
++	char *name = __read_nonnull_str_at (bin->buf, offset);
++	if (!name) {
++		r_bin_symbol_free (sym);
++		return NULL;
++	}
++	sym->name = name;
++	ut16 entry_idx = r_buf_read_le16_at (bin->buf, *offset);
++	*offset += 2;
++	sym->ordinal = entry_idx;
++	return sym;
++}
++
++RList *__get_entries(r_bin_le_obj_t *bin) {
++	ut64 offset = (ut64)bin->header->enttab + bin->headerOff;
++	RList *l = r_list_new ();
++	if (!l) {
++		return NULL;
++	}
++	while (true) {
++		LE_entry_bundle_header header;
++		LE_entry_bundle_entry e;
++		r_buf_read_at (bin->buf, offset, (ut8 *)&header, sizeof (header));
++		if (!header.count) {
++			break;
++		}
++		if ((header.type & ~ENTRY_PARAMETER_TYPING_PRESENT) == UNUSED_ENTRY) {
++			offset += sizeof (header.type) + sizeof (header.count);
++			while (header.count) {
++				r_list_append (l, (ut64 *)-1);
++				header.count--;
++			}
++			continue;
++		}
++		offset += sizeof (LE_entry_bundle_header);
++		bool typeinfo = header.type & ENTRY_PARAMETER_TYPING_PRESENT;
++		int i;
++		for (i = 0; i < header.count; i++) {
++			ut64 entry = -1;
++			r_buf_read_at (bin->buf, offset, (ut8 *)&e, sizeof (e));
++			switch (header.type & ~ENTRY_PARAMETER_TYPING_PRESENT) {
++			case ENTRY16:
++				entry = (ut64)e.entry_16.offset + bin->objtbl[header.objnum - 1].reloc_base_addr;
++				offset += sizeof (e.entry_16);
++				if (typeinfo) {
++					offset += (ut64)(e.entry_16.flags & ENTRY_PARAM_COUNT_MASK) * 2;
++				}
++				break;
++			case CALLGATE:
++				entry = (ut64)e.callgate.offset + bin->objtbl[header.objnum - 1].reloc_base_addr;
++				offset += sizeof (e.callgate);
++				if (typeinfo) {
++					offset += (ut64)(e.callgate.flags & ENTRY_PARAM_COUNT_MASK) * 2;
++				}
++				break;
++			case ENTRY32:
++				entry = (ut64)e.entry_32.offset + bin->objtbl[header.objnum - 1].reloc_base_addr;
++				offset += sizeof (e.entry_32);
++				if (typeinfo) {
++					offset += (ut64)(e.entry_32.flags & ENTRY_PARAM_COUNT_MASK) * 2;
++				}
++				break;
++			case FORWARDER:
++				offset += sizeof (e.forwarder);
++				break;
++			}
++			r_list_append (l, (void *)entry);
++		}
++	}
++	return l;
++}
++
++static void __get_symbols_at(r_bin_le_obj_t *bin, RList *syml, RList *entl, ut64 offset, ut64 end

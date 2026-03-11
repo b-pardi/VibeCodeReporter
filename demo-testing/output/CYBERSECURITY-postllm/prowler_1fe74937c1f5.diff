@@ -1,0 +1,117 @@
+@@ -51,6 +51,7 @@ from prowler.providers.common.audit_info import (
+     set_provider_execution_parameters,
+ )
+ from prowler.providers.common.clean import clean_provider_local_output_directories
++from prowler.providers.common.common import set_global_provider_object
+ from prowler.providers.common.mutelist import set_provider_mutelist
+ from prowler.providers.common.outputs import set_provider_output_options
+ from prowler.providers.common.quick_inventory import run_provider_quick_inventory
+@@ -149,6 +150,7 @@ def prowler():
+ 
+     # Set the audit info based on the selected provider
+     audit_info = set_provider_audit_info(provider, args.__dict__)
++    set_global_provider_object(args)
+ 
+     # Import custom checks from folder
+     if checks_folder:
+
+
+
+
+@@ -6,7 +6,7 @@ from azure.mgmt.subscription import SubscriptionClient
+ from msgraph.core import GraphClient
+ 
+ from prowler.lib.logger import logger
+-from prowler.providers.azure.lib.audit_info.models import Azure_Identity_Info
++from prowler.providers.azure.lib.audit_info.models import AzureIdentityInfo
+ from prowler.providers.azure.lib.regions.regions import get_regions_config
+ 
+ 
+@@ -99,7 +99,7 @@ class Azure_Provider:
+         managed_entity_auth,
+         subscription_ids,
+     ):
+-        identity = Azure_Identity_Info()
++        identity = AzureIdentityInfo()
+ 
+         # If credentials comes from service principal or browser, if the required permissions are assigned
+         # the identity can access AAD and retrieve the tenant domain name.
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,270 @@
++import sys
++from os import getenv
++from typing import Any, Optional
++
++from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
++from azure.mgmt.subscription import SubscriptionClient
++from colorama import Fore, Style
++from msgraph.core import GraphClient
++from pydantic import BaseModel
++
++from prowler.lib.logger import logger
++from prowler.providers.azure.lib.regions.regions import get_regions_config
++from prowler.providers.common.provider import CloudProvider
++
++
++class AzureIdentityInfo(BaseModel):
++    identity_id: str = ""
++    identity_type: str = ""
++    tenant_ids: list[str] = []
++    domain: str = "Unknown tenant domain (missing AAD permissions)"
++    subscriptions: dict = {}
++
++
++class AzureRegionConfig(BaseModel):
++    name: str = ""
++    authority: str = None
++    base_url: str = ""
++    credential_scopes: list = []
++
++
++class AzureProvider(CloudProvider):
++    session: DefaultAzureCredential
++    identity: AzureIdentityInfo
++    audit_resources: Optional[Any]
++    audit_metadata: Optional[Any]
++    audit_config: dict
++    region_config: AzureRegionConfig
++
++    def __init__(self, arguments):
++        logger.info("Setting Azure session ...")
++        subscription_ids = arguments.subscription_ids
++
++        logger.info("Checking if any credentials mode is set ...")
++        az_cli_auth = arguments.az_cli_auth
++        sp_env_auth = arguments.sp_env_auth
++        browser_auth = arguments.browser_auth
++        managed_entity_auth = arguments.managed_identity_auth
++        tenant_id = arguments.tenant_id
++
++        logger.info("Checking if region is different than default one")
++        region = arguments.azure_region
++        self.validate_arguments(
++            az_cli_auth, sp_env_auth, browser_auth, managed_entity_auth, tenant_id
++        )
++        self.region_config = self.setup_region_config(region)
++        self.session = self.setup_session(
++            az_cli_auth, sp_env_auth, browser_auth, managed_entity_auth, tenant_id
++        )
++        self.identity = self.setup_identity(
++            az_cli_auth,
++            sp_env_auth,
++            browser_auth,
++            managed_entity_auth,
++            subscription_ids,
++        )
++        if not arguments.only_logs:
++            self.print_credentials()
++
++    def validate_arguments(
++        self, az_cli_auth, sp_env_auth, browser_auth, managed_entity_auth, tenant_id
++    ):
++        if (
++            

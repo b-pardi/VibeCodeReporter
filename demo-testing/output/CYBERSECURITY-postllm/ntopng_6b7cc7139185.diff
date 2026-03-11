@@ -1,0 +1,111 @@
+@@ -40,8 +40,13 @@ typedef struct {
+   TCPSeqNum tcp_seq_s2d, tcp_seq_d2s;
+   u_int16_t cli2srv_window, srv2cli_window;
+   struct timeval synTime, synAckTime, ackTime; /* network Latency (3-way handshake) */
+-  struct timeval clientNwLatency; /* The RTT/2 between the client and nprobe */
+-  struct timeval serverNwLatency; /* The RTT/2 between nprobe and the server */
++  struct timeval clientRTT3WH, serverRTT3WH; /* Computed at 3WH */
++
++  struct {
++    u_int32_t last_cli_ack, last_srv_ack;
++    struct bpf_timeval last_cli_ts, last_srv_ts;
++    struct ndpi_analyze_struct cli_to_srv, srv_to_cli;
++  } rtt; /* Computed continuously */
+ } FlowTCP;
+ 
+ typedef struct {
+@@ -378,7 +383,7 @@ class Flow : public GenericHashEntry {
+   void updateServerName(Host *h);
+   void allocateCollection();
+   
+- public:
++public:
+   Flow(NetworkInterface *_iface, int32_t iface_idx,
+        u_int16_t _vlanId,
+        u_int16_t _observation_point_id, u_int32_t _private_flow_id,
+@@ -1107,6 +1112,9 @@ inline float get_goodput_bytes_thpt() const { return (goodput_bytes_thpt); };
+   double getSrvRetrPercentage();
+ 
+ #if defined(NTOPNG_PRO)
++  void updateTCPAck(const struct bpf_timeval *when,
++		    bool src2dst_direction, u_int32_t ack_id);
++
+ #if !defined(HAVE_NEDGE)
+   inline void updateProfile() { trafficProfile = iface->getFlowProfile(this); }
+ #endif
+@@ -1194,25 +1202,25 @@ inline float get_goodput_bytes_thpt() const { return (goodput_bytes_thpt); };
+     return (viewFlowStats);
+   }
+ 
+-  inline double getFlowNwLatency(bool client) const {
++  inline double getFlowRTT(bool client) const {
+     if(tcp == NULL)
+       return(0.0);
+     else
+-      return client ? Utils::timeval2ms(&tcp->clientNwLatency)
+-	: Utils::timeval2ms(&tcp->serverNwLatency);
++      return client ? Utils::timeval2ms(&tcp->clientRTT3WH) : Utils::timeval2ms(&tcp->serverRTT3WH);
+   };
+-  inline void setFlowNwLatency(const struct timeval *const tv, bool client) {
++  
++  inline void setFlowRTT(const struct timeval *const tv, bool client) {
+     if(tcp != NULL) {
+       if (client) {
+-	memcpy(&tcp->clientNwLatency, tv, sizeof(*tv));
++	memcpy(&tcp->clientRTT3WH, tv, sizeof(*tv));
+ 
+ 	if (cli_host)
+-	  cli_host->updateRoundTripTime(Utils::timeval2ms(&tcp->clientNwLatency));
++	  cli_host->updateNetworkRTT(Utils::timeval2ms(&tcp->clientRTT3WH));
+       } else {
+-	memcpy(&tcp->serverNwLatency, tv, sizeof(*tv));
++	memcpy(&tcp->serverRTT3WH, tv, sizeof(*tv));
+ 
+ 	if (srv_host)
+-	  srv_host->updateRoundTripTime(Utils::timeval2ms(&tcp->serverNwLatency));
++	  srv_host->updateNetworkRTT(Utils::timeval2ms(&tcp->serverRTT3WH));
+       }
+     }
+   }
+@@ -1224,10 +1232,10 @@ inline float get_goodput_bytes_thpt() const { return (goodput_bytes_thpt); };
+ 	tcp->srv2cli_window = window_val;
+     }
+   }
+-  inline void setRtt() {
++  inline void setRTT() {
+     if(tcp != NULL)
+-      rttSec = ((float)(tcp->serverNwLatency.tv_sec + tcp->clientNwLatency.tv_sec)) +
+-	((float)(tcp->serverNwLatency.tv_usec + tcp->clientNwLatency.tv_usec)) /
++      rttSec = ((float)(tcp->serverRTT3WH.tv_sec + tcp->clientRTT3WH.tv_sec)) +
++	((float)(tcp->serverRTT3WH.tv_usec + tcp->clientRTT3WH.tv_usec)) /
+ 	(float)1000000;
+   }
+   inline void setFlowApplLatency(float latency_msecs) {
+
+
+
+
+@@ -545,7 +545,7 @@ class Host : public GenericHashEntry,
+   void updateFinAckAlertsCounter(time_t when, bool finack_sent);
+ 
+   virtual void updateNetworkRTT(u_int32_t rtt_msecs) { return; }
+-  inline void updateRoundTripTime(u_int32_t rtt_msecs) {
++  inline void updateRoundTripTimexo(u_int32_t rtt_msecs) {
+     if (as) as->updateRoundTripTime(rtt_msecs);
+     updateNetworkRTT(rtt_msecs);
+   }
+
+
+
+
+@@ -53,13 +53,17 @@ Flow::Flow(NetworkInterface *_iface,
+   flow_dropped_counts_increased = 0, protocolErrorCode = 0;
+   srcAS = dstAS = 0, rttSec = 0;
+ 
+-  if(_protocol == IPPROTO_TCP)
++  if(_protocol == IPPROTO_TCP) {
+     tcp = (FlowTCP*)calloc(1, sizeof(FlowTCP));
+-  else
++
++    if(tcp != NULL)
++      ndpi_init_data_analysis(&tcp->rtt.cli_to_srv, 4),

@@ -1,0 +1,98 @@
+@@ -6,8 +6,7 @@ from shutil import rmtree
+ 
+ import matplotlib.pyplot as plt
+ from celery.utils.log import get_task_logger
+-from config.django.base import DJANGO_FINDINGS_BATCH_SIZE, DJANGO_TMP_OUTPUT_DIRECTORY
+-from django.db.models import Count, Q
++from config.django.base import DJANGO_TMP_OUTPUT_DIRECTORY
+ from reportlab.lib import colors
+ from reportlab.lib.enums import TA_CENTER
+ from reportlab.lib.pagesizes import letter
+@@ -26,11 +25,16 @@ from reportlab.platypus import (
+     TableStyle,
+ )
+ from tasks.jobs.export import _generate_compliance_output_directory, _upload_to_s3
+-from tasks.utils import batched
++from tasks.jobs.threatscore import compute_threatscore_metrics
++from tasks.jobs.threatscore_utils import (
++    _aggregate_requirement_statistics_from_database,
++    _calculate_requirements_data_from_statistics,
++    _load_findings_for_requirement_checks,
++)
+ 
+ from api.db_router import READ_REPLICA_ALIAS
+ from api.db_utils import rls_transaction
+-from api.models import Finding, Provider, ScanSummary, StatusChoices
++from api.models import Provider, ScanSummary, StatusChoices, ThreatScoreSnapshot
+ from api.utils import initialize_prowler_provider
+ from prowler.lib.check.compliance_models import Compliance
+ from prowler.lib.outputs.finding import Finding as FindingOutput
+@@ -974,236 +978,6 @@ def _create_dimensions_radar_chart(
+     return buffer
+ 
+ 
+-def _aggregate_requirement_statistics_from_database(
+-    tenant_id: str, scan_id: str
+-) -> dict[str, dict[str, int]]:
+-    """
+-    Aggregate finding statistics by check_id using database aggregation.
+-
+-    This function uses Django ORM aggregation to calculate pass/fail statistics
+-    entirely in the database, avoiding the need to load findings into memory.
+-
+-    Args:
+-        tenant_id (str): The tenant ID for Row-Level Security context.
+-        scan_id (str): The ID of the scan to retrieve findings for.
+-
+-    Returns:
+-        dict[str, dict[str, int]]: Dictionary mapping check_id to statistics:
+-            - 'passed' (int): Number of passed findings for this check
+-            - 'total' (int): Total number of findings for this check
+-
+-    Example:
+-        {
+-            'aws_iam_user_mfa_enabled': {'passed': 10, 'total': 15},
+-            'aws_s3_bucket_public_access': {'passed': 0, 'total': 5}
+-        }
+-    """
+-    requirement_statistics_by_check_id = {}
+-
+-    with rls_transaction(tenant_id, using=READ_REPLICA_ALIAS):
+-        # Use database aggregation to calculate stats without loading findings into memory
+-        aggregated_statistics_queryset = (
+-            Finding.all_objects.filter(tenant_id=tenant_id, scan_id=scan_id)
+-            .values("check_id")
+-            .annotate(
+-                total_findings=Count("id"),
+-                passed_findings=Count("id", filter=Q(status=StatusChoices.PASS)),
+-            )
+-        )
+-
+-        for aggregated_stat in aggregated_statistics_queryset:
+-            check_id = aggregated_stat["check_id"]
+-            requirement_statistics_by_check_id[check_id] = {
+-                "passed": aggregated_stat["passed_findings"],
+-                "total": aggregated_stat["total_findings"],
+-            }
+-
+-    logger.info(
+-        f"Aggregated statistics for {len(requirement_statistics_by_check_id)} unique checks"
+-    )
+-    return requirement_statistics_by_check_id
+-
+-
+-def _load_findings_for_requirement_checks(
+-    tenant_id: str,
+-    scan_id: str,
+-    check_ids: list[str],
+-    prowler_provider,
+-    findings_cache: dict[str, list[FindingOutput]] | None = None,
+-) -> dict[str, list[FindingOutput]]:
+-    """
+-    Load findings for specific check IDs on-demand with optional caching.
+-
+-    This function loads only the findings needed for a specific set of checks,
+-    minimizing memory usage by avoiding loading all findings at once. This is used
+-    when generating detailed findings tables for specific requirements in the PDF.
+-
+-    Supports optional caching to avoid duplicate queries when generating

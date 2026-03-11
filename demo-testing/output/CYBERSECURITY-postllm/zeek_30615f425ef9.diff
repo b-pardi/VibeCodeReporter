@@ -1,0 +1,120 @@
+@@ -5,6 +5,9 @@
+ #include <broker/config.hh>
+ #include <broker/configuration.hh>
+ #include <broker/endpoint.hh>
++#include <broker/event.hh>
++#include <broker/event_observer.hh>
++#include <broker/logger.hh>
+ #include <broker/variant.hh>
+ #include <broker/zeek.hh>
+ #include <unistd.h>
+@@ -16,10 +19,12 @@
+ #include "zeek/DebugLogger.h"
+ #include "zeek/Desc.h"
+ #include "zeek/Event.h"
++#include "zeek/Flare.h"
+ #include "zeek/Func.h"
+ #include "zeek/IntrusivePtr.h"
+ #include "zeek/Reporter.h"
+ #include "zeek/RunState.h"
++#include "zeek/Scope.h"
+ #include "zeek/SerializationFormat.h"
+ #include "zeek/Type.h"
+ #include "zeek/Var.h"
+@@ -86,6 +91,58 @@ void print_escaped(std::string& buf, std::string_view str) {
+     buf.push_back('"');
+ }
+ 
++class LoggerQueue {
++public:
++    void Push(broker::event_ptr event) {
++        std::list<broker::event_ptr> tmp;
++        tmp.emplace_back(std::move(event));
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            queue_.splice(queue_.end(), tmp);
++            if ( queue_.size() == 1 ) {
++                flare_.Fire();
++            }
++        }
++    }
++
++    auto Drain() {
++        std::list<broker::event_ptr> events;
++        std::lock_guard<std::mutex> lock(mutex_);
++        if ( ! queue_.empty() ) {
++            queue_.swap(events);
++            flare_.Extinguish();
++        }
++        return events;
++    }
++
++    auto FlareFd() const noexcept { return flare_.FD(); }
++
++private:
++    std::mutex mutex_;
++    zeek::detail::Flare flare_;
++    std::list<broker::event_ptr> queue_;
++};
++
++using LoggerQueuePtr = std::shared_ptr<LoggerQueue>;
++
++using BrokerSeverityLevel = broker::event::severity_level;
++
++class LoggerAdapter : public broker::event_observer {
++public:
++    using SeverityLevel = broker::event::severity_level;
++
++    explicit LoggerAdapter(SeverityLevel severity, LoggerQueuePtr queue)
++        : severity_(severity), queue_(std::move(queue)) {}
++
++    void observe(broker::event_ptr what) override { queue_->Push(std::move(what)); }
++
++    bool accepts(SeverityLevel severity, broker::event::component_type) const override { return severity <= severity_; }
++
++private:
++    SeverityLevel severity_;
++    LoggerQueuePtr queue_;
++};
++
+ } // namespace
+ 
+ namespace zeek::Broker {
+@@ -162,13 +219,19 @@ struct opt_mapping {
+ 
+ class BrokerState {
+ public:
+-    BrokerState(broker::configuration config, size_t congestion_queue_size)
++    using SeverityLevel = LoggerAdapter::SeverityLevel;
++
++    BrokerState(broker::configuration config, size_t congestion_queue_size, LoggerQueuePtr queue)
+         : endpoint(std::move(config), telemetry_mgr->GetRegistry()),
+           subscriber(
+-              endpoint.make_subscriber({broker::topic::statuses(), broker::topic::errors()}, congestion_queue_size)) {}
++              endpoint.make_subscriber({broker::topic::statuses(), broker::topic::errors()}, congestion_queue_size)),
++          loggerQueue(std::move(queue)) {}
+ 
+     broker::endpoint endpoint;
+     broker::subscriber subscriber;
++    LoggerQueuePtr loggerQueue;
++    SeverityLevel logSeverity = SeverityLevel::critical;
++    SeverityLevel stderrSeverity = SeverityLevel::critical;
+ };
+ 
+ const broker::endpoint_info Manager::NoPeer{{}, {}};
+@@ -213,7 +276,7 @@ std::string RenderEvent(const std::string& topic, const std::string& name, const
+ } // namespace
+ #endif
+ 
+-Manager::Manager(bool arg_use_real_time) : Backend(nullptr, nullptr, nullptr) {
++Manager::Manager(bool arg_use_real_time) : Backend(nullptr, nullptr, nullptr), iosource::IOSource(true) {
+     bound_port = 0;
+     use_real_time = arg_use_real_time;
+     peer_count = 0;
+@@ -324,12 +387,32 @@ void Manager::DoInitPostScript() {
+     config.set("caf.work-stealing.moderate-steal-interval", get_option("Broker::moderate_interval")->AsCount());
+     config.set("caf.work-stealing.relaxed-steal-interval", get_option("Broker::relaxed_interval")->AsCount());
+ 
++    // Hook up the logger.
++    auto checkLogSeverity = [](int level) {
++    

@@ -1,0 +1,127 @@
+@@ -52,6 +52,7 @@ except ImportError:
+ 
+ 
+ from ivre import config, geoiputils, nmapout, utils, xmlnmap
++from datetime import datetime
+ 
+ 
+ class DB(object):
+@@ -2433,6 +2434,18 @@ LockError on failure.
+ class DBFlow(DB):
+     """Backend-independent code to handle flows"""
+ 
++    @classmethod
++    def date_round(cls, date):
++        if isinstance(date, datetime):
++            ts = utils.datetime2timestamp(date)
++        else:
++            ts = date
++        ts = ts - (ts % config.FLOW_TIME_PRECISION)
++        if isinstance(date, datetime):
++            return datetime.fromtimestamp(ts)
++        else:
++            return ts
++
+ 
+ class MetaDB(object):
+ 
+@@ -2459,6 +2472,7 @@ class MetaDB(object):
+         "data": {"maxmind": ("maxmind", "MaxMindDBData")},
+         "agent": {"mongodb": ("mongo", "MongoDBAgent")},
+         "flow": {"neo4j": ("neo4j", "Neo4jDBFlow"),
++                 "mongodb": ("mongo", "MongoDBFlow"),
+                  "postgresql": ("sql.postgres", "PostgresDBFlow")},
+         "view": {"http": ("http", "HttpDBView"),
+                  "mongodb": ("mongo", "MongoDBView"),
+
+
+
+
+@@ -42,6 +42,7 @@ try:
+ except ImportError:
+     from urllib import unquote
+ import uuid
++import time
+ 
+ 
+ from future.builtins import bytes, range
+@@ -50,9 +51,11 @@ from past.builtins import basestring
+ import bson
+ import pymongo
+ 
+-
+-from ivre.db import DB, DBActive, DBNmap, DBPassive, DBAgent, DBView, LockError
++import random
++from ivre.db import DB, DBActive, DBNmap, DBPassive, DBAgent, DBView, DBFlow, \
++    LockError
+ from ivre import config, passive, utils, xmlnmap
++from pymongo.errors import BulkWriteError
+ 
+ 
+ class Nmap2Mongo(xmlnmap.Nmap2DB):
+@@ -4510,3 +4513,254 @@ scan object on success, and raises a LockError on failure.
+                 self.set_limits(
+                     self.find(self.columns[self.column_masters],
+                               fields=["_id"])))
++
++
++class MongoDBFlow(MongoDB, DBFlow):
++    column_flow = 0
++    column_passive = 1
++    column_timescale = 2
++
++    count_flow = 0
++    count_passive = 0
++    count_timescale = 0
++
++    def __init__(self, host, dbname, colname_flows="flows",
++                 colname_passive="passive", colname_timescales="timescales",
++                 **kargs):
++        MongoDB.__init__(self, host, dbname, **kargs)
++        DBFlow.__init__(self)
++        self.columns = [colname_flows, colname_passive, colname_timescales]
++
++    def start_bulk_insert(self):
++        """
++        Initialize bulks for inserting data in MongoDB.
++        Returns [flow_bulk, passive_bulk]
++        """
++        utils.LOGGER.debug("start_bulk_insert called")
++        return [
++            self.db[self.columns[self.column_flow]]
++                .initialize_unordered_bulk_op(),
++            self.db[self.columns[self.column_passive]]
++                .initialize_unordered_bulk_op(),
++            self.db[self.columns[self.column_timescale]]
++                .initialize_unordered_bulk_op()]
++
++    def _get_flow_key(self, rec):
++        key = {
++            'src_addr_0': rec['src_addr_0'],
++            'src_addr_1': rec['src_addr_1'],
++            'dst_addr_0': rec['dst_addr_0'],
++            'dst_addr_1': rec['dst_addr_1'],
++            'proto': rec['proto'],
++            # 'sensor': rec['sensor']
++        }
++        if rec['proto'] in ['udp', 'tcp']:
++            key['dst_port'] = rec['dport']
++        return key
++
++    def _get_passive_keys(self, rec):
++        keys = [
++            {'addr_0': rec['src_addr_0'], 'addr_1': rec['src_addr_1']},
++            {'addr_0': rec['dst_addr_0'], 'addr_1': rec['dst_addr_1']}
++        ]
++        for key in keys:
++            key['recontype'] = 'UNKNOWN'
++        return keys
++
++    def _add_or_update_dict_in_dict(self, main_dict, main_key, key, value):
++        if main_key not in main_dict:
++            main_dict[main_key] = {}
++        main_dict[main_key].update({key: value})
++
++    def _conn2flow(self, flow_bulk, rec):
++        """
++        Take a parsed conn.log

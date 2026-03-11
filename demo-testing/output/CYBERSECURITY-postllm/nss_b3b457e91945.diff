@@ -1,0 +1,141 @@
+@@ -85,7 +85,7 @@
+ #include "sechash.h"
+ #endif
+ 
+-#define MAX_KEY_LEN 512
++#define MAX_KEY_LEN 1024
+ #define PATH_LEN 150
+ #define BUFF_SIZE 150
+ #define UID_BITS 800
+
+
+
+
+@@ -9,6 +9,8 @@
+ #include "prtime.h"
+ #include "secerr.h"
+ #include "ssl.h"
++#include "nss.h"
++#include "blapit.h"
+ 
+ #include "gtest_utils.h"
+ #include "tls_agent.h"
+@@ -348,9 +350,14 @@ static void GenerateWeakRsaKey(ScopedSECKEYPrivateKey& priv,
+   ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
+   ASSERT_TRUE(slot);
+   PK11RSAGenParams rsaparams;
+-  // The absolute minimum size of RSA key that we can use with SHA-256 is
+-  // 256bit (hash) + 256bit (salt) + 8 (start byte) + 8 (end byte) = 528.
++// The absolute minimum size of RSA key that we can use with SHA-256 is
++// 256bit (hash) + 256bit (salt) + 8 (start byte) + 8 (end byte) = 528.
++#define RSA_WEAK_KEY 528
++#if RSA_MIN_MODULUS_BITS < RSA_WEAK_KEY
+   rsaparams.keySizeInBits = 528;
++#else
++  rsaparams.keySizeInBits = RSA_MIN_MODULUS_BITS + 1;
++#endif
+   rsaparams.pe = 65537;
+ 
+   // Bug 1012786: PK11_GenerateKeyPair can fail if there is insufficient
+@@ -390,6 +397,18 @@ TEST_P(TlsConnectTls13, DCWeakKey) {
+                                                 ssl_sig_rsa_pss_pss_sha256};
+   client_->SetSignatureSchemes(kSchemes, PR_ARRAY_SIZE(kSchemes));
+   server_->SetSignatureSchemes(kSchemes, PR_ARRAY_SIZE(kSchemes));
++#if RSA_MIN_MODULUS_BITS > RSA_WEAK_KEY
++  // save the MIN POLICY length.
++  PRInt32 minRsa;
++
++  ASSERT_EQ(SECSuccess, NSS_OptionGet(NSS_RSA_MIN_KEY_SIZE, &minRsa));
++#if RSA_MIN_MODULUS_BITS >= 2048
++  ASSERT_EQ(SECSuccess,
++            NSS_OptionSet(NSS_RSA_MIN_KEY_SIZE, RSA_MIN_MODULUS_BITS + 1024));
++#else
++  ASSERT_EQ(SECSuccess, NSS_OptionSet(NSS_RSA_MIN_KEY_SIZE, 2048));
++#endif
++#endif
+ 
+   ScopedSECKEYPrivateKey dc_priv;
+   ScopedSECKEYPublicKey dc_pub;
+@@ -412,6 +431,9 @@ TEST_P(TlsConnectTls13, DCWeakKey) {
+   auto cfilter = MakeTlsFilter<TlsExtensionCapture>(
+       client_, ssl_delegated_credentials_xtn);
+   ConnectExpectAlert(client_, kTlsAlertInsufficientSecurity);
++#if RSA_MIN_MODULUS_BITS > RSA_WEAK_KEY
++  ASSERT_EQ(SECSuccess, NSS_OptionSet(NSS_RSA_MIN_KEY_SIZE, minRsa));
++#endif
+ }
+ 
+ class ReplaceDCSigScheme : public TlsHandshakeFilter {
+
+
+
+
+@@ -52,6 +52,11 @@ extern unsigned SECKEY_PublicKeyStrength(const SECKEYPublicKey *pubk);
+ */
+ extern unsigned SECKEY_PublicKeyStrengthInBits(const SECKEYPublicKey *pubk);
+ 
++/*
++** Return the strength of the private key in bits
++*/
++extern unsigned SECKEY_PrivateKeyStrengthInBits(const SECKEYPrivateKey *privk);
++
+ /*
+ ** Return the length of the signature in bytes
+ */
+
+
+
+
+@@ -4,6 +4,7 @@
+ 
+ #ifndef _KEYI_H_
+ #define _KEYI_H_
++#include "secerr.h"
+ 
+ SEC_BEGIN_PROTOS
+ /* NSS private functions */
+@@ -36,6 +37,9 @@ SECStatus sec_DecodeRSAPSSParamsToMechanism(PLArenaPool *arena,
+                                             const SECItem *params,
+                                             CK_RSA_PKCS_PSS_PARAMS *mech);
+ 
++/* make sure the key length matches the policy for keyType */
++SECStatus seckey_EnforceKeySize(KeyType keyType, unsigned keyLength,
++                                SECErrorCodes error);
+ SEC_END_PROTOS
+ 
+ #endif /* _KEYHI_H_ */
+
+
+
+
+@@ -14,6 +14,7 @@
+ #include "secdig.h"
+ #include "prtime.h"
+ #include "keyi.h"
++#include "nss.h"
+ 
+ SEC_ASN1_MKSUB(SECOID_AlgorithmIDTemplate)
+ SEC_ASN1_MKSUB(SEC_IntegerTemplate)
+@@ -1040,6 +1041,59 @@ SECKEY_PublicKeyStrengthInBits(const SECKEYPublicKey *pubk)
+     return bitSize;
+ }
+ 
++unsigned
++SECKEY_PrivateKeyStrengthInBits(const SECKEYPrivateKey *privk)
++{
++    unsigned bitSize = 0;
++    SECItem params = { siBuffer, NULL, 0 };
++    SECStatus rv;
++
++    if (!privk) {
++        PORT_SetError(SEC_ERROR_INVALID_KEY);
++        return 0;
++    }
++
++    /* interpret modulus length as key strength */
++    switch (privk->keyType) {
++        case rsaKey:
++        case rsaPssKey:
++        case rsaOaepKey:
++            /* some tokens don't export CKA_MODULUS on the private key,
++             

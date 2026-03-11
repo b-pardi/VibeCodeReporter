@@ -1,0 +1,128 @@
+@@ -59,10 +59,6 @@ int main() {
+     DECLARE_STRUCT(endpoint_info, iter);
+     DECLARE_STRUCT(metrics_key, iter);
+     DECLARE_STRUCT(metrics_value, iter);
+-    DECLARE_STRUCT(proxy4_tbl_key, iter)
+-    DECLARE_STRUCT(proxy4_tbl_value, iter);
+-    DECLARE_STRUCT(proxy6_tbl_key, iter);
+-    DECLARE_STRUCT(proxy6_tbl_value, iter);
+     DECLARE_STRUCT(sock_key, iter);
+     DECLARE_STRUCT(ep_config, iter);
+     DECLARE_STRUCT(policy_key, iter);
+
+
+
+
+@@ -15,6 +15,8 @@
+  *  along with this program; if not, write to the Free Software
+  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+  */
++#include <linux/if_packet.h>
++
+ #include <node_config.h>
+ #include <netdev_config.h>
+ #include <bpf/api.h>
+@@ -30,6 +32,13 @@ int from_netdev(struct __sk_buff *skb)
+ 	if ((skb->cb[0] & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_ENCRYPT) {
+ 		skb->mark = skb->cb[0];
+ 		set_identity(skb, skb->cb[1]);
++	} else {
++		// Upper 16 bits may carry proxy port number, clear it out
++		__u32 magic = skb->cb[0] & 0xFFFF;
++		if (magic == MARK_MAGIC_TO_PROXY) {
++			skb->mark = skb->cb[0];
++			skb_change_type(skb, PACKET_HOST);
++		}
+ 	}
+ 	return TC_ACT_OK;
+ }
+
+
+
+
+@@ -26,6 +26,7 @@
+ #include <stdio.h>
+ 
+ #include <linux/icmpv6.h>
++#include <linux/if_packet.h>
+ 
+ #include "lib/tailcall.h"
+ #include "lib/utils.h"
+@@ -209,27 +210,10 @@ skip_service_lookup:
+ 	}
+ 
+ 	if (redirect_to_proxy(verdict, forwarding_reason)) {
+-		union macaddr host_mac = HOST_IFINDEX_MAC;
+-		union v6addr host_ip = {};
+-
+-		BPF_V6(host_ip, HOST_IP);
+-
+-		ret = ipv6_redirect_to_host_port(skb, &csum_off, l4_off,
+-						 verdict, tuple->dport,
+-						 orig_dip, tuple, &host_ip,
+-						 SECLABEL, forwarding_reason,
+-						 monitor);
+-		if (IS_ERR(ret))
+-			return ret;
+-
+-		cilium_dbg(skb, DBG_TO_HOST, skb->cb[CB_POLICY], 0);
+-
+-		ret = ipv6_l3(skb, l3_off, (__u8 *) &router_mac.addr, (__u8 *) &host_mac.addr, METRIC_EGRESS);
+-		if (ret != TC_ACT_OK)
+-			return ret;
+-
+-		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, HOST_IFINDEX);
+-		return redirect(HOST_IFINDEX, 0);
++		// Trace the packet before its forwarded to proxy
++		send_trace_notify(skb, TRACE_TO_PROXY, SECLABEL, 0,
++				  0, 0, forwarding_reason, monitor);
++		return skb_redirect_to_proxy(skb, verdict);
+ 	}
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip6))
+@@ -520,32 +504,10 @@ skip_service_lookup:
+ 	}
+ 
+ 	if (redirect_to_proxy(verdict, forwarding_reason)) {
+-		union macaddr host_mac = HOST_IFINDEX_MAC;
+-
+-		ret = ipv4_redirect_to_host_port(skb, &csum_off, l4_off,
+-						 verdict, tuple.dport,
+-						 orig_dip, &tuple, SECLABEL,
+-						 forwarding_reason, monitor);
+-		if (IS_ERR(ret))
+-			return ret;
+-
+-		/* After L4 write in port mapping: revalidate for direct packet access */
+-		if (!revalidate_data(skb, &data, &data_end, &ip4))
+-			return DROP_INVALID;
+-
+-		cilium_dbg(skb, DBG_TO_HOST, skb->cb[CB_POLICY], 0);
+-
+-		ret = ipv4_l3(skb, l3_off, (__u8 *) &router_mac.addr, (__u8 *) &host_mac.addr, ip4);
+-		if (ret != TC_ACT_OK)
+-			return ret;
+-
+-		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, HOST_IFINDEX);
+-
+-#ifdef HOST_REDIRECT_TO_INGRESS
+-		return redirect(HOST_IFINDEX, BPF_F_INGRESS);
+-#else
+-		return redirect(HOST_IFINDEX, 0);
+-#endif
++		// Trace the packet before its forwarded to proxy
++		send_trace_notify(skb, TRACE_TO_PROXY, SECLABEL, 0,
++				  0, 0, forwarding_reason, monitor);
++		return skb_redirect_to_proxy(skb, verdict);
+ 	}
+ 
+ 	/* After L4 write in port mapping: revalidate for direct packet access */
+@@ -742,8 +704,8 @@ ipv6_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 	ipv6_addr_copy(&tuple.saddr, (union v6addr *) &ip6->saddr);
+ 	ipv6_addr_copy(&orig_dip, (union v6addr *) &ip6->daddr);
+ 
+-	/* If packet is coming from the egress proxy we have to skip
+-	 * redirection to the egress proxy as we would loop forever. */
++	/* If packet is coming from the ingress proxy we have to skip
++	 * redirection to the ingress proxy as we would loop forever. */
+ 	skip_proxy = tc_index_skip_proxy(

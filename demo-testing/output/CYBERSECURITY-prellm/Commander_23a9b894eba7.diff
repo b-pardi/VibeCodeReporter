@@ -1,0 +1,115 @@
+@@ -77,6 +77,9 @@ def register_commands(commands, aliases, command_info):
+     misc_commands(commands)
+     misc_command_info(aliases, command_info)
+ 
++    from .verify_records import VerifyRecordsCommand
++    commands['verify-records'] = VerifyRecordsCommand()
++
+     from .. import importer
+     importer.register_commands(commands)
+     importer.register_command_info(aliases, command_info)
+
+
+
+
+@@ -6,7 +6,7 @@
+ #              |_|
+ #
+ # Keeper Commander
+-# Copyright 2021 Keeper Security Inc.
++# Copyright 2022 Keeper Security Inc.
+ # Contact: ops@keepersecurity.com
+ #
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,152 @@
++# -*- coding: utf-8 -*-
++#  _  __
++# | |/ /___ ___ _ __  ___ _ _ ®
++# | ' </ -_) -_) '_ \/ -_) '_|
++# |_|\_\___\___| .__/\___|_|
++#              |_|
++#
++# Keeper Commander
++# Copyright 2022 Keeper Security Inc.
++# Contact: ops@keepersecurity.com
++#
++
++import json
++import logging
++
++import itertools
++
++from .base import user_choice, Command
++from .. import api, crypto, utils
++from ..record import get_totp_code
++from ..proto import record_pb2
++
++
++class VerifyRecordsCommand(Command):
++    def execute(self, params, **kwargs):
++        records_to_fix = {}
++        records_to_delete = set()
++        for record_uid in params.record_cache:
++            record = params.record_cache[record_uid]
++            if record.get('version', 0) != 3:
++                continue
++            if 'data_unencrypted' not in record:
++                continue
++
++            try:
++                data = json.loads(record['data_unencrypted'])
++            except:
++                records_to_delete.add(record_uid)
++                continue
++            is_broken = False
++            # both fields and custom
++            for field in itertools.chain(data.get('fields', []), data.get('custom', [])):
++                value = field.get('value')
++                # value is not list
++                if not isinstance(value, list):
++                    is_broken = True
++                    if value:
++                        value = [value]
++                    else:
++                        value = []
++                    field['value'] = value
++                # fix credit card expiration on paymentCard
++                if field.get('type', '') == 'paymentCard':
++                    for card in field['value']:
++                        if isinstance(card, dict):
++                            if 'cardExpirationDate' in card:
++                                exp = card['cardExpirationDate']
++                                if isinstance(exp, str):
++                                    month, sep, year = exp.partition('/')
++                                    if not month.isnumeric() or not year.isnumeric():
++                                        is_broken = True
++                                        card['cardExpirationDate'] = ""
++                                else:
++                                    is_broken = True
++                                    card['cardExpirationDate'] = ""
++
++                        else:
++                            field['value'] = []
++                            break
++                # date field type should contain int value
++                if field.get('type', '') == 'date':
++                    orig_dates = field['value']
++                    tested_dates = [x for x in orig_dates if isinstance(x, int)]
++                    if len(tested_dates) < len(orig_dates):
++                        field['value'] = tested_dates
++                        is_broken = True
++
++            # custom only
++            for field in data.get('custom', []):
++                # OTP URL scheme should have oneTimeCode
++                if field.get('type', '') != 'oneTimeCode' and field.get('value'):
++                    value = field.get('value')
++                    if isinstance(value, list) and len(value) == 1:
++                        value = value[0]
++                        if isinstance(value, str) and value.startswith('otpauth'):
++   

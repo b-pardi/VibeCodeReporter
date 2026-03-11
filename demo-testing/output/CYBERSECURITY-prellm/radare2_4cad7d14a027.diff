@@ -1,0 +1,176 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,587 @@
++#include "ne.h"
++
++static char *__get_target_os(r_bin_ne_obj_t *bin) {
++	switch (bin->ne_header->targOS) {
++	case 1:
++		return "OS/2";
++	case 2:
++		return "Windows";
++	case 3:
++		return "European MS-DOS 4.x";
++	case 4:
++		return "Windows 386";
++	case 5:
++		return "BOSS (Borland Operating System Services)";
++	default:
++		return "Unknown";
++	}
++}
++
++static int __translate_perms(int flags) {
++	int perms = 0;
++	if (flags & IS_RX) {
++		if (flags & IS_DATA) {
++			perms = R_PERM_R;
++		} else {
++			perms = R_PERM_X;
++		}
++	}
++	if (!perms) {
++		perms = R_PERM_RWX;
++	}
++	return perms;
++}
++
++static char *__read_nonnull_str_at(RBuffer *buf, ut64 offset) {
++	ut8 sz = r_buf_read8_at (buf, offset);
++	if (!sz) {
++		return NULL;
++	}
++	char *str = malloc ((ut64)sz + 1);
++	if (!str) {
++		return NULL;
++	}
++	r_buf_read_at (buf, offset + 1, (ut8 *)str, sz);
++	str[sz] = '\0';
++	return str;
++}
++
++static char *__func_name_from_ord(char *module, ut16 ordinal) {
++	char *path = r_str_newf ("%s/%s/format/dll/%s.sdb", r_sys_prefix (NULL), R2_SDB, module);
++	char *ord = r_str_newf ("%d", ordinal);
++	char *name;
++	if (r_file_exists (path)) {
++		Sdb *sdb = sdb_new (NULL, path, 0);
++		name = sdb_get (sdb, ord, NULL);
++		if (!name) {
++			name = ord;
++		} else {
++			free (ord);
++		}
++		sdb_close (sdb);
++		free (sdb);
++	} else {
++		name = ord;
++	}
++	return name;
++}
++
++RList *r_bin_ne_get_segments(r_bin_ne_obj_t *bin) {
++	if (!bin) {
++		return NULL;
++	}
++	RList *segments = r_list_newf (free);
++	for (int i = 0; i < bin->ne_header->SegCount; i++) {
++		RBinSection *bs = R_NEW0 (RBinSection);
++		NE_image_segment_entry *se = &bin->segment_entries[i];
++		if (!bs) {
++			return segments;
++		}
++		bs->size = se->length;
++		bs->vsize = se->minAllocSz ? se->minAllocSz : 64000;
++		bs->bits = 16;
++		bs->is_data = se->flags & IS_DATA;
++		bs->perm = __translate_perms (se->flags);
++		bs->paddr = (ut64)se->offset * bin->alignment;
++		bs->name = r_str_newf ("%s.%d", se->flags & IS_MOVEABLE ? "MOVEABLE" : "FIXED", bs->paddr);
++		bs->is_segment = true;
++		r_list_append (segments, bs);
++	}
++	bin->segments = segments;
++	return segments;
++}
++
++static int __find_symbol_by_paddr (const void *paddr, const void *sym) {
++	return (int)!(*(ut64 *)paddr == ((RBinSymbol *)sym)->paddr);
++}
++
++RList *r_bin_ne_get_symbols(r_bin_ne_obj_t *bin) {
++	RBinSymbol *sym;
++	ut16 off = bin->ne_header->ResidNamTable + bin->header_offset;
++	RList *symbols = r_list_newf (free);
++	if (!symbols) {
++		return NULL;
++	}
++	RList *entries = r_bin_ne_get_entrypoints (bin);
++	bool resident = true, first = true;
++	while (true) {
++		ut8 sz = r_buf_read8_at (bin->buf, off);
++		if (!sz) {
++			first = true;
++			if (resident) {
++				resident = false;
++				off = bin->ne_header->OffStartNonResTab;
++				sz = r_buf_read8_at (bin->buf, off);
++				if (!sz) {
++					break;
++				}
++			} else {
++				break;
++			}
++		}
++		char *name = malloc ((ut64)sz + 1);
++		if (!name) {
++			break;
++		}
++		off++;
++		r_buf_read_at (bin->buf, off, (ut8 *)name, sz);
++		name[sz] = '\0';
++		off += sz;
++		sym = R_NEW0 (RBinSymbol);
++		if (!sym) {
++			break;
++		}
++		sym->name = name;
++		if (!first) {
++			sym->bind = r_str_const (R_BIN_BIND_GLOBAL_STR);
++		}
++		ut16 entry_off = r_buf_read_le16_at (bin->buf, off);
++		off += 2;
++		RBinAddr *entry = r_list_get_n (entries, entry_off);
++		if (entry) {
++			sym->paddr = entry->paddr;
++		} else {
++			sym->paddr = -1;
++		}
++		sym->ordinal = entry_off;
++		r_list_append (symbols, sym);
++		first = false;
++	}
++	RListIter *it;
++	RBinAddr *en;
++	int i = 1;
++	r_list_foreach (entries, it, en) {
++		if (!r_list_find (symbols, &en->paddr, __find_symbol_by_paddr)) {
++			sym = R_NEW0 (RBinSymbol);
++			if (!sym) {
++				break;
++			}
++			sym->name = r_str_newf ("entry%d", i - 1);
++			sym->paddr = en->paddr;
++			sym->bind = r_str_const (R_BIN_BIND_GLOBAL_STR);
++			sym->ordinal = i;
++			r_list_append (symbols, sym);
++		}
++		i++;
++	}
++	bin->symbols = symbols;
++	return symbols;
++}
++
++static char *

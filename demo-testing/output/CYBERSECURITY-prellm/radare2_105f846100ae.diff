@@ -1,0 +1,132 @@
+@@ -505,6 +505,133 @@ beach:
+ 	return reg_node;
+ }
+ 
++static RGraphNode *_edf_uninitialized_mem_get(RAnalEsilDFG *dfg, ut64 addr, ut32 size) {
++	r_return_val_if_fail (dfg && size, NULL);
++	char *content = r_str_newf ("[%d]@0x%"PFMT64x, size, addr);
++	RGraphNode *orig_mem_gnode = r_graph_add_node (dfg->flow, r_anal_esil_dfg_node_new (dfg, content));
++	free (content);
++	content = r_str_newf ("[%d]@0x%"PFMT64x":uninitialized_mem_var_%d", size, addr, dfg->idx + 1);
++	RAnalEsilDFGNode *mem_node = r_anal_esil_dfg_node_new (dfg, content);
++	free (content);
++	dfg->idx++;
++	mem_node->type = R_ANAL_ESIL_DFG_BLOCK_VAR;
++	RGraphNode *mem_gnode = r_graph_add_node (dfg->flow, mem_node);
++	r_graph_add_edge (dfg->flow, orig_mem_gnode, mem_gnode);
++	return mem_gnode;
++}
++
++static RGraphNode *_edf_mem_get(RAnalEsilDFG *dfg, ut64 addr, ut32 size) {
++	r_return_val_if_fail (dfg && size, NULL);
++	EsilDFGVar *mv = R_NEW0 (EsilDFGVar);
++	if (!mv) {
++		return NULL;
++	}
++	mv->from = addr;
++	mv->to = addr + size - 1;
++	mv->type = VAR_TYPE_MEM;
++	RQueue *parts = r_queue_new (size);
++	if (!parts) {
++		free (mv);
++		return NULL;
++	}
++	r_queue_enqueue (dfg->todo, mv);
++
++	// log2((search_rv.to + 1) - search_rv.from) maybe better?
++	// wat du if this fails?
++
++	RGraphNode *mem_node = NULL;
++	while (!r_queue_is_empty (dfg->todo)) {
++		mv = r_queue_dequeue (dfg->todo);
++		EsilDFGVar *part_mv = r_crbtree_find (dfg->vars, mv, _rv_find_cmp, dfg);
++		if (part_mv) {
++			r_queue_enqueue (parts, part_mv->node);
++		} else if (!mem_node) {
++			mem_node = _edf_uninitialized_mem_get (dfg, mv->from, (ut32)(mv->to - mv->from + 1));
++			if (!mem_node) {
++				dfg->malloc_failed = true;
++				break;
++			}
++			//insert in the gap
++			part_mv = R_NEW (EsilDFGVar);
++			if (!part_mv) {
++				R_FREE (mv);
++				dfg->malloc_failed = true;
++				break;
++			}
++			part_mv[0] = mv[0];
++			part_mv->node = mem_node;
++			r_crbtree_insert (dfg->vars, part_mv, _rv_ins_cmp, NULL);
++			//enqueue for later merge
++			r_queue_enqueue (parts, mem_node);
++		} else {
++			//initial regnode was already created
++			//only need to insert in the tree
++			part_mv = R_NEW (EsilDFGVar);
++			if (!part_mv) {
++				R_FREE (mv);
++				dfg->malloc_failed = true;
++				break;
++			}
++			part_mv[0] = mv[0];
++			part_mv->node = mem_node;
++			r_crbtree_insert (dfg->vars, part_mv, _rv_ins_cmp, NULL);
++		}
++		free (mv);
++	}
++	mem_node = NULL; // is this needed?
++	if (dfg->malloc_failed) {
++		while (!r_queue_is_empty (dfg->todo)) {
++			free (r_queue_dequeue (dfg->todo));
++		}
++		goto beach; // Outside loop!
++	}
++	switch (parts->size) {
++	case 0:
++		break;
++	case 1:
++		mem_node = r_queue_dequeue (parts);
++		break;
++	default: {
++		RAnalEsilDFGNode *_mem_node = r_anal_esil_dfg_node_new (dfg, "merge to ");
++		if (!_mem_node) {
++			while (!r_queue_is_empty (dfg->todo)) {
++				free (r_queue_dequeue (dfg->todo));
++			}
++			dfg->malloc_failed = true;
++			goto beach;
++		}
++
++		r_strbuf_appendf (_mem_node->content, "0x%"PFMT64x":var_%d", addr, dfg->idx++);
++		mem_node = r_graph_add_node (dfg->flow, _mem_node);
++		if (!mem_node) {
++			_dfg_node_free (_mem_node);
++			while (!r_queue_is_empty (dfg->todo)) {
++				free (r_queue_dequeue (dfg->todo));
++			}
++			dfg->malloc_failed = true;
++			goto beach;
++		}
++	}
++		do {
++			r_graph_add_edge (dfg->flow, r_queue_dequeue (parts), mem_node);
++		} while (!r_queue_is_empty (parts));
++		break;
++	}
++beach:
++	r_queue_free (parts);
++	return mem_node;
++}
++
++static RGraphNode *_edf_const_get(RAnalEsilDFG *dfg, char *const_value) {
++	RGraphNode *orig_value_gnode = r_graph_add_node (dfg->flow, r_anal_esil_dfg_node_new (dfg, const_value));
++	RAnalEsilDFGNode *value_node = r_anal_esil_dfg_node_new (dfg, const_value);
++	value_node->type = R_ANAL_ESIL_DFG_BLOCK_CONST;
++	r_strbuf_appendf (value_node->content, ":const_%d", dfg->idx++);
++	RGraphNode *ret = r_graph_add_node (dfg->flow, value_node);
++	r_graph_add_edge (dfg->flow, orig_value_gnode, ret);
++	return ret;
++}
++
+ static bool _edf_var_set(RAnalEsilDFG *dfg

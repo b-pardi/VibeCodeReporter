@@ -1,0 +1,117 @@
+@@ -1050,27 +1050,93 @@ static result<std::size_t> SendData(BareosSocket* sd,
+   return size;
+ }
+ 
+-struct message {
+-  PoolMem backing{PM_MESSAGE};
+-  std::size_t header_size{0};
+-  std::size_t data_size{0};
++class data_message {
++  /* some data is prefixed by a OFFSET_FADDR_SIZE-byte number -- called header
++   * here, which basically contains the file position to which to write the
++   * following block of data.
++   * The difference between FADDR and OFFSET is that offset may be any value
++   * (given to the core by a plugin), whereas FADDR is computed by the core
++   * itself and is equal to the number of bytes already read from the file
++   * descriptor. */
++  static inline constexpr std::size_t header_size = OFFSET_FADDR_SIZE;
++  /* our bsocket functions assume that they are allowed to overwrite
++   * the four bytes directly preceding the given buffer
++   * To keep the message alignment to 8, we "allocate" full 8 bytes instead
++   * of the required 4. */
++  static inline constexpr std::size_t bnet_size = 8;
++  static inline constexpr std::size_t data_offset = header_size + bnet_size;
++
++  std::vector<char> buffer{};
++  bool has_header{false};
++
++ public:
++  data_message(std::size_t data_size)
++  {
++    buffer.resize(data_size + data_offset);
++  }
++  data_message() : data_message(0) {}
++  data_message(const data_message&) = delete;
++  data_message& operator=(const data_message&) = delete;
++  data_message(data_message&&) = default;
++  data_message& operator=(data_message&&) = default;
++
++  // creates a message with the same header -- if any
++  data_message derived() const
++  {
++    data_message derived;
++
++    if (has_header) {
++      derived.has_header = true;
++      std::memcpy(derived.header_ptr(), header_ptr(), header_size);
++    }
+ 
+-  message(std::size_t header_size) : header_size{header_size} {}
++    return derived;
++  }
+ 
+-  void reserve(std::size_t max_data_size)
++  void set_header(std::uint64_t h)
+   {
+-    backing.check_size(header_size + max_data_size);
++    has_header = true;
++    auto* ptr = header_ptr();
++    std::memcpy(ptr, &h, header_size);
++
++    for (std::size_t i = 0; i < header_size / 2; ++i) {
++      std::swap(ptr[i], ptr[header_size - 1 - i]);
++    }
+   }
+ 
+-  char* header() { return backing.addr(); }
++  void resize(std::size_t new_size) { buffer.resize(data_offset + new_size); }
+ 
+-  char* data() { return backing.addr() + header_size; }
++  char* header_ptr() { return &buffer[bnet_size]; }
++  char* data_ptr() { return &buffer[data_offset]; }
++  const char* header_ptr() const { return &buffer[bnet_size]; }
++  const char* data_ptr() const { return &buffer[data_offset]; }
+ 
+-  const char* header() const { return backing.c_str(); }
++  std::size_t data_size() const
++  {
++    ASSERT(buffer.size() >= data_offset);
++    return buffer.size() - data_offset;
++  }
+ 
+-  const char* data() const { return backing.c_str() + header_size; }
++  /* important: this is not actually a POOLMEM*; do not pass it to POOLMEM*
++   *            functions, except to pass it to BareosSocket::SendData(). */
++  POOLMEM* as_socket_message()
++  {
++    if (has_header) {
++      return header_ptr();
++    } else {
++      return data_ptr();
++    }
++  }
+ 
+-  std::size_t size() const { return header_size + data_size; }
++  std::size_t message_size() const
++  {
++    auto size_with_header = buffer.size() - bnet_size;
++    if (has_header) {
++      return size_with_header;
++    } else {
++      return size_with_header - header_size;
++    }
++  }
+ };
+ 
+ // Send the content of a file on anything but an EFS filesystem.
+@@ -1133,7 +1199,7 @@ static inline bool SendPlainData(b_ctx& bctx)
+                               compute_fin.notify_one();
+                             });
+ 
+-  using shared_message = std::shared_ptr<const message>;
++  using shared_message = std::shared_ptr<const data_message>;
+ 
+   // FIXME(ssura): How big should the buffer be ?
+   auto [in, out]
+@@ -1152,13 +1218,14 @@ static inline bool SendPlainData(b_ctx& bctx)
+             retur

@@ -1,0 +1,120 @@
+new file mode 100755
+
+
+
+@@ -0,0 +1,419 @@
++import stat
++import subprocess
++import shutil
++import os
++import os.path
++import typing
++import sys
++from pathlib import Path
++
++
++def check_file_type(file_path: Path) -> str | None:
++    with open(str(file_path), 'rb') as f:
++        header = f.read(4)
++
++    if header == b'\x7fELF':
++        return "ELF"
++    elif header == b'\xfe\xed\xfa\xce':
++        return "Mach-O 32-bit (Little Endian)"
++    elif header == b'\xfe\xed\xfa\xcf':
++        return "Mach-O 64-bit (Little Endian)"
++    elif header == b'\xce\xfa\xed\xfe':
++        return "Mach-O 32-bit (Big Endian)"
++    elif header == b'\xcf\xfa\xed\xfe':
++        return "Mach-O 64-bit (Big Endian)"
++    elif header == b'\xca\xfe\xba\xbe':
++        return "Mach-O Fat Binary (Universal, Little Endian)"
++    elif header == b'\xbe\xba\xfe\xca':
++        return "Mach-O Fat Binary (Universal, Big Endian)"
++    else:
++        return None
++
++
++def eprint(msg: str):
++    print(msg, file=sys.stderr)
++
++
++def run(args: typing.List[str], no_error=False) -> str:
++    result = subprocess.run(args, capture_output=True)
++    if result.returncode != 0:
++        if no_error:
++            eprint(result.stderr)
++            eprint("WARNING: Command failed with return code {}: {}".format(result.returncode, args))
++            return ''
++
++        eprint(result.stderr)
++        eprint("Command failed with return code {}: {}".format(result.returncode, args))
++        sys.exit(result.returncode)
++    return result.stdout.decode("utf-8")
++
++
++def iter_macho_deps(binary_path: Path) -> typing.Iterator[Path]:
++    for line in run(["otool", "-L", str(binary_path)]).splitlines():
++        line = line.strip()
++        if not line.startswith('/nix/store/'):
++            continue
++
++        splited = line.split(' (', 1)
++        if len(splited) != 2:
++            continue
++
++        lib_path = Path(splited[0])
++        if not lib_path.exists():
++            eprint(f'WARNING: skipping not exists file={lib_path}')
++            continue
++
++        yield lib_path
++
++
++def iter_elf_deps(binary_path: Path) -> typing.Iterator[Path]:
++    def stripped_strs(strs: typing.Iterable[str]) -> typing.Iterable[str]:
++        return (cleaned for x in strs for cleaned in [x.strip()] if cleaned != "")
++
++    def get_rpaths(exe: str) -> typing.Iterable[str]:
++        return stripped_strs(run(["patchelf", "--print-rpath", exe]).split(":"))
++
++    def resolve_origin(origin: str, paths: typing.Iterable[str]) -> typing.Iterable[str]:
++        return (path.replace("$ORIGIN", origin) for path in paths)
++
++    def get_needed(exe: str) -> typing.Iterable[str]:
++        return stripped_strs(run(["patchelf", "--print-needed", exe]).splitlines())
++
++    def resolve_paths(needed: typing.Iterable[str], rpaths: typing.List[str]) -> typing.Iterable[str]:
++        existing_paths = lambda lib, paths: (
++            abs_path for path in paths for abs_path in [os.path.join(path, lib)]
++            if os.path.exists(abs_path)
++        )
++        for lib in needed:
++            for found in [next(existing_paths(lib, rpaths), None)]:
++                if found is None:
++                    eprint(f"WARNING: can't find {lib} in {rpaths}")
++                    continue
++
++                yield found
++
++    dirname = os.path.dirname(str(binary_path))
++    rpaths_raw = list(get_rpaths(str(binary_path)))
++    rpaths_raw = [dirname] if rpaths_raw == [] else rpaths_raw
++    rpaths = list(resolve_origin(dirname, rpaths_raw))
++    for path in (x for x in resolve_paths(get_needed(str(binary_path)), rpaths) if x is not None):
++        if not path.startswith('/nix/store/'):
++            continue
++        yield Path(path)
++
++
++if sys.platform == 'darwin':
++    iter_deps = iter_macho_deps
++else:
++    iter_deps = iter_elf_deps
++
++
++def iter_deps_recursive(binary_path: Path, depth: int=None, visited: typing.Set[Path]=None)  -> typing.Iterator[Path]:
++    is_first = depth is None
++    if depth is None:
++        depth = 0
++  

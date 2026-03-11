@@ -1,0 +1,162 @@
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2011-2021 - pancake, keegan */
++/* radare2 - LGPL - Copyright 2011-2022 - pancake, keegan */
+ 
+ #ifndef P9BIN_H
+ #define P9BIN_H
+@@ -24,6 +24,8 @@ typedef struct r_bin_plan9_obj_t {
+ 	// use this instead of the one in the header
+ 	ut64 entry;
+ 	bool is_kernel;
++	// pc quantization per arch
++	ut64 pcq;
+ } RBinPlan9Obj;
+ 
+ /* Flag for extended header. This means that an additional 64-bit integer follows
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,25 @@
++/* radare - LGPL - Copyright 2009-2022 - nibble, montekki, pancake, keegan */
++
++#include <r_bin.h>
++
++static bool get_line(RBinFile *bf, ut64 addr, char *file, int len, int *line) {
++	if (bf->sdb_addrinfo) {
++		char offset[SDB_NUM_BUFSZ];
++		char *offset_ptr = sdb_itoa (addr, 16, offset, sizeof (offset));
++		char *ret = sdb_get (bf->sdb_addrinfo, offset_ptr, 0);
++		if (ret) {
++			char *p = strchr (ret, '|');
++			if (p) {
++				*p = '\0';
++				strncpy (file, ret, len);
++				*line = atoi (p + 1);
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++RBinDbgInfo r_bin_dbginfo_p9 = {
++	.get_line = &get_line,
++};
+
+
+
+
+@@ -9,6 +9,8 @@
+ #undef P9_ALIGN
+ #define P9_ALIGN(address, align) (((address) + (align - 1)) & ~(align - 1))
+ 
++extern struct r_bin_dbginfo_t r_bin_dbginfo_p9;
++
+ static bool check_buffer(RBinFile *bf, RBuffer *buf) {
+ 	RSysArch arch;
+ 	int bits, big_endian;
+@@ -42,6 +44,29 @@ static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *b, ut64 loadaddr,
+ 	// kernels require different maps (see uses for details)
+ 	o->is_kernel = o->entry & KERNEL_MASK;
+ 
++	// each arch has a pc quantization used for line-number calculation
++	switch (o->header.magic) {
++	case MAGIC_AMD64:
++	case MAGIC_INTEL_386:
++		o->pcq = 1;
++		break;
++	case MAGIC_68020:
++		o->pcq = 2;
++		break;
++	case MAGIC_ARM64:
++	case MAGIC_PPC64:
++	case MAGIC_SPARC:
++	case MAGIC_SPARC64:
++	case MAGIC_MIPS_3000BE:
++	case MAGIC_MIPS_4000BE:
++	case MAGIC_MIPS_4000LE:
++	case MAGIC_MIPS_3000LE:
++	case MAGIC_ARM:
++	case MAGIC_PPC:
++		o->pcq = 4;
++		break;
++	}
++
+ 	if (bin_obj) {
+ 		*bin_obj = o;
+ 	}
+@@ -216,11 +241,11 @@ static RList *sections(RBinFile *bf) {
+ 	phys += ptr->size;
+ 	vsize += ptr->vsize;
+ 
+-	// add spsz segment
++	// add pc/sp offsets segment
+ 	if (!(ptr = R_NEW0 (RBinSection))) {
+ 		return ret;
+ 	}
+-	ptr->name = strdup ("spsz");
++	ptr->name = strdup ("pcsp");
+ 	ptr->size = o->header.spsz;
+ 	ptr->vsize = P9_ALIGN (o->header.spsz, align);
+ 	ptr->paddr = phys;
+@@ -231,11 +256,11 @@ static RList *sections(RBinFile *bf) {
+ 	phys += ptr->size;
+ 	vsize += ptr->vsize;
+ 
+-	// add pcsz segment
++	// add pc/line numbers segment
+ 	if (!(ptr = R_NEW0 (RBinSection))) {
+ 		return ret;
+ 	}
+-	ptr->name = strdup ("pcsz");
++	ptr->name = strdup ("pcline");
+ 	ptr->size = o->header.pcsz;
+ 	ptr->vsize = P9_ALIGN (o->header.pcsz, align);
+ 	ptr->paddr = phys;
+@@ -247,66 +272,217 @@ static RList *sections(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static RList *symbols(RBinFile *bf) {
+-	RList *ret = NULL;
+-	RBinPlan9Obj *o = (RBinPlan9Obj *)bf->o->bin_obj;
++typedef struct {
++	ut64 value;
++	char type;
++	char *name;
++} Sym;
+ 
+-	if (!(ret = r_list_newf (free))) {
+-		return NULL;
++static st64 sym_read(RBinFile *bf, Sym *sym, const ut64 offset) {
++	st64 size = 0;
++	const RBinPlan9Obj *o = (RBinPlan9Obj *)bf->o->bin_obj;
++	const ut64 syms = o->header_size + o->header.text + o->header.data;
++
++	ut64 value;
++	if (o->header.magic & HDR_MAGIC) {
++		// for 64-bit binaries the value type is 8 bytes
++		value = r_buf_read_be64_at (bf->buf, syms + offset);
++		if (value == UT64_MAX) {
++			return -1;
++		}
++		size += sizeof (ut64);
++	} else {
++		value = (ut64)r_buf_read_be32_at (bf->buf, syms + offset);
++		if (value == UT32_MAX) {
++			return -1;
++		}
++		size += sizeof (ut32);
+ 	}
+ 
+-	ut64 syms = o->header_size + o->header.text + o->header.data;
++	const ut8 typ = r_buf_read8_at (bf->buf, syms + offset + size);
++	if (typ == UT8_MAX) {
++		return -1;
++	}
++	size += sizeof (typ);
++	const char type = typ & 0x7f;
+ 
+-	ut64 of

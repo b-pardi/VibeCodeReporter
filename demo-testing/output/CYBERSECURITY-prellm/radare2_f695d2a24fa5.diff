@@ -1,0 +1,169 @@
+@@ -20,9 +20,9 @@ static RIODesc *r_io_ar_open(RIO *io, const char *file, int rw, int mode) {
+ 		filename += 2;
+ 	}
+ 
+-	RBuffer *b = ar_open_file (arname, filename);
+-	if (b) {
+-		res = r_io_desc_new (io, &r_io_plugin_ar, filename, rw, mode, b);
++	RArFp *arf = ar_open_file (arname, filename);
++	if (arf) {
++		res = r_io_desc_new (io, &r_io_plugin_ar, filename, rw, mode, arf);
+ 	}
+ 	free (url);
+ 	return res;
+@@ -34,60 +34,46 @@ static RList *r_io_ar_open_many(RIO *io, const char *file, int rw, int mode) {
+ }
+ 
+ static ut64 r_io_ar_lseek(RIO *io, RIODesc *fd, ut64 offset, int whence) {
+-	RBuffer *b;
+-	ut64 seek_val = 0;
+-
+-	if (!fd || !fd->data) {
+-		return -1;
+-	}
+-
+-	b = fd->data;
+-	seek_val = r_buf_tell (b);
++	r_return_val_if_fail (io && fd && fd->data, -1);
+ 
++	RArFp *arf = (RArFp *) fd->data;
++	ut64 size = arf->end - arf->start;
+ 	switch (whence) {
+ 	case SEEK_SET:
+-		seek_val = (r_buf_size (b) < offset)? r_buf_size (b) : offset;
+-		io->off = seek_val;
+-		r_buf_seek (b, seek_val, R_BUF_SET);
+-		return seek_val;
++		io->off = R_MIN (size, offset);
++		break;
+ 	case SEEK_CUR:
+-		seek_val = (r_buf_size (b) < offset)? r_buf_size (b) : offset;
+-		io->off = seek_val;
+-		r_buf_seek (b, seek_val, R_BUF_SET);
+-		return seek_val;
++		io->off = R_MIN (size, io->off + offset);
++		break;
+ 	case SEEK_END:
+-		seek_val = r_buf_size (b);
+-		io->off = seek_val;
+-		r_buf_seek (b, seek_val, R_BUF_SET);
+-		return seek_val;
++		io->off = size;
++		break;
++	default:
++		return -1;
+ 	}
+-	return seek_val;
++
++	return io->off;
+ }
+ 
+ static int r_io_ar_read(RIO *io, RIODesc *fd, ut8 *buf, int count) {
+-	RBuffer *b;
+ 	if (!fd || !fd->data || !buf) {
+ 		return -1;
+ 	}
+-	b = fd->data;
+-	return ar_read_at (b, io->off, buf, count);
++	return ar_read_at ((RArFp *) fd->data, io->off, buf, count);
+ }
+ 
+ static int r_io_ar_write(RIO *io, RIODesc *fd, const ut8 *buf, int count) {
+-	RBuffer *b = NULL;
+ 	if (!fd || !fd->data || !buf) {
+ 		return -1;
+ 	}
+-	return ar_write_at (b, io->off, (void *) buf, count);
++	return ar_write_at ((RArFp *) fd->data, io->off, (void *) buf, count);
+ }
+ 
+ static int r_io_ar_close(RIODesc *fd) {
+-	RBuffer *b = NULL;
+ 	if (!fd || !fd->data) {
+ 		return -1;
+ 	}
+-	b = fd->data;
+-	return ar_close (b);
++	return ar_close ((RArFp *) fd->data);
+ }
+ 
+ RIOPlugin r_io_plugin_ar = {
+
+
+
+
+@@ -3,252 +3,309 @@
+ #include <r_util.h>
+ #include "ar.h"
+ 
+-#define BUF_SIZE 512
++#define AR_MAGIC_HEADER "!<arch>\n"
++#define AR_FILE_HEADER_END "`\n"
+ 
+-const char *AR_MAGIC_HEADER = "!<arch>\n";
+-const char *AR_FILE_HEADER_END = "`\n";
+-const int AR_FILENAME_LEN = 16;
++typedef struct Filetable {
++	char *data;
++	ut64 size;
++	ut64 offset;
++} filetable;
+ 
+-/* Used to lookup filename table */
+-static int index_filename = -2;
+-
+-/**
+- * Open an ar/lib file. If filename is NULL, list archive files
+- */
+-R_API RBuffer *ar_open_file(const char *arname, const char *filename) {
+-	int r;
+-	RList *files = NULL;
+-	RBuffer *b = r_buf_new_file (arname, O_RDWR, 0);
+-	if (!b) {
+-		r_sys_perror (__FUNCTION__);
+-		return NULL;
++static RArFp *arfp_new(RBuffer *b, ut32 *refcount) {
++	r_return_val_if_fail (b, NULL);
++	RArFp *f = R_NEW (RArFp);
++	if (f) {
++		if (refcount) {
++			(*refcount)++;
++		}
++		f->name = NULL;
++		f->refcount = refcount;
++		f->buf = b;
++		f->start = 0;
++		f->end = 0;
+ 	}
++	return f;
++}
+ 
+-	/* Read magic header */
+-	char *buffer = calloc (1, BUF_SIZE + 1);
+-	if (!buffer) {
+-		return NULL;
++bool ar_check_magic(RBuffer *b) {
++	char buf[sizeof (AR_MAGIC_HEADER) - 1];
++	if (r_buf_read (b, (ut8 *)buf, sizeof (buf)) != sizeof (buf)) {
++		return false;
+ 	}
+-	r = ar_read_header (b, buffer);
+-	if (!r) {
+-		goto fail;
++	if (strncmp (buf, AR_MAGIC_HEADER, 8)) {
++		eprintf ("Wrong file type.\n");
++		return false;
+ 	}
+-	files = r_list_new ();
+-	/* Parse archive */
+-	ar_read_file (b, buffer, true, NULL, NULL);
+-	ar_read_filename_table (b, buffer, files, filename);
++	return true;
++}
++
++static inline void arf_clean_name(RArFp *arf) {
++	free (arf->name);
++	arf->name = NULL;
++}
+ 
+-	/* I

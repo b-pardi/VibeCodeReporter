@@ -1,0 +1,137 @@
+@@ -153,7 +153,7 @@ class Command:
+         except SystemExit:
+             # Raised when the usage is printed by an ArgparsedCommand
+             return
+-        except (TypeError, gdb.error):
++        except (TypeError, pwndbg.dbg_mod.Error):
+             pwndbg.exception.handle(self.function.__name__)
+             return
+ 
+@@ -634,7 +634,7 @@ def sloppy_gdb_parse(s: str) -> int | str:
+         #
+         # Here, the _mask_val.type should be `unsigned long long`
+         return int(val.cast(_mask_val_type))
+-    except (TypeError, gdb.error):
++    except (TypeError, pwndbg.dbg_mod.Error):
+         return s
+ 
+ 
+
+
+
+
+@@ -13,6 +13,10 @@ from typing import Tuple
+ dbg: Debugger = None
+ 
+ 
++class Error(Exception):
++    pass
++
++
+ class Frame:
+     def evaluate_expression(self, expression: str) -> Value:
+         """
+
+
+
+
+@@ -1,18 +1,18 @@
+ from __future__ import annotations
+ 
++import contextlib
+ import signal
+ from typing import Any
+ from typing import List
+ from typing import Tuple
++from typing import TypeVar
+ 
+ import gdb
+ from typing_extensions import Callable
+ from typing_extensions import override
+ 
+ import pwndbg
+-import pwndbg.commands
+ import pwndbg.gdblib
+-from pwndbg.commands import load_commands
+ from pwndbg.gdblib import gdb_version
+ from pwndbg.gdblib import load_gdblib
+ 
+@@ -30,22 +30,52 @@ def parse_and_eval(expression: str, global_context: bool) -> gdb.Value:
+         return gdb.parse_and_eval(expression)
+ 
+ 
++T = TypeVar("T")
++
++
++@contextlib.contextmanager
++def selection(target: T, get_current: Callable[[], T], select: Callable[[T], None]):
++    """
++    GDB has a lot of global state. Many of our queries require that we select a
++    given object globally before we make them. When doing that, we must always
++    be careful to return selection to its previous state before exiting. This
++    class automatically manages the selection of a single object type.
++
++    Upon entrace to the `with` block, the element given by `target` will be
++    compared to the object returned by calling `get_current`. If they
++    compare different, the value previously returned by `get_current` is
++    saved, and the element given by `target` will be selected by passing it
++    as an argument to `select`, and, after execution leaves the `with`
++    block, the previously saved element will be selected in the same fashion
++    as the first element.
++
++    If the elements don't compare different, this is a no-op.
++    """
++
++    current = get_current()
++    restore = False
++    if current != target:
++        select(target)
++        restore = True
++
++    try:
++        yield
++    finally:
++        if restore:
++            select(current)
++
++
+ class GDBFrame(pwndbg.dbg_mod.Frame):
+     def __init__(self, inner: gdb.Frame):
+         self.inner = inner
+ 
+     @override
+     def evaluate_expression(self, expression: str) -> pwndbg.dbg_mod.Value:
+-        selected = gdb.selected_frame()
+-        restore = False
+-        if selected != self.inner:
+-            self.inner.select()
+-            restore = True
+-
+-        value = parse_and_eval(expression, global_context=False)
+-
+-        if restore:
+-            selected.select()
++        with selection(self.inner, lambda: gdb.selected_frame(), lambda f: f.select()):
++            try:
++                value = parse_and_eval(expression, global_context=False)
++            except gdb.error as e:
++                raise pwndbg.dbg_mod.Error(e)
+ 
+         return GDBValue(value)
+ 
+@@ -56,15 +86,8 @@ class GDBThread(pwndbg.dbg_mod.Thread):
+ 
+     @override
+     def bottom_frame(self) -> pwndbg.dbg_mod.Frame:
+-        selected = gdb.selected_thread()
+-        restore = False
+-        if selected != self.inner:
+-            self.inner.switch()
+-            restore = True
+-
+-        value = gdb.newest_frame()
+-        if restore:
+-            selected.switch()
++        with selection(self.inner, lambda: gdb.selected_thread(), lambda t: t.switch()):
++            value = gdb.newest_frame()
+         return GDBFrame(

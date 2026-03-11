@@ -1,0 +1,105 @@
+@@ -507,13 +507,23 @@ public class DirectorySync {
+     public static void buildDirState(SyncFilesystem fs, Path dir, RamTreeState res, SyncState synced) throws IOException {
+         if (! fs.exists(dir))
+             throw new IllegalStateException("Dir does not exist: " + dir);
++        List<Pair<FileWrapper, Blake3state>> toUpdate = new ArrayList<>();
+         fs.applyToSubtree(dir, props -> {
+             String relPath = props.path.toString().substring(dir.toString().length() + 1);
+             FileState atSync = synced.byPath(relPath);
+             if (atSync != null && atSync.modificationTime == props.modifiedTime) {
+                 res.add(atSync);
+             } else {
+-                Blake3state b3 = fs.hashFile(props.path, props.meta);
++                Blake3state b3;
++                if (props.meta.isPresent() && props.meta.get().getFileProperties().hash.isPresent()) {
++                    b3 = props.meta.get().getFileProperties().hash.get();
++                } else {
++                    b3 = fs.hashFile(props.path, props.meta);
++                    if (props.meta.isPresent()) {
++                        // collect new hashes to set in bulk later
++                        toUpdate.add(new Pair<>(props.meta.get(), b3));
++                    }
++                }
+                 FileState fstat = new FileState(relPath, props.modifiedTime, props.size, b3);
+                 res.add(fstat);
+             }
+@@ -521,5 +531,9 @@ public class DirectorySync {
+             String relPath = d.toString().substring(dir.toString().length() + 1);
+             res.addDir(relPath);
+         });
++        if (! toUpdate.isEmpty()) {
++            log("REMOTE: Updating " + toUpdate.size() + " hashes");
++            fs.setHashes(toUpdate);
++        }
+     }
+ }
+\ No newline at end of file
+
+
+
+
+@@ -7,10 +7,12 @@ import peergos.server.simulation.FileAsyncReader;
+ import peergos.shared.user.fs.AsyncReader;
+ import peergos.shared.user.fs.Blake3state;
+ import peergos.shared.user.fs.FileWrapper;
++import peergos.shared.util.Pair;
+ 
+ import java.io.*;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.List;
+ import java.util.Optional;
+ import java.util.function.Consumer;
+ 
+@@ -63,6 +65,9 @@ public class LocalFileSystem implements SyncFilesystem {
+     @Override
+     public void setHash(Path p, Blake3state hash) {}
+ 
++    @Override
++    public void setHashes(List<Pair<FileWrapper, Blake3state>> toUpdate) {}
++
+     @Override
+     public long size(Path p) {
+         return p.toFile().length();
+
+
+
+
+@@ -9,16 +9,19 @@ import peergos.shared.user.fs.Blake3state;
+ import peergos.shared.user.fs.FileProperties;
+ import peergos.shared.user.fs.FileWrapper;
+ import peergos.shared.util.Futures;
++import peergos.shared.util.Pair;
+ 
+ import java.io.IOException;
+ import java.nio.file.Path;
+ import java.time.Instant;
+ import java.time.LocalDateTime;
+ import java.time.ZoneOffset;
++import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.function.Consumer;
+ import java.util.logging.Logger;
++import java.util.stream.Collectors;
+ 
+ public class PeergosSyncFS implements SyncFilesystem {
+     private static final Logger LOG = Logging.LOG();
+@@ -107,6 +110,13 @@ public class PeergosSyncFS implements SyncFilesystem {
+         f.setProperties(f.getFileProperties().withHash(Optional.of(hash)), context.crypto.hasher, context.network, parent).join();
+     }
+ 
++    @Override
++    public void setHashes(List<Pair<FileWrapper, Blake3state>> toUpdate) {
++        FileWrapper.bulkSetSameNameProperties(toUpdate.stream()
++                .map(p -> new Pair<>(p.left, p.left.getFileProperties().withHash(Optional.of(p.right))))
++                .collect(Collectors.toList()), context.network).join();
++    }
++
+     @Override
+     public long size(Path p) {
+         Optional<FileWrapper> file = context.getByPath(p).join();
+@@ -171,27 +181,7 @@ public class PeergosSyncFS implements SyncFilesystem {
+         }
+ 
+         byte[] hash = st

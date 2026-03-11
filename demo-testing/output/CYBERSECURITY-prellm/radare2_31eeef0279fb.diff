@@ -1,0 +1,122 @@
+@@ -39,30 +39,7 @@ static void r_anal_emul_restore(RCore *core, RConfigHold *hc) {
+ 	r_config_hold_free (hc);
+ }
+ 
+-static void type_match_var(RAnal *anal , Sdb *trace, ut64 addr,const char *type, int idx) {
+-	RAnalVar *v;
+-	const char *sp_name = r_reg_get_name (anal->reg, R_REG_NAME_SP);
+-	const char *bp_name = r_reg_get_name (anal->reg, R_REG_NAME_BP);
+-	ut64 sp = r_reg_getv (anal->reg, sp_name);
+-	ut64 bp = r_reg_getv (anal->reg, bp_name);
+-	char *key = sdb_fmt ("%d.mem.read", idx);
+-	int i, array_size = sdb_array_size (trace, key);
+-
+-	for (i = 0; i < array_size; i++) {
+-		if (bp_name) {
+-			int bp_idx = sdb_array_get_num (trace, key, i, 0) - bp;
+-			if ((v = r_anal_var_get (anal, addr, R_ANAL_VAR_KIND_BPV, 1, bp_idx))) {
+-				r_anal_var_retype (anal, addr, 1, bp_idx, R_ANAL_VAR_KIND_BPV, type, -1, v->isarg, v->name);
+-				r_anal_var_free (v);
+-			}
+-		}
+-		int sp_idx = sdb_array_get_num (trace, key, i, 0) - sp;
+-		if ((v = r_anal_var_get (anal, addr, R_ANAL_VAR_KIND_SPV, 1, sp_idx))) {
+-			r_anal_var_retype (anal, addr, 1, sp_idx, R_ANAL_VAR_KIND_SPV, type, -1, v->isarg, v->name);
+-			r_anal_var_free (v);
+-		}
+-	}
+-}
++#define SDB_CONTAINS(i,s) sdb_array_contains (trace, sdb_fmt ("%d.reg.write", i), s, 0)
+ 
+ static bool type_pos_hit(RAnal *anal, Sdb *trace, bool in_stack, int idx, int size, const char *place) {
+ 	if (in_stack) {
+@@ -71,27 +48,93 @@ static bool type_pos_hit(RAnal *anal, Sdb *trace, bool in_stack, int idx, int si
+ 		ut64 write_addr = sdb_num_get (trace, sdb_fmt ("%d.mem.write", idx), 0);
+ 		return (write_addr == sp + size);
+ 	} else {
+-		return sdb_array_contains (trace, sdb_fmt ("%d.reg.write", idx), place, 0);
++		return SDB_CONTAINS (idx, place);
++	}
++}
++
++static void var_rename (RAnal *anal, RAnalVar *v, const char *name, ut64 addr) {
++	if (!name || !v) {
++		return;
++	}
++	bool is_default = strncmp (v->name, "local_", 6)? false: true;
++	if (*name == '*') {
++		name++;
+ 	}
++	// longer name tends to be meaningful like "src" instead of "s1"
++	if (!is_default && (strlen (v->name) > strlen (name))) {
++		return;
++	}
++	RAnalFunction *fcn = r_anal_get_fcn_in (anal, addr, 0);
++	RAnalVar *v1 = r_anal_var_get_byname (anal, fcn, name);
++	if (v1) {
++		r_anal_var_free (v1);
++		return;
++	}
++	r_anal_var_rename (anal, fcn->addr, 1, v->kind, v->name, name);
+ }
+ 
+-static void type_match(RCore *core, ut64 addr, char *name, int prev_idx) {
++static void var_retype (RAnal *anal, RAnalVar *var, const char *vname, char *type, ut64 addr) {
++	if (!type || !var) {
++		return;
++	}
++	if (!strncmp (type, "int", 3)) {
++		return;
++	}
++	char *vtype = NULL;
++	char *ntype = type;
++	if (!strncmp (type, "const ", 6)) {
++		// Droping const from type
++		//TODO: Infering const type
++		ntype = type + 6;
++	}
++	if (vname && *vname == '*') {
++		if (!strcmp (type, "void") && strcmp (var->type, "int")) {
++			ntype = var->type;
++		} else {
++			//type *ptr => type *
++			vtype = r_str_newf ("%s %c", ntype, '*');
++		}
++	}
++	if (vtype && *vtype) {
++		ntype = vtype;
++	}
++	r_anal_var_retype (anal, addr, 1, -1, var->kind, ntype, -1, var->isarg, var->name);
++	free (vtype);
++}
++
++static const char *get_regname (RAnal *anal, Sdb *trace, int idx) {
++	const char *query = sdb_fmt ("%d.reg.read", idx);
++	const char *res = sdb_const_get (trace, query, 0);
++	if (!res) {
++		return NULL;
++	}
++	char *tmp = strchr (res, ',');
++	if (tmp) {
++		res = tmp + 1;
++	}
++	RRegItem *ri = r_reg_get (anal->reg, res, -1);
++	if (ri && (ri->size == 32) && (anal->bits == 64)) {
++		res = r_reg_32_to_64 (anal->reg, res);
++	}
++	return res;
++}
++
++static ut64 get_addr (Sdb *trace, const char *regname, int idx) {
++	if (!regname) {
++		return UT64_MAX;
++	}
++	const char *query = sdb_fmt ("%d.reg.read.%s", idx, regname);
++	return r_num_math (NULL, sdb_const_get (trace, query, 0));
++}
++
++static void type_match(RCore *core, ut64 addr, char *fcn_name, const char* cc, int prev_idx) {
+ 	Sdb *trace = core->anal->esil->db_trace;
+ 	Sdb *TDB = core->anal->sdb_types;
+ 	RAnal *anal = core->anal;
+-	char *fcn_name

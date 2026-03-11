@@ -1,0 +1,136 @@
+@@ -141,3 +141,9 @@ Pipe& Pipe::operator=(const Pipe& other)
+ 	status_flags[1] = other.status_flags[1];
+ 	return *this;
+ 	}
++
++PipePair::PipePair(int flags, int status_flags, int* fds)
++	: pipes{Pipe(flags, flags, status_flags, status_flags, fds ? fds + 0 : nullptr),
++	        Pipe(flags, flags, status_flags, status_flags, fds ? fds + 2 : nullptr)}
++	{
++	}
+
+
+
+
+@@ -66,4 +66,34 @@ private:
+ 	int status_flags[2];
+ };
+ 
++class PipePair {
++public:
++
++	PipePair(int flags, int status_flags, int* fds = nullptr);
++
++	Pipe& In()
++		{ return pipes[swapped]; }
++
++	Pipe& Out()
++		{ return pipes[!swapped]; }
++
++	const Pipe& In() const
++		{ return pipes[swapped]; }
++
++	const Pipe& Out() const
++		{ return pipes[!swapped]; }
++
++	int InFD() const
++		{ return In().ReadFD(); }
++
++	int OutFD() const
++		{ return Out().WriteFD(); }
++
++	void Swap()
++		{ swapped = ! swapped; }
++
++	Pipe pipes[2];
++	bool swapped = false;
++};
++
+ } // namespace bro
+
+
+
+
+@@ -26,7 +26,7 @@ static RETSIGTYPE supervisor_sig_handler(int signo)
+ 	}
+ 
+ zeek::Supervisor::Supervisor(zeek::Supervisor::Config cfg,
+-							 std::unique_ptr<bro::Pipe> pipe,
++							 std::unique_ptr<bro::PipePair> pipe,
+                              pid_t arg_stem_pid)
+ 	: config(std::move(cfg)), stem_pid(arg_stem_pid), stem_pipe(std::move(pipe))
+ 	{
+@@ -128,16 +128,18 @@ void zeek::Supervisor::HandleChildSignal()
+ 			bro_strerror_r(errno, tmp, sizeof(tmp));
+ 			reporter->Error("failed to fork Zeek supervisor stem process: %s\n", tmp);
+ 			signal_flare.Fire();
+-			// Sleep to avoid spining too fast in a revival-fail loop.
++			// Sleep to avoid spinning too fast in a revival-fail loop.
+ 			sleep(1);
+ 			}
+ 		else if ( stem_pid == 0 )
+ 			{
+ 			char stem_env[256];
+-			safe_snprintf(stem_env, sizeof(stem_env), "ZEEK_STEM=%d,%d",
+-			              stem_pipe->ReadFD(), stem_pipe->WriteFD());
++			safe_snprintf(stem_env, sizeof(stem_env), "ZEEK_STEM=%d,%d,%d,%d",
++			              stem_pipe->In().ReadFD(), stem_pipe->In().WriteFD(),
++			              stem_pipe->Out().ReadFD(), stem_pipe->Out().WriteFD());
+ 			char* env[] = { stem_env, (char*)0 };
+-			stem_pipe->UnsetFlags(FD_CLOEXEC);
++			stem_pipe->In().UnsetFlags(FD_CLOEXEC);
++			stem_pipe->Out().UnsetFlags(FD_CLOEXEC);
+ 			auto res = execle(config.zeek_exe_path.data(),
+ 			                  config.zeek_exe_path.data(),
+ 			                  (char*)0, env);
+@@ -150,6 +152,16 @@ void zeek::Supervisor::HandleChildSignal()
+ 		else
+ 			{
+ 			DBG_LOG(DBG_SUPERVISOR, "stem process revived, new pid: %d", stem_pid);
++			// Recreate the desired process hierarchy.
++
++			// TODO: probably a preferred order in which to create nodes
++			// e.g. logger, manager, proxy, worker
++			for ( const auto& n : nodes )
++				{
++				const auto& node = n.second;
++				std::string msg = fmt("create %s", node.name.data());
++				safe_write(stem_pipe->OutFD(), msg.data(), msg.size() + 1);
++				}
+ 			}
+ 		}
+ 
+@@ -161,14 +173,11 @@ void zeek::Supervisor::GetFds(iosource::FD_Set* read, iosource::FD_Set* write,
+                               iosource::FD_Set* except)
+ 	{
+ 	read->Insert(signal_flare.FD());
+-	read->Insert(stem_pipe->ReadFD());
++	read->Insert(stem_pipe->InFD());
+ 	}
+ 
+ double zeek::Supervisor::NextTimestamp(double* local_network_time)
+ 	{
+-	// We're only asked for a timestamp if either (1) a FD was ready
+-	// or (2) we're not idle (and we go idle if when Process is no-op),
+-	// so there's no case where returning -1 to signify a skip will help.
+ 	return timer_mgr->Time();
+ 	}
+ 
+@@ -177,7 +186,7 @@ void zeek::Supervisor::Process()
+ 	HandleChildSignal();
+ 
+ 	char buf[256];
+-	int bytes_read = read(stem_pipe->ReadFD(), buf, 256);
++	int bytes_read = read(stem_pipe->InFD(), buf, 256);
+ 
+ 	if ( bytes_read > 0 )
+ 		{
+@@ -185,9 +194,10 @@ void zeek::Supervisor::Process()
+ 		}
+ 	}
+ 
+-void zeek::Supervisor::RunStem(std::unique_ptr<bro::Pipe> pipe)
++std::string zeek::Supervisor::RunStem(std::unique_ptr<bro::PipePair> pipe)
+ 	{
+-	zeek::set_thread_name("zeek-stem");
++	zeek::set_thread_name("zee

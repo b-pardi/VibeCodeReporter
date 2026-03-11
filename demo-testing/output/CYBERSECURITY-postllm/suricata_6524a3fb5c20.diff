@@ -1,0 +1,111 @@
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2007-2024 Open Information Security Foundation
++/* Copyright (C) 2007-2025 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -56,8 +56,9 @@ enum {
+     STATS_TYPE_AVERAGE = 2,
+     STATS_TYPE_MAXIMUM = 3,
+     STATS_TYPE_FUNC = 4,
++    STATS_TYPE_DERIVE_DIV = 5,
+ 
+-    STATS_TYPE_MAX = 5,
++    STATS_TYPE_MAX = 6,
+ };
+ 
+ /**
+@@ -595,6 +596,20 @@ static void StatsReleaseCounter(StatsCounter *pc)
+     }
+ }
+ 
++/** \internal
++ *  \brief Get ID for counters referenced in a derive counter
++ *  \retval id (>=1) or 0 on error
++ */
++static uint16_t GetIdByName(const StatsPublicThreadContext *pctx, const char *name)
++{
++    for (const StatsCounter *c = pctx->head; c != NULL; c = c->next) {
++        if (strcmp(name, c->name) == 0) {
++            return c->id;
++        }
++    }
++    return 0;
++}
++
+ /**
+  * \brief Registers a counter.
+  *
+@@ -606,8 +621,8 @@ static void StatsReleaseCounter(StatsCounter *pc)
+  *         present counter on success
+  * \retval 0 on failure
+  */
+-static uint16_t StatsRegisterQualifiedCounter(
+-        const char *name, StatsPublicThreadContext *pctx, int type_q, uint64_t (*Func)(void))
++static uint16_t StatsRegisterQualifiedCounter(const char *name, StatsPublicThreadContext *pctx,
++        int type_q, uint64_t (*Func)(void), const char *dname1, const char *dname2)
+ {
+     StatsCounter **head = &pctx->head;
+     StatsCounter *temp = NULL;
+@@ -634,14 +649,27 @@ static uint16_t StatsRegisterQualifiedCounter(
+     if (temp != NULL)
+         return(temp->id);
+ 
++    uint16_t did1 = 0;
++    uint16_t did2 = 0;
++    if (type_q == STATS_TYPE_DERIVE_DIV) {
++        did1 = GetIdByName(pctx, dname1);
++        did2 = GetIdByName(pctx, dname2);
++        if (did1 == 0 || did2 == 0) {
++            return 0;
++        }
++    }
++
+     /* if we reach this point we don't have a counter registered by this name */
+     if ((pc = SCCalloc(1, sizeof(StatsCounter))) == NULL)
+         return 0;
+ 
+     /* assign a unique id to this StatsCounter.  The id is local to this
+      * thread context.  Please note that the id start from 1, and not 0 */
+-    pc->id = ++(pctx->curr_id);
+-
++    if (type_q == STATS_TYPE_DERIVE_DIV) {
++        pc->id = ++pctx->derive_id;
++    } else {
++        pc->id = ++(pctx->curr_id);
++    }
+     /* for AVG counters we use 2 indices into the tables: one for values,
+      * the other to track updates. */
+     if (type_q == STATS_TYPE_AVERAGE)
+@@ -655,6 +683,8 @@ static uint16_t StatsRegisterQualifiedCounter(
+ 
+     pc->type = type_q;
+     pc->Func = Func;
++    pc->did1 = did1;
++    pc->did2 = did2;
+ 
+     /* we now add the counter to the list */
+     if (prev == NULL)
+@@ -740,7 +770,7 @@ static int StatsOutput(ThreadVars *tv)
+         /* copy private table to a local variable to loop it w/o lock */
+         bool skip = false;
+         SCSpinLock(&sts->ctx->lock);
+-        uint16_t table_size = sts->ctx->curr_id + 1;
++        const uint16_t table_size = sts->ctx->curr_id + sts->ctx->derive_id + 1;
+         if (sts->ctx->copy_of_private == NULL) {
+             skip = true;
+         } else {
+@@ -771,6 +801,12 @@ static int StatsOutput(ThreadVars *tv)
+                     /* skip updates row */
+                     i++;
+                     break;
++                case STATS_TYPE_DERIVE_DIV:
++                    SCLogDebug("counter %u/%u is derived from counters %u / %u", pc->id, pc->gid,
++                            pc->did1, pc->did2);
++                    thread_table[pc->gid].value = thread_table_from_private[pc->did1].v;
++                    thread_table[pc->gid].updates = thread_table_from_private[pc->did2].v;
++                    break;
+                 default:
+                     SCLogDebug("Counter %s (%u:%u) value %" PRIu64, pc->name, pc->id, pc->gid,
+                             thread_table_from_private[i].v);
+@@ -824,6 +860,7 @@ static i

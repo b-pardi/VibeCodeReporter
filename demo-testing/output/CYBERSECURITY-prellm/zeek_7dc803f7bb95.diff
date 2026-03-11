@@ -1,0 +1,125 @@
+@@ -35,33 +35,31 @@ ICMPAnalyzer::~ICMPAnalyzer()
+ 	{
+ 	}
+ 
+-bool ICMPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet)
++bool ICMPAnalyzer::BuildConnTuple(size_t len, const uint8_t* data, Packet* packet,
++                                  ConnTuple& tuple)
+ 	{
+ 	if ( ! CheckHeaderTrunc(ICMP_MINLEN, len, packet) )
+ 		return false;
+ 
+-	ConnTuple id;
+-	id.src_addr = packet->ip_hdr->SrcAddr();
+-	id.dst_addr = packet->ip_hdr->DstAddr();
+-	id.proto = TRANSPORT_ICMP;
++	tuple.src_addr = packet->ip_hdr->SrcAddr();
++	tuple.dst_addr = packet->ip_hdr->DstAddr();
++	tuple.proto = TRANSPORT_ICMP;
+ 
+ 	const struct icmp* icmpp = (const struct icmp *) data;
+-	id.src_port = htons(icmpp->icmp_type);
++	tuple.src_port = htons(icmpp->icmp_type);
+ 
+ 	if ( packet->proto == IPPROTO_ICMP )
+-		id.dst_port = htons(ICMP4_counterpart(icmpp->icmp_type, icmpp->icmp_code, id.is_one_way));
++		tuple.dst_port = htons(ICMP4_counterpart(icmpp->icmp_type, icmpp->icmp_code, tuple.is_one_way));
+ 	else if ( packet->proto == IPPROTO_ICMPV6 )
+-		id.dst_port = htons(ICMP6_counterpart(icmpp->icmp_type, icmpp->icmp_code, id.is_one_way));
++		tuple.dst_port = htons(ICMP6_counterpart(icmpp->icmp_type, icmpp->icmp_code, tuple.is_one_way));
+ 	else
+ 		reporter->InternalError("Reached ICMP packet analyzer with unknown packet protocol %x",
+ 		                        packet->proto);
+ 
+-	ProcessConnection(id, packet, len);
+-
+ 	return true;
+ 	}
+ 
+-void ICMPAnalyzer::ContinueProcessing(Connection* c, double t, bool is_orig, int remaining, Packet* pkt)
++void ICMPAnalyzer::DeliverPacket(Connection* c, double t, bool is_orig, int remaining, Packet* pkt)
+ 	{
+ 	auto* ta = static_cast<ICMPTransportAnalyzer*>(c->GetRootAnalyzer());
+ 
+
+
+
+
+@@ -24,8 +24,6 @@ public:
+ 	ICMPAnalyzer();
+ 	~ICMPAnalyzer() override;
+ 
+-	bool AnalyzePacket(size_t len, const uint8_t* data, Packet* packet) override;
+-
+ 	static zeek::packet_analysis::AnalyzerPtr Instantiate()
+ 		{
+ 		return std::make_shared<ICMPAnalyzer>();
+@@ -36,7 +34,13 @@ public:
+ 
+ protected:
+ 
+-	void ContinueProcessing(Connection* c, double t, bool is_orig, int remaining,
++	/**
++	 * Parse the header from the packet into a ConnTuple object.
++	 */
++	bool BuildConnTuple(size_t len, const uint8_t* data, Packet* packet,
++	                    ConnTuple& tuple) override;
++
++	void DeliverPacket(Connection* c, double t, bool is_orig, int remaining,
+ 	                        Packet* pkt) override;
+ 
+ private:
+
+
+
+
+@@ -22,16 +22,20 @@ IPBasedAnalyzer::~IPBasedAnalyzer()
+ 	{
+ 	}
+ 
+-void IPBasedAnalyzer::ProcessConnection(const ConnTuple& conn_id, Packet* pkt, size_t remaining)
++bool IPBasedAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* pkt)
+ 	{
++	ConnTuple tuple;
++	if ( ! BuildConnTuple(len, data, pkt, tuple) )
++		return false;
++
+ 	const std::unique_ptr<IP_Hdr>& ip_hdr = pkt->ip_hdr;
+-	detail::ConnKey key(conn_id);
++	detail::ConnKey key(tuple);
+ 
+ 	Connection* conn = session_mgr->FindConnection(key);
+ 
+ 	if ( ! conn )
+ 		{
+-		conn = NewConn(&conn_id, key, pkt);
++		conn = NewConn(&tuple, key, pkt);
+ 		if ( conn )
+ 			session_mgr->Insert(conn, false);
+ 		}
+@@ -42,7 +46,7 @@ void IPBasedAnalyzer::ProcessConnection(const ConnTuple& conn_id, Packet* pkt, s
+ 			conn->Event(connection_reused, nullptr);
+ 
+ 			session_mgr->Remove(conn);
+-			conn = NewConn(&conn_id, key, pkt);
++			conn = NewConn(&tuple, key, pkt);
+ 			if ( conn )
+ 				session_mgr->Insert(conn, false);
+ 			}
+@@ -53,10 +57,10 @@ void IPBasedAnalyzer::ProcessConnection(const ConnTuple& conn_id, Packet* pkt, s
+ 		}
+ 
+ 	if ( ! conn )
+-		return;
++		return false;
+ 
+-	bool is_orig = (conn_id.src_addr == conn->OrigAddr()) &&
+-		(conn_id.src_port == conn->OrigPort());
++	bool is_orig = (tuple.src_addr == conn->OrigAddr()) &&
++	               (tuple.src_port == conn->OrigPort());
+ 
+ 	conn->CheckFlowLabel(is_orig, ip_hdr->FlowLabel());
+ 
+@@ -85,9 +89,9 @@ void IPBasedAnalyzer::ProcessConnection(const ConnTuple& conn_id, Packet* pkt, s
+ 
+ 		// TODO: Does this actually mean anyt

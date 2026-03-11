@@ -1,0 +1,99 @@
+@@ -394,6 +394,33 @@ TEST_P(TlsConnectTls13, TestTls13ResumeDifferentGroup) {
+             ssl_sig_rsa_pss_rsae_sha256);
+ }
+ 
++// Verify that TLS 1.3 server doesn't request certificate in the main
++// handshake, after resumption.
++TEST_P(TlsConnectTls13, TestTls13ResumeNoCertificateRequest) {
++  ConfigureSessionCache(RESUME_BOTH, RESUME_TICKET);
++  client_->SetupClientAuth();
++  server_->RequestClientAuth(true);
++  Connect();
++  SendReceive();  // Need to read so that we absorb the session ticket.
++  ScopedCERTCertificate cert1(SSL_LocalCertificate(client_->ssl_fd()));
++
++  Reset();
++  ConfigureSessionCache(RESUME_BOTH, RESUME_TICKET);
++  ExpectResumption(RESUME_TICKET);
++  server_->RequestClientAuth(false);
++  auto cr_capture =
++      MakeTlsFilter<TlsHandshakeRecorder>(server_, ssl_hs_certificate_request);
++  cr_capture->EnableDecryption();
++  Connect();
++  SendReceive();
++  EXPECT_EQ(0U, cr_capture->buffer().len()) << "expect nothing captured yet";
++
++  // Sanity check whether the client certificate matches the one
++  // decrypted from ticket.
++  ScopedCERTCertificate cert2(SSL_PeerCertificate(server_->ssl_fd()));
++  EXPECT_TRUE(SECITEM_ItemsAreEqual(&cert1->derCert, &cert2->derCert));
++}
++
+ // We need to enable different cipher suites at different times in the following
+ // tests.  Those cipher suites need to be suited to the version.
+ static uint16_t ChooseOneCipher(uint16_t version) {
+
+
+
+
+@@ -2312,6 +2312,13 @@ tls13_HandleCertificateRequest(sslSocket *ss, PRUint8 *b, PRUint32 length)
+     return SECSuccess;
+ }
+ 
++static PRBool
++tls13_CanRequestClientAuth(sslSocket *ss)
++{
++    return ss->opt.requestCertificate &&
++           ss->ssl3.hs.kea_def->authKeyType != ssl_auth_psk;
++}
++
+ static SECStatus
+ tls13_SendEncryptedServerSequence(sslSocket *ss)
+ {
+@@ -2343,7 +2350,7 @@ tls13_SendEncryptedServerSequence(sslSocket *ss)
+         return SECFailure; /* error code is set. */
+     }
+ 
+-    if (ss->opt.requestCertificate) {
++    if (tls13_CanRequestClientAuth(ss)) {
+         rv = tls13_SendCertificateRequest(ss);
+         if (rv != SECSuccess) {
+             return SECFailure; /* error code is set. */
+@@ -2462,9 +2469,11 @@ tls13_SendServerHelloSequence(sslSocket *ss)
+             LOG_ERROR(ss, SEC_ERROR_LIBRARY_FAILURE);
+             return SECFailure;
+         }
+-        TLS13_SET_HS_STATE(ss,
+-                           ss->opt.requestCertificate ? wait_client_cert
+-                                                      : wait_finished);
++        if (tls13_CanRequestClientAuth(ss)) {
++            TLS13_SET_HS_STATE(ss, wait_client_cert);
++        } else {
++            TLS13_SET_HS_STATE(ss, wait_finished);
++        }
+     }
+ 
+     ss->ssl3.hs.serverHelloTime = ssl_TimeUsec();
+@@ -4168,7 +4177,7 @@ tls13_ServerHandleFinished(sslSocket *ss, PRUint8 *b, PRUint32 length)
+         return SECFailure;
+     }
+ 
+-    if (!ss->opt.requestCertificate &&
++    if (!tls13_CanRequestClientAuth(ss) &&
+         (ss->ssl3.hs.zeroRttState != ssl_0rtt_done)) {
+         dtls_ReceivedFirstMessageInFlight(ss);
+     }
+@@ -5221,9 +5230,11 @@ tls13_HandleEndOfEarlyData(sslSocket *ss, PRUint8 *b, PRUint32 length)
+     }
+ 
+     ss->ssl3.hs.zeroRttState = ssl_0rtt_done;
+-    TLS13_SET_HS_STATE(ss,
+-                       ss->opt.requestCertificate ? wait_client_cert
+-                                                  : wait_finished);
++    if (tls13_CanRequestClientAuth(ss)) {
++        TLS13_SET_HS_STATE(ss, wait_client_cert);
++    } else {
++        TLS13_SET_HS_STATE(ss, wait_finished);
++    }
+     return SECSuccess;
+ }

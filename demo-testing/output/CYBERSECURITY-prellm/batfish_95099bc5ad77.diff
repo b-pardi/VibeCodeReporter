@@ -1,0 +1,86 @@
+@@ -5,6 +5,7 @@ import static com.google.common.base.Preconditions.checkArgument;
+ import static org.batfish.common.util.IspModelingUtils.installRoutingPolicyAdvertiseStatic;
+ import static org.batfish.datamodel.Interface.NULL_INTERFACE_NAME;
+ import static org.batfish.representation.aws.Utils.addStaticRoute;
++import static org.batfish.representation.aws.Utils.connectGatewayToVpc;
+ import static org.batfish.representation.aws.Utils.toStaticRoute;
+ 
+ import com.fasterxml.jackson.annotation.JsonCreator;
+@@ -22,6 +23,7 @@ import java.util.stream.Collectors;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import javax.annotation.ParametersAreNonnullByDefault;
++import org.batfish.common.Warnings;
+ import org.batfish.datamodel.BgpActivePeerConfig;
+ import org.batfish.datamodel.BgpProcess;
+ import org.batfish.datamodel.ConcreteInterfaceAddress;
+@@ -139,7 +141,8 @@ final class InternetGateway implements AwsVpcEntity, Serializable {
+     return _attachmentVpcIds;
+   }
+ 
+-  Configuration toConfigurationNode(ConvertedConfiguration awsConfiguration, Region region) {
++  Configuration toConfigurationNode(
++      ConvertedConfiguration awsConfiguration, Region region, Warnings warnings) {
+     Configuration cfgNode =
+         Utils.newAwsConfiguration(
+             _internetGatewayId, "aws", _tags, DeviceModel.AWS_INTERNET_GATEWAY);
+@@ -172,6 +175,16 @@ final class InternetGateway implements AwsVpcEntity, Serializable {
+         computeUnassociatedPrivateIpFilter(privatePublicMap.keySet());
+     cfgNode.getIpAccessLists().put(unassociatedIpFilter.getName(), unassociatedIpFilter);
+ 
++    _attachmentVpcIds.forEach(
++        vpcId -> {
++          Interface iface =
++              connectGatewayToVpc(
++                  _internetGatewayId, cfgNode, vpcId, awsConfiguration, region, warnings);
++          if (iface != null) {
++            iface.setIncomingFilter(unassociatedIpFilter);
++          }
++        });
++
+     BgpProcess bgpProcess =
+         BgpProcess.builder()
+             .setRouterId(bbInterfaceAddress.getIp())
+
+
+
+
+@@ -684,7 +684,7 @@ public final class Region implements Serializable {
+     }
+ 
+     for (InternetGateway igw : getInternetGateways().values()) {
+-      Configuration cfgNode = igw.toConfigurationNode(awsConfiguration, this);
++      Configuration cfgNode = igw.toConfigurationNode(awsConfiguration, this, warnings);
+       awsConfiguration.addNode(cfgNode);
+     }
+ 
+
+
+
+
+@@ -5,7 +5,6 @@ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.collect.Maps.immutableEntry;
+ import static org.batfish.representation.aws.AwsLocationInfoUtils.subnetInterfaceLinkLocationInfo;
+ import static org.batfish.representation.aws.AwsLocationInfoUtils.subnetInterfaceLocationInfo;
+-import static org.batfish.representation.aws.InternetGateway.UNASSOCIATED_PRIVATE_IP_FILTER_NAME;
+ import static org.batfish.representation.aws.Utils.addStaticRoute;
+ import static org.batfish.representation.aws.Utils.connect;
+ import static org.batfish.representation.aws.Utils.getInterfaceLinkLocalIp;
+@@ -212,37 +211,14 @@ public class Subnet implements AwsVpcEntity, Serializable {
+         toStaticRoute(
+             _cidrBlock, interfaceNameToRemote(cfgNode), getInterfaceLinkLocalIp(cfgNode, _vpcId)));
+ 
+-    // 1. connect the vpn gateway to the subnet if one exists
+-    // 2. create appropriate static routes
+     Optional<VpnGateway> optVpnGateway = region.findVpnGateway(_vpcId);
+-    if (optVpnGateway.isPresent()) {
+-      Configuration vgwConfig =
+-          awsConfiguration.getConfigurationNodes().get(optVpnGateway.get().getId());
+-      connect(awsConfiguration, cfgNode, vgwConfig);
+-      Ip nhipOnVgw = getInterfaceLinkLocalIp(cfgNode, vgwConfig.getHostname());
+-      addStaticRoute(
+-          vgwConfig, toStaticRoute(_cidrBlock, interfaceNameToRemote(cfgNode), nhipOnVgw));
+-    }
+-
+-    // 1. connect the internet gateway if its a public subnet
+-    // 2. create static routes on it for the subnet

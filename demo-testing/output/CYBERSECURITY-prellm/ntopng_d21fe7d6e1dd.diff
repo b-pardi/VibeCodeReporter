@@ -1,0 +1,94 @@
+@@ -47,11 +47,6 @@ class HostPools {
+   u_int32_t *schedule_bitmap;
+   bool *enforce_quotas_per_pool_member;   /* quotas can be pool-wide or per pool member */
+   bool *enforce_shapers_per_pool_member;
+-  volatile_members_t **volatile_members;
+-  Mutex **volatile_members_lock;
+-
+-  void reloadVolatileMembers(VlanAddressTree *_trees);
+-  void addVolatileMember(char *host_or_mac, u_int16_t user_pool_id, time_t lifetime);
+ #endif
+   inline HostPoolStats* getPoolStats(u_int16_t host_pool_id) {
+     if((host_pool_id >= max_num_pools) || (!stats))
+@@ -164,10 +159,7 @@ class HostPools {
+   inline u_int32_t getPoolSchedule(u_int16_t pool_id) {
+     return(((pool_id != NO_HOST_POOL_ID) && (pool_id < max_num_pools)) ? schedule_bitmap[pool_id] : DEFAULT_TIME_SCHEDULE);
+   }
+-  void luaVolatileMembers(lua_State *vm);
+-  void addToPool(char *host_or_mac, u_int16_t user_pool_id, int32_t lifetime_secs);
+-  void removeVolatileMemberFromPool(char *host_or_mac, u_int16_t user_pool_id);
+-  void purgeExpiredVolatileMembers();
++  void addToPool(char *host_or_mac, u_int16_t user_pool_id);
+ 
+   inline bool isChildrenSafePool(u_int16_t pool_id) {
+     return((pool_id < max_num_pools) ? children_safe[pool_id] : false);
+
+
+
+
+@@ -703,7 +703,6 @@ class NetworkInterface : public AlertableEntity {
+   void updateFlowsL7Policy();
+ #endif
+   void resetPoolsStats(u_int16_t pool_filter);
+-  inline void luaHostPoolsVolatileMembers(lua_State *vm) { if (host_pools) host_pools->luaVolatileMembers(vm); };
+ #endif
+   inline void luaHostPoolsStats(lua_State *vm)           { if (host_pools) host_pools->luaStats(vm);           };
+   void refreshHostPools();
+
+
+
+
+@@ -405,9 +405,7 @@ class Ntop {
+   bool addUser(char *username, char *full_name, char *password, char *host_role,
+ 	       char *allowed_networks, char *allowed_ifname, char *host_pool_id,
+ 	       char *language, bool allow_pcap_download);
+-  bool addUserLifetime(const char * const username, u_int32_t lifetime_secs); /* Captive portal users may expire */
+   bool addUserAPIToken(const char * const username, const char *api_token);
+-  bool clearUserLifetime(const char * const username);
+   bool isCaptivePortalUser(const char * const username);
+   bool deleteUser(char *username);
+   bool getUserHostPool(char *username, u_int16_t *host_pool_id);
+
+
+
+
+@@ -42,18 +42,11 @@ HostPools::HostPools(NetworkInterface *_iface) {
+ 
+   for(int i = 0; i < MAX_NUM_HOST_POOLS; i++) routing_policy_id[i] = DEFAULT_ROUTING_TABLE_ID;
+ 
+-  if((volatile_members = (volatile_members_t**)calloc(MAX_NUM_HOST_POOLS, sizeof(volatile_members_t*))) == NULL
+-     || (volatile_members_lock            = new (std::nothrow) Mutex*[MAX_NUM_HOST_POOLS]) == NULL
+-     || (pool_shaper = (u_int16_t*)calloc(MAX_NUM_HOST_POOLS, sizeof(u_int16_t))) == NULL
++  if((pool_shaper = (u_int16_t*)calloc(MAX_NUM_HOST_POOLS, sizeof(u_int16_t))) == NULL
+      || (schedule_bitmap = (u_int32_t*)calloc(MAX_NUM_HOST_POOLS, sizeof(u_int32_t))) == NULL
+      || (enforce_quotas_per_pool_member   = (bool*)calloc(MAX_NUM_HOST_POOLS, sizeof(bool))) == NULL
+      || (enforce_shapers_per_pool_member  = (bool*)calloc(MAX_NUM_HOST_POOLS, sizeof(bool))) == NULL)
+     throw 1;
+-
+-  for(int i = 0; i < MAX_NUM_HOST_POOLS; i++) {
+-    if((volatile_members_lock[i] = new (std::nothrow) Mutex()) == NULL)
+-      throw 2;
+-  }
+ #endif
+ 
+   stats = stats_shadow = NULL;
+@@ -126,31 +119,7 @@ HostPools::~HostPools() {
+     free(enforce_quotas_per_pool_member);
+   if(enforce_shapers_per_pool_member)
+     free(enforce_shapers_per_pool_member);
+-  if(volatile_members_lock) {
+-    for(int i = 0; i < MAX_NUM_HOST_POOLS; i++) {
+-      if(volatile_members_lock[i])
+-	delete volatile_members_lock[i];
+-    }
+-
+-    delete []volatile_members_lock;
+-  }
+-
+-  if(volatile_members) {
+-    for(int pool_id = 0; pool_id < MAX_NUM_HOST_POOLS; pool_id++) {
+-      volatile_members_t *current, *tmp;
+ 
+-      HASH_ITER(hh, volatile_members[pool_id], current, tmp) {
+-	HASH_DEL(volatile_members[pool_id], current);
+-	free(

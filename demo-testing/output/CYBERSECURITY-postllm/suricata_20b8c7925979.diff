@@ -1,0 +1,150 @@
+@@ -50,16 +50,12 @@ static int DecodeSCTPPacket(ThreadVars *tv, Packet *p, const uint8_t *pkt, uint1
+         return -1;
+     }
+ 
+-    p->sctph = (SCTPHdr *)pkt;
+-
+-    SET_SCTP_SRC_PORT(p,&p->sp);
+-    SET_SCTP_DST_PORT(p,&p->dp);
+-
++    SCTPHdr *sctph = PacketSetSCTP(p, pkt);
++    p->sp = SCNtohs(sctph->sh_sport);
++    p->dp = SCNtohs(sctph->sh_dport);
+     p->payload = (uint8_t *)pkt + sizeof(SCTPHdr);
+     p->payload_len = len - sizeof(SCTPHdr);
+-
+     p->proto = IPPROTO_SCTP;
+-
+     return 0;
+ }
+ 
+@@ -69,14 +65,11 @@ int DecodeSCTP(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p,
+     StatsIncr(tv, dtv->counter_sctp);
+ 
+     if (unlikely(DecodeSCTPPacket(tv, p,pkt,len) < 0)) {
+-        CLEAR_SCTP_PACKET(p);
++        PacketClearL4(p);
+         return TM_ECODE_FAILED;
+     }
+ 
+-#ifdef DEBUG
+-    SCLogDebug("SCTP sp: %" PRIu32 " -> dp: %" PRIu32,
+-        SCTP_GET_SRC_PORT(p), SCTP_GET_DST_PORT(p));
+-#endif
++    SCLogDebug("SCTP sp: %u -> dp: %u", p->sp, p->dp);
+ 
+     FlowSetupPacket(p);
+ 
+
+
+
+
+@@ -27,13 +27,6 @@
+ /** size of the packet header without any chunk headers */
+ #define SCTP_HEADER_LEN                       12
+ 
+-/* XXX RAW* needs to be really 'raw', so no SCNtohs there */
+-#define SCTP_GET_RAW_SRC_PORT(sctph)          SCNtohs((sctph)->sh_sport)
+-#define SCTP_GET_RAW_DST_PORT(sctph)          SCNtohs((sctph)->sh_dport)
+-
+-#define SCTP_GET_SRC_PORT(p)                  SCTP_GET_RAW_SRC_PORT(p->sctph)
+-#define SCTP_GET_DST_PORT(p)                  SCTP_GET_RAW_DST_PORT(p->sctph)
+-
+ typedef struct SCTPHdr_
+ {
+     uint16_t sh_sport;     /* source port */
+@@ -42,10 +35,6 @@ typedef struct SCTPHdr_
+     uint32_t sh_sum;       /* checksum, computed via crc32 */
+ } __attribute__((__packed__)) SCTPHdr;
+ 
+-#define CLEAR_SCTP_PACKET(p) { \
+-    (p)->sctph = NULL; \
+-} while (0)
+-
+ void DecodeSCTPRegisterTests(void);
+ 
+ #endif /* SURICATA_DECODE_SCTP_H */
+
+
+
+
+@@ -198,17 +198,6 @@ typedef struct Address_ {
+         SET_PORT(UDP_GET_DST_PORT((pkt)), *(prt)); \
+     } while (0)
+ 
+-/* Set the SCTP ports into the Ports of the Packet.
+- * Make sure p->sctph is initialized and validated. */
+-#define SET_SCTP_SRC_PORT(pkt, prt) do {            \
+-        SET_PORT(SCTP_GET_SRC_PORT((pkt)), *(prt)); \
+-    } while (0)
+-
+-#define SET_SCTP_DST_PORT(pkt, prt) do {            \
+-        SET_PORT(SCTP_GET_DST_PORT((pkt)), *(prt)); \
+-    } while (0)
+-
+-
+ #define GET_IPV4_SRC_ADDR_U32(p) ((p)->src.addr_data32[0])
+ #define GET_IPV4_DST_ADDR_U32(p) ((p)->dst.addr_data32[0])
+ #define GET_IPV4_SRC_ADDR_PTR(p) ((p)->src.addr_data32)
+@@ -437,9 +426,18 @@ struct PacketL3 {
+     } vars;
+ };
+ 
++enum PacketL4Types {
++    PACKET_L4_UNKNOWN = 0,
++    PACKET_L4_SCTP,
++};
++
+ struct PacketL4 {
++    enum PacketL4Types type;
+     bool csum_set;
+     uint16_t csum;
++    union L4Hdrs {
++        SCTPHdr *sctph;
++    } hdrs;
+ };
+ 
+ /* sizes of the members:
+@@ -577,7 +575,6 @@ typedef struct Packet_
+ 
+     TCPHdr *tcph;
+     UDPHdr *udph;
+-    SCTPHdr *sctph;
+     ESPHdr *esph;
+     ICMPV4Hdr *icmpv4h;
+     ICMPV6Hdr *icmpv6h;
+@@ -779,6 +776,25 @@ static inline bool PacketIsICMPv6(const Packet *p)
+     return PKT_IS_ICMPV6(p);
+ }
+ 
++static inline SCTPHdr *PacketSetSCTP(Packet *p, const uint8_t *buf)
++{
++    DEBUG_VALIDATE_BUG_ON(p->l4.type != PACKET_L4_UNKNOWN);
++    p->l4.type = PACKET_L4_SCTP;
++    p->l4.hdrs.sctph = (SCTPHdr *)buf;
++    return p->l4.hdrs.sctph;
++}
++
++static inline const SCTPHdr *PacketGetSCTP(const Packet *p)
++{
++    DEBUG_VALIDATE_BUG_ON(p->l4.type != PACKET_L4_SCTP);
++    return p->l4.hdrs.sctph;
++}
++
++static inline bool PacketIsSCTP(const Packet *p)
++{
++    return p->l4.type == PACKET_L4_SCTP;
++}
++
+ /** \brief Structure to hold thread specific data for all decode modules */
+ typedef struct DecodeThreadVars_
+ {
+
+
+
+
+@@ -184,9 +184,9 @@ void FlowInit(Flow *f, const Packet *p)
+         f->icmp_s.type = p->icmp_s.type;
+         f->icmp_s.code = p->icmp_s.code;
+         FlowSetICMPv6CounterPart(f);
+-    } else if (p->sctph != NULL) { /* XXX MACRO

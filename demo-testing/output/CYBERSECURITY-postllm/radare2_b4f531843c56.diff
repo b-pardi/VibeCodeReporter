@@ -1,0 +1,160 @@
+@@ -1053,50 +1053,83 @@ R_API void r_cons_echo(const char *msg) {
+ 	}
+ }
+ 
+-// TODO: must be called twice to remove all unnecessary reset codes. maybe adding the last two words would be faster
+-// TODO remove all the strdup
+-// TODO remove the slow memmove
+-static void optimize(void) {
+-	char *buf = C->buffer;
+-	int len = C->buffer_len;
+-	int i;
+-	int escape_n = 0;
+-	char escape[32];
+-	bool onescape = false;
+-	char *oldstr = NULL;
+-	for (i = 0; i < len; i++) {
+-		if (onescape) {
+-			escape[escape_n++] = buf[i];
+-			escape[escape_n] = 0;
+-			if (buf[i] == 'm' || buf[i] == 'K' || buf[i] == 'L') {
+-				int pos = (i - escape_n);
+-			// 	eprintf ("JJJ(%s) (%s)%c", escape + 1, oldstr?oldstr+1:"", 10);
+-				if (oldstr && !strcmp (escape, oldstr)) {
+-					// trim str
+-					memmove (buf + pos + 1, buf + i + 1, len - i + 1);
+-					i -= escape_n - 1;
+-					len -= escape_n;
++static void optimize(RConsContext *ctx) {
++	char *buf = ctx->buffer;
++	int len = ctx->buffer_len;
++	if (len < 1) {
++		return;
++	}
++
++	int i = 0;
++	int j = 0;
++	const int buf_sz = ctx->buffer_sz;
++
++	while (i < len) {
++		if (buf[i] == 0x1b && i + 1 < len && buf[i+1] == '[') {
++			char escape_seq[32];
++			int k = 0;
++
++			// Copy ESC and [
++			if (j + 2 > buf_sz) {
++				goto overflow;
++			}
++			escape_seq[k++] = buf[i++]; // ESC
++			escape_seq[k++] = buf[i++]; // [
++
++			while (i < len && k < sizeof (escape_seq) - 1) {
++				char c = buf[i++];
++				if (j + k > buf_sz) {
++					goto overflow;
+ 				}
+-				free (oldstr);
+-				oldstr = strdup (escape);
+-			//	eprintf ("ERN (%d) %s%c", pos, escape, 10);
+-				onescape = false;
+-			} else {
+-				if (escape_n + 1 >= sizeof (escape)) {
+-					escape_n = 0;
+-					onescape = false;
++				escape_seq[k++] = c;
++				if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
++					break;
+ 				}
+ 			}
+-		} else if (buf[i] == 0x1b) {
+-			escape_n = 0;
+-			onescape = true;
+-			escape[escape_n++] = buf[i];
+-			escape[escape_n] = 0;
++			escape_seq[k] = '\0';
++
++			// TODO: Implement logic here to determine if escape_seq should be kept,
++			// modified, or discarded based on context or previous sequences.
++			// For now, we assume it should always be kept.
++			bool keep_sequence = true;
++			if (keep_sequence) {
++				if (j + k <= buf_sz) {
++					memcpy (buf + j, escape_seq, k);
++					j += k;
++				} else {
++					goto overflow;
++				}
++			}
++		} else {
++			if (j < buf_sz) {
++				buf[j++] = buf[i++];
++			} else {
++				goto overflow;
++			}
++		}
++	}
++
++	if (j < ctx->buffer_len) {
++		ctx->buffer_len = j;
++		if (j < buf_sz) {
++			buf[j] = '\0';
++		}
++	}
++	return;
++
++overflow:
++	R_LOG_WARN ("Buffer overflow during ANSI optimization, output truncated");
++	if (j <= buf_sz) {
++		ctx->buffer_len = j;
++		if (j < buf_sz) {
++			buf[j] = '\0';
++		}
++	} else {
++		ctx->buffer_len = buf_sz > 0 ? buf_sz -1 : 0;
++		if (ctx->buffer_len >= 0 && buf_sz > 0) {
++			buf[ctx->buffer_len] = '\0';
+ 		}
+ 	}
+-	// eprintf ("FROM %d TO %d (%d)%c", C->buffer_len, len, codes, 10);
+-	C->buffer_len = len;
+-	free (oldstr);
+ }
+ 
+ R_API char *r_cons_drain(void) {
+@@ -1108,13 +1141,15 @@ R_API char *r_cons_drain(void) {
+ }
+ 
+ R_API void r_cons_flush(void) {
++	RConsContext *ctx = getctx ();
++	if (!ctx) {
++		r_cons_context_reset ();
++		ctx = getctx ();
++	}
+ 	if (!r_cons_instance) {
+ 		r_cons_instance = &g_cons_instance;
+ 	}
+ 	const char *tee = I->teefile;
+-	if (!C) {
+-		r_cons_context_reset ();
+-	}
+ 	if (C->noflush) {
+ 		return;
+ 	}
+@@ -1122,51 +1157,52 @@ R_API void r_cons_flush(void) {
+ 		r_cons_reset ();
+ 		return;
+ 	}
+-	if (!r_list_empty (C->marks)) {
+-		r_list_free (C->marks);
+-		C->marks = r_list_newf ((RListFree)r_cons_mark_free);
++	if (!r_list_empty (ctx->marks)) {
++		r_list_free (ctx->marks);
++		ctx->marks = r_list_newf ((RListFree)r_cons_mark_free);
+ 	}
+-	if (lastMatters () && !C->lastMode) {
++	if (lastMatters () && !ctx->lastMode) {
+ 		// snapshot of the output
+-		if (C->buffer_len > C->lastLength) {
+-			free (C->lastOutput);
+-			C->lastOutput = malloc (C->buffer_len + 1);
++		if (

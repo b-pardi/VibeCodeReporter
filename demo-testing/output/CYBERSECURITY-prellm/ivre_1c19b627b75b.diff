@@ -1,0 +1,111 @@
+@@ -1,7 +1,7 @@
+ #! /usr/bin/env python
+ 
+ # This file is part of IVRE.
+-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
++# Copyright 2011 - 2022 Pierre LALET <pierre@droids-corp.org>
+ #
+ # IVRE is free software: you can redistribute it and/or modify it
+ # under the terms of the GNU General Public License as published by
+@@ -26,15 +26,21 @@ from datetime import datetime
+ from itertools import chain
+ import re
+ from textwrap import wrap
+-from typing import Any, Callable, Dict, List, Set, Union, cast
++from typing import Any, Callable, Dict, Generator, Iterable, List, Set, Union, cast
+ 
+ 
+ from ivre.active.cpe import add_cpe_values
+ from ivre.config import VIEW_SYNACK_HONEYPOT_COUNT
+ from ivre.data.microsoft.exchange import EXCHANGE_BUILDS
+-from ivre.types import ParsedCertificate
++from ivre.types import ParsedCertificate, Tag
+ from ivre.types.active import HttpHeader, NmapAddress, NmapHost, NmapPort, NmapScript
+-from ivre.utils import get_domains, nmap_decode_data, nmap_encode_data, ports2nmapspec
++from ivre.utils import (
++    TORCERT_SUBJECT,
++    get_domains,
++    nmap_decode_data,
++    nmap_encode_data,
++    ports2nmapspec,
++)
+ 
+ 
+ ALIASES_TABLE_ELEMS = {
+@@ -240,16 +246,112 @@ def set_openports_attribute(host: NmapHost) -> None:
+             cur["ports"].append(port["port"])
+ 
+ 
+-def cleanup_synack_honeypot_host(host: NmapHost, update_openports: bool = True) -> None:
+-    """This function will clean the `host` record if it has too many (at
+-    least `VIEW_SYNACK_HONEYPOT_COUNT`) open ports that may be "syn-ack"
+-    honeypots (which means, ports for which is_real_service_port() returns
+-    False).
++def _prepare_tag(tag: Dict[str, Any]) -> Dict[str, Any]:
++    """This function uses a set() for the "info" value, while a list() is
++    used to store it. It is used in add_tags().
+ 
+     """
++    if "info" in tag:
++        tag["info"] = set(tag["info"])
++    return tag
++
++
++def _clean_tag(tag: Dict[str, Any]) -> Dict[str, Any]:
++    """This function is the opposite of `_prepare_tag()`. It is used in
++    add_tags().
++
++    """
++    if "info" in tag:
++        tag["info"] = sorted(tag["info"])
++    return tag
++
++
++def add_tags(host: NmapHost, tags: Iterable[Tag]) -> None:
++    """This function sets or update the "tags" attribute in `host` by
++    adding or updating the provided `tags`.
++
++    """
++    cur_tags = {tag["value"]: _prepare_tag(tag) for tag in host.get("tags", [])}
++    for tag in tags:
++        cur_tag = cur_tags.setdefault(
++            tag["value"], {"value": tag["value"], "type": tag["type"]}
++        )
++        if "info" in tag:
++            cur_tag.setdefault("info", set()).update(tag["info"])
++    if cur_tags:
++        host["tags"] = [_clean_tag(cur_tags[key]) for key in sorted(cur_tags)]
++
++
++def is_synack_honeypot(host: NmapHost) -> bool:
++    """Returns True iff the host has the "Honeypot" tag with "SYN+ACK
++    honeypot" info.
++
++    """
++    return any(
++        tag["value"] == "Honeypot" and "SYN+ACK honeypot" in tag.get("info", [])
++        for tag in host.get("tags", [])
++    )
++
++
++def gen_auto_tags(
++    host: NmapHost, update_openports: bool = True
++) -> Generator[Tag, None, None]:
++    """This function generates the automatically-generated tags ("TOR
++    node", "Scanner" and "Honeypot", for now).
++
++    If the host has too many (at least `VIEW_SYNACK_HONEYPOT_COUNT`)
++    open ports that may be "syn-ack" honeypots (which means, ports for
++    which is_real_service_port() returns False), this function will
++    generate the "Honeypot" / "SYN+ACK honeypot" tag **and** clean the
++    `host` record from the probable "SYN+ACK honeypot" ports.
++
++    If the "ports" field of the host document has changed, the
++    "openports" field is updated unless `update_openports` is False.
++
++    """
++    for port in host.get("ports", []):
++        for script in port.get("scripts", []):
++            if script["id"] == "ssl-cert":
++                for cert in script.get("ssl-cert", []):
++               

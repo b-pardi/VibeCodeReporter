@@ -1,0 +1,67 @@
+@@ -79,6 +79,7 @@ public class AggregatedMetrics {
+     public static final Counter MIRROR  = build("core_node_mirror", "Total mirror calls.");
+     public static final Counter PAID_MIRROR_START  = build("core_node_mirror_paid_start", "Total start paid mirror calls.");
+     public static final Counter PAID_MIRROR_COMPLETE  = build("core_node_mirror_paid_complete", "Total complete paid mirror calls.");
++    public static final Counter GET_USER_SNAPSHOTS  = build("core_node_get_user_snapshots", "Total get user snapshots calls.");
+     public static final Counter PAID_MIRROR_SUCCESS  = build("core_node_mirror_paid_success", "Total successful paid mirror calls.");
+     public static final Counter MIGRATE_USER  = build("core_node_migrate_user", "Total migrate-user calls.");
+ 
+
+
+
+
+@@ -396,11 +396,12 @@ public class Builder {
+         Multihash pkiServerId = getPkiServerId(a);
+         // build a mirroring proxying corenode, unless we are the pki node
+         boolean isPkiNode = nodeId.bareMultihash().equals(pkiServerId);
++        Optional<BatWithId> instanceBat = a.getOptionalArg("instance-bat").map(BatWithId::decode);
+         return isPkiNode ?
+                 buildPkiCorenode(localPointers, account, bats, localStorage, crypto, a) :
+                 new MirrorCoreNode(new HTTPCoreNode(buildP2pHttpProxy(a), pkiServerId), rawAccount, bats, account, proxingMutable,
+                         localStorage, rawPointers, localPointers, transactions, localSocial, usageStore, quotas, linkCounts, pkiServerId, peergosId,
+-                        a.fromPeergosDir("pki-mirror-state-path","pki-state.cbor"), crypto);
++                        a.fromPeergosDir("pki-mirror-state-path","pki-state.cbor"), instanceBat, crypto);
+     }
+ 
+     public static JdbcIpnsAndSocial buildRawPointers(Args a, Supplier<Connection> dbConnectionPool) {
+
+
+
+
+@@ -879,9 +879,10 @@ public class Main extends Builder {
+                 new Thread(() -> {
+                     while (true) {
+                         try {
+-                            BatWithId mirrorBat = BatWithId.decode(a.getArg("mirror.bat"));
+-                            Mirror.mirrorNode(nodeToMirrorId, mirrorBat, core, p2mMutable, localStorage, rawPointers,
+-                                    transactions, linkCounts, usageStore, hasher);
++                            BatWithId instanceBat = a.getOptionalArg("instance-bat").map(BatWithId::decode)
++                                    .orElseThrow(() -> new IllegalStateException("No instance bat supplied"));
++                            Mirror.mirrorNode(nodeToMirrorId, instanceBat, core, p2pHttpProxy, p2mMutable, localStorage, rawPointers,
++                                    rawAccount, batStore, transactions, linkCounts, usageStore, hasher);
+                             try {
+                                 int periodSeconds = a.getInt("server-mirror-period-seconds", 86400);
+                                 Thread.sleep(periodSeconds * 1_000L);
+
+
+
+
+@@ -87,29 +87,45 @@ public class Mirror {
+     );
+ 
+     public static void mirrorNode(Multihash nodeId,
+-                                  BatWithId mirrorBat,
++                                  BatWithId instanceBat,
+                                   CoreNode core,
++                                  HttpPoster p2pPoster,
+                                   MutablePointers p2pPointers,
+                                   DeletableContentAddressedStorage storage,
+                                   JdbcIpnsAndSocial targetPointers,
++                                  JdbcAccount targetAccount,
++                                  BatCave batStorage,
+                                   TransactionStore transactions,
+                                   LinkRetrievalCounter linkCounts,
+                                   UsageStore usage,
+                                   Hasher hasher) {
+         Logging.LOG().log(Level.INFO, "Mirroring data for node " + nodeId);
+-        List<String> allUsers = core.getUsernames(

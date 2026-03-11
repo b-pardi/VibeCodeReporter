@@ -1,0 +1,88 @@
+@@ -31,13 +31,13 @@ struct queries_breakdown {
+ };
+ 
+ struct dns_stats {
+-  u_int32_t num_queries, num_replies_ok, num_replies_error;
++  MonitoredCounter<u_int32_t> num_queries, num_replies_ok, num_replies_error;
+   struct queries_breakdown breakdown;
+ };
+ 
+ class DnsStats {
+  private:
+-  struct dns_stats sent, rcvd;
++  struct dns_stats sent_stats, rcvd_stats;
+ 
+   void incQueryBreakdown(struct queries_breakdown *bd, u_int16_t query_type);
+   void deserializeStats(json_object *o, struct dns_stats *stats);
+@@ -48,15 +48,18 @@ class DnsStats {
+  public:
+   DnsStats();
+ 
+-  inline void incNumDNSQueriesSent(u_int16_t query_type) { incNumDNSQueries(query_type, &sent); };
+-  inline void incNumDNSQueriesRcvd(u_int16_t query_type) { incNumDNSQueries(query_type, &rcvd); };
+-  inline void incNumDNSResponsesSent(u_int8_t ret_code)  { if(ret_code == 0) sent.num_replies_ok++; else sent.num_replies_error++; };
+-  inline void incNumDNSResponsesRcvd(u_int8_t ret_code)  { if(ret_code == 0) rcvd.num_replies_ok++; else rcvd.num_replies_error++; };
++  inline void incNumDNSQueriesSent(u_int16_t query_type) { incNumDNSQueries(query_type, &sent_stats); };
++  inline void incNumDNSQueriesRcvd(u_int16_t query_type) { incNumDNSQueries(query_type, &rcvd_stats); };
++  void updateStats(const struct timeval * const tv);
++  void incNumDNSResponsesSent(u_int8_t ret_code);
++  void incNumDNSResponsesRcvd(u_int8_t ret_code);
+ 
+   char* serialize();
+   void deserialize(json_object *o);
+   json_object* getJSONObject();
+   void lua(lua_State *vm);
++  bool hasAnomalies(time_t when);
++  void luaAnomalies(lua_State* vm, time_t when);
+ };
+ 
+ #endif /* _STATS_H_ */
+
+
+
+
+@@ -71,6 +71,7 @@ class HostStats: public Checkpointable, public GenericTrafficElement {
+   inline void incNumAnomalousFlows(bool as_client)          { if(as_client) anomalous_flows_as_client++; else anomalous_flows_as_server++; };
+   inline nDPIStats* getnDPIStats()                          { return(ndpiStats); };
+ 
++  virtual void computeAnomalyIndex(time_t when) {};
+   inline void incRetransmittedPkts(u_int32_t num)   { tcpPacketStats.pktRetr += num;      };
+   inline void incOOOPkts(u_int32_t num)             { tcpPacketStats.pktOOO += num;       };
+   inline void incLostPkts(u_int32_t num)            { tcpPacketStats.pktLost += num;      };
+@@ -85,7 +86,9 @@ class HostStats: public Checkpointable, public GenericTrafficElement {
+   inline u_int32_t getTotalAnomalousNumFlowsAsServer() const { return(anomalous_flows_as_server);  };
+   virtual void deserialize(json_object *obj)        {}
+   virtual void incNumFlows(bool as_client, Host *peer) { if(as_client) total_num_flows_as_client++; else total_num_flows_as_server++; } ;
+-  virtual void decNumFlows(bool as_client, Host *peer) {}
++  virtual void decNumFlows(bool as_client, Host *peer) {};
++  virtual bool hasAnomalies(time_t when) { return false; };
++  virtual void luaAnomalies(lua_State* vm, time_t when) {};
+   virtual void lua(lua_State* vm, bool mask_host, bool host_details, bool verbose);
+ 
+ #ifdef NTOPNG_PRO
+
+
+
+
+@@ -56,6 +56,8 @@ class LocalHostStats: public HostStats {
+   virtual void incNumDNSResponsesRcvd(u_int32_t ret_code) { if(dns) dns->incNumDNSResponsesRcvd(ret_code); };
+   virtual void incrVisitedWebSite(char *hostname);
+   virtual void tsLua(lua_State* vm);
++  virtual bool hasAnomalies(time_t when);
++  virtual void luaAnomalies(lua_State* vm, time_t when);
+   virtual HTTPstats* getHTTPstats() { return(http); };
+ };
+ 
+
+
+
+
+@@ -37,12 +37,10 @@ template <typename METRICTYPE> class MonitoredCounter : public MonitoredMetric<M
+       this->updateAnomalyIndex(when, delta);
+ 
+ #ifdef MONITOREDCOUNTER_DEBUG
+-#if 0
+       printf("%s[MonitoredCounter][value: %lu][diff: %lu][last_diff: %lu][delta: %ld][RSI: %lu][gains: %lu][losses: %lu]\n",
+              ((this->anomaly_index < 25) || (this->anomaly_index > 75)) ? "<<<***>>> Anomaly " : "",
+              (unsigned long)this->value, (unsigned long)diff, (unsigned long)last_diff, (long)delta,
+ 	     (un

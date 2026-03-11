@@ -1,0 +1,120 @@
+@@ -3,7 +3,7 @@
+ 
+    Copyright (C) 2000-2012 Free Software Foundation Europe e.V.
+    Copyright (C) 2011-2016 Planets Communications B.V.
+-   Copyright (C) 2013-2021 Bareos GmbH & Co. KG
++   Copyright (C) 2013-2022 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -650,6 +650,8 @@ class BareosDb : public BareosDbQueryEnum {
+   bool DeletePoolRecord(JobControlRecord* jcr, PoolDbRecord* pool_dbr);
+   bool DeleteMediaRecord(JobControlRecord* jcr, MediaDbRecord* mr);
+   bool PurgeMediaRecord(JobControlRecord* jcr, MediaDbRecord* mr);
++  void PurgeFiles(const char* jobids);
++  void PurgeJobs(const char* jobids);
+ 
+   /* sql_find.c */
+ 
+@@ -904,6 +906,7 @@ class BareosDb : public BareosDbQueryEnum {
+   bool MarkFileRecord(JobControlRecord* jcr, FileId_t FileId, JobId_t JobId);
+   void MakeInchangerUnique(JobControlRecord* jcr, MediaDbRecord* mr);
+   int UpdateStats(JobControlRecord* jcr, utime_t age);
++  void UpgradeCopies(const char* jobids);
+ 
+   /* Low level methods */
+   bool MatchDatabase(const char* db_driver,
+
+
+
+
+@@ -3,7 +3,7 @@
+ 
+    Copyright (C) 2000-2006 Free Software Foundation Europe e.V.
+    Copyright (C) 2011-2016 Planets Communications B.V.
+-   Copyright (C) 2013-2019 Bareos GmbH & Co. KG
++   Copyright (C) 2013-2022 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -218,4 +218,50 @@ bool BareosDb::PurgeMediaRecord(JobControlRecord* jcr, MediaDbRecord* mr)
+ 
+   return true;
+ }
++
++void BareosDb::PurgeFiles(const char* jobids)
++{
++  PoolMem query(PM_MESSAGE);
++
++  Mmsg(query, "DELETE FROM File WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "DELETE FROM BaseFiles WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "UPDATE Job SET PurgedFiles=1 WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++}
++
++void BareosDb::PurgeJobs(const char* jobids)
++{
++  PoolMem query(PM_MESSAGE);
++
++  /* Delete (or purge) records associated with the job */
++  PurgeFiles(jobids);
++
++  Mmsg(query, "DELETE FROM JobMedia WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "DELETE FROM Log WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "DELETE FROM RestoreObject WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "DELETE FROM PathVisibility WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "DELETE FROM NDMPJobEnvironment WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  Mmsg(query, "DELETE FROM JobStats WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++
++  UpgradeCopies(jobids);
++
++  /* Now remove the Job record itself */
++  Mmsg(query, "DELETE FROM Job WHERE JobId IN (%s)", jobids);
++  SqlQuery(query.c_str());
++}
+ #endif /* HAVE_SQLITE3 || HAVE_MYSQL || HAVE_POSTGRESQL || HAVE_INGRES */
+
+
+
+
+@@ -3,7 +3,7 @@
+ 
+    Copyright (C) 2000-2012 Free Software Foundation Europe e.V.
+    Copyright (C) 2011-2016 Planets Communications B.V.
+-   Copyright (C) 2013-2019 Bareos GmbH & Co. KG
++   Copyright (C) 2013-2022 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -516,5 +516,44 @@ bool BareosDb::UpdateNdmpLevelMapping(JobControlRecord* jcr,
+ 
+   return UPDATE_DB(jcr, cmd) > 0;
+ }
++
++/**
++ * Change the type of the next copy job to backup.
++ * We need to upgrade the next copy of a normal job,
++ * and also upgrade the next copy when the normal job
++ * already have been purged.
++ *
++ *   JobId: 1   PriorJobId: 0    (original)
++ *   JobId: 2   PriorJobId: 1    (first copy)
++ *   JobId: 3   PriorJobId: 1    (second copy)
++ *
++ *   JobId: 2   PriorJobId: 1    (first copy, now regular backup)
++ *   JobId: 3   PriorJobId:

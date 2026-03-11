@@ -1,0 +1,82 @@
+@@ -9,6 +9,7 @@ import threading
+ import logging
+ import csv
+ 
++from werkzeug.exceptions import Conflict
+ from flask import Blueprint, request, abort, jsonify, make_response
+ from flask_classful import route
+ from filteralchemy import (
+@@ -164,26 +165,82 @@ class VulnerabilityTemplateView(PaginatedMixin,
+ 
+     @route('/bulk_create/', methods=['POST'])
+     def bulk_create(self):
+-        try:
+-            validate_csrf(request.form.get('csrf_token'))
+-        except wtforms.ValidationError:
+-            abort(403)
+-        logger.info("Create vulns template from CSV")
+-        if 'file' not in request.files:
+-            abort(400, "Missing File in request")
+-        vulns_file = request.files['file']
+-        required_headers = {'name', 'exploitation'}
+-        io_wrapper = TextIOWrapper(vulns_file, encoding=request.content_encoding or "utf8")
+-
+-        vulns_reader = csv.DictReader(io_wrapper, skipinitialspace=True)
+-        intersect_required = set(vulns_reader.fieldnames).intersection(required_headers)
+-        if intersect_required != required_headers:
+-            logger.error("Missing Required headers in CSV (%s)", required_headers - intersect_required)
+-            abort(400, f"Missing Required headers in CSV ({required_headers - intersect_required})")
+-        custom_fields = {cf_schema.field_name: cf_schema for cf_schema in db.session.query(CustomFieldsSchema).all()}
+-        vulns_created_count = 0
+-        vulns_with_errors_count = 0
++        if 'file' in request.files:
++            try:
++                validate_csrf(request.form.get('csrf_token'))
++            except wtforms.ValidationError:
++                logger.error("Invalid CSRF token.")
++                abort(403)
++            logger.info("Create vulns template from CSV")
++            vulns_file = request.files['file']
++
++            io_wrapper = TextIOWrapper(vulns_file, encoding=request.content_encoding or "utf8")
++            vulns_reader = csv.DictReader(io_wrapper, skipinitialspace=True)
++
++            required_headers = {'name', 'exploitation'}
++            intersect_required = set(vulns_reader.fieldnames).intersection(required_headers)
++            if intersect_required != required_headers:
++                logger.error("Missing required headers in CSV: (%s)", required_headers - intersect_required)
++                abort(
++                    make_response(
++                        {"message": f"Missing required headers in CSV: ({required_headers - intersect_required})"}, 400
++                    )
++                )
++
++            vulns_to_create = self.parse_vuln_from_file(vulns_reader)
++        elif request.json:
++            logger.info("Create vulns template from vulnerabilities in Status Report")
++            if not request.json:
++                logger.error("Missing data to create vulnerabilities templates.")
++                abort(make_response({"message": "Missing data to create vulnerabilities templates."}, 400))
++
++            vulns_to_create = request.json
++            for vuln in vulns_to_create:
++                # Due to the definition in the model, we need to
++                # rename 'custom_fields' attribute to 'customfields'
++                vuln['customfields'] = vuln['custom_fields']
++        else:
++            logger.error("Missing data to create vulnerabilities templates.")
++            abort(make_response({"message": "Missing data to create vulnerabilities templates."}, 400))
++
++        if not vulns_to_create:
++            logger.error("Missing data to create vulnerabilities templates.")
++            abort(make_response({"message": "Missing data to create vulnerabilities templates."}, 400))
++
++        vulns_created = []
++        vulns_with_errors = []
++        vulns_with_conflict = []
+         schema = self.schema_class()
++        for vuln in vulns_to_create:
++            try:
++                vuln_schema = schema.load(vuln)
++                super(VulnerabilityTemplateView, self)._perform_create(vuln_schema)
++             

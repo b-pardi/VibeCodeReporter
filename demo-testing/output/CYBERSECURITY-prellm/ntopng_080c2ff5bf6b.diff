@@ -1,0 +1,109 @@
+@@ -36,6 +36,10 @@ class ElasticSearch {
+   u_int64_t elkExportedFlows, elkLastExportedFlows;
+   float elkExportRate;
+   u_int64_t checkpointDroppedFlows, checkpointExportedFlows; /* Those will hold counters at checkpoints */
++
++  char *es_template_push_url, *es_version_query_url;
++  char *es_version;
++  const char * const get_es_version();
+  public:
+   ElasticSearch();
+   ~ElasticSearch();
+@@ -44,6 +48,10 @@ class ElasticSearch {
+       checkpointExportedFlows = elkExportedFlows;
+     checkpointDroppedFlows = elkDroppedFlowsQueueTooLong;
+   };
++  inline bool atleast_version_6() {
++    const char * const ver = get_es_version();
++    return ver && strcmp(ver, "6") >= 0;
++  };
+   inline u_int32_t numDroppedFlows() const { return elkDroppedFlowsQueueTooLong; };
+   int sendToES(char* msg);
+   void pushEStemplate();
+
+
+
+
+@@ -70,8 +70,11 @@ class Utils {
+   static bool postHTTPTextFile(char *username, char *password, char *url, char *path, HTTPTranferStats *stats);
+   static bool httpGet(lua_State* vm, char *url, char *username,
+ 		      char *password, int timeout, bool return_content, HTTPTranferStats *stats);
++  static long httpGet(const char * const url,
++		      const char * const username, const char * const password,
++		      int timeout,
++		      char * const resp, const u_int resp_len);
+   static char* urlEncode(char *url);
+-  static bool httpGet(char *url, char *ret_buf, u_int ret_buf_len, HTTPTranferStats *stats);
+   static ticks getticks();
+   static char* getURL(char *url, char *buf, u_int buf_len);
+   static bool discardOldFilesExceeding(const char *path, const unsigned long max_size);
+
+
+
+
+@@ -754,6 +754,7 @@
+ 
+ /* Elastic Search */
+ #define NTOP_ES_TEMPLATE              "ntopng_template_elk.json"
++#define NTOP_ES6_TEMPLATE             "ntopng_template_elk6.json"
+ #define ES_MAX_QUEUE_LEN              32768
+ #define ES_BULK_BUFFER_SIZE           1*1024*1024
+ #define ES_BULK_MAX_DELAY             5
+
+
+
+
+@@ -34,6 +34,9 @@ static void* esLoop(void* ptr) {
+ /* **************************************** */
+ 
+ ElasticSearch::ElasticSearch() {
++  char *es_url, *es_host;
++
++  es_version = NULL;
+   num_queued_elems = 0;
+   head = NULL;
+   tail = NULL;
+@@ -43,12 +46,38 @@ ElasticSearch::ElasticSearch() {
+   elkExportRate = 0;
+   checkpointDroppedFlows = checkpointExportedFlows = 0;
+   lastUpdateTime.tv_sec = 0, lastUpdateTime.tv_usec = 0;
++
++  if (!(es_template_push_url = (char*)malloc(MAX_PATH))
++      || !(es_version_query_url = (char*)malloc(MAX_PATH))
++      || !(es_url = strdup(ntop->getPrefs()->get_es_url())))
++    throw "Not enough memory";
++
++  es_template_push_url[0] = '\0', es_version_query_url[0] = '\0';
++
++  // Prepare ES urls (keep only host and port by retaining only characters left of the first slash)
++  if(!strncmp(es_url, "http://", 7)){  // url starts either with http or https
++    Utils::tokenizer(es_url + 7, '/', &es_host);
++    snprintf(es_template_push_url, MAX_PATH, "http://%s/_template/ntopng_template", es_host);
++    snprintf(es_version_query_url, MAX_PATH, "http://%s/", es_host);
++  } else if(!strncmp(es_url, "https://", 8)){
++    Utils::tokenizer(es_url + 8, '/', &es_host);
++    snprintf(es_template_push_url, MAX_PATH, "https://%s/_template/ntopng_template", es_host);
++    snprintf(es_version_query_url, MAX_PATH, "https://%s/", es_host);
++  } else {
++    Utils::tokenizer(es_url, '/', &es_host);
++    snprintf(es_template_push_url, MAX_PATH, "%s/_template/ntopng_template", es_host);
++    snprintf(es_version_query_url, MAX_PATH, "%s/", es_host);
++  }
++
++  free(es_url);
+ }
+ 
+ /* **************************************** */
+ 
+ ElasticSearch::~ElasticSearch() {
+-
++  if(es_version) free(es_version);
++  if(es_template_push_url) free(es_template_push_url);
++  if(es_version_query_url) free(es_version_query_url);
+ }
+ 
+ /* ******************************************* */
+@@ -168,7 +197,8 @@ void ElasticSearch::indexESdata() {
+ 
+       snprintf(header, sizeof(header),
+ 	       "{\"index\": {\"_type\": \"%s\", \"_index\": 

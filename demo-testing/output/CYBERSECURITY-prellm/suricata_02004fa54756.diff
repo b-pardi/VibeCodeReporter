@@ -1,0 +1,95 @@
+@@ -83,8 +83,10 @@ typedef struct ThreadVars_ {
+     void *(*tm_func)(void *);
+     struct TmSlot_ *tm_slots;
+ 
+-    /** stream packet queue for flow time out injection */
++    /** Stream packet queue for flow time out injection. Either a pointer to the
++     *  workers input queue or to stream_pq_local */
+     struct PacketQueue_ *stream_pq;
++    struct PacketQueue_ *stream_pq_local;
+ 
+     uint8_t thread_setup_flags;
+ 
+
+
+
+
+@@ -109,8 +109,6 @@ void TmThreadsUnsetFlag(ThreadVars *tv, uint32_t flag)
+ 
+ /**
+  * \brief Separate run function so we can call it recursively.
+- *
+- * \note post_pq if only used for first slot
+  */
+ TmEcode TmThreadsSlotVarRun(ThreadVars *tv, Packet *p, TmSlot *slot)
+ {
+@@ -123,13 +121,7 @@ TmEcode TmThreadsSlotVarRun(ThreadVars *tv, Packet *p, TmSlot *slot)
+         /* handle error */
+         if (unlikely(r == TM_ECODE_FAILED)) {
+             /* Encountered error.  Return packets to packetpool and return */
+-            TmqhReleasePacketsToPacketPool(&s->slot_pre_pq);
+-
+-            SCMutexLock(&s->slot_post_pq.mutex_q);
+-            TmqhReleasePacketsToPacketPool(&s->slot_post_pq);
+-            SCMutexUnlock(&s->slot_post_pq.mutex_q);
+-
+-            TmThreadsSetFlag(tv, THV_FAILED);
++            TmThreadsSlotProcessPktFail(tv, s, NULL);
+             return TM_ECODE_FAILED;
+         }
+ 
+@@ -143,14 +135,7 @@ TmEcode TmThreadsSlotVarRun(ThreadVars *tv, Packet *p, TmSlot *slot)
+             if (s->slot_next != NULL) {
+                 r = TmThreadsSlotVarRun(tv, extra_p, s->slot_next);
+                 if (unlikely(r == TM_ECODE_FAILED)) {
+-                    TmqhReleasePacketsToPacketPool(&s->slot_pre_pq);
+-
+-                    SCMutexLock(&s->slot_post_pq.mutex_q);
+-                    TmqhReleasePacketsToPacketPool(&s->slot_post_pq);
+-                    SCMutexUnlock(&s->slot_post_pq.mutex_q);
+-
+-                    TmqhOutputPacketpool(tv, extra_p);
+-                    TmThreadsSetFlag(tv, THV_FAILED);
++                    TmThreadsSlotProcessPktFail(tv, s, extra_p);
+                     return TM_ECODE_FAILED;
+                 }
+             }
+@@ -162,21 +147,17 @@ TmEcode TmThreadsSlotVarRun(ThreadVars *tv, Packet *p, TmSlot *slot)
+ }
+ 
+ /** \internal
+- *  \brief check 'slot' pre_pq and post_pq at thread cleanup
++ *  \brief check 'slot' pre_pq and thread cleanup
+  *         and dump detailed info about the state of the packets
+  *         and threads if in a unexpected state.
+  */
+ static void CheckSlot(const TmSlot *slot)
+ {
+-    if (slot->slot_pre_pq.len || slot->slot_post_pq.len) {
++    if (slot->slot_pre_pq.len) {
+         for (Packet *xp = slot->slot_pre_pq.top; xp != NULL; xp = xp->next) {
+             SCLogNotice("pre_pq: slot id %u slot tm_id %u pre_pq.len %u packet src %s",
+                     slot->id, slot->tm_id, slot->slot_pre_pq.len, PktSrcToString(xp->pkt_src));
+         }
+-        for (Packet *xp = slot->slot_post_pq.top; xp != NULL; xp = xp->next) {
+-            SCLogNotice("post_pq: slot id %u slot tm_id %u post_pq.len %u packet src %s",
+-                    slot->id, slot->tm_id, slot->slot_post_pq.len, PktSrcToString(xp->pkt_src));
+-        }
+         TmThreadDumpThreads();
+         abort();
+     }
+@@ -316,17 +297,19 @@ static void *TmThreadsSlotPktAcqLoop(void *td)
+         }
+         memset(&slot->slot_pre_pq, 0, sizeof(PacketQueue));
+         SCMutexInit(&slot->slot_pre_pq.mutex_q, NULL);
+-        memset(&slot->slot_post_pq, 0, sizeof(PacketQueue));
+-        SCMutexInit(&slot->slot_post_pq.mutex_q, NULL);
+-
+-        /* get the 'pre qeueue' from module before the stream module */
+-        if (slot->slot_next != NULL && (slot->slot_next->tm_id == TMM_FLOWWORKER)) {
+-            SCLogDebug("pre-stream packetqueue %p (postq)", &s->slot_post_pq);
+-            tv->stream_pq = &slot->slot_post_pq;
+-        /* if the stream module is the first, get the threads input queue */
+-        } else if (slot == (TmSlot *)tv->tm_slots && (slot->tm_id == TMM_FLOWWORKER)) {
++
++        /* if

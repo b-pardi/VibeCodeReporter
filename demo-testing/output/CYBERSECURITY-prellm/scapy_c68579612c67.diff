@@ -1,0 +1,122 @@
+@@ -3,43 +3,49 @@
+ # This file is part of Scapy
+ # See http://www.secdev.org/projects/scapy for more information
+ # Copyright (C) Nils Weiss <nils@we155.de>
++# Copyright (C) Enrico Pozzobon <enricopozzobon@gmail.com>
+ # This program is published under a GPLv2 license
+ 
+-"""
+-ISOTPSocket.
+-"""
+-
+-
+ import ctypes
+ from ctypes.util import find_library
+ import struct
+ import socket
++import time
++from threading import Thread, Event, Semaphore
+ 
+-import scapy.modules.six as six
+-from scapy.error import Scapy_Exception, warning
+ from scapy.packet import Packet
+ from scapy.fields import StrField
++from scapy.layers.can import CAN
++import scapy.modules.six as six
++from scapy.error import Scapy_Exception, warning, log_loading
+ from scapy.supersocket import SuperSocket
+-from scapy.sendrecv import sndrcv
+-from scapy.arch.linux import get_last_packet_timestamp, SIOCGIFINDEX
+ from scapy.config import conf
+-from scapy.consts import WINDOWS
+-
+-if six.PY2:
+-    Scapy_Exception("ISOTP is not supported on python2, yet. "
+-                    "Switch to python3 and try it again.")
++from scapy.consts import LINUX
+ 
++__all__ = ["ISOTP", "ISOTPSniffer", "ISOTPSoftSocket", "ISOTPSocket",
++           "ISOTPSocketImplementation", "ISOTPMessageBuilder"]
+ 
+-if not WINDOWS:
++USE_CAN_ISOTP_KERNEL_MODULE = False
++if six.PY3 and LINUX:
+     LIBC = ctypes.cdll.LoadLibrary(find_library("c"))
+-    warning("Loading libc with ctypes")
+-else:
+-    warning("libc is unavailable")
++    try:
++        if conf.contribs['ISOTP']['use-can-isotp-kernel-module']:
++            USE_CAN_ISOTP_KERNEL_MODULE = True
++    except KeyError:
++        log_loading.info("Specify 'conf.contribs['ISOTP'] = "
++                         "{'use-can-isotp-kernel-module': True}' to enable "
++                         "usage of can-isotp kernel module.")
+ 
++CAN_MAX_IDENTIFIER = (1 << 29) - 1  # Maximum 29-bit identifier
++CAN_MTU = 16
++CAN_MAX_DLEN = 8
++ISOTP_MAX_DLEN_2015 = (1 << 32) - 1  # Maximum for 32-bit FF_DL
++ISOTP_MAX_DLEN = (1 << 12) - 1  # Maximum for 12-bit FF_DL
+ 
+-"""
+-ISOTP Packet
+-"""
++N_PCI_SF = 0x00  # /* single frame */
++N_PCI_FF = 0x10  # /* first frame */
++N_PCI_CF = 0x20  # /* consecutive frame */
++N_PCI_FC = 0x30  # /* flow control */
+ 
+ 
+ class ISOTP(Packet):
+@@ -47,101 +53,1149 @@ class ISOTP(Packet):
+     fields_desc = [
+         StrField('data', B"")
+     ]
++    __slots__ = Packet.__slots__ + ["src", "dst", "exsrc", "exdst"]
+ 
++    def answers(self, other):
++        if other.__class__ == self.__class__:
++            return self.payload.answers(other.payload)
++        return 0
+ 
+-CAN_MTU = 16
+-CAN_MAX_DLEN = 8
++    def __init__(self, *args, **kwargs):
++        self.src = None
++        self.dst = None
++        self.exsrc = None
++        self.exdst = None
++        if "src" in kwargs:
++            self.src = kwargs["src"]
++            del kwargs["src"]
++        if "dst" in kwargs:
++            self.dst = kwargs["dst"]
++            del kwargs["dst"]
++        if "exsrc" in kwargs:
++            self.exsrc = kwargs["exsrc"]
++            del kwargs["exsrc"]
++        if "exdst" in kwargs:
++            self.exdst = kwargs["exdst"]
++            del kwargs["exdst"]
++        Packet.__init__(self, *args, **kwargs)
++        self.validate_fields()
++
++    def validate_fields(self):
++        if self.src is not None:
++            if not 0 <= self.src <= CAN_MAX_IDENTIFIER:
++                raise Scapy_Exception("src is not a valid CAN identifier")
++        if self.dst is not None:
++            if not 0 <= self.dst <= CAN_MAX_IDENTIFIER:
++                raise Scapy_Exception("dst is not a valid CAN identifier")
++        if self.exsrc is not None:
++            if not 0 <= self.exsrc <= 0xff:
++                raise Scapy_Exception("exsrc is not a byte")
++        if self.exdst is not None:
++            if not 0 <= self.exdst <= 0xff:
++                raise Scapy_Exception("exdst is not a byte")
++
++    def fragment(self):
++        data_bytes_in_frame = 7
++        if self.exdst is not None:
++    

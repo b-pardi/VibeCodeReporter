@@ -1,0 +1,139 @@
+@@ -408,7 +408,7 @@ struct TranslationBlock {
+ //    uint8_t tcg_op_buf_full;
+ 
+     // indicates if this block was split up abnormally
+-//    uint8_t was_split;
++    uint8_t was_split;
+ 
+ };
+ 
+
+
+
+
+@@ -14,16 +14,16 @@ extern "C" {
+ #include "panda/plog.h"
+ #include "osi/osi_types.h"
+ #include "osi/osi_ext.h"
++#include "track_intexc/track_intexc_ext.h"
+ 
+ }
+ 
+-#include<fstream>
+-#include<map>
+-#include<set>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <set>
+ #include <iomanip>
+ #include <vector>
+-#include <iostream> 
+-#include<string> 
+ 
+ #ifdef CONFIG_SOFTMMU
+ 
+@@ -34,121 +34,269 @@ using namespace std;
+ typedef target_ulong Asid;
+ typedef target_ulong Pc;
+ 
++target_ulong start_main = 0;
++
+ map <Asid, vector<Pc>> asid_trace; 
+ 
++bool debug=false;
++
+ // Up to n-edge coverage 
+ int n;
+-Pc first_instr;
+-Pc last_instr;
+-string program_name;
+-Asid target_asid;
+-bool no_kernel;
+ 
+-vector<Pc> pc_trace;
+-// Called before each block, we have PC and ASID
+-void collect_edges(CPUState *env, TranslationBlock *tb) {
++
++map<target_ulong,target_ulong> last_bb_start;
++map<target_ulong,bool> last_bb_was_split;
++map<target_ulong,bool> last_bb_was_exception;
++map<target_ulong,bool> last_bb_intexc;
++map<target_ulong,target_ulong> last_bb_before_intexc;
++
++bool saw_main = false;
++
++
++void after_block(CPUState *env, TranslationBlock *tb, uint8_t exitCode) {
++
++    // only paying attention to one program and haven't seen main yet..
++    if (start_main && !saw_main) 
++        return;
+ 
+     target_ulong asid = panda_current_asid(env);
+-    target_ulong pc = panda_current_pc(env);
+-    uint64_t instr = rr_get_guest_instr_count(); 
+-
+-    if (no_kernel && panda_in_kernel(env)) return;
+-    //printf("asid: " TARGET_FMT_lx "pc: " TARGET_FMT_lx, asid, pc);  
+-    if (target_asid == asid && instr >= first_instr && instr <= last_instr) {
+-        //printf("asid: " TARGET_FMT_lx "pc: " TARGET_FMT_lx "\n", asid, pc);  
+-        pc_trace.push_back(pc); 
++    
++    // dont record pc if we are in exception or interrupt code
++    if (check_in_exception() || check_in_interrupt()) 
++        return;
++    
++    // dont record pc if last block was split
++    if (last_bb_was_split.count(asid) != 0 && !last_bb_was_split[asid])
++        last_bb_start[asid] = tb->pc;
++    
++    // keep track of if last bb was split
++    last_bb_was_split[asid] = tb->was_split; 
++    
++}
++
++
++void before_block(CPUState *env, TranslationBlock *tb) {
++    
++    if (start_main) {
++        // we are only paying attention to edges within some program
++        // and are waiting to see main
++        if (tb->pc == start_main) {
++            //   printf("saw main");
++            saw_main = true;
++        }
++        if (!saw_main)
++            return;
++    }
++    
++    target_ulong asid = panda_current_asid(env);
++    bool intexc = (check_in_exception() || check_in_interrupt());
++    
++    // we can only know transition if we know where we were for this asid last
++    if (last_bb_intexc.count(asid) != 0) {
++        
++        // four possibilities
++        
++        // 1. transition from reg to intexc code
++        if (!last_bb_intexc[asid] && intexc) {
++            // remember start pc of last bb before intexc
++            if (debug) 
++                cout << "trans from reg to intexc -- saving last_bb_before_intexc[" 
++                     << hex << asid << "]=" << last_bb_start[asid] << "\n";
++            last_bb_before_intexc[asid] = last_bb_start[asid];
++            goto done;
++        }
++        
++        // 2. transition from int/exc code to reg
++        if (last_bb_intexc[asid] && !intexc) {
++            // if this bb is just same as the last one before
++            // the int/exc, we ignore
++            if (debug) 
++                cout << "trans from intexc to reg\n";
++            if (tb->pc == last_bb_before_intexc[asid]) {
++                cout << "same last bb\n";
++                last_bb_start[asid] = tb->pc;
++                goto done;
++            }
++            

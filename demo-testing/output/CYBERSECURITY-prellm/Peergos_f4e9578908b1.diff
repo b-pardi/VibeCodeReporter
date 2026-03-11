@@ -1,0 +1,107 @@
+@@ -9,30 +9,105 @@ import peergos.shared.*;
+ import peergos.shared.cbor.*;
+ import peergos.shared.corenode.*;
+ import peergos.shared.crypto.hash.*;
++import peergos.server.storage.IPFS;
++import peergos.server.storage.IpfsDHT;
++import peergos.server.storage.UserQuotas;
++import peergos.shared.io.ipfs.api.JSONParser;
+ import peergos.shared.mutable.*;
+ import peergos.shared.storage.*;
+ import peergos.shared.user.*;
+ import peergos.shared.util.*;
+ 
++import java.net.URL;
++import java.nio.file.Paths;
+ import java.time.*;
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
+ import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.function.*;
++import java.util.stream.Collectors;
+ 
+ /** This class checks whether a given user is using more storage space than their quota
+  *
+  */
+ public class SpaceCheckingKeyFilter {
+     private static final Logger LOG = Logging.LOG();
++    private static final long DEFAULT_STORE_PERIOD = 60*1000*10; //10M
+     private final CoreNode core;
+     private final MutablePointers mutable;
+     private final ContentAddressedStorage dht;
+     private Function<String, Long> quotaSupplier;
++    private final Path statePath;
++    private final State state;
+ 
+-    private final Map<PublicKeyHash, Stat> currentView = new ConcurrentHashMap<>();
+-    private final ConcurrentHashMap<String, Usage> usage = new ConcurrentHashMap<>();
++    public static class State implements Cborable {
++        final Map<PublicKeyHash, Stat> currentView;
++        final Map<String, Usage> usage;
+ 
+-    private static class Stat {
++        public State(Map<PublicKeyHash, Stat> currentView, Map<String, Usage> usage) {
++            this.currentView = currentView;
++            this.usage = usage;
++        }
++
++        @Override
++        public CborObject toCbor() {
++            TreeMap<CborObject, ? extends Cborable> viewsMap = currentView.entrySet()
++                .stream()
++                .collect(Collectors.toMap(
++                    e -> e.getKey().toCbor(),
++                    e -> (Cborable) (e.getValue()),
++                    (a,b) -> a,
++                    () -> new TreeMap<>()
++                ));
++
++            CborObject.CborMap views = new CborObject.CborMap(viewsMap);
++            CborObject.CborMap usages = CborObject.CborMap.build(usage);
++            Map<String, Cborable> map = new HashMap<>();
++            map.put("views", views);
++            map.put("usages", usages);
++            return CborObject.CborMap.build(map);
++        }
++
++        public Map<String, Usage> getUsage() {
++            return new ConcurrentHashMap<>(usage);
++        }
++
++        @Override
++        public boolean equals(Object o) {
++            if (this == o) return true;
++            if (o == null || getClass() != o.getClass()) return false;
++
++            State state = (State) o;
++
++            if (currentView != null ? !currentView.equals(state.currentView) : state.currentView != null) return false;
++            return usage != null ? usage.equals(state.usage) : state.usage == null;
++        }
++
++        @Override
++        public int hashCode() {
++            int result = currentView != null ? currentView.hashCode() : 0;
++            result = 31 * result + (usage != null ? usage.hashCode() : 0);
++            return result;
++        }
++    }
++
++    public static State fromCbor(CborObject cbor) {
++        CborObject.CborMap map = (CborObject.CborMap) cbor;
++        CborObject.CborMap viewsMap = (CborObject.CborMap) map.get("views");
++        CborObject.CborMap usagesMap = (CborObject.CborMap) map.get("usages");
++
++        return new State(
++            viewsMap.getMap(PublicKeyHash::fromCbor, Stat::fromCbor),
++            usagesMap.getMap(
++                e -> ((CborObject.CborString) e).value,
++                Usage::fromCbor));
++    }
++
++    public static class Stat implements Cborable {
+         public final String ow

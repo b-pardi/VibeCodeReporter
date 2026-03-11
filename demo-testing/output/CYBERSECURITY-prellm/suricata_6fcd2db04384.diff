@@ -1,0 +1,140 @@
+deleted file mode 100644
+
+
+
+@@ -1,370 +0,0 @@
+-/* Copyright (C) 2013-2014 Tilera Corporation.
+- *
+- * You can copy, redistribute or modify this Program under the terms of
+- * the GNU General Public License version 2 as published by the Free
+- * Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * version 2 along with this program; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+- * 02110-1301, USA.
+- */
+-
+-/**
+- * \file
+- *
+- * \author Ken Steele, Tilera Corporation <suricata@tilera.com>
+- * \author Tom DeCanio <decanio.tom@gmail.com>
+- *
+- * Host side of PCIe alert logging from Suricata running on a
+- * TILEncore-Gx card.
+- */
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <sys/mman.h>
+-#include <sys/ioctl.h>
+-#include <sys/time.h>
+-#include <fcntl.h>
+-#include <malloc.h>
+-#include <unistd.h>
+-#include <stdint.h>
+-#include <string.h>
+-#include <errno.h>
+-#include <time.h>
+-#include <assert.h>
+-
+-#include <asm/tilegxpci.h>
+-
+-#define CHECK_SEQ_NUM 1
+-
+-/* The "/dev/tilegxpci%d" device to be used. */
+-unsigned int card_index = 0;
+-
+-unsigned int debug = 0;
+-
+-/*
+- * When set, drop all alerts rather than write to file. This is for
+- * testing performance on a file system that can't write files fast
+- * enough.
+- */
+-unsigned int drop_alerts = 0;
+-
+-/* Packet queue index. */
+-unsigned int queue_index;
+-
+-/* Prefix added to all file paths sent from PCIe card. */
+-char * path_prefix = NULL;
+-
+-/* By default, the host ring buffer is 4MB in size and it consists of
+- * 1024 entries of 4KB buffers. Modify GXPCI_HOST_PQ_RING_ENTRIES in
+- * <asm/tilegxpci.h> to change the size of each buffer. To increase
+- * the total ring buffer size, re-configure the host kernel using
+- * CONFIG_FORCE_MAX_ZONEORDER.
+- */
+-#ifdef GXPCI_HOST_PQ_SEGMENT_ENTRIES
+-/* New definitions for MDE 4.1.5 */
+-#define RING_BUF_ELEMS      GXPCI_HOST_PQ_SEGMENT_ENTRIES
+-#define RING_BUF_ELEM_SIZE  (HOST_PQ_SEGMENT_MAX_SIZE / GXPCI_HOST_PQ_SEGMENT_ENTRIES)
+-#else
+-/* Definitions prior to MDE 4.1.5 */
+-#define RING_BUF_ELEMS      GXPCI_HOST_PQ_RING_ENTRIES
+-#define RING_BUF_ELEM_SIZE  (HOST_PQ_RING_BUF_MAX_SIZE / GXPCI_HOST_PQ_RING_ENTRIES)
+-#endif
+-
+-/*********************************************************************/
+-/*                        Host-Side Packet Consumer                  */
+-/*********************************************************************/
+-
+-#define TAIL_UPDATE_LIMIT_ENABLE
+-
+-#define OP_OPEN         1
+-#define OP_WRITE        2
+-#define OP_CLOSE        3
+-
+-typedef struct {
+-    uint32_t    magic;
+-    uint32_t    fileno;
+-    uint32_t    op;
+-    uint32_t    seq;
+-    volatile uint32_t    len;
+-    uint32_t    next_offset;
+-    char        buf[];
+-} TrioMsg;
+-
+-typedef struct {
+-    FILE *fd;
+-} FDesc;
+-
+-#define MAX_FDESC 1024
+-
+-static FDesc *fdesc[MAX_FDESC];
+-
+-void run_pcie_logging(void)
+-{
+-    char dev_name[40];
+-    int pq_fd;
+-    unsigned int host_ring_buffer_size = RING_BUF_ELEMS * RING_BUF_ELEM_SIZE;
+-    volatile TrioMsg *p;
+-
+-    printf("Waiting for PCIe logging data from card %d on queue %d...\n", 
+-           card_index, queue_index);
+-
+-    if (path_prefix) {
+-        printf("PCIe logging into directory: '%s'\n", path_prefix);
+-        fflush(stdout);
+-    }
+-
+-    /* Open the packet queue file. */
+-    snprintf(dev_name, sizeof(dev_name), "/dev/tilegxpci%d/packet_queue/t2h/%d",
+-             card_index, queue_index);
+-    do {
+-        pq_fd = open(dev_name, O_RDWR);
+-        if (pq_fd < 0) {
+-            sleep(1);
+-        }
+-    } while (pq_fd < 0);
+-
+-    /* mmap the register space. */
+-    struct gxpci_host_pq_regs_app* pq_regs =
+-        (struct gxpci_host_pq_regs_ap

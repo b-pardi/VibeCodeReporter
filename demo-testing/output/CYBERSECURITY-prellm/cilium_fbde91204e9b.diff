@@ -1,0 +1,128 @@
+@@ -798,7 +798,7 @@ ipv6_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 
+ 	verdict = policy_can_access_ingress(skb, src_label, tuple.dport,
+ 					    tuple.nexthdr, sizeof(tuple.saddr),
+-					    &tuple.saddr);
++					    &tuple.saddr, false);
+ 
+ 	/* Reply packets and related packets are allowed, all others must be
+ 	 * permitted by policy */
+@@ -870,17 +870,6 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_TO_LXC) int tail_ipv6_policy(s
+ 	return ret;
+ }
+ 
+-/* Check whether the packet should be allowed despite unhandled IP fragments.
+- * Returns true if the packet should pass, false if it should be dropped. */
+-static bool check_ip4_fragments(struct iphdr *ip4)
+-{
+-#ifdef POLICY_INGRESS
+-	return !ipv4_is_fragment(ip4);
+-#else
+-	return true;
+-#endif
+-}
+-
+ #ifdef LXC_IPV4
+ static inline int __inline__
+ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding_reason)
+@@ -894,13 +883,11 @@ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 	struct ct_state ct_state_new = {};
+ 	bool skip_proxy, monitor = false;
+ 	__be32 orig_dip, orig_sip;
++	bool is_fragment = false;
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip4))
+ 		return DROP_INVALID;
+ 
+-	if (!check_ip4_fragments(ip4))
+-		return DROP_FRAG_NOSUPPORT;
+-
+ 	policy_clear_mark(skb);
+ 	tuple.nexthdr = ip4->protocol;
+ 
+@@ -915,6 +902,7 @@ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 
+ 	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
+ 	csum_l4_offset_and_flags(tuple.nexthdr, &csum_off);
++	is_fragment = ipv4_is_fragment(ip4);
+ 
+ 	ret = ct_lookup4(&CT_MAP4, &tuple, skb, l4_off, CT_INGRESS, &ct_state,
+ 			 &monitor);
+@@ -943,7 +931,7 @@ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 
+ 	verdict = policy_can_access_ingress(skb, src_label, tuple.dport,
+ 					    tuple.nexthdr, sizeof(orig_sip),
+-					    &orig_sip);
++					    &orig_sip, is_fragment);
+ 
+ 	/* Reply packets and related packets are allowed, all others must be
+ 	 * permitted by policy */
+
+
+
+
+@@ -48,10 +48,14 @@ static inline bool identity_is_reserved(__u32 identity)
+ 	return identity < HEALTH_ID;
+ }
+ 
++#ifndef HAVE_L4_POLICY
++#define HAVE_L4_POLICY 0
++#endif /* HAVE_L4_POLICY */
++
+ static inline int __inline__
+ __policy_can_access(void *map, struct __sk_buff *skb, __u32 identity,
+ 		    __u16 dport, __u8 proto, size_t cidr_addr_size,
+-		    void *cidr_addr, int dir)
++		    void *cidr_addr, int dir, bool is_fragment)
+ {
+ #ifdef DROP_ALL
+ 	return DROP_POLICY;
+@@ -66,18 +70,18 @@ __policy_can_access(void *map, struct __sk_buff *skb, __u32 identity,
+ 		.pad = 0,
+ 	};
+ 
+-#ifdef HAVE_L4_POLICY
+-	policy = map_lookup_elem(map, &key);
+-	if (likely(policy)) {
+-		cilium_dbg3(skb, DBG_L4_CREATE, identity, SECLABEL,
+-			    dport << 16 | proto);
+-
+-		/* FIXME: Use per cpu counters */
+-		__sync_fetch_and_add(&policy->packets, 1);
+-		__sync_fetch_and_add(&policy->bytes, skb->len);
+-		goto get_proxy_port;
++	if (HAVE_L4_POLICY && !is_fragment) {
++		policy = map_lookup_elem(map, &key);
++		if (likely(policy)) {
++			cilium_dbg3(skb, DBG_L4_CREATE, identity, SECLABEL,
++				    dport << 16 | proto);
++
++			/* FIXME: Use per cpu counters */
++			__sync_fetch_and_add(&policy->packets, 1);
++			__sync_fetch_and_add(&policy->bytes, skb->len);
++			goto get_proxy_port;
++		}
+ 	}
+-#endif /* HAVE_L4_POLICY */
+ 
+ 	/* If L4 policy check misses, fall back to L3. */
+ 	key.dport = 0;
+@@ -90,22 +94,24 @@ __policy_can_access(void *map, struct __sk_buff *skb, __u32 identity,
+ 		return TC_ACT_OK;
+ 	}
+ 
+-#ifdef HAVE_L4_POLICY
+-	key.sec_label = 0;
+-	key.dport = dport;
+-	key.protocol = proto;
+-	policy = map_lookup_elem(map, &key);
+-	if (likely(policy)) {
+-		/* FIXME: Use per cpu counters */
+-		__sync_fetch_and_add(&policy->packets, 1);
+-		__sync_fetch_and_add(&policy->bytes, skb->len);
+-		goto get_proxy_port;
++	if (HAVE_L4_POLICY && !is_fragment) {
++		key.sec_label = 0;
++		key.dport = dport;
++		key.protocol = proto;
++		po

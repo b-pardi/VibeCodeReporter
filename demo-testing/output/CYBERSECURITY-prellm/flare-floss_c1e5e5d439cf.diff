@@ -1,0 +1,118 @@
+@@ -379,13 +379,13 @@ class MemsetHook(viv_utils.emulator_drivers.Hook):
+         raise viv_utils.emulator_drivers.UnsupportedFunction()
+ 
+ 
+-class ExitProcessHook(viv_utils.emulator_drivers.Hook):
++class ExitExceptionHook(viv_utils.emulator_drivers.Hook):
+     """
+     Hook calls to ExitProcess and stop emulation when these are hit.
+     """
+ 
+     def hook(self, callname, driver, callconv, api, argv):
+-        if callname == "kernel32.ExitProcess":
++        if callname in ("kernel32.ExitProcess", "kernel32.RaiseException"):
+             raise viv_utils.emulator_drivers.StopEmulation()
+         elif callname == "kernel32.TerminateProcess":
+             h_process = argv[0]
+@@ -394,6 +394,15 @@ class ExitProcessHook(viv_utils.emulator_drivers.Hook):
+         raise viv_utils.emulator_drivers.UnsupportedFunction()
+ 
+ 
++class PrologHook(viv_utils.emulator_drivers.Hook):
++    def hook(self, callname, emu, callconv, api, argv):
++        if callname in ("__EH_prolog3", "__SEH_prolog4", "ntdll.seh4_prolog"):
++            # nop
++            callconv.execCallReturn(emu, 0, len(argv))
++            return True
++        raise viv_utils.emulator_drivers.UnsupportedFunction()
++
++
+ class SecurityCheckCookieHook(viv_utils.emulator_drivers.Hook):
+     def hook(self, callname, emu, callconv, api, argv):
+         if callname in ("__security_check_cookie", "@__security_check_cookie@4"):
+@@ -443,7 +452,8 @@ DEFAULT_HOOKS = (
+     AllocateHeapHook(),
+     MallocHeap(),
+     HeapFree(),
+-    ExitProcessHook(),
++    ExitExceptionHook(),
++    PrologHook(),
+     SecurityCheckCookieHook(),
+     MemcpyHook(),
+     StrlenHook(),
+@@ -457,7 +467,7 @@ DEFAULT_HOOKS = (
+ 
+ # TODO
+ # kernel32.GetModuleHandleA, kernel32.GetModuleHandleW
+-# msvcrt.printf, msvcrt.vfprintf, etc.
++# msvcrt.printf, msvcrt.vfprintf, snprintf, etc.
+ # kernel32.GetModuleFileNameA, kernel32.GetModuleFileNameW
+ 
+ 
+
+
+
+
+@@ -8,12 +8,18 @@ MAX_STRING_LENGTH = 2048
+ # Decoded String (DS)
+ # maximum number of instructions to emulate per function
+ DS_MAX_INSN_COUNT = 20000
+-# maximum number of address revisits per function
+-DS_MAX_ADDRESS_REVISITS = 1
+-# shortcut decoding of a function if only few strings are found...
++# maximum number of address revisits per function when extracting contexts
++DS_MAX_ADDRESS_REVISITS_CTX_EXTRACTION = 1
++# maximum number of address revisits per function when emulating decoding functions
++DS_MAX_ADDRESS_REVISITS_EMULATION = 300
++# shortcut decoding of a function if only few strings are found
+ DS_FUNCTION_MIN_DECODED_STRINGS = 5
+-# ... after emulating at least n function contexts
+-DS_FUNCTION_CTX_SHORTCUT_THRESHOLD = 15
++# decoding candidate only called a few times
++DS_FUNCTION_CALLS_RARE = 7
++# decoding candidate called more often
++DS_FUNCTION_CALLS_OFTEN = 15
++# for decoders called very often, limit threshold shortcut
++DS_FUNCTION_SHORTCUT_THRESHOLD_VERY_OFTEN = 15
+ 
+ # Tight String (TS)
+ # max instruction count to emulate in a tight loop
+
+
+
+
+@@ -11,6 +11,7 @@ from envi import Emulator
+ import floss.logging_
+ 
+ from . import api_hooks
++from .const import DS_MAX_ADDRESS_REVISITS_EMULATION
+ 
+ logger = floss.logging_.getLogger(__name__)
+ MAX_MAPS_SIZE = 1024 * 1024 * 100  # 100MB max memory allocated in an emulator instance
+
+
+
+
+@@ -15,9 +15,11 @@ import floss.decoding_manager
+ import floss.function_argument_getter
+ from floss.const import (
+     DS_MAX_INSN_COUNT,
+-    DS_MAX_ADDRESS_REVISITS,
++    DS_FUNCTION_CALLS_RARE,
++    DS_FUNCTION_CALLS_OFTEN,
+     DS_FUNCTION_MIN_DECODED_STRINGS,
+-    DS_FUNCTION_CTX_SHORTCUT_THRESHOLD,
++    DS_MAX_ADDRESS_REVISITS_CTX_EXTRACTION,
++    DS_FUNCTION_SHORTCUT_THRESHOLD_VERY_OFTEN,
+ )
+ from floss.utils import is_all_zeros
+ from floss.results import AddressType, DecodedString
+@@ -104,12 +106,30 @@ def memdiff(bytes1, bytes2):
+     return diffs
+ 
+ 
++def should_shortcut(fva: int, n: int, n_calls: int, found_strings: int) -> bool:
++    if n_calls < DS_FUNCTION_CALLS_RARE:
++        # don't shortcut
++        return False
++    elif n_

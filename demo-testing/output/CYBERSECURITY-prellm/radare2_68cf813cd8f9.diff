@@ -1,0 +1,143 @@
+@@ -23,6 +23,9 @@ typedef struct r_buf_t {
+ 	// RIOBind *iob;
+ 	// forward declaration
+ 	void *iob;
++	ut64 offset;
++	ut64 limit;
++	struct r_buf_t * parent;
+ } RBuffer;
+ 
+ typedef struct r_buf_cache_t {
+@@ -46,6 +49,7 @@ R_API RBuffer *r_buf_new_slurp(const char *file);
+ R_API RBuffer *r_buf_new_empty (ut64 len);
+ R_API RBuffer *r_buf_mmap(const char *file, int flags);
+ R_API RBuffer *r_buf_new_sparse(ut8 Oxff);
++R_API RBuffer *r_buf_new_slice(RBuffer *b, ut64 offset, ut64 size);
+ R_API bool r_buf_dump (RBuffer *buf, const char *file);
+ R_API RBuffer *r_buf_ref(RBuffer *b);
+ /* methods */
+
+
+
+
+@@ -109,7 +109,7 @@ static bool sparse_limits(RList *l, ut64 *min, ut64 *max) {
+ R_API RBuffer *r_buf_new_with_io(void *iob, int fd) {
+ 	RBuffer *b = r_buf_new ();
+ 	b->iob = iob;
+-	b->fd = fd; 
++	b->fd = fd;
+ 	return b;
+ }
+ 
+@@ -170,9 +170,31 @@ R_API RBuffer *r_buf_new_sparse(ut8 Oxff) {
+ 	return b;
+ }
+ 
++R_API RBuffer *r_buf_new_slice(RBuffer *b, ut64 offset, ut64 size) {
++	if (b && b->sparse) {
++		eprintf ("r_buf_new_slice not supported yet for sparse buffers\n");
++		return NULL;
++	}
++	RBuffer *buf = R_NEW0 (RBuffer);
++	if (!buf) {
++		return NULL;
++	}
++	memcpy (buf, b, sizeof (RBuffer));
++	buf->parent = r_buf_ref (b);
++	buf->ro = true;
++	buf->offset = offset;
++	if (buf->base > 0) {
++		buf->base += offset;
++	}
++	buf->limit = size;
++	return buf;
++}
++
+ R_API RBuffer *r_buf_new() {
+ 	RBuffer *b = R_NEW0 (RBuffer);
+ 	if (b) {
++		b->offset = 0;
++		b->limit = UT64_MAX;
+ 		b->fd = -1;
+ 		b->Oxff = 0xff;
+ 	}
+@@ -189,10 +211,10 @@ R_API ut64 r_buf_size (RBuffer *b) {
+ 	}
+ 	if (b->iob) {
+ 		RIOBind *iob = b->iob;
+-		return iob->fd_size (iob->io, b->fd);
++		return R_MIN (b->limit, R_MAX (0, iob->fd_size (iob->io, b->fd) - b->offset));
+ 	}
+ 	if (b->fd != -1) {
+-		return b->length;
++		return R_MIN (b->limit, R_MAX (0, b->length - b->offset));
+ 	}
+ 	if (b->sparse) {
+ 		ut64 max = 0LL;
+@@ -201,7 +223,7 @@ R_API ut64 r_buf_size (RBuffer *b) {
+ 		}
+ 		return 0LL;
+ 	}
+-	return b->empty? 0: b->length;
++	return b->empty? 0: R_MIN (b->limit, R_MAX (0, b->length - b->offset));
+ }
+ 
+ // rename to new?
+@@ -266,15 +288,16 @@ R_API bool r_buf_dump(RBuffer *b, const char *file) {
+ 
+ R_API int r_buf_seek (RBuffer *b, st64 addr, int whence) {
+ 	ut64 min = 0LL, max = 0LL;
++	ut64 pa = addr - b->base + b->offset;
+ 	if (b->fd != -1) {
+-		if (r_sandbox_lseek (b->fd, addr, whence) == -1) {
++		if (r_sandbox_lseek (b->fd, pa, whence) == -1) {
+ 			// seek failed - print error here?
+ 			return -1;
+ 		}
+ 	} else if (b->sparse) {
+ 		sparse_limits (b->sparse, &min, &max);
+ 		switch (whence) {
+-		case R_IO_SEEK_SET: b->cur = addr; break;
++		case R_IO_SEEK_SET: b->cur = pa; break;
+ 		case R_IO_SEEK_CUR: b->cur = b->cur + addr; break;
+ 		case R_IO_SEEK_END:
+ 			    if (sparse_limits (b->sparse, NULL, &max)) {
+@@ -283,13 +306,14 @@ R_API int r_buf_seek (RBuffer *b, st64 addr, int whence) {
+ 			    b->cur = max + addr; break; //b->base + b->length + addr; break;
+ 		}
+ 	} else {
++		ut64 effective_size = r_buf_size (b);
+ 		min = b->base;
+-		max = b->base + b->length;
++		max = b->base + effective_size;
+ 		switch (whence) {
+ 		//case 0: b->cur = b->base + addr; break;
+-		case R_IO_SEEK_SET: b->cur = addr; break;
++		case R_IO_SEEK_SET: b->cur = pa; break;
+ 		case R_IO_SEEK_CUR: b->cur = b->cur + addr; break;
+-		case R_IO_SEEK_END: b->cur = b->base + b->length + addr; break;
++		case R_IO_SEEK_END: b->cur = max + addr; break;
+ 		}
+ 	}
+ 	/* avoid out-of-bounds */
+@@ -363,7 +387,7 @@ R_API char *r_buf_to_string(RBuffer *b) {
+ }
+ 
+ R_API bool r_buf_append_bytes(RBuffer *b, const ut8 *buf, int length) {
+-	if (!b) {
++	if (!b || b->ro) {
+ 		return false;
+ 	}
+ 	if (b->fd != -1) {
+@@ -384,7 +408,9 @@ R_API bool r_buf_append_bytes(RBuffer *b, const ut8 *buf, int length) {
+ }
+ 
+ R_API bool r_buf_append_nbytes(RBuffer *b, int length) {
+-	if (!b) return false;
++	if (!b || b->ro) {
++		return false;
++	}
+ 	if (b->fd != -1) {
+ 		ut8 *buf = calloc (1, length);
+ 		if (buf) {
+@@ -404,7 +430,9 @@ R_API bool r

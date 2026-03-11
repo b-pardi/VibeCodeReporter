@@ -1,0 +1,101 @@
+@@ -19,6 +19,7 @@
+ #include "sslerr.h"
+ #include "sslproto.h"
+ #include "nss_scoped_ptrs.h"
++#include "sslimpl.h"
+ 
+ #include "nsskeys.h"
+ 
+@@ -346,6 +347,12 @@ class TestAgent {
+                        PR_TRUE);
+     if (rv != SECSuccess) return false;
+ 
++    if (cfg_.get<bool>("server")) {
++      // BoGo expects servers to enable ECH (backend) by default
++      rv = SSLExp_EnableTls13BackendEch(ssl_fd_.get(), true);
++      if (rv != SECSuccess) return false;
++    }
++
+     if (!ConfigureCiphers()) return false;
+ 
+     return true;
+
+
+
+
+@@ -3835,7 +3835,7 @@ ssl3_InitHandshakeHashes(sslSocket *ss)
+                 return SECFailure;
+             }
+ 
+-            /* Alternate transcript hash used in Encrypted Client Hello. */
++            /* Transcript hash used on ECH client. */
+             if (!ss->sec.isServer && ss->ssl3.hs.echHpkeCtx) {
+                 ss->ssl3.hs.shaEchInner = PK11_CreateDigestContext(hash_oid->offset);
+                 if (ss->ssl3.hs.shaEchInner == NULL) {
+@@ -3877,16 +3877,21 @@ ssl3_InitHandshakeHashes(sslSocket *ss)
+ 
+     if (ss->ssl3.hs.hashType != handshake_hash_record &&
+         ss->ssl3.hs.messages.len > 0) {
+-        /* When doing ECH, ssl3_UpdateHandshakeHashes will store outer messages into
+-         * the both the outer and inner transcripts. ssl3_UpdateDefaultHandshakeHashes
+-         * uses only the default context (which is the outer when doing ECH). */
++        /* When doing ECH, ssl3_UpdateHandshakeHashes will store outer messages
++         * into the both the outer and inner transcripts.
++         * ssl3_UpdateDefaultHandshakeHashes uses the default context which is
++         * the outer when doing client ECH. For ECH shared-mode or backend
++         * servers only the hs.messages buffer is used. */
+         if (ssl3_UpdateDefaultHandshakeHashes(ss, ss->ssl3.hs.messages.buf,
+                                               ss->ssl3.hs.messages.len) != SECSuccess) {
+             return SECFailure;
+         }
+-        /* When doing ECH, deriving accept_confirmation requires all messages
+-         * up to SH, then a synthetic SH. Don't free the buffers just yet. */
+-        if (!ss->ssl3.hs.echHpkeCtx) {
++        /* When doing ECH, deriving the accept_confirmation value requires all
++         * messages up to and including the ServerHello
++         * (see draft-ietf-tls-esni-14, Section 7.2).
++         *
++         * Don't free the transcript buffer until confirmation calculation. */
++        if (!ss->ssl3.hs.echHpkeCtx && !ss->opt.enableTls13BackendEch) {
+             sslBuffer_Clear(&ss->ssl3.hs.messages);
+         }
+     }
+
+
+
+
+@@ -183,6 +183,11 @@ SSL_ResetHandshake(PRFileDesc *s, PRBool asServer)
+         PORT_Assert(ss->ssl3.hs.echPublicName);
+         PORT_Free((void *)ss->ssl3.hs.echPublicName); /* CONST */
+         ss->ssl3.hs.echPublicName = NULL;
++    }
++    /* Make sure greaseEchBuf is freed in ECH setups without echHpkeCtx. */
++    if (ss->ssl3.hs.echHpkeCtx ||
++        ss->opt.enableTls13BackendEch ||
++        ss->opt.enableTls13GreaseEch) {
+         sslBuffer_Clear(&ss->ssl3.hs.greaseEchBuf);
+     }
+ 
+
+
+
+
+@@ -2169,6 +2169,7 @@ tls13_ConstructHelloRetryRequest(sslSocket *ss,
+                                  ssl3CipherSuite cipherSuite,
+                                  const sslNamedGroupDef *selectedGroup,
+                                  PRUint8 *cookie, unsigned int cookieLen,
++                                 const PRUint8 *cookieGreaseEchSignal,
+                                  sslBuffer *buffer)
+ {
+     SECStatus rv;
+@@ -2180,8 +2181,24 @@ tls13_ConstructHelloRetryRequest(sslSocket *ss,
+     ss->xtnData.selectedGroup = selectedGroup;
+     ss->xtnData.cookie.data = cookie;
+     ss->xtnData.cookie.len = cookieLen;
++
++    /* Set restored ss->ssl3.hs.greaseEchBuf value for ECH HRR extension
++     * reconstruction. */
++    if (cookieGreaseEchSignal) {
++        PORT_Assert(!ss->ssl3.hs.greaseEchBuf.len);
++        rv = sslBuffer_Append(&ss->ssl3.hs.greaseEchBuf,
++           

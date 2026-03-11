@@ -1,0 +1,106 @@
+@@ -603,6 +603,8 @@ class Ntop {
+   u_int32_t getNumFlowExportersInterfaces()    { return num_flow_interfaces; }
+   bool incNumFlowExporters();
+   bool incNumFlowExportersInterfaces();
++  void decNumFlowExporters();
++  void decNumFlowExportersInterfaces();
+ 
+   inline u_int getNumCPUs() { return (num_cpus); }
+   inline void setNumCPUs(u_int num) { num_cpus = num; }
+
+
+
+
+@@ -48,13 +48,23 @@ class ZMQParserInterface : public ParserInterface {
+    * while flow_devices_stats (FlowDevicesStats) in NetworkInterface
+    * is updated from collected flows */
+   std::map<u_int32_t, nProbeStats *> nprobes_last_remote_stats;
+-  nProbeStats *cumulative_remote_stats, *cumulative_remote_stats_shadow;
++
++  /* Note: using a small structure to account cumulative stats from 
++   * all remote probes. This is accessed concurrently, thus please
++   * consider a lock or shadow if you need to handle non-atomic access. */
++  struct {
++    u_int32_t remote_lifetime_timeout;
++    u_int32_t remote_idle_timeout;
++    u_int32_t remote_collected_lifetime_timeout;
++    u_int32_t sflow_pkt_sample_drops;
++  } cumulative_remote_stats;
+   struct timeval last_cumulative_remote_stats_update;
++
+   u_int32_t remote_lifetime_timeout, remote_idle_timeout;
+   u_int64_t zmq_initial_bytes, zmq_initial_pkts, zmq_initial_drops,
+             zmq_remote_initial_exported_flows;
+ 
+-  RwLock lock;
++  RwLock stats_lock;
+ 
+ #ifdef NTOPNG_PRO
+   CustomAppMaps *custom_app_maps;
+@@ -145,7 +155,7 @@ class ZMQParserInterface : public ParserInterface {
+                                    u_int32_t *const app_id);
+ #endif
+   u_int32_t getNumDroppedPackets() {
+-    return cumulative_remote_stats ? cumulative_remote_stats->sflow_pkt_sample_drops : 0;
++    return cumulative_remote_stats.sflow_pkt_sample_drops;
+   };
+   virtual void lua(lua_State *vm, bool fullStats);
+   virtual void probeLuaStats(lua_State *vm);
+
+
+
+
+@@ -37,8 +37,10 @@ ZMQParserInterface::ZMQParserInterface(const char *endpoint,
+   if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[new] %s", __FILE__);
+ 
+   zmq_initial_bytes = 0, zmq_initial_pkts = 0, zmq_initial_drops = 0;
+-  cumulative_remote_stats = cumulative_remote_stats_shadow = NULL;
++
++  memset(&cumulative_remote_stats, 0, sizeof(cumulative_remote_stats));
+   memset(&last_cumulative_remote_stats_update, 0, sizeof(last_cumulative_remote_stats_update));
++
+   zmq_remote_initial_exported_flows = 0;
+   remote_lifetime_timeout = remote_idle_timeout = 0;
+   once = false, is_sampled_traffic = false;
+@@ -290,8 +292,6 @@ void ZMQParserInterface::addMappingFromRedis() {
+ ZMQParserInterface::~ZMQParserInterface() {
+   map<u_int32_t, nProbeStats *>::iterator it;
+ 
+-  if (cumulative_remote_stats) delete (cumulative_remote_stats);
+-  if (cumulative_remote_stats_shadow) delete (cumulative_remote_stats_shadow);
+ #ifdef NTOPNG_PRO
+   if (custom_app_maps) delete (custom_app_maps);
+ #endif
+@@ -440,8 +440,6 @@ void ZMQParserInterface::luaGetAllKeyDescription(lua_State *vm) {
+ 
+   lua_newtable(vm);
+ 
+-  lock.rdlock(__FILE__, __LINE__);
+-
+   for (it = descriptions_map.begin();
+        it != descriptions_map.end(); ++it) {
+     char pen_field[128];
+@@ -456,8 +454,6 @@ void ZMQParserInterface::luaGetAllKeyDescription(lua_State *vm) {
+     lua_insert(vm, -2);
+     lua_settable(vm, -3);
+   }
+-
+-  lock.unlock(__FILE__, __LINE__);
+ }
+ 
+ /* **************************************************** */
+@@ -3219,23 +3215,17 @@ u_int8_t ZMQParserInterface::parseOption(const char *payload, int payload_size,
+ /* **************************************** */
+ 
+ u_int32_t ZMQParserInterface::periodicStatsUpdateFrequency() const {
+-  nProbeStats *zrs = cumulative_remote_stats;
+-  u_int32_t update_freq;
+   u_int32_t update_freq_min = ntop->getPrefs()->get_housekeeping_frequency();
+-
+-  if (zrs)
+-    update_freq = min_val(max_val(zrs->remote_lifetime_timeout, zrs->remote_idle_timeout),
+-			  zrs->remote_collected_lifetime_timeout);
+-  else
+-    update_freq = update_freq_min;
+-
++  u_int32_t update_fr

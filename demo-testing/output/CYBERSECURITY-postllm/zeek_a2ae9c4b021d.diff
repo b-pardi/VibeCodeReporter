@@ -1,0 +1,83 @@
+@@ -2,7 +2,6 @@
+ 
+ #include "zeek/spicy/runtime-support.h"
+ 
+-#include <algorithm>
+ #include <memory>
+ 
+ #include <hilti/rt/exception.h>
+@@ -10,6 +9,7 @@
+ #include <hilti/rt/types/port.h>
+ #include <hilti/rt/util.h>
+ 
++#include "net_util.h"
+ #include "zeek/Event.h"
+ #include "zeek/analyzer/Manager.h"
+ #include "zeek/analyzer/protocol/pia/PIA.h"
+@@ -493,7 +493,10 @@ void rt::protocol_begin(const std::optional<std::string>& analyzer, const ::hilt
+         return;
+     }
+ 
+-    // Instantiate a DPD analyzer.
++    // Instantiate a DPD analyzer. If a direct child of this type already
++    // exists, we abort silently because that makes usage nicer if either side
++    // of the connection might end up creating the analyzer; this way the user
++    // doesn't need to track what the other side already did.
+ 
+     auto cookie = static_cast<Cookie*>(hilti::rt::context::cookie());
+     assert(cookie);
+@@ -504,24 +507,17 @@ void rt::protocol_begin(const std::optional<std::string>& analyzer, const ::hilt
+ 
+     switch ( proto.value() ) {
+         case ::hilti::rt::Protocol::TCP: {
++            // Use a Zeek PIA stream (TCP) analyzer performing DPD.
+             auto pia_tcp = std::make_unique<analyzer::pia::PIA_TCP>(c->analyzer->Conn());
+-            pia_tcp->FirstPacket(true, nullptr);
+-            pia_tcp->FirstPacket(false, nullptr);
++            pia_tcp->FirstPacket(true, TransportProto::TRANSPORT_TCP);
++            pia_tcp->FirstPacket(false, TransportProto::TRANSPORT_TCP);
+ 
+             // Forward empty payload to trigger lifecycle management in this analyzer tree.
+             c->analyzer->ForwardStream(0, reinterpret_cast<const u_char*>(c->analyzer), true);
+             c->analyzer->ForwardStream(0, reinterpret_cast<const u_char*>(c->analyzer), false);
+ 
+             // If the child already exists, do not add it again so this function is idempotent.
+-            //
+-            // We inspect the children directly to work around zeek/zeek#2899.
+-            const auto& children = c->analyzer->GetChildren();
+-            if ( auto it = std::find_if(children.begin(), children.end(),
+-                                        [&](const auto& it) {
+-                                            return ! it->Removing() && ! it->IsFinished() &&
+-                                                   it->GetAnalyzerName() == pia_tcp->GetAnalyzerTag();
+-                                        });
+-                 it != children.end() )
++            if ( auto child = c->analyzer->GetChildAnalyzer(pia_tcp->GetAnalyzerName()) )
+                 return;
+ 
+             auto child = pia_tcp.release();
+@@ -529,7 +525,20 @@ void rt::protocol_begin(const std::optional<std::string>& analyzer, const ::hilt
+             break;
+         }
+ 
+-        case ::hilti::rt::Protocol::UDP: throw Unsupported("protocol_begin: UDPnot supported for DPD");
++        case ::hilti::rt::Protocol::UDP: {
++            // Use a Zeek PIA packet (UDP) analyzer performing DPD.
++            auto pia_udp = std::make_unique<analyzer::pia::PIA_UDP>(c->analyzer->Conn());
++            pia_udp->FirstPacket(true, TransportProto::TRANSPORT_UDP);
++            pia_udp->FirstPacket(false, TransportProto::TRANSPORT_UDP);
++
++            // Forward empty payload to trigger lifecycle management in this analyzer tree.
++            c->analyzer->ForwardPacket(0, reinterpret_cast<const u_char*>(c->analyzer), true, 0, nullptr, 0);
++            c->analyzer->ForwardPacket(0, reinterpret_cast<const u_char*>(c->analyzer), false, 0, nullptr, 0);
++
++            auto child = pia_udp.release();
++            c->analyzer->AddChildAnalyzer(child);
++            break;
++        }
+ 
+         case ::hilti::rt::Protocol::ICMP: throw Unsupported("protocol_begin: ICMP not supported for DPD");
+ 
+@@ -557,16 +566,8 @@ rt::ProtocolHandle rt::protocol_handle_get_or_create(const std::string& analyzer
+             c->analyzer->ForwardStream(0, reinterpret_cast<const u_char*>(c->analyzer), false);
+ 
+             // If the child 

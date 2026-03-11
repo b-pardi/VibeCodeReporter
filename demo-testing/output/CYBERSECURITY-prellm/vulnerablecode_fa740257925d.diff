@@ -1,0 +1,108 @@
+@@ -27,3 +27,11 @@ class Inference:
+ 
+         if self.confidence < 0:
+             raise UnderConfidenceError
++
++class Improver:
++    """
++    All improvers should inherit this class and implement updated_inferences method to return
++    new inferences for a package or vulnerability
++    """
++    def updated_inferences(self):
++        raise NotImplementedError
+
+
+
+
+@@ -86,7 +86,8 @@ class Advisory:
+ 
+     summary: str
+     vulnerability_id: Optional[str] = None
+-    affected_packages: List[AffectedPackage] = dataclasses.field(default_factory=list)
++    affected_package_urls: Iterable[PackageURL] = dataclasses.field(default_factory=list)
++    fixed_package_urls: Iterable[PackageURL] = dataclasses.field(default_factory=list)
+     references: List[Reference] = dataclasses.field(default_factory=list)
+ 
+     def __post_init__(self):
+@@ -94,6 +95,8 @@ class Advisory:
+             raise ValueError("CVE expected, found: {}".format(self.vulnerability_id))
+ 
+     def normalized(self):
++        affected_package_urls = set(self.affected_package_urls)
++        fixed_package_urls = set(self.fixed_package_urls)
+         references = sorted(
+             self.references, key=lambda reference: (reference.reference_id, reference.url)
+         )
+@@ -103,7 +106,8 @@ class Advisory:
+         return Advisory(
+             summary=self.summary,
+             vulnerability_id=self.vulnerability_id,
+-            affected_packages=sorted(self.affected_packages),
++            affected_package_urls=affected_package_urls,
++            fixed_package_urls=fixed_package_urls,
+             references=references,
+         )
+ 
+
+
+
+
+@@ -24,15 +24,16 @@
+ import dataclasses
+ import datetime
+ import logging
+-from itertools import chain
+ from typing import Tuple
+ from typing import Set
+ 
+-from django.db import transaction
+ 
+ from vulnerabilities import models
+-from vulnerabilities.data_source import Advisory, DataSource
++from vulnerabilities.data_source import Advisory
+ from vulnerabilities.data_source import PackageURL
++from vulnerabilities.data_inference import Inference
++from vulnerabilities.data_inference import MAX_CONFIDENCE
++from vulnerabilities.improve_runner import process_inferences
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -87,7 +88,7 @@ class ImportRunner:
+         data_source = self.importer.make_data_source(cutoff_date=cutoff_date)
+         with data_source:
+             advisories = data_source.updated_advisories()
+-            process_advisories(advisories)
++            process_advisories("importer", advisories)
+         self.importer.last_run = datetime.datetime.now(tz=datetime.timezone.utc)
+         self.importer.data_source_cfg = dataclasses.asdict(data_source.config)
+         self.importer.save()
+@@ -108,79 +109,10 @@ def get_vuln_pkg_refs(vulnerability, package):
+     )
+ 
+ 
+-@transaction.atomic
+-def process_advisories(advisories: Set[Advisory]) -> None:
+-    bulk_create_vuln_pkg_refs = set()
+-    for advisory in advisories:
+-        vuln, vuln_created = _get_or_create_vulnerability(advisory)
+-        for vuln_ref in advisory.references:
+-            ref, _ = models.VulnerabilityReference.objects.get_or_create(
+-                vulnerability=vuln, reference_id=vuln_ref.reference_id, url=vuln_ref.url
+-            )
+-
+-            for score in vuln_ref.severities:
+-                models.VulnerabilitySeverity.objects.update_or_create(
+-                    vulnerability=vuln,
+-                    scoring_system=score.system.identifier,
+-                    reference=ref,
+-                    defaults={"value": str(score.value)},
+-                )
+-
+-        for aff_pkg_with_patched_pkg in advisory.affected_packages:
+-            vulnerable_package, _ = _get_or_create_package(
+-                aff_pkg_with_patched_pkg.vulnerable_package
+-            )
+-            patched_package = None
+-            if aff_pkg_with_patched_pkg.patched_package:
+-                patched_package, _ = _get_or_create_package(
+-                    aff_pkg_with_patched_pk

@@ -1,0 +1,93 @@
+@@ -30,11 +30,13 @@ def run_benchmark(name: str, prefix: str, callback: Callable, count=COUNT) -> fl
+     profiler.disable()
+ 
+     pstats_file_name_base = f"{prefix}-{count}-{name}-{int(time.time())}"
+-    profiler.dump_stats(f"{pstats_file_name_base}.pstats")
++    filename = f"{pstats_file_name_base}.pstats"
++    profiler.dump_stats(filename)
+ 
+     full_time = pstats.Stats(profiler).total_tt
+ 
+     print(f"Time elapsed: {full_time}. Average time: {full_time / count}")
++    print(f"Saved benchmark data to {filename}")
+ 
+     return full_time / count
+ 
+@@ -58,8 +60,8 @@ def benchmark_context(name: str):
+     ## Benchmark the `context` command, no caching
+ 
+     def run_with_clear():
+-        pwndbg.commands.context.context.function()
+         pwndbg.lib.cache.clear_caches()
++        pwndbg.commands.context.context.function()
+ 
+     run_benchmark(
+         name,
+
+
+
+
+@@ -130,7 +130,8 @@ def first_kernel_ro_page() -> pwndbg.lib.memory.Page | None:
+             return mapping
+     # optimization: observe that the first Linux kernel region is the kernel text so search it last
+     # it now finds the first ro page almost instantly even for kernels that are partially initialized
+-    for mapping in fallback_mappings[1:] + [fallback_mappings[0]]:
++    # should find it within the first few page chunks if debugging linux kernel (reason for [:10])
++    for mapping in fallback_mappings[1:10] + [fallback_mappings[0]]:
+         # this loop handles when the kernel has not finished initialization
+         # and the permission of the first ro page has not been properly set
+         result = next(pwndbg.search.search(b"Linux version", mappings=[mapping]), None)
+@@ -141,7 +142,7 @@ def first_kernel_ro_page() -> pwndbg.lib.memory.Page | None:
+     return None
+ 
+ 
+-@pwndbg.lib.cache.cache_until("start")
++@pwndbg.lib.cache.cache_until("objfile")
+ def kconfig() -> pwndbg.aglib.kernel.kconfig_mod.Kconfig | None:
+     global _kconfig
+     config_start, config_end = None, None
+
+
+
+
+@@ -43,97 +43,134 @@ class PageTableLevel:
+ 
+ 
+ class PageTableScan:
+-    MAX_SAME_PG_TABLE_ENTRY = 0x10
+-
+-    # is_kernel is used only for Aarch64
+-    def __init__(self, pi: ArchPagingInfo, is_kernel: bool) -> None:
++    def __init__(self, pi: ArchPagingInfo) -> None:
+         # from ArchPagingInfo:
+         self.paging_level = pi.paging_level
+         self.PAGE_ENTRY_MASK = pi.PAGE_ENTRY_MASK
+         self.PAGE_INDEX_LEN = pi.PAGE_INDEX_LEN
+         self.PAGE_INDEX_MASK = pi.PAGE_INDEX_MASK
+         self.page_shift = pi.page_shift
+-        self.pageentry_flags = pi.pageentry_flags
+         self.should_stop_pagewalk = pi.should_stop_pagewalk
+         # for scanning
+-        self.result: List[Page] = []
+         self.pagesz = 1 << self.page_shift
+-        self.counters: Dict[int, int] = {}
+         self.ptrsize = pwndbg.aglib.arch.ptrsize
+         self.inf = pwndbg.dbg.selected_inferior()
+         self.fmt = "<" + ("Q" if self.ptrsize == 8 else "I") * (self.pagesz // self.ptrsize)
+-        self.cache: Dict[int, List[int]] = {}
+-        # below are info relating to the current page chunks being coalesced
+-        self.level_idxes = [0] * (self.paging_level + 1)
+-        self.curr = None
+-        self.is_kernel = is_kernel
++        self.cache: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
++        self.entry_cache: Dict[int, List[int]] = {}
+         self.arch = pwndbg.aglib.arch.name
+ 
+-    def scan(self, entry: int, level_remaining: int) -> None:
+-        # this needs to be EXTREMELY optimized as it is used to display context
+-        # making as few functions calls or memory reads as possible
+-        # avoid unnecessary python pointer deferences or repetative computations whenever possible
+-        # on average takes less than 0.09 seconds to complete for x64 and 0.12 for aarch64
+-        # around 25% of the time is used to read qemu system memory
+-        # in comparison, gdb-pt-dump takes ~0.12 for x64 and a few seconds for aarch64
+-        # --> 25% speed up f

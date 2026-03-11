@@ -1,0 +1,109 @@
+@@ -1406,11 +1406,82 @@ error:
+     return -1;
+ }
+ 
++static inline bool
++HaveEntireRecord(const SSLStateConnp *curr_connp, const uint32_t input_len)
++{
++    return (curr_connp->bytes_processed + input_len) >=
++                      (curr_connp->record_length + SSLV3_RECORD_HDR_LEN);
++}
++
++static inline bool
++RecordAlreadyProcessed(const SSLStateConnp *curr_connp)
++{
++    return ((curr_connp->record_length + SSLV3_RECORD_HDR_LEN) <
++            curr_connp->bytes_processed);
++}
++
++static inline int SSLv3ParseHandshakeTypeCertificate(SSLState *ssl_state,
++        const uint8_t * const initial_input,
++        const uint32_t input_len)
++{
++    if (EnsureRecordSpace(ssl_state->curr_connp, input_len) < 0) {
++        /* error, skip packet */
++        ssl_state->curr_connp->bytes_processed += input_len;
++        return -1;
++    }
++
++    uint32_t write_len = 0;
++    if (HaveEntireRecord(ssl_state->curr_connp, input_len)) {
++        if (RecordAlreadyProcessed(ssl_state->curr_connp)) {
++            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_SSL_RECORD);
++            return -1;
++        }
++        write_len = (ssl_state->curr_connp->record_length +
++                SSLV3_RECORD_HDR_LEN) - ssl_state->curr_connp->bytes_processed;
++    } else {
++        write_len = input_len;
++    }
++
++    if (SafeMemcpy(ssl_state->curr_connp->trec,
++                ssl_state->curr_connp->trec_pos,
++                ssl_state->curr_connp->trec_len,
++                initial_input, 0, input_len, write_len) != 0) {
++        return -1;
++    }
++    ssl_state->curr_connp->trec_pos += write_len;
++
++    int rc = TlsDecodeHSCertificate(ssl_state, ssl_state->curr_connp->trec,
++            ssl_state->curr_connp->trec_pos);
++    if (rc > 0) {
++        /* do not return normally if the packet was fragmented:
++           we would return the size of the _entire_ message,
++           while we expect only the number of bytes parsed bytes
++           from the _current_ fragment */
++        if (write_len < (ssl_state->curr_connp->trec_pos - rc)) {
++            SSLSetEvent(ssl_state, TLS_DECODER_EVENT_INVALID_SSL_RECORD);
++            return -1;
++        }
++
++        uint32_t diff = write_len -
++            (ssl_state->curr_connp->trec_pos - rc);
++        ssl_state->curr_connp->bytes_processed += diff;
++
++        ssl_state->curr_connp->trec_pos = 0;
++        ssl_state->curr_connp->handshake_type = 0;
++        ssl_state->curr_connp->hs_bytes_processed = 0;
++        ssl_state->curr_connp->message_length = 0;
++
++        return diff;
++    } else {
++        ssl_state->curr_connp->bytes_processed += write_len;
++        return write_len;
++    }
++}
++
+ static int SSLv3ParseHandshakeType(SSLState *ssl_state, const uint8_t *input,
+                                    uint32_t input_len, uint8_t direction)
+ {
+     const uint8_t *initial_input = input;
+-    uint32_t parsed = 0;
+     int rc;
+ 
+     if (input_len == 0) {
+@@ -1425,7 +1496,6 @@ static int SSLv3ParseHandshakeType(SSLState *ssl_state, const uint8_t *input,
+             if (input_len >= ssl_state->curr_connp->message_length &&
+                       input_len >= 40) {
+                 rc = TLSDecodeHandshakeHello(ssl_state, input, input_len);
+-
+                 if (rc < 0)
+                     return rc;
+             }
+@@ -1440,7 +1510,6 @@ static int SSLv3ParseHandshakeType(SSLState *ssl_state, const uint8_t *input,
+                     input_len >= 40) {
+                 rc = TLSDecodeHandshakeHello(ssl_state, input,
+                                              ssl_state->curr_connp->message_length);
+-
+                 if (rc < 0)
+                     return rc;
+             }
+@@ -1462,72 +1531,10 @@ static int SSLv3ParseHandshakeType(SSLState *ssl_state, const uint8_t *input,
+                            "direction!");
+                 break;
+             }
+-
+-            if (EnsureRecordSpace(ssl_state->curr_connp, input_len) < 0) {
+-                /* error, skip packet */
+-                parsed += input_len;
+-            

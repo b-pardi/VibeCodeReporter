@@ -1,0 +1,109 @@
+@@ -946,10 +946,13 @@ zeek::RecordValPtr Manager::MakeEvent(ArgsSpan args, zeek::detail::Frame* frame)
+     return rval;
+ }
+ 
+-bool Manager::DoSubscribe(const string& topic_prefix) {
++bool Manager::DoSubscribe(const string& topic_prefix, SubscribeCallback cb) {
+     DBG_LOG(DBG_BROKER, "Subscribing to topic prefix %s", topic_prefix.c_str());
+     bstate->subscriber.add_topic(topic_prefix, ! run_state::detail::zeek_init_done);
+ 
++    if ( cb )
++        cb(topic_prefix, {CallbackStatus::NotImplemented});
++
+     return true;
+ }
+ 
+
+
+
+
+@@ -380,7 +380,7 @@ public:
+ 
+ private:
+     // Register interest in peer event messages that use a certain topic prefix.
+-    bool DoSubscribe(const std::string& topic_prefix) override;
++    bool DoSubscribe(const std::string& topic_prefix, SubscribeCallback cb) override;
+ 
+     // Unregister interest in peer event messages.
+     bool DoUnsubscribe(const std::string& topic_prefix) override;
+
+
+
+
+@@ -185,13 +185,40 @@ public:
+         return DoPublishEvent(topic, event);
+     }
+ 
++    /**
++     * Status codes for callbacks.
++     */
++    enum class CallbackStatus {
++        Success,
++        Error,
++        NotImplemented,
++    };
++
++    /**
++     * Information for subscription callbacks.
++     */
++    struct SubscriptionCallbackInfo {
++        CallbackStatus status;              // The status of the operation.
++        std::optional<std::string> message; // Optional message.
++    };
++
++    using SubscribeCallback =
++        std::function<void(const std::string& topic_prefix, const SubscriptionCallbackInfo& info)>;
++
+     /**
+      * Register interest in messages that use a certain topic prefix.
+      *
++     * Invoking cb may happen while Subscribe() executes, for example if the
++     * call to Subscribe() is synchronous, or an error is discovered before
++     * submitting any work.
++     *
+      * @param topic_prefix a prefix to match against remote message topics.
++     * @param cb callback invoked when the subscription was processed.
+      * @return true if it's a new event subscription and it is now registered.
+      */
+-    bool Subscribe(const std::string& topic_prefix) { return DoSubscribe(topic_prefix); }
++    bool Subscribe(const std::string& topic_prefix, SubscribeCallback cb = SubscribeCallback()) {
++        return DoSubscribe(topic_prefix, std::move(cb));
++    }
+ 
+     /**
+      * Unregister interest in messages on a certain topic.
+@@ -314,13 +341,19 @@ private:
+      * Register interest in messages that use a certain topic prefix.
+      *
+      * If the backend hasn't yet established a connection, any subscriptions
+-     * should be queued until they can be processed.
++     * should be queued until they can be processed. If a callback is given,
++     * it should be called once the subscription can be determined to be
++     * active. The callback has to be invoked from Zeek's main thread. If
++     * the backend does not implement callbacks, it should invoke the callback
++     * with CallbackStatus::NotImplemented, which will act as success, but
++     * provides a way to distinguish behavior.
+      *
+      * @param topic_prefix a prefix to match against remote message topics.
++     * @param cb callback to invoke when the subscription is active
+      *
+      * @return true if it's a new event subscription and now registered.
+      */
+-    virtual bool DoSubscribe(const std::string& topic_prefix) = 0;
++    virtual bool DoSubscribe(const std::string& topic_prefix, SubscribeCallback cb) = 0;
+ 
+     /**
+      * Unregister interest in messages on a certain topic.
+
+
+
+
+@@ -39,6 +39,12 @@ bool ProxyThread::Start() {
+     zmq::socket_t xpub(ctx, zmq::socket_type::xpub);
+     zmq::socket_t xsub(ctx, zmq::socket_type::xsub);
+ 
++    // Enable XPUB_VERBOSE unconditional to enforce nodes receiving
++    // notifications about any new subscriptions, even if they have
++    // seen them before. This is needed to for the subscribe callback
++    // functionality to work reliably.
++    xpub.set(zmq::sockopt::xp

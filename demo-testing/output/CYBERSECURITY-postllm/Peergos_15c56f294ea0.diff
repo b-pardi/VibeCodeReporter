@@ -1,0 +1,75 @@
+@@ -329,7 +329,7 @@ public abstract class UserTests {
+         Path syncPath = PathUtil.get(username, "sync");
+         context.getByPath(syncPath).join().get()
+                 .mkdir("subdir", network, false, context.mirrorBatId(), crypto).join();
+-        context.createSecretLink(syncPath.resolve("subdir").toString(), false, Optional.empty(), Optional.empty(), "", false).join();
++        LinkProperties subdirLink = context.createSecretLink(syncPath.resolve("subdir").toString(), false, Optional.empty(), Optional.empty(), "", false).join();
+ 
+         FileWrapper syncDir = context.getByPath(syncPath).join().get();
+         FileWrapper deleted = syncDir.remove(context.getUserRoot().join(), syncPath, context).join();
+@@ -337,6 +337,22 @@ public abstract class UserTests {
+         Map<Path, SharedWithState> sharedWith = context.sharedWithCache.getAllDescendantShares(syncPath, deleted.version).join();
+         Assert.assertTrue(sharedWith.isEmpty());
+ 
++        try {
++            // test that the secret link itself has been removed
++            EncryptedCapability ecap = network.dhtClient.getSecretLink(syncLink.toLink(context.signer.publicKeyHash)).join();
++        } catch (IllegalStateException e) {
++            if (! e.getMessage().contains("No secret link"))
++                throw new RuntimeException("Failed");
++        }
++
++        try {
++            // test that the secret link itself has been removed
++            EncryptedCapability ecap = network.dhtClient.getSecretLink(subdirLink.toLink(context.signer.publicKeyHash)).join();
++        } catch (IllegalStateException e) {
++            if (! e.getMessage().contains("No secret link"))
++                throw new RuntimeException("Failed");
++        }
++
+         // now try to init sync dir again
+         context.getUserRoot().join().mkdir("sync", network, false, context.mirrorBatId(), crypto).join();
+         DirectorySync.init(context, username + "/sync");
+
+
+
+
+@@ -770,11 +770,16 @@ public class UserContext {
+     @JsMethod
+     public CompletableFuture<Snapshot> deleteSecretLink(long label, Path toFile, boolean isWritable) {
+         PublicKeyHash id = signer.publicKeyHash;
+-        return writeSynchronizer.applyComplexUpdate(id, signer,
+-                        (v, c) -> IpfsTransaction.call(id,
+-                                tid -> v.get(id).props.get().removeLink(signer, label, mirrorBat, tid, network.dhtClient, network.hasher)
+-                                        .thenCompose(wd -> c.commit(id, signer, wd, v.get(id), tid))
+-                                        .thenCompose(s -> sharedWithCache.removeSecretLink(toFile, label, s, c, network)), network.dhtClient));
++        return writeSynchronizer.applyComplexUpdate(id, signer, (v, c) -> deleteSecretLink(label, toFile, v, c)
++                .thenCompose(s -> sharedWithCache.removeSecretLink(toFile, label, s, c, network)));
++    }
++
++    public CompletableFuture<Snapshot> deleteSecretLink(long label, Path toFile, Snapshot in, Committer c) {
++        PublicKeyHash id = signer.publicKeyHash;
++        return in.withWriter(id, id, network).thenCompose(v -> IpfsTransaction.call(id,
++                tid -> v.get(id).props.get().removeLink(signer, label, mirrorBat, tid, network.dhtClient, network.hasher)
++                        .thenCompose(wd -> c.commit(id, signer, wd, v.get(id), tid))
++                        .thenApply(res -> v.mergeAndOverwriteWith(res)), network.dhtClient));
+     }
+ 
+     public static CompletableFuture<AbsoluteCapability> getPublicCapability(Path originalPath, NetworkAccess network) {
+
+
+
+
+@@ -2326,13 +2326,13 @@ public class FileWrapper {
+ 
+     /**
+      * @param parent
+-     * @param userContext
++     * @param context
+      * @return updated parent
+      */
+     @JsMethod
+-    public CompletableFuture<FileWrapper> remove(FileWrapper parent, Path ourPath, UserContext userContext) {
+-        NetworkAccess network = userContext.network;
+-        Hasher hasher = userContext.crypto.hasher;
++    public

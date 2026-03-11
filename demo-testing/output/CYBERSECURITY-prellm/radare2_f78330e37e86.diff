@@ -1,0 +1,153 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2007-2013 - pancake */
++/* radare - LGPL - Copyright 2007-2022 - pancake */
+ 
+ #include <string.h>
+ #include <r_types.h>
+
+
+
+
+@@ -5,6 +5,8 @@
+ #include <capstone/capstone.h>
+ #include <capstone/mips.h>
+ 
++R_IPI int mips_assemble(const char *str, ut64 pc, ut8 *out);
++
+ static R_TH_LOCAL ut64 t9_pre = UT64_MAX;
+ // http://www.mrc.uidaho.edu/mrc/people/jff/digital/MIPSir.html
+ 
+@@ -753,6 +755,12 @@ static int analop(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 		return -1;
+ 	}
+ 
++	if (anal->config->syntax == R_ASM_SYNTAX_REGNUM) {
++		cs_option (hndl, CS_OPT_SYNTAX, CS_OPT_SYNTAX_NOREGNAME);
++	} else {
++		cs_option (hndl, CS_OPT_SYNTAX, CS_OPT_SYNTAX_DEFAULT);
++	}
++
+ 	int n, opsize = -1;
+ 	cs_insn* insn;
+ 
+@@ -762,10 +770,11 @@ static int analop(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 		return -1;
+ 	}
+ 	op->size = 4;
+-	n = cs_disasm (hndl, (ut8*)buf, len, addr, 1, &insn);
++	n = cs_disasm (hndl, buf, len, addr, 1, &insn);
+ 	if (n < 1 || insn->size < 1) {
+ 		if (mask & R_ANAL_OP_MASK_DISASM) {
+ 			op->mnemonic = strdup ("invalid");
++			opsize = 4;
+ 		}
+ 		goto beach;
+ 	}
+@@ -774,6 +783,9 @@ static int analop(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 			insn->mnemonic,
+ 			insn->op_str[0]?" ":"",
+ 			insn->op_str);
++		if (op->mnemonic) {
++			r_str_replace_char (op->mnemonic, '$', 0);
++		}
+ 	}
+ 	op->id = insn->id;
+ 	opsize = op->size = insn->size;
+@@ -1212,17 +1224,33 @@ static RList *anal_preludes(RAnal *anal) {
+ 	return l;
+ }
+ 
++static int mips_cs_opasm(RAnal *anal, ut64 addr, const char *s, ut8 *buf, int len) {
++	int ret = mips_assemble (s, addr, buf);
++	if (anal->config->big_endian) {
++		ut8 tmp = buf[0];
++		buf[0] = buf[3];
++		buf[3] = tmp;
++		tmp = buf[1];
++		buf[1] = buf[2];
++		buf[2] = tmp;
++	}
++	return ret;
++}
++
+ RAnalPlugin r_anal_plugin_mips_cs = {
+ 	.name = "mips",
+ 	.desc = "Capstone MIPS analyzer",
+ 	.license = "BSD",
+ 	.esil = true,
+ 	.arch = "mips",
++	.cpus = "mips32/64,micro,r6,v3,v2",
+ 	.get_reg_profile = get_reg_profile,
+ 	.archinfo = archinfo,
+ 	.preludes = anal_preludes,
+ 	.bits = 16 | 32 | 64,
++	.endian = R_SYS_ENDIAN_LITTLE | R_SYS_ENDIAN_BIG,
+ 	.op = &analop,
++	.opasm = &mips_cs_opasm,
+ 	.mnemonics = cs_mnemonics,
+ };
+ 
+
+
+
+
+@@ -5,7 +5,38 @@
+ #include <r_lib.h>
+ #include <r_asm.h>
+ #include <r_anal.h>
++#include "disas-asm.h"
++#include "opcode/mips.h"
+ 
++static R_TH_LOCAL unsigned long Offset = 0;
++static R_TH_LOCAL RStrBuf *buf_global = NULL;
++static R_TH_LOCAL ut8 *bytes = NULL;
++static R_TH_LOCAL char *pre_cpu = NULL;
++static R_TH_LOCAL char *pre_features = NULL;
++static R_TH_LOCAL int mips_mode = 0;
++
++static int symbol_at_address(bfd_vma addr, struct disassemble_info *info) {
++	return 0;
++}
++
++static void memory_error_func(int status, bfd_vma memaddr, struct disassemble_info *info) {
++	//--
++}
++
++static int mips_buffer_read_memory(bfd_vma memaddr, bfd_byte *myaddr, unsigned int length, struct disassemble_info *info) {
++	int delta = (memaddr - Offset);
++	if (delta < 0) {
++		return -1;      // disable backward reads
++	}
++	if ((delta + length) > 4) {
++		return -1;
++	}
++	memcpy (myaddr, bytes + delta, length);
++	return 0;
++}
++
++DECLARE_GENERIC_PRINT_ADDRESS_FUNC()
++DECLARE_GENERIC_FPRINTF_FUNC()
+ 
+ static R_TH_LOCAL ut64 t9_pre = UT64_MAX;
+ #define REG_BUF_MAX 32
+@@ -1048,6 +1079,87 @@ static int analop_esil(RAnal *a, RAnalOp *op, ut64 addr, gnu_insn*insn) {
+ 	return 0;
+ }
+ 
++static int disassemble(RAnal *a, RAnalOp *op, const ut8 *buf, int len) {
++	struct disassemble_info disasm_obj = {0};
++	if (len < 4) {
++		return -1;
++	}
++	Offset = op->addr;
++	memcpy (bytes, buf, 4); // TODO handle thumb
++
++	const char *cpu = a->config->cpu;
++	if ((cpu != pre_cpu) && (a->config->features != pre_features)) {
++		free (disasm_obj.disassembler_options);
++		memset (&disasm_obj, '\0', sizeof (struct disassemble_info));
++	}	
++
++	/* prepare disassembler */
++	if (cpu && (!pre_cpu || !strcmp (cpu, pre_cpu))) {
++		if (!r_str_casec

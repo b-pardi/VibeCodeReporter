@@ -1,0 +1,148 @@
+@@ -61,6 +61,7 @@ struct ConnID {
+ 	uint32_t src_port;
+ 	uint32_t dst_port;
+ 	bool is_one_way;	// if true, don't canonicalize order
++	TransportProto proto;
+ };
+ 
+ static inline int addr_port_canon_lt(const IPAddr& addr1, uint32_t p1,
+
+
+
+
+@@ -42,6 +42,8 @@ detail::ConnIDKey detail::BuildConnIDKey(const ConnID& id)
+ 		key.port2 = id.src_port;
+ 		}
+ 
++	key.transport = id.proto;
++
+ 	return key;
+ 	}
+ 
+
+
+
+
+@@ -26,8 +26,9 @@ struct ConnIDKey {
+ 	in6_addr ip2;
+ 	uint16_t port1;
+ 	uint16_t port2;
++	TransportProto transport;
+ 
+-	ConnIDKey() : port1(0), port2(0)
++	ConnIDKey() : port1(0), port2(0), transport(TRANSPORT_UNKNOWN)
+ 		{
+ 		memset(&ip1, 0, sizeof(in6_addr));
+ 		memset(&ip2, 0, sizeof(in6_addr));
+
+
+
+
+@@ -32,7 +32,6 @@
+ #include "zeek/analyzer/protocol/stepping-stone/events.bif.h"
+ 
+ zeek::NetSessions* zeek::sessions;
+-zeek::NetSessions*& sessions = zeek::sessions;
+ 
+ namespace zeek {
+ 
+@@ -45,14 +44,7 @@ NetSessions::NetSessions()
+ 
+ NetSessions::~NetSessions()
+ 	{
+-	for ( const auto& entry : tcp_conns )
+-		Unref(entry.second);
+-	for ( const auto& entry : udp_conns )
+-		Unref(entry.second);
+-	for ( const auto& entry : icmp_conns )
+-		Unref(entry.second);
+-
+-	detail::fragment_mgr->Clear();
++	Clear();
+ 	}
+ 
+ void NetSessions::Done()
+@@ -84,7 +76,6 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 	ConnID id;
+ 	id.src_addr = ip_hdr->SrcAddr();
+ 	id.dst_addr = ip_hdr->DstAddr();
+-	ConnectionMap* d = nullptr;
+ 	BifEnum::Tunnel::Type tunnel_type = BifEnum::Tunnel::IP;
+ 
+ 	switch ( proto ) {
+@@ -94,7 +85,7 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 		id.src_port = tp->th_sport;
+ 		id.dst_port = tp->th_dport;
+ 		id.is_one_way = false;
+-		d = &tcp_conns;
++		id.proto = TRANSPORT_TCP;
+ 		break;
+ 		}
+ 
+@@ -104,7 +95,7 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 		id.src_port = up->uh_sport;
+ 		id.dst_port = up->uh_dport;
+ 		id.is_one_way = false;
+-		d = &udp_conns;
++		id.proto = TRANSPORT_UDP;
+ 		break;
+ 		}
+ 
+@@ -116,11 +107,9 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 		id.dst_port = analyzer::icmp::ICMP4_counterpart(icmpp->icmp_type,
+ 		                                                icmpp->icmp_code,
+ 		                                                id.is_one_way);
+-
+ 		id.src_port = htons(id.src_port);
+ 		id.dst_port = htons(id.dst_port);
+-
+-		d = &icmp_conns;
++		id.proto = TRANSPORT_ICMP;
+ 		break;
+ 		}
+ 
+@@ -132,11 +121,9 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 		id.dst_port = analyzer::icmp::ICMP6_counterpart(icmpp->icmp_type,
+ 		                                                icmpp->icmp_code,
+ 		                                                id.is_one_way);
+-
+ 		id.src_port = htons(id.src_port);
+ 		id.dst_port = htons(id.dst_port);
+-
+-		d = &icmp_conns;
++		id.proto = TRANSPORT_ICMP;
+ 		break;
+ 		}
+ 
+@@ -145,20 +132,21 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 		return;
+ 	}
+ 
+-	detail::ConnIDKey key = detail::BuildConnIDKey(id);
++	detail::ConnIDKey conn_key = detail::BuildConnIDKey(id);
++	detail::SessionKey key(&conn_key, sizeof(conn_key), false);
+ 	Connection* conn = nullptr;
+ 
+ 	// FIXME: The following is getting pretty complex. Need to split up
+ 	// into separate functions.
+-	auto it = d->find(key);
+-	if ( it != d->end() )
+-		conn = it->second;
++	auto it = session_map.find(key);
++	if (it != session_map.end() )
++		conn = static_cast<Connection*>(it->second);
+ 
+ 	if ( ! conn )
+ 		{
+-		conn = NewConn(key, t, &id, data, proto, ip_hdr->FlowLabel(), pkt);
++		conn = NewConn(conn_key, t, &id, data, proto, ip_hdr->FlowLabel(), pkt);
+ 		if ( conn )
+-			InsertConnection(d, key, conn);
++			InsertSession(std::move(key), conn);
+ 		}
+ 	else
+ 		{
+@@ -168,9 +156,9 @@ void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t rema
+ 			conn->Event(connection_reused, nullptr);
+ 
+ 			Rem

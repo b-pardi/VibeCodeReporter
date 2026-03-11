@@ -1,0 +1,102 @@
+@@ -1,6 +1,10 @@
+ package org.batfish.minesweeper;
+ 
++import static org.batfish.minesweeper.CommunityVar.Type.EXACT;
++
+ import com.google.common.base.MoreObjects;
++import dk.brics.automaton.Automaton;
++import dk.brics.automaton.RegExp;
+ import java.util.Comparator;
+ import java.util.Objects;
+ import javax.annotation.Nonnull;
+@@ -80,6 +84,28 @@ public final class CommunityVar implements Comparable<CommunityVar> {
+     return _literalValue;
+   }
+ 
++  /**
++   * Convert this community variable into an equivalent finite-state automaton.
++   *
++   * <p>Note: Currently this code assumes that any community regex represents a complete pattern for
++   * the communities of interest. For example, the regex "_65:" is not supported; instead use
++   * "_65:.*" or similar.
++   *
++   * @return the automaton
++   */
++  public Automaton toAutomaton() {
++    String regex = _regex;
++    if (_type != EXACT) {
++      // the Automaton library does not understand ^ and $, which respectively mark the beginning
++      // and end of the string,
++      // so replace them with the empty string
++      regex = regex.replaceAll("\\^", "()");
++      regex = regex.replaceAll("\\$", "()");
++    }
++    // TODO: Handle the case when the regex only matches a prefix of the communities of interest
++    return new RegExp(regex).toAutomaton();
++  }
++
+   @Override
+   public String toString() {
+     return MoreObjects.toStringHelper(this)
+
+
+
+
+@@ -4,7 +4,11 @@ import static java.util.stream.Collectors.toMap;
+ import static org.batfish.minesweeper.CommunityVarCollector.collectCommunityVars;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.HashMultimap;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Multimaps;
++import com.google.common.collect.SetMultimap;
++import dk.brics.automaton.Automaton;
+ import java.util.ArrayDeque;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+@@ -19,6 +23,7 @@ import java.util.SortedMap;
+ import java.util.SortedSet;
+ import java.util.TreeMap;
+ import java.util.regex.Matcher;
++import java.util.stream.Collectors;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import org.apache.commons.lang3.SerializationUtils;
+@@ -42,7 +47,6 @@ import org.batfish.datamodel.StaticRoute;
+ import org.batfish.datamodel.Topology;
+ import org.batfish.datamodel.Vrf;
+ import org.batfish.datamodel.bgp.AddressFamily;
+-import org.batfish.datamodel.bgp.community.Community;
+ import org.batfish.datamodel.collections.NodeInterfacePair;
+ import org.batfish.datamodel.ospf.OspfArea;
+ import org.batfish.datamodel.ospf.OspfProcess;
+@@ -59,6 +63,8 @@ import org.batfish.datamodel.routing_policy.expr.PrefixSetExpr;
+ import org.batfish.datamodel.routing_policy.statement.AddCommunity;
+ import org.batfish.datamodel.routing_policy.statement.DeleteCommunity;
+ import org.batfish.datamodel.routing_policy.statement.SetCommunity;
++import org.batfish.minesweeper.CommunityVar.Type;
++import org.batfish.minesweeper.bdd.CommunityVarConverter;
+ import org.batfish.minesweeper.collections.Table2;
+ 
+ /**
+@@ -120,6 +126,18 @@ public class Graph {
+ 
+   private Map<String, String> _namedCommunities;
+ 
++  /**
++   * In order to track community literals and regexes, we compute a set of "atomic predicates" for
++   * them. See initCommAtomicPredicates for details. These fields respectively record the number n
++   * of atomic predicates; a mapping from each community to its set of atomic predicates, each of
++   * which is an integer in the range 0...(n-1); and a mapping from each atomic predicate number to
++   * its semantic representation, which is an automaton representing a predicate on strings.
++   */
++  private int _numAtomicPredicates;
++
++  private Map<CommunityVar, Set<Integer>> _communityAtomicPredicates;
++  private Map<Integer, Automaton> _atomicPredicateAutomata;
++
+   /**
+    * Create a graph, loading configurations from the given {@link IBatfish}.
+    *
+@@ -131,7 +149,7 @@ public class Graph {
+  

@@ -1,0 +1,131 @@
+@@ -4214,7 +4214,6 @@ R_API int r_core_config_init(RCore *core) {
+ 	SETI ("cfg.cpuaffinity", 0, "run on cpuid");
+ 	// TODO: This is an experimental feature because it conflicts with the way RFlags are handled, that would work for 'get' but not for 'set' and may confuse some logic out there.. also slow downs some codepaths
+ 	SETCB ("cfg.regnums", "false", &cb_cfg_regnums, "Query register values before flags in RNum calls (EXPERIMENTAL)");
+-	SETB ("cfg.newpf", "true", "use pf2 when calling pf");
+ 
+ 	/* log */
+ 	SETICB ("log.level", R_LOG_LEVEL_DEFAULT, cb_config_log_level, "Target log level/severity (0:FATAL 1:ERROR 2:INFO 3:WARN 4:TODO 5:DEBUG)");
+
+
+
+
+@@ -2137,12 +2137,10 @@ static bool is_pfo_file(const char *fn) {
+ }
+ static void cmd_print_format(RCore *core, const char *_input, const ut8* block, int len) {
+ 	char *input = NULL;
+-	bool v2 = r_config_get_b (core->config, "cfg.newpf");
+ 	int mode = R_PRINT_MUSTSEE;
+ 	if (_input[1] == '2') {
+ 		// "pf2"
+ 		_input++;
+-		v2 = true;
+ 	}
+ 	switch (_input[1]) {
+ 	case '*': // "pf*"
+@@ -2457,13 +2455,8 @@ static void cmd_print_format(RCore *core, const char *_input, const ut8* block,
+ 			r_core_cmd_help_match (core, help_msg_pf, "pf");
+ 			goto err_arg1;
+ 		}
+-		if (v2) {
+-			r_print_format2 (core->print, core->addr,
+-				buf, size, fmt, mode, NULL, NULL);
+-		} else {
+-			r_print_format (core->print, core->addr,
+-				buf, size, fmt, mode, NULL, NULL);
+-		}
++		r_print_format (core->print, core->addr,
++			buf, size, fmt, mode, NULL, NULL);
+ 	err_arg1:
+ 		free (args);
+ 	err_args:
+
+
+
+
+@@ -23,7 +23,7 @@ R_LIB_VERSION_HEADER (r_lib);
+ // double-indirection required because cpp is crap
+ #define STRINGIFY2(x) #x
+ #define STRINGIFY(x) STRINGIFY2(x)
+-#define R2_ABIVERSION 44
++#define R2_ABIVERSION 45
+ #define R2_ABIVERSION_STRING STRINGIFY(R2_ABIVERSION)
+ 
+ #define R_LIB_ENV "R2_LIBR_PLUGINS"
+
+
+
+
+@@ -3,66 +3,106 @@
+ #include <r_cons.h>
+ #include <r_util.h>
+ #include <r_util/r_print.h>
++#include <r_util/r_num.h>
+ #include <r_reg.h>
+ 
+-// W T F :D
+-#define NOPTR 0
+-#define PTRSEEK 1
+-#define PTRBACK 2
+-#define NULLPTR 3
++enum {
++	PF_PTR_NONE = 0,
++	PF_PTR_SEEK = 1,
++	PF_PTR_BACK = 2,
++	PF_PTR_NULL = 3,
++};
++
+ #define STRUCTPTR 100
+ #define NESTEDSTRUCT 1
+ #define STRUCTFLAG 10000
+ #define NESTDEPTH 14
+ #define ARRAYINDEX_COEF 10000
++#define MINUSONE ((void *) (size_t) - 1)
+ 
+-#define MUSTSEE (mode & R_PRINT_MUSTSEE && mode & R_PRINT_ISFIELD && !(mode & R_PRINT_JSON))
++#define MUSTSEE (mode & R_PRINT_MUSTSEE && mode & R_PRINT_ISFIELD && ! (mode & R_PRINT_JSON))
+ #define ISQUIET (mode & R_PRINT_QUIET)
+ #define MUSTSET (mode & R_PRINT_MUSTSET && mode & R_PRINT_ISFIELD && setval)
+ #define SEEVALUE (mode & R_PRINT_VALUE)
+ #define MUSTSEEJSON (mode & R_PRINT_JSON && mode & R_PRINT_ISFIELD)
+ #define MUSTSEESTRUCT (mode & R_PRINT_STRUCT)
+ 
+-// FOR MINGW only
++// Extract array element index from size (size encodes both array size and element index)
++#define PF_EXTRACT_ELEM(elem, size) \
++	do { \
++		elem = -1; \
++		if (size >= ARRAYINDEX_COEF) { \
++			elem = size / ARRAYINDEX_COEF - 1; \
++			size %= ARRAYINDEX_COEF; \
++		} \
++	} while (0)
++
++// Check if current element should be printed (elem = -1 means all, elem = 0 means this one)
++#define PF_ELEM_SHOULD_PRINT(elem) ((elem) == -1 || (elem) == 0)
++
++// Update elem after printing: if elem was 0, mark done (-2); if positive, decrement
++#define PF_ELEM_ADVANCE(elem) \
++	do { \
++		if ((elem) == 0) { \
++			(elem) = -2; \
++		} else if ((elem) > 0) { \
++			(elem)--; \
++		} \
++	} while (0)
++
++// Print array separator if needed (when printing all elements and more remain)
++#define PF_PRINT_SEPARATOR(p, size, elem) \
++	do { \
++		if ((size) != 0 && (elem) == -1) { \
++			r_print_printf ((p), ", "); \
++		} \
++	} while (0)
++
++// should be private. and PrintFormat should return a string, not int
++// or maybe we want to return a struct with size too :?
++
+ #if __MINGW32__
+-// gmtime_r can be defined by mingw
+ #ifndef gmtime_r
+-static struct tm* gmtime_r(const time_t* t, s

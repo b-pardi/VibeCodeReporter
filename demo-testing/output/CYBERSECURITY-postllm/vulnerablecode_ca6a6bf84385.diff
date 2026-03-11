@@ -1,0 +1,103 @@
+@@ -49,6 +49,7 @@ from vulnerabilities.pipelines.v2_importers import (
+     elixir_security_importer as elixir_security_importer_v2,
+ )
+ from vulnerabilities.pipelines.v2_importers import epss_importer_v2
++from vulnerabilities.pipelines.v2_importers import fireeye_importer_v2
+ from vulnerabilities.pipelines.v2_importers import github_osv_importer as github_osv_importer_v2
+ from vulnerabilities.pipelines.v2_importers import gitlab_importer as gitlab_importer_v2
+ from vulnerabilities.pipelines.v2_importers import istio_importer as istio_importer_v2
+@@ -97,6 +98,7 @@ IMPORTERS_REGISTRY = create_registry(
+         npm_importer.NpmImporterPipeline,
+         nginx_importer.NginxImporterPipeline,
+         pysec_importer.PyPIImporterPipeline,
++        fireeye_importer_v2.FireeyeImporterPipeline,
+         apache_tomcat.ApacheTomcatImporter,
+         postgresql.PostgreSQLImporter,
+         debian.DebianImporter,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,225 @@
++#
++# Copyright (c) nexB Inc. and others. All rights reserved.
++# VulnerableCode is a trademark of nexB Inc.
++# SPDX-License-Identifier: Apache-2.0
++# See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
++# See https://github.com/aboutcode-org/vulnerablecode for support or download.
++# See https://aboutcode.org for more information about nexB OSS projects.
++#
++import logging
++import re
++from pathlib import Path
++from typing import Iterable
++
++from fetchcode.vcs import fetch_via_vcs
++
++from vulnerabilities.importer import AdvisoryData
++from vulnerabilities.importer import ReferenceV2
++from vulnerabilities.importer import VulnerabilitySeverity
++from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipelineV2
++from vulnerabilities.severity_systems import GENERIC
++from vulnerabilities.utils import build_description
++from vulnerabilities.utils import create_weaknesses_list
++from vulnerabilities.utils import cwe_regex
++from vulnerabilities.utils import dedupe
++from vulnerabilities.utils import find_all_cve
++from vulnerabilities.utils import get_advisory_url
++
++logger = logging.getLogger(__name__)
++
++
++class FireeyeImporterPipeline(VulnerableCodeBaseImporterPipelineV2):
++    spdx_license_expression = "CC-BY-SA-4.0 AND MIT"
++    license_url = "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/README.md"
++    notice = """
++    Copyright (c) Mandiant
++    The following licenses/licensing apply to this Mandiant repository:
++    1. CC BY-SA 4.0 - For CVE related information not including source code (such as PoCs)
++    2. MIT - For source code contained within provided CVE information
++    """
++    repo_url = "git+https://github.com/mandiant/Vulnerability-Disclosures"
++    pipeline_id = "fireeye_importer_v2"
++
++    @classmethod
++    def steps(cls):
++        return (
++            cls.clone,
++            cls.collect_and_store_advisories,
++            cls.clean_downloads,
++        )
++
++    def advisories_count(self):
++        base_path = Path(self.vcs_response.dest_dir)
++        return sum(
++            1
++            for p in base_path.glob("**/*")
++            if p.suffix.lower() == ".md" or p.stem.upper() == "README"
++        )
++
++    def clone(self):
++        self.log(f"Cloning `{self.repo_url}`")
++        self.vcs_response = fetch_via_vcs(self.repo_url)
++
++    def collect_advisories(self) -> Iterable[AdvisoryData]:
++        base_path = Path(self.vcs_response.dest_dir)
++        for file_path in base_path.glob("**/*"):
++            if file_path.suffix.lower() != ".md":
++                continue
++
++            if file_path.stem.upper() == "README":
++                continue
++
++            try:
++                with open(file_path, encoding="utf-8-sig") as f:
++                    yield parse_advisory_data(
++                        raw_data=f.read(), file_path=file_path, base_path=base_path
++                    )
++            except UnicodeError:
++                logger.error(f"Invalid File UnicodeError: {file_path}")
++
++    def clean_downloads(self):
++       

@@ -1,0 +1,113 @@
+@@ -42,6 +42,9 @@
+ #include "detect-engine-mpm.h"
+ #include "detect-engine-state.h"
+ #include "detect-engine-build.h"
++#include "detect-engine-prefilter.h"
++
++#include "tree.h"
+ 
+ #include "util-var-name.h"
+ #include "util-unittest.h"
+@@ -61,6 +64,8 @@ void DetectFlowbitFree (DetectEngineCtx *, void *);
+ #ifdef UNITTESTS
+ void FlowBitsRegisterTests(void);
+ #endif
++static bool PrefilterFlowbitIsPrefilterable(const Signature *s);
++static int PrefilterSetupFlowbits(DetectEngineCtx *de_ctx, SigGroupHead *sgh);
+ 
+ void DetectFlowbitsRegister (void)
+ {
+@@ -76,6 +81,8 @@ void DetectFlowbitsRegister (void)
+     /* this is compatible to ip-only signatures */
+     sigmatch_table[DETECT_FLOWBITS].flags |= SIGMATCH_IPONLY_COMPAT;
+ 
++    sigmatch_table[DETECT_FLOWBITS].SupportsPrefilter = PrefilterFlowbitIsPrefilterable;
++    sigmatch_table[DETECT_FLOWBITS].SetupPrefilter = PrefilterSetupFlowbits;
+     DetectSetupParseRegexes(PARSE_REGEX, &parse_regex);
+ }
+ 
+@@ -132,11 +139,9 @@ static int FlowbitOrAddData(DetectEngineCtx *de_ctx, DetectFlowbitsData *cd, cha
+ static int DetectFlowbitMatchToggle (Packet *p, const DetectFlowbitsData *fd)
+ {
+     if (p->flow == NULL)
+-        return 0;
+-
+-    FlowBitToggle(p->flow,fd->idx);
++        return -1;
+ 
+-    return 1;
++    return FlowBitToggle(p->flow, fd->idx);
+ }
+ 
+ static int DetectFlowbitMatchUnset (Packet *p, const DetectFlowbitsData *fd)
+@@ -152,11 +157,11 @@ static int DetectFlowbitMatchUnset (Packet *p, const DetectFlowbitsData *fd)
+ static int DetectFlowbitMatchSet (Packet *p, const DetectFlowbitsData *fd)
+ {
+     if (p->flow == NULL)
+-        return 0;
+-
+-    FlowBitSet(p->flow,fd->idx);
++        return -1;
+ 
+-    return 1;
++    int r = FlowBitSet(p->flow, fd->idx);
++    SCLogDebug("set %u", fd->idx);
++    return r;
+ }
+ 
+ static int DetectFlowbitMatchIsset (Packet *p, const DetectFlowbitsData *fd)
+@@ -189,9 +194,8 @@ static int DetectFlowbitMatchIsnotset (Packet *p, const DetectFlowbitsData *fd)
+ }
+ 
+ /*
+- * returns 0: no match
++ * returns 0: no match (or error)
+  *         1: match
+- *        -1: error
+  */
+ 
+ int DetectFlowbitMatch (DetectEngineThreadCtx *det_ctx, Packet *p,
+@@ -206,12 +210,25 @@ int DetectFlowbitMatch (DetectEngineThreadCtx *det_ctx, Packet *p,
+             return DetectFlowbitMatchIsset(p,fd);
+         case DETECT_FLOWBITS_CMD_ISNOTSET:
+             return DetectFlowbitMatchIsnotset(p,fd);
+-        case DETECT_FLOWBITS_CMD_SET:
+-            return DetectFlowbitMatchSet(p,fd);
++        case DETECT_FLOWBITS_CMD_SET: {
++            int r = DetectFlowbitMatchSet(p, fd);
++            /* only on a new "set" invoke the prefilter */
++            if (r == 1 && fd->post_rule_match_prefilter) {
++                SCLogDebug("flowbit set, appending to work queue");
++                PostRuleMatchWorkQueueAppend(det_ctx, s, DETECT_FLOWBITS, fd->idx);
++            }
++            return (r != -1);
++        }
+         case DETECT_FLOWBITS_CMD_UNSET:
+             return DetectFlowbitMatchUnset(p,fd);
+-        case DETECT_FLOWBITS_CMD_TOGGLE:
+-            return DetectFlowbitMatchToggle(p,fd);
++        case DETECT_FLOWBITS_CMD_TOGGLE: {
++            int r = DetectFlowbitMatchToggle(p, fd);
++            if (r == 1 && fd->post_rule_match_prefilter) {
++                SCLogDebug("flowbit set (by toggle), appending to work queue");
++                PostRuleMatchWorkQueueAppend(det_ctx, s, DETECT_FLOWBITS, fd->idx);
++            }
++            return (r != -1);
++        }
+         default:
+             SCLogError("unknown cmd %" PRIu32 "", fd->cmd);
+             return 0;
+@@ -388,6 +405,11 @@ void DetectFlowbitFree (DetectEngineCtx *de_ctx, void *ptr)
+     SCFree(fd);
+ }
+ 
++struct FBAnalyzer {
++    struct FBAnalyze *array;
++    uint32_t array_size;
++};
++
+ struct FBAnalyze {
+     uint16_t cnts[DETECT_FLOWBITS_CMD_MAX];
+     uint16_t state_cnts[DETECT_FLOWBITS_CMD_MAX];
+@@ -417,20 +439,143 @@ extern bool rule_engine_analysis_set;
+ static void DetectFlowbitsAnalyzeDump(const DetectEngineCtx *de_ctx

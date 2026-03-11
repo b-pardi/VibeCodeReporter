@@ -1,0 +1,100 @@
+@@ -39,10 +39,13 @@ import sys
+ import time
+ import subprocess
+ from getpass import getpass
++import re
++import select
+ 
+ RESCAN_INTERVAL_SEC = 15
+ 
+ def run(cmd, check=True):
++    """Execute command with error handling"""
+     try:
+         res = subprocess.run(cmd, check=check, capture_output=True, text=True)
+         return res.stdout.strip()
+@@ -51,53 +54,198 @@ def run(cmd, check=True):
+         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{out}") from e
+ 
+ def ensure_root():
++    """Verify script is running with root privileges"""
+     if os.geteuid() != 0:
+         sys.exit("This script must be run as root (try: sudo python3 wireless-connect.py)")
+ 
+-def list_disconnected_wifi_adapters():
++def get_all_wifi_adapters():
+     """
+-    Returns a list of dicts for Wi-Fi adapters that are NOT currently in use:
+-      { 'device': 'wlan0', 'state': 'disconnected' }
++    Returns a list of dicts for ALL Wi-Fi adapters (connected and disconnected):
++      { 'device': 'wlan0', 'state': 'connected', 'connection': 'MyNetwork' }
++    Uses multiple detection methods to find all wireless interfaces including USB adapters.
+     """
+-    raw = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"], check=False)
+     adapters = []
+-    for line in raw.splitlines():
+-        if not line or ":" not in line:
+-            continue
+-        parts = line.split(":")
+-        if len(parts) < 3:
+-            continue
+-        dev, typ, state = parts[0], parts[1].lower(), parts[2].lower()
+-        if typ != "wifi":
+-            continue
+-        # Exclude anything "in use": connected/connecting/unavailable/unmanaged
+-        if state in ("connected", "connecting", "unavailable"):
+-            continue
+-        # Keep only clearly available devices
+-        if state.startswith("disconnected") or state == "disconnected":
+-            adapters.append({"device": dev, "state": state})
+-    return adapters
++
++    # Method 1: NetworkManager detection (primary)
++    try:
++        raw = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"], check=False)
++        for line in raw.splitlines():
++            if not line or ":" not in line:
++                continue
++            parts = line.split(":")
++            if len(parts) < 4:
++                continue
++            dev, typ, state, connection = parts[0], parts[1].lower(), parts[2].lower(), parts[3]
++
++            # Only include WiFi interfaces
++            if typ == "wifi":
++                # Skip unavailable or unmanaged interfaces
++                if state not in ("unavailable", "unmanaged"):
++                    adapters.append({
++                        "device": dev,
++                        "state": state,
++                        "connection": connection if connection else "N/A",
++                        "method": "nmcli"
++                    })
++    except Exception as e:
++        print(f"Warning: NetworkManager detection failed: {e}")
++
++    # Method 2: Direct wireless interface detection via /sys/class/net
++    try:
++        import glob
++        for iface_path in glob.glob("/sys/class/net/*/wireless"):
++            iface_name = iface_path.split("/")[-2]
++
++            # Skip if already found by NetworkManager
++            if any(adapter["device"] == iface_name for adapter in adapters):
++                continue
++
++            # Check if interface is up and wireless
++            try:
++                with open(f"/sys/class/net/{iface_name}/operstate", "r") as f:
++                    operstate = f.read().strip()
++
++                # Determine connection state
++                state = "unknown"
++                connection = "N/A"
++
++                # Try to get state from iwconfig
++                try:
++                    iwconfig_out = run(["iwconfig", iface_name], check=False)
++                    if "ESSID:" in iwconfig_out:
++                        if 'ESSID:off' in iwconfig_out or 'ESSID:""' in iwconfig_out:
++                            state = "disconnected"
++         

@@ -1,0 +1,132 @@
+@@ -203,6 +203,11 @@ ct_recreate6:
+ 	case CT_REPLY:
+ 		policy_mark_skip(skb);
+ 
++#ifdef ENABLE_NODEPORT
++		/* See comment in handle_ipv4_from_lxc(). */
++		if (ct_state.node_port)
++			return redirect(NATIVE_DEV_IFINDEX, 0);
++#endif
+ 		if (ct_state.rev_nat_index) {
+ 			ret = lb6_rev_nat(skb, l4_off, &csum_off,
+ 					  ct_state.rev_nat_index, tuple, 0);
+@@ -512,6 +517,10 @@ ct_recreate4:
+ 		policy_mark_skip(skb);
+ 
+ #ifdef ENABLE_NODEPORT
++		/* This handles reply traffic for the case where the nodeport EP
++		 * is local to the node. We'll redirect to bpf_netdev egress to
++		 * perform the reverse DNAT.
++		 */
+ 		if (ct_state.node_port) {
+ 			return redirect(NATIVE_DEV_IFINDEX, 0);
+ 		}
+@@ -811,6 +820,7 @@ ipv6_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, __u8 *reason, s
+ 	if (ret == CT_NEW) {
+ 		ct_state_new.orig_dport = tuple.dport;
+ 		ct_state_new.src_sec_id = src_label;
++		ct_state_new.node_port = ct_state.node_port;
+ 		ret = ct_create6(get_ct_map6(&tuple), &tuple, skb, CT_INGRESS, &ct_state_new);
+ 		if (IS_ERR(ret))
+ 			return ret;
+
+
+
+
+@@ -50,6 +50,8 @@
+ #include "lib/nat.h"
+ #include "lib/lb.h"
+ 
++#define CB_SRC_IDENTITY 0
++
+ #if defined FROM_HOST && (defined ENABLE_IPV4 || defined ENABLE_IPV6)
+ static inline int rewrite_dmac_to_host(struct __sk_buff *skb, __u32 src_identity)
+ {
+@@ -66,6 +68,13 @@ static inline int rewrite_dmac_to_host(struct __sk_buff *skb, __u32 src_identity
+ }
+ #endif
+ 
++static inline void tc_index_clear_nodeport(struct __sk_buff *skb)
++{
++#ifdef ENABLE_NODEPORT
++	skb->tc_index &= ~TC_INDEX_F_SKIP_NODEPORT;
++#endif
++}
++
+ #if defined ENABLE_IPV4 || defined ENABLE_IPV6
+ static inline __u32 finalize_sec_ctx(__u32 secctx, __u32 src_identity)
+ {
+@@ -79,6 +88,15 @@ static inline __u32 finalize_sec_ctx(__u32 secctx, __u32 src_identity)
+ #endif /* ENABLE_SECCTX_FROM_IPCACHE */
+ 	return secctx;
+ }
++
++#ifdef ENABLE_NODEPORT
++static inline bool __inline__ tc_index_skip_nodeport(struct __sk_buff *skb)
++{
++	volatile __u32 tc_index = skb->tc_index;
++	tc_index_clear_nodeport(skb);
++	return tc_index & TC_INDEX_F_SKIP_NODEPORT;
++}
++#endif /* ENABLE_NODEPORT */
+ #endif
+ 
+ #ifdef ENABLE_IPV6
+@@ -98,6 +116,215 @@ static inline __u32 derive_sec_ctx(struct __sk_buff *skb, const union v6addr *no
+ #endif
+ }
+ 
++#ifdef ENABLE_NODEPORT
++__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT) int tail_nodeport_nat_ipv6(struct __sk_buff *skb)
++{
++	struct bpf_fib_lookup fib_params = {};
++	struct ipv6_nat_target target = {
++		.min_port = NODEPORT_PORT_MIN_NAT,
++		.max_port = NODEPORT_PORT_MAX_NAT,
++		.force_range = true,
++	};
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++	int ret, dir = skb->cb[CB_NAT];
++
++	BPF_V6(target.addr, IPV6_NODEPORT);
++
++	ret = snat_v6_process(skb, dir, &target);
++	if (IS_ERR(ret)) {
++		/* In case of no mapping, recircle back to main path. SNAT is very
++		 * expensive in terms of instructions (since we don't have BPF to
++		 * BPF calls as we use tail calls) and complexity, hence this is
++		 * done inside a tail call here.
++		 */
++		if (dir == NAT_DIR_INGRESS) {
++			skb->tc_index |= TC_INDEX_F_SKIP_NODEPORT;
++			ep_tail_call(skb, CILIUM_CALL_IPV6_FROM_LXC);
++			ret = DROP_MISSED_TAIL_CALL;
++		}
++		return ret;
++	}
++
++	if (!revalidate_data(skb, &data, &data_end, &ip6))
++		return DROP_INVALID;
++
++	fib_params.family = AF_INET6;
++	fib_params.ifindex = NATIVE_DEV_IFINDEX;
++
++	ipv6_addr_copy((union v6addr *) &fib_params.ipv6_src, (union v6addr *) &ip6->saddr);
++	ipv6_addr_copy((union v6addr *) &fib_params.ipv6_dst, (union v6addr *) &ip6->daddr);
++
++	ret = fib_lookup(skb, &fib_params, sizeof(fib_params),
++			 BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
++	if (ret != 0)
++		return DROP_NO_FIB;
++
++	if (eth_store_daddr(skb, fib_params.dmac, 0) < 0)
++		return DROP_WRITE_ERROR;
++	if (eth_store_saddr(skb, fib_params.smac, 0) < 0)
++		return DROP_WRITE_ERROR;
++
++	return redirect(fib_params.ifindex, 0);
++}
++
++/* See nodeport_lb4(). */
++static inline int nodeport_lb6(struct __sk_buff *skb, __u32 src_id

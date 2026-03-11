@@ -1,0 +1,122 @@
+@@ -1011,7 +1011,7 @@ ipv4_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label, __u8 *reason,
+ 	struct ct_state ct_state = {};
+ 	struct ct_state ct_state_new = {};
+ 	bool skip_ingress_proxy = false;
+-	bool is_fragment = false;
++	bool is_untracked_fragment = false;
+ 	__u32 monitor = 0;
+ 	__be32 orig_sip;
+ 	__u8 policy_match_type = POLICY_MATCH_NONE;
+@@ -1032,7 +1032,12 @@ ipv4_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label, __u8 *reason,
+ 
+ 	l4_off = l3_off + ipv4_hdrlen(ip4);
+ 	csum_l4_offset_and_flags(tuple.nexthdr, &csum_off);
+-	is_fragment = ipv4_is_fragment(ip4);
++#if !defined IPV4_FRAGMENTS
++	/* Indicate that this is a datagram fragment for which we cannot
++	 * retrieve L4 ports. Do not set flag if we support fragmentation.
++	 */
++	is_untracked_fragment = ipv4_is_fragment(ip4);
++#endif
+ 
+ 	ret = ct_lookup4(get_ct_map4(&tuple), &tuple, ctx, l4_off, CT_INGRESS, &ct_state,
+ 			 &monitor);
+@@ -1071,7 +1076,8 @@ ipv4_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label, __u8 *reason,
+ 
+ 	verdict = policy_can_access_ingress(ctx, src_label, tuple.dport,
+ 					    tuple.nexthdr,
+-					    is_fragment, &policy_match_type);
++					    is_untracked_fragment,
++					    &policy_match_type);
+ 
+ 	/* Reply packets and related packets are allowed, all others must be
+ 	 * permitted by policy */
+
+
+
+
+@@ -9,6 +9,7 @@
+ 
+ #include "common.h"
+ #include "utils.h"
++#include "ipv4.h"
+ #include "ipv6.h"
+ #include "dbg.h"
+ #include "l4.h"
+@@ -469,6 +470,28 @@ static __always_inline void ipv4_ct_tuple_reverse(struct ipv4_ct_tuple *tuple)
+ 	ct_flip_tuple_dir4(tuple);
+ }
+ 
++static __always_inline int ipv4_ct_extract_l4_ports(struct __ctx_buff *ctx,
++						    int off,
++						    struct ipv4_ct_tuple *tuple)
++{
++#if defined IPV4_FRAGMENTS
++	void *data, *data_end;
++	struct iphdr *ip4;
++
++	/* This function is called from ct_lookup4(), which is sometimes called
++	 * after data has been invalidated (see handle_ipv4_from_lxc())
++	 */
++	if (!revalidate_data(ctx, &data, &data_end, &ip4))
++		return DROP_INVALID;
++
++	if (unlikely(ipv4_is_fragment(ip4)))
++		return ipv4_handle_fragment(ctx, ip4, off,
++					    (struct ipv4_frag_l4ports *)&tuple->dport);
++#endif
++	/* load sport + dport into tuple */
++	return ctx_load_bytes(ctx, off, &tuple->dport, 4);
++}
++
+ static __always_inline void ct4_cilium_dbg_tuple(struct __ctx_buff *ctx, __u8 type,
+ 						 const struct ipv4_ct_tuple *tuple,
+ 						 __u32 rev_nat_index, int dir)
+@@ -551,14 +574,12 @@ static __always_inline int ct_lookup4(const void *map,
+ 				action = ACTION_CREATE;
+ 		}
+ 
+-		/* load sport + dport into tuple */
+-		if (ctx_load_bytes(ctx, off, &tuple->dport, 4) < 0)
++		if (ipv4_ct_extract_l4_ports(ctx, off, tuple) < 0)
+ 			return DROP_CT_INVALID_HDR;
+ 		break;
+ 
+ 	case IPPROTO_UDP:
+-		/* load sport + dport into tuple */
+-		if (ctx_load_bytes(ctx, off, &tuple->dport, 4) < 0)
++		if (ipv4_ct_extract_l4_ports(ctx, off, tuple) < 0)
+ 			return DROP_CT_INVALID_HDR;
+ 
+ 		action = ACTION_CREATE;
+
+
+
+
+@@ -80,7 +80,8 @@ account(struct __ctx_buff *ctx, struct policy_entry *policy)
+ 
+ static __always_inline int
+ __policy_can_access(const void *map, struct __ctx_buff *ctx, __u32 identity,
+-		    __u16 dport, __u8 proto, int dir, bool is_fragment, __u8 *match_type)
++		    __u16 dport, __u8 proto, int dir,
++		    bool is_untracked_fragment, __u8 *match_type)
+ {
+ #ifdef ALLOW_ICMP_FRAG_NEEDED
+ 	// When ALLOW_ICMP_FRAG_NEEDED is defined we allow all packets
+@@ -113,8 +114,8 @@ __policy_can_access(const void *map, struct __ctx_buff *ctx, __u32 identity,
+ 		.pad = 0,
+ 	};
+ 
+-	/* L4 lookup can't be done on fragments. */
+-	if (!is_fragment) {
++	/* L4 lookup can't be done on untracked fragments. */
++	if (!is_untracked_fragment) {
+ 		/* Start with L3/L4 lookup. */
+ 		policy = map_lookup_elem(map, &key);
+ 		if (likely(policy)) {
+@@ -159,7 +160,7 @@ __policy_can_access(const void *map, struct __ctx_buff *ctx, __u32 identity,
+ 	if (ctx_load_meta(ctx, CB_POLICY))
+ 		return CTX_ACT_OK;
+ 
+-	if (is_fragment)
++	if (

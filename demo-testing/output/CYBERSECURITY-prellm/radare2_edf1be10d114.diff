@@ -1,0 +1,133 @@
+@@ -64,6 +64,18 @@ static void zign_rename_for(REvent *ev, int type, void *user, void *data) {
+ void r_anal_hint_storage_init(RAnal *a);
+ void r_anal_hint_storage_fini(RAnal *a);
+ 
++static void r_meta_item_fini(RAnalMetaItem *item) {
++	free (item->str);
++}
++
++static void r_meta_item_free(void *_item) {
++	if (_item) {
++		RAnalMetaItem *item = _item;
++		r_meta_item_fini (item);
++		free (item);
++	}
++}
++
+ R_API RAnal *r_anal_new(void) {
+ 	int i;
+ 	RAnal *anal = R_NEW0 (RAnal);
+@@ -95,8 +107,8 @@ R_API RAnal *r_anal_new(void) {
+ 	r_event_hook (anal->zign_spaces.event, R_SPACE_EVENT_COUNT, zign_count_for, NULL);
+ 	r_event_hook (anal->zign_spaces.event, R_SPACE_EVENT_RENAME, zign_rename_for, NULL);
+ 	anal->sdb_fcns = sdb_ns (anal->sdb, "fcns", 1);
+-	anal->sdb_meta = sdb_ns (anal->sdb, "meta", 1);
+ 	r_anal_hint_storage_init (anal);
++	r_interval_tree_init (&anal->meta, r_meta_item_free);
+ 	anal->sdb_types = sdb_ns (anal->sdb, "types", 1);
+ 	anal->sdb_fmts = sdb_ns (anal->sdb, "spec", 1);
+ 	anal->sdb_cc = sdb_ns (anal->sdb, "cc", 1);
+@@ -147,6 +159,7 @@ R_API RAnal *r_anal_free(RAnal *a) {
+ 	ht_pp_free (a->ht_name_fun);
+ 	set_u_free (a->visited);
+ 	r_anal_hint_storage_fini (a);
++	r_interval_tree_fini (&a->meta);
+ 	free (a->cpu);
+ 	free (a->os);
+ 	free (a->zign_path);
+@@ -428,8 +441,9 @@ R_API bool r_anal_op_is_eob(RAnalOp *op) {
+ 
+ R_API int r_anal_purge (RAnal *anal) {
+ 	sdb_reset (anal->sdb_fcns);
+-	sdb_reset (anal->sdb_meta);
+ 	r_anal_hint_clear (anal);
++	r_interval_tree_fini (&anal->meta);
++	r_interval_tree_init (&anal->meta, r_meta_item_free);
+ 	sdb_reset (anal->sdb_types);
+ 	sdb_reset (anal->sdb_zigns);
+ 	sdb_reset (anal->sdb_classes);
+
+
+
+
+@@ -817,7 +817,7 @@ repeat:
+ 		case R_ANAL_OP_TYPE_LOAD:
+ 			if (anal->opt.loads) {
+ 				if (anal->iob.is_valid_offset (anal->iob.io, op.ptr, 0)) {
+-					r_meta_add (anal, R_META_TYPE_DATA, op.ptr, op.ptr + 4, "");
++					r_meta_set (anal, R_META_TYPE_DATA, op.ptr, 4, "");
+ 				}
+ 			}
+ 			break;
+@@ -1249,20 +1249,21 @@ R_API void r_anal_del_jmprefs(RAnal *anal, RAnalFunction *fcn) {
+ 
+ /* Does NOT invalidate read-ahead cache. */
+ R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int reftype) {
+-	RListIter *iter;
+-	RAnalMetaItem *meta;
+-
+-	RList *list = r_meta_find_list_in (anal, addr, -1, 4);
+-	r_list_foreach (list, iter, meta) {
++	RPVector *metas = r_meta_get_all_in(anal, addr, R_META_TYPE_ANY);
++	void **it;
++	r_pvector_foreach (metas, it) {
++		RAnalMetaItem *meta = ((RIntervalNode *)*it)->data;
+ 		switch (meta->type) {
+ 		case R_META_TYPE_DATA:
+ 		case R_META_TYPE_STRING:
+ 		case R_META_TYPE_FORMAT:
+-			r_list_free (list);
++			r_pvector_free (metas);
+ 			return 0;
++		default:
++			break;
+ 		}
+ 	}
+-	r_list_free (list);
++	r_pvector_free (metas);
+ 	if (anal->opt.norevisit) {
+ 		if (!anal->visited) {
+ 			anal->visited = set_u_new ();
+
+
+
+
+@@ -1,510 +1,222 @@
+-/* radare - LGPL - Copyright 2008-2020 - nibble, pancake */
+-
+-#if 0
+-    TODO
+-    ====
+-    - handle sync to synchronize all the data on disk.
+-    - actually listing only works in memory
+-    - array_add doesnt needs index, right?
+-    - remove unused arguments from r_meta_find (where ?)
+-    - implement r_meta_find
+-#endif
+-#if 0
+-  SDB SPECS
+-
+-DatabaseName:
+-  'anal.meta'
+-Keys:
+-  'meta.<type>.count=<int>'     number of added metas where 'type' is a single char
+-  'meta.<type>.<last>=<array>'  split array, each block contains K elements
+-  'meta.<type>.<addr>=<string>' string representing extra information of the meta type at given address
+-  'range.<baddr>=<array>'       store valid addresses in a base range array
+-#endif
++/* radare - LGPL - Copyright 2008-2020 - nibble, pancake, thestr4ng3r */
+ 
+ #include <r_anal.h>
+ #include <r_core.h>
+ 
+-#define META_RANGE_BASE(x) ((x)>>5)
+-#undef DB
+-#define DB a->sdb_meta
+-
+-static char *meta_inrange_get(RAnal *a, ut64 addr, int size) {
+-	if (size <= 0) {
+-		return NULL;
+-	}
+-	ut64 base = META_RANGE_BASE (addr);
+-	ut64 base2 = META_RANGE_BASE (addr + size - 1);
+-	char *res 

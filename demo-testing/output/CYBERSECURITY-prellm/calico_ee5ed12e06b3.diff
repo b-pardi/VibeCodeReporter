@@ -1,0 +1,116 @@
+@@ -92,13 +92,18 @@ allow:
+ 
+ #endif /* CALI_DEBUG_ALLOW_ALL */
+ 
++static CALI_BPF_INLINE struct cali_tc_state * state_get(void)
++{
++	__u32 key = 0;
++	return cali_v4_state_lookup_elem(&key);
++}
++
+ __attribute__((section("1/0")))
+ int calico_tc_norm_pol_tail(struct __sk_buff *skb)
+ {
+ 	CALI_DEBUG("Entering normal policy tail call\n");
+ 
+-	__u32 key = 0;
+-	struct cali_tc_state *state = cali_v4_state_lookup_elem(&key);
++	struct cali_tc_state *state = state_get();
+ 	if (!state) {
+ 	        CALI_DEBUG("State map lookup failed: DROP\n");
+ 	        goto deny;
+@@ -163,12 +168,6 @@ static CALI_BPF_INLINE int skb_nat_l4_csum_ipv4(struct __sk_buff *skb, size_t of
+ 	return ret;
+ }
+ 
+-static CALI_BPF_INLINE int update_state_map(struct cali_tc_state *state)
+-{
+-	int key = 0;
+-	return cali_v4_state_update_elem(&key, state, BPF_EXIST);
+-}
+-
+ static CALI_BPF_INLINE int forward_or_drop(struct __sk_buff *skb,
+ 					   struct cali_tc_state *state,
+ 					   struct fwd *fwd)
+@@ -372,7 +371,7 @@ deny:
+ 
+ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ {
+-	struct cali_tc_state state = {};
++	struct cali_tc_state *state;
+ 	struct fwd fwd = {
+ 		.res = TC_ACT_UNSPEC,
+ 		.reason = CALI_REASON_UNKNOWN,
+@@ -380,15 +379,22 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 	struct calico_nat_dest *nat_dest = NULL;
+ 	nat_lookup_result nat_res = NAT_LOOKUP_ALLOW;
+ 
++	state = state_get();
++	if (!state) {
++	        CALI_DEBUG("State map lookup failed: DROP\n");
++		return TC_ACT_SHOT;
++	}
++	__builtin_memset(state, 0, sizeof(*state));
++
+ 	/* We only try a FIB lookup and redirect for packets that are towards the host.
+ 	 * For packets that are leaving the host namespace, routing has already been done.
+ 	 */
+ 	fwd_fib_set(&fwd, CALI_F_TO_HOST);
+ 
+ 	if (CALI_LOG_LEVEL >= CALI_LOG_LEVEL_INFO) {
+-		state.prog_start_time = bpf_ktime_get_ns();
++		state->prog_start_time = bpf_ktime_get_ns();
+ 	}
+-	state.tun_ip = 0;
++	state->tun_ip = 0;
+ 
+ #ifdef CALI_SET_SKB_MARK
+ 	/* workaround for test since bpftool run cannot set it in context, wont
+@@ -512,7 +518,7 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 			cali_v4_arp_update_elem(&arpk, eth, 0);
+ 			CALI_DEBUG("ARP update for ifindex %d ip %x\n", arpk.ifindex, be32_to_host(arpk.ip));
+ 
+-			state.tun_ip = ip_header->saddr;
++			state->tun_ip = ip_header->saddr;
+ 			CALI_DEBUG("vxlan decap\n");
+ 			if (vxlan_v4_decap(skb)) {
+ 				fwd.reason = CALI_REASON_DECAP_FAIL;
+@@ -526,7 +532,7 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 			}
+ 			ip_header = skb_iphdr(skb);
+ 
+-			CALI_DEBUG("vxlan decap origin %x\n", be32_to_host(state.tun_ip));
++			CALI_DEBUG("vxlan decap origin %x\n", be32_to_host(state->tun_ip));
+ 		}
+ 	}
+ 
+@@ -552,23 +558,23 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 	struct udphdr *udp_header = (void*)(ip_header+1);
+ 	struct icmphdr *icmp_header = (void*)(ip_header+1);
+ 
+-	tc_state_fill_from_iphdr(&state, ip_header);
++	tc_state_fill_from_iphdr(state, ip_header);
+ 
+-	switch (state.ip_proto) {
++	switch (state->ip_proto) {
+ 	case IPPROTO_TCP:
+ 		// Re-check buffer space for TCP (has larger headers than UDP).
+ 		if (!skb_has_data_after(skb, ip_header, sizeof(struct tcphdr))) {
+ 			CALI_DEBUG("Too short for TCP: DROP\n");
+ 			goto deny;
+ 		}
+-		state.sport = be16_to_host(tcp_header->source);
+-		state.dport = be16_to_host(tcp_header->dest);
+-		CALI_DEBUG("TCP; ports: s=%d d=%d\n", state.sport, state.dport);
++		state->sport = be16_to_host(tcp_header->source);
++		state->dport = be16_to_host(tcp_header->dest);
++		CALI_DEBUG("TCP; ports: s=%d d=%d\n", state->sport, state->dport);
+ 		break;
+ 	case IPPROTO_UDP:
+-		state.sport = be16_to_host(udp_header->source);
+-		state.dport = be16_to_host(udp_header->dest);
+-		CALI_DEBUG("UDP; ports: s=%d d=%d\n", state.sport, state.dport);
++		state->sport = be16_to_host(udp_header->source);
++		state->dport = be16_to_host(udp_header->dest);
++		CALI_DEBUG("UDP; ports: s=%d d=%d\n", state->sport, state->dport);
+ 		

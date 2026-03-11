@@ -1,0 +1,80 @@
+@@ -604,7 +604,7 @@ public class Main extends Builder {
+                     OfflineBatCache offlineBats = new OfflineBatCache(batCave, new JdbcBatCave(Builder.getDBConnector(a, "bat-cache-sql-file", dbConnector), commands));
+ 
+                     UserService server = new UserService(withoutS3, offlineBats, crypto, offlineCorenode, offlineAccounts,
+-                            httpSocial, pointerCache, admin, httpUsage, serverMessager, null);
++                            httpSocial, pointerCache, admin, httpUsage, serverMessager, null, Optional.of(a));
+ 
+                     InetSocketAddress localAPIAddress = new InetSocketAddress("localhost", port);
+                     List<String> appSubdomains = Arrays.asList("markup-viewer,calendar,code-editor,pdf".split(","));
+@@ -771,9 +771,9 @@ public class Main extends Builder {
+             ServerMessageStore serverMessages = new ServerMessageStore(getDBConnector(a, "server-messages-sql-file", dbConnectionPool),
+                     sqlCommands, core, p2pDht);
+             UserService localAPI = new UserService(cachingStorage, p2pBats, crypto, corePropagator, verifyingAccount,
+-                    p2pSocial, p2mMutable, storageAdmin, p2pSpaceUsage, serverMessages, gc);
++                    p2pSocial, p2mMutable, storageAdmin, p2pSpaceUsage, serverMessages, gc, Optional.of(a));
+             UserService p2pAPI = new UserService(incomingP2PStorage, p2pBats, crypto, corePropagator, verifyingAccount,
+-                    p2pSocial, p2mMutable, storageAdmin, p2pSpaceUsage, serverMessages, gc);
++                    p2pSocial, p2mMutable, storageAdmin, p2pSpaceUsage, serverMessages, gc, Optional.empty());
+             InetSocketAddress localAPIAddress = userAPIAddress;
+             InetSocketAddress p2pAPIAddress = new InetSocketAddress("localhost", localP2PApi.getTCPPort());
+ 
+
+
+
+
+@@ -89,6 +89,7 @@ public class UserService {
+     public final ServerMessager serverMessages;
+     public final GarbageCollector gc; // not exposed
+     private final Optional<BlockCache> blockCache;
++    private final Optional<Args> syncArgs;
+     private HttpServer localhostServer;
+ 
+     public UserService(ContentAddressedStorage storage,
+@@ -101,7 +102,8 @@ public class UserService {
+                        InstanceAdmin controller,
+                        SpaceUsage usage,
+                        ServerMessager serverMessages,
+-                       GarbageCollector gc) {
++                       GarbageCollector gc,
++                       Optional<Args> syncArgs) {
+         this.storage = storage;
+         this.bats = bats;
+         this.crypto = crypto;
+@@ -114,6 +116,7 @@ public class UserService {
+         this.serverMessages = serverMessages;
+         this.gc = gc;
+         this.blockCache = storage.getBlockCache();
++        this.syncArgs = syncArgs;
+     }
+ 
+     public static class TlsProperties {
+@@ -271,6 +274,9 @@ public class UserService {
+             blockCache.ifPresent(cache -> addHandler(localhostServer, null, "/" + Constants.CONFIG,
+                     new ConfigHandler(cache),
+                     basicAuth, local, host, nodeIds, false));
++            syncArgs.ifPresent(args -> addHandler(localhostServer, null, "/" + Constants.SYNC,
++                    new SyncConfigHandler(args, storage, coreNode),
++                    basicAuth, local, host, nodeIds, false));
+         }
+         addHandler(localhostServer, tlsServer, UI_URL, handler, basicAuth, local, host, nodeIds, true);
+ 
+
+new file mode 100755
+
+
+
+@@ -0,0 +1,176 @@
++package peergos.server.net;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpHandler;
++import peergos.server.sync.DirectorySync;
++import peergos.server.util.Args;
++import peergos.server.util.HttpUtil;
++import peergos.server.util.Logging;
++import peergos.server.util.TimeLimited;
++import peergos.shared.corenode.CoreNode;
++import peergos.shared.crypto.hash.PublicKeyHash;
++import peergos.shared.io.ipfs.api.JSONParser;
++import peergos.shared.s

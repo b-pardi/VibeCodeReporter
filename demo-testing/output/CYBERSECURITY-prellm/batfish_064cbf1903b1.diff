@@ -1,0 +1,102 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,855 @@
++package org.batfish.dataplane.ibdp;
++
++import static com.google.common.base.MoreObjects.firstNonNull;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.ImmutableSortedMap;
++import com.google.common.collect.Streams;
++import java.util.Collection;
++import java.util.Comparator;
++import java.util.Map;
++import java.util.Optional;
++import java.util.Queue;
++import java.util.Set;
++import java.util.SortedMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
++import java.util.stream.Stream;
++import javax.annotation.Nonnull;
++import javax.annotation.Nullable;
++import javax.annotation.ParametersAreNonnullByDefault;
++import org.batfish.datamodel.AbstractRouteDecorator;
++import org.batfish.datamodel.Configuration;
++import org.batfish.datamodel.Interface;
++import org.batfish.datamodel.InterfaceAddress;
++import org.batfish.datamodel.Ip;
++import org.batfish.datamodel.OspfInterAreaRoute;
++import org.batfish.datamodel.OspfIntraAreaRoute;
++import org.batfish.datamodel.OspfRoute;
++import org.batfish.datamodel.Prefix;
++import org.batfish.datamodel.RouteFilterList;
++import org.batfish.datamodel.RoutingProtocol;
++import org.batfish.datamodel.ospf.OspfArea;
++import org.batfish.datamodel.ospf.OspfAreaSummary;
++import org.batfish.datamodel.ospf.OspfDefaultOriginateType;
++import org.batfish.datamodel.ospf.OspfNeighborConfigId;
++import org.batfish.datamodel.ospf.OspfProcess;
++import org.batfish.datamodel.ospf.OspfSessionProperties;
++import org.batfish.datamodel.ospf.OspfTopology;
++import org.batfish.datamodel.ospf.OspfTopology.EdgeId;
++import org.batfish.datamodel.ospf.StubType;
++import org.batfish.dataplane.rib.AbstractRib;
++import org.batfish.dataplane.rib.OspfInterAreaRib;
++import org.batfish.dataplane.rib.OspfIntraAreaRib;
++import org.batfish.dataplane.rib.OspfRib;
++import org.batfish.dataplane.rib.RibDelta;
++import org.batfish.dataplane.rib.RibDelta.Builder;
++import org.batfish.dataplane.rib.RouteAdvertisement;
++import org.batfish.dataplane.rib.RouteAdvertisement.Reason;
++
++/** An OSPF routing process, a dataplane version of {@link OspfProcess} */
++@ParametersAreNonnullByDefault
++final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute> {
++  /* Provided configuration */
++  /** The configuration/datamodel process */
++  @Nonnull private final OspfProcess _process;
++  /** The parent {@link Configuration} */
++  @Nonnull private final Configuration _c;
++  /** The name of the VRF we are in */
++  @Nonnull private final String _vrfName;
++  /** The current known topology */
++  @Nonnull private OspfTopology _topology;
++
++  /* Computed configuration & cached variables */
++  private final boolean _useMinMetricForSummaries;
++
++  /* Internal RIBs */
++  @Nonnull private final OspfIntraAreaRib _intraAreaRib;
++  @Nonnull private final OspfInterAreaRib _interAreaRib;
++  @Nonnull private final OspfRib _ospfRib;
++
++  /* Message queues */
++  @Nonnull
++  private SortedMap<OspfTopology.EdgeId, Queue<RouteAdvertisement<OspfIntraAreaRoute>>>
++      _intraAreaIncomingRoutes = ImmutableSortedMap.of();
++
++  @Nonnull
++  private SortedMap<EdgeId, Queue<RouteAdvertisement<OspfInterAreaRoute>>>
++      _interAreaIncomingRoutes = ImmutableSortedMap.of();
++
++  /** Delta that captures process initialization (creating intra-area routes based on interfaces) */
++  @Nonnull private RibDelta<OspfIntraAreaRoute> _initializationDelta;
++  /** Delta to pass to the main RIB */
++  @Nonnull private RibDelta.Builder<OspfRoute> _changeset;
++
++  OspfRoutingProcess(
++      OspfProcess process, String vrfName, Configuration configuration, OspfTopology topology) {
++    _c = configuration;
++    _vrfName = vrfName;
++    _process = process;
++    _topology = topology;
++
++    _intraAreaRib = new OspfIntraAreaRib();
++    _interAreaRib = new OspfInterAreaRib();
++    _ospfRib = new OspfRib();
++
++    update

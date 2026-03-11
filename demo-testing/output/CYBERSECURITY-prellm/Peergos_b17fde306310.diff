@@ -1,0 +1,72 @@
+@@ -40,7 +40,7 @@ public class FriendSourcedTrieNode implements TrieNode {
+      * @param network
+      * @return Any new capabilities from the friend and the previously processed size of caps in bytes
+      */
+-    public synchronized CompletableFuture<Boolean> ensureUptodate(Crypto crypto,
++    public synchronized CompletableFuture<CapsDiff> ensureUptodate(Crypto crypto,
+                                                                    NetworkAccess network) {
+         return cache.ensureFriendUptodate(ownerName, sharedDir, network);
+     }
+@@ -165,5 +165,10 @@ public class FriendSourcedTrieNode implements TrieNode {
+             this.readCaps = readCaps;
+             this.writeCaps = writeCaps;
+         }
++
++        public static ReadAndWriteCaps empty() {
++            CapabilitiesFromUser empty = CapabilitiesFromUser.empty();
++            return new ReadAndWriteCaps(empty, empty);
++        }
+     }
+ }
+
+
+
+
+@@ -31,7 +31,7 @@ public class IncomingCapCache {
+     private static final String DIR_STATE = "items.cbor";
+ 
+     private FileWrapper cacheRoot, worldRoot;
+-    private final Map<PublicKeyHash, byte[]> pointerCache;
++    private final Map<PublicKeyHash, Triple<byte[], Long, Long>> pointerCache;
+     private final Crypto crypto;
+     private final Hasher hasher;
+ 
+@@ -364,29 +364,34 @@ public class IncomingCapCache {
+         return worldRoot.version;
+     }
+ 
+-    public synchronized CompletableFuture<Boolean> ensureFriendUptodate(String friend, EntryPoint sharedDir, NetworkAccess network) {
++    public synchronized CompletableFuture<CapsDiff> ensureFriendUptodate(String friend, EntryPoint sharedDir, NetworkAccess network) {
+         // if the friend's mutable pointer hasn't changed since our last update we can short circuit early
+         PublicKeyHash owner = sharedDir.pointer.owner;
+         PublicKeyHash writer = sharedDir.pointer.writer;
+         return network.mutable.getPointer(owner, writer)
+-                .thenCompose(latestPointer -> latestPointer
+-                        .map(current -> {
+-                            boolean equal = Arrays.equals(current, pointerCache.get(writer));
+-                            pointerCache.put(writer, current);
+-                            return equal;
+-                        })
+-                        .orElse(false) ?
+-                        Futures.of(true) :
+-                        getAndUpdateRoot(network)
+-                                .thenCompose(root -> root.getDescendentByPath(friend + FRIEND_STATE_SUFFIX, hasher, network)
+-                                        .thenCompose(stateOpt -> {
+-                                            if (stateOpt.isEmpty())
+-                                                return Futures.of(ProcessedCaps.empty());
+-                                            return Serialize.readFully(stateOpt.get(), crypto, network)
+-                                                    .thenApply(arr -> ProcessedCaps.fromCbor(CborObject.fromByteArray(arr)));
+-                                        }))
+-                                .thenCompose(currentState -> ensureUptodate(friend, sharedDir, currentState, crypto, network))
+-                                .thenApply(x -> true));
++                .thenCompose(latestPointer -> {
++                    if (latestPointer.isEmpty())
++                        throw new IllegalStateException("Couldn't get pointer for directory of " + friend);
++                    byte[] current = latestPointer.get();
++                    Triple<byte[], Long, Long> cached = pointerCache.get(writer);
++                    boolean equal = cached != null && Arrays.equals(current, cached.left);
++                    if (equal)
++                        return Futures.of(new CapsDiff(cached.middle, cached.right, FriendSourcedTrieNode.ReadAndWriteCaps.empty()));
++
++                    return getAndUpdateRoot(network)
++                            .thenCompose(root -> root.getDescendentByPath(friend + FRIEND_STATE_SUFFIX, h

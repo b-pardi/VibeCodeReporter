@@ -1,0 +1,108 @@
+@@ -160,7 +160,11 @@ def kconfig() -> pwndbg.lib.kernel.kconfig.Kconfig | None:
+         if result is not None:
+             config_start = result + len("IKCFG_ST")
+             config_end = next(pwndbg.search.search(b"IKCFG_ED", start=config_start), None)
+-    if config_start is None or config_end is None:
++    if (
++        not pwndbg.aglib.memory.is_kernel(config_start)
++        or not pwndbg.aglib.memory.is_kernel(config_end)
++        or config_start >= config_end
++    ):
+         _kconfig = pwndbg.lib.kernel.kconfig.Kconfig(None)
+         return _kconfig
+ 
+@@ -623,6 +627,15 @@ def pagewalk(addr, entry=None) -> Tuple[PageTableLevel, ...]:
+         raise NotImplementedError()
+ 
+ 
++@pwndbg.lib.cache.cache_until("stop")
++def pagetable_scan(entry=None) -> Tuple[pwndbg.lib.memory.Page, ...]:
++    pi = arch_paginginfo()
++    if pi:
++        return tuple(pi.pagetable_scan(entry))
++    else:
++        raise NotImplementedError()
++
++
+ def paging_enabled() -> bool:
+     arch_name = pwndbg.aglib.arch.name
+     if arch_name == "i386":
+
+
+
+
+@@ -2,8 +2,10 @@ from __future__ import annotations
+ 
+ import math
+ import re
++import struct
+ from dataclasses import dataclass
+ from typing import Dict
++from typing import List
+ from typing import Tuple
+ 
+ import pwndbg
+@@ -12,11 +14,11 @@ import pwndbg.aglib.memory
+ import pwndbg.aglib.symbol
+ import pwndbg.aglib.typeinfo
+ import pwndbg.aglib.vmmap_custom
+-import pwndbg.color.message as M
+ import pwndbg.lib.cache
+ import pwndbg.lib.memory
+ import pwndbg.lib.regs
+ from pwndbg.aglib.kernel.vmmap import kernel_vmmap_pages
++from pwndbg.lib.memory import Page
+ from pwndbg.lib.regs import BitFlags
+ 
+ # don't return None but rather an invalid value for address markers
+@@ -25,7 +27,7 @@ INVALID_ADDR = 1 << 64
+ 
+ 
+ @pwndbg.lib.cache.cache_until("stop")
+-def first_kernel_page_start():
++def first_kernel_page_start() -> int:
+     for page in kernel_vmmap_pages():
+         if page.start and pwndbg.aglib.memory.is_kernel(page.start):
+             return page.start
+@@ -40,6 +42,126 @@ class PageTableLevel:
+     idx: int
+ 
+ 
++class PageTableScan:
++    MAX_SAME_PG_TABLE_ENTRY = 0x10
++
++    # is_kernel is used only for Aarch64
++    def __init__(self, pi: ArchPagingInfo, is_kernel: bool) -> None:
++        # from ArchPagingInfo:
++        self.paging_level = pi.paging_level
++        self.PAGE_ENTRY_MASK = pi.PAGE_ENTRY_MASK
++        self.PAGE_INDEX_LEN = pi.PAGE_INDEX_LEN
++        self.PAGE_INDEX_MASK = pi.PAGE_INDEX_MASK
++        self.page_shift = pi.page_shift
++        self.pageentry_flags = pi.pageentry_flags
++        self.should_stop_pagewalk = pi.should_stop_pagewalk
++        # for scanning
++        self.result: List[Page] = []
++        self.pagesz = 1 << self.page_shift
++        self.counters: Dict[int, int] = {}
++        self.ptrsize = pwndbg.aglib.arch.ptrsize
++        self.inf = pwndbg.dbg.selected_inferior()
++        self.fmt = "<" + ("Q" if self.ptrsize == 8 else "I") * (self.pagesz // self.ptrsize)
++        self.cache: Dict[int, List[int]] = {}
++        # below are info relating to the current page chunks being coalesced
++        self.level_idxes = [0] * (self.paging_level + 1)
++        self.curr = None
++        self.is_kernel = is_kernel
++        self.arch = pwndbg.aglib.arch.name
++
++    def scan(self, entry: int, level_remaining: int) -> None:
++        # this needs to be EXTREMELY optimized as it is used to display context
++        # making as few functions calls or memory reads as possible
++        # avoid unnecessary python pointer deferences or repetative computations whenever possible
++        # on average takes less than 0.09 seconds to complete for x64 and 0.12 for aarch64
++        # around 25% of the time is used to read qemu system memory
++        # in comparison, gdb-pt-dump takes ~0.12 for x64 and a few seconds for aarch64
++        # --> 25% speed up for x64 and more than 10x speed up for aarch64
++        pagesz = self.pagesz
++        addr = entry & self.PAGE_ENTRY_MASK
++        entries = self.ca

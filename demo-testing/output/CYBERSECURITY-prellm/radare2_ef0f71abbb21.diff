@@ -1,0 +1,126 @@
+@@ -69,8 +69,8 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, char **output,
+ #define r_sys_conv_utf16_to_utf8_l(buf, len) r_str_newlen (buf, len)
+ #endif
+ R_API int r_sys_get_src_dir_w32(char *buf);
+-R_API char *r_sys_cmd_str_w32(const char *cmd);
+-R_API bool r_sys_create_child_proc_w32(const char *cmdline, HANDLE out);
++R_API bool r_sys_cmd_str_full_w32(const char *cmd, const char *input, char **output, char **sterr);
++R_API bool r_sys_create_child_proc_w32(const char *cmdline, HANDLE in, HANDLE out, HANDLE err);
+ #endif
+ R_API int r_sys_truncate(const char *file, int sz);
+ R_API int r_sys_cmd(const char *cmd);
+
+
+
+
+@@ -150,7 +150,7 @@ static int w32_createPipe(R2Pipe *r2pipe, const char *cmd) {
+ 		PIPE_READMODE_MESSAGE | \
+ 		PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+ 		sizeof (buf), sizeof (buf), 0, NULL);
+-	if (r_sys_create_child_proc_w32 (cmd, NULL)) {
++	if (r_sys_create_child_proc_w32 (cmd, NULL, NULL, NULL)) {
+ 		if (ConnectNamedPipe (r2pipe->pipe, NULL)) {
+ 			return true;
+ 		}
+
+
+
+
+@@ -613,18 +613,15 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, char **output,
+ #elif __WINDOWS__
+ // TODO: fully implement the rest
+ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, char **output, int *len, char **sterr) {
+-	char *result = r_sys_cmd_str_w32 (cmd);
++	bool result = r_sys_cmd_str_full_w32 (cmd, input, output, sterr);
+ 	if (len) {
+ 		*len = 0;
++		if (output && result) {
++			*len = strlen (*output);
++		}
+ 	}
+-	if (output) {
+-		*output = result;
+-		*len = strlen (result);
+-	}
+-	if (result) {
+-		return true;
+-	}
+-	return false;
++
++	return result;
+ }
+ #else
+ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, char **output, int *len, char **sterr) {
+
+
+
+
+@@ -53,45 +53,93 @@ R_API int r_sys_get_src_dir_w32(char *buf) {
+ 	return true;
+ }
+ 
+-R_API char *r_sys_cmd_str_w32(const char *cmd) {
+-	char *ret = NULL;
++R_API bool r_sys_cmd_str_full_w32(const char *cmd, const char *input, char **output, char **sterr) {
++	HANDLE in = NULL;
+ 	HANDLE out = NULL;
++	HANDLE err = NULL;
+ 	SECURITY_ATTRIBUTES saAttr;
+-	char *argv0 = getexe (cmd);
+ 
+ 	// Set the bInheritPlugin flag so pipe handles are inherited.
+ 	saAttr.nLength = sizeof (SECURITY_ATTRIBUTES);
+ 	saAttr.bInheritHandle = TRUE;
+ 	saAttr.lpSecurityDescriptor = NULL;
+-	HANDLE fh;
+-
+-	// Create a pipe for the child process's STDOUT.
+-	if (!CreatePipe (&fh, &out, &saAttr, 0))
+-		ErrorExit ("StdoutRd CreatePipe");
+-
+-	// Ensure the read handle to the pipe for STDOUT is not inherited.
+-	if (!SetHandleInformation (fh, HANDLE_FLAG_INHERIT, 0) )
+-		ErrorExit ("Stdout SetHandleInformation");
++	HANDLE fi = NULL;
++	HANDLE fo = NULL;
++	HANDLE fe = NULL;
++
++	// Create a pipe for the child process's STDOUT and STDERR.
++	// Ensure the read handle to the pipe for STDOUT and SRDERR and write handle of STDIN is not inherited.
++	if (output) {
++		if (!CreatePipe (&fo, &out, &saAttr, 0)) {
++			ErrorExit ("StdOutRd CreatePipe");
++		}
++		if (!SetHandleInformation (fo, HANDLE_FLAG_INHERIT, 0)) {
++			ErrorExit ("StdOut SetHandleInformation");
++		}
++	}
++	if (sterr) {
++		if (!CreatePipe (&fe, &err, &saAttr, 0)) {
++			ErrorExit ("StdErrRd CreatePipe");
++		}
++		if (!SetHandleInformation (fe, HANDLE_FLAG_INHERIT, 0)) {
++			ErrorExit ("StdErr SetHandleInformation");
++		}
++	}
++	if (input) {
++		if (!CreatePipe (&fi, &in, &saAttr, 0)) {
++			ErrorExit ("StdInRd CreatePipe");
++		}
++		LPDWORD nBytesWritten;
++		WriteFile (in, input, strlen(input) + 1, &nBytesWritten, NULL);
++		if (!SetHandleInformation (in, HANDLE_FLAG_INHERIT, 0)) {
++			ErrorExit ("StdIn SetHandleInformation");
++		}
++	}
+ 
+-	r_sys_create_child_proc_w32 (cmd, out);
++	if (!r_sys_create_child_proc_w32 (cmd, fi, out, err)) {
++		return false;
++	}
+ 
+ 	// Close the write end of the pipe before reading from the
+ 	// read end of the pipe, to control child process execution.
+ 	// The pipe is assumed to have enough buffer space to hold the
+ 	// data the child process has already written to it.
+-	if (!Close

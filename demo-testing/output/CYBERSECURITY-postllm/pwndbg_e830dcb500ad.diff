@@ -1,0 +1,129 @@
+@@ -109,7 +109,7 @@ def print_slab(slab: Slab, indent, verbose: bool) -> None:
+ 
+ 
+ def print_cpu_cache(cpu_cache: CpuCache, verbose: bool, indent) -> None:
+-    indent.print(f"{C.green('Per-CPU Data')} @ {_yx(cpu_cache.address)}:")
++    indent.print(f"{C.green('kmem_cache_cpu')} @ {_yx(cpu_cache.address)} [CPU {cpu_cache.cpu}]:")
+     with indent:
+         indent.print(f"{C.blue('Freelist')}:", _yx(int(cpu_cache.freelist)))
+ 
+@@ -156,10 +156,8 @@ def slab_info(name: str, verbose: bool) -> None:
+         indent.print(f"{C.blue('Align')}: {slab_cache.align}")
+         indent.print(f"{C.blue('Object Size')}: {slab_cache.object_size}")
+ 
+-        # TODO: Handle multiple CPUs
+-        cpu_cache = slab_cache.cpu_cache
+-
+-        print_cpu_cache(cpu_cache, verbose, indent)
++        for cpu_cache in slab_cache.cpu_caches:
++            print_cpu_cache(cpu_cache, verbose, indent)
+ 
+         # TODO: print_node_cache
+ 
+
+
+
+
+@@ -1,6 +1,7 @@
+ import functools
+ import math
+ import re
++from typing import Optional
+ from typing import Tuple
+ 
+ import gdb
+@@ -46,6 +47,12 @@ def requires_debug_syms(default=None):
+     return decorator
+ 
+ 
++@requires_debug_syms(default=1)
++def nproc() -> int:
++    """Returns the number of processing units available, similar to nproc(1)"""
++    return int(gdb.lookup_global_symbol("nr_cpu_ids").value())
++
++
+ @requires_debug_syms(default={})
+ def load_kconfig() -> pwndbg.lib.kernel.kconfig.Kconfig:
+     config_start = pwndbg.gdblib.symbol.address("kernel_config_data")
+@@ -171,7 +178,7 @@ class x86_64Ops(ArchOps):
+     def page_size(self) -> int:
+         return 1 << self.PAGE_SHIFT
+ 
+-    def per_cpu(self, addr: gdb.Value, cpu=None):
++    def per_cpu(self, addr: gdb.Value, cpu: Optional[int] = None):
+         if cpu is None:
+             cpu = gdb.selected_thread().num - 1
+ 
+@@ -253,7 +260,7 @@ class Aarch64Ops(ArchOps):
+     def page_size(self) -> int:
+         return 1 << self.PAGE_SHIFT
+ 
+-    def per_cpu(self, addr: gdb.Value, cpu=None):
++    def per_cpu(self, addr: gdb.Value, cpu: Optional[int] = None):
+         if cpu is None:
+             cpu = gdb.selected_thread().num - 1
+ 
+@@ -315,7 +322,7 @@ def page_size() -> int:
+ 
+ 
+ @requires_debug_syms()
+-def per_cpu(addr: gdb.Value, cpu=None):
++def per_cpu(addr: gdb.Value, cpu: Optional[int] = None):
+     ops = arch_ops()
+     if ops:
+         return ops.per_cpu(addr, cpu)
+
+
+
+
+@@ -139,8 +139,17 @@ class SlabCache:
+ 
+     @property
+     def cpu_cache(self) -> "CpuCache":
+-        cpu_cache = kernel.per_cpu(self._slab_cache["cpu_slab"])
+-        return CpuCache(cpu_cache, self)
++        """returns cpu cache associated to current thread"""
++        cpu = gdb.selected_thread().num - 1
++        cpu_cache = kernel.per_cpu(self._slab_cache["cpu_slab"], cpu=cpu)
++        return CpuCache(cpu_cache, self, cpu)
++
++    @property
++    def cpu_caches(self) -> Generator["CpuCache", None, None]:
++        """returns cpu caches for all cpus"""
++        for cpu in range(kernel.nproc()):
++            cpu_cache = kernel.per_cpu(self._slab_cache["cpu_slab"], cpu=cpu)
++            yield CpuCache(cpu_cache, self, cpu)
+ 
+     @property
+     def cpu_partial(self) -> int:
+@@ -164,9 +173,10 @@ class SlabCache:
+ 
+ 
+ class CpuCache:
+-    def __init__(self, cpu_cache: gdb.Value, slab_cache: SlabCache):
++    def __init__(self, cpu_cache: gdb.Value, slab_cache: SlabCache, cpu: int):
+         self._cpu_cache = cpu_cache
+         self.slab_cache = slab_cache
++        self.cpu = cpu
+ 
+     @property
+     def address(self) -> int:
+
+
+
+
+@@ -61,6 +61,8 @@ def test_command_slab_info():
+         res = gdb.execute(f"slab info -v {cache_name}", to_string=True)
+         assert cache_name in res
+         assert "Freelist" in res
++        for cpu in range(pwndbg.gdblib.kernel.nproc()):
++            assert f"[CPU {cpu}]" in res
+ 
+     res = gdb.execute("slab info -v does_not_exit", to_string=True)
+     assert "not found" in res
+
+
+
+
+@@ -40,3 +40,9 @@ def test_gdblib_kernel_krelease():
+ @pytest.mark.skipif(not pwndb

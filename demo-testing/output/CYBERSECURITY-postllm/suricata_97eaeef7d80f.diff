@@ -1,0 +1,130 @@
+@@ -121,6 +121,5 @@ int LuaRegisterExtensions(lua_State *lua_state)
+ 
+     LuaRegisterFunctions(lua_state);
+     LuaRegisterTlsFunctions(lua_state);
+-    LuaRegisterSmtpFunctions(lua_state);
+     return 0;
+ }
+
+
+
+
+@@ -588,7 +588,6 @@ static lua_State *LuaScriptSetup(const char *filename, LogLuaMasterCtx *ctx)
+     /* register functions common to all */
+     LuaRegisterFunctions(luastate);
+     LuaRegisterTlsFunctions(luastate);
+-    LuaRegisterSmtpFunctions(luastate);
+ 
+     if (lua_pcall(luastate, 0, 0, 0) != 0) {
+         SCLogError("couldn't run script 'setup' function: %s", lua_tostring(luastate, -1));
+
+
+
+
+@@ -24,6 +24,7 @@
+ #include "util-lua-flowvarlib.h"
+ #include "util-lua-http.h"
+ #include "util-lua-dns.h"
++#include "util-lua-smtp.h"
+ #include "util-lua-ssh.h"
+ #include "util-lua-flowlib.h"
+ #include "util-lua-hashlib.h"
+@@ -46,6 +47,7 @@ static const luaL_Reg builtins[] = {
+     { "suricata.ja3", SCLuaLoadJa3Lib },
+     { "suricata.packet", LuaLoadPacketLib },
+     { "suricata.rule", SCLuaLoadRuleLib },
++    { "suricata.smtp", SCLuaLoadSmtpLib },
+     { "suricata.ssh", SCLuaLoadSshLib },
+     { NULL, NULL },
+ };
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2014 Open Information Security Foundation
++/* Copyright (C) 2014-2025 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -26,306 +26,149 @@
+  */
+ 
+ #include "suricata-common.h"
+-
+-#include "conf.h"
+-
+-#include "threads.h"
+-#include "threadvars.h"
+-#include "tm-threads.h"
+-#include "output.h"
+-
+ #include "app-layer-smtp.h"
+ 
+-#include "lua.h"
+-#include "lualib.h"
+-
+ #include "util-lua.h"
+ #include "util-lua-common.h"
+ #include "util-lua-smtp.h"
+-#include "util-file.h"
+ 
+-/*
+- * \brief internal function used by SMTPGetMimeField
+- *
+- * \param luastate luastate stack to use and push attributes to
+- * \param flow network flow of SMTP packets
+- * \param name name of the attribute to extract from MimeDecField
+- *
+- * \retval 1 if success mimefield found and pushed to stack. Returns error
+- * int and msg pushed to luastate stack if error occurs.
+- */
++#include "lua.h"
++#include "lauxlib.h"
++
++static const char smtp_tx_mt[] = "suricata:smtp:tx";
+ 
+-static int GetMimeDecField(lua_State *luastate, Flow *flow, const char *name)
++struct LuaSmtpTx {
++    SMTPTransaction *tx;
++};
++
++static int LuaSmtpGetTx(lua_State *L)
+ {
+-    /* extract state from flow */
+-    SMTPState *state = (SMTPState *) FlowGetAppState(flow);
+-    /* check that state exists */
+-    if(state == NULL) {
+-        return LuaCallbackError(luastate, "Internal error: no state in flow");
++    if (!(LuaStateNeedProto(L, ALPROTO_SMTP))) {
++        return LuaCallbackError(L, "error: protocol not SMTP");
+     }
+-    /* pointer to current transaction in state */
+-    SMTPTransaction *smtp_tx = state->curr_tx;
+-    if(smtp_tx == NULL) {
+-        return LuaCallbackError(luastate, "Transaction ending or not found");
++
++    Flow *flow = LuaStateGetFlow(L);
++    if (flow == NULL) {
++        return LuaCallbackError(L, "error: no flow found");
+     }
+-    /* pointer to tail of msg list of MimeStateSMTP in current transaction. */
+-    MimeStateSMTP *mime = smtp_tx->mime_state;
+-    /* check if msg_tail was hit */
+-    if(mime == NULL){
+-        return LuaCallbackError(luastate, "Internal error: no fields in transaction");
++
++    SMTPState *state = (SMTPState *)FlowGetAppState(flow);
++    if (state == NULL) {
++        return LuaCallbackError(L, "error: no SMTP state");
+     }
+-    /* extract MIME field based on specific field name. */
+-    const uint8_t *field_value;
+-    uint32_t field_len;
+-    /* check MIME field */
+-    if (!SCMimeSmtpGetHeader(mime, name, &field_value, &field_len)) {
+-        return LuaCallbackError(luastate, "Error: mimefield not found");
++
++    SMTPTransaction *tx = state->curr_tx;
++    if (tx == NULL) {
++        return LuaCallbackError(L, "error: no SMTP transaction found");

@@ -1,0 +1,121 @@
+@@ -58,24 +58,6 @@ urllib3.disable_warnings(urllib3.exceptions.SecurityWarning)
+ socket.getaddrinfo = cached_getaddrinfo
+ 
+ 
+-class HTTPBearerAuth(AuthBase):
+-    def __init__(self, token):
+-        self.token = token
+-
+-    def __call__(self, request):
+-        request.headers["Authorization"] = f"Bearer {self.token}"
+-        return request
+-
+-
+-class HTTPXBearerAuth(httpx.Auth):
+-    def __init__(self, token: str) -> None:
+-        self.token = token
+-
+-    def auth_flow(self, request: httpx.Request) -> Generator:
+-        request.headers["Authorization"] = f"Bearer {self.token}"
+-        yield request
+-
+-
+ class BaseRequester:
+     def __init__(self):
+         self._url = None
+@@ -151,6 +133,15 @@ class BaseRequester:
+         return self._rate
+ 
+ 
++class HTTPBearerAuth(AuthBase):
++    def __init__(self, token):
++        self.token = token
++
++    def __call__(self, request):
++        request.headers["Authorization"] = f"Bearer {self.token}"
++        return request
++
++
+ class Requester(BaseRequester):
+     def __init__(self):
+         super().__init__()
+@@ -275,25 +266,42 @@ class Requester(BaseRequester):
+         raise RequestException(err_msg)
+ 
+ 
++class HTTPXBearerAuth(httpx.Auth):
++    def __init__(self, token: str) -> None:
++        self.token = token
++
++    def auth_flow(self, request: httpx.Request) -> Generator:
++        request.headers["Authorization"] = f"Bearer {self.token}"
++        yield request
++
++
++class ProxyRoatingTransport(httpx.AsyncBaseTransport):
++    def __init__(self, proxies, **kwargs) -> None:
++        self._transports = [
++            httpx.AsyncHTTPTransport(proxy=proxy, **kwargs) for proxy in proxies
++        ]
++
++    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
++        transport = random.choice(self._transports)
++        return await transport.handle_async_request(request)
++
++
+ class AsyncRequester(BaseRequester):
+     def __init__(self):
+         super().__init__()
+ 
+-        proxy = None
+-        try:
+-            proxy = self.parse_proxy(random.choice(options["proxies"]))
+-        except IndexError:
+-            pass
+-
+-        transport = httpx.AsyncHTTPTransport(
+-            verify=False,
+-            cert=self._cert,
+-            limits=httpx.Limits(max_connections=options["thread_count"]),
+-            # httpx doesn't let you choose different proxy for each request
+-            # https://github.com/encode/httpx/discussions/3183
+-            proxy=proxy,
+-            retries=options["max_retries"],
+-            socket_options=self._socket_options,
++        tpargs = {
++            "verify": False,
++            "cert": self._cert,
++            "limits": httpx.Limits(max_connections=options["thread_count"]),
++            "socket_options": self._socket_options,
++        }
++        transport = (
++            ProxyRoatingTransport(
++                list(map(self.parse_proxy, options["proxies"])), **tpargs
++            )
++            if options["proxies"]
++            else httpx.AsyncHTTPTransport(**tpargs)
+         )
+ 
+         self.session = httpx.AsyncClient(
+@@ -344,59 +352,60 @@ class AsyncRequester(BaseRequester):
+         url = safequote(self._url + path if self._url else path)
+         parsed_url = urlparse(url)
+ 
+-        try:
+-            if self.agents:
+-                self.set_header("user-agent", random.choice(self.agents))
++        for _ in range(options["max_retries"] + 1):
++            try:
++                if self.agents:
++                    self.set_header("user-agent", random.choice(self.agents))
+ 
+-            # Use "target" extension to avoid the URL path from being normalized
+-            request = self.session.build_request(
+-                options["http_method"],
+-                url,
+-                headers=self.headers,
+-                data=options["data"],
+-            )
+-            if p := parsed_url.path:
+-                request.extensions = {"target": p.encode()}
++                # Use "target" extension to avoid the URL p

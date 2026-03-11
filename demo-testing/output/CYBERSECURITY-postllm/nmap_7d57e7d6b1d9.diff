@@ -1,0 +1,126 @@
+@@ -1,5 +1,5 @@
+ /*
+-** $Id: lapi.c,v 2.259.1.2 2017/12/06 18:35:12 roberto Exp $
++** $Id: lapi.c $
+ ** Lua API
+ ** See Copyright Notice in lua.h
+ */
+@@ -10,6 +10,7 @@
+ #include "lprefix.h"
+ 
+ 
++#include <limits.h>
+ #include <stdarg.h>
+ #include <string.h>
+ 
+@@ -36,11 +37,14 @@ const char lua_ident[] =
+   "$LuaAuthors: " LUA_AUTHORS " $";
+ 
+ 
+-/* value at a non-valid index */
+-#define NONVALIDVALUE		cast(TValue *, luaO_nilobject)
+ 
+-/* corresponding test */
+-#define isvalid(o)	((o) != luaO_nilobject)
++/*
++** Test for a valid index (one that is not the 'nilvalue').
++** '!ttisnil(o)' implies 'o != &G(L)->nilvalue', so it is not needed.
++** However, it covers the most common cases in a faster way.
++*/
++#define isvalid(L, o)	(!ttisnil(o) || o != &G(L)->nilvalue)
++
+ 
+ /* test for pseudo index */
+ #define ispseudo(i)		((i) <= LUA_REGISTRYINDEX)
+@@ -48,56 +52,65 @@ const char lua_ident[] =
+ /* test for upvalue */
+ #define isupvalue(i)		((i) < LUA_REGISTRYINDEX)
+ 
+-/* test for valid but not pseudo index */
+-#define isstackindex(i, o)	(isvalid(o) && !ispseudo(i))
+-
+-#define api_checkvalidindex(l,o)  api_check(l, isvalid(o), "invalid index")
+-
+-#define api_checkstackindex(l, i, o)  \
+-	api_check(l, isstackindex(i, o), "index not in the stack")
+ 
+-
+-static TValue *index2addr (lua_State *L, int idx) {
++/*
++** Convert an acceptable index to a pointer to its respective value.
++** Non-valid indices return the special nil value 'G(L)->nilvalue'.
++*/
++static TValue *index2value (lua_State *L, int idx) {
+   CallInfo *ci = L->ci;
+   if (idx > 0) {
+-    TValue *o = ci->func + idx;
+-    api_check(L, idx <= ci->top - (ci->func + 1), "unacceptable index");
+-    if (o >= L->top) return NONVALIDVALUE;
+-    else return o;
++    StkId o = ci->func + idx;
++    api_check(L, idx <= L->ci->top - (ci->func + 1), "unacceptable index");
++    if (o >= L->top) return &G(L)->nilvalue;
++    else return s2v(o);
+   }
+   else if (!ispseudo(idx)) {  /* negative index */
+     api_check(L, idx != 0 && -idx <= L->top - (ci->func + 1), "invalid index");
+-    return L->top + idx;
++    return s2v(L->top + idx);
+   }
+   else if (idx == LUA_REGISTRYINDEX)
+     return &G(L)->l_registry;
+   else {  /* upvalues */
+     idx = LUA_REGISTRYINDEX - idx;
+     api_check(L, idx <= MAXUPVAL + 1, "upvalue index too large");
+-    if (ttislcf(ci->func))  /* light C function? */
+-      return NONVALIDVALUE;  /* it has no upvalues */
+-    else {
+-      CClosure *func = clCvalue(ci->func);
+-      return (idx <= func->nupvalues) ? &func->upvalue[idx-1] : NONVALIDVALUE;
++    if (ttisCclosure(s2v(ci->func))) {  /* C closure? */
++      CClosure *func = clCvalue(s2v(ci->func));
++      return (idx <= func->nupvalues) ? &func->upvalue[idx-1]
++                                      : &G(L)->nilvalue;
++    }
++    else {  /* light C function or Lua function (through a hook)?) */
++      api_check(L, ttislcf(s2v(ci->func)), "caller not a C function");
++      return &G(L)->nilvalue;  /* no upvalues */
+     }
+   }
+ }
+ 
+ 
++
+ /*
+-** to be called by 'lua_checkstack' in protected mode, to grow stack
+-** capturing memory errors
++** Convert a valid actual index (not a pseudo-index) to its address.
+ */
+-static void growstack (lua_State *L, void *ud) {
+-  int size = *(int *)ud;
+-  luaD_growstack(L, size);
++l_sinline StkId index2stack (lua_State *L, int idx) {
++  CallInfo *ci = L->ci;
++  if (idx > 0) {
++    StkId o = ci->func + idx;
++    api_check(L, o < L->top, "invalid index");
++    return o;
++  }
++  else {    /* non-positive index */
++    api_check(L, idx != 0 && -idx <= L->top - (ci->func + 1), "invalid index");
++    api_check(L, !ispseudo(idx), "invalid index");
++    return L->top + idx;
++  }
+ }
+ 
+ 
+ LUA_API int lua_checkstack (lua_State *L, int n) {
+   int res;
+-  CallInfo *ci = L->ci;
++  CallInfo *ci;
+   lua_lock(L);
++  ci = L->ci;
+   api_check(L, n >= 0, "negative 'n'");
+   if (L->stack_last - L->top > n)  /* stack large enough? */
+     res = 1;  /* yes; check is OK */
+@@ -106,7 +119,7 @@ LUA_API int lua_chec

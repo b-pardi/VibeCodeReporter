@@ -1,0 +1,100 @@
+@@ -49,7 +49,7 @@ import xml.sax
+ 
+ 
+ from builtins import range
+-from future.utils import viewitems
++from future.utils import viewitems, viewvalues
+ # tests: I don't want to depend on cluster for now
+ try:
+     import cluster
+@@ -326,15 +326,10 @@ class DB(object):
+         return 0
+ 
+ 
+-class DBNmap(DB):
+-    def __init__(self, output_mode="json", output=sys.stdout):
+-        super(DBNmap, self).__init__()
+-        self.content_handler = xmlnmap.Nmap2Txt
+-        self.output_function = {
+-            "normal": nmapout.displayhosts,
+-        }.get(output_mode, nmapout.displayhosts_json)
+-        self.output = output
+-        self.__schema_migrations = {
++class DBActive(DB):
++    def __init__(self):
++        super(DBActive, self).__init__()
++        self._schema_migrations = {
+             "hosts": {
+                 None: (1, self.__migrate_schema_hosts_0_1),
+                 1: (2, self.__migrate_schema_hosts_1_2),
+@@ -409,56 +404,98 @@ class DBNmap(DB):
+     def is_scan_present(self, _):
+         return False
+ 
+-    def store_scan(self, fname, **kargs):
+-        """This method opens a scan result, and calls the appropriate
+-        store_scan_* method to parse (and store) the scan result.
+-
+-        """
+-        scanid = utils.hash_file(fname, hashtype="sha256")
+-        if self.is_scan_present(scanid):
+-            utils.LOGGER.debug("Scan already present in Database (%r).", fname)
+-            return False
+-        with utils.open_file(fname) as fdesc:
+-            fchar = fdesc.read(1)
+-        try:
+-            store_scan_function = {
+-                b'<': self.store_scan_xml,
+-                b'{': self.store_scan_json,
+-            }[fchar]
+-        except KeyError:
+-            raise ValueError("Unknown file type %s" % fname)
+-        return store_scan_function(fname, filehash=scanid, **kargs)
+-
+-    def store_scan_xml(self, fname, **kargs):
+-        """This method parses an XML scan result, displays a JSON
+-        version of the result, and return True if everything went
+-        fine, False otherwise.
+-
+-        In backend-specific subclasses, this method stores the result
+-        instead of displaying it, thanks to the `content_handler`
+-        attribute.
++    @staticmethod
++    def merge_host_docs(rec1, rec2):
++        """Merge two host records and return the result. Unmergeable /
++        hard-to-merge fields are lost (e.g., extraports).
+ 
+         """
+-        parser = xml.sax.make_parser()
+-        self.start_store_hosts()
+-        try:
+-            content_handler = self.content_handler(fname, **kargs)
+-        except Exception:
+-            utils.LOGGER.warning('Exception (file %r)', fname, exc_info=True)
++        if rec1.get("schema_version") != rec2.get("schema_version"):
++            raise ValueError("Cannot merge host documents. "
++                             "Schema versions differ (%r != %r)" % (
++                                 rec1.get("schema_version"),
++                                 rec2.get("schema_version")))
++        rec = {}
++        if "schema_version" in rec1:
++            rec["schema_version"] = rec1["schema_version"]
++        # When we have different values, we will use the one from the
++        # most recent scan, rec2
++        if rec1.get("endtime") > rec2.get("endtime"):
++            rec1, rec2 = rec2, rec1
++        for fname, function in [("starttime", min), ("endtime", max)]:
++            try:
++                rec[fname] = function(record[fname] for record in [rec1, rec2]
++                                      if fname in record)
++            except ValueError:
++                pass
++        rec["state"] = "up" if rec1.get("state") == "up" else rec2.get("state")
++        if rec["state"] is None:
++            del rec["state"]
++        rec["categories"] = list(
++            set(rec1.get("categories", [])).union(
++                rec2.get("categories", []))
++        )
++        for field in ["addr", "source", "os"]:
++            rec[field] = rec2[field] if rec2.get(field) else rec

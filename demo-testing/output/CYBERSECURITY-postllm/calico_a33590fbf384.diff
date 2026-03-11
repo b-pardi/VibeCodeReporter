@@ -1,0 +1,85 @@
+@@ -38,6 +38,7 @@ enum cali_ct_type {
+ #define CALI_CT_FLAG_NP_LOOP	0x800 /* marks connections that were turned around when accessing nodeport on a local IP */
+ #define CALI_CT_FLAG_NP_REMOTE	0x1000 /* marks connections from local host to remote backend of a nodeport */
+ #define CALI_CT_FLAG_NP_NO_DSR	0x2000 /* marks connections from a client which is excluded from DSR */
++#define CALI_CT_FLAG_SKIP_REDIR_PEER	0x4000 /* marks connections from a client which is excluded from redir */
+ 
+ struct calico_ct_leg {
+ 	__u64 bytes;
+
+
+
+
+@@ -89,7 +89,7 @@ skip_redir_ifindex:
+ 		bool redirect_peer = GLOBAL_FLAGS & CALI_GLOBALS_REDIRECT_PEER;
+ 
+ 		if (redirect_peer && ct_result_rc(state->ct_result.rc) == CALI_CT_ESTABLISHED_BYPASS &&
+-			state->ct_result.ifindex_fwd != CT_INVALID_IFINDEX) {
++			state->ct_result.ifindex_fwd != CT_INVALID_IFINDEX && !(ctx->state->ct_result.flags & CALI_CT_FLAG_SKIP_REDIR_PEER)) {
+ 			rc = bpf_redirect_peer(state->ct_result.ifindex_fwd, 0);
+ 			if (rc == TC_ACT_REDIRECT) {
+ 				CALI_DEBUG("Redirect to peer interface (%d) succeeded.", state->ct_result.ifindex_fwd);
+
+
+
+
+@@ -32,6 +32,7 @@ enum cali_rt_flags {
+ 	CALI_RT_NO_DSR      = 0x80,
+ 	CALI_RT_BLACKHOLE_DROP  = 0x100,
+ 	CALI_RT_BLACKHOLE_REJECT  = 0x200,
++	CALI_RT_VM_WORKLOAD = 0x800,
+ };
+ 
+ struct cali_rt {
+@@ -84,6 +85,7 @@ static CALI_BPF_INLINE enum cali_rt_flags cali_rt_lookup_flags(ipv46_addr_t *add
+ #define cali_rt_flags_host(t) (((t) & CALI_RT_HOST) == CALI_RT_HOST)
+ #define cali_rt_flags_local_host(t) (((t) & (CALI_RT_LOCAL | CALI_RT_HOST)) == (CALI_RT_LOCAL | CALI_RT_HOST))
+ #define cali_rt_flags_local_workload(t) (((t) & CALI_RT_LOCAL) && ((t) & CALI_RT_WORKLOAD))
++#define cali_rt_flags_local_workload_vm(t) (((t) & CALI_RT_LOCAL) && ((t) & CALI_RT_WORKLOAD) && ((t) & CALI_RT_VM_WORKLOAD))
+ #define cali_rt_flags_remote_workload(t) (!((t) & CALI_RT_LOCAL) && ((t) & CALI_RT_WORKLOAD))
+ #define cali_rt_flags_remote_host(t) (((t) & (CALI_RT_LOCAL | CALI_RT_HOST)) == CALI_RT_HOST)
+ #define cali_rt_flags_remote_tunneled_host(t) (((t) & (CALI_RT_LOCAL | CALI_RT_HOST | CALI_RT_TUNNELED)) == (CALI_RT_HOST | CALI_RT_TUNNELED))
+
+
+
+
+@@ -606,16 +606,20 @@ syn_force_policy:
+ 			goto skip_policy;
+ 		}
+ 		ctx->state->flags |= CALI_ST_DEST_IS_HOST;
+-	} else if (CALI_F_FROM_HEP && !ctx->nat_dest && !cali_rt_is_local(dest_rt)) {
+-		/* Disable FIB, let the packet go through the host after it is
+-		 * policed. It is ingress into the system and we got a packet, which is
+-		 * not for this host, and it wasn't resolved as a service and it is not
+-		 * for a local workload either. But we hit a route so it may be some L2
+-		 * broadcast, we do not quite know. Let the host route it or dump it.
+-		 *
+-		 * https://github.com/projectcalico/calico/issues/8918
+-		 */
+-		ctx->state->flags |= CALI_ST_SKIP_FIB;
++	} else if (CALI_F_FROM_HEP) {
++		if (cali_rt_flags_local_workload_vm(dest_rt->flags)) {
++			ctx->state->flags |= CALI_ST_SKIP_REDIR_PEER;
++		} else if (!ctx->nat_dest && !cali_rt_is_local(dest_rt)) {
++			/* Disable FIB, let the packet go through the host after it is
++			 * policed. It is ingress into the system and we got a packet, which is
++			 * not for this host, and it wasn't resolved as a service and it is not
++			 * for a local workload either. But we hit a route so it may be some L2
++			 * broadcast, we do not quite know. Let the host route it or dump it.
++			 *
++			 * https://github.com/projectcalico/calico/issues/8918
++			 */
++			ctx->state->flags |= CALI_ST_SKIP_FIB;
++		}
+ 	}
+ 
+ 	if (CALI_F_TO_HEP && ctx->nat_dest && !skb_seen(ctx->skb) && !(ctx->state->flags & CALI_ST_HOST_PSNAT)) {
+@@ -1336,6 +1340,9 @@ int calico_tc_skb_new_flow_entrypoint(struct __sk_buff *skb)
+ 	if (CALI_F_TO_HOST && state->flags & CALI_ST_SKIP_FIB) {
+ 		ct_ctx_nat->flags |= CALI_CT_FLAG_SKIP_FIB;
+ 	}
++	if (CALI_F_FROM_HEP && state->flags & CALI_ST_SKIP_REDIR_PEER) {
++		ct_ctx_nat->flags |= CALI_CT_FLAG_SKIP_REDIR_PEER;
++	}
+ 	if (CALI_F_TO_WEP) {
+ 		if (!(ctx->skb->mark & CALI_SKB_MARK_SEEN)

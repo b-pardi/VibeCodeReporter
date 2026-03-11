@@ -1,0 +1,106 @@
+@@ -248,6 +248,10 @@ extern void clear_script_analysis();
+ // Called when Zeek is terminating.
+ extern void finish_script_execution();
+ 
++// Returns true if the given call has a specialized ZAM equivalent when
++// used in a conditional.
++extern bool IsZAM_BuiltInCond(const CallExpr* c);
++
+ // Used for C++-compiled scripts to signal their presence, by setting this
+ // to a non-empty value.
+ extern void (*CPP_init_hook)();
+
+
+
+
+@@ -3,196 +3,142 @@
+ // ZAM methods associated with instructions that replace calls to
+ // built-in functions.
+ 
++#include "zeek/script_opt/ZAM/BuiltIn.h"
++
+ #include "zeek/Func.h"
+ #include "zeek/Reporter.h"
+ #include "zeek/script_opt/ZAM/Compile.h"
+ 
+ namespace zeek::detail {
+ 
+-bool ZAMCompiler::IsZAM_BuiltIn(const Expr* e) {
+-    // The expression e is either directly a call (in which case there's
+-    // no return value), or an assignment to a call.
+-    const CallExpr* c;
+-
+-    if ( e->Tag() == EXPR_CALL )
+-        c = e->AsCallExpr();
+-    else
+-        c = e->GetOp2()->AsCallExpr();
+-
+-    auto func_expr = c->Func();
+-    if ( func_expr->Tag() != EXPR_NAME )
+-        // An indirect call.
+-        return false;
+-
+-    auto func_val = func_expr->AsNameExpr()->Id()->GetVal();
+-    if ( ! func_val )
+-        // A call to a function that hasn't been defined.
+-        return false;
+-
+-    auto func = func_val->AsFunc();
+-    if ( func->GetKind() != BuiltinFunc::BUILTIN_FUNC )
+-        return false;
+-
+-    auto& args = c->Args()->Exprs();
++// Maps BiF names to their associated ZBI class.
++std::unordered_map<std::string, const ZAMBuiltIn*> builtins;
+ 
+-    const NameExpr* n = nullptr; // name to assign to, if any
++ZAMBuiltIn::ZAMBuiltIn(std::string name, bool _ret_val_matters) : ret_val_matters(_ret_val_matters) {
++    builtins[name] = this;
++}
+ 
+-    if ( e->Tag() != EXPR_CALL )
+-        n = e->GetOp1()->AsRefExpr()->GetOp1()->AsNameExpr();
++SimpleZBI::SimpleZBI(std::string name, ZOp _op, int _nargs, bool _ret_val_matters)
++    : ZAMBuiltIn(std::move(name), _ret_val_matters), op(_op), nargs(_nargs) {}
+ 
+-    using GenBuiltIn = bool (ZAMCompiler::*)(const NameExpr* n, const ExprPList& args);
+-    static std::vector<std::pair<const char*, GenBuiltIn>> builtins = {
+-        {"Analyzer::__name", &ZAMCompiler::BuiltIn_Analyzer__name},
+-        {"Broker::__flush_logs", &ZAMCompiler::BuiltIn_Broker__flush_logs},
+-        {"Files::__enable_reassembly", &ZAMCompiler::BuiltIn_Files__enable_reassembly},
+-        {"Files::__set_reassembly_buffer", &ZAMCompiler::BuiltIn_Files__set_reassembly_buffer},
+-        {"Log::__write", &ZAMCompiler::BuiltIn_Log__write},
+-        {"cat", &ZAMCompiler::BuiltIn_cat},
+-        {"current_time", &ZAMCompiler::BuiltIn_current_time},
+-        {"get_port_transport_proto", &ZAMCompiler::BuiltIn_get_port_etc},
+-        {"network_time", &ZAMCompiler::BuiltIn_network_time},
+-        {"reading_live_traffic", &ZAMCompiler::BuiltIn_reading_live_traffic},
+-        {"reading_traces", &ZAMCompiler::BuiltIn_reading_traces},
+-        {"strstr", &ZAMCompiler::BuiltIn_strstr},
+-        {"sub_bytes", &ZAMCompiler::BuiltIn_sub_bytes},
+-        {"to_lower", &ZAMCompiler::BuiltIn_to_lower},
+-    };
+-
+-    for ( auto& b : builtins )
+-        if ( util::streq(func->Name(), b.first) )
+-            return (this->*(b.second))(n, args);
+-
+-    return false;
+-}
++SimpleZBI::SimpleZBI(std::string name, ZOp _const_op, ZOp _op, bool _ret_val_matters)
++    : ZAMBuiltIn(std::move(name), _ret_val_matters), op(_op), const_op(_const_op), nargs(1) {}
+ 
+-bool ZAMCompiler::BuiltIn_Analyzer__name(const NameExpr* n, const ExprPList& args) {
+-    if ( ! n ) {
+-        reporter->Warning("return value from built-in function ignored");
+-        return true;
++bool SimpleZBI::Build(ZAMCompiler* zam, const NameExpr* n, const ExprPList& args) const {
++    ZInstI z;
++    if ( nargs == 0 ) {
++        if ( n )
++            z = ZInstI(op, zam->Frame1Slot(n, OP1_WRITE));
++        else
++            z = ZInstI(op);
+     }
++    else {
++   

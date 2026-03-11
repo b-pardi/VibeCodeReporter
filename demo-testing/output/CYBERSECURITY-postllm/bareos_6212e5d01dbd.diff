@@ -1,0 +1,147 @@
+@@ -37,302 +37,6 @@
+ #include "lib/util.h"
+ #include "lib/bpipe.h"
+ 
+-int execvp_errors[]
+-    = {EACCES,  ENOEXEC, EFAULT, EINTR, E2BIG, ENAMETOOLONG, ENOMEM,
+-#ifndef HAVE_WIN32
+-       ETXTBSY,
+-#endif
+-       ENOENT};
+-int num_execvp_errors = (int)(sizeof(execvp_errors) / sizeof(int));
+-
+-#define MAX_ARGV 100
+-
+-#if !defined(HAVE_WIN32)
+-static void BuildArgcArgv(char* cmd, int* bargc, char* bargv[], int max_arg);
+-
+-namespace {
+-// Convert errno into an exit code for later analysis
+-int get_error_code()
+-{
+-  for (int i = 0; i < num_execvp_errors; i++) {
+-    if (execvp_errors[i] == errno) { return 200 + i; /* exit code => errno */ }
+-  }
+-  return 255;  // unknown errno
+-}
+-}  // namespace
+-
+-/*
+- * Run an external program. Optionally wait a specified number
+- * of seconds. Program killed if wait exceeded. We open
+- * a bi-directional pipe so that the user can read from and
+- * write to the program.
+- */
+-Bpipe* OpenBpipe(const char* prog,
+-                 int wait,
+-                 const char* mode,
+-                 bool dup_stderr,
+-                 const std::unordered_map<std::string, std::string>& env_vars)
+-{
+-  char* bargv[MAX_ARGV];
+-  int bargc;
+-  int readp[2], writep[2];
+-  POOLMEM* tprog;
+-  int mode_read, mode_write;
+-  Bpipe* bpipe;
+-  int save_errno;
+-
+-  bpipe = (Bpipe*)malloc(sizeof(Bpipe));
+-  memset(bpipe, 0, sizeof(Bpipe));
+-  mode_read = (mode[0] == 'r');
+-  mode_write = (mode[0] == 'w' || mode[1] == 'w');
+-
+-  // Build arguments for running program.
+-  tprog = GetPoolMemory(PM_FNAME);
+-  PmStrcpy(tprog, prog);
+-  BuildArgcArgv(tprog, &bargc, bargv, MAX_ARGV);
+-
+-  // Each pipe is one way, write one end, read the other, so we need two
+-  if (mode_write && pipe(writep) == -1) {
+-    save_errno = errno;
+-    free(bpipe);
+-    FreePoolMemory(tprog);
+-    errno = save_errno;
+-    return NULL;
+-  }
+-  if (mode_read && pipe(readp) == -1) {
+-    save_errno = errno;
+-    if (mode_write) {
+-      close(writep[0]);
+-      close(writep[1]);
+-    }
+-    free(bpipe);
+-    FreePoolMemory(tprog);
+-    errno = save_errno;
+-    return NULL;
+-  }
+-
+-  // Start worker process
+-  switch (bpipe->worker_pid = fork()) {
+-    case -1: /* error */
+-      save_errno = errno;
+-      if (mode_write) {
+-        close(writep[0]);
+-        close(writep[1]);
+-      }
+-      if (mode_read) {
+-        close(readp[0]);
+-        close(readp[1]);
+-      }
+-      free(bpipe);
+-      FreePoolMemory(tprog);
+-      errno = save_errno;
+-      return NULL;
+-
+-    case 0: /* child */
+-      if (mode_write) {
+-        close(writep[1]);
+-        dup2(writep[0], 0); /* Dup our write to his stdin */
+-      }
+-      if (mode_read) {
+-        close(readp[0]);   /* Close unused child fds */
+-        dup2(readp[1], 1); /* dup our read to his stdout */
+-        if (dup_stderr) { dup2(readp[1], 2); /*   and his stderr */ }
+-      }
+-
+-#  if defined(HAVE_FCNTL_F_CLOSEM)
+-      // fcntl(fd, F_CLOSEM) needs the lowest filedescriptor to close.
+-      fcntl(3, F_CLOSEM);
+-#  elif defined(HAVE_CLOSEFROM)
+-      // closefrom needs the lowest filedescriptor to close.
+-      closefrom(3);
+-#  else
+-      for (int i = 3; i <= 32; i++) { /* close any open file descriptors */
+-        close(i);
+-      }
+-#  endif
+-
+-      // merge environment variables into our environment
+-      for (auto& [var_name, var_value] : env_vars) {
+-        if (var_value.empty()) {
+-          unsetenv(var_name.c_str());
+-        } else {
+-          setenv(var_name.c_str(), var_value.c_str(), 1);
+-        }
+-      }
+-
+-      execvp(bargv[0], bargv); /* call the program */
+-
+-      // execvp will only return on error
+-      perror("Program execution failed");
+-
+-#  if defined(HAVE_DARWIN_OS)
+-      // MacOS does not like std::quick_exit()
+-      std::_Exit(get_error_code());
+-#  else
+-      std::quick_exit(get_error_code());
+-#  endif
+-
+-    default: /* parent */
+-      break;
+-  }
+-
+-  FreePoolMemory(tprog);
+-
+-  if (mode_read) {
+-    close(readp[1]);                    /* close unused

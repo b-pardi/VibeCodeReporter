@@ -1,0 +1,127 @@
+@@ -497,6 +497,12 @@ const struct DecodeEvents_ DEvents[] = {
+             MPLS_UNKNOWN_PAYLOAD_TYPE,
+     },
+ 
++    /* Geneve events */
++    {
++            "decoder.geneve.unknown_payload_type",
++            GENEVE_UNKNOWN_PAYLOAD_TYPE,
++    },
++
+     /* ERSPAN events */
+     {
+             "decoder.erspan.header_too_small",
+
+
+
+
+@@ -183,6 +183,9 @@ enum {
+     MPLS_BAD_LABEL_RESERVED,
+     MPLS_UNKNOWN_PAYLOAD_TYPE,
+ 
++    /* Geneve events */
++    GENEVE_UNKNOWN_PAYLOAD_TYPE,
++
+     /* ERSPAN events */
+     ERSPAN_HEADER_TOO_SMALL,
+     ERSPAN_UNSUPPORTED_VERSION,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,498 @@
++/* Copyright (C) 2020 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Ali Jad Khalil <jadkhal@amazon.com>
++ *
++ * Geneve tunneling scheme decoder.
++ *
++ * This implementation is based on the following specification doc:
++ * https://tools.ietf.org/html/draft-ietf-nvo3-geneve-16#section-3
++ */
++
++#include "suricata-common.h"
++#include "decode.h"
++#include "decode-geneve.h"
++#include "decode-events.h"
++
++#include "detect-engine-port.h"
++
++#include "flow.h"
++
++#include "util-unittest.h"
++#include "util-debug.h"
++
++#include "pkt-var.h"
++#include "util-profiling.h"
++#include "host.h"
++
++#define VALID_GENEVE_VERSIONS                                                                      \
++    {                                                                                              \
++        0                                                                                          \
++    }
++#define GENEVE_VERSION(hdr_ptr)        (hdr_ptr->ver_plus_len >> 6)
++#define GENEVE_RESERVED_FLAGS(hdr_ptr) (hdr_ptr->flags & 0x3F)
++
++#define GENEVE_MIN_HEADER_LEN            sizeof(GeneveHeader)
++#define GENEVE_TOTAL_OPT_LEN(hdr_ptr)    ((hdr_ptr->ver_plus_len & 0x3F) << 2)
++#define GENEVE_TOTAL_HEADER_LEN(hdr_ptr) (GENEVE_MIN_HEADER_LEN + GENEVE_TOTAL_OPT_LEN(hdr_ptr))
++
++#define GENEVE_MIN_SINGLE_OPT_LEN         sizeof(GeneveOption)
++#define GENEVE_SINGLE_OPT_LEN(option_ptr) ((option_ptr->flags_plus_len & 0x1F) << 2)
++#define GENEVE_SINGLE_OPT_TOTAL_LEN(option_ptr)                                                    \
++    (GENEVE_MIN_SINGLE_OPT_LEN + GENEVE_SINGLE_OPT_LEN(option_ptr))
++
++#define GENEVE_MAX_PORTS      4
++#define GENEVE_UNSET_PORT     -1
++#define GENEVE_DEFAULT_PORT   6081
++#define GENEVE_DEFAULT_PORT_S "6081"
++
++static bool g_geneve_enabled = true;
++static int g_geneve_ports_idx = 0;
++static int g_geneve_ports[GENEVE_MAX_PORTS] = { GENEVE_DEFAULT_PORT, GENEVE_UNSET_PORT,
++    GENEVE_UNSET_PORT, GENEVE_UNSET_PORT };
++
++/* Geneve structs based on diagrams from the following specification doc:
++ *    https://tools.ietf.org/html/draft-ietf-nvo3-geneve-16#section-3 */
++typedef struct GeneveOption_ {
++    uint16_t option_class;
++    uint8_t type;
++    uint8_t flags_plus_len;
++    uint8_t option_data[0];
++} GeneveOption;
++
++typedef struct GeneveHeader_ {
++    uint8_t ver_plus_len;
++    uint8_t flags;
++    uint16_t eth_type;
++    uint8_t vni[3];
++    uint8_t res;
++    GeneveOption options[0];
++} GeneveHeader;
++
++bool DecodeGeneveEnabledForPort(const uint16_t sp, const uint16_t dp)
++{
++    SCLogDebug("ports %u->%u ports %d %d %d %d", sp, dp, g_geneve_ports[0], g_geneve_ports[1],
++            g_geneve_ports[2], g_geneve_ports[3]);
++
++    if (g_geneve_enab

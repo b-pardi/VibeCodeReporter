@@ -1,0 +1,156 @@
+@@ -1335,15 +1335,6 @@ int cil_from_host(struct __ctx_buff *ctx)
+ 	if (magic == MARK_MAGIC_PROXY_INGRESS ||  magic == MARK_MAGIC_PROXY_EGRESS)
+ 		obs_point = TRACE_FROM_PROXY;
+ 
+-#ifdef ENABLE_IPSEC
+-	if (magic == MARK_MAGIC_ENCRYPT) {
+-		send_trace_notify(ctx, TRACE_FROM_STACK, identity, UNKNOWN_ID,
+-				  TRACE_EP_ID_UNKNOWN, ctx->ingress_ifindex,
+-				  TRACE_REASON_ENCRYPTED, 0, proto);
+-		return CTX_ACT_OK;
+-	}
+-#endif /* ENABLE_IPSEC */
+-
+ 	return do_netdev(ctx, proto, identity, obs_point, true);
+ }
+ 
+@@ -1380,6 +1371,17 @@ int cil_to_netdev(struct __ctx_buff *ctx)
+ 		src_sec_identity = get_identity(ctx);
+ #endif
+ 
++	/* Load the ethertype just once: */
++	validate_ethertype(ctx, &proto);
++
++#ifdef ENABLE_IPSEC
++	if (magic == MARK_MAGIC_ENCRYPT)
++		send_trace_notify(ctx, TRACE_FROM_STACK,
++				  ctx_load_meta(ctx, CB_ENCRYPT_IDENTITY), UNKNOWN_ID,
++				  TRACE_EP_ID_UNKNOWN, ctx->ingress_ifindex,
++				  TRACE_REASON_ENCRYPTED, 0, proto);
++#endif /* ENABLE_IPSEC */
++
+ 	/* Filter allowed vlan id's and pass them back to kernel.
+ 	 */
+ 	if (ctx->vlan_present) {
+@@ -1403,9 +1405,6 @@ int cil_to_netdev(struct __ctx_buff *ctx)
+ 	}
+ #endif
+ 
+-	/* Load the ethertype just once: */
+-	validate_ethertype(ctx, &proto);
+-
+ #ifdef ENABLE_HOST_FIREWALL
+ 	/* This was initially added for Egress GW. There it's no longer needed,
+ 	 * but it potentially also helps other paths (LB-to-remote-backend ?).
+
+
+
+
+@@ -181,10 +181,6 @@ static __always_inline __u32 inherit_identity_from_host(struct __ctx_buff *ctx,
+ 		*identity = get_identity(ctx);
+ 	} else if (magic == MARK_MAGIC_HOST) {
+ 		*identity = HOST_ID;
+-#ifdef ENABLE_IPSEC
+-	} else if (magic == MARK_MAGIC_ENCRYPT) {
+-		*identity = ctx_load_meta(ctx, CB_ENCRYPT_IDENTITY);
+-#endif
+ 	} else {
+ #if defined ENABLE_IPV4 && defined ENABLE_IPV6
+ 		__u16 proto = ctx_get_protocol(ctx);
+
+deleted file mode 100644
+
+
+
+@@ -1,288 +0,0 @@
+-/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+-/* Copyright Authors of Cilium */
+-
+-#include <bpf/ctx/skb.h>
+-#include "common.h"
+-#include "pktgen.h"
+-
+-#define NODE_ID 2333
+-#define TUNNEL_ID 0x1234
+-#define ENCRYPT_KEY 3
+-#define ENABLE_IPV4
+-#define ENABLE_IPV6
+-#define ENABLE_IPSEC
+-
+-#define ENCAP_IFINDEX 4
+-#define skb_set_tunnel_key mock_skb_set_tunnel_key
+-#define ctx_redirect mock_ctx_redirect
+-
+-int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
+-			    const struct bpf_tunnel_key *from,
+-			    __maybe_unused __u32 size,
+-			    __maybe_unused __u32 flags)
+-{
+-	if (from->tunnel_id != TUNNEL_ID)
+-		return -1;
+-	if (from->local_ipv4 != 0)
+-		return -2;
+-	if (from->remote_ipv4 != bpf_htonl(v4_node_two))
+-		return -3;
+-	return 0;
+-}
+-
+-int mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused, int ifindex, __u32 flags)
+-{
+-	if (ifindex != ENCAP_IFINDEX)
+-		return -1;
+-	if (flags != 0)
+-		return -2;
+-	return CTX_ACT_REDIRECT;
+-}
+-
+-#include "bpf_host.c"
+-
+-ASSIGN_CONFIG(__u32, security_label, TUNNEL_ID)
+-
+-#include "lib/ipcache.h"
+-
+-#define FROM_HOST 0
+-#define ESP_SEQUENCE 69865
+-
+-struct {
+-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+-	__uint(key_size, sizeof(__u32));
+-	__uint(max_entries, 1);
+-	__array(values, int());
+-} entry_call_map __section(".maps") = {
+-	.values = {
+-		[FROM_HOST] = &cil_from_host,
+-	},
+-};
+-
+-PKTGEN("tc", "ipv4_ipsec_from_host")
+-int ipv4_ipsec_from_host_pktgen(struct __ctx_buff *ctx)
+-{
+-	struct pktgen builder;
+-	struct iphdr *l3;
+-	struct ip_esp_hdr *l4;
+-	void *data;
+-
+-	pktgen__init(&builder, ctx);
+-
+-	l3 = pktgen__push_ipv4_packet(&builder, (__u8 *)mac_one, (__u8 *)mac_two,
+-				      v4_pod_one, v4_pod_two);
+-	if (!l3)
+-		return TEST_ERROR;
+-	l4 = pktgen__push_default_esphdr(&builder);
+-	if (!l4)
+-		return TEST_ERROR;
+-	l4->spi = ENCRYPT_KEY;
+-	l4->seq_no = ESP_SEQUENCE;
+-
+-	data = pktgen__push_data(&builder, default_data, sizeof(default_data));
+-	if (!data)
+-		return TEST_ERROR;
+-
+-	pktgen__finish(&builder);
+-	return 0;
+-}
+-
+-SETUP("tc", "ipv4_ipsec_from_host")
+-int ipv4_ipsec_from_host_setup(struct __

@@ -1,0 +1,152 @@
+@@ -21,6 +21,20 @@ static void prepend_current_pc (RDebug *dbg, RList *list) {
+ 	}
+ }
+ 
++
++#if HAVE_PTRACE
++struct frames_proxy_args {
++	RDebugFrameCallback cb;
++	RDebug *dbg;
++	ut64 at;
++};
++
++static void *backtrace_proxy(void *user) {
++	struct frames_proxy_args *args = user;
++	return args->cb (args->dbg, args->at);
++}
++#endif
++
+ static RList *r_debug_native_frames(RDebug *dbg, ut64 at) {
+ 	RDebugFrameCallback cb = NULL;
+ 	if (dbg->btalgo) {
+@@ -42,7 +56,18 @@ static RList *r_debug_native_frames(RDebug *dbg, ut64 at) {
+ 		}
+ 	}
+ 
+-	RList *list = (dbg->btalgo && !strcmp (dbg->btalgo, "trace")) ? r_list_clone (dbg->call_frames) : cb (dbg, at);
++	RList *list;
++	if(dbg->btalgo && !strcmp (dbg->btalgo, "trace")) {
++		r_list_clone (dbg->call_frames);
++	} else {
++#if HAVE_PTRACE
++		struct frames_proxy_args args = { cb, dbg, at };
++		list = r_debug_ptrace_func (dbg, backtrace_proxy, &args);
++#else
++		cb (dbg, at);
++#endif
++	}
++
+ 	prepend_current_pc (dbg, list);
+ 	return list;
+ }
+
+
+
+
+@@ -609,6 +609,10 @@ R_API bool r_debug_continue_back(RDebug *dbg);
+ static inline long r_debug_ptrace(RDebug *dbg, r_ptrace_request_t request, pid_t pid, void *addr, r_ptrace_data_t data) {
+ 	return dbg->iob.ptrace (dbg->iob.io, request, pid, addr, data);
+ }
++
++static inline void *r_debug_ptrace_func(RDebug *dbg, void *(*func)(void *), void *user) {
++	return dbg->iob.ptrace_func (dbg->iob.io, func, user);
++}
+ #endif
+ 
+ /* plugin pointers */
+
+
+
+
+@@ -257,6 +257,7 @@ typedef RIOSection *(*RIOSectionVgetSec) (RIO *io, ut64 vaddr);
+ typedef RIOSection *(*RIOSectionAdd) (RIO *io, ut64 addr, ut64 vaddr, ut64 size, ut64 vsize, int rwx, const char *name, ut32 bin_id, int fd);
+ #if HAVE_PTRACE
+ typedef long (*RIOPtraceFn) (RIO *io, r_ptrace_request_t request, pid_t pid, void *addr, r_ptrace_data_t data);
++typedef void *(*RIOPtraceFuncFn) (RIO *io, void *(*func)(void *), void *user);
+ #endif
+ 
+ typedef struct r_io_bind_t {
+@@ -290,6 +291,7 @@ typedef struct r_io_bind_t {
+ 	RIOSectionAdd section_add;
+ #if HAVE_PTRACE
+ 	RIOPtraceFn ptrace;
++	RIOPtraceFuncFn ptrace_func;
+ #endif
+ } RIOBind;
+ 
+@@ -496,6 +498,7 @@ R_API bool r_io_write_i (RIO* io, ut64 addr, ut64 *val, int size, bool endian);
+ #if HAVE_PTRACE
+ R_API long r_io_ptrace(RIO *io, r_ptrace_request_t request, pid_t pid, void *addr, r_ptrace_data_t data);
+ R_API pid_t r_io_ptrace_fork(RIO *io, void (*child_callback)(void *), void *child_callback_user);
++R_API void *r_io_ptrace_func(RIO *io, void *(*func)(void *), void *user);
+ #endif
+ 
+ extern RIOPlugin r_io_plugin_procpid;
+
+
+
+
+@@ -562,6 +562,7 @@ R_API void r_io_bind(RIO *io, RIOBind *bnd) {
+ 	bnd->sect_vget = r_io_section_vget;
+ #if HAVE_PTRACE
+ 	bnd->ptrace = r_io_ptrace;
++	bnd->ptrace_func = r_io_ptrace_func;
+ #endif
+ }
+ 
+@@ -674,6 +675,17 @@ R_API pid_t r_io_ptrace_fork(RIO *io, void (*child_callback)(void *), void *chil
+ #endif
+ 
+ 
++R_API void *r_io_ptrace_func(RIO *io, void *(*func)(void *), void *user) {
++#if USE_PTRACE_WRAP
++	ptrace_wrap_instance *wrap = io_ptrace_wrap_instance (io);
++	if (wrap) {
++		return ptrace_wrap_func (wrap, func, user);
++	}
++#endif
++	return func (user);
++}
++
++
+ //remove all descs and maps
+ R_API int r_io_fini(RIO* io) {
+ 	if (!io) {
+
+
+
+
+@@ -31,9 +31,12 @@ typedef int ptrace_wrap_ptrace_request;
+ typedef enum {
+ 	PTRACE_WRAP_REQUEST_TYPE_STOP,
+ 	PTRACE_WRAP_REQUEST_TYPE_PTRACE,
+-	PTRACE_WRAP_REQUEST_TYPE_FORK
++	PTRACE_WRAP_REQUEST_TYPE_FORK,
++	PTRACE_WRAP_REQUEST_TYPE_FUNC
+ } ptrace_wrap_request_type;
+ 
++typedef void *(*ptrace_wrap_func_func)(void *);
++
+ typedef struct ptrace_wrap_request_t {
+ 	ptrace_wrap_request_type type;
+ 	union {
+@@ -49,6 +52,10 @@ typedef struct ptrace_wrap_request_t {
+ 			void *child_callback_user;
+ 			int *_errno;
+ 		} fork;
++		struct {
++			ptrace_wrap_func_func func;
++			void *user;
++		} func;
+ 	};
+ } ptrace_wrap_request;
+ 
+@@ -60,6 +67,7 @@ typedef struct ptrace_wrap_instance_t {
+ 	union {
+ 		long ptrace_result;
+ 		pid_t fork_result;
++		void *func_result;
+ 	};
+ } ptrace_wrap_instance;
+ 
+@@ -67,5 +75,6 @

@@ -1,0 +1,125 @@
+@@ -37,7 +37,9 @@ R_API bool r_bin_wr_output(RBin *bin, const char *filename) {
+ 	if (!filename || !binfile || !binfile->buf) {
+ 		return false;
+ 	}
+-	return r_file_dump (filename, r_buf_buffer (binfile->buf), r_buf_size (binfile->buf), 0);
++	ut64 tmpsz;
++	const ut8 *tmp = r_buf_buffer (binfile->buf, &tmpsz);
++	return r_file_dump (filename, tmp, tmpsz, 0);
+ }
+ 
+ R_API bool r_bin_wr_entry(RBin *bin, ut64 addr) {
+
+
+
+
+@@ -40,10 +40,10 @@
+ #define READWORD(x, i) READ32 (x, i)
+ #endif
+ 
+-#define BREAD8(x, i) r_read_ble8(r_buf_get_at (x, (i), NULL)); (i) += 1
+-#define BREAD16(x, i) r_read_ble16(r_buf_get_at (x, (i), NULL), bin->endian); (i) += 2
+-#define BREAD32(x, i) r_read_ble32(r_buf_get_at (x, (i), NULL), bin->endian); (i) += 4
+-#define BREAD64(x, i) r_read_ble64(r_buf_get_at (x, (i), NULL), bin->endian); (i) += 8
++#define BREAD8(x, i) r_buf_read_ble8_at(x, i); (i) += 1
++#define BREAD16(x, i) r_buf_read_ble16_at(x, i, bin->endian); (i) += 2
++#define BREAD32(x, i) r_buf_read_ble32_at(x, i, bin->endian); (i) += 4
++#define BREAD64(x, i) r_buf_read_ble64_at(x, i, bin->endian); (i) += 8
+ 
+ #if R_BIN_ELF64
+ static inline int UTX_MUL(ut64 *r, ut64 a, ut64 b) {
+
+
+
+
+@@ -2751,10 +2751,13 @@ void MACH0_(mach_headerfields)(RBinFile *file) {
+ #endif
+ 			}
+ 			break;
+-		case LC_ID_DYLIB: // install_name_tool
++		case LC_ID_DYLIB: { // install_name_tool
++			char *id = r_buf_get_string (buf, addr + 20);
+ 			cb_printf ("0x%08"PFMT64x"  id           %s\n",
+-				addr + 20, r_buf_get_at (buf, addr + 20, NULL));
++				addr + 20, id? id: "");
++			free (id);
+ 			break;
++		}
+ 		case LC_UUID:
+ 			{
+ 				ut8 i, uuid[16];
+@@ -2776,17 +2779,24 @@ void MACH0_(mach_headerfields)(RBinFile *file) {
+ 			}
+ 			break;
+ 		case LC_LOAD_DYLIB:
+-		case LC_LOAD_WEAK_DYLIB:
++		case LC_LOAD_WEAK_DYLIB: {
++			char *load_dylib = r_buf_get_string (buf, addr + 16);
+ 			cb_printf ("0x%08"PFMT64x"  load_dylib  %s\n",
+-				addr + 16, r_buf_get_at (buf, addr + 16, NULL));
++				addr + 16, load_dylib? load_dylib: "");
++			free (load_dylib);
+ 			break;
+-		case LC_RPATH:
+-			cb_printf ("0x%08"PFMT64x"  rpath       %s\n",
+-				addr + 4, r_buf_get_at (buf, addr + 4, NULL));
++		}
++		case LC_RPATH: {
++			char *rpath = r_buf_get_string (buf, addr + 4);
++			cb_printf ("0x%08" PFMT64x "  rpath       %s\n",
++				addr + 4, rpath ? rpath : "");
++			free (rpath);
+ 			break;
++		}
+ 		case LC_CODE_SIGNATURE:
+ 			{
+-			ut32 *words = (ut32*)r_buf_get_at (buf, addr, NULL);
++			ut32 words[2];
++			r_buf_read_at (buf, addr, (ut8 *)words, sizeof (words));
+ 			cb_printf ("0x%08"PFMT64x"  dataoff     0x%08x\n", addr, words[0]);
+ 			cb_printf ("0x%08"PFMT64x"  datasize    %d\n", addr + 4, words[1]);
+ 			cb_printf ("# wtf mach0.sign %d @ 0x%x\n", words[1], words[0]);
+
+
+
+
+@@ -934,9 +934,12 @@ static bool r_bin_mdmp_init_pe_bins(struct r_bin_mdmp_obj *obj) {
+ 		if (!(paddr = r_bin_mdmp_get_paddr (obj, module->base_of_image))) {
+ 			continue;
+ 		}
+-		int left = 0;
+-		const ut8 *b = r_buf_get_at (obj->b, paddr, &left);
+-		buf = r_buf_new_with_bytes (b, R_MIN (left, module->size_of_image));
++		ut8 *b = R_NEWS (ut8, module->size_of_image);
++		if (!b) {
++			continue;
++		}
++		int r = r_buf_read_at (obj->b, paddr, b, module->size_of_image);
++		buf = r_buf_new_with_bytes (b, r);
+ 		dup = false;
+ 		if (check_pe32_buf (buf, module->size_of_image)) {
+ 			r_list_foreach(obj->pe32_bins, it_dup, pe32_dup) {
+
+
+
+
+@@ -88,8 +88,7 @@ RList *r_bin_mz_get_segments (const struct r_bin_mz_obj_t *bin) {
+ 	for (i = 0; i < num_relocs; i++) {
+ 		RBinSection c;
+ 		ut64 laddr, paddr, section_laddr;
+-		ut16 *curr_seg;
+-		int left;
++		ut16 curr_seg;
+ 
+ 		laddr = r_bin_mz_va_to_la (relocs[i].segment, relocs[i].offset);
+ 		if ((laddr + 2) >= bin->load_module_size) {
+@@ -97,12 +96,12 @@ RList *r_bin_mz_get_segments (const struct r_bin_mz_obj_t *bin) {
+ 		}
+ 
+ 		paddr = r_bin_mz_la_to_pa (bin, laddr);
+-		curr_seg = (ut16 *)r_buf_get_at (bin->b, paddr, &left);
+-		if (left < 2) {
++		if (r_buf_size (bin->b) < paddr + 2) {
+ 			continue;
+ 		}
++		cur

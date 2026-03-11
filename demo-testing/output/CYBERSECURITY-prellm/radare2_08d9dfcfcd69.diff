@@ -1,0 +1,120 @@
+@@ -247,6 +247,19 @@ R_API bool r_anal_op_nonlinear(int t) {
+ 	}
+ }
+ 
++R_API bool r_anal_op_ismemref(int t) {
++	switch (t) {
++	case R_ANAL_OP_TYPE_LOAD:
++	case R_ANAL_OP_TYPE_MOV:
++	case R_ANAL_OP_TYPE_STORE:
++	case R_ANAL_OP_TYPE_LEA:
++	case R_ANAL_OP_TYPE_CMP:
++		return true;
++	default:
++		return false;
++	}
++}
++
+ R_API const char *r_anal_optype_to_string(int t) {
+ 	t &= R_ANAL_OP_TYPE_MASK; // ignore the modifier bits... we dont want this!
+ 	switch (t) {
+
+
+
+
+@@ -3302,8 +3302,8 @@ repeat:
+ 	}
+ 
+ 	st64 follow = (st64)r_config_get_i (core->config, "dbg.follow");
+-	ut64 pc = r_debug_reg_get (core->dbg, "PC");
+ 	if (follow > 0) {
++		ut64 pc = r_debug_reg_get (core->dbg, "PC");
+ 		if ((pc < core->offset) || (pc > (core->offset + follow))) {
+ 			r_core_cmd0 (core, "sr PC");
+ 		}
+@@ -3581,6 +3581,8 @@ static void cmd_esil_mem(RCore *core, const char *input) {
+ 			eprintf ("Cannot deinitialize %s\n", name);
+ 		}
+ 		r_flag_unset_name (core->flags, name);
++		r_flag_unset_name (core->flags, "aeim.stack");
++		r_flag_unset_name (core->flags, "aeim.fd");
+ 		// eprintf ("Deinitialized %s\n", name);
+ 		return;
+ 	}
+
+
+
+
+@@ -356,48 +356,75 @@ static void typesList(RCore *core, int mode) {
+ 	}
+ }
+ 
+-static void set_offset_hint (RCore *core, const char *type, ut64 addr, int offimm) {
++static void set_offset_hint (RCore *core, RAnalOp op, const char *type, ut64 addr, int offimm) {
++	const char *res = r_type_get_struct_memb (core->anal->sdb_types, type, offimm);
++	const char *cmt = ((offimm == 0) && res)? res: type;
+ 	if (offimm > 0) {
+-		char *res = r_type_get_struct_memb (core->anal->sdb_types, type, offimm);
+ 		if (res) {
+ 			r_anal_hint_set_offset (core->anal, addr, res);
+ 		}
++	} else if (cmt && r_anal_op_ismemref (op.type)) {
++			r_meta_set_string (core->anal, R_META_TYPE_COMMENT, addr, cmt);
+ 	}
+ }
+ 
+-static void link_struct_offset (RCore *core, RAnalFunction *fcn, const char *type, ut64 taddr) {
++static void link_struct_offset (RCore *core, RAnalFunction *fcn) {
+ 	RAnalBlock *bb;
+ 	RListIter *it;
+ 	RAnalOp aop = {0};
++	bool ioCache = r_config_get_i (core->config, "io.cache");
++	bool stack_set = false;
++	int dbg_follow = r_config_get_i (core->config, "dbg.follow");
++	Sdb *TDB = core->anal->sdb_types;
+ 	RAnalEsil *esil = core->anal->esil;
+ 	int iotrap = r_config_get_i (core->config, "esil.iotrap");
+ 	int stacksize = r_config_get_i (core->config, "esil.stack.depth");
+ 	unsigned int addrsize = r_config_get_i (core->config, "esil.addr.size");
+-	const char *pc_name = r_reg_get_name (core->dbg->reg, R_REG_NAME_PC);
+-	RRegItem *pc = r_reg_get (core->dbg->reg, pc_name, -1);
++	const char *pc_name = r_reg_get_name (core->anal->reg, R_REG_NAME_PC);
++	const char *sp_name = r_reg_get_name (core->anal->reg, R_REG_NAME_SP);
++	RRegItem *pc = r_reg_get (core->anal->reg, pc_name, -1);
+ 
+ 	if (!fcn) {
+ 		return;
+ 	}
+-	r_reg_arena_push (core->anal->reg);
+ 	if (!(esil = r_anal_esil_new (stacksize, iotrap, addrsize))) {
+ 		return;
+ 	}
++	r_anal_esil_setup (esil, core->anal, 0, 0, 0);
+ 	int i, ret, bsize = R_MAX (64, core->blocksize);
+ 	const int mininstrsz = r_anal_archinfo (core->anal, R_ANAL_ARCHINFO_MIN_OP_SIZE);
+ 	const int minopcode = R_MAX (1, mininstrsz);
++	const int maxopcode = R_MAX (16, r_anal_archinfo (core->anal, R_ANAL_ARCHINFO_MAX_OP_SIZE));
+ 	ut8 *buf = malloc (bsize);
+ 	if (!buf) {
+ 		free (buf);
+ 		r_anal_esil_free (esil);
+ 		return;
+ 	}
++	r_reg_arena_push (core->anal->reg);
++	r_debug_reg_sync (core->dbg, R_REG_TYPE_ALL, true);
++	ut64 spval = r_reg_getv (esil->anal->reg, sp_name);
++	if (spval) {
++		// reset stack pointer to intial value
++		RRegItem *sp = r_reg_get (esil->anal->reg, sp_name, -1);
++		ut64 curpc = r_reg_getv (esil->anal->reg, pc_name);
++		int delta = (curpc > fcn->addr)? curpc - fcn->addr: 0;
++		if (delta > maxopcode) {
++			r_reg_set_value (esil->anal->reg, sp, spval + fcn->maxstack);
++		}
++	} else {
++		// intialize stack
++		r_core_cmd0 (core, "aeim");
++		stack_set = true;
++	}
++	r_config_set_i (core->config, "io.cache", 1);
++	r_confi

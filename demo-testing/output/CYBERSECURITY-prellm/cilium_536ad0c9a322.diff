@@ -1,0 +1,133 @@
+@@ -80,7 +80,7 @@
+ #define CILIUM_CALL_IPV4_TO_ENDPOINT		13
+ #define CILIUM_CALL_IPV6_TO_ENDPOINT		14
+ #define CILIUM_CALL_IPV4_NODEPORT_NAT_EGRESS	15
+-#define CILIUM_CALL_IPV6_NODEPORT_NAT		16
++#define CILIUM_CALL_IPV6_NODEPORT_NAT_EGRESS	16
+ #define CILIUM_CALL_IPV4_NODEPORT_REVNAT	17
+ #define CILIUM_CALL_IPV6_NODEPORT_REVNAT	18
+ #define CILIUM_CALL_IPV4_ENCAP_NODEPORT_NAT	19
+@@ -101,7 +101,8 @@
+ #define CILIUM_CALL_SRV6_DECAP			34
+ #define CILIUM_CALL_SRV6_REPLY			35
+ #define CILIUM_CALL_IPV4_NODEPORT_NAT_INGRESS	36
+-#define CILIUM_CALL_SIZE			37
++#define CILIUM_CALL_IPV6_NODEPORT_NAT_INGRESS	37
++#define CILIUM_CALL_SIZE			38
+ 
+ typedef __u64 mac_t;
+ 
+
+
+
+
+@@ -571,10 +571,48 @@ drop_err:
+ }
+ #endif /* ENABLE_DSR */
+ 
+-__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT)
+-int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
++__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT_INGRESS)
++int tail_nodeport_nat_ingress_ipv6(struct __ctx_buff *ctx)
++{
++	const bool nat_46x64 = ctx_load_meta(ctx, CB_NAT_46X64);
++	union v6addr tmp = IPV6_DIRECT_ROUTING;
++	struct ipv6_nat_target target = {
++		.min_port = NODEPORT_PORT_MIN_NAT,
++		.max_port = NODEPORT_PORT_MAX_NAT,
++		.src_from_world = true,
++	};
++	int ret;
++
++	if (nat_46x64)
++		build_v4_in_v6(&tmp, IPV4_DIRECT_ROUTING);
++	target.addr = tmp;
++
++	ret = snat_v6_process(ctx, NAT_DIR_INGRESS, &target);
++	if (IS_ERR(ret)) {
++		/* In case of no mapping, recircle back to main path. SNAT is very
++		 * expensive in terms of instructions (since we don't have BPF to
++		 * BPF calls as we use tail calls) and complexity, hence this is
++		 * done inside a tail call here.
++		 */
++		bpf_skip_nodeport_set(ctx);
++		ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
++		ret = DROP_MISSED_TAIL_CALL;
++		goto drop_err;
++	}
++
++	bpf_mark_snat_done(ctx);
++
++	ep_tail_call(ctx, CILIUM_CALL_IPV6_NODEPORT_REVNAT);
++	ret = DROP_MISSED_TAIL_CALL;
++	goto drop_err;
++
++ drop_err:
++	return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, METRIC_INGRESS);
++}
++
++__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT_EGRESS)
++int tail_nodeport_nat_ipv6_egress(struct __ctx_buff *ctx)
+ {
+-	enum nat_dir dir = (enum nat_dir)ctx_load_meta(ctx, CB_NAT);
+ 	const bool nat_46x64 = ctx_load_meta(ctx, CB_NAT_46X64);
+ 	union v6addr tmp = IPV6_DIRECT_ROUTING;
+ 	struct bpf_fib_lookup_padded fib_params = {
+@@ -593,69 +631,52 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 	struct ipv6hdr *ip6;
+ 	int ret, ext_err = 0;
+ 
++#ifdef TUNNEL_MODE
++	struct remote_endpoint_info *info;
++	union v6addr *dst;
++#endif
++
+ 	if (nat_46x64)
+ 		build_v4_in_v6(&tmp, IPV4_DIRECT_ROUTING);
+ 	target.addr = tmp;
++
+ #ifdef TUNNEL_MODE
+-	if (dir == NAT_DIR_EGRESS) {
+-		struct remote_endpoint_info *info;
+-		union v6addr *dst;
++	if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
++		ret = DROP_INVALID;
++		goto drop_err;
++	}
+ 
+-		if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
+-			ret = DROP_INVALID;
++	dst = (union v6addr *)&ip6->daddr;
++	info = ipcache_lookup6(&IPCACHE_MAP, dst, V6_CACHE_KEY_LEN);
++	if (info && info->tunnel_endpoint != 0) {
++		ret = __encap_with_nodeid(ctx, info->tunnel_endpoint,
++					  WORLD_ID,
++					  NOT_VTEP_DST,
++					  (enum trace_reason)CT_NEW,
++					  TRACE_PAYLOAD_LEN);
++		if (ret)
+ 			goto drop_err;
+-		}
+-
+-		dst = (union v6addr *)&ip6->daddr;
+-		info = ipcache_lookup6(&IPCACHE_MAP, dst, V6_CACHE_KEY_LEN);
+-		if (info != NULL && info->tunnel_endpoint != 0) {
+-			ret = __encap_with_nodeid(ctx, info->tunnel_endpoint,
+-						  WORLD_ID,
+-						  NOT_VTEP_DST,
+-						  (enum trace_reason)CT_NEW,
+-						  TRACE_PAYLOAD_LEN);
+-			if (ret)
+-				goto drop_err;
+ 
+-			BPF_V6(target.addr, ROUTER_IP);
+-			fib_params.l.ifindex = ENCAP_IFINDEX;
++		BPF_V6(target.addr, ROUTER_IP);
++		fib_params.l.ifindex = ENCAP_IFINDEX;
+ 
+-			/* fib lookup not necessary when going over tunnel. */
+-			if (eth_store_daddr(ctx, fib_params.l.dmac, 0) < 0) {
+-				ret = DROP_WRITE_ERROR;
+-				goto drop_err;
+-			}
+-			if (eth_store_saddr

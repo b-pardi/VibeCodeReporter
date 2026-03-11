@@ -1,0 +1,99 @@
+@@ -69,9 +69,11 @@ std::shared_ptr<const Cilium::PolicyHostMap>
+ createHostMap(Server::Configuration::ListenerFactoryContext& context) {
+   return context.singletonManager().getTyped<const Cilium::PolicyHostMap>(
+     SINGLETON_MANAGER_REGISTERED_NAME(cilium_host_map), [&context] {
+-      return std::make_shared<Cilium::PolicyHostMap>(
+-        context.localInfo().node(), context.clusterManager(),
+-	context.dispatcher(), context.scope(), context.threadLocal());
++      auto map = std::make_shared<Cilium::PolicyHostMap>(
++          context.localInfo().node(), context.clusterManager(),
++	  context.dispatcher(), context.scope(), context.threadLocal());
++      map->startSubscription();
++      return map;
+     });
+ }
+ 
+
+
+
+
+@@ -129,7 +129,6 @@ PolicyHostMap::PolicyHostMap(std::unique_ptr<Envoy::Config::Subscription<cilium:
+ 			     ThreadLocal::SlotAllocator& tls)
+   : PolicyHostMap(tls) {
+   subscription_ = std::move(subscription);
+-  subscription_->start({}, *this);
+ }
+ 
+ PolicyHostMap::PolicyHostMap(const envoy::api::v2::core::Node& node, Upstream::ClusterManager& cm,
+@@ -154,8 +153,16 @@ void PolicyHostMap::onConfigUpdate(const ResourceVector& resources) {
+     newmap->insert(config);
+   }
+ 
++  // Force 'this' to be not deleted for as long as the lambda stays
++  // alive.  Note that generally capturing a shared pointer is
++  // dangerous as it may happen that there is a circular reference
++  // from 'this' to itself via the lambda capture, leading to 'this'
++  // never being released. It should happen in this case, though.
++  std::shared_ptr<PolicyHostMap> shared_this = shared_from_this();
++
+   // Assign the new map to all threads.
+-  tls_->set([newmap](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
++  tls_->set([shared_this, newmap](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
++      UNREFERENCED_PARAMETER(shared_this);
+       return newmap;
+   });
+ }
+
+
+
+
+@@ -46,6 +46,7 @@ enum ID : uint64_t { UNKNOWN = 0, WORLD = 2 };
+ 
+ class PolicyHostMap : public Singleton::Instance,
+                       Config::SubscriptionCallbacks<cilium::NetworkPolicyHosts>,
++                      public std::enable_shared_from_this<PolicyHostMap>,
+                       public Logger::Loggable<Logger::Id::config> {
+ public:
+   PolicyHostMap(const envoy::api::v2::core::Node& node,
+@@ -56,6 +57,8 @@ public:
+   PolicyHostMap(ThreadLocal::SlotAllocator& tls);
+   ~PolicyHostMap() {}
+ 
++  void startSubscription() { subscription_->start({}, *this); }
++
+   // A shared pointer to a immutable copy is held by each thread. Changes are done by
+   // creating a new version and assigning the new shared pointer to the thread local
+   // slot on each thread.
+
+
+
+
+@@ -125,8 +125,10 @@ createHostMap(const std::string& config, Server::Configuration::ListenerFactoryC
+ 	  std::make_unique<Envoy::Config::FilesystemSubscriptionImpl<cilium::NetworkPolicyHosts>>(
+               context.dispatcher(), path, stats);
+        
+-        return std::make_shared<Cilium::PolicyHostMap>(std::move(subscription),
+-						       context.threadLocal());
++        auto map = std::make_shared<Cilium::PolicyHostMap>(std::move(subscription),
++							   context.threadLocal());
++        map->startSubscription();
++        return map;
+     });
+ }
+ 
+@@ -185,7 +187,9 @@ createPolicyMap(const std::string& config, Server::Configuration::FactoryContext
+         Envoy::Config::SubscriptionStats stats = Envoy::Config::Utility::generateStats(context.scope());
+         auto subscription = std::make_unique<Envoy::Config::FilesystemSubscriptionImpl<cilium::NetworkPolicy>>(context.dispatcher(), path, stats);
+        
+-        return std::make_shared<Cilium::NetworkPolicyMap>(std::move(subscription), context.threadLocal());
++        auto map = std::make_shared<Cilium::NetworkPolicyMap>(std::move(subscription), context.threadLocal());
++	map->startSubscription();
++	return map;
+       });
+ }
+ 
+@@ -383,31 +387,31 @@ resources:
+   host_addresses: [ "0.0.0.0/0", "::/0" ]
+ )EOF";
+ 
+-

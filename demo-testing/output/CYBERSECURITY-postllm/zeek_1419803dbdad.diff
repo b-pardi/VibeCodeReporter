@@ -1,0 +1,127 @@
+@@ -213,12 +213,16 @@ void ValTrace::ComputeDelta(const ValTrace* prev, DeltaVector& deltas) const
+ 			// use the constant representation instead.
+ 			break;
+ 
++		case TYPE_ANY:
+ 		case TYPE_FILE:
+ 		case TYPE_OPAQUE:
+-		case TYPE_ANY:
+-			// These we have no way of creating as constants.
+-			reporter->Error("cannot generate an event trace for an event of type %s",
+-			                type_name(tag));
++			// If we have a previous instance, we can ignore this
++			// one, because we know it's equivalent (due to the
++			// test at the beginning of this method), and it's
++			// not meaningful to recurse inside it looking for
++			// interior changes.
++			if ( ! prev )
++				deltas.emplace_back(std::make_unique<DeltaUnsupportedCreate>(this));
+ 			break;
+ 
+ 		case TYPE_LIST:
+@@ -241,6 +245,13 @@ void ValTrace::ComputeDelta(const ValTrace* prev, DeltaVector& deltas) const
+ 			if ( prev )
+ 				ComputeTableDelta(prev, deltas);
+ 
++			else if ( GetType()->AsTableType()->IsUnspecifiedTable() )
++				// For unspecified values, we generate them
++				// as empty constructors, because we don't
++				// know their yield type and thus can't
++				// create variables corresponding to them.
++				break;
++
+ 			else if ( t->Yield() )
+ 				deltas.emplace_back(std::make_unique<DeltaTableCreate>(this));
+ 			else
+@@ -250,6 +261,11 @@ void ValTrace::ComputeDelta(const ValTrace* prev, DeltaVector& deltas) const
+ 		case TYPE_VECTOR:
+ 			if ( prev )
+ 				ComputeVectorDelta(prev, deltas);
++
++			else if ( GetType()->AsVectorType()->IsUnspecifiedVector() )
++				// See above for empty tables/sets.
++				break;
++
+ 			else
+ 				deltas.emplace_back(std::make_unique<DeltaVectorCreate>(this));
+ 			break;
+@@ -722,6 +738,11 @@ std::string DeltaVectorCreate::Generate(ValTraceMgr* vtm) const
+ 	return std::string(" = vector(") + vec + ")";
+ 	}
+ 
++std::string DeltaUnsupportedCreate::Generate(ValTraceMgr* vtm) const
++	{
++	return " = UNSUPPORTED " + obj_desc_short(vt->GetVal()->GetType().get());
++	}
++
+ EventTrace::EventTrace(const ScriptFunc* _ev, double _nt, size_t event_num) : ev(_ev), nt(_nt)
+ 	{
+ 	auto ev_name = std::regex_replace(ev->Name(), std::regex(":"), "_");
+@@ -770,13 +791,19 @@ void EventTrace::Generate(FILE* f, ValTraceMgr& vtm, const DeltaGenVec& dvec, st
+ 		fprintf(f, "\t");
+ 
+ 		auto& val = d.GetVal();
++		bool define_local = d.IsFirstDef() && ! vtm.IsGlobal(val);
+ 
+-		if ( d.IsFirstDef() && ! vtm.IsGlobal(val) )
++		if ( define_local )
+ 			fprintf(f, "local ");
+ 
+ 		if ( d.NeedsLHS() )
++			{
+ 			fprintf(f, "%s", vtm.ValName(val).c_str());
+ 
++			if ( define_local )
++				fprintf(f, ": %s", obj_desc_short(val->GetType().get()).c_str());
++			}
++
+ 		auto anno = offset < num_pre ? " # from script" : "";
+ 
+ 		fprintf(f, "%s;%s\n", d.RHS().c_str(), anno);
+@@ -798,7 +825,8 @@ void EventTrace::Generate(FILE* f, ValTraceMgr& vtm, const DeltaGenVec& dvec, st
+ 		}
+ 	else
+ 		{
+-		fprintf(f, "\tset_network_time(double_to_time(%.06f));\n", nt);
++		auto tm = vtm.TimeConstant(nt);
++		fprintf(f, "\tset_network_time(%s);\n", tm.c_str());
+ 		fprintf(f, "\tevent __EventTrace::%s();\n", successor.c_str());
+ 		}
+ 
+@@ -870,64 +898,26 @@ const std::string& ValTraceMgr::ValName(const ValPtr& v)
+ 	{
+ 	auto find = val_names.find(v.get());
+ 	if ( find == val_names.end() )
+-		{
+-		if ( IsAggr(v->GetType()) )
+-			{ // Aggregate shouldn't exist; create it
+-			ASSERT(val_map.count(v.get()) == 0);
+-			NewVal(v);
+-			find = val_names.find(v.get());
+-			}
++		find = val_names.insert({v.get(), GenValName(v)}).first;
+ 
+-		else
+-			{ // Non-aggregate can be expressed using a constant
+-			auto tag = v->GetType()->Tag();
+-			std::string rep;
+-
+-			if ( tag == TYPE_STRING )
+-				{
+-				auto s = v->AsStringVal();
+-				rep = escape_string(s->Bytes(), s->Len());
+-				}
+-
+-			else if ( tag == TYPE_LIST )
+-				{
+-				auto lv = cast_intrusive<ListVal>(v);
+-				for ( auto& v_i : lv->Vals() )
+-					{
+-					if ( ! rep.empty() )
+-						rep += ", ";
+-
+-					rep += ValName(v_i);
+-					}
+-				}
+-
+-			else if ( tag == TY

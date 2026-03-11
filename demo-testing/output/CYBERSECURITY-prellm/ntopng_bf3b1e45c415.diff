@@ -1,0 +1,109 @@
+@@ -118,6 +118,8 @@ class Flow : public GenericHashEntry {
+   ProcessInfo *client_proc, *server_proc;
+   /* Container Information */
+   ContainerInfo *client_cont, *server_cont;
++  /* Tcp Information */
++  TcpInfo *client_tcp, *server_tcp;
+ 
+   /* Stats */
+   u_int32_t cli2srv_packets, srv2cli_packets;
+@@ -498,7 +500,7 @@ class Flow : public GenericHashEntry {
+ #ifdef HAVE_EBPF
+   void setProcessInfo(eBPFevent *event, bool client_process);
+ #endif
+-  void setProcessInfo(const Parsed_eBPF * const ebpf, bool client_process);
++  void setParsedeBPFInfo(const Parsed_eBPF * const ebpf, bool client_process);
+ };
+ 
+ #endif /* _FLOW_H_ */
+
+
+
+
+@@ -113,6 +113,8 @@ class Utils {
+   static int numberOfSetBits(u_int32_t i);
+   static void initRedis(Redis **r, const char *redis_host, const char *redis_password,
+ 			u_int16_t redis_port, u_int8_t _redis_db_id, bool giveup_on_failure);
++  static int tcpStateStr2State(const char * const state_str);
++  static const char * tcpState2StateStr(int state);
+   static bool str2DetailsLevel(const char *details, DetailsLevel *out);
+   static u_int32_t roundTime(u_int32_t now, u_int32_t rounder, int32_t offset_from_utc);
+   static bool isCriticalNetworkProtocol(u_int16_t protocol_id);
+
+
+
+
+@@ -194,6 +194,14 @@ typedef struct {
+   } k8s;
+ } ContainerInfo;
+ 
++typedef struct {
++  int conn_state;
++  u_int32_t rcvd_bytes;
++  u_int32_t retx_pkts, lost_pkts;
++  u_int32_t in_segs, out_segs, unacked_segs;
++  double rtt, rtt_var;
++} TcpInfo;
++
+ typedef struct zmq_flow_core {
+   u_int8_t version; /* 0 so far */
+ 
+@@ -219,7 +227,8 @@ typedef struct zmq_flow_core {
+ typedef struct zmq_flow_ebpf {
+   ProcessInfo process_info;
+   ContainerInfo container_info;
+-  bool process_info_set, container_info_set;
++  TcpInfo tcp_info;
++  bool process_info_set, container_info_set, tcp_info_set;
+ } Parsed_eBPF;
+ 
+ /* Handle vendor-proprietary applications.
+
+
+
+
+@@ -62,6 +62,7 @@ Flow::Flow(NetworkInterface *_iface,
+   ndpiFlow = NULL, cli_id = srv_id = NULL;
+   client_proc = server_proc = NULL;
+   client_cont = server_cont = NULL;
++  client_tcp = server_tcp = NULL;
+   json_info = strdup("{}"), cli2srv_direction = true, twh_over = twh_ok = false,
+     dissect_next_http_packet = false,
+     check_tor = false, host_server_name = NULL, diff_num_http_requests = 0,
+@@ -241,6 +242,9 @@ Flow::~Flow() {
+     free(server_cont);
+   }
+ 
++  if(client_tcp) free(client_tcp);
++  if(server_tcp) free(server_tcp);
++
+   if(isHTTP()) {
+     if(protos.http.last_method) free(protos.http.last_method);
+     if(protos.http.last_url)    free(protos.http.last_url);
+@@ -3686,11 +3690,17 @@ void Flow::setProcessInfo(eBPFevent *event, bool client_process) {
+ 
+ /* ***************************************************** */
+ 
+-void Flow::setProcessInfo(const Parsed_eBPF * const ebpf, bool client_process) {
+-  const ProcessInfo *pi = ebpf && ebpf->process_info_set ? &ebpf->process_info : NULL;
+-  const ContainerInfo *ci = ebpf && ebpf->container_info_set ? &ebpf->container_info : NULL;
++void Flow::setParsedeBPFInfo(const Parsed_eBPF * const ebpf, bool client_process) {
++  if(!ebpf)
++    return;
++
++  const ProcessInfo *pi = ebpf->process_info_set ? &ebpf->process_info : NULL;
++  const ContainerInfo *ci = ebpf->container_info_set ? &ebpf->container_info : NULL;
++  const TcpInfo *ti = ebpf->tcp_info_set ? &ebpf->tcp_info : NULL;
++
+   ProcessInfo   **process_info   = client_process ? &client_proc : &server_proc;
+   ContainerInfo **container_info = client_process ? &client_cont : &server_cont;
++  TcpInfo **tcp_info = client_process ? &client_tcp : &server_tcp;
+ 
+   if(pi && (*process_info || (*process_info = (ProcessInfo*)calloc(1, sizeof(ProcessInfo))))) {
+     ProcessInfo *cur = *process_info;
+@@ -3709,6 +3719,11 @@ void Flow::setProcessInfo(const Parsed_eBPF * const ebpf, bool client_process) {
+     if(ci->k8s.pod)  cur->k8s.pod  = strdup(ci->k8s.pod);
+     if(ci->k8s.ns)   cur->k8s.ns   = strdup(ci->k8s.ns);
+   }
++
++  if(ti && (*tcp_info || (*tcp_info = (TcpInfo*)calloc(

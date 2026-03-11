@@ -1,0 +1,149 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,8 @@
++/* radare - LGPL - Copyright 2021 - pancake */
++
++#include <r_main.h>
++
++int main(int argc, const char **argv) {
++	return r_main_r2pm (argc, argv);
++}
++
+
+
+
+
+@@ -38,6 +38,7 @@ R_API int r_main_rafind2(int argc, const char **argv);
+ R_API int r_main_radiff2(int argc, const char **argv);
+ R_API int r_main_ragg2(int argc, const char **argv);
+ R_API int r_main_rasign2(int argc, const char **argv);
++R_API int r_main_r2pm(int argc, const char **argv);
+ 
+ #ifdef __cplusplus
+ }
+
+
+
+
+@@ -1,7 +1,5 @@
+-/* radare - LGPL - Copyright 2012-2020 - pancake */
++/* radare - LGPL - Copyright 2012-2021 - pancake */
+ 
+-#include <stdio.h>
+-#include <string.h>
+ #include <r_main.h>
+ #include <r_util.h>
+ 
+@@ -9,6 +7,7 @@ R_LIB_VERSION(r_main);
+ 
+ static RMain foo[] = {
+ 	{ "r2", r_main_radare2 },
++	{ "r2pm", r_main_r2pm },
+ 	{ "rax2", r_main_rax2 },
+ 	{ "radiff2", r_main_radiff2 },
+ 	{ "rafind2", r_main_rafind2 },
+@@ -20,8 +19,8 @@ static RMain foo[] = {
+ 	{ NULL, NULL }
+ };
+ 
+-R_API RMain *r_main_new (const char *name) {
+-	int i = 0;
++R_API RMain *r_main_new(const char *name) {
++	size_t i = 0;
+ 	while (foo[i].name) {
+ 		if (!strcmp (name, foo[i].name)) {
+ 			RMain *m = R_NEW0 (RMain);
+@@ -47,7 +46,9 @@ R_API int r_main_run(RMain *m, int argc, const char **argv) {
+ 
+ R_API int r_main_version_print(const char *progname) {
+ 	char *s = r_str_version (progname);
+-	printf ("%s\n", s);
+-	free (s);
++	if (s) {
++		printf ("%s\n", s);
++		free (s);
++	}
+ 	return 0;
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,568 @@
++/* radare - LGPL - Copyright 2021 - pancake */
++
++#include <r_main.h>
++
++static int r_main_r2pm_sh(int argc, const char **argv) {
++	int i;
++	RStrBuf *sb = r_strbuf_new ("r2pm.sh");
++	for (i = 1; i < argc; i++) {
++		r_strbuf_appendf (sb, " %s", argv[i]);
++	}
++	char *cmd = r_strbuf_drain (sb);
++	int res = r_sandbox_system (cmd, 0);
++	free (cmd);
++	return res;
++}
++
++static const char *helpmsg = \
++"Usage: r2pm [-flags] [pkgs...]\n"\
++"Commands:\n"\
++" -c ([git/dir])      clear source cache (GITDIR)\n"\
++" -ci <pkgname>       clean + install\n"\
++" -cp                 clean the user's home plugin directory\n"\
++" -d,doc [pkgname]    show documentation for given package\n"\
++" -f                  force operation (install, uninstall, ..)\n"\
++" -gi <pkg>           global install (system-wide)\n"\
++" -h                  show this message\n"\
++" -H variable         show value of given variable\n"\
++" -I                  information about repository and installed packages\n"\
++" -i <pkgname>        install or update package in your home (pkgname=all)\n"\
++" -l                  list installed pkgs\n"\
++" -r [cmd ...args]    run shell command with R2PM_BINDIR in PATH\n"\
++" -s [<keyword>]      search in database\n"\
++" -uci <pkgname>      uninstall + clean + install\n"\
++" -ui <pkgname>       uninstall + install\n"\
++" -u <pkgname>        r2pm -u baleful (See -f to force uninstall)\n"\
++" -U                  r2pm -U (upgrade all outdated packages)\n"\
++" -v                  show version\n"\
++"Environment:\n"\
++" SUDO=sudo           use this tool as sudo\n"\
++" R2PM_PLUGDIR=${R2PM_PLUGDIR}\n"\
++" R2PM_BINDIR=${R2PM_BINDIR}\n"\
++" R2PM_OFFLINE=0      disabled by default, avoid init/update calls if set to !=0\n"\
++" R2PM_NATIVE=0       set to 1 to use the native C codepath for r2pm\n"\
++" R2PM_DBDIR=${R2PM_DBDIR}\n"\
++" R2PM_GITDIR=${R2PM_GITDIR}\n"\
++" R2PM_GITSKIP=${R2PM_GITSKIP}\n";
++
++typedef struct r_r2pm_t {
++	bool help;
++	bool clean;
++	bool force;
++	bool global;
++	bool list;
++	bool init;
++	bool run;
++	bool doc;
++	bool search;
++	bool version;
++	bool info;
++	bool install;
++	bool uninstall;
++} R2Pm;
++
++static int git_pull(const char *dir) {
++	char *s = r_str_newf ("cd %s\ngit pull", dir);
++	int rc = r_sandbox_system (s, 0);
++	free (s);
++	return rc;
++}
++
++static int git_clone(const char *dir, const char *url) {
++	char *cmd = r_str_newf ("git clone -q --depth=3 --recursive %s %s", url, dir);
++	int rc = r_sandbox_system (cmd, 0);
++

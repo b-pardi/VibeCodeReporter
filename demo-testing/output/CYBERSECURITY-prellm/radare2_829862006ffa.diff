@@ -1,0 +1,125 @@
+@@ -130,8 +130,6 @@ static void pair_str(PJ *pj, const char *key, const char *val) {
+ 	}
+ }
+ 
+-R_API int r_core_bin_set_cur(RCore *core, RBinFile *binfile);
+-
+ static ut64 rva(RBin *bin, ut64 paddr, ut64 vaddr, int va) {
+ 	if (va == VA_TRUE) {
+ 		if (paddr != UT64_MAX) {
+@@ -347,20 +345,25 @@ R_API int r_core_bin_set_env(RCore *r, RBinFile *binfile) {
+ 	return false;
+ }
+ 
+-R_API int r_core_bin_set_cur(RCore *core, RBinFile *binfile) {
++R_API bool r_core_bin_set_cur(RCore *core, RBinFile *binfile) {
++	r_return_val_if_fail (core && binfile, false);
++	ut32 fd = UT32_MAX;
+ 	if (!core->bin) {
+ 		return false;
+ 	}
+ 	if (!binfile) {
+-		// Find first available binfile
+-		ut32 fd = r_core_file_cur_fd (core);
+-		binfile = fd != (ut32)-1
+-				  ? r_bin_file_find_by_fd (core->bin, fd)
+-				  : NULL;
+-		if (!binfile) {
+-			return false;
++		if (core && core->io->desc) {
++			fd = core->io->desc->fd;
+ 		}
+ 	}
++	// Find first available binfile
++	if (fd == UT32_MAX) {
++		return false;
++	}
++	binfile = r_bin_file_find_by_fd (core->bin, fd);
++	if (!binfile) {
++		return false;
++	}
+ 	r_bin_file_set_cur_binfile (core->bin, binfile);
+ 	return true;
+ }
+@@ -2786,7 +2789,9 @@ static int bin_sections(RCore *r, PJ *pj, int mode, ut64 laddr, int va, ut64 at,
+ 	} else if (IS_MODE_NORMAL (mode) && printHere) {
+ 		r_cons_printf ("Current section\n");
+ 	} else if (IS_MODE_SET (mode)) {
+-		fd = r_core_file_cur_fd (r);
++		if (r && r->io->desc) {
++			fd = r->io->desc->fd;
++		}
+ 		r_flag_space_set (r->flags, print_segments? R_FLAGS_FS_SEGMENTS: R_FLAGS_FS_SECTIONS);
+ 	}
+ 	if (IS_MODE_NORMAL (mode)) {
+
+
+
+
+@@ -9,6 +9,24 @@
+ static int r_core_file_do_load_for_debug(RCore *r, ut64 loadaddr, const char *filenameuri);
+ static int r_core_file_do_load_for_io_plugin(RCore *r, ut64 baseaddr, ut64 loadaddr);
+ 
++static bool close_but_cb(void *user, void *data, ut32 id) {
++       RCore *core = (RCore *)user;
++       RIODesc *desc = (RIODesc *)data;
++       if (core && desc && core->io->desc) {
++               if (desc->fd != core->io->desc->fd) {
++                       // TODO: use the API
++                       r_core_cmdf (core, "o-%d", desc->fd);
++               }
++       }
++       return true;
++}
++
++// TODO: move to IO as a helper?
++R_API bool r_core_file_close_all_but(RCore *core) {
++       r_id_storage_foreach (core->io->files, close_but_cb, core);
++       return true;
++}
++
+ static bool __isMips (RAsm *a) {
+ 	return a && a->cur && a->cur->arch && strstr (a->cur->arch, "mips");
+ }
+@@ -27,15 +45,15 @@ static void loadGP(RCore *core) {
+ 	}
+ }
+ 
+-R_API int r_core_file_reopen(RCore *core, const char *args, int perm, int loadbin) {
++R_API bool r_core_file_reopen(RCore *core, const char *args, int perm, int loadbin) {
+ 	int isdebug = r_config_get_i (core->config, "cfg.debug");
+ 	char *path;
+ 	ut64 laddr = r_config_get_i (core->config, "bin.laddr");
+-	RCoreFile *file = NULL;
++	RIODesc *file = NULL;
+ 	RIODesc *odesc = core->io ? core->io->desc : NULL;
+ 	RBinFile *bf = odesc ? r_bin_file_find_by_fd (core->bin, odesc->fd) : NULL;
+ 	char *ofilepath = NULL, *obinfilepath = (bf && bf->file)? strdup (bf->file): NULL;
+-	int ret = false;
++	bool ret = false;
+ 	ut64 origoff = core->offset;
+ 	if (odesc) {
+ 		if (odesc->referer) {
+@@ -127,7 +145,7 @@ R_API int r_core_file_reopen(RCore *core, const char *args, int perm, int loadbi
+ 				had_rbin_info = true;
+ 			}
+ 		}
+-		r_core_file_close_fd (core, odesc->fd);
++		r_io_fd_close (core->io, odesc->fd);
+ 		eprintf ("File %s reopened in %s mode\n", path,
+ 			(perm & R_PERM_W)? "read-write": "read-only");
+ 
+@@ -212,12 +230,6 @@ R_API void r_core_sysenv_end(RCore *core, const char *cmd) {
+ 	}
+ }
+ 
+-#if DISCUSS
+-EDITOR r_sys_setenv ("EDITOR", r_config_get (core->config, "cfg.editor"));
+-CURSOR cursor position (offset from curseek)
+-VERBOSE cfg.verbose
+-#endif
+-
+ R_API char *r_core_sysenv_begin(RCore * core, const char *cmd) {
+ 	char *f, *ret = cmd? strdup (cmd): NULL;
+ 	RIODesc *desc = core->io->desc;
+@@ -598,7 +610,6 @@ static bool linkcb(void *use

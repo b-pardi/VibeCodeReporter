@@ -1,0 +1,109 @@
+@@ -296,6 +296,8 @@ static inline bool panda_in_kernel(CPUState *cpu) {
+ #if defined(TARGET_I386)
+     return ((env->hflags & HF_CPL_MASK) == 0);
+ #elif defined(TARGET_ARM)
++    // Note: returns true for non-SVC modes (hypervisor, monitor, system, etc).
++    // See: https://www.keil.com/pack/doc/cmsis/Core_A/html/group__CMSIS__CPSR__M.html
+     return ((env->uncached_cpsr & CPSR_M) > ARM_CPU_MODE_USR);
+ #elif defined(TARGET_PPC)
+     return msr_pr;
+
+
+
+
+@@ -17,6 +17,7 @@ PANDAENDCOMMENT */
+ // 2019-JAN-29   do not put an entry in the callstack if the block was stopped
+ //               before the call at the end was made
+ // 2019-MAY-21   add (more accurate) stack segregation option (threaded)
++// 2020-SEPT-8   add MIPS32 support, switch to central "panda_in_kernel()"
+ #define __STDC_FORMAT_MACROS
+ 
+ #include <cinttypes>
+@@ -36,6 +37,8 @@ PANDAENDCOMMENT */
+ #include <capstone/arm.h>
+ #elif defined(TARGET_PPC)
+ #include <capstone/ppc.h>
++#elif defined(TARGET_MIPS)
++#include <capstone/mips.h>
+ #endif
+ 
+ #include "panda/plugin.h"
+@@ -149,21 +152,15 @@ void verbose_log(const char *msg, TranslationBlock *tb, stackid curStackid,
+     // end of function verbose_log
+ }
+ 
+-static inline bool in_kernelspace(CPUArchState* env) {
+-#if defined(TARGET_I386)
+-    return ((env->hflags & HF_CPL_MASK) == 0);
+-#elif defined(TARGET_ARM)
+-    return ((env->uncached_cpsr & CPSR_M) == ARM_CPU_MODE_SVC);
+-#else
+-    return false;
+-#endif
+-}
+-
+ static inline target_ulong get_stack_pointer(CPUArchState* env) {
+ #if defined(TARGET_I386)
+     return env->regs[R_ESP];
+ #elif defined(TARGET_ARM)
+     return env->regs[13];
++#elif defined(TARGET_MIPS)
++    return env->active_tc.gpr[29]; // $sp
++#elif defined(TARGET_PPC)
++    return env->gpr[1]; // r1
+ #else
+     return 0;
+ #endif
+@@ -171,14 +168,15 @@ static inline target_ulong get_stack_pointer(CPUArchState* env) {
+ 
+ // get the stackid when the heuristic stack segregation method is in use
+ // assumes stack_segregation is STACK_HEURISTIC
+-static stackid get_heuristic_stackid(CPUArchState* env) {
++static stackid get_heuristic_stackid(CPUState* cpu) {
+     // why is this part of get_stackid removed from it? to make SonarQube stop
+     // complaining about get_stackid having too many return statements without
+     // causing it to complain about if statements being nested too deep
+     target_ulong asid;
++    CPUArchState *env = static_cast<CPUArchState *>(cpu->env_ptr);
+ 
+     // Track all kernel-mode stacks together
+-    if (in_kernelspace(env)) {
++    if (panda_in_kernel(cpu)) {
+         asid = 0;
+     } else {
+         asid = panda_current_asid(ENV_GET_CPU(env));
+@@ -224,10 +222,13 @@ static stackid get_heuristic_stackid(CPUArchState* env) {
+     return cursi;
+ }
+ 
+-static stackid get_stackid(CPUArchState* env) {
+-    int in_kernel = in_kernelspace(env);
++static stackid get_stackid(CPUState* cpu) {
++
++    int in_kernel = panda_in_kernel(cpu);
++    CPUArchState *env = static_cast<CPUArchState *>(cpu->env_ptr);
++
+     if (STACK_HEURISTIC == stack_segregation) {
+-        return get_heuristic_stackid(env);
++        return get_heuristic_stackid(cpu);
+     } else if (STACK_THREADED == stack_segregation) {
+         OsiThread *thr = get_current_thread(first_cpu);
+         stackid cursi;
+@@ -313,7 +314,7 @@ done2:
+ }
+ 
+ void after_block_translate(CPUState *cpu, TranslationBlock *tb) {
+-    CPUArchState* env = (CPUArchState*)cpu->env_ptr;
++    CPUArchState *env = static_cast<CPUArchState *>(cpu->env_ptr);
+ 
+     call_cache[tb->pc] = disas_block(env, tb->pc, tb->size);
+ 
+@@ -321,9 +322,8 @@ void after_block_translate(CPUState *cpu, TranslationBlock *tb) {
+ }
+ 
+ void before_block_exec(CPUState *cpu, TranslationBlock *tb) {
+-  CPUArchState *env = static_cast<CPUArchState *>(cpu->env_ptr);
+-  std::vector<stack_entry> &v = callstacks[get_stackid(env)];
+-  std::vector<target_ulong> &w = function_stacks[get_stackid(env)];
++  std::vector<stack_entry> &v = callstacks[get_stackid(cpu)];
++  std::vector<target_ulong> &w = funct

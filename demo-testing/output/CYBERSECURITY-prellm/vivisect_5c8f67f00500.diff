@@ -1,0 +1,114 @@
+@@ -49,13 +49,6 @@ class ElfReloc:
+     def __repr__(self):
+         return "reloc: @%s %d %s" % (hex(self.r_offset), self.getType(), self.getName())
+ 
+-    def __eq__(self, other):
+-        if self.name != other.name:
+-            return False
+-        if self._vs_values != other._vs_values:
+-            return False
+-        return True
+-
+     def setName(self, name):
+         self.name = name
+ 
+@@ -152,21 +145,6 @@ class ElfSymbol:
+             return 1
+         return -1
+ 
+-    def __eq__(self, other):
+-        if self.st_value != other.st_value:
+-            return False
+-        if self.st_name != other.st_name:
+-            return False
+-        if self.st_size != other.st_size:
+-            return False
+-        if self.st_info != other.st_info:
+-            return False
+-        if self.st_other != other.st_other:
+-            return False
+-        if self.st_shndx != other.st_shndx:
+-            return False
+-        return True
+-
+     def setName(self, name):
+         self.name = name
+ 
+@@ -297,12 +275,14 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+         self.secnames = {}
+         self.symbols  = []
+         self.relocs   = []
++        self.relocvas = []
+         self.symbols_by_name = {}
+         self.symbols_by_addr = {}
+         self.dynamics = []
+         self.dynamic_symbols = []
+         self.dynstrtabmeta = (None, None)
+         self.dynstrtab = []
++        self.dynsymtabct = None     # populated by _parseDynStrs()
+ 
+         self._parsePheaders()
+         self._parseDynLinkInfo()
+@@ -311,6 +291,7 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+         self._parseDynamicsFromSections()
+ 
+         # load symbols and relocs from DYNAMICS
++        self._parseDynStrs()
+         self._parseDynSyms()
+         self._parseDynRelocs()
+ 
+@@ -400,10 +381,26 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+         if symtab is None:
+             return
+ 
++        ssymtabva = self.getSection('.dynsym').sh_addr
++        dsymtabva = self.dyns.get(DT_SYMTAB)
++        if ssymtabva != dsymtabva:
++            logger.warn("Section headers and Dynamics disagree on Symbol Table:  sec: 0x%x, dyn: 0x%x", 
++                    ssymtabva, dsymtabva)
++
++        # only parse the symbols that are not already accounted for.
++        # symbols are ordered, so existence of index Y is always the same
+         sym = self._cls_symbol(bigend=self.bigend)
+-        syms = sym * (len(symtab) / len(sym))
+-        vstruct.VArray(elems=syms).vsParse(symtab, fast=True)
++        count = len(symtab) / len(sym)
++        diff = count - len(self.dynamic_symbols)
++        if diff == 0:
++            return
+ 
++        offset = len(self.dynamic_symbols) * len(sym)
++
++        syms = sym * diff
++        vstruct.VArray(elems=syms).vsParse(symtab[offset:], fast=True)
++
++        logger.warn("_parseDynSymsFromSections:  current_count: %d\tdiff: %d\toffset: %d\t", count, diff, offset)
+         for sym in syms:
+             if not sym.st_name:
+                 continue
+@@ -427,13 +424,16 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+             else:
+                 raise Exception('Platform not supported: %d' % (self.bits))
+             dyn.vsParse(dynbytes)
+-            logger.debug("dynamic: %r: 0x%x", dt_names.get(dyn.d_tag), dyn.d_value)
+ 
+             if dyn.d_tag in Elf32Dynamic.has_string:
+                 name = self.getStrtabString(dyn.d_value, ".dynstr")
+                 dyn.setName(name)
+ 
+-            self.dynamics.append(dyn)
++            # don't add a second entry
++            if dyn not in self.dynamics:
++                logger.debug("dynamic: %r: 0x%x", dt_names.get(dyn.d_tag), dyn.d_value)
++                self.dynamics.append(dyn)
++
+             if dyn.d_tag == DT_NULL: # Represents the end
+                 break
+             dynbytes = dynbytes[len(dyn):]
+@@ -473,25 +473,49 @@ class Elf(vs_elf.Elf32, vs_elf.Elf64):
+                 break
+             dynbytes = dynbytes[len(dyn):]
+ 
+-    def _parseDynSyms(self):
+-        '''
+-        Parses the Symbol Table a

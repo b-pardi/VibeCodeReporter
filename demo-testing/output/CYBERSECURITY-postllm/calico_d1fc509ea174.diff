@@ -1,0 +1,112 @@
+@@ -190,14 +190,18 @@ enum calico_skb_mark {
+ 	CALI_SKB_MARK_CT_ESTABLISHED         = 0x08000000,
+ 	CALI_SKB_MARK_CT_ESTABLISHED_MASK    = 0x08000000,
+ 
+-       /* CALI_SKB_MARK_TO_NAT_IFACE_OUT signals to routing that this packet should to
+-        * to the bpfnatout interface.
+-        */
+-       CALI_SKB_MARK_TO_NAT_IFACE_OUT        = 0x41000000,
+-       /* CALI_SKB_MARK_FROM_NAT_IFACE_OUT signals to the next hop that the packet passed
+-	* through bpfnatout so that it can set its conntrack correctly.
+-	*/
+-       CALI_SKB_MARK_FROM_NAT_IFACE_OUT      = 0x81000000,
++	/* CALI_SKB_MARK_RELATED_RESOLVED mean it is related traffic, we already
++	 * know that and we have resolved NAT etc.
++	 */
++	CALI_SKB_MARK_RELATED_RESOLVED        = 0x11000000,
++	/* CALI_SKB_MARK_TO_NAT_IFACE_OUT signals to routing that this packet should to
++	 * to the bpfnatout interface.
++	 */
++	CALI_SKB_MARK_TO_NAT_IFACE_OUT        = 0x41000000,
++	/* CALI_SKB_MARK_FROM_NAT_IFACE_OUT signals to the next hop that the packet passed
++	 * through bpfnatout so that it can set its conntrack correctly.
++	 */
++	CALI_SKB_MARK_FROM_NAT_IFACE_OUT      = 0x81000000,
+ 
+ };
+ 
+
+
+
+
+@@ -204,10 +204,11 @@ enum calico_ct_result_type {
+ #define CT_RES_SYN		0x1000
+ #define CT_RES_CONFIRMED	0x2000
+ 
+-#define ct_result_rc(rc)		((rc) & 0xff)
+-#define ct_result_flags(rc)		((rc) & ~0xff)
+-#define ct_result_set_rc(val, rc)	((val) = ct_result_flags(val) | (rc))
+-#define ct_result_set_flag(val, flags)	((val) |= (flags))
++#define ct_result_rc(rc)			((rc) & 0xff)
++#define ct_result_flags(rc)			((rc) & ~0xff)
++#define ct_result_set_rc(val, rc)		((val) = ct_result_flags(val) | (rc))
++#define ct_result_set_flag(val, flags)		((val) |= (flags))
++#define ct_result_clear_flag(val, flags)	((val) &= ~(flags))
+ 
+ #define ct_result_is_related(rc)	((rc) & CT_RES_RELATED)
+ #define ct_result_rpf_failed(rc)	((rc) & CT_RES_RPF_FAILED)
+
+
+
+
+@@ -173,10 +173,13 @@ skip_redir_ifindex:
+ 			.tot_len = 0,
+ 			.ifindex = CALI_F_TO_HOST ? ctx->skb->ingress_ifindex : ctx->skb->ifindex,
+ 			.l4_protocol = state->ip_proto,
+-			.sport = bpf_htons(state->sport),
+-			.dport = bpf_htons(state->dport),
+ 		};
+ 
++		if (state->ip_proto != IPPROTO_ICMP_46) {
++			fib_params(ctx)->sport = bpf_htons(state->sport);
++			fib_params(ctx)->dport = bpf_htons(state->dport);
++		}
++
+ 		/* set the ipv4 here, otherwise the ipv4/6 unions do not get
+ 		 * zeroed properly
+ 		 */
+@@ -190,7 +193,6 @@ skip_redir_ifindex:
+ #endif
+ 
+ 		CALI_DEBUG("FIB family=%d\n", fib_params(ctx)->family);
+-		CALI_DEBUG("FIB tot_len=%d\n", fib_params(ctx)->tot_len);
+ 		CALI_DEBUG("FIB ifindex=%d\n", fib_params(ctx)->ifindex);
+ 		CALI_DEBUG("FIB l4_protocol=%d\n", fib_params(ctx)->l4_protocol);
+ 		CALI_DEBUG("FIB sport=%d\n", bpf_ntohs(fib_params(ctx)->sport));
+@@ -352,6 +354,11 @@ skip_fib:
+ 			CALI_DEBUG("marking CALI_SKB_MARK_FROM_NAT_IFACE_OUT\n");
+ 		}
+ 
++		if (ct_result_is_related(state->ct_result.rc)) {
++			CALI_DEBUG("Related traffic, marking with CALI_SKB_MARK_RELATED_RESOLVED\n");
++			ctx->fwd.mark |= CALI_SKB_MARK_RELATED_RESOLVED;
++		}
++
+ 		CALI_DEBUG("Traffic is towards host namespace, marking with 0x%x.\n", ctx->fwd.mark);
+ 
+ 		/* FIXME: this ignores the mask that we should be using.
+
+
+
+
+@@ -64,7 +64,7 @@ static CALI_BPF_INLINE int parse_packet_ip_v4(struct cali_tc_ctx *ctx)
+ 	}
+ #endif
+ 
+-	CALI_DEBUG("IP id=%d\n",bpf_ntohs(ip_hdr(ctx)->id));
++	CALI_DEBUG("IP id=%d len=%d\n",bpf_ntohs(ip_hdr(ctx)->id), bpf_htons(ip_hdr(ctx)->tot_len));
+ 	CALI_DEBUG("IP s=%x d=%x\n", bpf_ntohl(ip_hdr(ctx)->saddr), bpf_ntohl(ip_hdr(ctx)->daddr));
+ 	// Drop malformed IP packets
+ 	if (ip_hdr(ctx)->ihl < 5) {
+
+
+
+
+@@ -1437,7 +1437,7 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 
+ 	// Set the dport to 0, to make sure conntrack entries for icmp is proper as we use
+ 	// dport to hold icmp type and code
+-	if (state->ip_proto == IPPROTO_ICMP_46) {
++	if (state->ip_proto == IPPROTO_ICMP_46 && !ct_related) {
+ 		state->dport = 0;
+ 		state->pos

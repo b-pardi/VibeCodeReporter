@@ -1,0 +1,136 @@
+@@ -9,6 +9,7 @@ import pwndbg.arguments
+ import pwndbg.chain
+ import pwndbg.commands
+ import pwndbg.commands.telescope
++from pwndbg.lib.functions import format_flags_argument
+ 
+ parser = argparse.ArgumentParser(description="Prints determined arguments for call instruction.")
+ parser.add_argument("-f", "--force", action="store_true", help="Force displaying of all arguments.")
+@@ -38,7 +39,11 @@ def call_args() -> List[str]:
+ 
+     for arg, value in pwndbg.arguments.get(pwndbg.aglib.disasm.one()):
+         code = arg.type != "char"
+-        pretty = pwndbg.chain.format(value, code=code)
++        pretty = (
++            pwndbg.chain.format(value, code=code)
++            if not arg.flags
++            else format_flags_argument(arg.flags, value)
++        )
+         results.append("        %-10s %s" % (arg.name + ":", pretty))
+ 
+     return results
+
+
+
+
+@@ -16,6 +16,12 @@ class Argument(NamedTuple):
+     type: str
+     derefcnt: int
+     name: str
++    flags: tuple[Flag, ...] | None = None
++
++
++class Flag(NamedTuple):
++    value: int
++    name: str
+ 
+ 
+ class LazyFunctions(Mapping[str, Function]):
+@@ -38,3 +44,38 @@ class LazyFunctions(Mapping[str, Function]):
+ 
+ 
+ functions = LazyFunctions()
++
++
++def format_flags_argument(flags: tuple[Flag, ...], value: int):
++    original_value: int = value
++    flag_names: List[str] = []
++
++    # For some functions, some named flags are combinations
++    # of other named flags. For example, the `mmap` flag
++    # `MAP_SHARED_VALIDATE` is a combination of `MAP_SHARED`
++    # and `MAP_PRIVATE`. As long as flags is ordered by
++    # descending popcount, this loop will output more specific
++    # flags.
++    for flag in flags:
++        if (value & flag.value) == flag.value:
++            flag_names.append(flag.name)
++            value = value & ~flag.value
++
++    # If none of the known flags matched the value, just
++    # format the value as a normal hex integer.
++    if len(flag_names) == 0:
++        return hex(original_value)
++
++    # If we matched at least one known flag, but there
++    # is some remaining un-matched portion of the value,
++    # include that in the formatted | expression.
++    if value != 0:
++        flag_names.append(hex(value))
++
++    # The final format includes the original value as hex,
++    # any matched flags, and the left-over unmatched portion
++    # of the integer.
++    #
++    # For example:
++    # 0x03 (FLAG_2|0x01)
++    return f"{original_value:#x} ({'|'.join(flag_names)})"
+
+
+
+
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from pwndbg.lib.functions import Argument
++from pwndbg.lib.functions import Flag
+ from pwndbg.lib.functions import Function
+ 
+ 
+@@ -28479,7 +28480,18 @@ _functions = {
+             Argument(type="void", derefcnt=1, name="addr"),
+             Argument(type="size_t", derefcnt=0, name="len"),
+             Argument(type="int", derefcnt=0, name="prot"),
+-            Argument(type="int", derefcnt=0, name="flags"),
++            Argument(
++                type="int",
++                derefcnt=0,
++                name="flags",
++                flags=(
++                    Flag(value=0x03, name="MAP_SHARED_VALIDATE"),
++                    Flag(value=0x01, name="MAP_SHARED"),
++                    Flag(value=0x02, name="MAP_PRIVATE"),
++                    Flag(value=0x20, name="MAP_ANONYMOUS"),
++                    Flag(value=0x10, name="MAP_FIXED"),
++                ),
++            ),
+             Argument(type="int", derefcnt=0, name="fd"),
+             Argument(type="off_t", derefcnt=0, name="offset"),
+         ],
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,34 @@
++from __future__ import annotations
++
++import gdb
++
++import tests
++
++MMAP_GAPS_BINARY = tests.binaries.get("mmap_gaps.out")
++
++
++def test_dump_mmap_args(start_binary):
++    """
++    Tests dumpargs command on an xmmap call
++    """
++    start_binary(MMAP_GAPS_BINARY)
++
++    # Run until main
++    gdb.execute("break main")
++    gdb.execute("continue")
++
++    # Stop on xmmap(...)
++    gdb.execute("nextcall

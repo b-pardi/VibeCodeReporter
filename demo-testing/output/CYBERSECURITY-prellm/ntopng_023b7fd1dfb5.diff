@@ -1,0 +1,117 @@
+@@ -45,6 +45,8 @@ class LocalHostStats: public HostStats {
+ 
+   void updateHostContacts();
+   void saveOldSites();
++  void removeRedisSitesKey(Host *host);
++  void addRedisSitesKey(Host *host);
+   
+  public:
+   LocalHostStats(Host *_host);
+
+
+
+
+@@ -82,6 +82,12 @@ class NetworkInterface : public AlertableEntity {
+   ServiceMap *sMap;
+ #endif
+ 
++  /* Variables used by top sites periodic update */
++  u_int8_t current_cycle = 0;
++  FrequentStringItems *top_sites;
++  char *old_sites;
++  time_t nextSitesUpdate;
++
+   /* Flows queues waiting to be dumped */
+   SPSCQueue<Flow *> *idleFlowsToDump, *activeFlowsToDump;
+   Condvar dump_condition; /* Condition variable used to wait when no flows have been enqueued for dump */
+@@ -289,6 +295,13 @@ class NetworkInterface : public AlertableEntity {
+ 		Paginator *p,
+ 		const char *sortColumn);
+ 
++  /* Functions used to update top sites of the interface */
++  void saveOldSites();
++  void removeRedisSitesKey();
++  void addRedisSitesKey();
++  void updateSitesStats(const struct timeval *tv);
++
++
+   bool isNumber(const char *str);
+   bool checkIdle();
+   bool checkPeriodicStatsUpdateTime(const struct timeval *tv);
+@@ -345,6 +358,7 @@ class NetworkInterface : public AlertableEntity {
+ 		      void *user_data);
+ 
+   void checkDisaggregationMode();
++  void incrVisitedWebSite(char *hostname);
+   inline void setCPUAffinity(int core_id)      { cpu_affinity = core_id; };
+   inline void getIPv4Address(bpf_u_int32 *a, bpf_u_int32 *m) { *a = ipv4_network, *m = ipv4_network_mask; };
+   inline AddressTree* getInterfaceNetworks()   { return(&interface_networks); };
+
+
+
+
+@@ -484,7 +484,8 @@
+ #define CONST_DEFAULT_IS_ACTIVE_LOCAL_HOSTS_CACHE_ENABLED 0
+ #define CONST_DEFAULT_ACTIVE_LOCAL_HOSTS_CACHE_INTERVAL   3600 /* Every hour by default */
+ #define HASHKEY_LOCAL_HOSTS_TOP_SITES_KEYS                "ntopng.cache.top_sites"
+-#define HASHKEY_LOCAL_HOSTS_TOP_SITES_KEYS_PUSHED         "ntopng.cache.top_sites_hour_done"
++#define HASHKEY_LOCAL_HOSTS_TOP_SITES_HOUR_KEYS_PUSHED    "ntopng.cache.top_sites_hour_done"
++#define HASHKEY_LOCAL_HOSTS_TOP_SITES_DAY_KEYS_PUSHED     "ntopng.cache.top_sites_day_done"
+ #define CONST_DEFAULT_DOCS_DIR       "httpdocs"
+ #define CONST_DEFAULT_SCRIPTS_DIR    "scripts"
+ #define CONST_DEFAULT_CALLBACKS_DIR  "scripts/callbacks"
+
+
+
+
+@@ -217,6 +217,7 @@ using namespace std;
+ #include "TcpPacketStats.h"
+ #include "DSCPStats.h"
+ #include "ntop_typedefs.h"
++#include "FrequentStringItems.h"
+ #include "Alert.h"
+ #include "AlertableEntity.h"
+ #include "Trace.h"
+@@ -348,7 +349,6 @@ using namespace std;
+ #include "TextDump.h"
+ #include "NIndexFlowDB.h"
+ #endif
+-#include "FrequentStringItems.h"
+ #ifdef NTOPNG_PRO
+ #include "NtopPro.h"
+ #include "DnsHostMapping.h"
+
+
+
+
+@@ -33,17 +33,8 @@ LocalHostStats::LocalHostStats(Host *_host) : HostStats(_host) {
+   num_contacts_as_cli = num_contacts_as_srv = 0;
+   current_cycle = 0;
+ 
+-  if (_host != NULL) {
+-    char ip_buf[64], redis_key[128];
+-    time_t now = time(NULL); 
+-    struct tm t_now;
+-    localtime_r(&now, &t_now);
+-    
+-    snprintf(redis_key, sizeof(redis_key), "%s@%u_%u_%u", _host->get_ip()->print(ip_buf, sizeof(ip_buf)),
+-              _host->get_vlan_id(), _host->getInterface()->get_id(), t_now.tm_hour);
+-
+-    ntop->getRedis()->lrem((char*) HASHKEY_LOCAL_HOSTS_TOP_SITES_KEYS_PUSHED, redis_key);
+-  }
++  if (_host != NULL)
++    removeRedisSitesKey(_host);
+   
+   num_contacted_hosts_as_client.init(8);       /* 128 bytes */
+   num_host_contacts_as_server.init(8);         /* 128 bytes */
+@@ -65,17 +56,8 @@ LocalHostStats::LocalHostStats(LocalHostStats &s) : HostStats(s) {
+   nextSitesUpdate = 0, nextContactsUpdate = time(NULL)+HOST_CONTACTS_REFRESH;
+   num_contacts_as_cli = num_contacts_as_srv = 0;
+ 
+-  if (this->host != NULL) {
+-    char ip_buf[64], redis_key[128];
+-    time_t now = time(NULL); 
+-    struct tm t_now;
+-    localtime_r(&now, &t_now);
+-    
+-    snprintf(redis_key, sizeof(redis_key), "%s@%u_%u_%u", this->host->get_ip()->print(ip_buf, s

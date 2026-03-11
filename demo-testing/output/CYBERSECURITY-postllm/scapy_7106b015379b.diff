@@ -1,0 +1,141 @@
+@@ -11,18 +11,57 @@ To disable Radius-EAP defragmentation (True by default), you can use::
+     conf.contribs.setdefault("radius", {}).setdefault("auto-defrag", False)
+ """
+ 
+-import struct
++import collections
++import enum
+ import hashlib
+ import hmac
+-from scapy.compat import orb, raw
+-from scapy.packet import Packet, Padding, bind_layers, bind_bottom_up
+-from scapy.fields import ByteField, ByteEnumField, IntField, StrLenField,\
+-    XStrLenField, XStrFixedLenField, FieldLenField, PacketLenField,\
+-    PacketListField, IPField, MultiEnumField
+-from scapy.layers.inet import UDP
++import struct
++
++from scapy.ansmachine import AnsweringMachine
++from scapy.compat import bytes_encode
++from scapy.config import conf, crypto_validator
++from scapy.error import log_runtime, Scapy_Exception
++from scapy.packet import (
++    Packet,
++    Padding,
++    bind_layers,
++    bind_bottom_up,
++)
++from scapy.fields import (
++    ByteEnumField,
++    ByteField,
++    FieldLenField,
++    IPField,
++    IntEnumField,
++    IntField,
++    MultiEnumField,
++    MultipleTypeField,
++    PacketLenField,
++    PacketListField,
++    StrField,
++    StrFixedLenField,
++    StrLenField,
++    XStrFixedLenField,
++    XStrLenField,
++)
++from scapy.sendrecv import send
++from scapy.utils import strxor
++
+ from scapy.layers.eap import EAP
+-from scapy.config import conf
+-from scapy.error import Scapy_Exception
++from scapy.layers.inet import UDP, IP
++from scapy.layers.ntlm import MD4le
++
++if conf.crypto_valid:
++    from scapy.layers.tls.crypto.cipher_block import Cipher_DES_ECB
++    from scapy.layers.tls.crypto.hash import (
++        Hash_MD4,
++        Hash_MD5,
++        Hash_SHA,
++    )
++else:
++    Cipher_DES_ECB = None
++    Hash_MD4 = Hash_MD5 = Hash_SHA = None
++
+ 
+ # https://www.iana.org/assignments/radius-types/radius-types.xhtml
+ _radius_attribute_types = {
+@@ -254,7 +293,7 @@ class RadiusAttribute(Packet):
+         """
+ 
+         if _pkt:
+-            attr_type = orb(_pkt[0])
++            attr_type = _pkt[0]
+             return cls.registered_attributes.get(attr_type, cls)
+         return cls
+ 
+@@ -526,26 +565,56 @@ class RadiusAttr_User_Password(_RadiusAttrHexStringVal):
+     """RFC 2865"""
+     val = 2
+ 
++    def decrypt(self, radius_packet, secret):
++        """
++        Return the decrypted value of the User-Password field
++        RFC2865 sect 5.2
++        """
++        password = b""
++
++        encrypted = self.value
++        ci = radius_packet.authenticator
++        while encrypted:
++            bi = Hash_MD5().digest(secret + ci)
++            ci, encrypted = encrypted[:16], encrypted[16:]
++            password += strxor(ci, bi)
++
++        return password.rstrip(b"\x00")
++
++    @staticmethod
++    def encrypt(radius_packet, password, secret):
++        """
++        Create a User-Password attribute from a secret
++        RFC2865 sect 5.2
++        """
++        password = bytes_encode(password)
++
++        # Pad to 16 octets boundary
++        password += (-len(password) % 16) * b"\x00"
++
++        encrypted = b""
++        ci = radius_packet.authenticator
++        while password:
++            bi = Hash_MD5().digest(secret + ci)
++            ci = strxor(password[:16], bi)
++            password = password[16:]
++
++        return RadiusAttr_User_Password(value=encrypted)
++
+ 
+ class RadiusAttr_State(_RadiusAttrHexStringVal):
+     """RFC 2865"""
+     val = 24
+ 
+ 
+-def prepare_packed_data(radius_packet, packed_req_authenticator):
++def prepare_packed_data(radius_packet, RequestAuth):
+     """
+     Pack RADIUS data prior computing the authentication MAC
+     """
+-
+-    packed_hdr = struct.pack("!B", radius_packet.code)
+-    packed_hdr += struct.pack("!B", radius_packet.id)
+-    packed_hdr += struct.pack("!H", radius_packet.len)
+-
+-    packed_attrs = b''
+-    for attr in radius_packet.attributes:
+-        packed_attrs += raw(attr)
+-
+-    return packed_hdr + packed_req_authenticator + packed_attrs
++    s = bytes(radius_packet)
++    Code_Id_Length = s[:4]
++    Attributes = s[4 + 16:]
++

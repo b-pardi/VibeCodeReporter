@@ -1,0 +1,126 @@
+@@ -27,45 +27,6 @@ static void print_hex(std::string name, u_char* data, int len)
+ 	printf("\n");
+ 	}
+ 
+-static bool tls1_prf(const u_char *secret, int secret_len, const char* label,
+-		const u_char* rnd1, int rnd1_len, const u_char* rnd2, int rnd2_len, u_char* out, size_t out_len)
+-	{
+-	// alloc buffers
+-	EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_TLS1_PRF, NULL);
+-	size_t seed_len = strlen(label) + rnd1_len + rnd2_len;
+-	u_char *seed = (u_char*) malloc(seed_len);
+-	u_char *ptr = seed;
+-
+-	// seed = label + rnd1 + rnd2
+-	memcpy(ptr, label, strlen(label));
+-	ptr += strlen(label);
+-	memcpy(ptr, rnd1, rnd1_len);
+-	ptr += rnd1_len;
+-	memcpy(ptr, rnd2, rnd2_len);
+-	ptr += rnd2_len;
+-
+-	if (EVP_PKEY_derive_init(pctx) <= 0)
+-		goto abort; /* Error */
+-	// FIXME: sha384 should not be hardcoded
+-	if (EVP_PKEY_CTX_set_tls1_prf_md(pctx, EVP_sha384()) <= 0)
+-		goto abort; /* Error */
+-	if (EVP_PKEY_CTX_set1_tls1_prf_secret(pctx, secret, secret_len) <= 0)
+-		goto abort; /* Error */
+-	if (EVP_PKEY_CTX_add1_tls1_prf_seed(pctx, seed, seed_len) <= 0)
+-		goto abort; /* Error */
+-	if (EVP_PKEY_derive(pctx, out, &out_len) <= 0)
+-		goto abort; /* Error */
+-
+-	EVP_PKEY_CTX_free(pctx);
+-	free(seed);
+-	return true;
+-
+-abort:
+-	EVP_PKEY_CTX_free(pctx);
+-	free(seed);
+-	return false;
+-	}
+-
+ namespace zeek::analyzer::ssl {
+ 
+ #define MSB(a) ((a>>8)&0xff)
+@@ -87,8 +48,8 @@ SSL_Analyzer::SSL_Analyzer(Connection* c)
+ 	c_seq = 0;
+ 	s_seq = 0;
+ 	// FIXME: should this be initialized to nullptr?
+-	secret = new zeek::StringVal(0, "");
+-	keys = new zeek::StringVal(0, "");
++	secret = nullptr;
++	keys = nullptr;
+ 	pia = nullptr;
+ 	}
+ 
+@@ -96,8 +57,6 @@ SSL_Analyzer::~SSL_Analyzer()
+ 	{
+ 	delete interp;
+ 	delete handshake_interp;
+-	delete secret;
+-	delete keys;
+ 	}
+ 
+ void SSL_Analyzer::Done()
+@@ -176,16 +135,49 @@ void SSL_Analyzer::Undelivered(uint64_t seq, int len, bool orig)
+ 
+ void SSL_Analyzer::SetSecret(const u_char* data, int len)
+ 	{
+-	// FIXME: Is this the proper way to initialize a zeek::StringVal?
+-	//        the alternative requires a cast: new zeek::StringVal(len, data)
+-	secret = new zeek::StringVal(new zeek::String(data, len, true));
++	secret = make_intrusive<zeek::StringVal>(len, (const char*)data);
+ 	}
+ 
+ void SSL_Analyzer::SetKeys(const u_char* data, int len)
+ 	{
+-	keys = new zeek::StringVal(new zeek::String(data, len, true));
++	keys = make_intrusive<zeek::StringVal>(len, (const char*)data);
++	}
++
++bool SSL_Analyzer::TLS12_PRF(const std::string& secret, const std::string& label,
++		const char* rnd1, size_t rnd1_len, const char* rnd2, size_t rnd2_len, u_char* out, size_t out_len)
++	{
++	// alloc buffers
++	EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_TLS1_PRF, NULL);
++	size_t seed_len = label.length() + rnd1_len + rnd2_len;
++	std::string seed{};
++	seed.reserve(seed_len);
++
++	// seed = label + rnd1 + rnd2
++	seed.append(label);
++	seed.append(rnd1, rnd1_len);
++	seed.append(rnd2, rnd2_len);
++
++	if (EVP_PKEY_derive_init(pctx) <= 0)
++		goto abort; /* Error */
++	// FIXME: sha384 should not be hardcoded
++	if (EVP_PKEY_CTX_set_tls1_prf_md(pctx, EVP_sha384()) <= 0)
++		goto abort; /* Error */
++	if (EVP_PKEY_CTX_set1_tls1_prf_secret(pctx, secret.data(), secret.length()) <= 0)
++		goto abort; /* Error */
++	if (EVP_PKEY_CTX_add1_tls1_prf_seed(pctx, seed.data(), seed.length()) <= 0)
++		goto abort; /* Error */
++	if (EVP_PKEY_derive(pctx, out, &out_len) <= 0)
++		goto abort; /* Error */
++
++	EVP_PKEY_CTX_free(pctx);
++	return true;
++
++abort:
++	EVP_PKEY_CTX_free(pctx);
++	return false;
+ 	}
+ 
++
+ bool SSL_Analyzer::TryDecryptApplicationData(int len, const u_char* data, bool is_orig, uint8_t content_type, uint16_t raw_tls_version)
+ 	{
+ 	// Unsupported cipher suite. Currently supported:
+@@ -198,19 +190,20 @@ bool SSL_Analyzer::TryDecryptApplicationData(int len, const u_char* data, bool i
+ 		}
+ 
+ 	// Neither secret or key present: abort
+-	if ( secret->Len() == 0 && keys->Len() == 0 )
++	if ( ( secret == nullptr || secret->Len() == 0 ) && ( keys == nullptr || keys->Le

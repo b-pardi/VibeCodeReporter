@@ -1,0 +1,94 @@
+@@ -5,10 +5,14 @@ import com.google.common.collect.Comparators;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.ImmutableSetMultimap;
+-import com.google.common.collect.ImmutableSortedMap;
++import com.google.common.collect.ImmutableSortedSet;
+ import com.google.common.collect.Ordering;
+ import com.google.common.collect.SetMultimap;
+ import com.google.common.collect.Sets;
++import com.google.common.graph.ImmutableNetwork;
++import com.google.common.graph.MutableNetwork;
++import com.google.common.graph.Network;
++import com.google.common.graph.NetworkBuilder;
+ import com.google.common.hash.Hashing;
+ import com.google.errorprone.annotations.MustBeClosed;
+ import io.opentracing.contrib.jaxrs2.client.ClientTracingFeature;
+@@ -54,7 +58,6 @@ import java.util.TreeSet;
+ import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+-import java.util.function.Predicate;
+ import java.util.function.Supplier;
+ import java.util.regex.Pattern;
+ import java.util.regex.PatternSyntaxException;
+@@ -80,6 +83,7 @@ import org.batfish.common.Pair;
+ import org.batfish.common.plugin.FlowProcessor;
+ import org.batfish.datamodel.BgpNeighbor;
+ import org.batfish.datamodel.BgpProcess;
++import org.batfish.datamodel.BgpSession;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.DataPlane;
+ import org.batfish.datamodel.Edge;
+@@ -232,6 +236,13 @@ public class CommonUtil {
+     return 0;
+   }
+ 
++  /**
++   * Compute ip owners. See {@link #computeIpOwners(boolean, Map)} for detailed description.
++   *
++   * @param configurations {@link Configurations} keyed by hostname
++   * @param excludeInactive Whether to exclude inactive interfaces
++   * @return A map of {@link Ip}s to a set of hostnames that own this IP
++   */
+   public static Map<Ip, Set<String>> computeIpOwners(
+       Map<String, Configuration> configurations, boolean excludeInactive) {
+     return computeIpOwners(
+@@ -244,7 +255,8 @@ public class CommonUtil {
+   }
+ 
+   /**
+-   * Compute the owners of IP addresses
++   * Compute a mapping of IP addresses to a set of hostnames that "own" this IP (e.g., as an network
++   * interface address)
+    *
+    * @param excludeInactive whether to ignore inactive interfaces
+    * @param enabledInterfaces A mapping of enabled interfaces hostname -> interface name -> {@link
+@@ -628,29 +640,148 @@ public class CommonUtil {
+   }
+ 
+   /**
+-   * Initialize BGP neighbors for all nodes.
++   * Check if a bgp peer is reachable to establish a session
+    *
+-   * @param configurations map of all configurations, keyed by hostname
+-   * @param ipOwners mapping of Ips to a set of nodes (hostnames) that owns those IPs
+-   * @param checkReachability whether bgp neighbor reachability should be checked
+-   * @param flowProcessor dataplane plugin to use to check reachability. Must not be {@code null} if
+-   *     {@code checkReachability = true}
+-   * @param dp dataplane to use to check reachability. Must not be {@code null} if {@code
+-   *     checkReachability = true}
++   * <p><b>Warning:</b> Notion of directionality is important here, we are assuming {@code src} is
++   * initiating the connection according to its local configuration
+    */
+-  public static void initRemoteBgpNeighbors(
++  @Nullable
++  private static boolean isReachableBgpNeighbor(
++      BgpNeighbor src,
++      BgpNeighbor dst,
++      @Nullable FlowProcessor flowProcessor,
++      @Nullable DataPlane dp) {
++    Ip srcAddress = src.getLocalIp();
++    Ip dstAddress = src.getAddress();
++    if (dstAddress == null) {
++      return false;
++    }
++    boolean isEbgp = !src.getLocalAs().equals(src.getRemoteAs());
++    if (flowProcessor == null || dp == null) {
++      throw new BatfishException("Cannot compute neighbor reachability without a dataplane");
++    }
++
++    /*
++     * Ensure that the session can be established by running traceroute in both directions
++     */
++    Flow

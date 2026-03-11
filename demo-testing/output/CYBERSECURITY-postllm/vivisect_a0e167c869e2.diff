@@ -1,0 +1,123 @@
+@@ -620,12 +620,11 @@ class EnviCli(Cmd):
+         fname = argv[0]
+         command = ' '.join(argv[1:])
+ 
+-        strcanvas = e_canvas.StringMemoryCanvas(self.canvas.mem)
++        strcanvas = e_canvas.FileBackedMemoryCanvas(fname, self.canvas.mem)
+         with e_canvas.TeeCanvas(self, (self.canvas, strcanvas)) as tc:
+             self.onecmd(command)
+ 
+-            with open(fname, 'wb') as f:
+-                f.write(str(strcanvas).encode('utf-8'))
++        strcanvas.flush()
+ 
+     def do_search(self, line):
+         '''
+
+
+
+
+@@ -383,6 +383,40 @@ class StringMemoryCanvas(MemoryCanvas):
+         return self.strval
+ 
+ 
++class FileBackedMemoryCanvas(StringMemoryCanvas):
++    '''
++    FileBackedMemoryCanvas writes output to a file of your choosing.  It writes
++    out the data to the file after `rollwindow` number of calls to `addText()`.
++
++    NOTE: when done writing to the canvas, be certain to call `flush()` or you
++            will lose data.
++    '''
++    def __init__(self, filename, mem, syms=None, append=True, rollwindow=100):
++        StringMemoryCanvas.__init__(self, mem, syms)
++        if append:
++            self.fd = open(filename, 'a', encoding='utf-8')
++        else:
++            self.fd = open(filename, 'w', encoding='utf-8')
++
++        self.rollwindow = rollwindow
++        self.linecount = 0
++
++    def addText(self, text, tag=None):
++        super().addText(text, tag)
++
++        self.linecount += 1
++        if self.linecount % self.rollwindow == 0:
++            self.flush()
++
++    def flush(self):
++        self.fd.write(str(self))
++        self.clearCanvas()
++        self.linecount = 0
++
++    def __del__(self):
++        self.flush()
++        self.fd.close()
++
+ class CanvasMethodProxy(object):
+     '''
+     Target for teecanvas.
+@@ -393,8 +427,15 @@ class CanvasMethodProxy(object):
+ 
+     def __call__(self, *args, **kwargs):
+         for canvas in self.canvases:
+-            attr = getattr(canvas, self.name)
+-            attr(*args, **kwargs)
++            try:
++                attr = getattr(canvas, self.name)
++                attr(*args, **kwargs)
++            except Exception as e:
++                logger.warning("Error: %r", e, exc_info=1)
++
++    def __getattr__(self, name):
++        obj = getattr(self.canvases[0], self.name)
++        return getattr(obj, name)
+ 
+ 
+ class TeeCanvas(object):
+
+
+
+
+@@ -1049,6 +1049,7 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+         -U         - Remainder of args is "step until" expression (stop on True)
+         -Q         - Do not output to canvas
+         -O         - Step Over calls (ie. stay in this function)
++        -M         - Stay in the same Memory Map (step over calls to other maps)
+         """
+         t = self.trace
+         argv = e_cli.splitargs(line)
+@@ -1065,6 +1066,8 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+         showop = False
+         quiet = False
+         stepover = False
++        module = False
++        curmap = None
+ 
+         for opt, optarg in opts:
+ 
+@@ -1092,6 +1095,11 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+             elif opt == '-O':
+                 stepover = True
+ 
++            elif opt == '-M':
++                module = True
++                pc = t.getProgramCounter()
++                curmap = t.getMemoryMap(pc)
++
+         if ( count is None 
+              and taddr is None
+              and until is None
+@@ -1150,12 +1158,34 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+ 
+ 
+                 # execute the instruction
+-                if op.iflags & envi.IF_CALL and stepover:
+-                    bp = vtrace.breakpoints.OneTimeBreak(op.va + op.size)
+-                    self.trace.addBreakpoint(bp)
+-                    self.trace.run()
++                if op.iflags & envi.IF_CALL and (stepover or module):
++                    follow = True
++                    if module:
++                        for tgtva in op

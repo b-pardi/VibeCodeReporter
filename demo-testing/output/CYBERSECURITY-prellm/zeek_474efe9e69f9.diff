@@ -1,0 +1,194 @@
+@@ -4,7 +4,6 @@
+ 
+ #include "Attr.h"
+ #include "Expr.h"
+-#include "Serializer.h"
+ #include "threading/SerialTypes.h"
+ 
+ const char* attr_name(attr_tag t)
+@@ -531,70 +530,3 @@ bool Attributes::operator==(const Attributes& other) const
+ 	return true;
+ 	}
+ 
+-bool Attributes::Serialize(SerialInfo* info) const
+-	{
+-	return SerialObj::Serialize(info);
+-	}
+-
+-Attributes* Attributes::Unserialize(UnserialInfo* info)
+-	{
+-	return (Attributes*) SerialObj::Unserialize(info, SER_ATTRIBUTES);
+-	}
+-
+-IMPLEMENT_SERIAL(Attributes, SER_ATTRIBUTES);
+-
+-bool Attributes::DoSerialize(SerialInfo* info) const
+-	{
+-	DO_SERIALIZE(SER_ATTRIBUTES, BroObj);
+-
+-	info->s->WriteOpenTag("Attributes");
+-	assert(type);
+-	if ( ! (type->Serialize(info) && SERIALIZE(attrs->length())) )
+-		return false;
+-
+-	loop_over_list((*attrs), i)
+-		{
+-		Attr* a = (*attrs)[i];
+-
+-		Expr* e = a->AttrExpr();
+-		SERIALIZE_OPTIONAL(e);
+-
+-		if ( ! SERIALIZE(char(a->Tag())) )
+-			return false;
+-		}
+-
+-	info->s->WriteCloseTag("Attributes");
+-	return true;
+-	}
+-
+-bool Attributes::DoUnserialize(UnserialInfo* info)
+-	{
+-	DO_UNSERIALIZE(BroObj);
+-
+-	type = BroType::Unserialize(info);
+-	if ( ! type )
+-		return false;
+-
+-	int len;
+-	if ( ! UNSERIALIZE(&len) )
+-		return false;
+-
+-	attrs = new attr_list(len);
+-	while ( len-- )
+-		{
+-		Expr* e;
+-		UNSERIALIZE_OPTIONAL(e, Expr::Unserialize(info))
+-
+-		char tag;
+-		if ( ! UNSERIALIZE(&tag) )
+-			{
+-			delete e;
+-			return false;
+-			}
+-
+-		attrs->append(new Attr((attr_tag)tag, e));
+-		}
+-
+-	return true;
+-	}
+-
+
+
+
+
+@@ -96,17 +96,12 @@ public:
+ 
+ 	attr_list* Attrs()	{ return attrs; }
+ 
+-	bool Serialize(SerialInfo* info) const;
+-	static Attributes* Unserialize(UnserialInfo* info);
+-
+ 	bool operator==(const Attributes& other) const;
+ 
+ protected:
+ 	Attributes() : type(), attrs(), in_record()	{ }
+ 	void CheckAttr(Attr* attr);
+ 
+-	DECLARE_SERIAL(Attributes);
+-
+ 	BroType* type;
+ 	attr_list* attrs;
+ 	bool in_record;
+
+deleted file mode 100644
+
+
+
+@@ -1,1357 +0,0 @@
+-#include <unistd.h>
+-#include <fcntl.h>
+-#include <errno.h>
+-#include <signal.h>
+-#include <sys/time.h>
+-#include <netinet/in.h>
+-#include <assert.h>
+-
+-#include <openssl/ssl.h>
+-#include <openssl/err.h>
+-
+-#include <algorithm>
+-
+-#include "bro-config.h"
+-#include "ChunkedIO.h"
+-#include "NetVar.h"
+-
+-ChunkedIO::ChunkedIO() : stats(), tag(), pure()
+-	{
+-	}
+-
+-void ChunkedIO::Stats(char* buffer, int length)
+-	{
+-	safe_snprintf(buffer, length,
+-		      "bytes=%luK/%luK chunks=%lu/%lu io=%lu/%lu bytes/io=%.2fK/%.2fK",
+-		      stats.bytes_read / 1024, stats.bytes_written / 1024,
+-		      stats.chunks_read, stats.chunks_written,
+-		      stats.reads, stats.writes,
+-		      stats.bytes_read / (1024.0 * stats.reads),
+-		      stats.bytes_written / (1024.0 * stats.writes));
+-	}
+-
+-#ifdef DEBUG_COMMUNICATION
+-
+-void ChunkedIO::AddToBuffer(uint32 len, char* data, bool is_read)
+-	{
+-	Chunk* copy = new Chunk;
+-	copy->len = len;
+-	copy->data = new char[len];
+-	memcpy(copy->data, data, len);
+-
+-	std::list<Chunk*>* l = is_read ? &data_read : &data_written;
+-	l->push_back(copy);
+-
+-	if ( l->size() > DEBUG_COMMUNICATION )
+-		{
+-		Chunk* old = l->front();
+-		l->pop_front();
+-		delete [] old->data;
+-		delete old;
+-		}
+-	}
+-
+-void ChunkedIO::AddToBuffer(Chunk* chunk, bool is_read)
+-	{
+-	AddToBuffer(chunk->len, chunk->data, is_read);
+-	}
+-
+-void ChunkedIO::DumpDebugData(const char* basefnname, bool want_reads)
+-	{
+-	std::list<Chunk*>* l = want_reads ? &data_read : &data_written;
+-
+-	int count = 0;
+-
+-	for ( std::list<Chunk*>::iterator i = l->begin(); i != l->end(); ++i )
+-		{
+-		static char buffer[128];
+-		snprintf(buffer, sizeof(buffer), "%s.%s.%d", basefnname,
+-				 want_reads ? "read" : "write", ++count);
+-		buffer[sizeof(buffer) - 1] = '\0';
+-
+-		int fd = open(buffer, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+-		if ( fd < 0 )
+-			continue;
+-
+-		ChunkedIOFd io(fd, "dump-file");
+-		io.Write(*i);
+-		io.Flush();
+-		safe_close(fd);
+-		}
+-
+-	l->clear();
+-	}
+-
+-#endif
+-
+-ChunkedIOFd::ChunkedIOFd(int arg_fd, const char* 

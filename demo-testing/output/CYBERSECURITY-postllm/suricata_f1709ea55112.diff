@@ -1,0 +1,105 @@
+@@ -674,16 +674,45 @@ DefragInsertFrag(ThreadVars *tv, DecodeThreadVars *dtv, DefragTracker *tracker,
+             switch (tracker->policy) {
+             case DEFRAG_POLICY_BSD:
+                 if (frag_offset < prev->offset + prev->data_len) {
+-                    if (frag_offset >= prev->offset) {
+-                        ltrim = prev->offset + prev->data_len - frag_offset;
++                    if (prev->offset <= frag_offset) {
++                        /* We prefer the data from the previous
++                         * fragment, so trim off the data in the new
++                         * fragment that exists in the previous
++                         * fragment. */
++                        uint16_t prev_end = prev->offset + prev->data_len;
++                        if (prev_end > frag_end) {
++                            /* Just skip. */
++                            /* TODO: Set overlap flag. */
++                            goto done;
++                        }
++                        ltrim = prev_end - frag_offset;
++
++                        if ((next != NULL) && (frag_end > next->offset)) {
++                            next->ltrim = frag_end - next->offset;
++                        }
++
++                        goto insert;
++                    }
++
++                    /* If the end of this fragment overlaps the start
++                     * of the previous fragment, then trim up the
++                     * start of previous fragment so this fragment is
++                     * used.
++                     *
++                     * See:
++                     * DefragBsdSubsequentOverlapsStartOfOriginal.
++                     */
++                    if (frag_offset <= prev->offset && frag_end > prev->offset + prev->ltrim) {
++                        uint16_t prev_ltrim = frag_end - prev->offset;
++                        if (prev_ltrim > prev->ltrim) {
++                            prev->ltrim = prev_ltrim;
++                        }
+                     }
++
+                     if ((next != NULL) && (frag_end > next->offset)) {
+                         next->ltrim = frag_end - next->offset;
+                     }
+-                    if ((frag_offset < prev->offset) &&
+-                        (frag_end >= prev->offset + prev->data_len)) {
+-                        prev->skip = 1;
+-                    }
++
+                     goto insert;
+                 }
+                 break;
+@@ -1178,6 +1207,65 @@ error:
+     return NULL;
+ }
+ 
++/**
++ * Allocate a test packet, much like BuildIpv4TestPacket, but with
++ * the full content provided by the caller.
++ */
++static int BuildIpv4TestPacketWithContent(Packet **packet, uint8_t proto, uint16_t id, uint16_t off,
++        int mf, const uint8_t *content, int content_len)
++{
++    Packet *p = NULL;
++    int hlen = 20;
++    int ttl = 64;
++    IPV4Hdr ip4h;
++
++    p = SCCalloc(1, sizeof(*p) + default_packet_size);
++    FAIL_IF_NULL(p);
++
++    PacketInit(p);
++
++    struct timeval tval;
++    gettimeofday(&tval, NULL);
++    p->ts = SCTIME_FROM_TIMEVAL(&tval);
++    ip4h.ip_verhl = 4 << 4;
++    ip4h.ip_verhl |= hlen >> 2;
++    ip4h.ip_len = htons(hlen + content_len);
++    ip4h.ip_id = htons(id);
++    if (mf)
++        ip4h.ip_off = htons(IP_MF | off);
++    else
++        ip4h.ip_off = htons(off);
++    ip4h.ip_ttl = ttl;
++    ip4h.ip_proto = proto;
++
++    ip4h.s_ip_src.s_addr = 0x01010101; /* 1.1.1.1 */
++    ip4h.s_ip_dst.s_addr = 0x02020202; /* 2.2.2.2 */
++
++    /* copy content_len crap, we need full length */
++    PacketCopyData(p, (uint8_t *)&ip4h, sizeof(ip4h));
++    p->ip4h = (IPV4Hdr *)GET_PKT_DATA(p);
++    SET_IPV4_SRC_ADDR(p, &p->src);
++    SET_IPV4_DST_ADDR(p, &p->dst);
++
++    PacketCopyDataOffset(p, hlen, content, content_len);
++    SET_PKT_LEN(p, hlen + content_len);
++
++    p->ip4h->ip_csum = IPV4Checksum((uint16_t *)GET_PKT_DATA(p), hlen, 0);
++
++    /* Self test. */
++    FAIL_IF(IPV4_GET_VER(p) != 4);
++    FAIL_IF(IPV4_GET_HLEN(p) != hlen);
++    FAIL_IF(IPV4_GET_IPLEN(p) != hlen + content_

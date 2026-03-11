@@ -1,0 +1,129 @@
+@@ -117,6 +117,9 @@
+ #define ICMPV6_GET_UNUSED(p)       (p)->icmpv6h->icmpv6b.icmpv6e.unused
+ /** macro for icmpv6 "error_ptr" access */
+ #define ICMPV6_GET_ERROR_PTR(p)    (p)->icmpv6h->icmpv6b.icmpv6e.error_ptr
++/** macro for icmpv6 "mtu" accessibility */
++// ICMPv6 has MTU only for type too big
++#define ICMPV6_HAS_MTU(p)          ((p)->icmpv6h->type == ICMP6_PACKET_TOO_BIG)
+ /** macro for icmpv6 "mtu" access */
+ #define ICMPV6_GET_MTU(p)          SCNtohl((p)->icmpv6h->icmpv6b.icmpv6e.mtu)
+ 
+
+
+
+
+@@ -174,6 +174,7 @@
+ #include "detect-tcpmss.h"
+ #include "detect-udphdr.h"
+ #include "detect-icmpv6hdr.h"
++#include "detect-icmpv6-mtu.h"
+ #include "detect-ipv4hdr.h"
+ #include "detect-ipv6hdr.h"
+ #include "detect-krb5-cname.h"
+@@ -547,6 +548,7 @@ void SigTableSetup(void)
+     DetectUdphdrRegister();
+     DetectTcpmssRegister();
+     DetectICMPv6hdrRegister();
++    DetectICMPv6mtuRegister();
+     DetectIpv4hdrRegister();
+     DetectIpv6hdrRegister();
+     DetectKrb5CNameRegister();
+
+
+
+
+@@ -239,6 +239,7 @@ enum DetectKeywordId {
+     DETECT_IPV4HDR,
+     DETECT_IPV6HDR,
+     DETECT_ICMPV6HDR,
++    DETECT_ICMPV6MTU,
+     DETECT_TCPHDR,
+     DETECT_UDPHDR,
+     DETECT_TCPMSS,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,189 @@
++/* Copyright (C) 2020 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Philippe Antoine <p.antoine@catenacyber.fr>
++ *
++ */
++
++#include "suricata-common.h"
++
++#include "detect.h"
++#include "detect-parse.h"
++
++#include "detect-icmpv6-mtu.h"
++#include "detect-engine-uint.h"
++
++/* prototypes */
++static int DetectICMPv6mtuMatch (DetectEngineThreadCtx *, Packet *,
++        const Signature *, const SigMatchCtx *);
++static int DetectICMPv6mtuSetup (DetectEngineCtx *, Signature *, const char *);
++void DetectICMPv6mtuFree (void *);
++#ifdef UNITTESTS
++void DetectICMPv6mtuRegisterTests (void);
++#endif
++static int PrefilterSetupIcmpv6mtu(DetectEngineCtx *de_ctx, SigGroupHead *sgh);
++static bool PrefilterIcmpv6mtuIsPrefilterable(const Signature *s);
++
++/**
++ * \brief Registration function for icmpv6.mtu: keyword
++ */
++
++void DetectICMPv6mtuRegister(void)
++{
++    sigmatch_table[DETECT_ICMPV6MTU].name = "icmpv6.mtu";
++    sigmatch_table[DETECT_ICMPV6MTU].desc = "match on ICMPv6 MTU field";
++    sigmatch_table[DETECT_ICMPV6MTU].url = DOC_URL DOC_VERSION "/rules/header-keywords.html#icmpv6mtu";
++    sigmatch_table[DETECT_ICMPV6MTU].Match = DetectICMPv6mtuMatch;
++    sigmatch_table[DETECT_ICMPV6MTU].Setup = DetectICMPv6mtuSetup;
++    sigmatch_table[DETECT_ICMPV6MTU].Free = DetectICMPv6mtuFree;
++#ifdef UNITTESTS
++    sigmatch_table[DETECT_ICMPV6MTU].RegisterTests = DetectICMPv6mtuRegisterTests;
++#endif
++    sigmatch_table[DETECT_ICMPV6MTU].SupportsPrefilter = PrefilterIcmpv6mtuIsPrefilterable;
++    sigmatch_table[DETECT_ICMPV6MTU].SetupPrefilter = PrefilterSetupIcmpv6mtu;
++
++    DetectU32Register();
++    return;
++}
++
++// returns 0 on no mtu, and 1 if mtu
++static inline int DetectICMPv6mtuGetValue(Packet *p, uint32_t *picmpv6mtu)
++{
++    if (!(PKT_IS_ICMPV6(p)) || PKT_IS_PSEUDOPKT(p))
++        return 0;
++    if (ICMPV6_GET_CODE(p) != 0)
++        return 0;
++    if (!(ICMPV6_HAS_MTU(p)))
++        return 0;
++
++    *picmpv6mtu = ICMPV6_GET_MTU(p);
++    return 1;
++}
++
++/**
++ * \brief This function is used to match ICMPV6 MTU rule option on a packet with those passed via i

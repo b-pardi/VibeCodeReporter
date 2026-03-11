@@ -1,0 +1,144 @@
+@@ -49,7 +49,7 @@ public:
+   static char* l4proto2name(u_int8_t proto);
+   static u_int8_t l4name2proto(const char *name);
+   static u_int8_t queryname2type(const char *name);
+-  static bool  isIPAddress(char *name);
++  static bool  isIPAddress(const char *ip);
+ #ifdef __linux__ 
+   static int   setAffinityMask(char *cores_list, cpu_set_t *mask);
+   static int   setThreadAffinityWithMask(pthread_t thread, cpu_set_t *mask);
+
+
+
+
+@@ -26,12 +26,14 @@
+ 
+ class UnexpectedServer : public FlowCheck {
+  private:
+-  ndpi_ptree_t *whitelist;
++  ndpi_ptree_t *whitelist_ptree;
++  void *whitelist_automa;
++  u_int32_t whitelisted_servers;
+ 
+   virtual FlowAlertType getAlertType() const = 0;
+ 
+ protected:
+-  bool isAllowedHost(const IpAddress *p);
++  bool isAllowedHost(Flow *f);
+ 
+   virtual bool isAllowedProto(Flow *f)          { return(false); }
+   virtual const IpAddress* getServerIP(Flow *f) { return(f->get_srv_ip_addr()); }
+@@ -40,13 +42,17 @@ public:
+   UnexpectedServer() : FlowCheck(ntopng_edition_community,
+ 				  false /* All interfaces */, false /* Don't exclude for nEdge */, false /* NOT only for nEdge */,
+ 				  true /* has_protocol_detected */, false /* has_periodic_update */, false /* has_flow_end */) {
+-    if((whitelist = ndpi_ptree_create()) == NULL)
++    whitelisted_servers = 0;
++    whitelist_automa = NULL;
++    if((whitelist_ptree = ndpi_ptree_create()) == NULL)
+       throw "Out of memory";
+   };
+ 
+   ~UnexpectedServer() {
+-    if(whitelist)
+-      ndpi_ptree_destroy(whitelist);
++    if(whitelist_ptree)
++      ndpi_ptree_destroy(whitelist_ptree);
++    if(whitelist_automa)
++      ndpi_free_automa(whitelist_automa);
+   };
+ 
+   void protocolDetected(Flow *f);
+
+
+
+
+@@ -290,7 +290,7 @@ u_int8_t Utils::queryname2type(const char *name) {
+ 
+ /* ****************************************************** */
+ 
+-bool Utils::isIPAddress(char *ip) {
++bool Utils::isIPAddress(const char *ip) {
+   struct in_addr addr4;
+   struct in6_addr addr6;
+ 
+
+
+
+
+@@ -24,35 +24,54 @@
+ 
+ /* ***************************************************** */
+ 
+-bool UnexpectedServer::isAllowedHost(const IpAddress *p) {
+-  if((p == NULL) || p->isBroadcastAddress())
+-    return(true);
+-  else {
+-    u_int64_t match_ip;
+-    int rc;
+-    ndpi_ip_addr_t a;
+-
+-    memset(&a, 0, sizeof(a));
+-  
+-    if(p->isIPv4())
+-      a.ipv4 = p->get_ipv4();
+-    else
+-      memcpy(&a.ipv6, p->get_ipv6(), sizeof(struct ndpi_in6_addr));
++bool UnexpectedServer::isAllowedHost(Flow *f) {
++  const IpAddress *p;
++  u_int64_t match_ip;
++  ndpi_ip_addr_t a;
++  int rc;
++
++  if (!whitelisted_servers)
++    return true;
++
++  p = getServerIP(f);
++
++  if (p == NULL 
++      || p->isBroadcastAddress())
++    return true;
++
++  /* Check IP */
++
++  memset(&a, 0, sizeof(a));
++  if(p->isIPv4())
++    a.ipv4 = p->get_ipv4();
++  else
++    memcpy(&a.ipv6, p->get_ipv6(), sizeof(struct ndpi_in6_addr));
+   
+-    rc = ndpi_ptree_match_addr(whitelist, &a, &match_ip);
++  rc = ndpi_ptree_match_addr(whitelist_ptree, &a, &match_ip);
++  if (rc == 0 && match_ip)
++    return true;
+   
+-    if((rc != 0) || (!match_ip))
+-      return(false);
+-    else
+-      return(true);
++  /* Check Domain */
++
++  if(whitelist_automa) {
++    char *server_name = f->getFlowServerInfo();
++
++    //ntop->getTrace()->traceEvent(TRACE_NORMAL, "Checking server name %s", server_name);
++
++    if (server_name != NULL
++        && strlen(server_name) > 0
++        && ndpi_match_string(whitelist_automa, server_name) == 1)
++      return true;
+   }
++
++  return false;
+ }
+ 
+ /* ***************************************************** */
+ 
+ bool UnexpectedServer::loadConfiguration(json_object *config) {
+   FlowCheck::loadConfiguration(config); /* Parse parameters in common */
+-  json_object *whitelist_json, *whitelisted_ip_json;
++  json_object *whitelist_json, *whitelisted_server_json;
+ 
+   // ntop->getTrace()->traceEvent(TRACE_NORMAL, "%s() %s", __FUNCTION__, json_object_to_json_string(config));
+ 
+@@ -64,27 +83,51 @@ bool UnexpectedServer::loadConfiguration(json_ob

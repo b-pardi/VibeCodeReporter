@@ -1,0 +1,135 @@
+@@ -6,7 +6,7 @@ R_API char *r_anal_rtti_demangle_class_name(RAnal *anal, const char *name) {
+ 	RVTableContext context;
+ 	r_anal_vtable_begin (anal, &context);
+ 	if (context.abi == R_ANAL_CPP_ABI_MSVC) {
+-		return r_anal_rtti_msvc_demangle_class_name (name);
++		return r_anal_rtti_msvc_demangle_class_name (&context, name);
+ 	}
+ 	// TODO: implement class name demangling for itanium
+ 	return NULL;
+
+
+
+
+@@ -377,7 +377,7 @@ static void rtti_msvc_print_base_class_descriptor_json(rtti_base_class_descripto
+  * .?AVClassInInnerNamespace@InnerNamespace@OuterNamespace@@
+  * => OuterNamespace::InnerNamespace::AVClassInInnerNamespace
+  */
+-R_API char *r_anal_rtti_msvc_demangle_class_name(const char *name) {
++R_API char *r_anal_rtti_msvc_demangle_class_name(RVTableContext *context, const char *name) {
+ 	if (!name) {
+ 		return NULL;
+ 	}
+@@ -387,27 +387,19 @@ R_API char *r_anal_rtti_msvc_demangle_class_name(const char *name) {
+ 		|| strncmp (name + original_len - 2, "@@", 2) != 0) {
+ 		return NULL;
+ 	}
+-	char *ret = malloc ((original_len - 6) * 2 + 1);
+-	if (!ret) {
+-		return NULL;
+-	}
+-	char *c = ret;
+-	const char *oc = name + original_len - 3;
+-	size_t part_len = 0;
+-	while (oc >= name + 4) {
+-		if (*oc == '@') {
+-			memcpy (c, oc + 1, part_len);
+-			c += part_len;
+-			*c++ = ':';
+-			*c++ = ':';
+-			part_len = 0;
++	char *ret = context->anal->binb.demangle (NULL, "msvc", name, 0, false);
++	if (ret && *ret) {
++		char *n = strchr (ret, ' ');
++		if (n && *(++n)) {
++			char *tmp = strdup (n);
++			free (ret);
++			ret = tmp;
+ 		} else {
+-			part_len++;
++			R_FREE (ret);
+ 		}
+-		oc--;
++	} else {
++		R_FREE (ret);
+ 	}
+-	memcpy (c, oc + 1, part_len);
+-	c[part_len] = '\0';
+ 	return ret;
+ }
+ 
+@@ -880,7 +872,7 @@ static const char *recovery_apply_complete_object_locator(RRTTIMSVCAnalContext *
+ 		return existing;
+ 	}
+ 
+-	char *name = r_anal_rtti_msvc_demangle_class_name (col->td->td.name);
++	char *name = r_anal_rtti_msvc_demangle_class_name (context->vt_context, col->td->td.name);
+ 	if (!name) {
+ 		if (context->vt_context->anal->verbose) {
+ 			eprintf ("Failed to demangle a class name: \"%s\"\n", col->td->td.name);
+@@ -921,7 +913,7 @@ static const char *recovery_apply_type_descriptor(RRTTIMSVCAnalContext *context,
+ 		return existing;
+ 	}
+ 
+-	char *name = r_anal_rtti_msvc_demangle_class_name (td->td.name);
++	char *name = r_anal_rtti_msvc_demangle_class_name (context->vt_context, td->td.name);
+ 	if (!name) {
+ 		if (context->vt_context->anal->verbose) {
+ 			eprintf("Failed to demangle a class name: \"%s\"\n", td->td.name);
+
+
+
+
+@@ -1166,6 +1166,7 @@ R_API void r_bin_bind(RBin *bin, RBinBind *b) {
+ 		b->get_name = __getname;
+ 		b->get_sections = r_bin_get_sections;
+ 		b->get_vsect_at = __get_vsection_at;
++		b->demangle = r_bin_demangle;
+ 	}
+ }
+ 
+
+
+
+
+@@ -5,7 +5,7 @@
+ #include <cxx/demangle.h>
+ 
+ R_API void r_bin_demangle_list(RBin *bin) {
+-	const char *langs[] = { "c++", "java", "objc", "swift", "dlang", "msvc", NULL };
++	const char *langs[] = { "c++", "java", "objc", "swift", "dlang", "msvc", "rust", NULL };
+ 	RBinPlugin *plugin;
+ 	RListIter *it;
+ 	int i;
+@@ -27,7 +27,7 @@ R_API char *r_bin_demangle_plugin(RBin *bin, const char *name, const char *str)
+ 	RListIter *it;
+ 	if (bin && name && str) {
+ 		r_list_foreach (bin->plugins, it, plugin) {
+-			if (plugin->demangle) {
++			if (plugin->demangle && !strncmp (plugin->name, name, strlen (plugin->name))) {
+ 				return plugin->demangle (str);
+ 			}
+ 		}
+
+
+
+
+@@ -24,6 +24,7 @@ static EManglingType get_mangling_type(char *sym)
+ 	}
+ 
+ 	switch (*sym) {
++	case '.':
+ 	case '?':
+ 		mangling_type = eManglingMicrosoft;
+ 		break;
+
+
+
+
+@@ -105,9 +105,11 @@ static state_func const state_table[eTCStateMax] = {
+ // State machine for parsing type codes functions
+ ///////////////////////////////////////////////////////////////////////////////
+ 
++static void init_state_struct(SStateInfo *state, char *buff_for_parsing);
+ static EDemanglerErr get_type_code_string(char *sym, unsigned int *amount_of_read_chars, char **str_type_code);
+ stat

@@ -1,0 +1,127 @@
+@@ -201,18 +201,18 @@ class TestBase(TestCase):
+         logger.debug("Additional Service created. status='%s'" % str(api_response.status))
+ 
+     def wait_until_exists(self, name, resource_type, ns="default"):
+-        retry_until_success(kubectl, function_args=["get %s %s -n%s" %
++        retry_until_success(kubectl, function_args=["get %s %s -n %s" %
+                                                     (resource_type, name, ns)])
+ 
+     def delete_and_confirm(self, name, resource_type, ns="default"):
+         try:
+-            kubectl("delete %s %s -n%s" % (resource_type, name, ns))
++            kubectl("delete %s %s -n %s" % (resource_type, name, ns))
+         except subprocess.CalledProcessError:
+             pass
+ 
+         def is_it_gone_yet(res_name, res_type):
+             try:
+-                kubectl("get %s %s -n%s" % (res_type, res_name, ns),
++                kubectl("get %s %s -n %s" % (res_type, res_name, ns),
+                         logerr=False)
+                 raise self.StillThere
+             except subprocess.CalledProcessError:
+
+
+
+
+@@ -16,6 +16,7 @@ import os
+ import random
+ import subprocess
+ import time
++import enum
+ 
+ from tests.k8st.test_base import TestBase, Pod
+ from tests.k8st.utils.utils import start_external_node_with_bgp, \
+@@ -23,7 +24,11 @@ from tests.k8st.utils.utils import start_external_node_with_bgp, \
+ 
+ _log = logging.getLogger(__name__)
+ 
+-bird_conf_tor = """
++class TopologyMode(enum.Enum):
++    RR = "rr"
++    MESH = "mesh"
++
++bird_conf_tor_mesh = """
+ # Template for all BGP clients
+ template bgp bgp_template {
+   debug { states };
+@@ -64,12 +69,47 @@ protocol bgp Mesh_with_node_3 from bgp_template {
+ }
+ """
+ 
++bird_conf_tor_rr = """
++# Template for all BGP clients
++template bgp bgp_template {
++  debug { states };
++  description "Connection to BGP peer";
++  local as 63000;
++  multihop;
++  gateway recursive; # This should be the default, but just in case.
++  import all;        # Import all routes, since we don't know what the upstream
++                     # topology is and therefore have to trust the ToR/RR.
++  export all;
++  source address ip@local;  # The local address we use for the TCP connection
++  add paths on;
++  graceful restart;  # See comment in kernel section about graceful restart.
++  connect delay time 2;
++  connect retry time 5;
++  error wait time 5,30;
++}
++
++# ------------- RR -------------
++protocol bgp RR_with_master_node from bgp_template {
++  neighbor %s as 64512;
++  passive on;
++}
++"""
++
+ 
+ class _TestLocalBGPPeer(TestBase):
++    def set_topology(self, value):
++        self.topology = value
+ 
+     def setUp(self):
+         super(_TestLocalBGPPeer, self).setUp()
+ 
++        if self.topology == TopologyMode.MESH:
++          _log.info("Topology MESH")
++        elif self.topology == TopologyMode.RR:
++          _log.info("Topology RR")
++        else:
++          _log.exception("Topology unknown")
++
+         # Create bgp test namespace
+         self.ns = "bgp-test-" + hex(random.randint(0, 0xffffffff))
+         self.create_namespace(self.ns)
+@@ -99,7 +139,7 @@ class _TestLocalBGPPeer(TestBase):
+ apiVersion: projectcalico.org/v3
+ kind: BGPFilter
+ metadata:
+-  name: export-to-tor
++  name: export-child-cluster-cidr
+ spec:
+   exportV4:
+   - action: Accept
+@@ -112,10 +152,11 @@ spec:
+     cidr: ca11:c0::/32
+     source: RemotePeers
+ """)
+-        self.add_cleanup(lambda: calicoctl("delete bgpfilter export-to-tor", allow_fail=True))
++        self.add_cleanup(lambda: calicoctl("delete bgpfilter export-child-cluster-cidr", allow_fail=True))
+ 
+-        # Establish BGPPeer from cluster nodes to tor
+-        kubectl("""apply -f - << EOF
++        if self.topology == TopologyMode.MESH:
++          # Establish BGPPeer from cluster nodes to tor
++          kubectl("""apply -f - << EOF
+ apiVersion: projectcalico.org/v3
+ kind: BGPPeer
+ metadata:
+@@ -124,10 +165,48 @@ spec:
+   peerIP: %s
+   asNumber: 63000
+   filters:
+-  - export-to-tor
++  - export-child-cluster-cidr
++EOF
++""" % self.external

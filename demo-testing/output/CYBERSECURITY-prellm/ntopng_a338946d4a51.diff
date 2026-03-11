@@ -1,0 +1,172 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,329 @@
++#include <iostream>
++#include <sstream>
++#include <fstream>
++#include <string.h>
++#include <unistd.h>
++
++#include "json.h"
++#include "ndpi_main.h"
++#include <zmq.h>
++
++using namespace std;
++
++struct zmq_msg_hdr {
++  char url[32];
++  u_int32_t version;
++  u_int32_t size;
++};
++
++static pair<char *, size_t> get_corpus(string filename) {
++  ifstream is(filename, ios::binary);
++
++  if (is) {
++    stringstream buffer;
++    buffer << is.rdbuf();
++    size_t length = buffer.str().size();
++    char * aligned_buffer;
++    if (posix_memalign( (void **)&aligned_buffer, 64, (length + 63) / 64  * 64))
++      throw "Allocation failed";
++    memset(aligned_buffer, 0x20, (length + 63) / 64  * 64);
++    memcpy(aligned_buffer, buffer.str().c_str(), length);
++    is.close();
++    return make_pair((char *)aligned_buffer, length);
++  } 
++
++  cerr << "JSON file " << filename << "not found or empty\n";
++  exit(1);
++}
++
++int key_is_int(char *key) {
++  int i, length = strlen(key);
++
++  for (i = 0; i < length; i++)
++    if (!isdigit(key[i]))
++      return 0;
++
++  return 1;
++}
++
++void json_to_tlv(json_object * jobj, ndpi_serializer *serializer) {
++  enum json_type type;
++  int rc, ikey, ival = 0;
++  char *sval = NULL;
++
++  json_object_object_foreach(jobj, key, val) {
++    type = json_object_get_type(val);
++
++    //printf("key: %s type: %u ", key, type);
++
++    switch (type) {
++      case json_type_int:
++        ival = json_object_get_int(val);
++      break;
++      case json_type_string:
++        sval = (char *) json_object_get_string(val);
++      break;
++      default:
++        printf("JSON type %u not supported\n", type);
++      break;
++    }
++
++    rc = 0;
++    if (key_is_int(key)) {
++      ikey = atoi(key);
++      switch (type) {
++        case json_type_int:
++          rc = ndpi_serialize_uint32_uint32(serializer, ikey, ival);
++        break;
++        case json_type_string:
++          rc = ndpi_serialize_uint32_string(serializer, ikey, sval);
++        break;
++        default:
++        break;
++      }
++    } else {
++      switch (type) {
++        case json_type_int:
++          rc = ndpi_serialize_string_uint32(serializer, key, ival);
++        break;
++        case json_type_string:
++          rc = ndpi_serialize_string_string(serializer, key, sval);
++        break;
++        default:
++        break;
++      }
++    }
++
++    if (rc == -1)
++      printf("Serialization error: %d\n", rc);
++  }
++}
++
++void print_help(char *bin) {
++  cerr << "Usage: " << bin << " -i <JSON file> [-z <ZMQ endpoint>] [-E <num encoding loops] [-D <num decoding loop>] [-v]\n";
++  cerr << "Note: the JSON file should contain an array of records\n";
++}
++
++int main(int argc, char *argv[]) {
++  char *json_path = NULL;
++  char* zmq_endpoint = NULL;
++  void *zmq_sock = NULL;
++  void *zmq_context = NULL;
++  int enc_repeat = 1, dec_repeat = 1;
++  int verbose = 0;
++  struct timeval t1, t2;
++  uint64_t total_time_usec;
++  ndpi_serializer *serializer;
++  ndpi_serializer deserializer;
++  int rc, i, num_elements, exported_flows = 0;
++  char c;
++
++  while ((c = getopt(argc, argv,"hi:vz:E:D:")) != '?') {
++    if (c == (char) 255 || c == -1) break;
++
++    switch(c) {
++      case 'h':
++        print_help(argv[0]);
++        exit(0);
++      break;
++    
++      case 'i':
++        json_path = strdup(optarg);
++      break;
++
++      case 'v':
++        verbose = 1;
++      break;
++
++      case 'z':
++        zmq_endpoint = strdup(optarg);
++      break;
++
++      case 'E':
++        enc_repeat = atoi(optarg);
++      break;
++
++      case 'D':
++        dec_repeat = atoi(optarg);
++      break;
++    }
++  }
++
++  if (json_path == NULL) {
++    print_help(argv[0]);
++    exit(1);
++  }
++
++  if (zmq_endpoint) {
++    zmq_context = zmq_ctx_new();
++    if (zmq_context == NULL) {
++      printf("Unable to initialize ZMQ zmq_context");
++      exit(1);
++    }
++
++    zmq_sock = zmq_socket(zmq_context, ZMQ_PUB);
++    if (zmq_sock == NULL) {
++      printf("Unable to create ZMQ socket");
++    

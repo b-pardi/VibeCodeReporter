@@ -1,0 +1,119 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2012-2023 - houndthe */
++/* radare - LGPL - Copyright 2012-2025 - pancake, houndthe */
+ 
+ #include <r_anal.h>
+ #include <r_bin_dwarf.h>
+@@ -12,11 +12,12 @@ typedef struct dwarf_parse_context_t {
+ 	HtUP/*<ut64 offset, DwarfDie *die>*/ *die_map;
+ 	HtUP/*<offset, RBinDwarfLocList*>*/  *locations;
+ 	const char *lang; // for demangling
++	RArena *arena;
+ } Context;
+ 
+ typedef struct dwarf_function_t {
+ 	ut64 addr;
+-	char *name;
++	const char *name;
+ 	char *signature;
+ 	bool is_external;
+ 	bool is_method;
+@@ -60,10 +61,11 @@ static void variable_free(Variable *var) {
+ 
+ /* return -1 if attr isn't found */
+ static inline st32 find_attr_idx(const RBinDwarfDie *die, st32 attr_name) {
+-	st32 i;
+ 	R_RETURN_VAL_IF_FAIL (die, -1);
+-	for (i = 0; i < die->count; i++) {
+-		if (die->attr_values[i].attr_name == attr_name) {
++
++	R_VEC_FOREACH_I (die->attr_values, i) {
++		RBinDwarfAttrValue *value = RVecDwarfAttrValue_at(die->attr_values, i);
++		if (value->attr_name == attr_name) {
+ 			return i;
+ 		}
+ 	}
+@@ -72,11 +74,12 @@ static inline st32 find_attr_idx(const RBinDwarfDie *die, st32 attr_name) {
+ 
+ /* return NULL if attr isn't found */
+ static RBinDwarfAttrValue *find_attr(const RBinDwarfDie *die, st32 attr_name) {
+-	st32 i;
+ 	R_RETURN_VAL_IF_FAIL (die, NULL);
+-	for (i = 0; i < die->count; i++) {
+-		if (die->attr_values[i].attr_name == attr_name) {
+-			return &die->attr_values[i];
++
++	RBinDwarfAttrValue *value;
++	R_VEC_FOREACH (die->attr_values, value) {
++		if (value->attr_name == attr_name) {
++			return value;
+ 		}
+ 	}
+ 	return NULL;
+@@ -152,8 +155,16 @@ static bool strbuf_rev_append_char(RStrBuf *sb, const char *s, const char *needl
+ 	return ret;
+ }
+ 
+-static inline char *create_type_name_from_offset(ut64 offset) {
+-	return r_str_newf ("type_0x%" PFMT64x, offset);
++static inline char *create_type_name_from_offset(RArena *arena, ut64 offset) {
++	return r_arena_push_strf (arena, "type_0x%" PFMT64x, offset);
++}
++
++static RBinDwarfAttrValue *get_die_attr(const RBinDwarfDie *die, int attr_name) {
++	st32 idx = find_attr_idx (die, attr_name);
++	if (idx == -1) {
++		return NULL;
++	}
++	return RVecDwarfAttrValue_at (die->attr_values, idx);
+ }
+ 
+ /**
+@@ -162,16 +173,12 @@ static inline char *create_type_name_from_offset(ut64 offset) {
+  * @param die
+  * @return char* DIEs name or NULL if error
+  */
+-static char *get_die_name(const RBinDwarfDie *die) {
+-	st32 name_attr_idx = find_attr_idx (die, DW_AT_name);
+-	if (name_attr_idx < 0 || name_attr_idx >= die->count) {
+-		return NULL;
+-	}
+-	RBinDwarfAttrValue *av = &die->attr_values[name_attr_idx];
+-	if (av->kind == DW_AT_KIND_STRING && name_attr_idx != -1 && av->string.content) {
+-		return strdup (av->string.content);
++static const char *get_die_name(RArena *arena, const RBinDwarfDie *die) {
++	RBinDwarfAttrValue *av = get_die_attr(die, DW_AT_name);
++	if (av && av->kind == DW_AT_KIND_STRING && av->string.content) {
++		return av->string.content;
+ 	}
+-	return create_type_name_from_offset (die->offset);
++	return create_type_name_from_offset (arena, die->offset);
+ }
+ 
+ /**
+@@ -182,15 +189,15 @@ static char *get_die_name(const RBinDwarfDie *die) {
+  */
+ static ut64 get_die_size(const RBinDwarfDie *die) {
+ 	ut64 size = 0;
+-	st32 byte_size_idx = find_attr_idx (die, DW_AT_byte_size);
++	RBinDwarfAttrValue *av = get_die_attr (die, DW_AT_byte_size);
+ 
+-	if (byte_size_idx != -1) {
+-		size = die->attr_values[byte_size_idx].uconstant * CHAR_BIT;
++	if (av) {
++		size = av->uconstant * CHAR_BIT;
+ 	} else {
+-		st32 bit_size_idx = find_attr_idx (die, DW_AT_bit_size);
++		av = get_die_attr (die, DW_AT_bit_size);
+ 
+-		if (bit_size_idx != -1) {
+-			size = die->attr_values[bit_size_idx].uconstant;
++		if (av) {
++			size = av->uconstant;
+ 		}
+ 	}
+ 	return size;
+@@ -218,15 +225,13 @@ static void parse_array_type(Context *ctx, int idx, RStrBuf *strbuf) {
+ 			// right now we skip non direct descendats of the structure
+ 			// can be also DW_TAG_suprogram for class methods or tag for templates
+ 	

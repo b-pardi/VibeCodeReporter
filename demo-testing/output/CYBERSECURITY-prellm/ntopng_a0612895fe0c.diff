@@ -1,0 +1,121 @@
+@@ -29,6 +29,7 @@ class ThreadedActivity;
+ typedef struct {
+   ticks  tot_ticks, max_ticks;
+   u_long tot_calls;
++  bool is_slow;
+ } threaded_activity_rrd_stats_t;
+ 
+ typedef struct {
+@@ -44,6 +45,7 @@ class ThreadedActivityStats {
+   threaded_activity_stats_t *ta_stats, *ta_stats_shadow;
+   time_t start_time;
+   const ThreadedActivity *threaded_activity;
++  static ticks tickspersec;
+ 
+   void updateRRDStats(bool write, ticks cur_ticks);
+   void luaRRDStats(lua_State *vm, bool write, threaded_activity_stats_t *cur_stats);
+@@ -52,6 +54,7 @@ class ThreadedActivityStats {
+   ThreadedActivityStats(const ThreadedActivity *ta);
+   ~ThreadedActivityStats();
+ 
++  bool isRRDSlow() const;
+   void updateRRDWriteStats(ticks cur_ticks);
+   void updateRRDReadStats(ticks cur_ticks);
+ 
+
+
+
+
+@@ -865,6 +865,7 @@
+ #define ALERTS_MANAGER_SEVERITY_FIELD        "alert_severity"
+ #define STATS_MANAGER_STORE_NAME             "top_talkers.db"
+ 
++#define THREADED_ACTIVITY_STATS_SLOW_RRD_MS   5  /* RRD are slow if an update takes more than 5 millis */
+ #define CONST_MAX_NUM_THREADED_ACTIVITIES 64
+ #define STARTUP_SCRIPT_PATH        "startup.lua"
+ #define BOOT_SCRIPT_PATH           "boot.lua" /* Executed as root before networking is setup */
+
+
+
+
+@@ -5230,6 +5230,20 @@ static int ntop_rrd_tune(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++// ***API***
++static int ntop_rrd_is_slow(lua_State* vm) {
++  struct ntopngLuaContext *ctx = getLuaVMContext(vm);
++
++  if(ctx && ctx->threaded_activity_stats)
++    lua_pushboolean(vm, ctx->threaded_activity_stats->isRRDSlow());
++  else
++    lua_pushboolean(vm, false);
++
++  return CONST_LUA_OK;
++}
++
++/* ****************************************** */
++
+ /* positional 1:4 parameters for ntop_rrd_fetch */
+ static int __ntop_rrd_args (lua_State* vm, char **filename, char **cf, time_t *start, time_t *end) {
+   char *start_s, *end_s, *err;
+@@ -11754,12 +11768,13 @@ static const luaL_Reg ntop_reg[] = {
+   { "networkPrefix",    ntop_network_prefix },
+ 
+   /* RRD */
+-  { "rrd_create",        ntop_rrd_create },
+-  { "rrd_update",        ntop_rrd_update },
+-  { "rrd_fetch",         ntop_rrd_fetch  },
++  { "rrd_create",        ntop_rrd_create        },
++  { "rrd_update",        ntop_rrd_update        },
++  { "rrd_fetch",         ntop_rrd_fetch         },
+   { "rrd_fetch_columns", ntop_rrd_fetch_columns },
+-  { "rrd_lastupdate",    ntop_rrd_lastupdate  },
+-  { "rrd_tune",          ntop_rrd_tune  },
++  { "rrd_lastupdate",    ntop_rrd_lastupdate    },
++  { "rrd_tune",          ntop_rrd_tune          },
++  { "rrd_is_slow",       ntop_rrd_is_slow       },
+ 
+   /* Prefs */
+   { "getPrefs",          ntop_get_prefs },
+
+
+
+
+@@ -21,6 +21,8 @@
+ 
+ #include "ntop_includes.h"
+ 
++ticks ThreadedActivityStats::tickspersec = Utils::gettickspersec();
++
+ /* ******************************************* */
+ 
+ ThreadedActivityStats::ThreadedActivityStats(const ThreadedActivity *ta) {
+@@ -39,6 +41,18 @@ ThreadedActivityStats::~ThreadedActivityStats() {
+ 
+ /* ******************************************* */
+ 
++bool ThreadedActivityStats::isRRDSlow() const {
++  threaded_activity_stats_t *cur_stats = ta_stats;
++
++  if(cur_stats) {
++    return cur_stats->rrd.write.is_slow || cur_stats->rrd.read.is_slow;
++  }
++
++  return false;
++}
++
++/* ******************************************* */
++
+ void ThreadedActivityStats::updateRRDStats(bool write, ticks cur_ticks) {
+   threaded_activity_stats_t *cur_stats = ta_stats;
+   threaded_activity_rrd_stats_t *rrd_stats;
+@@ -49,6 +63,16 @@ void ThreadedActivityStats::updateRRDStats(bool write, ticks cur_ticks) {
+     rrd_stats->tot_ticks += cur_ticks;
+     rrd_stats->tot_calls += 1;
+     if(cur_ticks > rrd_stats->max_ticks) rrd_stats->max_ticks = cur_ticks;
++
++    if(rrd_stats->tot_calls && !(rrd_stats->tot_calls % 10)) {
++      /* Evaluate the condition every 10 updates */
++      if(rrd_stats->tot_ticks / (float)tickspersec / rrd_stats->tot_calls * 1000 >= THREADED_ACTIVITY_STATS_SLOW_RRD_MS)
++	rrd_stats->is_

@@ -1,0 +1,89 @@
+@@ -2,15 +2,36 @@ package peergos.server.tests;
+ 
+ import org.junit.*;
+ import org.peergos.*;
++import peergos.server.JavaCrypto;
++import peergos.server.corenode.JdbcIpnsAndSocial;
++import peergos.server.space.JdbcUsageStore;
+ import peergos.server.sql.*;
+ import peergos.server.storage.*;
++import peergos.server.storage.auth.Want;
+ import peergos.server.util.*;
++import peergos.shared.Crypto;
++import peergos.shared.MaybeMultihash;
+ import peergos.shared.cbor.*;
++import peergos.shared.corenode.CoreNode;
++import peergos.shared.crypto.SigningKeyPair;
++import peergos.shared.crypto.asymmetric.PublicSigningKey;
++import peergos.shared.crypto.hash.PublicKeyHash;
+ import peergos.shared.io.ipfs.*;
++import peergos.shared.mutable.PointerUpdate;
++import peergos.shared.storage.*;
++import peergos.shared.storage.auth.BatWithId;
++import peergos.shared.user.fs.EncryptedCapability;
++import peergos.shared.user.fs.SecretLink;
++import peergos.shared.util.EfficientHashMap;
++import peergos.shared.util.Futures;
++import peergos.shared.util.ProgressConsumer;
+ 
+ import java.io.*;
+ import java.nio.file.*;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
+ import java.sql.*;
++import java.time.LocalDateTime;
+ import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.*;
+@@ -18,8 +39,75 @@ import java.util.function.*;
+ import java.util.stream.*;
+ 
+ public class GCTests {
++    private static final Crypto crypto = JavaCrypto.init();
+ 
++    private Supplier<Connection> getDb(Path file) throws Exception {
++        File storeFile = file.toFile();
++        String sqlFilePath = storeFile.getPath();
++        Connection db = Sqlite.build(sqlFilePath);
++        Connection instance = new Sqlite.UncloseableConnection(db);
++        return () -> instance;
++    }
++
++    @Test
++    public void fullGC() throws Exception {
++        Path dir = Files.createTempDirectory("peergos-gc-test");
++        SqliteCommands cmds = new SqliteCommands();
++        BlockMetadataStore metadb = new JdbcBlockMetadataStore(getDb(dir.resolve("metadata.sqlite")), cmds);
+ 
++        WriteOnlyStorage storage = new WriteOnlyStorage(metadb);
++        JdbcIpnsAndSocial pointers = new JdbcIpnsAndSocial(getDb(dir.resolve("mutable.sqlite")), cmds);
++        JdbcUsageStore usage = new JdbcUsageStore(getDb(dir.resolve("usage.sqlite")), cmds);
++
++        GarbageCollector gc = new GarbageCollector(storage, pointers, usage, dir, (x, y) -> Futures.of(true), true);
++        gc.collect(s -> Futures.of(true));
++
++        verifyAllReachableBlocksArePresent(pointers, metadb, storage);
++
++        // write a tree, gc and verify again
++        SigningKeyPair signer = SigningKeyPair.random(crypto.random, crypto.signer);
++        PublicKeyHash writer = ContentAddressedStorage.hashKey(signer.publicSigningKey);
++        Cid root = generateTree(42, 1000, blocks -> blocks
++                        .forEach(b -> storage.storage.put(b, true)),
++                (b, kids) -> metadb.put(b, null, new BlockMetadata(10, kids, Collections.emptyList())));
++        pointers.setPointer(writer, Optional.empty(), signer.signMessage(new PointerUpdate(MaybeMultihash.empty(), MaybeMultihash.of(root), Optional.of(1L)).serialize()).join()).join();
++
++        verifyAllReachableBlocksArePresent(pointers, metadb, storage);
++
++        // test deleting a block fails to verify
++        Cid toRemove = storage.storage.keySet().stream().findAny().get();
++        storage.storage.remove(toRemove);
++        try {
++            verifyAllReachableBlocksArePresent(pointers, metadb, storage);
++            throw new RuntimeException("Should not get here");
++        } catch (IllegalStateException expected) {}
++        storage.storage.put(toRemove, true);
++    }
++
++    public void verifyAllReachableBlocksArePresent(JdbcIpnsAndSocial pointers,
++                                                   BlockMetadataStore meta,
++                                                   DeletableContentAddressedStorage stor

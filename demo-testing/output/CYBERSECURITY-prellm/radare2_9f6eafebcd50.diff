@@ -1,0 +1,124 @@
+@@ -242,6 +242,7 @@ R_API int r_anal_op_execute(RAnal *anal, RAnalOp *op) {
+ }
+ 
+ R_API bool r_anal_op_nonlinear(int t) {
++	t &= R_ANAL_OP_TYPE_MASK;
+ 	switch (t) {
+ 	//call
+ 	case R_ANAL_OP_TYPE_CALL:
+@@ -271,6 +272,7 @@ R_API bool r_anal_op_nonlinear(int t) {
+ }
+ 
+ R_API bool r_anal_op_ismemref(int t) {
++	t &= R_ANAL_OP_TYPE_MASK;
+ 	switch (t) {
+ 	case R_ANAL_OP_TYPE_LOAD:
+ 	case R_ANAL_OP_TYPE_MOV:
+
+
+
+
+@@ -2614,6 +2614,9 @@ jmp $$ + 4 + ( [delta] * 2 )
+ 			op->stackop = R_ANAL_STACK_GET;
+ 			op->stackptr = 0;
+ 			op->ptr = -MEMDISP(1);
++		} else if (REGBASE(1) == ARM_REG_PC) {
++			op->refptr = 4;
++			op->ptr = (addr & ~3LL) + (thumb? 4: 8) + MEMDISP(1);
+ 		}
+ 		break;
+ 	case ARM_INS_BLX:
+
+
+
+
+@@ -5,8 +5,6 @@
+ #include <r_util.h>
+ #include <r_core.h>
+ #define LOOP_MAX 10
+-#define SUMARRAY(arr, size, res) do (res) += (arr)[--(size)]; while ((size))
+-#define MAXINSTR 20
+ 
+ enum {
+ 	ROMEM = 0,
+@@ -88,17 +86,16 @@ static void var_retype (RAnal *anal, RAnalVar *var, const char *vname, char *typ
+ 	if (!*trim) {
+ 		return;
+ 	}
+-	if (!strncmp (trim, "int", 3)) {
++	bool is_ptr = (vname && *vname == '*')? true: false;
++	if (!strncmp (trim, "int", 3) || (!is_ptr && !strcmp (trim, "void"))) {
++		// default or void type
+ 		return;
+ 	}
+ 	const char *tmp = strstr (var->type, "int");
+ 	bool is_default = tmp? true: false;
+-	bool is_ptr = (vname && *vname == '*')? true: false;
+-	bool is_void = !strncmp (var->type, "void", 4)? true: false;
+-	if (!is_void && !is_default) {
+-		return;
+-	}
+-	if (is_void && !is_ptr && !r_str_endswith (var->type, "*")) {
++	if (!is_default && strncmp (var->type, "void", 4)) {
++		// return since type is already propgated
++		// except for "void *", since "void *" => "char *" is possible
+ 		return;
+ 	}
+ 	char ntype[256];
+@@ -117,7 +114,7 @@ static void var_retype (RAnal *anal, RAnalVar *var, const char *vname, char *typ
+ 		//TODO: Infering const type
+ 		snprintf (ntype, len, "%s", type + 6);
+ 	}
+-	if (vname && *vname == '*') {
++	if (is_ptr) {
+ 		//type *ptr => type *
+ 		strncat (ntype, " *", len);
+ 	}
+@@ -161,7 +158,7 @@ static ut64 get_addr (Sdb *trace, const char *regname, int idx) {
+ #define DEFAULT_MAX 3
+ #define REG_SZ 10
+ 
+-static void type_match(RCore *core, ut64 addr, char *fcn_name, ut64 faddr, const char* cc,
++static void type_match(RCore *core, ut64 addr, char *fcn_name, ut64 baddr, const char* cc,
+ 		int prev_idx, bool userfnc, ut64 caddr) {
+ 	Sdb *trace = core->anal->esil->db_trace;
+ 	Sdb *TDB = core->anal->sdb_types;
+@@ -204,15 +201,21 @@ static void type_match(RCore *core, ut64 addr, char *fcn_name, ut64 faddr, const
+ 		// Backtrace instruction from source sink to prev source sink
+ 		for (j = idx; j >= prev_idx; j--) {
+ 			ut64 instr_addr = sdb_num_get (trace, sdb_fmt ("%d.addr", j), 0);
+-			if (instr_addr < faddr) {
+-				free (type);
+-				goto beach;
++			if (instr_addr < baddr) {
++				break;
+ 			}
+ 			RAnalOp *op = r_core_anal_op (core, instr_addr, R_ANAL_OP_MASK_BASIC);
+-			if (!op || (op && op->type == R_ANAL_OP_TYPE_CALL)) {
++			if (!op) {
+ 				r_anal_op_free (op);
+ 				break;
+ 			}
++			RAnalOp *next_op = r_core_anal_op (core, instr_addr + op->size, R_ANAL_OP_MASK_BASIC);
++			if (!next_op || (j != idx && (next_op->type == R_ANAL_OP_TYPE_CALL
++							|| next_op->type == R_ANAL_OP_TYPE_JMP))) {
++				r_anal_op_free (op);
++				r_anal_op_free (next_op);
++				break;
++			}
+ 			char *key = NULL;
+ 			RAnalVar *var = op->var;
+ 			if (!in_stack) {
+@@ -268,7 +271,7 @@ static void type_match(RCore *core, ut64 addr, char *fcn_name, ut64 faddr, const
+ 						break;
+ 					}
+ 				}
+-			} else if (var && res && (xaddr != UT64_MAX)) { // Type progation using value
++			} else if (var && res && xaddr && (xaddr != UT64_MAX)) { // Type progation using value
+ 				char tmp[REG_SZ] = {0};
+ 				get_src_regname (core, instr_addr, tmp, sizeof (tmp));
+ 				ut64 ptr = get_addr (trace, tmp, j);
+@@ -277,11 +280,11 @@ static void type_match(RCore *core, ut64 addr, char *fcn_name, ut64 faddr, const
+ 				}
+ 			}
+ 			r_anal_op_free (op);

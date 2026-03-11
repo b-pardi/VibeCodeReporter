@@ -1,0 +1,105 @@
+@@ -21,6 +21,8 @@ import socket
+ import random
+ import re
+ import requests
++import threading
++import time
+ 
+ from requests.adapters import HTTPAdapter
+ from requests.auth import AuthBase, HTTPBasicAuth, HTTPDigestAuth
+@@ -28,21 +30,22 @@ from requests.packages.urllib3 import disable_warnings
+ from requests_ntlm import HttpNtlmAuth
+ from urllib.parse import urlparse
+ 
+-from lib.core.exceptions import InvalidURLException, RequestException
+-from lib.core.settings import READ_RESPONSE_ERROR_REGEX, PROXY_SCHEMES, UNKNOWN
++from lib.core.decorators import cached
++from lib.core.exceptions import RequestException
++from lib.core.settings import (
++    RATE_UPDATE_DELAY, READ_RESPONSE_ERROR_REGEX,
++    PROXY_SCHEMES,
++)
+ from lib.core.structures import CaseInsensitiveDict
+-from lib.connection.dns import cached_getaddrinfo, cache_dns
++from lib.connection.dns import cached_getaddrinfo
+ from lib.connection.response import Response
+ from lib.utils.common import safequote
+ from lib.utils.mimetype import guess_mimetype
+-from lib.utils.schemedet import detect_scheme
+ 
+ # Disable InsecureRequestWarning from urllib3
+ disable_warnings()
+ # Use custom `socket.getaddrinfo` for `requests` which supports DNS caching
+ socket.getaddrinfo = cached_getaddrinfo
+-# Standard ports for different schemes
+-STANDARD_PORTS = {"http": 80, "https": 443}
+ 
+ 
+ class HTTPBearerAuth(AuthBase):
+@@ -56,15 +59,16 @@ class HTTPBearerAuth(AuthBase):
+ 
+ class Requester:
+     def __init__(self, **kwargs):
++        self._url = None
+         self._proxy_cred = None
++        self._rate = 0
+         self.httpmethod = kwargs.get("httpmethod", "get")
+         self.data = kwargs.get("data", None)
+         self.max_pool = kwargs.get("max_pool", 100)
+         self.max_retries = kwargs.get("max_retries", 3)
++        self.max_rate = kwargs.get("max_rate", 3)
+         self.timeout = kwargs.get("timeout", 10)
+-        self.ip = kwargs.get("ip", None)
+         self.proxy = kwargs.get("proxy", [])
+-        self.default_scheme = kwargs.get("scheme", None)
+         self.follow_redirects = kwargs.get("follow_redirects", False)
+         self.random_agents = kwargs.get("random_agents", None)
+         self.headers = CaseInsensitiveDict(kwargs.get("headers", {}))
+@@ -79,68 +83,11 @@ class Requester:
+         if self.data and "content-type" not in self.headers:
+             self.set_header("content-type", guess_mimetype(self.data))
+ 
+-    def set_target(self, url):
+-        # If no scheme specified, unset it first
+-        if "://" not in url:
+-            url = f"{self.default_scheme or UNKNOWN}://{url}"
+-        if not url.endswith("/"):
+-            url += "/"
+-
+-        parsed = urlparse(url)
+-
+-        self.base_path = parsed.path
+-        if parsed.path.startswith("/"):
+-            self.base_path = parsed.path[1:]
+-
+-        # Credentials in URL (https://[user]:[password]@website.com)
+-        if "@" in parsed.netloc:
+-            cred, parsed.netloc = parsed.netloc.split("@")
+-            self.set_auth("basic", cred)
+-
+-        self.host = parsed.netloc.split(":")[0]
+-
+-        if parsed.scheme not in (UNKNOWN, "https", "http"):
+-            raise InvalidURLException(f"Unsupported URI scheme: {parsed.scheme}")
+-
+-        # If no port specified, set default (80, 443)
+-        try:
+-            self.port = int(parsed.netloc.split(":")[1])
+-
+-            if not 0 < self.port < 65536:
+-                raise ValueError
+-        except IndexError:
+-            self.port = STANDARD_PORTS.get(parsed.scheme, None)
+-        except ValueError:
+-            invalid_port = parsed.netloc.split(":")[1]
+-            raise InvalidURLException(f"Invalid port number: {invalid_port}")
+-
+-        try:
+-            # If no scheme is found, detect it by port number
+-            self.scheme = (
+-                parsed.scheme
+-                if parsed.scheme != UNKNOWN
+-                else detect_scheme(self.host, self.port)
+-            )
+-        except ValueError:
+-            # If the user neither provides th

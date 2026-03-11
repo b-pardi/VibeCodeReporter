@@ -1,0 +1,161 @@
+@@ -301,7 +301,7 @@ static RList *sections(RBinFile *bf) {
+ 			continue;
+ 		}
+ 		r_buf_read_at (obj->b, module->module_name_rva, (ut8*)&b, sizeof (b));
+-		str = b;
++		str = (struct minidump_string *)b;
+ 		int ptr_name_len = (str->length + 2) * 4;
+ 		if (ptr_name_len < 1 || ptr_name_len > sizeof (b) - 4) {
+ 			continue;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,649 @@
++/* radare - LGPL - Copyright 2018 - pancake */
++
++#include <r_types.h>
++#include <r_util.h>
++#include <r_lib.h>
++#include <r_bin.h>
++#include "../i/private.h"
++
++// enable debugging messages
++#define D if (0)
++
++static bool is64 = false;
++static ut64 dwordsBeginAt = UT64_MAX;
++static ut64 stringsBeginAt = UT64_MAX;
++static ut64 symbolsBeginAt = UT64_MAX;
++// static ut64 symbolsCount = UT64_MAX;
++static RList *globalSymbols = NULL;
++
++#define SECTIONS_BEGIN 0x220
++#define SEGMENTS_BEGIN 0x1b0
++
++typedef struct symbols_header_t {
++	ut32 magic;
++	ut32 version;
++	ut8 uuid[16];
++	ut32 unk0;
++	ut32 unk1;
++	ut32 slotsize;
++	ut32 addr;
++	bool valid;
++	int size;
++} SymbolsHeader;
++
++// header starts at offset 0 and ends at offset 0x40
++static SymbolsHeader parseHeader(RBuffer *buf) {
++	ut8 b[64];
++	SymbolsHeader sh = { 0 };
++	(void)r_buf_read_at (buf, 0, b, sizeof (b));
++	sh.magic = r_read_le32 (b);
++	sh.version = r_read_le32 (b + 4);
++	sh.valid = sh.magic == 0xff01ff02;
++	int i;
++	for (i = 0; i < 16; i++) {
++		sh.uuid[i] = b[24 + i];
++	}
++	sh.unk0 = r_read_le16 (b + 0x28);
++	sh.unk1 = r_read_le16 (b + 0x2c); // is slotsize + 1 :?
++	sh.slotsize = r_read_le16 (b + 0x2e);
++	sh.size = 0x40;
++	return sh;
++}
++
++typedef struct symbols_metadata_t { // 0x40
++	ut32 cputype;
++	ut32 subtype;
++	ut32 n_segments;
++	ut32 namelen;
++	ut32 name;
++	bool valid;
++	ut32 size;
++	RList *segments;
++	ut32 addr;
++	int bits;
++	const char *arch;
++	const char *cpu;
++} SymbolsMetadata;
++
++// this is_segment concept is a bad idea imho
++static RBinSection *newSection(const char *name, ut32 from, ut32 to, bool is_segment) {
++	RBinSection *s = R_NEW0 (RBinSection);
++	if (!s) {
++		return NULL;
++	}
++	s->name = strdup (name);
++	s->size = to - from + 1;
++	s->vsize = s->size;
++	s->paddr = from;
++	s->vaddr = from;
++	s->add = true;
++	s->perm = strstr (name, "TEXT")? 5: 4;
++	s->is_segment = is_segment;
++	return s;
++}
++
++static RList *parseSegments(RBuffer *buf, int off, int count) {
++	ut8 *b = calloc (count, 32);
++	(void)r_buf_read_at (buf, off, b, count * 32);
++	int x = off;
++	int X = 0;
++	int i;
++	RList *segments = r_list_newf ((RListFree)r_bin_section_free);
++	if (!segments) {
++		return NULL;
++	}
++	// eprintf ("Segments: %d\n", count);
++	for (i = 0; i < count; i++) {
++		int A = r_read_le32 (b + X + 16);
++		int B = r_read_le32 (b + X + 16 + 8);
++		//	eprintf ("0x%08x  segment  0x%08x 0x%08x  %s\n",
++		//		x, A, A + B, b + X);
++		const char *name = (const char *)(b + X);
++		r_list_append (segments, newSection ((const char *)b + X, A, A + B, true));
++		x += 32;
++		X += 32;
++	}
++	return segments;
++}
++
++static const char *typeString(ut32 n, int *bits) {
++	*bits = 32;
++	if (n == 12) { // CPU_SUBTYPE_ARM_V7) {
++		return "arm";
++	}
++	if (n == 0x0100000c) { // arm64
++		*bits = 64;
++		is64 = true;
++		return "arm";
++	}
++	if (n == 0x0200000c) { // arm64-32
++		//  TODO: must change bits
++		is64 = false;
++		*bits = 64;
++		return "arm";
++	}
++	return "x86";
++}
++
++static const char *subtypeString(int n) {
++	if (n == 9) { // CPU_SUBTYPE_ARM_V7) {
++		return "armv7";
++	}
++	return "?";
++}
++
++// metadata section starts at offset 0x40 and ends around 0xb0 depending on filenamelength
++static SymbolsMetadata parseMetadata(RBuffer *buf, int off) {
++	SymbolsMetadata sm = { 0 };
++	ut8 b[0x100] = { 0 };
++	(void)r_buf_read_at (buf, off, b, sizeof (b));
++	sm.addr = off;
++	sm.cputype = r_read_le32 (b);
++	sm.arch = typeString (sm.cputype, &sm.bits);
++	//  eprintf ("0x%08x  cputype  0x%x -> %s\n", 0x40, sm.cputype, typeString (sm.cputype));
++	// bits = (strstr (typeString (sm.cputype, &sm.bits), "64"))? 64: 32;
++	sm.subtype = r_read_le32 (b + 4);
++	s

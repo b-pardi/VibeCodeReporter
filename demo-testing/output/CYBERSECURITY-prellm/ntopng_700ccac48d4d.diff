@@ -1,0 +1,89 @@
+@@ -67,6 +67,9 @@ class Host : public GenericHashEntry, public HostAlertableEntity, public Score,
+     u_int32_t syn_sent_last_min, synack_recvd_last_min; /* (attacker) */
+     u_int32_t syn_recvd_last_min, synack_sent_last_min; /* (victim) */
+   } syn_scan; 
++  struct {
++    u_int32_t current /* computing */, last /* in the last interval */;
++  } max_score;
+ 
+   std::atomic<u_int32_t> num_active_flows_as_client, num_active_flows_as_server; /* Need atomic as inc/dec done on different threads */
+   u_int32_t asn;
+@@ -321,6 +324,10 @@ class Host : public GenericHashEntry, public HostAlertableEntity, public Score,
+   inline u_int32_t syn_scan_attacker_hits() const { return syn_scan.syn_sent_last_min > syn_scan.synack_recvd_last_min ? syn_scan.syn_sent_last_min - syn_scan.synack_recvd_last_min : 0; };
+   inline void reset_syn_scan_hits() { syn_scan.syn_sent_last_min = syn_scan.synack_recvd_last_min = syn_scan.syn_recvd_last_min = syn_scan.synack_sent_last_min = 0; };
+ 
++  void update_max_score() { u_int32_t curr = getScore(); if (curr > max_score.current) max_score.current = curr; }
++  void reset_max_score() { max_score.last = max_score.current; max_score.current = 0; }
++  u_int32_t get_max_score() { return max_score.last; }
++
+   void incNumFlows(time_t t, bool as_client);
+   void decNumFlows(time_t t, bool as_client);
+   inline void incNumAlertedFlows(bool as_client) { active_alerted_flows++; if(stats) stats->incNumAlertedFlows(as_client); }
+
+
+
+
+@@ -22,10 +22,8 @@
+ #ifndef _SCORE_ALERT_H_
+ #define _SCORE_ALERT_H_
+ 
+-
+ #include "ntop_includes.h"
+ 
+-
+ class ScoreAlert : public HostAlert {
+  private:
+   u_int64_t score, score_threshold;
+@@ -35,7 +33,7 @@ class ScoreAlert : public HostAlert {
+  public:
+   static HostAlertType getClassType() { return { host_alert_score, alert_category_security }; }
+ 
+-  ScoreAlert(HostCallback *c, Host *f, AlertLevel severity, u_int8_t cli_score, u_int8_t srv_score);
++  ScoreAlert(HostCallback *c, Host *f, AlertLevel severity, u_int8_t cli_score, u_int8_t srv_score, u_int64_t _score, u_int64_t _threshold);
+   ~ScoreAlert() {};
+   
+   HostAlertType getAlertType() const { return getClassType(); }
+
+
+
+
+@@ -96,6 +96,7 @@ Host::~Host() {
+ /* NOTE: overrides Score::incScoreValue to handle increments for host members as well */
+ u_int16_t Host::incScoreValue(u_int16_t score_incr, ScoreCategory score_category, bool as_client) {
+   NetworkStats *ns = getNetworkStats(get_local_network_id());
++  u_int16_t score_inc;
+ 
+   /* Do increments only on members that don't change during the lifecycle of the host */
+   if(as)      as->incScoreValue(score_incr, score_category, as_client);
+@@ -103,8 +104,11 @@ u_int16_t Host::incScoreValue(u_int16_t score_incr, ScoreCategory score_category
+   if(country) country->incScoreValue(score_incr, score_category, as_client);
+   if(ns)      ns->incScoreValue(score_incr, score_category, as_client);
+   if(iface)   iface->incScoreValue(score_incr, as_client);
+-  
+-  return Score::incScoreValue(score_incr, score_category, as_client);
++  score_inc = Score::incScoreValue(score_incr, score_category, as_client);
++
++  update_max_score();
++
++  return score_inc;
+ }
+ 
+ /* *************************************** */
+@@ -155,6 +159,7 @@ void Host::updateSynAckAlertsCounter(time_t when, bool synack_sent) {
+ void Host::housekeep(time_t t) {  
+   switch(get_state()) {
+   case hash_entry_state_active:
++    reset_max_score(); 
+     iface->execHostCallbacks(this);
+     break;
+   case hash_entry_state_idle:
+@@ -213,6 +218,7 @@ void Host::initialize(Mac *_mac, u_int16_t _vlanId) {
+   flow_flood.victim_counter   = new (std::nothrow) AlertCounter();
+   syn_scan.syn_sent_last_min = syn_scan.synack_recvd_last_min = 0;
+   syn_scan.syn_recvd_last_min = syn_scan.synack_sent_last_min = 0;
++  max_score.current = max_score.last = 0;
+   PROFILING_SUB_SECTION_EXIT(iface, 17);
+ 
+   if(ip.getVersion() /* IP is set */) {
+@@ -1713,7 +1719,6 @@ bool Host::triggerAlert(HostAlert *alert) {
+   incScoreValue(alert->getCliScore(

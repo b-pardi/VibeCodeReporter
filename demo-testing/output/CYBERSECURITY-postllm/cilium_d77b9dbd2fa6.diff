@@ -1,0 +1,91 @@
+@@ -28,6 +28,7 @@
+ #include "lib/ipv6.h"
+ #include "lib/ipv4.h"
+ #include "lib/icmp6.h"
++#include "lib/icmp.h"
+ #include "lib/eth.h"
+ #include "lib/dbg.h"
+ #include "lib/l3.h"
+@@ -1040,8 +1041,18 @@ static __always_inline int handle_ipv4_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 						   auth_type);
+ 		}
+ 
+-		if (verdict != CTX_ACT_OK)
++		if (verdict != CTX_ACT_OK) {
++			/* If policy_deny_response_enabled is set and the packet has been denied,
++			 * respond with an ICMPv4 "Destination Unreachable"
++			 */
++			if (CONFIG(policy_deny_response_enabled) &&
++			    (verdict == DROP_POLICY || verdict == DROP_POLICY_DENY)) {
++				ctx_store_meta(ctx, CB_VERDICT, verdict);
++				return tail_call_internal(ctx, CILIUM_CALL_IPV4_POLICY_DENIED,
++							ext_err);
++			}
+ 			return verdict;
++		}
+ 
+ 		break;
+ 	case CT_RELATED:
+@@ -2469,4 +2480,26 @@ out:
+ 	return ret;
+ }
+ 
++#ifdef ENABLE_IPV4
++__declare_tail(CILIUM_CALL_IPV4_POLICY_DENIED)
++int tail_policy_denied_ipv4(struct __ctx_buff *ctx)
++{
++	int ret;
++	__u32 verdict = ctx_load_meta(ctx, CB_VERDICT);
++
++	ret = generate_icmp4_reply(ctx, ICMP_DEST_UNREACH, ICMP_PKT_FILTERED);
++	if (!ret) {
++		cilium_dbg_capture(ctx, DBG_CAPTURE_DELIVERY, ctx_get_ifindex(ctx));
++		ret = redirect_self(ctx);
++
++		if (!IS_ERR(ret)) {
++			update_metrics(ctx_full_len(ctx), METRIC_EGRESS, __DROP_REASON(verdict));
++			return ret;
++		}
++	}
++
++	return send_drop_notify_error(ctx, SECLABEL_IPV4, ret, METRIC_EGRESS);
++}
++#endif /* ENABLE_IPV4 */
++
+ BPF_LICENSE("Dual BSD/GPL");
+
+
+
+
+@@ -31,3 +31,5 @@ NODE_CONFIG(bool, supports_fib_lookup_skip_neigh,
+ 	    "Whether or not BPF_FIB_LOOKUP_SKIP_NEIGH is supported.")
+ 
+ NODE_CONFIG(__u8, tracing_ip_option_type, "The IP option type to use for packet tracing")
++
++NODE_CONFIG(bool, policy_deny_response_enabled, "Enable ICMP responses for policy-denied traffic")
+
+
+
+
+@@ -651,6 +651,7 @@ enum {
+ #define	CB_ENCRYPT_MAGIC	CB_SRC_LABEL	/* Alias, non-overlapping */
+ #define	CB_DST_ENDPOINT_ID	CB_SRC_LABEL    /* Alias, non-overlapping */
+ #define CB_SRV6_SID_1		CB_SRC_LABEL	/* Alias, non-overlapping */
++#define CB_VERDICT		CB_SRC_LABEL	/* Alias, non-overlapping */
+ 	CB_1,
+ #define	CB_DELIVERY_REDIRECT	CB_1		/* Alias, non-overlapping */
+ #define	CB_NAT_46X64		CB_1		/* Alias, non-overlapping */
+
+
+
+
+@@ -97,7 +97,8 @@
+ #define CILIUM_CALL_IPV4_NO_SERVICE			45
+ #define CILIUM_CALL_IPV6_NO_SERVICE			46
+ #define CILIUM_CALL_MULTICAST_EP_DELIVERY		47
+-#define CILIUM_CALL_SIZE				48
++#define CILIUM_CALL_IPV4_POLICY_DENIED			48
++#define CILIUM_CALL_SIZE				49
+ 
+ /* Private per-EP map for internal tail calls. Its bpffs pin is replaced every
+  * time the BPF object is loaded. An existing pinned map is never reused.

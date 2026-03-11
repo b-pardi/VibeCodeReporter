@@ -1,0 +1,122 @@
+@@ -101,17 +101,6 @@ int OpenRelative(open_context ctx, const char* path)
+   return fd;
+ }
+ 
+-std::size_t aligned_idx(const std::vector<config::data_file>& datafiles)
+-{
+-  ASSERT(datafiles.size() == 2);
+-
+-  if (datafiles[0].BlockSize != 1) {
+-    return 0;
+-  } else {
+-    return 1;
+-  }
+-}
+-
+ block to_dedup(block_header header, std::uint64_t Begin, std::uint32_t Count)
+ {
+   return block{
+@@ -159,6 +148,18 @@ record_header from_dedup(record r)
+       .DataSize = r.DataSize,
+   };
+ }
++
++auto FindDataIdx(const data::bsize_map& map, std::uint64_t size)
++{
++  for (auto [bsize, idx] : map) {
++    if (size % bsize == 0) { return idx; }
++  }
++
++  throw std::runtime_error(
++      "Could not find an appropriate data file for "
++      "record of size "
++      + std::to_string(size));
++}
+ };  // namespace
+ 
+ volume::volume(open_type type, const char* path) : sys_path{path}
+@@ -201,39 +202,27 @@ data::data(open_context ctx, const config& conf)
+   auto& rf = conf.recordfile();
+   if (rf.Start != 0) { throw std::runtime_error("recordfile start != 0."); }
+ 
++  raii_fd bfd = OpenRelative(ctx, bf.relpath.c_str());
++  raii_fd rfd = OpenRelative(ctx, rf.relpath.c_str());
++  blocks = decltype(blocks){ctx.read_only, bfd.fileno(), bf.End};
++  records = decltype(records){ctx.read_only, rfd.fileno(), rf.End};
++  fds.emplace_back(std::move(bfd));
++  fds.emplace_back(std::move(rfd));
++
+   auto& dfs = conf.datafiles();
+-  if (dfs.size() != 2) { throw std::runtime_error("too many datafiles."); }
+-  const config::data_file* unalf = nullptr;
+-  const config::data_file* alf = nullptr;
+ 
+   for (auto& df : dfs) {
+-    if (df.BlockSize == 1) {
+-      unalf = &df;
+-    } else if (df.BlockSize > 1) {
+-      alf = &df;
++    raii_fd& fd = fds.emplace_back(OpenRelative(ctx, df.relpath.c_str()));
++    if (!ctx.read_only && df.ReadOnly) {
++      throw std::runtime_error("file '" + df.relpath + "' is readonly,"
++			       " but write permissions requested.");
+     }
+-  }
+-
+-  if (!unalf) { throw std::runtime_error("no unaligned file."); }
+-
+-  if (!alf) { throw std::runtime_error("no aligned file."); }
++    auto idx = datafiles.size();
++    datafiles.emplace_back(ctx.read_only, fd.fileno(), df.Size);
+ 
+-  bfd = OpenRelative(ctx, bf.relpath.c_str());
+-  rfd = OpenRelative(ctx, rf.relpath.c_str());
+-  afd = OpenRelative(ctx, alf->relpath.c_str());
+-  ufd = OpenRelative(ctx, unalf->relpath.c_str());
+-
+-  if (!ctx.read_only && alf->ReadOnly) {
+-    throw std::runtime_error("aligned file is readonly, but rw requested.");
+-  }
+-  if (!ctx.read_only && unalf->ReadOnly) {
+-    throw std::runtime_error("unaligned file is readonly, but rw requested.");
++    idx_to_dfile[df.Idx] = idx;
++    bsize_to_idx[df.BlockSize] = df.Idx;
+   }
+-
+-  blocks = decltype(blocks){ctx.read_only, bfd.fileno(), bf.End};
+-  records = decltype(records){ctx.read_only, rfd.fileno(), rf.End};
+-  aligned = decltype(aligned){ctx.read_only, afd.fileno(), alf->Size};
+-  unaligned = decltype(unaligned){ctx.read_only, ufd.fileno(), unalf->Size};
+ }
+ 
+ void volume::update_config()
+@@ -241,11 +230,8 @@ void volume::update_config()
+   conf->blockfile().End = backing->blocks.size();
+   conf->recordfile().End = backing->records.size();
+   for (auto& dfile : conf->datafiles()) {
+-    if (dfile.BlockSize == 1) {
+-      dfile.Size = backing->unaligned.size();
+-    } else {
+-      dfile.Size = backing->aligned.size();
+-    }
++    auto dfile_idx = backing->idx_to_dfile.at(dfile.Idx);
++    dfile.Size = backing->datafiles[dfile_idx].size();
+   }
+ 
+   auto serialized = conf->serialize();
+@@ -262,12 +248,14 @@ void volume::update_config()
+ 
+ save_state volume::BeginBlock()
+ {
+-  return {
+-      .block_size = backing->blocks.size(),
+-      .record_size = backing->records.size(),
+-      .aligned_size = backing->aligned.size(),
+-      .unaligned_size = backing->unaligned.size(),
+-  };
++  save_state s;
++
++  s.block_size = backing->blocks.size();
++  s.record_size = backing->records.size();
++
++  for (auto& vec : backing->data

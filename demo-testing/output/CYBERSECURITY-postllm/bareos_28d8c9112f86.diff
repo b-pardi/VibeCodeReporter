@@ -1,0 +1,119 @@
+@@ -58,6 +58,9 @@
+ #include "filed/backup.h"
+ #include "lib/compression.h"
+ 
++#include <locale>
++#include <codecvt>
++
+ #if defined(WIN32_VSS)
+ #  include "win32/findlib/win32.h"
+ #  include "vss.h"
+@@ -1823,7 +1826,16 @@ static bool BackupCmd(JobControlRecord* jcr)
+              jcr->fd_impl->pVSSClient->GetDriverName(),
+              (drive_count) ? szWinDriveLetters : "None");
+ 
+-        if (!jcr->fd_impl->pVSSClient->CreateSnapshots(szWinDriveLetters,
++	std::vector<std::wstring> volumes{};
++	volumes.reserve(drive_count);
++	std::wstring_convert<std::codecvt_utf8<wchar_t>> converter{};
++	for (int i = 0; i < drive_count; ++i) {
++	  char drive[4] = "_:\\";
++	  drive[0] = szWinDriveLetters[i];
++	  std::wstring drive_w = converter.from_bytes(drive);
++	  volumes.emplace_back(std::move(drive_w));
++	}
++        if (!jcr->fd_impl->pVSSClient->CreateSnapshots(volumes,
+                                                        onefs_disabled)) {
+           BErrNo be;
+           Jmsg(jcr, M_FATAL, 0,
+
+
+
+
+@@ -327,48 +327,58 @@ static inline POOLMEM* GetMountedVolumeForMountPointPath(POOLMEM* volumepath,
+ 
+ static inline bool HandleVolumeMountPoint(VSSClientGeneric* pVssClient,
+ 					  std::unordered_map<std::string, std::string>& mount_to_vol,
+-					  LPWSTR parent,
++					  std::unordered_set<std::wstring>& snapshoted_volumes,
++					  const std::wstring& parent,
+                                           IVssBackupComponents* pVssObj,
+                                           POOLMEM*& volumepath,
+                                           POOLMEM*& mountpoint)
+ {
+-  bool retval = false;
+-  HRESULT hr;
+-  POOLMEM* vol = NULL;
+   POOLMEM* pvol;
+   VSS_ID pid;
+ 
+-  vol = GetMountedVolumeForMountPointPath(volumepath, mountpoint);
+-  hr = pVssObj->AddToSnapshotSet((LPWSTR)vol, GUID_NULL, &pid);
+-
++  bool snapshot_success = false;
+ 
++  std::wstring vol{};
++  {
++    POOLMEM* vol_ = GetMountedVolumeForMountPointPath(volumepath, mountpoint);
++    vol.assign((wchar_t*)vol_);
++    FreePoolMemory(vol_);
++  }
+   pvol = GetPoolMemory(PM_FNAME);
+-  wchar_2_UTF8(pvol, (wchar_t*)vol);
+-
+-  PoolMem utf8_parent(PM_FNAME);
+-  wchar_2_UTF8(utf8_parent.addr(), parent);
+-  PoolMem path(PM_FNAME);
+-  path.strcpy(utf8_parent.c_str());
+-  path.strcat(mountpoint);
++  wchar_2_UTF8(pvol, vol.c_str());
++  if (auto found = snapshoted_volumes.find(vol);
++      found == snapshoted_volumes.end()) {
++    HRESULT hr = pVssObj->AddToSnapshotSet(const_cast<LPWSTR>(vol.c_str()), GUID_NULL, &pid);
++    if (SUCCEEDED(hr)) {
++      pVssClient->AddVolumeMountPointSnapshots(pVssObj, vol,
++					       snapshoted_volumes);
++      Dmsg1(200, "%s added to snapshotset \n", pvol);
++      snapshot_success = true;
++    } else if ((unsigned)hr == VSS_ERROR_OBJECT_ALREADY_EXISTS) {
++      Dmsg1(200, "%s already in snapshotset, skipping.\n", pvol);
++    } else {
++      Dmsg3(200,
++	    "%s with vmp %s could not be added to snapshotset, COM ERROR: 0x%X\n",
++	    vol, mountpoint, hr);
++    }
++  } else {
++    snapshot_success = true;
++  }
+ 
+-  mount_to_vol.emplace(path.c_str(), pvol);
++  if (snapshot_success) {
++    PoolMem utf8_parent(PM_FNAME);
++    wchar_2_UTF8(utf8_parent.addr(), parent.c_str());
++    PoolMem path(PM_FNAME);
++    path.strcpy(utf8_parent.c_str());
++    path.strcat(mountpoint);
+ 
+-  if (SUCCEEDED(hr)) {
+-    pVssClient->AddVolumeMountPointSnapshots(pVssObj, (wchar_t*)vol);
+-    Dmsg1(200, "%s added to snapshotset \n", pvol);
+-    retval = true;
+-  } else if ((unsigned)hr == VSS_ERROR_OBJECT_ALREADY_EXISTS) {
+-    Dmsg1(200, "%s already in snapshotset, skipping.\n", pvol);
+-  } else {
+-    Dmsg3(200,
+-          "%s with vmp %s could not be added to snapshotset, COM ERROR: 0x%X\n",
+-          vol, mountpoint, hr);
++    mount_to_vol.emplace(path.c_str(), pvol);
+   }
+ 
++
+   FreePoolMemory(pvol);
+-  if (vol) { FreePoolMemory(vol); }
+ 
+-  return retval;
++  return snapshot_success;
+ }
+ 
+ // Helper macro for quick treatment of case statements for error codes
+@@ -622,50 +632,56 @@ bool 

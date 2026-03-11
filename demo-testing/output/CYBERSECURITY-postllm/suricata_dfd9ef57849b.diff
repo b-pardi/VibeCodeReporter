@@ -1,0 +1,127 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,540 @@
++/* Copyright (C) 2024-2025 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/* License note: While this "glue" code to the nDPI library is GPLv2,
++ * nDPI is itself LGPLv3 which is known to be incompatible with the
++ * GPLv2. */
++
++#include "suricata-common.h"
++#include "suricata-plugin.h"
++
++#include "detect-engine-helper.h"
++#include "detect-parse.h"
++#include "flow-callbacks.h"
++#include "flow-storage.h"
++#include "output-eve.h"
++#include "thread-callbacks.h"
++#include "thread-storage.h"
++#include "util-debug.h"
++
++#include "ndpi_api.h"
++
++static ThreadStorageId thread_storage_id = { .id = -1 };
++static FlowStorageId flow_storage_id = { .id = -1 };
++static int ndpi_protocol_keyword_id = -1;
++static int ndpi_risk_keyword_id = -1;
++
++struct NdpiThreadContext {
++    struct ndpi_detection_module_struct *ndpi;
++};
++
++struct NdpiFlowContext {
++    struct ndpi_flow_struct *ndpi_flow;
++    ndpi_protocol detected_l7_protocol;
++    bool detection_completed;
++};
++
++typedef struct DetectnDPIProtocolData_ {
++    ndpi_master_app_protocol l7_protocol;
++    bool negated;
++} DetectnDPIProtocolData;
++
++typedef struct DetectnDPIRiskData_ {
++    ndpi_risk risk_mask; /* uint64 */
++    bool negated;
++} DetectnDPIRiskData;
++
++static void ThreadStorageFree(void *ptr)
++{
++    SCLogDebug("Free'ing nDPI thread storage");
++    struct NdpiThreadContext *context = ptr;
++    ndpi_exit_detection_module(context->ndpi);
++    SCFree(context);
++}
++
++static void FlowStorageFree(void *ptr)
++{
++    struct NdpiFlowContext *ctx = ptr;
++    ndpi_flow_free(ctx->ndpi_flow);
++    SCFree(ctx);
++}
++
++static void OnFlowInit(ThreadVars *tv, Flow *f, const Packet *p, void *_data)
++{
++    struct NdpiFlowContext *flowctx = SCCalloc(1, sizeof(*flowctx));
++    if (flowctx == NULL) {
++        FatalError("Failed to allocate nDPI flow context");
++    }
++
++    flowctx->ndpi_flow = ndpi_flow_malloc(SIZEOF_FLOW_STRUCT);
++    if (flowctx->ndpi_flow == NULL) {
++        FatalError("Failed to allocate nDPI flow");
++    }
++
++    memset(flowctx->ndpi_flow, 0, SIZEOF_FLOW_STRUCT);
++    flowctx->detection_completed = false;
++    FlowSetStorageById(f, flow_storage_id, flowctx);
++}
++
++static void OnFlowUpdate(ThreadVars *tv, Flow *f, Packet *p, void *_data)
++{
++    struct NdpiThreadContext *threadctx = ThreadGetStorageById(tv, thread_storage_id);
++    struct NdpiFlowContext *flowctx = FlowGetStorageById(f, flow_storage_id);
++    uint16_t ip_len = 0;
++    void *ip_ptr = NULL;
++
++    if (!threadctx->ndpi || !flowctx->ndpi_flow) {
++        return;
++    }
++
++    if (PacketIsIPv4(p)) {
++        const IPV4Hdr *ip4h = PacketGetIPv4(p);
++        ip_len = IPV4_GET_RAW_IPLEN(ip4h);
++        ip_ptr = (void *)PacketGetIPv4(p);
++    } else if (PacketIsIPv6(p)) {
++        const IPV6Hdr *ip6h = PacketGetIPv6(p);
++        ip_len = IPV6_HEADER_LEN + IPV6_GET_RAW_PLEN(ip6h);
++        ip_ptr = (void *)PacketGetIPv6(p);
++    }
++
++    if (!flowctx->detection_completed && ip_ptr != NULL && ip_len > 0) {
++        uint64_t time_ms = ((uint64_t)p->ts.secs) * 1000 + p->ts.usecs / 1000;
++
++        SCLogDebug("Performing nDPI detection...");
++
++        flowctx->detected_l7_protocol = ndpi_detection_process_packet(
++                threadctx->ndpi, flowctx->ndpi_flow, ip_ptr, ip_len, time_ms, NULL);
++
++        if (ndpi_is_protocol_det

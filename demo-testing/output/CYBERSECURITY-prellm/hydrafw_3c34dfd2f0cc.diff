@@ -1,0 +1,146 @@
+@@ -187,6 +187,7 @@ bool file_close(FIL *file_handle)
+ /**
+  * @brief   Creates a new file and writes data in it
+  *
++ * @param[in]  file_handle	pointer to a FIL object
+  * @param[in]  data		pointer to a buffer containing the data to write
+  * @param[in]  len		length of the data buffer
+  * @param[in]  prefix		prefix of the file. a number will be appended
+@@ -194,11 +195,13 @@ bool file_close(FIL *file_handle)
+  *
+  * @return			The operation status.
+  */
+-bool file_create_write(uint8_t* data, uint32_t len, const char * prefix, char * filename)
++bool file_create_write(FIL *file_handle, uint8_t* data, uint32_t len, const char * prefix, char * filename)
+ {
+ 	uint32_t i;
+ 	FRESULT err;
+-	FIL FileObject;
++
++// FIL is a huge struct with 512+ bytes in non-tiny fs. Not any thread's stack can handle this.
++//	FIL FileObject;
+ 	uint32_t bytes_written;
+ 
+ 	if(len == 0) {
+@@ -214,19 +217,19 @@ bool file_create_write(uint8_t* data, uint32_t len, const char * prefix, char *
+ 	/* Save data in file */
+ 	for(i=0; i<999; i++) {
+ 		snprintf(filename, FILENAME_SIZE, "0:%s%ld.txt", prefix, i);
+-		err = f_open(&FileObject, filename, FA_WRITE | FA_CREATE_NEW);
++		err = f_open(file_handle, filename, FA_WRITE | FA_CREATE_NEW);
+ 		if(err == FR_OK) {
+ 			break;
+ 		}
+ 	}
+ 	if(err == FR_OK) {
+-		err = f_write(&FileObject, data, len, (void *)&bytes_written);
++		err = f_write(file_handle, data, len, (void *)&bytes_written);
+ 		if(err != FR_OK) {
+-			f_close(&FileObject);
++			f_close(file_handle);
+ 			return FALSE;
+ 		}
+ 
+-		err = f_close(&FileObject);
++		err = f_close(file_handle);
+ 		if (err != FR_OK) {
+ 			return FALSE;
+ 		}
+
+
+
+
+@@ -41,7 +41,7 @@ bool file_open(FIL *file_handle, const char * filename, const char mode);
+ uint32_t file_read(FIL *file_handle, uint8_t *data, int len);
+ bool file_readline(FIL *file_handle, uint8_t *data, int len);
+ bool file_append(FIL *file_handle, uint8_t *data, int len);
+-bool file_create_write(uint8_t* data, uint32_t len, const char * prefix, char * filename);
++bool file_create_write(FIL *file_handle, uint8_t* data, uint32_t len, const char * prefix, char * filename);
+ bool file_close(FIL *file_handle);
+ bool file_sync(FIL * file_handle);
+ 
+
+
+
+
+@@ -99,6 +99,7 @@ t_token_dict tl_dict[] = {
+ 	{ T_SNIFF, "sniff" },
+ 	{ T_TRACE_UART1, "trace-uart1" },
+ 	{ T_FRAME_TIME, "frame-time" },
++	{ T_PCAP, "pcap" },
+ 	{ T_BIN, "bin" },
+ 	{ T_DIRECT_MODE_0, "dm0" },
+ 	{ T_DIRECT_MODE_1, "dm1" },
+@@ -352,6 +353,10 @@ t_token tokens_mode_nfc_sniff[] = {
+ 		T_FRAME_TIME,
+ 		.help = "Add start/end frame timestamp(in CPU cycles)"
+ 	},
++	{
++		T_PCAP,
++		.help = "Save output file in Wireshark PCAP format"
++	},
+ 	{ }
+ };
+ 
+
+
+
+
+@@ -91,6 +91,7 @@ enum {
+ 	T_SNIFF,
+ 	T_TRACE_UART1,
+ 	T_FRAME_TIME,
++	T_PCAP,
+ 	T_BIN,
+ 	T_DIRECT_MODE_0,
+ 	T_DIRECT_MODE_1,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,319 @@
++/*
++ * HydraBus/HydraNFC
++ *
++ * Copyright (C) 2012-2014 Benjamin VERNOUX
++ * Copyright (C) 2015 Nicolas CHAUVEAU
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "file_fmt_pcap.h"
++
++#include <stdarg.h>
++#include <stdio.h> /* sprintf */
++
++#include "ch.h"
++#include "hal.h"
++
++#include "mcu.h"
++#include "trf797x.h"
++#include "types.h"
++
++#include "hydranfc.h"
++#include "hydranfc_cmd_sniff_iso14443.h"
++#include "hydranfc_cmd_sniff_downsampling.h"
++
++#include "common.h"
++#include "microsd.h"
++#include "ff.h"
++
++extern void tprintf(const char *fmt, ...);
++
++static filename_t write_filename;
++
++// 50 bytes for local buf is not enough - F

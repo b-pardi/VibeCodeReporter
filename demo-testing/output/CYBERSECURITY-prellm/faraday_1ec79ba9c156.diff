@@ -1,0 +1,102 @@
+@@ -1,12 +1,14 @@
+ import datetime
+ import logging
++import time
+ 
+-from itsdangerous import TimedJSONWebSignatureSerializer
+ from flask import Blueprint, request
+ from flask_security.utils import hash_data
+ from flask import current_app as app
+ from marshmallow import Schema
+ import flask_login
++import jwt
++
+ 
+ from faraday.server.config import faraday_server
+ from faraday.server.api.base import GenericView
+@@ -35,16 +37,14 @@ class TokenAuthView(GenericView):
+               description: Ok
+         """
+         user_id = flask_login.current_user.fs_uniquifier
+-        serializer = TimedJSONWebSignatureSerializer(
+-            app.config['SECRET_KEY'],
+-            salt="api_token",
+-            expires_in=int(faraday_server.api_token_expiration)
+-        )
+         hashed_data = hash_data(flask_login.current_user.password) if flask_login.current_user.password else None
+         user_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+         requested_at = datetime.datetime.utcnow()
+         audit_logger.info(f"User [{flask_login.current_user.username}] requested token from IP [{user_ip}] at [{requested_at}]")
+-        return serializer.dumps({'user_id': user_id, "validation_check": hashed_data}).decode('utf-8')
++        iat = int(time.time())
++        exp = iat + int(faraday_server.api_token_expiration)
++        jwt_data = {'user_id': user_id, "validation_check": hashed_data, 'iat': iat, 'exp': exp}
++        return jwt.encode(jwt_data, app.config['SECRET_KEY'], algorithm="HS512")
+ 
+ 
+ TokenAuthView.register(token_api)
+
+
+
+
+@@ -10,7 +10,8 @@ import pyotp
+ import requests
+ from flask_limiter import Limiter
+ from flask_limiter.util import get_remote_address
+-from itsdangerous import TimedJSONWebSignatureSerializer, SignatureExpired, BadSignature
++
++import jwt
+ from random import SystemRandom
+ 
+ from faraday.settings import load_settings
+@@ -153,18 +154,17 @@ def register_handlers(app):
+         flask.abort(403)
+ 
+     def verify_token(token):
+-        serialized = TimedJSONWebSignatureSerializer(app.config['SECRET_KEY'], salt="api_token")
+         try:
+-            data = serialized.loads(token)
++            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS512"])
+             user_id = data["user_id"]
+             user = User.query.filter_by(fs_uniquifier=user_id).first()
+             if not user or not verify_hash(data['validation_check'], user.password):
+                 logger.warn('Invalid authentication token. token invalid after password change')
+                 return None
+             return user
+-        except SignatureExpired:
++        except jwt.ExpiredSignatureError:
+             return None  # valid token, but expired
+-        except BadSignature:
++        except jwt.InvalidSignatureError:
+             return None  # invalid token
+ 
+     @app.login_manager.request_loader
+
+
+
+
+@@ -1,6 +1,7 @@
+ import pytest
+ from flask_security.utils import hash_password
+-from itsdangerous import TimedJSONWebSignatureSerializer
++import jwt
++import time
+ 
+ from faraday.server.models import User
+ from faraday.server.web import get_app
+@@ -79,10 +80,12 @@ class TestLogin:
+         session.add(ws)
+         session.commit()
+ 
+-        serializer = TimedJSONWebSignatureSerializer(get_app().config['SECRET_KEY'], expires_in=500, salt="token")
+-        token = serializer.dumps({'user_id': alice.id})
++        iat = int(time.time())
++        exp = iat + 43200
++        jwt_data = {'user_id': alice.id, 'iat': iat, 'exp': exp}
++        token = jwt.encode(jwt_data, get_app().config['SECRET_KEY'], algorithm="HS512")
+ 
+-        headers = {'Authorization': b'Token ' + token}
++        headers = {'Authorization': f'Token {token}'}
+ 
+         ws = test_client.get('/v3/ws/wonderland', headers=headers)
+         assert ws.status_code == 401

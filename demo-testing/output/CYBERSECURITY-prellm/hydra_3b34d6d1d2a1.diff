@@ -1,0 +1,107 @@
+@@ -25,6 +25,12 @@ from hydra.core.object_type import ObjectType
+ from hydra.core.utils import JobRuntime
+ from hydra.errors import HydraException, MissingConfigException
+ from hydra.plugins.config_source import ConfigLoadError, ConfigSource
++from hydra.types import RunMode
++
++
++class UnspecifiedMandatoryDefault(Exception):
++    def __init__(self, config_group: str,) -> None:
++        self.config_group = config_group
+ 
+ 
+ @dataclass
+@@ -77,6 +83,9 @@ class ParsedOverrideWithLine:
+     override: ParsedOverride
+     input_line: str
+ 
++    def __repr__(self) -> str:
++        return f"[Parsed] {self.input_line}"
++
+ 
+ @dataclass
+ class DefaultElement:
+@@ -178,12 +187,28 @@ class ConfigLoaderImpl(ConfigLoader):
+         self,
+         config_name: Optional[str],
+         overrides: List[str],
++        run_mode: RunMode,
+         strict: Optional[bool] = None,
+     ) -> DictConfig:
+         if strict is None:
+             strict = self.default_strict
+ 
+         parsed_overrides = [self._parse_override(override) for override in overrides]
++        filtered_parsed_overrides = []
++        for x in parsed_overrides:
++            if ConfigLoaderImpl._is_sweeper_override(x.override):
++                if run_mode == RunMode.RUN:
++                    raise HydraException(
++                        f"'{x.input_line}' is a sweeper override, did you forget to to use --multirun|-m ?"
++                    )
++                elif run_mode == RunMode.MULTIRUN:
++                    # filter, the sweeper will pass pass concrete overrides to individual jobs
++                    if x.override.key.startswith("hydra."):
++                        raise HydraException(
++                            f"Sweeping over Hydra configuration is not supported : '{x.input_line}'"
++                        )
++            else:
++                filtered_parsed_overrides.append(x)
+ 
+         if config_name is not None and not self.repository.config_exists(config_name):
+             self.missing_config_error(
+@@ -219,15 +244,32 @@ class ConfigLoaderImpl(ConfigLoader):
+         split_at = len(defaults)
+ 
+         config_group_overrides, config_overrides = self.split_overrides(
+-            parsed_overrides
++            filtered_parsed_overrides
+         )
++
+         self._combine_default_lists(defaults, job_defaults)
+         ConfigLoaderImpl._apply_overrides_to_defaults(config_group_overrides, defaults)
+ 
+         # Load and defaults and merge them into cfg
+-        cfg = self._merge_defaults_into_config(
+-            hydra_cfg, job_cfg, job_cfg_load_trace, defaults, split_at
+-        )
++        try:
++            cfg = self._merge_defaults_into_config(
++                hydra_cfg,
++                job_cfg,
++                job_cfg_load_trace,
++                defaults,
++                split_at,
++                run_mode=run_mode,
++            )
++        except UnspecifiedMandatoryDefault as e:
++            options = self.get_group_options(e.config_group)
++            opt_list = "\n".join(["\t" + x for x in options])
++            msg = (
++                f"You must specify '{e.config_group}', e.g, {e.config_group}=<OPTION>"
++                f"\nAvailable options:"
++                f"\n{opt_list}"
++            )
++            raise HydraException(msg) from e
++
+         OmegaConf.set_struct(cfg.hydra, True)
+         OmegaConf.set_struct(cfg, strict)
+ 
+@@ -274,6 +316,7 @@ class ConfigLoaderImpl(ConfigLoader):
+             config_name=master_config.hydra.job.config_name,
+             strict=self.default_strict,
+             overrides=overrides,
++            run_mode=RunMode.RUN,
+         )
+ 
+         with open_dict(sweep_config):
+@@ -317,6 +360,11 @@ class ConfigLoaderImpl(ConfigLoader):
+                 matches.append(default)
+         return matches
+ 
++    # TODO: should be a function in the sweeper. somehow.
++    @staticmethod
++    def _is_sweeper_override(override: ParsedOverride) -> bool:
++        return override.value is not None and "," in override.value
++
+     @staticmeth

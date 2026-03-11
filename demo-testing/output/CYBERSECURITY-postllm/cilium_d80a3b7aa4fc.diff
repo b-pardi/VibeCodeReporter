@@ -1,0 +1,138 @@
+@@ -602,9 +602,9 @@ ct_recreate6:
+ 	}
+ #endif
+ 	if (is_defined(ENABLE_HOST_ROUTING)) {
+-		int oif;
++		int oif, fib_err;
+ 
+-		ret = fib_redirect_v6(ctx, ETH_HLEN, ip6, false,
++		ret = fib_redirect_v6(ctx, ETH_HLEN, ip6, false, &fib_err,
+ 				      ctx->ingress_ifindex, &oif);
+ 		if (likely(ret == CTX_ACT_REDIRECT))
+ 			send_trace_notify(ctx, TRACE_TO_NETWORK, SECLABEL,
+@@ -1106,9 +1106,9 @@ skip_vtep:
+ 	}
+ #endif /* TUNNEL_MODE */
+ 	if (is_defined(ENABLE_HOST_ROUTING)) {
+-		int oif;
++		int oif, fib_err;
+ 
+-		ret = fib_redirect_v4(ctx, ETH_HLEN, ip4, false,
++		ret = fib_redirect_v4(ctx, ETH_HLEN, ip4, false, &fib_err,
+ 				      ctx->ingress_ifindex, &oif);
+ 		if (likely(ret == CTX_ACT_REDIRECT))
+ 			send_trace_notify(ctx, TRACE_TO_NETWORK, SECLABEL,
+
+
+
+
+@@ -43,7 +43,7 @@ maybe_add_l2_hdr(struct __ctx_buff *ctx __maybe_unused,
+ static __always_inline int
+ fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
+ 		struct ipv6hdr *ip6, const bool needs_l2_check,
+-		int iif, int *oif)
++		int *fib_err, int iif, int *oif)
+ {
+ 	bool no_neigh = false;
+ 	struct bpf_redir_neigh *nh = NULL;
+@@ -61,18 +61,18 @@ fib_redirect_v6(struct __ctx_buff *ctx, int l3_off,
+ 
+ 	ret = fib_lookup(ctx, &fib_params, sizeof(fib_params),
+ 			 BPF_FIB_LOOKUP_DIRECT);
+-	switch (ret) {
+-	case BPF_FIB_LKUP_RET_SUCCESS:
+-		break;
+-	case BPF_FIB_LKUP_RET_NO_NEIGH:
+-		nh_params.nh_family = fib_params.family;
+-		__bpf_memcpy_builtin(&nh_params.ipv6_nh, &fib_params.ipv6_dst,
+-				     sizeof(nh_params.ipv6_nh));
+-		no_neigh = true;
+-		nh = &nh_params;
+-		break;
+-	default:
+-		return CTX_ACT_DROP;
++	if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
++		*fib_err = ret;
++		if (likely(ret == BPF_FIB_LKUP_RET_NO_NEIGH)) {
++			nh_params.nh_family = fib_params.family;
++			__bpf_memcpy_builtin(&nh_params.ipv6_nh,
++					     &fib_params.ipv6_dst,
++					     sizeof(nh_params.ipv6_nh));
++			no_neigh = true;
++			nh = &nh_params;
++		} else {
++			return CTX_ACT_DROP;
++		}
+ 	}
+ 
+ 	*oif = fib_params.ifindex;
+@@ -123,7 +123,7 @@ out_send:
+ static __always_inline int
+ fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
+ 		struct iphdr *ip4, const bool needs_l2_check,
+-		int iif, int *oif)
++		int *fib_err, int iif, int *oif)
+ {
+ 	bool no_neigh = false;
+ 	struct bpf_redir_neigh *nh = NULL;
+@@ -138,19 +138,19 @@ fib_redirect_v4(struct __ctx_buff *ctx, int l3_off,
+ 
+ 	ret = fib_lookup(ctx, &fib_params, sizeof(fib_params),
+ 			 BPF_FIB_LOOKUP_DIRECT);
+-	switch (ret) {
+-	case BPF_FIB_LKUP_RET_SUCCESS:
+-		break;
+-	case BPF_FIB_LKUP_RET_NO_NEIGH:
+-		/* GW could also be v6, so copy union. */
+-		nh_params.nh_family = fib_params.family;
+-		__bpf_memcpy_builtin(&nh_params.ipv6_nh, &fib_params.ipv6_dst,
+-				     sizeof(nh_params.ipv6_nh));
+-		no_neigh = true;
+-		nh = &nh_params;
+-		break;
+-	default:
+-		return CTX_ACT_DROP;
++	if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
++		*fib_err = ret;
++		if (likely(ret == BPF_FIB_LKUP_RET_NO_NEIGH)) {
++			/* GW could also be v6, so copy union. */
++			nh_params.nh_family = fib_params.family;
++			__bpf_memcpy_builtin(&nh_params.ipv6_nh,
++					     &fib_params.ipv6_dst,
++					     sizeof(nh_params.ipv6_nh));
++			no_neigh = true;
++			nh = &nh_params;
++		} else {
++			return CTX_ACT_DROP;
++		}
+ 	}
+ 
+ 	*oif = fib_params.ifindex;
+
+
+
+
+@@ -480,7 +480,7 @@ int tail_nodeport_ipv6_dsr(struct __ctx_buff *ctx)
+ 		ret = DROP_INVALID;
+ 		goto drop_err;
+ 	}
+-	ret = fib_redirect_v6(ctx, ETH_HLEN, ip6, true,
++	ret = fib_redirect_v6(ctx, ETH_HLEN, ip6, true, &ext_err,
+ 			      ctx_get_ifindex(ctx), &oif);
+ 	if (likely(ret == CTX_ACT_REDIRECT)) {
+ 		cilium_capture_out(ctx);
+@@ -497,10 +497,10 @@ drop_err:
+ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV46_RFC8215)
+ int tail_nat_ipv46(struct __ctx_buff *ctx)
+ {
++	int ret, oif, ext_err = 0;
+ 	void *data, *data_end;
+ 	struct ipv6hdr *ip6;
+ 	struct iphdr *ip4;
+-	int ret, oif;
+ 	int l3_off = ETH_HLEN;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip4)) {
+@@ -515,7 +515,7 @@ int tail_nat_ipv46(struct __ctx_buff *ctx)
+ 		ret = DROP_INVALID;
+ 		goto drop_e

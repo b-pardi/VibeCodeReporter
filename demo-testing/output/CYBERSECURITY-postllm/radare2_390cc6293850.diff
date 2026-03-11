@@ -1,0 +1,181 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,82 @@
++/* radare2 - LGPL - Copyright 2023 - pancake */
++
++#include <r_arch.h>
++#include "sm5xx.h"
++
++static bool decode(RArchSession *a, RAnalOp *op, RArchDecodeMask mask) {
++	enum sm5xx_cpu cpu = CPU_SM500;
++	RStrBuf *sb = r_strbuf_new ("");
++	int type = 0;
++	int size = sm5xx_disassemble (cpu, sb, 0, op->bytes, &type);
++	op->mnemonic = r_strbuf_drain (sb);
++	switch (type) {
++	case STEP_COND:
++		op->type = R_ANAL_OP_TYPE_CJMP;
++		break;
++	case STEP_OVER:
++		op->type = R_ANAL_OP_TYPE_CALL;
++		break;
++	case STEP_OUT:
++		op->type = R_ANAL_OP_TYPE_RET;
++		break;
++	default:
++		op->type = R_ANAL_OP_TYPE_MOV;
++		break;
++	}
++	op->size = size;
++	return true;
++}
++
++static char *regs(RArchSession *as) {
++	const char *const p =
++		"=PC	pc\n"
++		"=SP	sp\n"
++		"=A0	y\n"
++		"=A1	y\n"
++		"gpr	acc	.8	0	0\n"
++		"gpr	bl	.8	1	0\n"
++		"gpr	bm	.8	2	0\n"
++		"gpr	bmask	.8	2	0\n"
++		"gpr	c	.8	2	0\n"
++		"gpr	skip	.8	2	0\n"
++		"gpr	w	.8	2	0\n"
++		"gpr	r	.8	2	0\n"
++	// u8 m_r_out;
++	// int m_r_mask_option;
++	// bool m_ext_wakeup;
++	// bool m_halt;
++	// int m_clk_div;
++		"gpr	C	.1	.24	0\n"
++		"gpr	Z	.1	.25	0\n"
++		"gpr	I	.1	.26	0\n"
++		"gpr	D	.1	.27	0\n"
++		"gpr	V	.1	.30	0\n"
++		"gpr	N	.1	.31	0\n"
++		"gpr	sp	.8	4	0\n"
++		"gpr	pc	.64	5	0\n";
++	return strdup (p);
++}
++
++static int archinfo(RArchSession *a, ut32 q) {
++	return 1;
++}
++
++RArchPlugin r_arch_plugin_sm5xx = {
++	.name = "sm5xx",
++	.desc = "Sharp SM 5XX family MCUs",
++	.license = "BSD",
++	.bits = 4,
++	.regs = regs,
++	.arch = "sm5xx",
++	.cpus = "5a,500,510,511,530,590",
++	.info = archinfo,
++	.decode = &decode,
++};
++
++#ifndef R2_PLUGIN_INCORE
++R_API RLibStruct radare_plugin = {
++	.type = R_LIB_TYPE_ARCH,
++	.data = &r_arch_plugin_sm5xx,
++	.version = R2_VERSION
++};
++#endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,455 @@
++// Sharp SM5xx MCU family disassembler
++// Based on mame code licensed under BSD-3-Clause
++// copyright-holders:hap, Jonathan Gevaryahu
++// radare2 - 2023 - pancake
++
++#include <r_arch.h>
++
++#include "sm5xx.h"
++
++#define STEP_COND 0x10000000
++#define STEP_OVER 0x20000000
++#define STEP_OUT 0x40000000
++
++// constructor
++
++#if 0
++sm510_common_disassembler_sm510_common_disassembler() {
++	// init 6-bit lfsr pc lut
++	for (ut32 i = 0, pc = 0; i < 0x3f; i++)
++	{
++		m_l2r6[i] = pc;
++		m_r2l6[pc] = i;
++		pc = increment_pc(pc, 6);
++	}
++
++	m_l2r6[0x3f] = 0x3f;
++	m_r2l6[0x3f] = 0x3f;
++
++	// init 7-bit lfsr pc lut
++	for (ut32 i = 0, pc = 0; i < 0x7f; i++)
++	{
++		m_l2r7[i] = pc;
++		m_r2l7[pc] = i;
++		pc = increment_pc(pc, 7);
++	}
++
++	m_l2r7[0x7f] = 0x7f;
++	m_r2l7[0x7f] = 0x7f;
++}
++#endif
++
++static ut64 increment_pc(ut64 pc, ut8 pclen) {
++	ut32 feed = ((pc >> 1 ^ pc) & 1) ? 0 : (1 << (pclen - 1));
++	ut32 mask = (1 << pclen) - 1;
++	return feed | (pc >> 1 & (mask >> 1)) | (pc & ~mask);
++}
++
++// common lookup tables
++static const char *const s_mnemonics[] = {
++	// SM510
++	"?", "",
++	"lb", "lbl", "sbm", "exbla", "incb", "decb",
++	"atpl", "rtn0", "rtn1", "tl", "tml", "tm", "t",
++	"exc", "bdc", "exci", "excd", "lda", "lax", "ptw", "wr", "ws",
++	"kta", "atbp", "atx", "atl", "atfc", "atr",
++	"add", "add11", "adx", "coma", "rot", "rc", "sc",
++	"tb", "tc", "tam", "tmi", "ta0", "tabl", "tis", "tal", "tf1", "tf4",
++	"rm", "sm",
++	"pre", "sme", "rme", "tmel",
++	"skip", "cend", "idiv", "dr", "dta", "clklo", "clkhi",
++
++	// SM500
++	"comcb", "rtn", "rtns", "ssr", "tr", "trs", "rbm",
++	"addc", "pdtw", "tw", "dtw",
++	"ats", "exksa", "exkfa",
++	"rmf", "smf", "comcn",
++	"ta", "tm", "tg",
++
++	// SM530
++	"sabm", "sabl", "exbl",
++	"tg", "tba",
++	"keta", "atf", "sds", "rds",
++	"inis",
++
++	// SM590
++	"tax", "lblx", "mtr", "str", "inbm", "debm", "rta", "blta", "exax", "tba", "ads", "adc", "lbmx", "tls",
++	"nop", "cctrl", "inbl", "debl", "xbla", "adcs", "tr"
++};
++
++// number of bits per opcode parameter, 8 or larger means 2-byte opcode
++static const ut8 s_bits[] = {
++	// SM510
++	0, 8,
++	4, 8, 0, 0, 0, 0,
++	0, 0, 0, 4+8, 2+8, 6, 6,
++	2, 0, 2, 2, 2, 4, 0, 0, 0,
++	0, 0, 0, 0, 0, 0,
++	0, 0, 4, 0, 0, 0, 0

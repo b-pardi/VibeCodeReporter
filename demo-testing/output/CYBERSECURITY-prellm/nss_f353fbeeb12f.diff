@@ -1,0 +1,101 @@
+@@ -224,8 +224,26 @@ class StagedRecords {
+   void ForwardAll(std::shared_ptr<TlsAgent>& peer,
+                   TlsAgent::State expected_state) {
+     ForwardAll(peer);
+-    peer->Handshake();
+-    EXPECT_EQ(expected_state, peer->state());
++    switch (expected_state) {
++      case TlsAgent::STATE_CONNECTED:
++        // The handshake callback should have been called, so check that before
++        // checking that SSL_ForceHandshake succeeds.
++        EXPECT_EQ(expected_state, peer->state());
++        EXPECT_EQ(SECSuccess, SSL_ForceHandshake(peer->ssl_fd()));
++        break;
++
++      case TlsAgent::STATE_CONNECTING:
++        // Check that SSL_ForceHandshake() blocks.
++        EXPECT_EQ(SECFailure, SSL_ForceHandshake(peer->ssl_fd()));
++        EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
++        // Update and check the state.
++        peer->Handshake();
++        EXPECT_EQ(TlsAgent::STATE_CONNECTING, peer->state());
++        break;
++
++      default:
++        ADD_FAILURE() << "No idea how to handle this state";
++    }
+   }
+ 
+   void ForwardPartial(std::shared_ptr<TlsAgent>& peer) {
+@@ -260,12 +278,9 @@ class StagedRecords {
+       if (g_ssl_gtest_verbose) {
+         std::cerr << role_ << ": forward " << data_ << std::endl;
+       }
+-      SECStatus rv = SSL_RecordLayerData(
++      EXPECT_EQ(SECSuccess, SSL_RecordLayerData(
+           peer->ssl_fd(), epoch_, content_type_, data_.data(),
+-          static_cast<unsigned int>(data_.len()));
+-      if (rv != SECSuccess) {
+-        EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
+-      }
++          static_cast<unsigned int>(data_.len())));
+     }
+ 
+     // Slices the tail off this record and returns it.
+
+
+
+
+@@ -407,7 +407,7 @@ ssl3_GatherCompleteHandshake(sslSocket *ss, int flags)
+         SSL_TRC(3, ("%d: SSL3[%d] Cannot gather data; fatal alert already sent",
+                     SSL_GETPID(), ss->fd));
+         PORT_SetError(SSL_ERROR_HANDSHAKE_FAILED);
+-        return SECFailure;
++        return -1;
+     }
+ 
+     SSL_TRC(30, ("%d: SSL3[%d]: ssl3_GatherCompleteHandshake",
+@@ -427,13 +427,6 @@ ssl3_GatherCompleteHandshake(sslSocket *ss, int flags)
+ 
+         processingEarlyData = ss->ssl3.hs.zeroRttState == ssl_0rtt_accepted;
+ 
+-        /* If we have a detached record layer, don't ever gather. */
+-        if (ss->recordWriteCallback) {
+-            ssl_ReleaseSSL3HandshakeLock(ss);
+-            PORT_SetError(PR_WOULD_BLOCK_ERROR);
+-            return (int)SECFailure;
+-        }
+-
+         /* Without this, we may end up wrongly reporting
+          * SSL_ERROR_RX_UNEXPECTED_* errors if we receive any records from the
+          * peer while we are waiting to be restarted.
+@@ -441,7 +434,18 @@ ssl3_GatherCompleteHandshake(sslSocket *ss, int flags)
+         if (ss->ssl3.hs.restartTarget) {
+             ssl_ReleaseSSL3HandshakeLock(ss);
+             PORT_SetError(PR_WOULD_BLOCK_ERROR);
+-            return (int)SECFailure;
++            return -1;
++        }
++
++        /* If we have a detached record layer, don't ever gather. */
++        if (ss->recordWriteCallback) {
++            PRBool done = ss->firstHsDone;
++            ssl_ReleaseSSL3HandshakeLock(ss);
++            if (done) {
++                return 1;
++            }
++            PORT_SetError(PR_WOULD_BLOCK_ERROR);
++            return -1;
+         }
+ 
+         ssl_ReleaseSSL3HandshakeLock(ss);
+@@ -663,7 +667,8 @@ SSLExp_RecordLayerData(PRFileDesc *fd, PRUint16 epoch,
+      * available to PR_Read(). */
+     if (contentType != ssl_ct_application_data) {
+         rv = ssl3_HandleNonApplicationData(ss, contentType, 0, 0, &ss->gs.buf);
+-        if (rv != SECSuccess) {
++        /* This occasionally blocks, but that's OK here. */
++        if (rv != SECSuccess && PORT_GetError() != PR_WOULD_BLOCK_ERROR) {
+             goto loser;
+         }
+     }

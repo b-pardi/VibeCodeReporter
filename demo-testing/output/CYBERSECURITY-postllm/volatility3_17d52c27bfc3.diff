@@ -1,0 +1,78 @@
+@@ -11,7 +11,6 @@ import contextlib
+ import logging
+ import math
+ import os
+-import struct
+ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+ 
+ from volatility3.framework import constants, exceptions, interfaces, layers
+@@ -377,25 +376,73 @@ class KernelPDBScanner(interfaces.automagic.AutomagicInterface):
+                     valid_kernel = (virtual_layer_name, address, res[0])
+         return valid_kernel
+ 
+-    def method_low_stub_offset(self,
++    class LowStubLayout:
++        """
++        Represents the layout of the Low Stub which exists only on x64 machines with no virtualization/emulation,
++        responsible for transitioning from Real Mode(16 bit) to Protected Mode(32 bit) and Long Mode(64 bit) on boot/return from sleep.
++        Contains offsets to fields and structures within the undocumented structure _PROCESSOR_START_BLOCK.
++        Here's a reference: https://github.com/mic101/windows/blob/master/WRK-v1.2/base/ntos/inc/amd64.h#L3334
++        """
++
++        # Expected signature for validation, constructed from:
++        # PROCESSOR_START_BLOCK->Jmp->OpCode | PROCESSOR_START_BLOCK->Jmp->Offset | PROCESSOR_START_BLOCK->CompletionFlag
++        JMP_AND_COMPLETION_SIGNATURE = 0x00000001000600E9
++
++        # Address of LmTarget (Long Mode target)
++        PROCESSOR_START_BLOCK_LM_TARGET_OFFSET = (
++            0x70  # PROCESSOR_START_BLOCK->LmTarget, PVOID 8 bytes
++        )
++
++        # CR3 register within structures describing initial processor state to be started
++        PROCESSOR_START_BLOCK_CR3_OFFSET = 0xA0  # PROCESSOR_START_BLOCK->ProcessorState->SpecialRegisters->Cr3, ULONG64 8 bytes
++
++    def method_low_stub_offset(
++        self,
+         context: interfaces.context.ContextInterface,
+         vlayer: layers.intel.Intel,
+         progress_callback: constants.ProgressCallback = None,
+     ) -> Optional[ValidKernelType]:
++        # This method is only valid for x64 systems
++        if not isinstance(vlayer, intel.Intel32e):
++            return None
+         kernel_hint = 0
+         kernel_base = 0
+-        physical_layer = context.layers.get('memory_layer')
+-
+-        # try locating kernel base via x64 Low Stub in lower 1MB starting from second page (4KB)
+-        # if "Discard Low Memory" setting is disabled in BIOS, the Low Stub may be at the third/fourth or further pages
+-        for offset in range(0x1000,0x100000, 0x1000):
+-            if 0xffffffffffff00ff & int.from_bytes(physical_layer.read(offset, 0x8), "little") != 0x00000001000600E9:
+-                continue  # not _PROCESSOR_START_BLOCK->Jmp
+-            potential_kernel_hint = int.from_bytes(physical_layer.read(offset + 0x70, 0x8), "little")
+-            if (0xfffff80000000003 & potential_kernel_hint) != 0xfffff80000000000:
+-                continue  # not _PROCESSOR_START_BLOCK->LmTarget
+-            kernel_hint = potential_kernel_hint & 0xffffffffffff
+-            kernel_base = kernel_hint & (~0x1fffff) & 0xffffffffffff
++        physical_layer = context.layers.get("memory_layer")
++
++        # Try locating kernel base via x64 Low Stub in lower 1MB starting from second page (4KB)
++        # If "Discard Low Memory" setting is disabled in BIOS, the Low Stub may be at the third/fourth or further pages
++        for offset in range(0x1000, 0x100000, 0x1000):
++            jmp_and_completion_values = int.from_bytes(
++                physical_layer.read(offset, 0x8), "little"
++            )
++            if (
++                0xFFFFFFFFFFFF00FF & jmp_and_completion_values
++                != self.LowStubLayout.JMP_AND_COMPLETION_SIGNATURE
++            ):
++                continue
++            cr3_value = int.from_bytes(
++                physical_layer.read(
++                    offset + self.LowStubLayout.PROCESSOR_START_BLOCK_CR3_OFFSET, 0x8
++                ),
++                "little",
++            )
++
++            # Compare previously observed valid page table address that's stored in vlayer._initial_entry
++        

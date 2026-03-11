@@ -1,0 +1,147 @@
+@@ -1073,7 +1073,9 @@ static int cmd_rap_run(void *data, const char *input) {
+ 	char *res = r_io_system (core->io, input);
+ 	if (res) {
+ 		int ret = atoi (res);
+-		r_cons_printf ("%s\n", res);
++		if (ret == 0 && *res) {
++			r_cons_printf ("%s\n", res);
++		}
+ 		free (res);
+ 		r_core_return_value (core, ret);
+ 		return ret;
+
+
+
+
+@@ -27,7 +27,7 @@ R_API bool r_strbuf_append_n(RStrBuf *sb, const char *s, size_t l);
+ R_API bool r_strbuf_prepend(RStrBuf *sb, const char *s);
+ R_API bool r_strbuf_appendf(RStrBuf *sb, const char *fmt, ...) R_PRINTF_CHECK(2, 3);
+ R_API bool r_strbuf_vappendf(RStrBuf *sb, const char *fmt, va_list ap);
+-R_API char *r_strbuf_get(RStrBuf *sb);
++R_API char *r_strbuf_get(RStrBuf *sb); // rename _tostring
+ R_API char *r_strbuf_drain(RStrBuf *sb);
+ R_API char *r_strbuf_drain_nofree(RStrBuf *sb);
+ R_API bool r_strbuf_replace(RStrBuf *sb, const char *key, const char *val);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,274 @@
++/* radare2 - LGPL - Copyright 2022 - pancake */
++
++// iostream utilities
++
++#include "io_stream.h"
++
++static char *stream_art(RIOStream *s) {
++	ut64 saddr = 0;
++	ut64 daddr = 0;
++	RListIter *iter;
++	RIOStreamItem *si;
++	RStrBuf *sb = r_strbuf_new ("");
++	r_strbuf_append (sb, "             ");
++	r_strbuf_append (sb, ".---------[ host ]-----------.      .---------[ dest ]-----------.\n");
++	int i, j;
++	bool firstline = true;
++	r_list_foreach (s->log, iter, si) {
++		firstline = true;
++		if (si->size < 1) {
++			continue;
++		}
++		r_strbuf_append (sb, "             ");
++		r_strbuf_append (sb, "|                            |      |                            |\n");
++		for (i = 0; i < si->size;) {
++			ut64 at = i + (si->host? saddr: daddr);
++			r_strbuf_appendf (sb, "0x%08"PFMT64x" %c ", at, si->host? '>': '<');
++			if (si->host) {
++				r_strbuf_append (sb, "|");
++			} else {
++				r_strbuf_append (sb, "|                            |");
++				if (firstline) {
++					r_strbuf_append (sb, " <--- |");
++				} else {
++					r_strbuf_append (sb, "      |");
++				}
++			}
++			// hex
++			int oi = i;
++			for (j = 0; j < 8 && i < si->size; j++, i++) {
++				if ((j % 4) == 0) {
++					r_strbuf_append (sb, " ");
++				}
++				r_strbuf_appendf (sb, "%02x", si->data[i]);
++			}
++			// padding
++			for (; j < 8; j++) {
++				if ((j % 4) == 0) {
++					r_strbuf_append (sb, " ");
++				}
++				r_strbuf_append (sb, "  ");
++			}
++			r_strbuf_append (sb, " ");
++			// asc
++			i = oi;
++			for (j = 0; j < 8 && i < si->size; j++, i++) {
++				char ch = IS_PRINTABLE (si->data[i])? si->data[i]: '.';
++				r_strbuf_appendf (sb, "%c", ch);
++			}
++			// padding
++			for (; j < 8; j++) {
++				r_strbuf_append (sb, " ");
++			}
++			r_strbuf_append (sb, " ");
++			if (si->host) {
++				if (firstline) {
++					if (si->host) {
++						r_strbuf_append (sb, "| ---> ");
++					} else {
++						r_strbuf_append (sb, "|      ");
++					}
++				} else {
++					r_strbuf_append (sb, "|      ");
++				}
++			}
++			if (si->host) {
++				r_strbuf_append (sb, "|                            |\n");
++			} else {
++				r_strbuf_append (sb, "|\n");
++			}
++			firstline = false;
++		}
++		// r_strbuf_append (sb, " |\n");
++		if (si->host) {
++			saddr += si->size;
++		} else {
++			daddr += si->size;
++		}
++	}
++	r_strbuf_append (sb, "             ");
++	r_strbuf_append (sb, "|                            |      |                            |\n");
++	r_strbuf_append (sb, "             ");
++	r_strbuf_append (sb, "`----------------------------'      '----------------------------'\n");
++	r_strbuf_appendf (sb, "Sent %"PFMT64d" bytes. Received %"PFMT64d" bytes.", saddr, daddr);
++	return r_strbuf_drain (sb);
++}
++
++static void update_buffer(RIOStream *s) {
++	r_buf_free (s->buf);
++	s->buf = r_buf_new ();
++	RIOStreamItem *si;
++	RListIter *iter;
++	ut64 size = 0;
++	// find the size
++	r_list_foreach (s->log, iter, si) {
++		switch (s->mode) {
++		case R_PERM_R:
++			if (!si->host) {
++				size += si->size;
++			}
++			break;
++		case R_PERM_W:
++			if (si->host) {
++				size += si->size;
++			}
++			break;
++		case R_PERM_RW:
++			

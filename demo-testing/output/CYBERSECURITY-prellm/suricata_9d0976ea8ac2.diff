@@ -1,0 +1,107 @@
+@@ -40,7 +40,7 @@ typedef struct OutputLoggerThreadStore_ {
+ /** per thread data for this module, contains a list of per thread
+  *  data for the packet loggers. */
+ typedef struct OutputLoggerThreadData_ {
+-    OutputLoggerThreadStore *store;
++    OutputLoggerThreadStore *store[ALPROTO_MAX];
+ } OutputLoggerThreadData;
+ 
+ /* logger instance, a module + a output ctx,
+@@ -62,7 +62,7 @@ typedef struct OutputTxLogger_ {
+     void (*ThreadExitPrintStats)(ThreadVars *, void *);
+ } OutputTxLogger;
+ 
+-static OutputTxLogger *list = NULL;
++static OutputTxLogger *list[ALPROTO_MAX] = { NULL };
+ 
+ int OutputRegisterTxLogger(LoggerId id, const char *name, AppProto alproto,
+                            TxLogger LogFunc,
+@@ -113,11 +113,11 @@ int OutputRegisterTxLogger(LoggerId id, const char *name, AppProto alproto,
+         op->ts_log_progress = ts_log_progress;
+     }
+ 
+-    if (list == NULL) {
++    if (list[alproto] == NULL) {
+         op->id = 1;
+-        list = op;
++        list[alproto] = op;
+     } else {
+-        OutputTxLogger *t = list;
++        OutputTxLogger *t = list[alproto];
+         while (t->next)
+             t = t->next;
+         if (t->id * 2 > UINT32_MAX) {
+@@ -132,23 +132,53 @@ int OutputRegisterTxLogger(LoggerId id, const char *name, AppProto alproto,
+     return 0;
+ }
+ 
++static void OutputTxLogList0(ThreadVars *tv,
++        OutputLoggerThreadData *op_thread_data,
++        Packet *p, Flow *f, void *tx, const uint64_t tx_id)
++{
++    const OutputTxLogger *logger = list[ALPROTO_UNKNOWN];
++    const OutputLoggerThreadStore *store = op_thread_data->store[ALPROTO_UNKNOWN];
++
++    DEBUG_VALIDATE_BUG_ON(logger == NULL && store != NULL);
++    DEBUG_VALIDATE_BUG_ON(logger != NULL && store == NULL);
++    DEBUG_VALIDATE_BUG_ON(logger == NULL && store == NULL);
++
++    while (logger && store) {
++        DEBUG_VALIDATE_BUG_ON(logger->LogFunc == NULL);
++
++        SCLogDebug("logger %p", logger);
++
++        /* always invoke "wild card" tx loggers */
++        SCLogDebug("Logging tx_id %"PRIu64" to logger %d", tx_id, logger->logger_id);
++        PACKET_PROFILING_LOGGER_START(p, logger->logger_id);
++        logger->LogFunc(tv, store->thread_data, p, f, f->alstate, tx, tx_id);
++        PACKET_PROFILING_LOGGER_END(p, logger->logger_id);
++
++        logger = logger->next;
++        store = store->next;
++
++        DEBUG_VALIDATE_BUG_ON(logger == NULL && store != NULL);
++        DEBUG_VALIDATE_BUG_ON(logger != NULL && store == NULL);
++    }
++}
++
+ static TmEcode OutputTxLog(ThreadVars *tv, Packet *p, void *thread_data)
+ {
+     DEBUG_VALIDATE_BUG_ON(thread_data == NULL);
+     if (p->flow == NULL)
+         return TM_ECODE_OK;
+ 
+-    if (list == NULL) {
+-        /* No child loggers registered. */
+-        return TM_ECODE_OK;
+-    }
+-
+     OutputLoggerThreadData *op_thread_data = (OutputLoggerThreadData *)thread_data;
+ 
+     Flow * const f = p->flow;
+     const uint8_t ipproto = f->proto;
+     const AppProto alproto = f->alproto;
+ 
++    if (list[alproto] == NULL && list[ALPROTO_UNKNOWN] == NULL) {
++        /* No child loggers registered. */
++        return TM_ECODE_OK;
++    }
++
+     if (AppLayerParserProtocolHasLogger(p->proto, alproto) == 0)
+         goto end;
+     const LoggerId logger_expectation = AppLayerParserProtocolGetLoggerBits(p->proto, alproto);
+@@ -180,6 +210,12 @@ static TmEcode OutputTxLog(ThreadVars *tv, Packet *p, void *thread_data)
+         void * const tx = ires.tx_ptr;
+         tx_id = ires.tx_id;
+ 
++        if (list[ALPROTO_UNKNOWN] != 0) {
++            OutputTxLogList0(tv, op_thread_data, p, f, tx, tx_id);
++            if (list[alproto] == NULL)
++                goto next_tx;
++        }
++
+         LoggerId tx_logged = AppLayerParserGetTxLogged(f, alstate, tx);
+         const LoggerId tx_logged_old = tx_logged;
+         SCLogDebug("logger: expect %08x, have %08x", logger_expectation, tx_logged);
+@@ -195,8 +231,8 @@ static TmEcode OutputTxLog(ThreadVars *tv, Packet *p, void *thread_data)
+         SCLogDebug("tx_progress_ts %d tx_pro

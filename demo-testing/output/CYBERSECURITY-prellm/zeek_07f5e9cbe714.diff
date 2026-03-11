@@ -1,0 +1,161 @@
+@@ -52,10 +52,6 @@ void EventHandler::SetFunc(FuncPtr f)
+ 
+ void EventHandler::Call(Args* vl, bool no_remote)
+ 	{
+-#ifdef PROFILE_BRO_FUNCTIONS
+-	DEBUG_MSG("Event: %s\n", Name());
+-#endif
+-
+ 	if ( new_event )
+ 		NewEvent(vl);
+ 
+
+
+
+
+@@ -5,18 +5,6 @@
+ 
+ #include "zeek/zeek-config.h"
+ 
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#ifdef TIME_WITH_SYS_TIME
+-#include <sys/time.h>
+-#include <time.h>
+-#else
+-#ifdef HAVE_SYS_TIME_H
+-#include <sys/time.h>
+-#else
+-#include <time.h>
+-#endif
+-#endif
+ #include <broker/error.hh>
+ #include <ctype.h>
+ #include <errno.h>
+@@ -25,7 +13,6 @@
+ #include <signal.h>
+ #include <stdlib.h>
+ #include <sys/param.h>
+-#include <sys/resource.h>
+ #include <unistd.h>
+ #include <algorithm>
+ 
+@@ -42,6 +29,7 @@
+ #include "zeek/Reporter.h"
+ #include "zeek/RunState.h"
+ #include "zeek/Scope.h"
++#include "zeek/ScriptProfile.h"
+ #include "zeek/Stmt.h"
+ #include "zeek/Traverse.h"
+ #include "zeek/Var.h"
+@@ -348,9 +336,6 @@ bool ScriptFunc::IsPure() const
+ 
+ ValPtr ScriptFunc::Invoke(zeek::Args* args, Frame* parent) const
+ 	{
+-#ifdef PROFILE_BRO_FUNCTIONS
+-	DEBUG_MSG("Function: %s\n", Name());
+-#endif
+ 	SegmentProfiler prof(segment_logger, location);
+ 
+ 	if ( sample_logger )
+@@ -417,6 +402,9 @@ ValPtr ScriptFunc::Invoke(zeek::Args* args, Frame* parent) const
+ 				f->SetElement(j, arg);
+ 			}
+ 
++		if ( spm )
++			spm->StartInvocation(this, body.stmts);
++
+ 		f->Reset(args->size());
+ 
+ 		try
+@@ -439,6 +427,9 @@ ValPtr ScriptFunc::Invoke(zeek::Args* args, Frame* parent) const
+ 			continue;
+ 			}
+ 
++		if ( spm )
++			spm->EndInvocation();
++
+ 		if ( f->HasDelayed() )
+ 			{
+ 			assert(! result);
+@@ -758,9 +749,9 @@ bool BuiltinFunc::IsPure() const
+ 
+ ValPtr BuiltinFunc::Invoke(Args* args, Frame* parent) const
+ 	{
+-#ifdef PROFILE_BRO_FUNCTIONS
+-	DEBUG_MSG("Function: %s\n", Name());
+-#endif
++	if ( spm )
++		spm->StartInvocation(this);
++
+ 	SegmentProfiler prof(segment_logger, Name());
+ 
+ 	if ( sample_logger )
+@@ -772,7 +763,11 @@ ValPtr BuiltinFunc::Invoke(Args* args, Frame* parent) const
+ 	CheckPluginResult(handled, hook_result, FUNC_FLAVOR_FUNCTION);
+ 
+ 	if ( handled )
++		{
++		if ( spm )
++			spm->EndInvocation();
+ 		return hook_result;
++		}
+ 
+ 	if ( g_trace_state.DoTrace() )
+ 		{
+@@ -795,6 +790,9 @@ ValPtr BuiltinFunc::Invoke(Args* args, Frame* parent) const
+ 		g_trace_state.LogTrace("\tFunction return: %s\n", d.Description());
+ 		}
+ 
++	if ( spm )
++		spm->EndInvocation();
++
+ 	return result;
+ 	}
+ 
+
+
+
+
+@@ -6,6 +6,7 @@
+ 
+ #include <unistd.h>
+ 
++#include "zeek/ScriptProfile.h"
+ #include "zeek/script_opt/ScriptOpt.h"
+ 
+ #ifdef HAVE_GETOPT_H
+@@ -142,6 +143,9 @@ void usage(const char* prog, int code)
+ 	fprintf(stderr, "    -m|--mem-leaks                  | show leaks  [perftools]\n");
+ 	fprintf(stderr, "    -M|--mem-profile                | record heap [perftools]\n");
+ #endif
++	fprintf(
++		stderr,
++		"    --profile-scripts[=file]        | profile scripts to given file (default stdout)\n");
+ 	fprintf(stderr, "    --pseudo-realtime[=<speedup>]   | enable pseudo-realtime for performance "
+ 	                "evaluation (default 1)\n");
+ 	fprintf(stderr, "    -j|--jobs                       | enable supervisor mode\n");
+@@ -362,7 +366,9 @@ Options parse_cmdline(int argc, char** argv)
+ 			}
+ 		}
+ 
+-	constexpr struct option long_opts[] = {
++	int profile_scripts = 0;
++
++	struct option long_opts[] = {
+ 		{"parse-only", no_argument, nullptr, 'a'},
+ 		{"bare-mode", no_argument, nullptr, 'b'},
+ 		{"capture-unprocessed", required_argument, nullptr, 'c'},
+@@ -403,6 +409,7 @@ Options parse_cmdline(int argc, char** argv)
+ 		{"mem-profile", no_argument, nullptr, 'M'},
+ #endif
+ 
++		{"profile-scripts", optional_argument, &profile_scripts, 1},
+ 		{"pseudo-realtime", optional_argument, nullptr, '~'},
+ 		{"jobs", optional_argument, nullptr, 'j'},
+ 		{"test", no_argument, nullptr, '#'},
+@@ -601,6 +608,11 @@ Options parse_cmdline(int argc, char** argv)
+ 			case 0:
+ 				// This happens for long options that don't have
+ 				// a short-option equivalent.
++				i

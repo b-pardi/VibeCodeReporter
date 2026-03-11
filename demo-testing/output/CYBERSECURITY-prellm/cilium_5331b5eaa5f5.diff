@@ -1,0 +1,164 @@
+@@ -52,6 +52,7 @@
+ #include "lib/lb.h"
+ #include "lib/nodeport.h"
+ #include "lib/eps.h"
++#include "lib/egress_gw.h"
+ #include "lib/host_firewall.h"
+ #include "lib/overloadable.h"
+ #include "lib/encrypt.h"
+@@ -1029,6 +1030,16 @@ out:
+ 	}
+ #endif
+ 
++#if defined(ENABLE_EGRESS_GATEWAY)
++	if ((ctx->mark & MARK_MAGIC_SNAT_DONE) != MARK_MAGIC_SNAT_DONE) {
++		ret = egress_nat_fwd(ctx);
++		if (IS_ERR(ret))
++			return send_drop_notify_error(ctx, 0, ret,
++						      CTX_ACT_DROP,
++						      METRIC_EGRESS);
++	}
++#endif
++
+ #if defined(ENABLE_NODEPORT) && \
+ 	(!defined(ENABLE_DSR) || \
+ 	 (defined(ENABLE_DSR) && defined(ENABLE_DSR_HYBRID)) || \
+
+
+
+
+@@ -704,6 +704,30 @@ ct_recreate4:
+ 		}
+ 	}
+ 
++#ifdef ENABLE_EGRESS_GATEWAY
++	{
++		struct egress_info *info;
++		struct endpoint_key key = {};
++
++		info = lookup_ip4_egress_endpoint(ip4->saddr, ip4->daddr);
++		if (!info)
++			goto skip_egress_gateway;
++
++		/* Encap and redirect the packet to egress gateway node through a tunnel.
++		 * Even if the tunnel endpoint is on the same host, follow the same data
++		 * path to be consistent. In future, it can be optimized by directly
++		 * direct to external interface.
++		 */
++		ret = encap_and_redirect_lxc(ctx, info->tunnel_endpoint, encrypt_key,
++					     &key, SECLABEL, monitor);
++		if (ret == IPSEC_ENDPOINT)
++			goto encrypt_to_stack;
++		else
++			return ret;
++	}
++skip_egress_gateway:
++#endif
++
+ #ifdef ENCAP_IFINDEX
+ 	{
+ 		struct endpoint_key key = {};
+@@ -712,7 +736,7 @@ ct_recreate4:
+ 		key.family = ENDPOINT_KEY_IPV4;
+ 
+ 		ret = encap_and_redirect_lxc(ctx, tunnel_endpoint, encrypt_key,
+-					     &key, SECLABEL, monitor);
++					    &key, SECLABEL, monitor);
+ 		if (ret == DROP_NO_TUNNEL_ENDPOINT)
+ 			goto pass_to_stack;
+ 		/* If not redirected noteably due to IPSEC then pass up to stack
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2019-2021 Authors of Cilium */
++
++#ifndef __EGRESS_GW_H_
++#define __EGRESS_GW_H_
++
++#include <bpf/ctx/ctx.h>
++#include <bpf/api.h>
++
++#include "eps.h"
++#include "tailcall.h"
++#include "nat.h"
++#include "edt.h"
++#include "lb.h"
++#include "common.h"
++#include "overloadable.h"
++#include "conntrack.h"
++#include "csum.h"
++#include "encap.h"
++#include "trace.h"
++
++#ifdef ENABLE_EGRESS_GATEWAY
++
++static __always_inline int handle_egress_nat_ipv4(struct __ctx_buff *ctx)
++{
++	struct egress_info *info;
++	struct iphdr *ip4;
++	void *data, *data_end;
++	bool from_endpoint = true;
++	struct ipv4_nat_target target = {
++		.min_port = 32767,
++		.max_port = 43835,
++	};
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip4))
++		return DROP_INVALID;
++
++	info = lookup_ip4_egress_endpoint(ip4->saddr, ip4->daddr);
++	if (!info)
++		return CTX_ACT_OK;
++
++	target.addr = info->egress_ip;
++
++	return snat_v4_process(ctx, NAT_DIR_EGRESS, &target, from_endpoint);
++}
++
++static __always_inline int egress_nat_fwd(struct __ctx_buff *ctx)
++{
++	int ret = CTX_ACT_OK;
++		__u16 proto;
++
++	if (!validate_ethertype(ctx, &proto))
++		return CTX_ACT_OK;
++
++	switch (proto) {
++#ifdef ENABLE_IPV4
++	case bpf_htons(ETH_P_IP):
++	ret = handle_egress_nat_ipv4(ctx);
++		break;
++#endif /* ENABLE_IPV4 */
++	default:
++		break;
++	}
++	return ret;
++}
++
++#endif /* ENABLE_EGRESS_GATEWAY */
++#endif /* __EGRESS_GW_H_ */
+
+
+
+
+@@ -60,7 +60,14 @@ lookup_ip4_endpoint_policy_map(__u32 ip)
+ #define IPCACHE_STATIC_PREFIX							\
+ 	(8 * (sizeof(struct ipcache_key) - sizeof(struct bpf_lpm_trie_key)	\
+ 	      - sizeof(union v6addr)))
+-#define IPCACHE_PREFIX_LEN(PREFIX) (IPCACHE_STATIC_PREFIX + PREFIX)
++#define IPCACHE_PREFIX_LEN(PREFIX) (IPCACHE_STATIC_PREFIX + (PREFIX))
++
++/* EGRESS_STATIC_PREFIX gets sizeof non-IP, non-prefix part of ipcache_key */
++#define EGRESS_STATIC_PREFIX							\
++	(8 * (sizeof(struct egress_key) - sizeof(struct bpf_lpm_trie_key)	\
++	      - 4))
++#define EGRESS_PREFIX_LEN(PREFIX) (EGRESS_STATIC_PREFIX + (PREFIX))
++#define EGRESS_IPV4_PREFIX EGRESS_PREFIX_LEN(32)
+ 
+ #define V6_CACHE_KEY_LEN (sizeof(union v6addr)*8)
+ 
+@@ -130,4

@@ -1,0 +1,123 @@
+@@ -1,10 +1,12 @@
+ from __future__ import annotations
+ 
+ import argparse
++import datetime
+ import os
+ import stat
+-from subprocess import CalledProcessError
+-from subprocess import check_output
++import time
++from typing import List
++from typing import NamedTuple
+ from typing import Union
+ 
+ import gdb
+@@ -77,48 +79,45 @@ parser.add_argument(
+ )
+ 
+ 
+-def find_pids(target, user, exact, all):
++import psutil
++
++
++def find_pids(target: str, user: str | None, exact: bool, all: bool) -> List[int]:
+     # Note: we can't use `ps -C <target>` because this does not accept process names with spaces
+     # so target='a b' would actually match process names 'a' and 'b' here
+     # so instead, we will filter by process name or full cmdline later on
+     # if provided, filter by effective username or uid; otherwise, select all processes
+-    ps_filter = ["-u", user] if user is not None else ["-e"]
+-    ps_cmd = ["ps", "-o", "pid,args"] + ps_filter
+ 
+-    try:
+-        ps_output = check_output(ps_cmd, universal_newlines=True)
+-    except FileNotFoundError:
+-        print(message.error("Error: did not find `ps` command"))
+-        return
+-    except CalledProcessError:
+-        print(message.error(f"The `{' '.join(ps_cmd)}` command returned non-zero status"))
+-        return
++    current_pid = os.getpid()
+ 
+     pids_exact_match_cmd = []
+     pids_partial_match_cmd = []
+     pids_partial_match_args = []
+ 
+-    # Skip header line
+-    for line in ps_output.strip().splitlines()[1:]:
+-        process_info = line.split(maxsplit=1)
++    iter_process = psutil.process_iter(["pid", "name", "cmdline", "username"])
++    iter_process = filter(lambda p: p.pid != current_pid, iter_process)
++    if user is not None:
++        iter_process = filter(lambda p: proc.username() == user, iter_process)
+ 
+-        if len(process_info) <= 1:
+-            # No command name?
++    for proc in iter_process:
++        try:
++            cmdline = proc.cmdline()
++        except (psutil.NoSuchProcess, psutil.AccessDenied):
++            # The process no longer exists or we don't have permission
+             continue
++        else:
++            if not cmdline:
++                continue
+ 
+-        pid, args = process_info
+-        cmd = args.split(maxsplit=1)[0]
++            cmd = cmdline[0]
++            args = " ".join(cmdline)
+ 
+-        # Cannot attach to gdb itself.
+-        if int(pid) == os.getpid():
+-            continue
+-
+-        if target == cmd:
+-            pids_exact_match_cmd.append(pid)
+-        elif target in cmd:
+-            pids_partial_match_cmd.append(pid)
+-        elif target in args:
+-            pids_partial_match_args.append(pid)
++            if target == cmd:
++                pids_exact_match_cmd.append(proc.pid)
++            elif target in cmd:
++                pids_partial_match_cmd.append(proc.pid)
++            elif target in args:
++                pids_partial_match_args.append(proc.pid)
+ 
+     if exact and all:
+         return pids_exact_match_cmd + pids_partial_match_cmd + pids_partial_match_args
+@@ -130,8 +129,105 @@ def find_pids(target, user, exact, all):
+         return pids_exact_match_cmd or pids_partial_match_cmd or pids_partial_match_args
+ 
+ 
++class ProcessInfo(NamedTuple):
++    pid: int
++    user: str
++    elapsed: str
++    command: str
++    start_time: float
++
++
++def resolve_target_process(
++    pids: List[int],
++    method: str,
++    no_truncate: bool,
++) -> int | None:
++    proc_infos: List[ProcessInfo] = []
++
++    for pid in pids:
++        try:
++            proc = psutil.Process(pid)
++            start_time = proc.create_time()
++            proc_infos.append(
++                ProcessInfo(
++                    proc.pid,
++                    proc.username(),
++                    str(datetime.timedelta(seconds=int(time.time() - start_time))),
++                    " ".join(proc.cmdline()),
++                    start_time,
++                )
++            )
++        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
++           

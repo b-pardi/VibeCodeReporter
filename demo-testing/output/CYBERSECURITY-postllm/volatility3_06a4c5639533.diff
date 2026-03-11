@@ -1,0 +1,100 @@
+@@ -15,16 +15,33 @@ from volatility3.framework.interfaces import plugins
+ vollog = logging.getLogger(__name__)
+ 
+ 
+-class Check_modules(
+-    linux_utilities_modules.ModuleDisplayPlugin, plugins.PluginInterface
+-):
++class Check_modules(plugins.PluginInterface):
+     """Compares module list to sysfs info, if available"""
+ 
+     _version = (3, 0, 0)
+     _required_framework_version = (2, 0, 0)
+ 
+-    def __init__(self, *args, **kwargs):
+-        super().__init__(self.compare_kset_and_lsmod, *args, **kwargs)
++    @classmethod
++    def compare_kset_and_lsmod(
++        cls, context: str, vmlinux_name: str
++    ) -> Generator[extensions.module, None, None]:
++        kset_modules = linux_utilities_modules.Modules.get_kset_modules(
++            context=context, vmlinux_name=vmlinux_name
++        )
++
++        lsmod_modules = set(
++            str(utility.array_to_string(modules.name))
++            for modules in linux_utilities_modules.Modules.list_modules(
++                context=context, vmlinux_module_name=vmlinux_name
++            )
++        )
++
++        for mod_name in set(kset_modules.keys()).difference(lsmod_modules):
++            yield kset_modules[mod_name]
++
++    run = linux_utilities_modules.ModuleDisplayPlugin.run
++    _generator = linux_utilities_modules.ModuleDisplayPlugin.generator
++    implementation = compare_kset_and_lsmod
+ 
+     @classmethod
+     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
+@@ -51,21 +68,3 @@ class Check_modules(
+         cls, context: interfaces.context.ContextInterface, vmlinux_name: str
+     ) -> Dict[str, extensions.module]:
+         return linux_utilities_modules.Modules.get_kset_modules(context, vmlinux_name)
+-
+-    @classmethod
+-    def compare_kset_and_lsmod(
+-        cls, context: str, vmlinux_name: str
+-    ) -> Generator[extensions.module, None, None]:
+-        kset_modules = linux_utilities_modules.Modules.get_kset_modules(
+-            context=context, vmlinux_name=vmlinux_name
+-        )
+-
+-        lsmod_modules = set(
+-            str(utility.array_to_string(modules.name))
+-            for modules in linux_utilities_modules.Modules.list_modules(
+-                context=context, vmlinux_module_name=vmlinux_name
+-            )
+-        )
+-
+-        for mod_name in set(kset_modules.keys()).difference(lsmod_modules):
+-            yield kset_modules[mod_name]
+
+
+
+
+@@ -15,16 +15,49 @@ from volatility3.framework.interfaces import plugins
+ vollog = logging.getLogger(__name__)
+ 
+ 
+-class Hidden_modules(
+-    linux_utilities_modules.ModuleDisplayPlugin, plugins.PluginInterface
+-):
++class Hidden_modules(plugins.PluginInterface):
+     """Carves memory to find hidden kernel modules"""
+ 
+     _required_framework_version = (2, 10, 0)
+     _version = (3, 0, 0)
+ 
+-    def __init__(self, *args, **kwargs):
+-        super().__init__(self.find_hidden_modules, *args, **kwargs)
++    @classmethod
++    def get_hidden_modules(
++        cls,
++        context: interfaces.context.ContextInterface,
++        vmlinux_module_name: str,
++        known_module_addresses: Set[int],
++        modules_memory_boundaries: Tuple,
++    ) -> Iterable[interfaces.objects.ObjectInterface]:
++        """Enumerate hidden modules by taking advantage of memory address alignment patterns
++
++        This technique is much faster and uses less memory than the traditional scan method
++        in Volatility2, but it doesn't work with older kernels.
++
++        From kernels 4.2 struct module allocation are aligned to the L1 cache line size.
++        In i386/amd64/arm64 this is typically 64 bytes. However, this can be changed in
++        the Linux kernel configuration via CONFIG_X86_L1_CACHE_SHIFT. The alignment can
++        also be obtained from the DWARF info i.e. DW_AT_alignment<64>, but dwarf2json
++        doesn't support this feature yet.
++        In kernels < 4.2, alignment attributes are absent in the struct module, meaning
++        alignment cannot be guaranteed. Therefore, for older kernels, it's be

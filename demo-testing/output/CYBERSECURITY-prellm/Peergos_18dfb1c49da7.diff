@@ -1,0 +1,76 @@
+@@ -7,6 +7,7 @@ import peergos.server.storage.ResetableFileInputStream;
+ import peergos.server.util.Args;
+ import peergos.server.util.PeergosNetworkUtils;
+ import peergos.shared.crypto.hash.*;
++import peergos.shared.crypto.random.SafeRandom;
+ import peergos.shared.util.TriFunction;
+ import peergos.shared.*;
+ import peergos.shared.cbor.*;
+@@ -281,10 +282,17 @@ public class MultiUserTests {
+                 u1.network.mutable, u1.network.dhtClient).join();
+         Assert.assertTrue("New writer key present", keysOwnedByRootSigner.contains(theFile.writer()));
+ 
+-        parentFolder.remove(u1.getUserRoot().get(), u1.network, crypto.hasher).get();
++        AbsoluteCapability cap = theFile.getPointer().capability;
++        Set<String> sharedWriteAccessWithBefore = u1.network.sharedWithCache.getSharedWith(SharedWithCache.Access.WRITE, cap);
++        Assert.assertTrue("file shared", ! sharedWriteAccessWithBefore.isEmpty());
++
++        theFile.remove(parentFolder, u1.network, crypto.hasher).get();
+         Optional<FileWrapper> removedFile = u1.getByPath(filePath).get();
+         Assert.assertTrue("file removed", ! removedFile.isPresent());
+ 
++        Set<String> sharedWriteAccessWithAfter = u1.network.sharedWithCache.getSharedWith(SharedWithCache.Access.WRITE, cap);
++        Assert.assertTrue("file shared", sharedWriteAccessWithAfter.isEmpty());
++
+         for (UserContext userContext : userContexts) {
+             Optional<FileWrapper> sharedFile = userContext.getByPath(filePath).get();
+             Assert.assertTrue("shared file removed", ! sharedFile.isPresent());
+@@ -294,6 +302,461 @@ public class MultiUserTests {
+         Assert.assertTrue("New writer key not present", ! updatedKeysOwnedByRootSigner.contains(theFile.writer()));
+     }
+ 
++
++    @Test
++    public void renamedFileSharedWith() throws Exception {
++        //read access
++        TriFunction<UserContext, List<UserContext>, Path, CompletableFuture<Boolean>> readAccessSharingFunction =
++                (u1, u2List, filePath) ->
++                        u1.shareReadAccessWith(filePath, u2List.stream().map(u -> u.username).collect(Collectors.toSet()));
++
++        renamedFileSharedWith(readAccessSharingFunction, SharedWithCache.Access.READ);
++        //write access
++        TriFunction<UserContext, List<UserContext>, Path, CompletableFuture<Boolean>> writeAccessSharingFunction =
++                (u1, u2List, filePath) ->
++                        u1.shareWriteAccessWith(filePath, u2List.stream().map(u -> u.username).collect(Collectors.toSet()));
++        renamedFileSharedWith(writeAccessSharingFunction, SharedWithCache.Access.WRITE);
++    }
++
++    private void renamedFileSharedWith(
++            TriFunction<UserContext, List<UserContext>, Path, CompletableFuture<Boolean>> shareFunction,
++            SharedWithCache.Access sharedWithAccess)
++            throws Exception {
++        UserContext u1 = PeergosNetworkUtils.ensureSignedUp(random(), "a", network.clear(), crypto);
++
++        // send follow requests from each other user to "a"
++        List<UserContext> userContexts = getUserContexts(1);
++        for (UserContext userContext : userContexts) {
++            userContext.sendFollowRequest(u1.username, SymmetricKey.random()).get();
++        }
++
++        // make "a" reciprocate all the follow requests
++        List<FollowRequestWithCipherText> u1Requests = u1.processFollowRequests().get();
++        for (FollowRequestWithCipherText u1Request : u1Requests) {
++            boolean accept = true;
++            boolean reciprocate = true;
++            u1.sendReplyFollowRequest(u1Request, accept, reciprocate).get();
++        }
++
++        // complete the friendship connection
++        for (UserContext userContext : userContexts) {
++            userContext.processFollowRequests().get();//needed for side effect
++        }
++
++        // upload a file to "a"'s space
++        FileWrapper u1Root = u1.getUserRoot().get();
++        String filename = "somefile.txt";
++        byte[] data1 = "H

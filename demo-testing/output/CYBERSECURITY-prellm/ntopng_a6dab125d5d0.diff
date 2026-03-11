@@ -1,0 +1,123 @@
+@@ -77,7 +77,7 @@ class NetworkInterface : public AlertableEntity {
+   u_int32_t num_alerts_engaged[MAX_NUM_PERIODIC_SCRIPTS];
+   u_int64_t num_active_alerted_flows, num_idle_alerted_flows;
+   u_int64_t num_active_misbehaving_flows, num_idle_misbehaving_flows;
+-  u_int32_t num_dropped_alerts, num_dropped_flow_scripts_calls;
++  u_int32_t num_dropped_alerts, prev_dropped_alerts, checked_dropped_alerts, num_dropped_flow_scripts_calls;
+   u_int64_t num_new_flows;
+   bool has_stored_alerts;
+   AlertsQueue *alertsQueue;
+@@ -364,6 +364,7 @@ class NetworkInterface : public AlertableEntity {
+   inline void incKeepAlivePkts(u_int32_t num)       { tcpPacketStats.incKeepAlive(num); };
+   virtual void checkPointCounters(bool drops_only);
+   bool registerSubInterface(NetworkInterface *sub_iface, u_int32_t criteria);
++  u_int32_t checkDroppedAlerts();
+ 
+   /* Overridden in ViewInterface.cpp */
+   virtual u_int64_t getCheckPointNumPackets();
+
+
+
+
+@@ -31,7 +31,7 @@ class NetworkInterfaceTsPoint: public TimeseriesPoint {
+   LocalTrafficStats local_stats;
+   u_int hosts, local_hosts;
+   u_int devices, flows, http_hosts;
+-  u_int engaged_alerts;
++  u_int engaged_alerts, dropped_alerts;
+   u_int num_alerted_flows, num_misbehaving_flows;
+   TcpPacketStats tcpPacketStats;
+   PacketStats packetStats;
+
+
+
+
+@@ -48,6 +48,9 @@ typedef struct {
+   struct {
+     threaded_activity_rrd_stats_t write;
+   } rrd;
++  struct {
++    bool has_drops;
++  } alerts;
+ } threaded_activity_stats_t;
+ 
+ class ThreadedActivityStats {
+@@ -74,6 +77,9 @@ class ThreadedActivityStats {
+   inline time_t getLastStartTime()   { return(last_start_time);   }
+ 
+   bool isRRDSlow() const;
++  inline bool hasAlertsDrops() const {
++    return ta_stats.alerts.has_drops;
++  }
+ 
+   /* RRD stats and drops for writes */
+   void updateRRDWriteStats(ticks cur_ticks);
+@@ -88,6 +94,7 @@ class ThreadedActivityStats {
+   inline void setScheduledTime(time_t t) { scheduled_time = t; }
+   inline void setDeadline(time_t t)      { deadline = t; }
+   inline void setCurrentProgress(int _progress) { progress = min(max(_progress, 0), 100); }
++  inline void setAlertsDrops()           { ta_stats.alerts.has_drops = true; }
+ 
+   void lua(lua_State *vm);
+ };
+
+
+
+
+@@ -8980,6 +8980,18 @@ static int ntop_interface_refresh_alerts(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_interface_check_dropped_alerts(lua_State* vm) {
++  NetworkInterface *iface = getCurrentInterface(vm);
++
++  if(!iface)
++    return(CONST_LUA_ERROR);
++
++  lua_pushinteger(vm, iface->checkDroppedAlerts());
++  return(CONST_LUA_OK);
++}
++
++/* ****************************************** */
++
+ static Host* ntop_host_get_context_host(lua_State* vm) {
+   struct ntopngLuaContext *c = getLuaVMContext(vm);
+ 
+@@ -10060,6 +10072,7 @@ static int ntop_get_predominant_status(lua_State* vm) {
+ /* ****************************************** */
+ 
+ static int ntop_flow_trigger_alert(lua_State* vm) {
++  struct ntopngLuaContext *ctx = getLuaVMContext(vm);
+   Flow *f = ntop_flow_get_context_flow(vm);
+   FlowStatus status;
+   AlertType atype;
+@@ -10110,15 +10123,23 @@ static int ntop_flow_trigger_alert(lua_State* vm) {
+       flow_str = ndpi_serializer_get_buffer(&flow_json, &buflen);
+ 
+       if(flow_str) {
+-        if(!sqlite_queue->enqueue(flow_str))
++        if(!sqlite_queue->enqueue(flow_str)) {
+           f->getInterface()->incNumDroppedAlerts(1);
+ 
++          if(ctx->threaded_activity_stats)
++            ctx->threaded_activity_stats->setAlertsDrops();
++        }
++
+         notif_queue->enqueue(flow_str);
+       }
+ 
+       ndpi_term_serializer(&flow_json);
+-    } else
++    } else {
+       f->getInterface()->incNumDroppedAlerts(1);
++
++      if(ctx->threaded_activity_stats)
++        ctx->threaded_activity_stats->setAlertsDrops();
++    }
+   }
+ 
+   lua_pushboolean(vm, triggered);
+@@ -10128,6 +10149,7 @@ static int ntop_flow_trigger_alert(lua_State* vm) {
+ /* ****************************************** */
+ 
+ static int ntop_push_sqlite_

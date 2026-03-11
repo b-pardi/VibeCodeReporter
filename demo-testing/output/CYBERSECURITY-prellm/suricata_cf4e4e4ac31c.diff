@@ -1,0 +1,119 @@
+@@ -48,9 +48,12 @@
+ #define PARSE_REGEX         "^([a-z]+)(?:,\\s*(.*))?"
+ static DetectParseRegex parse_regex;
+ 
++#define MAX_TOKENS 100
++
+ int DetectFlowbitMatch (DetectEngineThreadCtx *, Packet *,
+         const Signature *, const SigMatchCtx *);
+ static int DetectFlowbitSetup (DetectEngineCtx *, Signature *, const char *);
++static int FlowbitOrAddData(DetectEngineCtx *, DetectFlowbitsData *, char *);
+ void DetectFlowbitFree (void *);
+ void FlowBitsRegisterTests(void);
+ 
+@@ -69,6 +72,50 @@ void DetectFlowbitsRegister (void)
+     DetectSetupParseRegexes(PARSE_REGEX, &parse_regex);
+ }
+ 
++static int FlowbitOrAddData(DetectEngineCtx *de_ctx, DetectFlowbitsData *cd, char *arrptr)
++{
++    char *strarr[MAX_TOKENS];
++    char *token;
++    char *saveptr = NULL;
++    uint8_t i = 0;
++
++    while ((token = strtok_r(arrptr, "|", &saveptr))) {
++        // Check for leading/trailing spaces in the token
++        while(isspace((unsigned char)*token))
++            token++;
++        if (*token == 0)
++            continue;
++        char *end = token + strlen(token) - 1;
++        while(end > token && isspace((unsigned char)*end))
++            *(end--) = '\0';
++
++        // Check for spaces in between the flowbit names
++        if (strchr(token, ' ') != NULL) {
++            SCLogError(SC_ERR_INVALID_SIGNATURE, "Spaces are not allowed in flowbit names.");
++            return -1;
++        }
++
++        if (i == MAX_TOKENS) {
++            SCLogError(SC_ERR_INVALID_SIGNATURE, "Number of flowbits exceeds "
++                       "maximum allowed: %d.", MAX_TOKENS);
++            return -1;
++        }
++        strarr[i] = token;
++        arrptr = NULL;
++        i++;
++    }
++
++    cd->or_list_size = i;
++    cd->or_list = SCCalloc(cd->or_list_size, sizeof(uint32_t));
++    if (unlikely(cd->or_list == NULL))
++        return -1;
++    for (uint8_t j = 0; j < cd->or_list_size ; j++) {
++        cd->or_list[j] = VarNameStoreSetupAdd(strarr[j], VAR_TYPE_FLOW_BIT);
++        de_ctx->max_fb_id = MAX(cd->or_list[j], de_ctx->max_fb_id);
++    }
++
++    return 1;
++}
+ 
+ static int DetectFlowbitMatchToggle (Packet *p, const DetectFlowbitsData *fd)
+ {
+@@ -104,6 +151,13 @@ static int DetectFlowbitMatchIsset (Packet *p, const DetectFlowbitsData *fd)
+ {
+     if (p->flow == NULL)
+         return 0;
++    if (fd->or_list_size > 0) {
++        for (uint8_t i = 0; i < fd->or_list_size; i++) {
++            if (FlowBitIsset(p->flow, fd->or_list[i]) == 1)
++                return 1;
++        }
++        return 0;
++    }
+ 
+     return FlowBitIsset(p->flow,fd->idx);
+ }
+@@ -112,7 +166,13 @@ static int DetectFlowbitMatchIsnotset (Packet *p, const DetectFlowbitsData *fd)
+ {
+     if (p->flow == NULL)
+         return 0;
+-
++    if (fd->or_list_size > 0) {
++        for (uint8_t i = 0; i < fd->or_list_size; i++) {
++            if (FlowBitIsnotset(p->flow, fd->or_list[i]) == 1)
++                return 1;
++        }
++        return 0;
++    }
+     return FlowBitIsnotset(p->flow,fd->idx);
+ }
+ 
+@@ -181,12 +241,14 @@ static int DetectFlowbitParse(const char *str, char *cmd, int cmd_len, char *nam
+             name[strlen(name) - 1] = '\0';
+         }
+ 
+-        /* Validate name, spaces are not allowed. */
+-        for (size_t i = 0; i < strlen(name); i++) {
+-            if (isblank(name[i])) {
+-                SCLogError(SC_ERR_INVALID_SIGNATURE,
+-                    "spaces not allowed in flowbit names");
+-                return 0;
++        if (strchr(name, '|') == NULL) {
++            /* Validate name, spaces are not allowed. */
++            for (size_t i = 0; i < strlen(name); i++) {
++                if (isblank(name[i])) {
++                    SCLogError(SC_ERR_INVALID_SIGNATURE,
++                        "spaces not allowed in flowbit names");
++                    return 0;
++                }
+             }
+         }
+     }
+@@ -240,17 +302,24 @@ int DetectFlowbitSetup (DetectEngineCtx *de_ctx, Signature *s, const char *rawst
+             break;
+     }
+ 
+-    cd = SCMalloc(sizeof(DetectFlowbitsData

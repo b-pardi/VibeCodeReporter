@@ -1,0 +1,96 @@
+@@ -2181,7 +2181,7 @@ public class PaloAltoConfigurationBuilder extends PaloAltoParserBaseListener
+     _currentInterface =
+         _currentParentInterface
+             .getUnits()
+-            .computeIfAbsent(name, n -> new Interface(n, Interface.Type.TUNNEL));
++            .computeIfAbsent(name, n -> new Interface(n, Interface.Type.TUNNEL_UNIT));
+     _currentInterface.setParent(_currentParentInterface);
+     defineFlattenedStructure(INTERFACE, name, ctx);
+   }
+@@ -2197,9 +2197,11 @@ public class PaloAltoConfigurationBuilder extends PaloAltoParserBaseListener
+     _currentInterface =
+         _currentParentInterface
+             .getUnits()
+-            .computeIfAbsent(name, n -> new Interface(n, Interface.Type.VLAN));
++            .computeIfAbsent(name, n -> new Interface(n, Interface.Type.VLAN_UNIT));
+     _currentInterface.setParent(_currentParentInterface);
+     defineFlattenedStructure(INTERFACE, name, ctx);
++    // TODO: convert vlan ID for created vlan units
++    todo(ctx);
+   }
+ 
+   @Override
+
+
+
+
+@@ -44,6 +44,9 @@ import org.batfish.datamodel.EmptyIpSpace;
+ import org.batfish.datamodel.ExprAclLine;
+ import org.batfish.datamodel.HeaderSpace;
+ import org.batfish.datamodel.Interface;
++import org.batfish.datamodel.Interface.Dependency;
++import org.batfish.datamodel.Interface.DependencyType;
++import org.batfish.datamodel.InterfaceType;
+ import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.Ip6AccessList;
+ import org.batfish.datamodel.IpAccessList;
+@@ -703,6 +706,9 @@ public class ConvertConfigurationJob extends BatfishJob<ConvertConfigurationResu
+     Set<String> inInterfaces = ImmutableSet.copyOf(c.getAllInterfaces().keySet());
+     for (String name : inInterfaces) {
+       Interface i = c.getAllInterfaces().get(name);
++      if (!verifyDependencies(c, w, i)) {
++        continue;
++      }
+       // VI invariant: switchport is true iff SwitchportMode is not NONE.
+       boolean hasSwitchportMode = i.getSwitchportMode() != SwitchportMode.NONE;
+       if (hasSwitchportMode != i.getSwitchport()) {
+@@ -716,8 +722,128 @@ public class ConvertConfigurationJob extends BatfishJob<ConvertConfigurationResu
+       if (i.getSwitchport() && !i.getAllAddresses().isEmpty()) {
+         w.redFlag(String.format("Interface %s is a switchport, but it has L3 addresses", name));
+         c.getAllInterfaces().remove(name);
++        continue;
++      }
++      if (i.getActive()) {
++        if (!verifyChannelGroupExists(c, w, i)) {
++          continue;
++        }
++        if (i.getInterfaceType() == InterfaceType.VLAN && i.getVlan() == null) {
++          w.redFlag(String.format("Interface %s is a VLAN interface but has no vlan set", name));
++          c.getAllInterfaces().remove(name);
++          continue;
++        }
++        if (i.getChannelGroup() != null) {
++          String aggregateName = i.getChannelGroup();
++          Interface aggregate = c.getAllInterfaces().get(aggregateName);
++          if (aggregate == null) {
++            w.redFlag(
++                String.format(
++                    "Interface %s is a member of undefined aggregate or or redundant interface %s",
++                    name, aggregateName));
++            c.getAllInterfaces().remove(name);
++            continue;
++          }
++          if (!i.getAllAddresses().isEmpty()) {
++            w.redFlag(
++                String.format(
++                    "Interface %s is a member of %s interface %s but it has L3 addresses",
++                    name, aggregate.getInterfaceType(), aggregateName));
++            c.getAllInterfaces().remove(name);
++            continue;
++          }
++        }
++        if (i.getInterfaceType() == InterfaceType.LOGICAL
++            && !verifyLogicalBindDependencies(c, w, i)) {
++          continue;
++        }
++      }
++    }
++  }
++
++  /**
++   * Removes undefined aggregate dependencies, and removes interface if it has an undefined bind
++   * dependency.
++   *
++   * <p>Return {@code true} iff interface was not removed.
++   */
++  private stat

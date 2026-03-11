@@ -1,0 +1,122 @@
+@@ -67,11 +67,27 @@ PPP_PROT_REG_CB(on_proc_change);
+ 
+ PPP_CB_BOILERPLATE(on_proc_change);
+ 
++/*
++
++How does asidstory work?
++
++Here is a picture of what seems to happen during a replay.
+ 
++*      |            |              |             |      !
++sggggggbbbggggggggggbbbbbbbbbbbbbbbbbggggggggggggbbbggggg
++
++s - start
++g - we have a good proc (pid & name reasonable)
++b - we have a bad proc (pid or name bad)
++
++*/
++
++
++bool *status_c=NULL;
+ uint32_t num_cells = 80;
+ uint64_t min_instr;
+ uint64_t max_instr = 0;
+-double scale;
++double scale = 0;
+ 
+ bool pid_ok(int pid) {
+     if (pid < 4) {
+@@ -209,14 +225,21 @@ bool spit_out_total_instr_once = false;
+ int num_ok = 0;
+ int num_not_ok = 0;
+ 
+-bool proc_ok = true;
++bool proc_ok = false;
+ bool asid_just_changed = false;
+ OsiProc *proc_at_asid_changed = NULL;
+ uint64_t instr_count_at_asid_changed;
+ target_ulong asid_at_asid_changed;
+ 
+-bool check_proc_ok(OsiProc *proc) {
+-    return (proc && pid_ok(proc->pid));
++bool check_proc(OsiProc *proc) {
++    if (proc && pid_ok(proc->pid)) {
++        int l = strlen(proc->name);
++        for (int i=0; i<l; i++) 
++            if (!isprint(proc->name[i]))
++                return false;
++    }
++    if (strlen(proc->name) < 3) return false;
++    return true;
+ }
+ 
+ 
+@@ -226,6 +249,9 @@ bool check_proc_ok(OsiProc *proc) {
+    updating first / last instr and cell counts
+ */
+ void saw_proc(CPUState *env, OsiProc *proc, uint64_t instr_count) {
++//    printf ("saw_proc %s %d %" PRId64 "\n",
++//            proc->name, (int) proc->pid, instr_count);
++
+     const NamePid namepid(proc->name ? proc->name : "", proc->pid, proc->asid);        
+     ProcessData &pd = process_datas[namepid];
+     if (pd.first == 0) {
+@@ -265,20 +291,31 @@ void saw_proc(CPUState *env, OsiProc *proc, uint64_t instr_count) {
+ 
+ // proc was seen from instr i1 to i2
+ void saw_proc_range(CPUState *env, OsiProc *proc, uint64_t i1, uint64_t i2) {
+-    uint64_t step = floor(1.0 / scale) / 2;
++//    printf ("saw_proc_range %s %d (%" PRId64 " ..%" PRId64 ")\n", 
++//            proc->name, (int) proc->pid, i1, i2);
++
++     uint64_t step = floor(1.0 / scale) / 2;
+     // assume that last process was running from last asid change to basically now
+     saw_proc(env, proc, i1);
+     saw_proc(env, proc, i2);
++//    printf ("step = %d\n", (int) step/3);
+     for (uint64_t i=i1; i<=i2; i+=step/3) {
+         saw_proc(env, proc, i);
+     }
+ }
+ 
+ 
+-bool saw_first_reasonable = false;
+ 
+ uint64_t num_asid_change = 0;
+ uint64_t num_seq_bb = 0;
++bool asid_changed = false;
++
++OsiProc *proc_at_first_good_proc;
++uint64_t instr_at_first_good_proc;
++
++// use to count how many bb in a row have same proc name
++// if that is changing we won't believe it
++int proc_counter;
+ 
+ // when asid changes, try to figure out current proc, which can fail in which case
+ // the before_block_exec callback will try again at the start of each subsequent
+@@ -288,43 +325,39 @@ uint64_t num_seq_bb = 0;
+ int asidstory_asid_changed(CPUState *env, target_ulong old_asid, target_ulong new_asid) {
+     // some fool trying to use asidstory for boot? 
+     if (new_asid == 0) return 0;
+-
+-    //    printf ("%" PRId64 " %" PRId64 " ASID CHANGE %x %x\n", num_asid_change, num_seq_bb, old_asid, new_asid);
+     num_asid_change ++;
+ 
+-    uint64_t curr_instr = rr_get_guest_instr_count();
+-    if (proc_at_asid_changed != NULL) {
+-        saw_proc_range(env, proc_at_asid_changed, instr_count_at_asid_changed, curr_instr-100);
+-    }
+-    asid_at_asid_changed = new_asid;
+-    instr_count_at_asid_changed = curr_instr;
+-    proc_at_asid_changed = get_current_process(env);
+-    proc_ok = check_proc_ok(proc_at_asid_changed);
+-    if (proc_ok) {
+-        PPP_RUN_CB(on_proc_change, env, new_asid, proc_at_asid_changed);
++//    printf ("asid just changed\n");
++    if (proc_ok && proc_counter==0) {
++//        printf ("and we had a good proc for last interval\n");
++
++        // asid just changed and for prev bb (and probably some number
++        // previoust) 

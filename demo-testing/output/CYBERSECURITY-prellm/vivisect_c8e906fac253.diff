@@ -1,0 +1,106 @@
+@@ -3,14 +3,17 @@ import struct
+ import envi
+ import envi.bits as e_bits
+ import envi.archs.i386 as e_i386
+-import envi.archs.i386.disasm as ed_i386
++import envi.archs.i386.opconst as e_i386_const
+ import opcode64 as opcode86
+-all_tables = opcode86.tables86
+ 
+ from envi.archs.i386.disasm import iflag_lookup, operand_range, priv_lookup, \
+         i386Opcode, i386ImmOper, i386RegOper, i386ImmMemOper, i386RegMemOper, \
+-        i386SibOper
++        i386SibOper, PREFIX_REPNZ, PREFIX_REP, PREFIX_OP_SIZE, PREFIX_ADDR_SIZE, \
++        MANDATORY_PREFIXES, PREFIX_REP_MASK
++
+ from envi.archs.amd64.regs import *
++from envi.archs.i386.opconst import OP_REG32AUTO, OP_MEM32AUTO, INS_VEXREQ, OP_NOVEXL
++all_tables = opcode86.tables86
+ 
+ # Pre generate these for fast lookup. Because our REX prefixes have the same relative
+ # bit relationship to eachother, we can cheat a little...
+@@ -34,8 +37,6 @@ amd64_prefixes[0x4f] = (0x1f << 16)
+ amd64_prefixes[0xc5] = (0x20 << 16)  # VEX 2byte
+ amd64_prefixes[0xc4] = (0x40 << 16)  # VEX 3byte
+ 
+-mandatory_prefixes = [0x66, 0xf2, 0xf3]
+-
+ 
+ # NOTE: some notes from the intel manual...
+ # REX.W overrides 66, but alternate registers (via REX.B etc..) can have 66 to be 16 bit..
+@@ -58,6 +59,10 @@ PREFIX_VEX3  = 0x400000  # 3 byte VEX (data stored in opcode)
+ PREFIX_VEX_L = 0x800000  # L bit set
+ PREFIX_VEX   = PREFIX_VEX2 | PREFIX_VEX3
+ 
++PREFIX_SIZE_BOTH = (PREFIX_REX_W | PREFIX_VEX_L)
++
++IMM_REQOFFS = (opcode86.ADDRMETH_I, opcode86.ADDRMETH_J, opcode86.ADDRMETH_L)
++
+ VEX_V_SHIFT  = 59
+ 
+ REX_BUMP = 8
+@@ -75,7 +80,7 @@ class Amd64Opcode(i386Opcode):
+             pfx = '%s: ' % pfx
+ 
+         mnem = self.mnem
+-        if self.prefixes & PREFIX_VEX:
++        if self.prefixes & PREFIX_VEX and not self.opcode & e_i386_const.INS_VEXNOPREF:
+             mnem = 'v' + mnem
+ 
+         return pfx + mnem + " " + ",".join([o.repr(self) for o in self.opers])
+@@ -90,7 +95,7 @@ class Amd64Opcode(i386Opcode):
+                 mcanv.addNameText("%s: " % pfx, pfx)
+ 
+         mnem = self.mnem
+-        if self.prefixes & PREFIX_VEX:
++        if self.prefixes & PREFIX_VEX and not self.opcode & e_i386_const.INS_VEXNOPREF:
+             mnem = 'v' + mnem
+ 
+         mcanv.addNameText(mnem, typename="mnemonic")
+@@ -154,10 +159,11 @@ class Amd64RipRelOper(envi.DerefOper):
+         mcanv.addText("]")
+ 
+     def repr(self, op):
+-        return "[rip + %d]" % self.imm
++        return "%s [rip + %d]" % (e_i386.sizenames[self.tsize], self.imm)
++
+ 
+ operands_index = 2
+-vex_pp_table = ( (0xf,), (0x66,0xf), (0xf3,0xf), (0xf2,0xf) )
++vex_pp_table = ( (0xf,), (0x66,), (0xf3,), (0xf2,) )
+ vex3_mmmm_table = ( (None,), (None,), (0x38,), (0x3A,), None, None, None, None )   # None is invalid.  (None,) adds no table depths
+ 
+ 
+@@ -173,7 +179,9 @@ class Amd64Disasm(e_i386.i386Disasm):
+         # 64-bit only
+         self._dis_amethods[opcode86.ADDRMETH_B >> 16] = self.ameth_b
+         self._dis_amethods[opcode86.ADDRMETH_H >> 16] = self.ameth_h
++        self._dis_amethods[opcode86.ADDRMETH_E >> 16] = self.ameth_e
+         self._dis_amethods[opcode86.ADDRMETH_L >> 16] = self.ameth_l
++        self._dis_amethods[opcode86.ADDRMETH_VEXH >> 16] = self.ameth_vexh
+ 
+         # Over-ride these which are in use by the i386 version of the ASM
+         self.ROFFSETMMX   = e_i386.getRegOffset(amd64regs, "mm0")
+@@ -192,7 +200,6 @@ class Amd64Disasm(e_i386.i386Disasm):
+         Use the oper type and prefixes to decide on the tsize for
+         the operand.
+         """
+-
+         mode = MODE_32
+ 
+         sizelist = opcode86.OPERSIZE.get(opertype, None)
+@@ -204,7 +211,7 @@ class Amd64Disasm(e_i386.i386Disasm):
+ 
+         # NOTE: REX takes precedence over 66
+         # (see section 2.2.1.2 in Intel 2a)
+-        if prefixes & PREFIX_REX_W:
++        if prefixes & PREFIX_SIZE_BOTH:
+ 
+             mode = MODE_64
+ 
+@@ -215,11 +222,47 @@ class Amd64Disasm(e_i386.i386Disasm):
+         return sizelist[mode]
+ 
+     def disasm(self, bytez, offset, va):
++        '''
++        Th

@@ -1,0 +1,109 @@
+@@ -56,6 +56,34 @@ class Nmap2Mongo(xmlnmap.Nmap2DB):
+         return bson.Binary(data)
+ 
+ 
++def _old_array(*values, **kargs):
++    """Returns a string construction using '$concat' to replace arrays for
++MongoDB < 3.2.
++
++    Uses kargs because Python 2.7 would not accept this:
++
++    def _old_array(*values, sep="###", convert_to_string=False):
++
++    """
++    sep = kargs.get("sep", "###")
++    convert_to_string = kargs.get("convert_to_string", False)
++    result = []
++    values = iter(values)
++    try:
++        elt = next(values)
++    except StopIteration:
++        return ""
++    result.append({'$toLower': elt} if convert_to_string else elt)
++    for elt in values:
++        # '$toLower' is a hack to convert a value to a string and
++        # prevent the exception "$concat only supports strings, not
++        # NumberInt32" for example.
++        result.extend([sep, {'$toLower': elt} if convert_to_string else elt])
++    if len(result) == 1:
++        return result
++    return {'$concat': result}
++
++
+ class MongoDB(DB):
+ 
+     schema_migrations = {}
+@@ -139,6 +167,15 @@ class MongoDB(DB):
+             self._server_info = self.db_client.server_info()
+             return self._server_info
+ 
++    @property
++    def mongodb_32_more(self):
++        """True iff MongoDB server version is 3.2 or more."""
++        try:
++            return self._mongodb_32_more
++        except AttributeError:
++            self._mongodb_32_more = self.server_info['versionArray'] >= [3, 2]
++            return self._mongodb_32_more
++
+     @property
+     def find(self):
+         """Wrapper around column .find() method, depending on pymongo
+@@ -385,9 +422,17 @@ e.g.  .explain()) based on the column and a filter.
+             if subfield in self.needunwind:
+                 pipeline += [{"$unwind": "$" + subfield}]
+         if is_ipfield:
+-            pipeline.append(
+-                {'$project': {field: ['$%s_0' % field, '$%s_1' % field]}}
+-            )
++            if self.mongodb_32_more:
++                pipeline.append(
++                    {'$project': {field: ['$%s_0' % field, '$%s_1' % field]}}
++                )
++            else:
++                pipeline.append(
++                    {'$project': {field: _old_array(
++                        '$%s_0' % field, '$%s_1' % field,
++                        convert_to_string=True,
++                    )}}
++                )
+         pipeline.append({'$group': {'_id': '$%s' % field}})
+         return pipeline
+ 
+@@ -406,8 +451,11 @@ e.g.  .explain()) based on the column and a filter.
+             )
+         )
+         if is_ipfield:
+-            return (None if res['_id'][0] is None else res['_id']
+-                    for res in cursor)
++            if self.mongodb_32_more:
++                return (None if res['_id'][0] is None else res['_id']
++                        for res in cursor)
++            return ([int(val) for val in res] if res[0] else None
++                    for res in (res['_id'].split('###') for res in cursor))
+         return (res['_id'] for res in cursor)
+ 
+     # filters
+@@ -2034,15 +2082,26 @@ it is not expected)."""
+                 '$addr_0': 1,
+                 '$addr_1': 1,
+             }
+-            specialflt = [{"$project": {field: ['$addr_0', '$addr_1']}}]
+-            outputproc = lambda x: {
+-                'count': x['count'],
+-                '_id': self.internal2ip(x['_id']),
+-            }
++            if self.mongodb_32_more:
++                specialflt = [{"$project": {field: ['$addr_0', '$addr_1']}}]
++                outputproc = lambda x: {
++                    'count': x['count'],
++                    '_id': self.internal2ip(x['_id']),
++                }
++            else:
++                specialflt = [{"$project": {field: _old_array(
++                    "$addr_0", "$addr_1",
++                    convert_to_string=True,
++                )}}]
++                outputproc = lambda x: {
++                    'count': x['count'],
++                    '_id': self.internal2i

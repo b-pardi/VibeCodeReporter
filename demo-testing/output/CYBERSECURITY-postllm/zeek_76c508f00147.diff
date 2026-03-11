@@ -1,0 +1,133 @@
+@@ -4,6 +4,7 @@
+ 
+ #include <memory>
+ 
++#include "zeek/broker/WebSocketShim.h"
+ #include "zeek/cluster/Backend.h"
+ #include "zeek/cluster/Component.h"
+ #include "zeek/cluster/Serializer.h"
+@@ -24,6 +25,8 @@ zeek::plugin::Configuration Plugin::Configure() {
+ 
+     AddComponent(new cluster::BackendComponent("BROKER", fail_instantiate));
+ 
++    AddComponent(new cluster::BackendComponent("BROKER_WEBSOCKET_SHIM", Broker::WebSocketShim::Instantiate));
++
+     zeek::plugin::Configuration config;
+     config.name = "Zeek::Cluster_Backend_Broker";
+     config.description = "Cluster backend using Broker";
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,182 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/broker/WebSocketShim.h"
++
++#include <broker/hub.hh>
++#include <memory>
++
++#include "zeek/Reporter.h"
++#include "zeek/broker/Manager.h"
++#include "zeek/cluster/Backend.h"
++#include "zeek/cluster/serializer/broker/Serializer.h"
++#include "zeek/iosource/IOSource.h"
++#include "zeek/iosource/Manager.h"
++
++#define BROKER_WS_DEBUG(...)                                                                                           \
++    do {                                                                                                               \
++        DBG_LOG(DBG_BROKER, __VA_ARGS__);                                                                              \
++    } while ( 0 )
++
++namespace zeek::Broker {
++
++class WebSocketState {
++public:
++    WebSocketState() : hub(broker_mgr->MakeHub({broker::topic::errors()})) {}
++    ~WebSocketState() {
++        // Let the manager know we're done with this hook.
++        broker_mgr->DestroyHub(std::move(hub));
++    }
++
++    broker::hub hub;
++};
++
++/**
++ * IOSource for the WebSocketShim to decouple IO Source lifetime from the
++ * backend's lifetime.
++ *
++ * This pattern repeats. We should figure out something generic.
++ */
++class WebSocketShim::IOSource : public zeek::iosource::IOSource {
++public:
++    IOSource(WebSocketShim* shim) : shim(shim) {}
++
++    void Close() {
++        shim = nullptr; // No more callbacks to shim!
++        SetClosed(true);
++    }
++
++    // IOSource::Process()
++    void Process() override {
++        if ( shim )
++            shim->Process();
++    }
++
++    // IOSource::Tag()
++    const char* Tag() override {
++        if ( ! shim )
++            return "<WebSocketShim orphan>";
++
++        return shim->Name().c_str();
++    }
++
++    // IOSource::GetNextTimeout()
++    double GetNextTimeout() override { return -1; }
++
++private:
++    WebSocketShim* shim = nullptr;
++};
++
++WebSocketShim::WebSocketShim(std::unique_ptr<zeek::cluster::EventSerializer> es,
++                             std::unique_ptr<zeek::cluster::LogSerializer> ls,
++                             std::unique_ptr<zeek::cluster::detail::EventHandlingStrategy> ehs)
++    : zeek::cluster::Backend("Broker_WebSocket_Shim", std::move(es), std::move(ls), std::move(ehs)) {
++    iosrc = new IOSource(this);
++
++    // iosource_mgr takes ownership of src.
++    zeek::iosource_mgr->Register(iosrc, true /* dont_count=true - do not prevent Zeek from shutting down*/);
++}
++
++WebSocketShim::~WebSocketShim() {
++    try {
++        DoTerminate();
++    } catch ( ... ) {
++        abort();
++    }
++}
++
++bool WebSocketShim::DoInit() {
++    state = std::make_unique<WebSocketState>();
++
++    zeek::iosource_mgr->Register(iosrc, false);
++    zeek::iosource_mgr->RegisterFd(state->hub.read_fd(), iosrc);
++
++    return true;
++}
++
++void WebSocketShim::DoTerminate() {
++    if ( state ) {
++        if ( iosrc ) {
++            zeek::iosource_mgr->UnregisterFd(state->hub.read_fd(), iosrc);
++            iosrc->Close();
++            iosrc = nullptr; // iosource_mgr took ownership and will free this one.
++        }
++        else
++            zeek::reporter->InternalWarning("Missing iosrc in WebSocketShim::DoTerminate()");
++
++        state.reset();
++    }
++}
++
++bool WebSocketShim::DoPublishEvent(const std::string& topic, zeek::cluste

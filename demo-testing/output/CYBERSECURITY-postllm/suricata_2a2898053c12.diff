@@ -1,0 +1,115 @@
+@@ -111,6 +111,7 @@ static void *ParseDpdkConfigAndConfigureDevice(const char *iface);
+ static void DPDKDerefConfig(void *conf);
+ 
+ #define DPDK_CONFIG_DEFAULT_THREADS                     "auto"
++#define DPDK_CONFIG_DEFAULT_INTERRUPT_MODE              false
+ #define DPDK_CONFIG_DEFAULT_MEMPOOL_SIZE                65535
+ #define DPDK_CONFIG_DEFAULT_MEMPOOL_CACHE_SIZE          "auto"
+ #define DPDK_CONFIG_DEFAULT_RX_DESCRIPTORS              1024
+@@ -126,6 +127,7 @@ static void DPDKDerefConfig(void *conf);
+ 
+ DPDKIfaceConfigAttributes dpdk_yaml = {
+     .threads = "threads",
++    .irq_mode = "interrupt-mode",
+     .promisc = "promisc",
+     .multicast = "multicast",
+     .checksum_checks = "checksum-checks",
+@@ -434,6 +436,15 @@ static int ConfigSetThreads(DPDKIfaceConfig *iconf, const char *entry_str)
+     SCReturnInt(0);
+ }
+ 
++static bool ConfigSetInterruptMode(DPDKIfaceConfig *iconf, bool enable)
++{
++    SCEnter();
++    if (enable)
++        iconf->flags |= DPDK_IRQ_MODE;
++
++    SCReturnBool(true);
++}
++
+ static int ConfigSetRxQueues(DPDKIfaceConfig *iconf, uint16_t nb_queues)
+ {
+     SCEnter();
+@@ -695,6 +706,17 @@ static int ConfigLoad(DPDKIfaceConfig *iconf, const char *iface)
+     if (retval < 0)
+         SCReturnInt(retval);
+ 
++    bool irq_enable;
++    retval = ConfGetChildValueBoolWithDefault(if_root, if_default, dpdk_yaml.irq_mode, &entry_bool);
++    if (retval != 1) {
++        irq_enable = DPDK_CONFIG_DEFAULT_INTERRUPT_MODE;
++    } else {
++        irq_enable = entry_bool ? true : false;
++    }
++    retval = ConfigSetInterruptMode(iconf, irq_enable);
++    if (retval != true)
++        SCReturnInt(-EINVAL);
++
+     // currently only mapping "1 thread == 1 RX (and 1 TX queue in IPS mode)" is supported
+     retval = ConfigSetRxQueues(iconf, (uint16_t)iconf->threads);
+     if (retval < 0)
+@@ -1106,6 +1128,11 @@ static void DeviceInitPortConf(const DPDKIfaceConfig *iconf,
+             },
+     };
+ 
++    SCLogConfig("%s: interrupt mode is %s", iconf->iface,
++            iconf->flags & DPDK_IRQ_MODE ? "enabled" : "disabled");
++    if (iconf->flags & DPDK_IRQ_MODE)
++        port_conf->intr_conf.rxq = 1;
++
+     // configure RX offloads
+     if (dev_info->rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH) {
+         if (iconf->nb_rx_queues > 1) {
+
+
+
+
+@@ -25,6 +25,7 @@
+ 
+ typedef struct DPDKIfaceConfigAttributes_ {
+     const char *threads;
++    const char *irq_mode;
+     const char *promisc;
+     const char *multicast;
+     const char *checksum_checks;
+
+
+
+
+@@ -93,6 +93,13 @@ TmEcode NoDPDKSupportExit(ThreadVars *tv, const void *initdata, void **data)
+ 
+ #define BURST_SIZE 32
+ static struct timeval machine_start_time = { 0, 0 };
++// interrupt mode constants
++#define MIN_ZERO_POLL_COUNT          10U
++#define MIN_ZERO_POLL_COUNT_TO_SLEEP 10U
++#define MINIMUM_SLEEP_TIME_US        1U
++#define STANDARD_SLEEP_TIME_US       100U
++#define MAX_EPOLL_TIMEOUT_MS         500U
++static rte_spinlock_t intr_lock[RTE_MAX_ETHPORTS];
+ 
+ /**
+  * \brief Structure to hold thread specific variables.
+@@ -104,6 +111,7 @@ typedef struct DPDKThreadVars_ {
+     TmSlot *slot;
+     LiveDevice *livedev;
+     ChecksumValidationMode checksum_mode;
++    bool intr_enabled;
+     /* references to packet and drop counters */
+     uint16_t capture_dpdk_packets;
+     uint16_t capture_dpdk_rx_errs;
+@@ -142,6 +150,40 @@ static uint64_t CyclesToSeconds(uint64_t cycles);
+ static void DPDKFreeMbufArray(struct rte_mbuf **mbuf_array, uint16_t mbuf_cnt, uint16_t offset);
+ static uint64_t DPDKGetSeconds(void);
+ 
++static bool InterruptsRXEnable(uint16_t port_id, uint16_t queue_id)
++{
++    uint32_t event_data = port_id << UINT16_WIDTH | queue_id;
++    int32_t ret = rte_eth_dev_rx_intr_ctl_q(port_id, queue_id, RTE_EPOLL_PER_THREAD,
++            RTE_INTR_EVENT_ADD, (void *)((uintptr_t)event_data));
++
++    if (ret != 0) {
++        SCLogError("%s-Q%d: failed to enable interrupt mode: %s", DPDKGetPortNameByPortID(port_id),
++                queue_id, rte_strerror(-ret));
++        return false;
++

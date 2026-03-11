@@ -1,0 +1,81 @@
+@@ -4,9 +4,13 @@ import peergos.server.corenode.*;
+ import peergos.server.mutable.*;
+ import peergos.server.social.*;
+ import peergos.shared.*;
++import peergos.shared.cbor.*;
+ import peergos.shared.corenode.*;
++import peergos.shared.crypto.*;
+ import peergos.shared.crypto.asymmetric.*;
+ import peergos.shared.crypto.asymmetric.curve25519.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.merklebtree.*;
+ import peergos.shared.mutable.*;
+ import peergos.shared.social.*;
+ import peergos.shared.storage.*;
+@@ -197,9 +201,25 @@ public class Start
+                 new CachingStorage(new IpfsDHT(), dhtCacheEntries, maxValueSizeToCache) :
+                 RAMStorage.getSingleton();
+         try {
+-            UserRepository userRepository = UserRepository.buildSqlLite(path, dht, maxUserCount);
+-            HttpCoreNodeServer.createAndStart(keyfile, passphrase, corenodePort, userRepository, userRepository, a);
+-        } catch (SQLException e) {
++            UserRepository mutable = UserRepository.buildSqlLite(path, dht, maxUserCount);
++            PublicKeyHash peergosIdentity = a.hasArg("peergos.identity.hash") ?
++                    PublicKeyHash.fromString(a.getArg("peergos.identity.hash")) :
++                    IpfsCoreNode.PEERGOS_IDENTITY_KEY_HASH;
++
++            PublicSigningKey pkiPublic = a.hasArg("pki.public.key") ?
++                    PublicSigningKey.fromByteArray(
++                            Files.readAllBytes(Paths.get(a.getArg("pki.public.key")))) :
++                    IpfsCoreNode.PKI_PUBLIC_KEY;
++            SecretSigningKey pkiSecretKey = SecretSigningKey.fromCbor(CborObject.fromByteArray(
++                    Files.readAllBytes(Paths.get(a.getArg("pki.secret.key")))));
++            SigningKeyPair pkiKeys = new SigningKeyPair(pkiPublic, pkiSecretKey);
++            PublicKeyHash pkiPublicHash = new RAMStorage().hashKey(pkiKeys.publicSigningKey);
++
++            MaybeMultihash currentPkiRoot = mutable.getPointerTarget(pkiPublicHash, dht).get();
++
++            IpfsCoreNode core = new IpfsCoreNode(pkiKeys, currentPkiRoot, dht, mutable, peergosIdentity);
++            HttpCoreNodeServer.createAndStart(keyfile, passphrase, corenodePort, core, mutable, a);
++        } catch (Exception e) {
+             throw new RuntimeException(e);
+         }
+     }
+
+
+
+
+@@ -26,6 +26,7 @@ public class IpfsCoreNode implements CoreNode {
+ 
+     public static final PublicSigningKey PEERGOS_IDENTITY_KEY = PublicSigningKey.fromString("ggFYIE7uD1ViM9KfiA1w69n774/jk6hERINN3xACPyabWiBp");
+     public static final PublicKeyHash PEERGOS_IDENTITY_KEY_HASH = PublicKeyHash.fromString("zdpuAvZynWLuyvovJwa34bj24M7cspt5M8seFfrFLrPWDGFDW");
++    public static final PublicSigningKey PKI_PUBLIC_KEY = null; // Fill in once generated
+ 
+     private final PublicKeyHash peergosIdentity;
+     private final ContentAddressedStorage ipfs;
+@@ -38,20 +39,26 @@ public class IpfsCoreNode implements CoreNode {
+ 
+     private MaybeMultihash currentRoot;
+ 
+-    public IpfsCoreNode(SigningPrivateKeyAndPublicHash signer,
++    public IpfsCoreNode(SigningKeyPair pkiKeys,
+                         MaybeMultihash currentRoot,
+                         ContentAddressedStorage ipfs,
+                         MutablePointers mutable,
+                         PublicKeyHash peergosIdentity) {
+         this.currentRoot = MaybeMultihash.empty();
+         this.ipfs = ipfs;
+-        this.signer = signer;
+         this.mutable = mutable;
+         this.peergosIdentity = peergosIdentity;
++        byte[] signature = pkiKeys.secretSigningKey.signatureOnly(pkiKeys.publicSigningKey.serialize());
++        try {
++            PublicKeyHash pkiPublicHash = this.ipfs.putSigningKey(signature, peergosIdentity, pkiKeys.publicSigningKey).get();
++            this.signer = new SigningPrivateKeyAndPublicHash(pkiPublicHash, pkiKeys.secretSigningKey);
++        } catch (Exception e) {
++            throw new RuntimeException(e.getMessage(), e);
++        }
+         this.update(currentRoot);
+     }
+ 
+-  

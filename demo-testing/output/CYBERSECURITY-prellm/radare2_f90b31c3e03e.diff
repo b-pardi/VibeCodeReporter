@@ -1,0 +1,109 @@
+@@ -26,6 +26,8 @@ R_API RAnalBlock *r_anal_bb_new() {
+ 	bb->parent_reg_arena = NULL;
+ 	bb->stackptr = 0;
+ 	bb->parent_stackptr = INT_MAX;
++	bb->cmpval = UT64_MAX;
++	bb->cmpreg = NULL;
+ 	return bb;
+ }
+ 
+
+
+
+
+@@ -765,6 +765,20 @@ static bool try_get_delta_jmptbl_info(RAnal *anal, RAnalFunction *fcn, ut64 jmp_
+ 	return isValid;
+ }
+ 
++static ut64 try_get_cmpval_from_parents(RAnal * anal, RAnalFunction *fcn, RAnalBlock *my_bb, const char * cmp_reg) {
++	r_return_val_if_fail (fcn && fcn->bbs && cmp_reg, UT64_MAX);
++	RListIter *iter;
++	RAnalBlock *tmp_bb;
++	r_list_foreach (fcn->bbs, iter, tmp_bb) {
++		if (tmp_bb->jump == my_bb->addr || tmp_bb->fail == my_bb->addr) {
++			if (tmp_bb->cmpreg == cmp_reg) {
++				return tmp_bb->cmpval;
++			}
++		}
++	}
++	return UT64_MAX;
++}
++
+ static bool try_get_jmptbl_info(RAnal *anal, RAnalFunction *fcn, ut64 addr, RAnalBlock *my_bb, ut64 *table_size, ut64 *default_case) {
+ 	bool isValid = false;
+ 	int i;
+@@ -1369,6 +1383,8 @@ repeat:
+ 		case R_ANAL_OP_TYPE_CMP:
+ 			if (op.ptr) {
+ 				cmpval = op.ptr;
++				bb->cmpval = cmpval;
++				bb->cmpreg = op.reg;
+ 			}
+ 			break;
+ 		case R_ANAL_OP_TYPE_CJMP:
+@@ -1530,9 +1546,15 @@ repeat:
+ 					movptr = UT64_MAX;
+ 				} else if (is_arm) {
+ 					if (op.ptrsize == 2) { // LDRH on thumb/arm
+-						int tablesize = cmpval + 15;
++						ut64 pred_cmpval = try_get_cmpval_from_parents(anal, fcn, bb, op.ireg);
++						int tablesize = 1;
++						if (pred_cmpval != UT64_MAX) {
++							tablesize += pred_cmpval;
++						} else {
++							tablesize += cmpval;
++						}
+ 						ret = try_walkthrough_jmptbl (anal, fcn, depth, op.addr, op.addr + op.size,
+-							op.addr + 4, 2, tablesize / 2, UT64_MAX, ret);
++							op.addr + 4, 2, tablesize, UT64_MAX, ret);
+ 						// skip inlined jumptable
+ 						idx += (tablesize * 2);
+ 					}
+
+
+
+
+@@ -19,14 +19,14 @@
+ #define REGID(x) insn->detail->arm.operands[x].reg
+ #define IMM(x) (ut32)(insn->detail->arm.operands[x].imm)
+ #define INSOP(x) insn->detail->arm.operands[x]
+-#define MEMBASE(x) r_str_get (cs_reg_name(*handle, insn->detail->arm.operands[x].mem.base))
+-#define MEMBASE64(x) r_str_get (cs_reg_name(*handle, insn->detail->arm64.operands[x].mem.base))
++#define MEMBASE(x) r_str_get (cs_reg_name (*handle, insn->detail->arm.operands[x].mem.base))
++#define MEMBASE64(x) r_str_get (cs_reg_name (*handle, insn->detail->arm64.operands[x].mem.base))
+ #define REGBASE(x) insn->detail->arm.operands[x].mem.base
+ #define REGBASE64(x) insn->detail->arm64.operands[x].mem.base
+ // s/index/base|reg/
+-#define MEMINDEX(x) r_str_get (cs_reg_name(*handle, insn->detail->arm.operands[x].mem.index))
++#define MEMINDEX(x) r_str_get (cs_reg_name (*handle, insn->detail->arm.operands[x].mem.index))
+ #define HASMEMINDEX(x) (insn->detail->arm.operands[x].mem.index != ARM_REG_INVALID)
+-#define MEMINDEX64(x) r_str_get (cs_reg_name(*handle, insn->detail->arm64.operands[x].mem.index))
++#define MEMINDEX64(x) r_str_get (cs_reg_name (*handle, insn->detail->arm64.operands[x].mem.index))
+ #define HASMEMINDEX64(x) (insn->detail->arm64.operands[x].mem.index != ARM64_REG_INVALID)
+ #define MEMDISP(x) insn->detail->arm.operands[x].mem.disp
+ #define MEMDISP64(x) (ut64)insn->detail->arm64.operands[x].mem.disp
+@@ -2632,11 +2632,13 @@ jmp $$ + 4 + ( [delta] * 2 )
+ 		op->type = R_ANAL_OP_TYPE_UJMP;
+ 		op->cycles = 2;
+ 		op->ptrsize = 2;
++		op->ireg = r_str_get (cs_reg_name (handle, INSOP (0).mem.index));
+ 		break;
+ 	case ARM_INS_TBB: // byte jump table
+ 		op->type = R_ANAL_OP_TYPE_UJMP;
+ 		op->cycles = 2;
+ 		op->ptrsize = 1;
++		op->ireg = r_str_get (cs_reg_name (handle, INSOP (0).mem.index));
+ 		break;
+ 	case ARM_INS_PLD:
+ 		op->type = R_ANAL_OP_TYPE_LEA; // not really a lea, just a prefetch
+@@ -2758,6 +2760,7 @@ jmp $$ + 4 + ( [delta] * 2 )
+ 		if (ISIMM(1)) {
+ 			op->ptr = IMM(1);
+ 		}
++		op->reg = r_str_get (cs_reg_name (handle, INSOP (0).reg));
+ 		break;
+ 	case ARM_INS_ROR:
+ 	case ARM_INS_ORN:
+@@ -2835,7 +2838,7 @@ jmp $$ + 4 + ( [delta] * 2 )
+ 				op->type = R_ANAL_OP_TYPE_UCJMP;
+ 				op->fail = 

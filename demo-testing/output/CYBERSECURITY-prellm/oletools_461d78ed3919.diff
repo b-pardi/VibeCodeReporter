@@ -1,0 +1,120 @@
+@@ -60,7 +60,7 @@ from __future__ import print_function
+ #                        improve encryption detection for ppt
+ # 2021-05-07 v0.56.2 MN: - fixed bug in check_excel (issue #584, PR #585)
+ 
+-__version__ = '0.56.2'
++__version__ = '0.60.dev1'
+ 
+ 
+ #------------------------------------------------------------------------------
+@@ -81,8 +81,7 @@ __version__ = '0.56.2'
+ 
+ #=== IMPORTS =================================================================
+ 
+-import argparse, sys, re, zlib, struct, os
+-from os.path import dirname, abspath
++import argparse, sys, re, zlib, struct, os, io
+ 
+ import olefile
+ 
+@@ -98,10 +97,37 @@ _parent_dir = os.path.normpath(os.path.join(_thismodule_dir, '..'))
+ if _parent_dir not in sys.path:
+     sys.path.insert(0, _parent_dir)
+ 
+-from oletools.thirdparty.prettytable import prettytable
+-from oletools import crypto
++from oletools.thirdparty.tablestream import tablestream
++from oletools import crypto, ftguess, olevba, mraptor
++from oletools.common.log_helper import log_helper
+ 
++# === LOGGING =================================================================
+ 
++log = log_helper.get_or_create_silent_logger('oleid')
++
++# === CONSTANTS ===============================================================
++
++class RISK(object):
++    """
++    Constants for risk levels
++    """
++    HIGH = 'HIGH'
++    MEDIUM = 'Medium'
++    LOW = 'low'
++    NONE = 'none'
++    INFO = 'info'
++    UNKNOWN = 'Unknown'
++    ERROR = 'Error'  # if a check triggered an unexpected error
++
++risk_color = {
++    RISK.HIGH: 'red',
++    RISK.MEDIUM: 'yellow',
++    RISK.LOW: 'white',
++    RISK.NONE: 'green',
++    RISK.INFO: 'cyan',
++    RISK.UNKNOWN: None,
++    RISK.ERROR: None
++}
+ 
+ #=== FUNCTIONS ===============================================================
+ 
+@@ -166,7 +192,7 @@ class Indicator(object):
+     """
+ 
+     def __init__(self, _id, value=None, _type=bool, name=None,
+-                 description=None):
++                 description=None, risk=RISK.UNKNOWN, hide_if_false=True):
+         self.id = _id
+         self.value = value
+         self.type = _type
+@@ -174,17 +200,19 @@ class Indicator(object):
+         if name == None:
+             self.name = _id
+         self.description = description
++        self.risk = risk
++        self.hide_if_false = hide_if_false
+ 
+ 
+ class OleID(object):
+     """
+-    Summary of information about an OLE file
++    Summary of information about an OLE file (and a few other MS Office formats)
+ 
+     Call :py:meth:`OleID.check` to gather all info on a given file or run one
+     of the `check_` functions to just get a specific piece of info.
+     """
+ 
+-    def __init__(self, input_file):
++    def __init__(self, filename=None, data=None):
+         """
+         Create an OleID object
+ 
+@@ -199,11 +227,17 @@ class OleID(object):
+         If filename is given, only :py:meth:`OleID.check` opens the file. Other
+         functions will return None
+         """
+-        if isinstance(input_file, olefile.OleFileIO):
+-            self.ole = input_file
++        if filename is None and data is None:
++            raise ValueError('OleID requires either a file path or file data, or both')
++        if data is None:
++            with open(filename, 'rb') as f:
++                self.data = f.read()
++        self.data_bytesio = io.BytesIO(self.data)
++        if isinstance(filename, olefile.OleFileIO):
++            self.ole = filename
+             self.filename = None
+         else:
+-            self.filename = input_file
++            self.filename = filename
+             self.ole = None
+         self.indicators = []
+         self.suminfo_data = None
+@@ -214,24 +248,37 @@ class OleID(object):
+ 
+         :returns: list of all :py:class:`Indicator`s created
+         """
++        self.ftg = ftguess.FileTypeGuesser(filepath=self.filename, data=self.data)
++        ftype = self.ftg.ftype
++        ft = Indicator('ftype', value=ftype.longname, _type=str, name='File format', risk=RISK.INFO)
++        self.indicators.append(ft)
++    

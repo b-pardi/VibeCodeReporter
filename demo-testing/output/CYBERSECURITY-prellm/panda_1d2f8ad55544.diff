@@ -1,0 +1,123 @@
+@@ -22,6 +22,7 @@ enum coverage_mode {
+ 
+ struct RecordID {
+     target_ulong pid_or_asid;
++    target_ulong tid;
+     target_ulong pc;
+ };
+ 
+@@ -38,25 +39,76 @@ template <> struct hash<RecordID> {
+         // https://en.cppreference.com/w/cpp/utility/hash
+         result_type const h1 = std::hash<target_ulong>{}(s.pid_or_asid);
+         result_type const h2 = std::hash<target_ulong>{}(s.pc);
+-        return h1 ^ (h2 << 1);
++        result_type const h3 = std::hash<target_ulong>{}(s.tid);
++        return h1 ^ (h2 << 2) ^ (h3 << 1);
+     }
+ };
+-} // namespace std
++}
++// namespace std
+ 
+ // Also needed to use an unordered set (probably in case there is a hash
+ // collision).
+ bool operator==(const RecordID &lhs, const RecordID &rhs)
+ {
+-    bool result = (lhs.pid_or_asid == rhs.pid_or_asid) && (lhs.pc == rhs.pc);
++    bool result = (lhs.pid_or_asid == rhs.pid_or_asid) && (lhs.pc == rhs.pc) &&
++            (lhs.tid == rhs.tid);
+     return result;
+ }
+ 
+ coverage_mode mode = MODE_ASID;
+ 
+-int before_block_exec_process(CPUState *cpu, TranslationBlock *tb)
++void write_process_record(RecordID id, uint64_t size)
+ {
+-    // We keep track of pairs of PIDs and PCs that we've already seen
+-    // since we only need to write out distinct pairs once.
++    // Get the process name
++    char *process_name = NULL;
++    bool in_kernel = panda_in_kernel(first_cpu);
++    if (!in_kernel) {
++        OsiProc *proc = get_current_process(first_cpu);
++        if (NULL != proc) {
++            process_name = g_strdup(proc->name);
++            free_osiproc(proc);
++        } else {
++            process_name = g_strdup("(unknown)");
++        }
++    } else {
++        process_name = g_strdup("(kernel)");
++    }
++
++    // Log coverage data
++    // process and thread ID are in decimal, as that is the radix
++    // used by most tools that produce human readable output
++    fprintf(coveragelog,
++            "%s," TARGET_FMT_lu "," TARGET_FMT_lu ",%lu,0x"
++            TARGET_FMT_lx ",%lu\n",
++            process_name,
++            id.pid_or_asid, id.tid, (uint64_t)in_kernel,
++            id.pc, size);
++    g_free(process_name);
++}
++
++int before_block_exec_process_full(CPUState *cpu, TranslationBlock *tb)
++{
++    RecordID id;
++    id.pc = tb->pc;
++    OsiThread *thread = get_current_thread(cpu);
++    if (NULL != thread) {
++        id.pid_or_asid = thread->pid;
++        id.tid = thread->tid;
++        free_osithread(thread);
++    } else {
++        id.pid_or_asid = 0;
++        id.tid = 0;
++    }
++
++    write_process_record(id, (uint64_t)tb->size);
++
++    return 0;
++}
++
++int before_block_exec_process_unique(CPUState *cpu, TranslationBlock *tb)
++{
++    // We keep track of PID/TID/PC tuples that we've already seen
++    // since we only need to write out distinct tuples once.
+     static std::unordered_set<RecordID> seen;
+ 
+     RecordID id;
+@@ -65,10 +117,15 @@ int before_block_exec_process(CPUState *cpu, TranslationBlock *tb)
+     // Get process id
+     OsiThread *thread = get_current_thread(cpu);
+ 
+-    // Create the tuple of process id and program counter
+-    id.pid_or_asid = thread ? thread->pid : 0;
+-    target_ulong tid = thread->tid;
+-    free_osithread(thread);
++    // Create the tuple of process id, thead id, and program counter
++    if (NULL != thread) {
++        id.pid_or_asid = thread->pid;
++        id.tid = thread->tid;
++        free_osithread(thread);
++    } else {
++        id.pid_or_asid = 0;
++        id.tid = 0;
++    }
+ 
+     // Have we seen this block before?
+     if (seen.find(id) == seen.end()) {
+@@ -76,37 +133,32 @@ int before_block_exec_process(CPUState *cpu, TranslationBlock *tb)
+         // No!  Put it into the list.
+         seen.insert(id);
+ 
+-        // Get the process name
+-        char *process_name = NULL;
+-        bool in_kernel = panda_in_kernel(first_cpu);
+-        if (!in_kernel) {
+-            OsiProc *proc = get_current_process(first_cpu);
+-            if (NULL != proc) {
+-                process_name = g_strdup(proc->name);
+-          

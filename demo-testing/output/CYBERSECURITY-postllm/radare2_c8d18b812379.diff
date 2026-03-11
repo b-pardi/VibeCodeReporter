@@ -1,0 +1,106 @@
+@@ -354,6 +354,7 @@ static void check_purity(HtUP *ht, RAnalFunction *fcn) {
+ 		switch (rt) {
+ 		case R_ANAL_REF_TYPE_CALL:
+ 		case R_ANAL_REF_TYPE_CODE:
++		case R_ANAL_REF_TYPE_ICOD:
+ 			{
+ 				RAnalFunction *called_fcn = r_anal_get_fcn_in (fcn->anal, ref->addr, 0);
+ 				if (!called_fcn) {
+@@ -1059,25 +1060,31 @@ repeat:
+ 			}
+ 			break;
+ 		case R_ANAL_OP_TYPE_LOAD:
++			// R2R db/anal/arm db/esil/apple
+ 			if (anal->iob.is_valid_offset (anal->iob.io, op->ptr, 0)) {
+ 				// TODO: what about the qword loads!??!?
+ 				ut8 dd[4] = {0};
+ 				(void)anal->iob.read_at (anal->iob.io, op->ptr, (ut8 *) dd, sizeof (dd));
+ 				// if page have exec perms
+ 				ut64 da = (ut64)r_read_ble32 (dd, R_ARCH_CONFIG_IS_BIG_ENDIAN (anal->config));
+-				if (da != UT32_MAX && anal->iob.is_valid_offset (anal->iob.io, da, 0)) {
++				if (da != UT32_MAX && da != UT64_MAX && anal->iob.is_valid_offset (anal->iob.io, da, 0)) {
+ 					/// R2_590 - this must be CODE | READ , not CODE|DATA, but raises 10 fails
+-					r_anal_xrefs_set (anal, op->addr, da, R_ANAL_REF_TYPE_CODE | R_ANAL_REF_TYPE_DATA);
++					// r_anal_xrefs_set (anal, op->addr, da, R_ANAL_REF_TYPE_CODE | R_ANAL_REF_TYPE_DATA);
++					r_anal_xrefs_set (anal, op->addr, da, R_ANAL_REF_TYPE_ICOD | R_ANAL_REF_TYPE_EXEC);
++				} else {
++					R_LOG_DEBUG ("Invalid refs 0x%08"PFMT64x" .. 0x%08"PFMT64x" .. 0x%08"PFMT64x" not adding", op->addr, op->ptr, da);
++					/// XXX this breaks the db/esil/apple tests
++				//	r_meta_set (anal, R_META_TYPE_DATA, op->ptr, 4, "");
+ 				}
+-				r_anal_xrefs_set (anal, op->addr, op->ptr, R_ANAL_REF_TYPE_DATA);
++				// maybe optional or in the else
++				// r_anal_xrefs_set (anal, op->addr, op->ptr, R_ANAL_REF_TYPE_DATA);
+ 				if (anal->opt.loads) {
+ 					// set this address as data if destination is not code
+-					if (anal->iob.is_valid_offset (anal->iob.io, op->ptr, 0)) {
+ 						r_meta_set (anal, R_META_TYPE_DATA, op->ptr, 4, "");
+-					}
+ 				}
+ 			}
+ 			break;
++			break;
+ 			// Case of valid but unused "add [rax], al"
+ 		case R_ANAL_OP_TYPE_ADD:
+ 			if (is_arm && anal->config->bits == 32) {
+
+
+
+
+@@ -364,8 +364,8 @@ R_API const char *r_anal_ref_type_tostring(RAnalRefType type) {
+ 	case ' ':
+ 	case R_ANAL_REF_TYPE_NULL:
+ 		return "NULL";
+-	case R_ANAL_REF_TYPE_CODE | R_ANAL_REF_TYPE_DATA:
+-		return "ICOD"; // indirect code reference
++	case R_ANAL_REF_TYPE_ICOD:
++		return "ICOD";
+ 	case R_ANAL_REF_TYPE_CODE:
+ 		return "CODE";
+ 	case R_ANAL_REF_TYPE_CALL:
+@@ -374,9 +374,10 @@ R_API const char *r_anal_ref_type_tostring(RAnalRefType type) {
+ 		return "JUMP";
+ 	case R_ANAL_REF_TYPE_DATA:
+ 		return "DATA";
+-	case R_ANAL_REF_TYPE_STRING:
++	case R_ANAL_REF_TYPE_STRN:
+ 		return "STRN";
+ 	default:
++		// R_LOG_ERROR("Invalid unknown ref type %c", R_ANAL_REF_TYPE_MASK (type));
+ 		return "UNKN";
+ 	}
+ }
+@@ -414,12 +415,16 @@ R_API int r_anal_ref_typemask(int x) {
+ 	const int maskedType = x & 0xff;
+ 	switch (maskedType) {
+ 	case R_ANAL_REF_TYPE_NULL:
++	case R_ANAL_REF_TYPE_CODE | R_ANAL_REF_TYPE_DATA: // 'g' // XXX R2_590 - this is a conflictive type
+ 	case R_ANAL_REF_TYPE_CODE: // 'c' // code ref
+ 	case R_ANAL_REF_TYPE_CALL: // 'C' // code ref (call)
+ 	case R_ANAL_REF_TYPE_JUMP: // 'j' // code ref (call)
+ 	case R_ANAL_REF_TYPE_DATA: // 'd' // mem ref
+-	case R_ANAL_REF_TYPE_STRN: // 's'  // string ref
++	case R_ANAL_REF_TYPE_STRN: // 's' // string ref
++	case R_ANAL_REF_TYPE_ICOD: // 'i' // indirect cod reference
+ 		return maskedType;
++	case ' ':
++		return R_ANAL_REF_TYPE_NULL;
+ 	}
+ 	R_LOG_ERROR ("Invalid reftype mask '%c' (0x%02x)", x, x);
+ 	// SHOULD NEVER HAPPEN MAYBE WARN HERE
+@@ -433,6 +438,7 @@ R_API RAnalRefType r_anal_xrefs_type(char ch) {
+ 	case R_ANAL_REF_TYPE_CALL:
+ 	case R_ANAL_REF_TYPE_DATA:
+ 	case R_ANAL_REF_TYPE_STRN:
++	case R_ANAL_REF_TYPE_ICOD:
+ 	case R_ANAL_REF_TYPE_NULL:
+ 		return (RAnalRefType)ch;
+ 	default:
+
+
+
+
+@@ -658,18 +658,35 @@ static void r_anal_analyze_fcn_refs(RCore *core, RAnalFunction *fcn, int depth)
+ 			continue;
+ 		}
+ 		int rt = R_ANAL_REF_TYPE_MASK (ref->type);

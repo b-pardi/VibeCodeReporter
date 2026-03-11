@@ -1,0 +1,82 @@
+@@ -1591,6 +1591,47 @@ TEST_P(TlsConnectTls13, Tls13DsaIsNotAdvertisedServer) {
+             capture->extension());
+ }
+ 
++TEST_P(TlsConnectTls13, Tls13RsaPkcs1IsAdvertisedClient) {
++  EnsureTlsSetup();
++  static const SSLSignatureScheme kSchemes[] = {ssl_sig_rsa_pkcs1_sha256,
++                                                ssl_sig_rsa_pss_rsae_sha256};
++  client_->SetSignatureSchemes(kSchemes, PR_ARRAY_SIZE(kSchemes));
++  auto capture =
++      MakeTlsFilter<TlsExtensionCapture>(client_, ssl_signature_algorithms_xtn);
++  Connect();
++  // We should only have the one signature algorithm advertised.
++  static const uint8_t kExpectedExt[] = {0,
++                                         4,
++                                         ssl_sig_rsa_pss_rsae_sha256 >> 8,
++                                         ssl_sig_rsa_pss_rsae_sha256 & 0xff,
++                                         ssl_sig_rsa_pkcs1_sha256 >> 8,
++                                         ssl_sig_rsa_pkcs1_sha256 & 0xff};
++  ASSERT_EQ(DataBuffer(kExpectedExt, sizeof(kExpectedExt)),
++            capture->extension());
++}
++
++TEST_P(TlsConnectTls13, Tls13RsaPkcs1IsAdvertisedServer) {
++  EnsureTlsSetup();
++  static const SSLSignatureScheme kSchemes[] = {ssl_sig_rsa_pkcs1_sha256,
++                                                ssl_sig_rsa_pss_rsae_sha256};
++  server_->SetSignatureSchemes(kSchemes, PR_ARRAY_SIZE(kSchemes));
++  auto capture = MakeTlsFilter<TlsExtensionCapture>(
++      server_, ssl_signature_algorithms_xtn, true);
++  capture->SetHandshakeTypes({kTlsHandshakeCertificateRequest});
++  capture->EnableDecryption();
++  server_->RequestClientAuth(false);  // So we get a CertificateRequest.
++  Connect();
++  // We should only have the one signature algorithm advertised.
++  static const uint8_t kExpectedExt[] = {0,
++                                         4,
++                                         ssl_sig_rsa_pss_rsae_sha256 >> 8,
++                                         ssl_sig_rsa_pss_rsae_sha256 & 0xff,
++                                         ssl_sig_rsa_pkcs1_sha256 >> 8,
++                                         ssl_sig_rsa_pkcs1_sha256 & 0xff};
++  ASSERT_EQ(DataBuffer(kExpectedExt, sizeof(kExpectedExt)),
++            capture->extension());
++}
++
+ // variant, version, certificate, auth type, signature scheme
+ typedef std::tuple<SSLProtocolVariant, uint16_t, std::string, SSLAuthType,
+                    SSLSignatureScheme>
+
+
+
+
+@@ -784,15 +784,19 @@ ssl_HasCert(const sslSocket *ss, PRUint16 maxVersion, SSLAuthType authType)
+  * Both by policy and by having a token that supports it. */
+ static PRBool
+ ssl_SignatureSchemeAccepted(PRUint16 minVersion,
+-                            SSLSignatureScheme scheme)
++                            SSLSignatureScheme scheme,
++                            PRBool forCert)
+ {
+     /* Disable RSA-PSS schemes if there are no tokens to verify them. */
+     if (ssl_IsRsaPssSignatureScheme(scheme)) {
+         if (!PK11_TokenExists(auth_alg_defs[ssl_auth_rsa_pss])) {
+             return PR_FALSE;
+         }
+-    } else if (ssl_IsRsaPkcs1SignatureScheme(scheme)) {
+-        /* Disable PKCS#1 signatures if we are limited to TLS 1.3. */
++    } else if (!forCert && ssl_IsRsaPkcs1SignatureScheme(scheme)) {
++        /* Disable PKCS#1 signatures if we are limited to TLS 1.3.
++         * We still need to advertise PKCS#1 signatures in CH and CR
++         * for certificate signatures.
++         */
+         if (minVersion >= SSL_LIBRARY_VERSION_TLS_1_3) {
+             return PR_FALSE;
+         }
+@@ -851,7 +855,8 @@ ssl_CheckSignatureSchemes(sslSocket *ss)
+     /* Ensure that there is a signature scheme that can be accepted.*/
+     for (unsigned int i = 0; i < ss->ssl3.signatureSchemeCount; ++i) {
+         if (ssl_SignatureSchemeAccepted(ss->vrange.min,
+-                                        ss->ssl3.signatureSchemes[i])) {
++                                        ss->ssl3.signatureSchemes[i],
++                                        PR_FALSE /*

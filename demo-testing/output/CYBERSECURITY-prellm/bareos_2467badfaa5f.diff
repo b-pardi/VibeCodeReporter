@@ -1,0 +1,118 @@
+@@ -596,15 +596,26 @@ bool BareosSocket::AuthenticateInboundConnection(JobControlRecord *jcr,
+   return TwoWayAuthenticate(jcr, what, identity, password, tls_resource, true);
+ }
+ 
+-bool BareosSocket::EvaluateCleartextBareosHello(bool &cleartext) const
++bool BareosSocket::EvaluateCleartextBareosHello(const QualifiedResourceNameTypeConverter &converter,
++                                                bool &cleartext,
++                                                std::string &client_name,
++                                                uint32_t &r_code) const
+ {
+-  char buffer[12];
++  char buffer[256];
+   memset(buffer, 0, sizeof(buffer));
+-  int ret = ::recv(fd_, buffer, 10, MSG_PEEK);
+-  if (ret == 10) {
++  int ret = ::recv(fd_, buffer, 255, MSG_PEEK);
++  if (ret >= 10) {
+     std::string hello("Hello ");
+     std::string received(&buffer[4]);
+-    cleartext = hello == received ? true : false;
++    cleartext = received.compare(0, hello.size(), hello) == 0;
++    if (cleartext) {
++      std::string name;
++      uint32_t code;
++      if (GetNameAndResourceTypeFromHello(buffer, converter, name, code)) {
++        client_name = name;
++        r_code = code;
++      }
++    }
+     return true;
+   }
+   return false;
+
+
+
+
+@@ -48,6 +48,7 @@ struct btimer_t; /* forward reference */
+ class BareosSocket;
+ class Tls;
+ class BStringList;
++class QualifiedResourceNameTypeConverter;
+ btimer_t *StartBsockTimer(BareosSocket *bs, uint32_t wait);
+ void StopBsockTimer(btimer_t *wid);
+ 
+@@ -185,7 +186,10 @@ class BareosSocket : public SmartAlloc {
+   void ClearLocking(); /* in bsock.c */
+   void SetSourceAddress(dlist *src_addr_list);
+   void ControlBwlimit(int bytes); /* in bsock.c */
+-  bool EvaluateCleartextBareosHello(bool &cleartext) const;
++  bool EvaluateCleartextBareosHello(const QualifiedResourceNameTypeConverter &converter,
++                                    bool &cleartext,
++                                    std::string &client_name,
++                                    uint32_t &r_code) const;
+   void OutputCipherMessageString(std::function<void(const char *)>);
+   void GetCipherMessageString(std::string &str);
+   bool ReceiveAndEvaluateResponseMessage(uint32_t &id_out, BStringList &args_out);
+
+
+
+
+@@ -27,7 +27,15 @@
+ static bool CheckForCleartextConnection(BareosSocket *bs, ConfigurationParser *config, bool &do_cleartext)
+ {
+   bool cleartext_requested;
+-  if (!bs->EvaluateCleartextBareosHello(cleartext_requested)) {
++  std::string client_name;
++  uint32_t r_code;
++
++  QualifiedResourceNameTypeConverter *converter = config->GetQualifiedResourceNameTypeConverter();
++  if (!converter) { return false; }
++  if (!bs->EvaluateCleartextBareosHello(*converter,
++                                        cleartext_requested,
++                                        client_name,
++                                        r_code)) {
+     Dmsg0(100, "Could not read out cleartext hello\n");
+     return false;
+   }
+
+
+
+
+@@ -29,6 +29,10 @@
+ #include "include/jcr.h"
+ #include "lib/edit.h"
+ #include "lib/ascii_control_characters.h"
++#include "lib/bstringlist.h"
++#include "lib/qualified_resource_name_type_converter.h"
++
++#include <algorithm>
+ 
+ /*
+  * Various BAREOS Utility subroutines
+@@ -179,17 +183,62 @@ void UnbashSpaces(PoolMem &pm)
+    }
+ }
+ 
+-void SwapSeparatorsInString(std::string &str,
+-                            char separator,
+-                            char new_separator)
++struct HelloInformation {
++  std::string hello_string;
++  std::string resource_type_string;
++  uint32_t position_of_name;
++};
++
++static std::list<HelloInformation> hello_list {
++  /* this order is important */
++  { "Hello Storage calling start Job", "R_JOB", 5 },
++  { "Hello Start Storage Job", "R_JOB", 4 },
++  { "Hello Start Job", "R_JOB", 3 },
++  { "Hello Director", "R_DIRECTOR", 2 },
++  { "Hello Storage", "R_STORAGE", 2 },
++  { "Hello Client", "R_CLIENT", 2 },
++  { "Hello", "R_CONSOLE", 1 }
++};
++
++bool GetNameAndResourceTypeFromHello(const char *input,
++                 

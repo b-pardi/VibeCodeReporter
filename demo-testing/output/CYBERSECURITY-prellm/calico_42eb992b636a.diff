@@ -1,0 +1,139 @@
+@@ -118,4 +118,10 @@ struct bpf_map_def_extended {
+ 	__u32 unused2;
+ };
+ 
++
++enum calico_tc_flags {
++	CALICO_TC_HOST_EP = 1<<0,
++	CALICO_TC_INGRESS = 1<<1,
++};
++
+ #endif /* __CALICO_BPF_H__ */
+
+
+
+
+@@ -1,59 +1,189 @@
+ #ifndef __CALICO_CONNTRACK_H__
+ #define __CALICO_CONNTRACK_H__
+ 
++#include <linux/in.h>
+ #import "bpf.h"
+ 
+ // Connection tracking.
+ 
+ struct calico_ct_key {
+-	__be32 src_addr; // NBO
+-	__be32 dst_addr; // NBO
+-    uint16_t src_port; // HBO
+-    uint16_t dst_port; // HBO
+-    uint8_t protocol;
+-} __attribute__((packed));
+-
+-
+-enum calico_ct_type {
+-     CALICO_CT_TYPE_ALLOW = 0,
+-     CALICO_CT_TYPE_NAT = 1,
++	uint32_t protocol;
++	__be32 addr_a, addr_b; // NBO
++	uint16_t port_a, port_b; // HBO
+ };
+ 
+-enum calico_egress_act {
+-     CALICO_EGRESS_LOCAL_EP = 0,
+-     CALICO_EGRESS_PASS = 1,
++enum CALICO_CT_TYPE {
++	CALICO_CT_TYPE_NORMAL = 0,  // Non-NATted entry.
++	CALICO_CT_TYPE_NAT_FWD = 1, // Forward entry for a DNATted flow, keyed on orig src/dst. Points to the reverse entry.
++	CALICO_CT_TYPE_NAT_REV = 2, // "Reverse" entry for a NATted flow, contains NAT + tracking information.
+ };
+ 
+-struct calico_ct_nat {
+-	__be32 src_addr; // NBO
+-	__be32 dst_addr; // NBO
+-    __be16 src_port; // NBO
+-    __be16 dst_port; // NBO
+-};
++struct calico_ct_tcp_state {
++	__u32 seqno;
+ 
+-union calico_ct_data {
+-    struct calico_ct_nat ct_nat;
++	__u32 syn_seen :1;
++	__u32 ack_seen :1;
++	__u32 fin_seen :1;
+ };
+ 
+-enum calico_ct_flags {
+-	CALICO_CT_F_WORKLOAD_APPROVED = 1<<0,
+-	CALICO_CT_F_HOST_APPROVED     = 1<<1,
+-	CALICO_CT_F_REPLY_SEEN        = 1<<2,
++struct calico_ct_value {
++	__u32 type;
++	union {
++		// CALICO_CT_TYPE_NORMAL and CALICO_CT_TYPE_NAT_REV.
++		struct {
++			struct calico_ct_tcp_state a_to_b, b_to_a;
++
++			// CALICO_CT_TYPE_NAT_REV only.
++			__u32 orig_dst;
++			__u16 orig_port;
++		};
++
++		// CALICO_CT_TYPE_NAT_FWD; key for the CALICO_CT_TYPE_NAT_REV entry.
++		struct calico_ct_key nat_rev_key;
++	};
++} __attribute__((packed));
++
++struct bpf_map_def_extended __attribute__((section("maps"))) calico_ct_map_v4 = {
++	.type = BPF_MAP_TYPE_HASH,
++	.key_size = sizeof(struct calico_ct_key),
++	.value_size = sizeof(struct calico_ct_value),
++	.map_flags = BPF_F_NO_PREALLOC,
++	.max_entries = 512000, // arbitrary
++	.pinning_strategy = 2 /* global namespace */,
+ };
+ 
+-struct calico_ct_value {
+-    uint8_t ct_type;
+-    uint8_t flags;
+-    union calico_ct_data data;
++static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(struct calico_ct_key *k, enum CALICO_CT_TYPE type,
++		__be32 ip_src, __be32 ip_dst, __u16 sport, __u16 dport, __be32 orig_dst, __u16 orig_dport, struct tcphdr *tcp_header) {
++	struct calico_ct_value ct_value = {};
++	ct_value.type = type;
++	ct_value.orig_dst = orig_dst;
++	ct_value.orig_port = orig_dport;
++	bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
++	if (srcLTDest) {
++		*k = (struct calico_ct_key) {
++			.protocol = IPPROTO_TCP,
++			.addr_a = ip_src, .port_a = sport,
++			.addr_b = ip_dst, .port_b = dport,
++		};
++		ct_value.a_to_b.seqno = tcp_header->seq;
++		ct_value.a_to_b.syn_seen = 1;
++		return bpf_map_update_elem(&calico_ct_map_v4, k, &ct_value, 0);
++	} else  {
++		*k = (struct calico_ct_key) {
++			.protocol = IPPROTO_TCP,
++			.addr_a = ip_dst, .port_a = dport,
++			.addr_b = ip_src, .port_b = sport,
++		};
++		ct_value.b_to_a.seqno = tcp_header->seq;
++		ct_value.b_to_a.syn_seen = 1;
++		return bpf_map_update_elem(&calico_ct_map_v4, k, &ct_value, 0);
++	}
++}
++
++static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_nat_fwd(struct calico_ct_key *rk, __be32 ip_src, __be32 ip_dst, __u16 sport, __u16 dport) {
++	struct calico_ct_value ct_value = {.type = CALICO_CT_TYPE_NAT_FWD};
++	bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
++	if (srcLTDest) {
++		struct calico_ct_key k = {
++			.protocol = IPPROTO_TCP,
++			.addr_a = ip_src, .port_a = sport,
++			.addr_b = ip_dst, .port_b = dport,
++		};
++		ct_value.nat_rev_key = *rk;
++		return bpf_map_update_elem(&calico_ct_map_v4

@@ -1,0 +1,131 @@
+@@ -6,6 +6,7 @@
+ // files in this directory that contain subsections like this one.
+ 
+ typedef void (*hypercall_t)(CPUState *cpu);
++typedef void (*register_hypercall_t)(uint32_t, hypercall_t);
+ void register_hypercall(uint32_t magic, hypercall_t);
+ void unregister_hypercall(uint32_t magic);
+ 
+
+
+
+
+@@ -15,6 +15,7 @@
+ #include "callstack_instr/callstack_instr.h"
+ 
+ extern "C" {
++#include <hypercaller/hypercaller.h>
+ 
+ #include "panda/rr/rr_log.h"
+ #include "panda/plog.h"
+@@ -37,17 +38,17 @@ extern "C" {
+ bool init_plugin(void *);
+ void uninit_plugin(void *);
+ 
+-int get_loglevel() ;
++int get_loglevel();
+ void set_loglevel(int new_loglevel);
+ }
+ bool linechange_taint = true;
+ bool hypercall_taint = true;
+-bool chaff_bugs = false;
+-Panda__SrcInfoPri *si = NULL;
++// bool chaff_bugs = false;
+ const char *global_src_filename = NULL;
+ uint64_t global_src_linenum;
+ unsigned global_ast_loc_id;
+ bool debug = false;
++// uint64_t global_funcaddr;
+ 
+ #define dprintf(...) if (debug) { printf(__VA_ARGS__); fflush(stdout); }
+ 
+@@ -67,70 +68,98 @@ Panda__SrcInfoPri *pandalog_src_info_pri_create(const char *src_filename, uint64
+     si->insertionpoint = 1;
+     return si;
+ }
+-// should just be able to include these from taint2.h or taint_processor.cpp
++
++// The following two functions are taken from taint_api.cpp
++// We can figure out how to avoid code duplication later...
+ Addr make_maddr(uint64_t a) {
+-  Addr ma;
+-  ma.typ = MADDR;
+-  ma.val.ma = a;
+-  ma.off = 0;
+-  ma.flag = (AddrFlag) 0;
+-  return ma;
++    Addr ma;
++    ma.typ = MADDR;
++    ma.val.ma = a;
++    ma.off = 0;
++    ma.flag = (AddrFlag) 0;
++    return ma;
+ }
++
+ Addr make_greg(uint64_t r, uint16_t off) {
+-    Addr ra = {
+-        .typ = GREG,
+-        .val = { .gr = r },
+-        .off = off,
+-        .flag = (AddrFlag) 0
+-    };
+-    return ra;
++    Addr a;
++    a.typ = GREG;
++    a.val.gr = r;
++    a.off = off;
++    a.flag = (AddrFlag) 0;
++    return a;
+ }
+-void print_membytes(CPUState *env, target_ulong a, target_ulong len) {
+-    unsigned char c = (unsigned char)0;
+-    printf("{ ");
++
++void print_membytes(CPUState *env, target_ulong address, target_ulong len) {
++    unsigned char c = (unsigned char) 0;
++    printf("Content: { ");
+     for (int i = 0; i < len; i++) {
+-        if (-1 == panda_virtual_memory_read(env, a+i, (uint8_t *) &c, sizeof(char))) {
++        if (panda_virtual_memory_read(env, address + i, (uint8_t *) &c, sizeof(char)) == -1) {
+             printf(" XX");
+         } else {
+             printf("%02x ", c);
+         }
+     }
+-    printf("}");
++    printf("}\n");
+ }
+ 
++struct args {
++    CPUState *cpu;
++    const char *src_filename;
++    uint64_t src_linenum;
++    unsigned ast_loc_id;
++    // uint64_t funcaddr;
++};
++
+ // max length of strnlen or taint query
+ #define LAVA_TAINT_QUERY_MAX_LEN (target_ulong)64ULL
+-#if defined(TARGET_I386)
+-void lava_taint_query(target_ulong buf, LocType loc_t, target_ulong buf_len, const char *astnodename) {
++#if defined(TARGET_I386) || defined(TARGET_ARM)
++void lava_taint_query(CPUState *cpu, target_ulong buf, LocType loc_t, target_ulong buf_len, const char *astnodename) {
++    dprintf("[pri_taint] Attempt to lava_taint_query\n");
++
+     // can't do a taint query if it is not a valid register (loc) or if
+     // the buf_len is greater than the register size (assume size of guest pointer)
+     if (loc_t == LocReg && (buf >= CPU_NB_REGS || buf_len >= sizeof(target_ulong) ||
+-                buf_len == (target_ulong)-1))
++                buf_len == (target_ulong) -1)) {
++        dprintf("[pri_taint] The register is not valid OR buf_len > register size\n");
++        return;
++    }
++    if (loc_t == LocErr || loc_t == LocConst) {
++        dprintf("[pri_taint] The Location is either error OR constant. Shouldn't happen based on pfun()\n");
+         return;
+-    if (loc_t == LocErr || loc_t == LocConst)
++    }
++    if (!pandalog || !taint2_enabled()) {
++        dprintf("[pri_taint] No Panda log or Taint2 not enabled\n");
+         return;
+-

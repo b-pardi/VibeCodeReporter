@@ -1,0 +1,107 @@
+@@ -40,10 +40,10 @@ static void FrameDebug(const char *prefix, const Frames *frames, const Frame *fr
+         type_name = AppLayerParserGetFrameNameById(frames->ipproto, frames->alproto, frame->type);
+     }
+     SCLogDebug("[%s] %p: frame:%p type:%u/%s id:%" PRIi64 " flags:%02x offset:%" PRIu64
+-               ", len:%" PRIi64 ", events:%u %u/%u/%u/%u",
++               ", len:%" PRIi64 ", inspect_progress:%" PRIu64 ", events:%u %u/%u/%u/%u",
+             prefix, frames, frame, frame->type, type_name, frame->id, frame->flags, frame->offset,
+-            frame->len, frame->event_cnt, frame->events[0], frame->events[1], frame->events[2],
+-            frame->events[3]);
++            frame->len, frame->inspect_progress, frame->event_cnt, frame->events[0],
++            frame->events[1], frame->events[2], frame->events[3]);
+ #endif
+ }
+ 
+
+
+
+
+@@ -51,8 +51,8 @@ typedef struct Frame {
+     int64_t len;
+     int64_t id;
+     uint64_t tx_id; /**< tx_id to match this frame. UINT64T_MAX if not used. */
++    uint64_t inspect_progress; /**< inspection tracker relative to the start of the frame */
+ } Frame;
+-// size 40
+ 
+ #define FRAMES_STATIC_CNT 3
+ 
+@@ -68,13 +68,11 @@ typedef struct Frames {
+     AppProto alproto;
+ #endif
+ } Frames;
+-// size 136
+ 
+ typedef struct FramesContainer {
+     Frames toserver;
+     Frames toclient;
+ } FramesContainer;
+-// size 272
+ 
+ void FramesFree(Frames *frames);
+ void FramesPrune(Flow *f, Packet *p);
+
+
+
+
+@@ -219,6 +219,7 @@ static int FrameStreamDataFunc(
+                " }, input: %p, input_len:%u, offset:%" PRIu64,
+             fsd, fsd->det_ctx, fsd->transforms, fsd->frame, fsd->list_id, fsd->idx,
+             fsd->data_offset, fsd->frame_offset, input, input_len, offset);
++    // PrintRawDataFp(stdout, input, input_len);
+ 
+     InspectionBuffer *buffer =
+             InspectionBufferMultipleForListGet(fsd->det_ctx, fsd->list_id, fsd->idx);
+@@ -230,52 +231,72 @@ static int FrameStreamDataFunc(
+     const uint8_t *data = input;
+     uint8_t ci_flags = 0;
+     uint32_t data_len;
+-    uint64_t inspect_offset = 0;
+-    if (fsd->frame_offset == offset) {
++
++    /* fo: frame offset; offset relative to start of the frame */
++    uint64_t fo_inspect_offset = 0;
++
++    if (frame->offset == 0 && offset == 0) {
+         ci_flags |= DETECT_CI_FLAGS_START;
+         SCLogDebug("have frame data start");
+ 
+         if (frame->len >= 0) {
+             data_len = MIN(input_len, frame->len);
++            if (data_len == frame->len) {
++                ci_flags |= DETECT_CI_FLAGS_END;
++                SCLogDebug("have frame data end");
++            }
+         } else {
+             data_len = input_len;
+         }
+-
+-        if (data_len == frame->len) {
+-            ci_flags |= DETECT_CI_FLAGS_END;
+-            SCLogDebug("have frame data end");
+-        }
+-        // inspect_offset 0
+     } else {
+-        BUG_ON(offset < fsd->data_offset);
+-        inspect_offset = offset - fsd->frame_offset;
++        const uint64_t so_frame_inspect_offset = frame->inspect_progress + frame->offset;
++        const uint64_t so_inspect_offset = MAX(offset, so_frame_inspect_offset);
++        fo_inspect_offset = so_inspect_offset - frame->offset;
+ 
++        if (frame->offset >= offset) {
++            ci_flags |= DETECT_CI_FLAGS_START;
++            SCLogDebug("have frame data start");
++        }
+         if (frame->len >= 0) {
+-            if (inspect_offset >= (uint64_t)frame->len) {
+-                SCLogDebug("data entirely past frame");
++            if (fo_inspect_offset >= (uint64_t)frame->len) {
++                SCLogDebug("data entirely past frame (%" PRIu64 " > %" PRIi64 ")",
++                        fo_inspect_offset, frame->len);
+                 return 1;
+             }
+-            uint32_t adjusted_frame_len = (uint32_t)((uint64_t)frame->len - inspect_offset);
+-            SCLogDebug("frame len after applying offset %" PRIu64 ": %u", inspect_offset,
+-                    adjusted_frame_len);
+ 
+-            data_len = MIN(adjusted_frame_

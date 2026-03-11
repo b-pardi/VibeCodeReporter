@@ -1,0 +1,92 @@
+@@ -296,6 +296,42 @@ void volume::PushRecord(record_header header,
+                         const char* data,
+                         std::size_t size)
+ {
++  if (!current_block) {
++    throw std::runtime_error(
++        "Cannot write record to volume when no block was started.");
++  }
++
++  if (header.Stream < 0) {
++    // this header might be a continuation header
++    urid rec_id = {
++        .VolSessionId = current_block->VolSessionId,
++        .VolSessionTime = current_block->VolSessionTime,
++        .FileIndex = header.FileIndex,
++        .Stream = -header.Stream,
++    };
++
++    if (auto found = unfinished.find(rec_id); found != unfinished.end()) {
++      auto idx = found->second.FileIdx;
++      auto& vec = backing->datafiles[backing->idx_to_dfile[idx]];
++      auto start = found->second.Continue;
++
++      if (found->second.Size < size) {
++        throw std::runtime_error("Trying to append " + std::to_string(size)
++                                 + " bytes to a record, but only "
++                                 + std::to_string(found->second.Size)
++                                 + " bytes are left.");
++      }
++
++      auto* ptr = vec.data() + start;
++      std::memcpy(ptr, data, size);
++
++      found->second.Size -= size;
++      found->second.Continue += size;
++
++      if (found->second.Size == 0) { unfinished.erase(found); }
++    }
++  }
++
+   auto idx = FindDataIdx(backing->bsize_to_idx, header.DataSize);
+ 
+   auto& vec = backing->datafiles[backing->idx_to_dfile[idx]];
+@@ -304,6 +340,21 @@ void volume::PushRecord(record_header header,
+   vec.reserve_extra(header.DataSize);
+   vec.append_range(data, size);
+   backing->records.push_back(to_dedup(header, idx, start, size));
++
++  if (size != header.DataSize) {
++    urid rec_id = {
++        .VolSessionId = current_block->VolSessionId,
++        .VolSessionTime = current_block->VolSessionTime,
++        .FileIndex = header.FileIndex,
++        .Stream = header.Stream,
++    };
++
++    unfinished.emplace(rec_id, record_space{
++                                   .FileIdx = idx,
++                                   .Size = SafeCast(header.DataSize - size),
++                                   .Continue = start + size,
++                               });
++  }
+ }
+ 
+ void volume::create_new(int creation_mode,
+
+
+
+
+@@ -166,6 +166,13 @@ struct urid  // universial record id
+ 
+   std::int32_t FileIndex; /* File index supplied by File daemon */
+   std::int32_t Stream;    /* Stream number supplied by File daemon */
++
++  friend constexpr bool operator==(urid l, urid r)
++  {
++    return l.VolSessionId == r.VolSessionId
++           && l.VolSessionTime == r.VolSessionTime && l.FileIndex == r.FileIndex
++           && l.Stream == r.Stream;
++  }
+ };
+ 
+ struct urid_hash {
+@@ -227,7 +234,7 @@ class volume {
+     std::uint32_t FileIdx; /* in which data file was the space reserved */
+     std::uint32_t Size;    /* Size left of reserved space */
+     std::uint64_t
+-        Begin; /* offset into datafile from where to continue writing */
++        Continue; /* offset into datafile from where to continue writing */
+   };
+ 
+   std::unordered_map<urid, record_space, urid_hash> unfinished;

@@ -1,0 +1,133 @@
+@@ -79,6 +79,7 @@
+ #include "util-memcmp.h"
+ #include "util-misc.h"
+ #include "util-signal.h"
++#include "util-affinity.h"
+ 
+ #include "reputation.h"
+ #include "util-atomic.h"
+@@ -197,6 +198,7 @@ static void RegisterUnittests(void)
+     SCLogRegisterTests();
+     MagicRegisterTests();
+     UtilMiscRegisterTests();
++    ThreadingAffinityRegisterTests();
+     DetectAddressTests();
+     DetectProtoTests();
+     DetectPortTests();
+
+
+
+
+@@ -27,11 +27,13 @@
+ #define _THREAD_AFFINITY
+ #include "util-affinity.h"
+ #include "conf.h"
++#include "conf-yaml-loader.h"
+ #include "runmodes.h"
+ #include "util-cpu.h"
+ #include "util-byte.h"
+ #include "util-debug.h"
+ #include "util-dpdk.h"
++#include "util-unittest.h"
+ 
+ ThreadsAffinityType thread_affinity[MAX_CPU_SET] = {
+     {
+@@ -1092,3 +1094,929 @@ void UtilAffinityCpusExclude(ThreadsAffinityType *mod_taf, ThreadsAffinityType *
+     SCMutexUnlock(&mod_taf->taf_mutex);
+ }
+ #endif /* HAVE_DPDK */
++
++#ifdef UNITTESTS
++// avoiding Darwin/MacOS as it does not support bitwise CPU affinity
++#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
++
++/**
++ * \brief Helper function to reset affinity state for unit tests
++ * This properly clears CPU sets without destroying initialized mutexes
++ */
++static void ResetAffinityForTest(void)
++{
++    thread_affinity_init_done = 0;
++    for (int i = 0; i < MAX_CPU_SET; i++) {
++        ThreadsAffinityType *taf = &thread_affinity[i];
++        CPU_ZERO(&taf->cpu_set);
++        CPU_ZERO(&taf->lowprio_cpu);
++        CPU_ZERO(&taf->medprio_cpu);
++        CPU_ZERO(&taf->hiprio_cpu);
++        taf->nb_threads = 0;
++        taf->prio = PRIO_LOW;
++        taf->mode_flag = BALANCED_AFFINITY;
++
++        for (int j = 0; j < MAX_NUMA_NODES; j++) {
++            taf->lcpu[j] = 0;
++        }
++
++        if (taf->children) {
++            for (uint32_t j = 0; j < taf->nb_children; j++) {
++                if (taf->children[j]) {
++                    SCFree((void *)taf->children[j]->name);
++                    SCFree(taf->children[j]);
++                }
++            }
++            SCFree(taf->children);
++            taf->children = NULL;
++        }
++        taf->nb_children = 0;
++        taf->nb_children_capacity = 0;
++
++        if (i == MANAGEMENT_CPU_SET) {
++            taf->name = "management-cpu-set";
++        } else if (i == WORKER_CPU_SET) {
++            taf->name = "worker-cpu-set";
++        } else if (i == VERDICT_CPU_SET) {
++            taf->name = "verdict-cpu-set";
++        } else if (i == RECEIVE_CPU_SET) {
++            taf->name = "receive-cpu-set";
++        } else {
++            taf->name = NULL;
++        }
++
++        // Don't touch the mutex - it should remain initialized
++    }
++}
++
++/**
++ * \brief Test basic CPU affinity parsing in new format
++ */
++static int ThreadingAffinityTest01(void)
++{
++    SCConfCreateContextBackup();
++    SCConfInit();
++    ResetAffinityForTest();
++    const char *config = "%YAML 1.1\n"
++                         "---\n"
++                         "threading:\n"
++                         "  cpu-affinity:\n"
++                         "    management-cpu-set:\n"
++                         "      cpu: [ 0 ]\n"
++                         "    worker-cpu-set:\n"
++                         "      cpu: [ 1, 2, 3 ]\n";
++
++    SCConfYamlLoadString(config, strlen(config));
++
++    AffinitySetupLoadFromConfig();
++    FAIL_IF_NOT(AffinityConfigIsLegacy() == false);
++
++    ThreadsAffinityType *mgmt_taf = &thread_affinity[MANAGEMENT_CPU_SET];
++    FAIL_IF_NOT(CPU_ISSET(0, &mgmt_taf->cpu_set));
++    FAIL_IF_NOT(CPU_COUNT(&mgmt_taf->cpu_set) == 1);
++
++    ThreadsAffinityType *worker_taf = &thread_affinity[WORKER_CPU_SET];
++    FAIL_IF_NOT(CPU_ISSET(1, &worker_taf->cpu_set));
++    FAIL_IF_NOT(CPU_ISSET(2, &worker_taf->cpu_set));
++    FAIL_IF_NOT(CPU_ISSET(3, &worker_taf->cpu_set));
++    FAIL_IF_NOT(CPU_COUNT(&worker_taf->cpu_set));
++
++    SCConfRestoreContextBackup();
++    PASS;
++}
++
++/**
++ * \brief Test deprecated CPU affinity format parsing
++ */
++st

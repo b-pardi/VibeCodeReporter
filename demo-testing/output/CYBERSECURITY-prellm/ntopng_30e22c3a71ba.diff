@@ -1,0 +1,115 @@
+@@ -86,7 +86,7 @@ class NetworkInterface : public Checkpointable {
+ 
+   /* Live Capture */
+   Mutex active_captures_lock;
+-  u_int8_t num_active_captures;
++  u_int8_t num_live_captures;
+   struct ntopngLuaContext *live_captures[MAX_NUM_PCAP_CAPTURES];
+   static bool matchLiveCapture(struct ntopngLuaContext * const luactx, Flow * const f);
+   void deliverLiveCapture(const struct pcap_pkthdr * const h, const u_char * const packet, Flow * const f);
+@@ -515,10 +515,10 @@ class NetworkInterface : public Checkpointable {
+ 
+   PacketDumper *getPacketDumper(void)                  { return pkt_dumper;     }
+   PacketDumperTuntap *getPacketDumperTap(void)         { return pkt_dumper_tap; }
+-  bool registerLiveCapture(struct ntopngLuaContext * const luactx);
++  bool registerLiveCapture(struct ntopngLuaContext * const luactx, int *id);
+   bool deregisterLiveCapture(struct ntopngLuaContext * const luactx);
+   void dumpLiveCaptures(lua_State* vm);
+-  void stopLiveCapture(char *user, Host *h);
++  bool stopLiveCapture(char *user, int capture_id);
+ #ifdef NTOPNG_PRO
+ #ifdef HAVE_NEDGE
+   void updateHostsL7Policy(u_int16_t host_pool_id);
+
+
+
+
+@@ -461,6 +461,8 @@ struct ntopngLuaContext {
+     u_int32_t capture_until, capture_max_pkts, num_captured_packets;
+     void *matching_host;
+     char username[32];
++    bool bpfFilterSet;
++    struct bpf_program fcode;
+     
+     /* Status */
+     bool pcaphdr_sent;
+
+
+
+
+@@ -132,7 +132,7 @@ LuaEngine::~LuaEngine() {
+ 
+       if(ctx->iface != NULL)
+ 	ctx->iface->deregisterLiveCapture(ctx);
+-      
++
+       free(ctx);
+     }
+ 
+@@ -1298,7 +1298,7 @@ static int ntop_set_https_bind_addr(lua_State* vm) {
+ }
+ 
+ #endif
+- 
++
+ /* ****************************************** */
+ 
+ #ifdef HAVE_NEDGE
+@@ -3633,11 +3633,11 @@ static int ntop_interface_dump_live_captures(lua_State* vm) {
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+   struct ntopngLuaContext *c;
+   NetworkInterface *iface = getCurrentInterface(vm);
+-  
++
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(!Utils::isUserAdministrator(vm)) return(CONST_LUA_ERROR);
+-  
++
+ #ifdef DONT_USE_LUAJIT
+   lua_getglobal(vm, "userdata");
+   c = (struct ntopngLuaContext*)lua_touserdata(vm, lua_gettop(vm));
+@@ -3658,11 +3658,12 @@ static int ntop_interface_dump_live_captures(lua_State* vm) {
+ static int ntop_interface_live_capture(lua_State* vm) {
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+   struct ntopngLuaContext *c;
++  int capture_id;
+ 
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(!Utils::isUserAdministrator(vm)) return(CONST_LUA_ERROR);
+-  
++
+ #ifdef DONT_USE_LUAJIT
+   lua_getglobal(vm, "userdata");
+   c = (struct ntopngLuaContext*)lua_touserdata(vm, lua_gettop(vm));
+@@ -3672,13 +3673,13 @@ static int ntop_interface_live_capture(lua_State* vm) {
+ 
+   if((!ntop_interface) || (!c))
+     return(CONST_LUA_ERROR);
+-  
++
+   if(lua_type(vm, 1) == LUA_TSTRING) /* Optional */ {
+     Host *h;
+     char host_ip[64];
+     char *key;
+     u_int16_t vlan_id = 0;
+-    
++
+     get_host_vlan_info((char*)lua_tostring(vm, 1), &key, &vlan_id, host_ip, sizeof(host_ip));
+ 
+     if((!ntop_interface) || ((h = ntop_interface->findHostByIP(get_allowed_nets(vm), host_ip, vlan_id)) == NULL)) {
+@@ -3692,19 +3693,21 @@ static int ntop_interface_live_capture(lua_State* vm) {
+   c->live_capture.capture_max_pkts = 100000; /* No more than 100k packets */
+   c->live_capture.num_captured_packets = 0;
+   c->live_capture.stopped = c->live_capture.done = c->live_capture.pcaphdr_sent = false;
++  c->live_capture.bpfFilterSet = false;
+   snprintf(c->live_capture.username, sizeof(c->live_capture.username), "%s", c->user);
+-  ntop_interface->registerLiveCapture(c);
+ 
+-  ntop->getTrace()->traceEvent(TRACE_NORMAL,
+-			       "Starting live capture for user %s",
+-			       c->live_capture.username);
++  if(ntop_interface->registerLiveCapture(c, &capture_id)) {
++    ntop->getTrace()->traceEvent(TRACE_NORMAL,
++

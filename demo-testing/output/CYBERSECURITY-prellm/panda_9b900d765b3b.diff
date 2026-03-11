@@ -1,0 +1,91 @@
+@@ -13,7 +13,7 @@ import re
+ import random
+ from math import ceil
+ from panda import Panda, blocking, ffi
+-from panda.x86.helper import * # XXX omg these are 32-bit names
++from panda.x86.helper import * # XXX these are the i386 names but they do line up for x86_64. Should change
+ 
+ import logging
+ 
+@@ -21,13 +21,6 @@ logging.basicConfig(level = logging.INFO)
+ logger = logging.getLogger('panda.file_hooking')
+ logger.setLevel(logging.INFO)
+ 
+-# TODO: move PPP decorator into core panda
+-def ppp(plugin_name, attr):
+-    def inner(func):
+-        panda.plugins[plugin_name].__getattr__(attr)(func)
+-        return func
+-    return inner
+-
+ # Classes for tracking faked files by name and FD
+ class FakedFile:
+     '''
+@@ -58,6 +51,12 @@ class FakedFile:
+                 len(file_contents))   # Num bytes read
+ 
+ 
++    def write(self, fd, new_data):
++        # Update contents from fd.offset
++        print(f"Write to hooked file with data {new_data}")
++        self.contents[fd.offset:fd.offset+len(new_data)] = new_data
++        fd.offset += len(new_data)
++
+     def get_mode(self):
+         return 0o664 # Regular file (octal)
+ 
+@@ -160,12 +159,19 @@ def on_sys_read_return(cpu, pc, fd, buf, count):
+         else: # Function
+         """
+ 
+-        # Write seems to be OK - call fn and update guest memory
++        # First try a junk write to see if memory write will fail (avoids calling class twice)
++        try:
++            panda.virtual_memory_write(cpu, buf, b'PANDA_TEST_DATA')
++        except Exception: # Page not mapped. Make guest retry
++            cpu.env_ptr.regs[R_EAX] = ffi.cast("unsigned char", -11) # Return EAGAIN
++            return
++        # Call fn and update guest memory
+         (data, ret_val) = faker.get_data(f, count)
+         if data and len(data):
+-            write_result = panda.virtual_memory_write(cpu, buf, data)
+-            if write_result < 0: # Page not mapped. Make guest retry
+-                logger.info(f"\t Failed to write data into guest memory")
++            try:
++                panda.virtual_memory_write(cpu, buf, data)
++            except Exception: # Page not mapped. Make guest retry. XXX: calls get_data twice
++                logger.info(f"\t Failed to write data into guest memory. XXX Duplicate call to get_data")
+                 cpu.env_ptr.regs[R_EAX] = ffi.cast("unsigned char", -11) # Return EAGAIN
+                 return
+ 
+@@ -279,35 +285,72 @@ def on_sys_write_enter(cpu, pc, fd, buf_ptr, count):
+     if is_hooked(fd, asid):
+         cpu.env_ptr.regs[R_EAX] = 0xFF # Invalid FD - will make kernel return an error that
+                                         # we'll hide. Prevents the write from really happening
+-        (buf, err) = panda.virtual_memory_read(cpu, buf_ptr, count)
+-        logger.info(f"Write {buf} to faked FD {fd}")
++        buf = panda.virtual_memory_read(cpu, buf_ptr, count)
++        logger.warning(f"Saw write of data to faked FD({fd}): {buf}")
++        f = file_descriptors[(fd, asid)]
++        faker = files_faked[f.filename]
++        faker.write(f, buf)
+ 
+ # Write return: Mask error
+ @panda.ppp("syscalls2", "on_sys_write_return")
+ def on_sys_write_return(cpu, pc, fd, buf, count):
+     asid = panda.current_asid(cpu)
+     if is_hooked(fd, asid):
+-        logger.debug(f"Hide error writing to FD {fd}")
++        logger.info(f"Hide error writing to FD {fd}")
+         cpu.env_ptr.regs[R_EAX] = count # Pretend we wrote all bytes
+ 
+ @panda.ppp("syscalls2", "on_sys_dup2_enter")
+ def dup2_return(cpu, pc, oldfd, newfd):
+     asid = panda.current_asid(cpu)
+     if is_hooked(oldfd, asid):
+-        if cpu.env_ptr.regs[R_EAX] == newfd:
+-            logger.debug(f"DUP2 on a fake FD. Copy {oldfd} to {newfd}")
++        if cpu.env_ptr.regs[R_EAX] == newfd: # Else something was wrong
++            logger.info(f"DUP2 on a fake FD. Copy {oldfd} to {newfd}")
+             assert((newfd, asid) not in file_descriptors), "DUP2 with a dest FD already used"
+             file_descriptors[(newfd, asid)] = file

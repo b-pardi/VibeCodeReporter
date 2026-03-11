@@ -1,0 +1,115 @@
+@@ -54,9 +54,13 @@ class Flow : public GenericHashEntry {
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   u_int16_t alert_score;
+-  Bitmap last_notified_status_map;
++  Bitmap status_map, last_notified_status_map;
+   time_t performed_lua_calls[FLOW_LUA_CALL_MAX_VAL];
+   struct ndpi_flow_struct *ndpiFlow;
++  FlowStatus alerted_status;
++  AlertType alert_type;
++  AlertLevel alert_level;
++  char *tmp_alert_json;
+ 
+   /* When the interface isViewed(), the corresponding view needs to acknowledge the purge
+      before the flow can actually be deleted from memory. This guarantees the view has
+@@ -219,7 +223,6 @@ class Flow : public GenericHashEntry {
+   bool isLowGoodput() const;
+   static void updatePacketStats(InterarrivalStats *stats, const struct timeval *when, bool update_iat);
+   bool isReadyToBeMarkedAsIdle();
+-  bool isBlacklistedFlow() const;
+   inline bool isDeviceAllowedProtocol() const {
+       return(!cli_host || !srv_host ||
+         ((cli_host->getDeviceAllowedProtocolStatus(ndpiDetectedProtocol, true) == device_proto_allowed) &&
+@@ -251,7 +254,13 @@ class Flow : public GenericHashEntry {
+        time_t _first_seen, time_t _last_seen);
+   ~Flow();
+ 
++  inline Bitmap getStatusBitmap()               { return(status_map);           }
++  inline void addStatus(FlowStatus status)      { status_map.setBit(status);    }
+   FlowStatus getFlowStatus(Bitmap *status_map) const;
++  void triggerAlert(AlertType atype, AlertLevel severity, const char*alert_json);
++  inline void setAlertedStatus(FlowStatus status)      { alerted_status = status; };
++
++  bool isBlacklistedFlow() const;
+   struct site_categories* getFlowCategory(bool force_categorization);
+   void freeDPIMemory();
+   static const ndpi_protocol ndpiUnknownProtocol;
+
+
+
+
+@@ -47,6 +47,11 @@ Flow::Flow(NetworkInterface *_iface,
+     flow_dropped_counts_increased = false, vrfId = 0;
+     alert_score = CONST_NO_SCORE_SET;
+ 
++  tmp_alert_json = NULL;
++  alert_type = alert_none;
++  alert_level = alert_level_none;
++  alerted_status = status_normal;
++
+   alert_rowid = -1;
+   last_notified_status_map.setBit(status_normal);
+   purge_acknowledged_mark = detection_completed = update_flow_port_stats = false;
+@@ -295,6 +300,7 @@ Flow::~Flow() {
+   freeDPIMemory();
+   if(icmp_info) delete(icmp_info);
+   if(external_alert) json_object_put(external_alert);
++  if(tmp_alert_json) free(tmp_alert_json);
+ }
+ 
+ /* *************************************** */
+@@ -329,10 +335,12 @@ bool Flow::triggerAlerts() const {
+ 
+ /* *************************************** */
+ 
++// TODO: refactor
+ void Flow::dumpFlowAlert() {
+   time_t when;
+   FlowStatus status;
+   Bitmap status_map;
++  bool is_from_lua = false;
+ 
+   if(!triggerAlerts())
+     return;
+@@ -340,7 +348,13 @@ void Flow::dumpFlowAlert() {
+   status = getFlowStatus(&status_map);
+ 
+   if(!isFlowAlerted()) {
+-    bool do_dump = Utils::dumpFlowStatus(status);
++    bool do_dump;
++    is_from_lua = (alert_type != alert_none);
++
++    if(is_from_lua)
++      do_dump = true;
++    else
++      do_dump = Utils::dumpFlowStatus(status);
+ 
+ #ifdef HAVE_NEDGE
+     /* NOTE: this must be explicitly re-checked as a more specific alert
+@@ -373,7 +387,12 @@ void Flow::dumpFlowAlert() {
+     }
+ 
+     if(do_dump) {
+-      iface->getAlertsManager()->storeFlowAlert(this);
++      if(is_from_lua) {
++        iface->getAlertsManager()->storeFlowAlert(this, alert_type, alert_level, tmp_alert_json);
++
++        if(tmp_alert_json) free(tmp_alert_json);
++      } else
++        iface->getAlertsManager()->storeFlowAlert(this);
+ 
+       setFlowAlerted();
+ 
+@@ -3681,6 +3700,10 @@ FlowStatus Flow::getFlowStatus(Bitmap *status_map) const {
+ #endif
+   u_int16_t l7proto = ndpi_get_lower_proto(ndpiDetectedProtocol);
+ 
++  if(alerted_status != status_normal)
++    // TODO refactor
++    return(alerted_status);
++
+   status_map->reset();
+ 
+   if(iface->isPacketInterface() && iface->is_purge_idle_interface()
+@@ -3834,9 +3857,6 @@ FlowStatus Flow::getFlowStatus(Bitmap

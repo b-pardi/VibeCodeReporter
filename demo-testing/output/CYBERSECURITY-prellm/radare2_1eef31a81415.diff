@@ -1,0 +1,135 @@
+@@ -51,7 +51,8 @@
+ #define PDI_HEAP_BLOCKS     0x10
+ #define PDI_HEAP_ENTRIES_EX 0x200
+ 
+-#define RtlpHpHeapGlobalsOffset 0x44A0
++static size_t RtlpHpHeapGlobalsOffset = 0;
++static size_t RtlpLFHKeyOffset = 0;
+ 
+ #define CHECK_INFO(heapInfo)\
+ 	if (!heapInfo) {\
+@@ -119,6 +120,9 @@ static bool init_func() {
+ 	if (!RtlDestroyQueryDebugBuffer) {
+ 		RtlDestroyQueryDebugBuffer = (NTSTATUS (NTAPI *)(PDEBUG_BUFFER))GetProcAddress (ntdll, "RtlDestroyQueryDebugBuffer");
+ 	}
++	if (!w32_NtQueryInformationProcess) {
++		w32_NtQueryInformationProcess = (NTSTATUS *)GetProcAddress (ntdll, "NtQueryInformationProcess");
++	}
+ 	return true;
+ }
+ 
+@@ -232,40 +236,98 @@ static void free_extra_info(PDEBUG_HEAP_INFORMATION heap) {
+ 	}
+ }
+ 
+-static WPARAM GetNtDllOffset(RDebug *dbg) {
+-	r_return_val_if_fail (dbg, 0);
+-	RList *map_list = r_w32_dbg_maps (dbg);
+-	RListIter *iter;
++static bool GetHeapGlobalsOffset(RDebug *dbg, HANDLE h_proc) {
++	RList *modules = r_w32_dbg_modules (dbg);
++	RListIter *it;
+ 	RDebugMap *map;
+-	WPARAM ntdllOffset = 0;
+-	// Get ntdll .data location
+-	r_list_foreach (map_list, iter, map) {
+-		if (strstr (map->name, "ntdll.dll | .data")) {
+-			ntdllOffset = map->addr;
++	bool found = false;
++	const char ntdll[] = "ntdll.dll";
++	int oldfd = 0;
++	static ut64 lastNdtllAddr = 0;
++	r_list_foreach (modules, it, map) {
++		if (!strncmp(map->name, ntdll, sizeof (ntdll))) {
++			found = true;
+ 			break;
+ 		}
+ 	}
+-	r_list_free (map_list);
+-	return ntdllOffset;
++	if (!found) {
++		eprintf ("ntdll.dll not loaded.");
++		r_list_free (modules);
++		return false;
++	}
++	bool doopen = lastNdtllAddr != map->addr;
++	char *ntdllopen = dbg->corebind.cmdstrf (dbg->corebind.core, "ob~%s", ntdll);
++	if (*ntdllopen) {
++		char *saddr = strtok (ntdllopen, " ");
++		for (int i = 0; i < 3; i++) {
++			saddr = strtok (NULL, " ");
++		}
++		ut64 addr = r_num_math (NULL, saddr + 3);
++		if (doopen) {
++			// Close to reopen at the right address
++			int fd = atoi (ntdllopen);
++			dbg->corebind.cmdstrf (dbg->corebind.core, "o-%d", fd);
++			RtlpHpHeapGlobalsOffset = RtlpLFHKeyOffset = 0;
++		}
++	}
++
++	if (doopen) {
++		char *ntdllpath = r_lib_path ("ntdll");
++		eprintf ("Opening %s\n", ntdllpath);
++		dbg->corebind.cmdf (dbg->corebind.core, "o %s 0x%"PFMT64x"", ntdllpath, map->addr);
++		lastNdtllAddr = map->addr;
++	}
++	r_list_free (modules);
++
++	if (!RtlpHpHeapGlobalsOffset || !RtlpLFHKeyOffset) {
++		char *res = dbg->corebind.cmdstrf (dbg->corebind.core, "idpi~RtlpHpHeapGlobals");
++		if (!*res) {
++			// Try downloading the pdb
++			free (res);
++			dbg->corebind.cmd (dbg->corebind.core, "idpd");
++			res = dbg->corebind.cmdstrf (dbg->corebind.core, "idpi~RtlpHpHeapGlobals");
++		}
++		if (*res) {
++			RtlpHpHeapGlobalsOffset = r_num_math (NULL, res);
++		} else {
++			free (res);
++			return false;
++		}
++		free (res);
++		res = dbg->corebind.cmdstrf (dbg->corebind.core, "idpi~RtlpLFHKey");
++		if (*res) {
++			RtlpLFHKeyOffset = r_num_math (NULL, res);
++		}
++		free (res);
++	}
++
++	if (doopen) {
++		// Close ntdll.dll
++		char *res = dbg->corebind.cmdstrf (dbg->corebind.core, "o~%s", ntdll);
++		int fd = atoi (res);
++		free (res);
++		dbg->corebind.cmdf (dbg->corebind.core, "o-%d", fd);
++	}
++	return true;
+ }
+ 
+ static WPARAM GetLFHKey(RDebug *dbg, HANDLE h_proc, bool segment) {
+ 	r_return_val_if_fail (dbg, 0);
+ 	WPARAM lfhKey = 0;
+ 	WPARAM lfhKeyLocation;
+-	WPARAM ntdllOffset = GetNtDllOffset (dbg);
+ 
+-	if (ntdllOffset) {
+-		if (segment) {
+-			WPARAM RtlpHpHeapGlobals = ntdllOffset + RtlpHpHeapGlobalsOffset; // ntdll!RtlpHpHeapGlobals
+-			lfhKeyLocation = RtlpHpHeapGlobals + sizeof (WPARAM);
+-		} else {
+-			lfhKeyLocation = ntdllOffset + 0x7508; // ntdll!RtlpLFHKey
+-		}
+-		if (!ReadProcessMemory (h_proc, (PVOID)lfhKeyLocation, &lfhKey, sizeof (WPARAM), NULL)) {
+-			r_sys_perror ("ReadProcessMemory");
+-			eprintf ("LFH key not found.\n");
+-		}
++	if (!GetHeapGlobalsOffset (dbg, h_proc)) {
++		return 0;
++	}
++
++	if (segment) {
++		lfhKeyLocation = RtlpHpHeapGlobalsOffset + sizeof (WPARAM);
++	} else {
++

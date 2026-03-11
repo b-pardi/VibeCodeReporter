@@ -1,0 +1,133 @@
+@@ -11,3 +11,70 @@
+ // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
++
++#include <linux/bpf.h>
++#include <bpf/libbpf.h>    // for bpftool dyn loader struct 'bpf_map_def'
++
++#define CALICO_BPF_INLINE inline __attribute__((always_inline))
++
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++#define be32_to_host(value) __builtin_bswap32(value)
++#define be16_to_host(value) __builtin_bswap16(value)
++#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++#define be32_to_host(value) (value)
++#define be16_to_host(value) (value)
++#else
++#error "COMPILER ERROR: cannot determine target endianness."
++#endif
++
++
++/*
++ * BPF helper function stubs
++ */
++
++#define MAKEFUNC(ret_type,fname,...) \
++	static ret_type (*bpf_ ## fname)(__VA_ARGS__) = (void*) BPF_FUNC_ ## fname;
++
++#define BPF_REDIR_EGRESS 0
++#define BPF_REDIR_INGRESS 1
++MAKEFUNC(int, msg_redirect_hash,
++	struct sk_msg_md*, struct bpf_map_def*, void*, __u64)
++MAKEFUNC(int, sock_hash_update,
++	struct bpf_sock_ops*, struct bpf_map_def*, void*, __u64)
++MAKEFUNC(void*, map_lookup_elem, struct bpf_map_def*, const void*)
++
++/*
++ * Data types, structs, and unions
++ */
++
++struct ip4key {
++	__u32 mask;
++	__u32 addr;
++};
++
++union ip4_bpf_lpm_trie_key {
++	struct bpf_lpm_trie_key lpm;
++	struct ip4key ip;
++};
++
++// helper functions
++CALICO_BPF_INLINE void ip4val_to_lpm(
++	union ip4_bpf_lpm_trie_key *ret, __u32 mask, __u32 addr) {
++	ret->lpm.prefixlen = mask;
++	ret->ip.addr = addr;
++}
++
++CALICO_BPF_INLINE __u32 port_to_host(__u32 port) {
++	return be32_to_host(port) >> 16;
++}
++
++CALICO_BPF_INLINE __u32 safe_extract_port(__u32 port) {
++	// The verifier doesn't seem to like reading something different than
++	// 32 bits for these fields:
++	//
++	// https://github.com/torvalds/linux/commit/303def35f64e37bcd5401d202889f5fbc0241179#diff-ecd5cf968e9720d49c4360acef3e8e32R5160
++	//
++	// Trick the optimizer to load the full 32 bits
++	// instead of only 16.
++	return (port >> 16) | (port & 0xffff);
++}
+
+
+
+
+@@ -2,35 +2,27 @@
+ 
+ #include "sockops.h"
+ 
+-__attribute__(section("sk_msg"))
+-int calico_sk_msg(struct sk_msg_md *msg)
++__attribute__((section("calico_sk_msg_func")))
++enum sk_action calico_sk_msg(struct sk_msg_md *msg)
+ {
+ 	struct sock_key key = {};
+-	__u32 sip4, dip4, sport, dport;
++	__u32 sip, sport, dip, dport;
+ 	int err;
+ 
+-	dip4 = msg->remote_ip4;
+-	sip4 = msg->local_ip4;
++	dip = msg->remote_ip4;
++	sip = msg->local_ip4;
+ 
+-	// convert to network byte-order
+-	sport = __builtin_bswap32(msg->local_port) >> 16;
+-
+-	// The verifier doesn't seem to like reading something different than
+-	// 32 bits for these fields:
+-	//
+-	// https://github.com/torvalds/linux/commit/303def35f64e37bcd5401d202889f5fbc0241179#diff-ecd5cf968e9720d49c4360acef3e8e32R5160
+-	//
+-	// Trick the optimizer to load the full 32 bits
+-	// instead of only 16.
+-	dport = (msg->remote_port >> 16) | (msg->remote_port & 0xffff);
++	sport = port_to_host(msg->local_port);
++	dport = safe_extract_port(msg->remote_port);
+ 
++	if (sip == ENVOY_IP && sport == ENVOY_PORT) {
+ 	// If the source is envoy, we need to redirect to the socket to the
+ 	// other end. That is, not on the envoy side and with an IP/port
+ 	// matching the destination IP/port.
+-	if (sip4 == ENVOY_IP && sport == ENVOY_PORT) {
+-		key.ip4 = dip4;
++		key.ip4 = dip;
+ 		key.port = dport;
+ 		key.envoy_side = 0;
++	} else {
+ 	// The destination IP/port is usually never envoy in our testing
+ 	// because we get executed before the destination address is rewritten
+ 	// by iptables so the packet from the app still has the destination
+@@ -41,17 +33,16 @@ int calico_sk_msg(struct sk_msg_md *msg)
+ 	// rest of the stack). We need to redirect to the socket envoy is
+ 	// listening on, which is addressed by setting envoy side and the
+ 	// IP/port of the app.
+-	} else {
+-		key.ip4 = sip4;
++		key.ip4 = sip;
+ 		key.port = sport;
+ 		key.envoy_side = 1;
+ 	}
+ 
+-	err = bpf_msg_redirect_hash(ms

@@ -1,0 +1,99 @@
+@@ -4,6 +4,7 @@ import static org.batfish.representation.aws.InternetGateway.BACKBONE_INTERFACE_
+ 
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableSet;
+ import java.io.IOException;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -69,6 +70,13 @@ public class AwsConfiguration extends VendorConfiguration {
+     for (Region region : _regions.values()) {
+       region.toConfigurationNodes(_convertedConfiguration, getWarnings());
+     }
++    // We do this de-duplication because cross-region connections will show up in both regions
++    Set<VpcPeeringConnection> vpcPeeringConnections =
++        _regions.values().stream()
++            .flatMap(r -> r.getVpcPeeringConnections().values().stream())
++            .collect(ImmutableSet.toImmutableSet());
++    vpcPeeringConnections.forEach(
++        c -> c.createConnection(_regions, _convertedConfiguration, getWarnings()));
+   }
+ 
+   @Override
+
+
+
+
+@@ -15,6 +15,7 @@ public interface AwsVpcEntity {
+   String JSON_KEY_BGP_ASN = "BgpAsn";
+   String JSON_KEY_CIDR_BLOCK = "CidrBlock";
+   String JSON_KEY_CIDR_BLOCK_ASSOCIATION_SET = "CidrBlockAssociationSet";
++  String JSON_KEY_CIDR_BLOCK_SET = "CidrBlockSet";
+   String JSON_KEY_CIDR_IP = "CidrIp";
+   String JSON_KEY_CODE = "Code";
+   String JSON_KEY_CREATED = "Created";
+@@ -115,6 +116,8 @@ public interface AwsVpcEntity {
+   String JSON_KEY_VPN_GATEWAYS = "VpnGateways";
+ 
+   String STATE_DELETED = "deleted";
++
++  String STATUS_ACTIVE = "active";
+   String STATUS_DELETED = "deleted";
+ 
+   String XML_KEY_ASN = "asn";
+
+
+
+
+@@ -304,7 +304,7 @@ final class Region implements Serializable {
+         return json -> {
+           String code =
+               json.get(AwsVpcEntity.JSON_KEY_STATUS).get(AwsVpcEntity.JSON_KEY_CODE).textValue();
+-          if (!code.equals(AwsVpcEntity.STATUS_DELETED)) {
++          if (code.equals(AwsVpcEntity.STATUS_ACTIVE)) {
+             VpcPeeringConnection vpcPeerConn =
+                 BatfishObjectMapper.mapper().convertValue(json, VpcPeeringConnection.class);
+             _vpcPeerings.put(vpcPeerConn.getId(), vpcPeerConn);
+@@ -488,6 +488,8 @@ final class Region implements Serializable {
+       vpnConnection.applyToVpnGateway(awsConfiguration, this, warnings);
+     }
+ 
++    // VpcPeeringConnections are processed in AwsConfiguration since they can be cross region
++
+     applySecurityGroupsAcls(awsConfiguration.getConfigurationNodes());
+ 
+     // TODO: for now, set all interfaces to have the same bandwidth
+
+
+
+
+@@ -2,6 +2,9 @@ package org.batfish.representation.aws;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static org.batfish.representation.aws.Utils.addStaticRoute;
++import static org.batfish.representation.aws.Utils.connect;
++import static org.batfish.representation.aws.Utils.getInterfaceIp;
++import static org.batfish.representation.aws.Utils.suffixedInterfaceName;
+ import static org.batfish.representation.aws.Utils.toStaticRoute;
+ 
+ import com.fasterxml.jackson.annotation.JsonCreator;
+@@ -28,9 +31,9 @@ import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.IpAccessList;
+ import org.batfish.datamodel.Prefix;
+ import org.batfish.datamodel.StaticRoute;
++import org.batfish.datamodel.Vrf;
+ import org.batfish.representation.aws.NetworkAcl.NetworkAclAssociation;
+ import org.batfish.representation.aws.Route.State;
+-import org.batfish.representation.aws.Route.TargetType;
+ 
+ /**
+  * Representation of an AWS subnet
+@@ -156,11 +159,12 @@ public class Subnet implements AwsVpcEntity, Serializable {
+             instancesIfaceName, cfgNode, instancesIfaceAddress, "To instances " + _subnetId);
+ 
+     // connect to the VPC
+-    Configuration vpcConfigNode = awsConfiguration.getConfigurationNodes().get(_vpcId);
+-    Utils.connect(awsConfiguration, cfgNode, vpcConfigNode);
++    Configuration vpcConfigNode =
++        awsConfiguration.getConfigurationNodes().get(Vpc.nodeName(_vpcId));
++    connect(awsConfi

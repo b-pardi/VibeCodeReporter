@@ -1,0 +1,108 @@
+@@ -28,33 +28,25 @@ class PacketDumper {
+  private:
+   NetworkInterface *iface;
+   pcap_dumper_t *dumper;
+-  u_int64_t num_sampled_packets, num_dumped_packets, num_dumped_unknown_packets;
+-  u_int32_t file_id, num_dumped_unknown_files;
++  u_int32_t file_id;
+   u_int16_t iface_type;
+-  time_t sec_start;
+-  int sampling_rate;
+-  unsigned int max_pkts_per_file;
+-  unsigned int num_pkts_cur_file;
++  u_int64_t num_dumped_packets;
++  u_int64_t max_bytes_per_file;
++  u_int64_t num_bytes_cur_file;
+   char *out_path;
+ 
+  public:
+-  PacketDumper(NetworkInterface *i);
+   PacketDumper(NetworkInterface *i, const char *path);
+   ~PacketDumper();
+ 
+   void init(NetworkInterface *i);
+   void closeDump();
+-  void idle(time_t when);
+-  bool checkClose(time_t when);
+-  bool openDump(time_t when, int sampling_rate);
+-  void dumpPacket(const struct pcap_pkthdr *h, const u_char *packet,
+-                  dump_reason reason, int sampling_rate);
+-  inline u_int64_t get_num_dumped_packets() { return(num_dumped_packets+num_dumped_unknown_packets); }
+-  inline u_int64_t get_num_dumped_files()   { return(file_id+num_dumped_unknown_files); }
+-  void lua(lua_State *vm);
+-  inline void incUnknownPacketDump(u_int16_t num_pkts) {
+-    num_dumped_unknown_packets += num_pkts, num_dumped_unknown_files++;
+-  }
++  void idle();
++  bool checkClose();
++  bool openDump();
++  void dumpPacket(const struct pcap_pkthdr *h, const u_char *packet);
++  inline u_int64_t get_num_dumped_packets() { return num_dumped_packets; }
++  inline u_int64_t get_num_dumped_files()   { return file_id; }
+ };
+ 
+ #endif /* _PACKET_DUMPER_H_ */
+
+
+
+
+@@ -76,6 +76,7 @@ class Prefs {
+   int32_t max_num_alerts_per_entity, max_num_flow_alerts;
+   u_int32_t safe_search_dns_ip, global_primary_dns_ip, global_secondary_dns_ip;
+   u_int32_t max_num_packets_per_tiny_flow, max_num_bytes_per_tiny_flow;
++  u_int32_t max_extracted_pcap_mbytes;
+   u_int32_t max_ui_strlen;
+   u_int8_t default_l7policy;
+   u_int8_t num_ts_slots, ts_num_steps;
+@@ -323,8 +324,10 @@ class Prefs {
+   inline int32_t   get_max_num_alerts_per_entity()       { return(max_num_alerts_per_entity); };
+   inline int32_t   get_max_num_flow_alerts()             { return(max_num_flow_alerts); };
+ 
+-  inline u_int32_t get_max_num_packets_per_tiny_flow()  { return(max_num_packets_per_tiny_flow); }
+-  inline u_int32_t get_max_num_bytes_per_tiny_flow()    { return(max_num_bytes_per_tiny_flow); }
++  inline u_int32_t get_max_num_packets_per_tiny_flow()  { return(max_num_packets_per_tiny_flow); };
++  inline u_int32_t get_max_num_bytes_per_tiny_flow()    { return(max_num_bytes_per_tiny_flow); };
++
++  inline u_int64_t get_max_extracted_pcap_mbytes() { return max_extracted_pcap_mbytes; };
+ 
+   inline u_int32_t get_safe_search_dns_ip()      { return(safe_search_dns_ip);                          };
+   inline u_int32_t get_global_primary_dns_ip()   { return(global_primary_dns_ip);                       };
+
+
+
+
+@@ -247,11 +247,12 @@
+ 
+ #define CONST_DEMO_MODE_DURATION       600 /* 10 min */
+ #define CONST_MAX_DUMP_DURATION        300 /* 5 min */
+-#define CONST_DUMP_SAMPLING_RATE       1   /* sampling disabled by default */
+ #define CONST_MAX_NUM_PACKETS_PER_LIVE 100000 /* live captures via HTTP */
+-#define CONST_MAX_NUM_PACKETS_PER_DUMP 1000000
+ #define CONST_MAX_DUMP                 500000000
+ 
++#define CONST_MAX_EXTR_PCAP_MBYTES NTOPNG_PREFS_PREFIX".max_extracted_pcap_mbytes"
++#define CONST_DEFAULT_MAX_EXTR_PCAP_MBYTES 100
++
+ #define MIN_CONNTRACK_UPDATE           3  /* sec */
+ #define MIN_NETFILTER_UPDATE           30 /* sec */
+ 
+
+
+
+
+@@ -23,12 +23,6 @@
+ 
+ /* ********************************************* */
+ 
+-PacketDumper::PacketDumper(NetworkInterface *i) {
+-  init(i);
+-}
+-
+-/* ********************************************* */
+-
+ PacketDumper::PacketDumper(NetworkInterface *i, const char *path) {
+   init(i);
+   out_path = strdup(path); 
+@@ -46,15 +40,15 @@ PacketDumper::~PacketDumper() {
+ void PacketDumper::init(NetworkInterface *i) {
+   char *name = i->get

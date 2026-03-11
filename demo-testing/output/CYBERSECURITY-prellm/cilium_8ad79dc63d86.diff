@@ -1,0 +1,154 @@
+@@ -79,6 +79,8 @@ int main(void)
+ 	DECLARE(struct, lb6_affinity_key, iter);
+ 	DECLARE(struct, lb_affinity_val, iter);
+ 	DECLARE(struct, lb_affinity_match, iter);
++	DECLARE(struct, lb4_src_range_key, iter);
++	DECLARE(struct, lb6_src_range_key, iter);
+ 
+ 	return 0;
+ }
+
+
+
+
+@@ -362,6 +362,7 @@ enum {
+ #define DROP_IS_CLUSTER_IP	-174
+ #define DROP_FRAG_NOT_FOUND	-175
+ #define DROP_FORBIDDEN_ICMP6	-176
++#define DROP_NOT_IN_SRC_RANGE	-177
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ 
+@@ -538,6 +539,7 @@ enum {
+ 	SVC_FLAG_AFFINITY     = (1 << 4),  /* sessionAffinity=clientIP */
+ 	SVC_FLAG_LOADBALANCER = (1 << 5),  /* LoadBalancer service */
+ 	SVC_FLAG_ROUTABLE     = (1 << 6),  /* Not a surrogate/ClusterIP entry */
++	SVC_FLAG_SOURCE_RANGE = (1 << 7),  /* Check LoadBalancer source range */
+ };
+ 
+ struct ipv6_ct_tuple {
+@@ -755,6 +757,23 @@ struct ct_state {
+ 	__u16 backend_id;	/* Backend ID in lb4_backends */
+ };
+ 
++#define SRC_RANGE_STATIC_PREFIX(STRUCT)		\
++	(8 * (sizeof(STRUCT) - sizeof(struct bpf_lpm_trie_key)))
++
++struct lb4_src_range_key {
++	struct bpf_lpm_trie_key lpm_key;
++	__u16 rev_nat_id;
++	__u16 pad;
++	__u32 addr;
++};
++
++struct lb6_src_range_key {
++	struct bpf_lpm_trie_key lpm_key;
++	__u16 rev_nat_id;
++	__u16 pad;
++	union v6addr addr;
++};
++
+ static __always_inline int redirect_peer(int ifindex __maybe_unused,
+ 					 __u32 flags __maybe_unused)
+ {
+
+
+
+
+@@ -48,6 +48,17 @@ struct bpf_elf_map __section_maps LB6_AFFINITY_MAP = {
+ };
+ #endif
+ 
++#ifdef ENABLE_SRC_RANGE_CHECK
++struct bpf_elf_map __section_maps LB6_SRC_RANGE_MAP = {
++	.type		= BPF_MAP_TYPE_LPM_TRIE,
++	.size_key	= sizeof(struct lb6_src_range_key),
++	.size_value	= sizeof(__u8),
++	.pinning	= PIN_GLOBAL_NS,
++	.max_elem	= LB6_SRC_RANGE_MAP_SIZE,
++	.flags		= BPF_F_NO_PREALLOC,
++};
++#endif
++
+ #endif /* ENABLE_IPV6 */
+ 
+ #ifdef ENABLE_IPV4
+@@ -88,6 +99,17 @@ struct bpf_elf_map __section_maps LB4_AFFINITY_MAP = {
+ };
+ #endif
+ 
++#ifdef ENABLE_SRC_RANGE_CHECK
++struct bpf_elf_map __section_maps LB4_SRC_RANGE_MAP = {
++	.type		= BPF_MAP_TYPE_LPM_TRIE,
++	.size_key	= sizeof(struct lb4_src_range_key),
++	.size_value	= sizeof(__u8),
++	.pinning	= PIN_GLOBAL_NS,
++	.max_elem	= LB4_SRC_RANGE_MAP_SIZE,
++	.flags		= BPF_F_NO_PREALLOC,
++};
++#endif
++
+ #endif /* ENABLE_IPV4 */
+ 
+ #ifdef ENABLE_SESSION_AFFINITY
+@@ -188,6 +210,26 @@ bool lb6_svc_is_hostport(const struct lb6_service *svc __maybe_unused)
+ #endif /* ENABLE_HOSTPORT */
+ }
+ 
++static __always_inline
++bool lb4_svc_has_src_range_check(const struct lb4_service *svc __maybe_unused)
++{
++#ifdef ENABLE_SRC_RANGE_CHECK
++	return svc->flags & SVC_FLAG_SOURCE_RANGE;
++#else
++	return false;
++#endif /* ENABLE_SRC_RANGE_CHECK */
++}
++
++static __always_inline
++bool lb6_svc_has_src_range_check(const struct lb6_service *svc __maybe_unused)
++{
++#ifdef ENABLE_SRC_RANGE_CHECK
++	return svc->flags & SVC_FLAG_SOURCE_RANGE;
++#else
++	return false;
++#endif /* ENABLE_SRC_RANGE_CHECK */
++}
++
+ static __always_inline
+ bool lb4_svc_is_local_scope(const struct lb4_service *svc)
+ {
+@@ -437,6 +479,31 @@ static __always_inline int lb6_extract_key(struct __ctx_buff *ctx __maybe_unused
+ 	return extract_l4_port(ctx, tuple->nexthdr, l4_off, &key->dport, NULL);
+ }
+ 
++static __always_inline
++bool lb6_src_range_ok(const struct lb6_service *svc __maybe_unused,
++		      const union v6addr *saddr __maybe_unused)
++{
++#ifdef ENABLE_SRC_RANGE_CHECK
++	struct lb6_src_range_key key;
++
++	if (!lb6_svc_has_src_range_check(svc))
++		return true;
++
++	key = (typeof(key)) {
++		.lpm_key = { SRC_RANGE_STATIC_PREFIX(key), {} },
++		.rev_nat_id = svc->rev_nat_index,
++		.addr = *saddr,
++	};
++
++	if (map_lookup_elem(&LB6_SRC_RANGE_MAP, &key))
++		return true;
++
++	return false;
++#else
++	return true;
++#endif /* ENABLE_SRC_RANGE_CHECK */
++}
++
+ static __always_inline
+ struct lb6_service *lb6_lookup_service(struct lb6_key *key,
+ 				       const bool scope_switch)
+@@ -904,6 +971,31 @@ static __always_inline int lb4_extract_key(struct __ctx_buff *ctx __maybe_unused
+ 	return extract_l4_port(ctx, ip4->protoco

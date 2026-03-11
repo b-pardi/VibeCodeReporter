@@ -1,0 +1,140 @@
+@@ -2,6 +2,7 @@
+ 
+ // project class definition to be used by project.c
+ 
++#include "rvc.h"
+ #include <r_core.h>
+ 
+ R_API RProject *r_project_new(void) {
+@@ -38,6 +39,7 @@ R_API void r_project_close(RProject *p) {
+ 	// close the current project
+ 	R_FREE (p->name);
+ 	R_FREE (p->path);
++	r_vc_close (p->rvc, true);
+ }
+ 
+ R_API bool r_project_open(RProject *p, const char *name, const char *path) {
+
+
+
+
+@@ -317,6 +317,19 @@ static bool r_core_project_load(RCore *core, const char *prj_name, const char *r
+ 	} else {
+ 		ret = r_core_cmd_file (core, rcpath);
+ 	}
++	char *prj_path = r_file_dirname(rcpath);
++	if (prj_path) {
++		//check if the project uses git
++		Rvc *vc = r_vc_git_open (prj_path);
++		if (!vc) {
++			// if the project does not use git, try rvc
++			vc = r_vc_open (prj_path);
++		}
++		core->prj->rvc = vc;
++		free (prj_path);
++	} else {
++		eprintf ( "Failed to load rvc\n");
++	}
+ 	r_config_set_b (core->config, "cfg.fortunes", cfg_fortunes);
+ 	r_config_set_b (core->config, "scr.interactive", scr_interactive);
+ 	r_config_set_b (core->config, "scr.prompt", scr_prompt);
+@@ -662,9 +675,10 @@ R_API bool r_core_project_save(RCore *core, const char *prj_name) {
+ 		free (prj_bin_dir);
+ 		free (bin_file);
+ 	}
+-	if (r_config_get_b (core->config, "prj.vc")) {
+-		if (!rvc_git_repo_exists (core, prj_dir)) {
+-			if (!rvc_git_init (core, prj_dir)) {
++	if (core->prj->rvc || r_config_get_b (core->config, "prj.vc")) {
++		// assume that if the repo is not loaded, the repo doesn't exist
++		if (!core->prj->rvc) {
++			if (!(core->prj->rvc = rvc_git_init (core, prj_dir))) {
+ 				free (prj_dir);
+ 				free (script_path);
+ 				return false;
+@@ -673,7 +687,8 @@ R_API bool r_core_project_save(RCore *core, const char *prj_name) {
+ 		RList *paths = r_list_new ();
+ 		if (paths) {
+ 			if (r_list_append (paths, prj_dir)) {
+-				if (!rvc_git_commit (core, prj_dir, NULL, NULL, paths)) {
++				if (!rvc_git_commit (core, core->prj->rvc,
++							NULL, NULL, paths)) {
+ 					r_list_free (paths);
+ 					free (prj_dir);
+ 					free (script_path);
+
+
+
+
+@@ -192,13 +192,13 @@ static void free_blobs(RList *blobs) {
+ 	r_list_free (blobs);
+ }
+ 
+-static char *absp2rp(const char *rp, const char *absp) {
++static char *absp2rp(Rvc *rvc, const char *absp) {
+ 	char *p;
+-	char *arp = r_file_abspath (rp);
++	char *arp = r_file_abspath (rvc->path);
+ 	if (!arp) {
+ 		return NULL;
+ 	}
+-	if (r_str_len_utf8 (arp) < r_str_len_utf8 (rp)) {
++	if (r_str_len_utf8 (arp) < r_str_len_utf8 (rvc->path)) {
+ 		free (arp);
+ 		return NULL;
+ 	}
+@@ -212,8 +212,8 @@ static char *absp2rp(const char *rp, const char *absp) {
+ 	return ret;
+ }
+ 
+-char *rp2absp(const char *rp, const char *path) {
+-	char *arp = r_file_abspath (rp);
++char *rp2absp(Rvc *rvc, const char *path) {
++	char *arp = r_file_abspath (rvc->path);
+ 	if (!arp) {
+ 		return NULL;
+ 	}
+@@ -229,14 +229,13 @@ char *rp2absp(const char *rp, const char *path) {
+ 
+ //TODO:Make the tree related functions abit cleaner & more efficient
+ 
+-static RList *get_commits(const char *rp, const size_t max_num) {
++static RList *get_commits(Rvc *rvc, const size_t max_num) {
+ 	char *i;
+ 	RList *ret = r_list_new ();
+ 	if (!ret) {
+ 		return NULL;
+ 	}
+-	Sdb *db = vcdb_open(rp);
+-	i = sdb_get (db, sdb_const_get (db, CURRENTB, 0), 0);
++	i = sdb_get (rvc->db, sdb_const_get (rvc->db, CURRENTB, 0), 0);
+ 	if (!i) {
+ 		r_list_free (ret);
+ 		ret = NULL;
+@@ -251,7 +250,7 @@ static RList *get_commits(const char *rp, const size_t max_num) {
+ 			ret = NULL;
+ 			break;
+ 		}
+-		i = sdb_get (db, i, 0);
++		i = sdb_get (rvc->db, i, 0);
+ 		if (!i) {
+ 			r_list_free (ret);
+ 			ret = NULL;
+@@ -262,8 +261,6 @@ static RList *get_commits(const char *rp, const size_t max_num) {
+ 		}
+ 	}
+ ret:
+-	sdb_unlink (db);
+-	sdb_free (db);
+ 	return ret;
+ }
+ 
+@@ -322,8 +319,8 @@ fail_ret:
+ 
+ }
+ 
+-static int branch_exists(const char *rp, const char *bname) {
+-	RList *branches = r_vc_get_branches (rp);
++static int branch_exists(Rvc *rvc, const char *bname) {
++	RList *branches = r_vc_get_branches (rvc);
+ 	if (!branches

@@ -1,0 +1,83 @@
+@@ -683,7 +683,6 @@ class Flow : public GenericHashEntry {
+   inline bool isIngress2EgressDirection() { return(ingress2egress_direction); }
+ #endif
+   void housekeep(time_t t);
+-  void postFlowSetIdle(time_t t);
+   void setParsedeBPFInfo(const ParsedeBPF * const ebpf, bool src2dst_direction);
+   inline const ContainerInfo* getClientContainerInfo() const {
+     return cli_ebpf && cli_ebpf->container_info_set ? &cli_ebpf->container_info : NULL;
+
+
+
+
+@@ -60,7 +60,7 @@ class Host : public GenericHashEntry, public AlertableEntity {
+   AlertCounter *flow_flood_attacker_alert, *flow_flood_victim_alert;
+   u_int32_t syn_sent_last_min, synack_recvd_last_min; /* syn scan counters (attacker) */
+   u_int32_t syn_recvd_last_min, synack_sent_last_min; /* syn scan counters (victim) */
+-  MonitoredGauge<u_int32_t> num_active_flows_as_client, num_active_flows_as_server;
++  std::atomic<u_int32_t> num_active_flows_as_client, num_active_flows_as_server; /* Need atomic as inc/dec done on different threads */
+   u_int32_t asn;
+   AutonomousSystem *as;
+   Country *country;
+@@ -318,8 +318,8 @@ class Host : public GenericHashEntry, public AlertableEntity {
+   inline void incTotalAlerts(AlertType alert_type) { stats->incTotalAlerts(alert_type); }
+   inline u_int32_t getTotalAlerts()       { return(stats->getTotalAlerts()); }
+   virtual u_int32_t getActiveHTTPHosts()  const { return(0); };
+-  inline u_int32_t getNumOutgoingFlows()  const { return(num_active_flows_as_client.get()); }
+-  inline u_int32_t getNumIncomingFlows()  const { return(num_active_flows_as_server.get()); }
++  inline u_int32_t getNumOutgoingFlows()  const { return(num_active_flows_as_client); }
++  inline u_int32_t getNumIncomingFlows()  const { return(num_active_flows_as_server); }
+   inline u_int32_t getNumActiveFlows()    const { return(getNumOutgoingFlows()+getNumIncomingFlows()); }
+   inline u_int32_t getTotalNumFlowsAsClient() const { return(stats->getTotalNumFlowsAsClient());  };
+   inline u_int32_t getTotalNumFlowsAsServer() const { return(stats->getTotalNumFlowsAsServer());  };
+
+
+
+
+@@ -527,6 +527,7 @@ class NetworkInterface : public AlertableEntity {
+   virtual u_int32_t periodicStatsUpdateFrequency() const;
+   void periodicStatsUpdate();
+   void purgeQueuedIdleEntries();
++  void purgeQueuedIdleFlows();
+   struct timeval periodicUpdateInitTime() const;
+   virtual u_int32_t getFlowMaxIdle();
+ 
+
+
+
+
+@@ -99,8 +99,7 @@ Flow::Flow(NetworkInterface *_iface,
+   if(cli_host) {
+     NetworkStats *network_stats = cli_host->getNetworkStats(cli_host->get_local_network_id());
+ 
+-    cli_host->incUses();
+-    cli_host->incNumFlows(last_seen, true);
++    cli_host->incUses(), cli_host->incNumFlows(last_seen, true);
+     if(network_stats) network_stats->incNumFlows(last_seen, true);
+     cli_ip_addr = cli_host->get_ip();
+     cli_host->incCliContactedHosts(_srv_ip);
+@@ -113,8 +112,7 @@ Flow::Flow(NetworkInterface *_iface,
+   if(srv_host) {
+     NetworkStats *network_stats = srv_host->getNetworkStats(srv_host->get_local_network_id());
+ 
+-    srv_host->incUses();
+-    srv_host->incNumFlows(last_seen, false);
++    srv_host->incUses(), srv_host->incNumFlows(last_seen, false);
+     if(network_stats) network_stats->incNumFlows(last_seen, false);
+     srv_ip_addr = srv_host->get_ip();
+ 
+@@ -251,16 +249,78 @@ Flow::~Flow() {
+   }
+ #endif
+ 
+-  if(cli_host)
+-    cli_host->decUses();
+-  else if(cli_ip_addr) /* Dynamically allocated only when cli_host was NULL */
++  /*
++    Get client and server hosts. Use unsafe* methods to get the client and server also for 'viewed' interfaces.
++    For 'viewed' interfaces, host pointers are shared across multiple 'viewed' interfaces and thus they are termed as unsafe.
++    However, as Flow destructors are called by the view interface sequentially on all the 'viewed' interfaces,
++    it is safe to use usafe pointers.
++
++    NOTE: Host scores are decreased here in a safe way as ~Flows are deleted in the same thread that performs user script
++    hook calls which causes sco

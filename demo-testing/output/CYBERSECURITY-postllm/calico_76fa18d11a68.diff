@@ -1,0 +1,109 @@
+@@ -24,237 +24,60 @@ struct ct_iter_ctx {
+ 	__u64 now;
+ 	__u64 end_time;
+ 
+-	__u64 num_kvs_seen_normal;
+-	__u64 num_kvs_seen_nat_fwd;
+-	__u64 num_kvs_seen_nat_rev;
+-	__u64 num_kvs_deleted_normal;
+-	__u64 num_kvs_deleted_nat_fwd;
+-	__u64 num_kvs_deleted_nat_rev;
++	__u64 num_cleaned;
+ };
+ 
+-// sub_age calculates now-then assuming that the difference is less than
+-// 1<<63.  Values larger than that are assumed to have wrapped (then>now) and
+-// 0 is returned in that case.
+-static __u64 sub_age(__u64 now, __u64 then)
++// process_ccq_entry processes an entry in the "cleanup queue" map. The map
++// is keyed with conntrack key which the userspace cleaner sees as expired.
++// The value has <rev_key>:<last_seen_ts>:<rev_last_seen_ts>
++// The rev_key is dummy for Normal and reverse entries and is valid for Forward entry.
++static long process_ccq_entry(void *map, struct calico_ct_key *key, struct cali_ccq_value *value, void *ctx)
+ {
+-	__u64 age = now - then;
+-	if (age > (1ull<<63)) {
+-		// Wrapped, assume that means then > now.
+-		return 0;
+-	}
+-	return age;
+-}
+-
+-#define CT_VALUE_FINS_SEEN_DSR(value) (value->a_to_b.fin_seen || value->b_to_a.fin_seen)
+-#define CT_VALUE_FINS_SEEN_NON_DSR(value) (value->a_to_b.fin_seen && value->b_to_a.fin_seen)
+-#define CT_VALUE_ESTABLISHED(value) (value->a_to_b.syn_seen && value->a_to_b.ack_seen && value->b_to_a.syn_seen && value->b_to_a.ack_seen)
+-#define CT_VALUE_DSR(value) (value->flags & CALI_CT_FLAG_DSR_FWD)
+-
+-// max_age returns the maximum age for the given conntrack "tracking" entry.
+-static __u64 calculate_max_age(const struct calico_ct_key *key, const struct calico_ct_value *value)
+-{
+-	__u64 max_age;
+-	switch (key->protocol) {
+-	case IPPROTO_TCP:
+-		if (value->a_to_b.rst_seen || value->b_to_a.rst_seen) {
+-			max_age = __globals.tcp_reset_seen;
+-		} else if (
+-		    (CT_VALUE_DSR(value) && CT_VALUE_FINS_SEEN_DSR(value)) ||
+-		    CT_VALUE_FINS_SEEN_NON_DSR(value)
+-		) {
+-			max_age = __globals.tcp_fins_seen;
+-		} else if (CT_VALUE_ESTABLISHED(value) || CT_VALUE_DSR(value)) {
+-			if (value->rst_seen) {
+-				/* We have seen RST in the past, but we have seen traffic
+-				 * since then so we want to be cautious and not tear down
+-				 * the conntrack too soon in case the RST was spurious,
+-				 * but we are also not sure if the connection is still
+-				 * established.
+-				 */
+-				max_age = __globals.tcp_fins_seen;
+-			} else {
+-				max_age = __globals.tcp_established;
+-			}
+-		} else {
+-			max_age = __globals.tcp_syn_sent;
+-		}
+-		break;
+-	case IPPROTO_UDP:
+-		max_age = __globals.udp_timeout;
+-		break;
+-	case IPPROTO_ICMP_46:
+-		max_age = __globals.icmp_timeout;
+-		break;
+-	default:
+-		max_age = __globals.generic_timeout;
+-		break;
+-	}
+-	CALI_DEBUG("max_age %d", max_age / 1000000000);
+-	return max_age;
+-}
+-
+-static bool entry_expired(const struct calico_ct_key *key, const struct calico_ct_value *value, struct ct_iter_ctx *ctx)
+-{
+-	__u64 age = sub_age(ctx->now, value->last_seen);
+-	__u64 max_age = calculate_max_age(key, value);
+-	return age > max_age;
+-}
+-
+-// process_ct_entry callback function for the conntrack map iteration.  Checks
+-// the entry for expiry.  Expired normal entries are deleted inline.  Expired
+-// NAT entries are queued for deletion in the cali_ccq map.
+-static long process_ct_entry(void *map, const void *key, void *value, void *ctx)
+-{
+-	const struct calico_ct_key *ct_key = key;
+-	struct calico_ct_value *ct_value = value;
+-	struct calico_ct_value *rev_value;
+ 	struct ct_iter_ctx *ictx = ctx;
+-
+-	__u64 age = sub_age(ictx->now, ct_value->last_seen);
+-	__u64 age_s = age/1000000000ull;
+-
+-	CALI_DEBUG("Checking: proto=%d " IP_FMT ":%d", ct_key->protocol, debug_ip(ct_key->addr_a), ct_key->port_a);
+-	CALI_DEBUG("  <-> " IP_FMT ":%d age=%ds", debug_ip(ct_key->addr_b), ct_key->port_b, age_s);
+-
+-	__u64 max_age, max_age_s;
+-
+-	switch (ct_value->type) {
+-	case CALI_CT_TYPE_NORMAL:
+-		// Non-NAT entry, we only need to look at this entry to determine if it
+-		// has expired.
+-		ictx->num_k

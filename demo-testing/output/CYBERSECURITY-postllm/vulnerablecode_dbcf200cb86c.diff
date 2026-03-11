@@ -1,0 +1,92 @@
+@@ -11,9 +11,11 @@ import logging
+ from typing import Iterable
+ 
+ from dotenv import load_dotenv
++from packageurl import PackageURL
+ 
+ from vulnerabilities import utils
+ from vulntotal.validator import DataSource
++from vulntotal.validator import InvalidCVEError
+ from vulntotal.validator import VendorData
+ from vulntotal.vulntotal_utils import get_item
+ from vulntotal.vulntotal_utils import github_constraints_satisfied
+@@ -27,7 +29,7 @@ class GithubDataSource(DataSource):
+ 
+     def fetch_github(self, graphql_query):
+         """
+-        Requires GitHub API key in .env file
++        Requires GitHub API key in .env file.
+         For example::
+ 
+                 GH_TOKEN="your-github-token"
+@@ -39,7 +41,7 @@ class GithubDataSource(DataSource):
+         end_cursor = ""
+         interesting_edges = []
+         while True:
+-            queryset = generate_graphql_payload(purl, end_cursor)
++            queryset = generate_graphql_payload_from_purl(purl, end_cursor)
+             response = self.fetch_github(queryset)
+             self._raw_dump.append(response)
+             security_advisories = get_item(response, "data", "securityVulnerabilities")
+@@ -47,7 +49,28 @@ class GithubDataSource(DataSource):
+             end_cursor = get_item(security_advisories, "pageInfo", "endCursor")
+             if not security_advisories["pageInfo"]["hasNextPage"]:
+                 break
+-        return parse_advisory(interesting_edges)
++        return parse_advisory(interesting_edges, purl)
++
++    def datasource_advisory_from_cve(self, cve: str) -> Iterable[VendorData]:
++        if not cve.upper().startswith("CVE-"):
++            raise InvalidCVEError
++
++        queryset = generate_graphql_payload_from_cve(cve)
++        response = self.fetch_github(queryset)
++        self._raw_dump = [response]
++        grouped_advisory = group_advisory_by_package(response, cve)
++
++        for advisory in grouped_advisory:
++            ecosystem = get_item(advisory, "package", "ecosystem")
++            ecosystem = get_purl_type(ecosystem)
++            package_name = get_item(advisory, "package", "name")
++            purl = PackageURL.from_string(f"pkg:{ecosystem}/{package_name}")
++            yield VendorData(
++                purl=purl,
++                aliases=sorted(list(set(advisory.get("identifiers", None)))),
++                affected_versions=sorted(list(set(advisory.get("firstPatchedVersion", None)))),
++                fixed_versions=sorted(list(set(advisory.get("vulnerableVersionRange", None)))),
++            )
+ 
+     @classmethod
+     def supported_ecosystem(cls):
+@@ -61,10 +84,21 @@ class GithubDataSource(DataSource):
+             "rust": "RUST",
+             "npm": "NPM",
+             "erlang": "ERLANG",
++            "pub": "PUB",
+         }
+ 
+ 
+-def parse_advisory(interesting_edges) -> Iterable[VendorData]:
++def parse_advisory(interesting_edges, purl) -> Iterable[VendorData]:
++    """
++    Parses the GraphQL response and yields VendorData instances.
++
++    Parameters:
++        interesting_edges (list): List of edges containing security advisory.
++        purl (PackageURL): PURL to be included in VendorData.
++
++    Yields:
++        VendorData instance containing purl, aliases, affected_versions and fixed_versions.
++    """
+     for edge in interesting_edges:
+         node = edge["node"]
+         aliases = [aliase["value"] for aliase in get_item(node, "advisory", "identifiers")]
+@@ -72,6 +106,7 @@ def parse_advisory(interesting_edges) -> Iterable[VendorData]:
+         parsed_fixed_versions = get_item(node, "firstPatchedVersion", "identifier")
+         fixed_versions = [parsed_fixed_versions] if parsed_fixed_versions else []
+         yield VendorData(
++            purl=PackageURL(purl.type, purl.namespace, purl.name),
+             aliases=sorted(list(set(aliases))),
+             affected_versions=sorted(list(set(affected_versions))),
+             fixed_versions=sorted(list(set(fixed_versions))),
+@@ -86,39 +121,49 @@ def extract_interesting_edge(edges, pur

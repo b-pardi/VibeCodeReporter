@@ -1,0 +1,63 @@
+@@ -261,7 +261,7 @@ public class GarbageCollector {
+         snapshotSaver.apply(allPointers.entrySet().stream()).join();
+ 
+         AtomicLong delCount = new AtomicLong(0);
+-        reachability.getUnreachable(del ->  delCount.addAndGet(del.size()));
++        reachability.getUnreachable(del -> delCount.addAndGet(del.size()));
+         deleteConfirm.apply(delCount.get(), nBlocks).join();
+ 
+         int deleteParallelism = 4;
+
+
+
+
+@@ -41,8 +41,13 @@ public class SqliteBlockReachability {
+     private static final String UNREACHABLE = "SELECT hash, version FROM reachability WHERE reachable = false";
+     private static final String COUNT = "SELECT COUNT(*) FROM reachability";
+     private static final String BLOCK_INDEX = "SELECT idx FROM reachability WHERE hash=? AND latest=true";
++    private static final String BLOCK_VERSION_INDEX = "SELECT idx FROM reachability WHERE hash=? AND VERSION=?";
++    private static final String OLD_BLOCK_INDEX = "SELECT idx FROM reachability WHERE hash=? AND latest=false";
+     private static final String BLOCK_BY_INDEX = "SELECT hash FROM reachability WHERE idx=?";
+     private static final String LINKS = "SELECT child FROM links WHERE parent=?";
++    private static final String UPDATE_LINK_PARENTS = "UPDATE links SET parent=? WHERE parent=?";
++    private static final String UPDATE_LINK_KIDS = "UPDATE links SET child=? WHERE child=?";
++    private static final String UPDATE_OLD_EMPTY_LINKS = "UPDATE emptylinks SET parent=? WHERE parent=?";
+     private static final String DELETE_LINKS = "DELETE FROM links WHERE parent=?";
+     private static final String DELETE_EMPTY_LINKS = "DELETE FROM emptylinks WHERE parent=?";
+     private static final String DELETE_BLOCK = "DELETE FROM reachability WHERE hash=? AND version=?";
+@@ -89,7 +94,13 @@ public class SqliteBlockReachability {
+     public synchronized void addBlocks(List<BlockVersion> versions) {
+         try (Connection conn = getNonCommittingConnection();
+              PreparedStatement insert = conn.prepareStatement(cmds.insertOrIgnoreCommand("INSERT ", INSERT_SUFFIX));
+-             PreparedStatement oldlatest = conn.prepareStatement(NOT_LATEST)) {
++             PreparedStatement oldlatest = conn.prepareStatement(NOT_LATEST);
++             PreparedStatement linkParents = conn.prepareStatement(UPDATE_LINK_PARENTS);
++             PreparedStatement linkKids = conn.prepareStatement(UPDATE_LINK_KIDS);
++             PreparedStatement oldBlockIndices = conn.prepareStatement(OLD_BLOCK_INDEX);
++             PreparedStatement blockIndex = conn.prepareStatement(BLOCK_INDEX);
++             PreparedStatement updateOldEmptyLinkIndices = conn.prepareStatement(UPDATE_OLD_EMPTY_LINKS);
++        ) {
+             List<BlockVersion> distinct = versions.stream().distinct().collect(Collectors.toList());
+             List<BlockVersion> latestVersions = distinct.stream()
+                     .filter(v -> v.isLatest && v.version != null)
+@@ -111,6 +122,44 @@ public class SqliteBlockReachability {
+             }
+             int[] changed = insert.executeBatch();
+             conn.commit();
++            for (BlockVersion latest : latestVersions) {
++                blockIndex.setBytes(1, latest.cid.toBytes());
++                ResultSet latestIdRes = blockIndex.executeQuery();
++                if (!latestIdRes.next())
++                    throw new IllegalStateException("Latest block not present: " + latest.cid);
++                long latestId = latestIdRes.getLong(1);
++
++                oldBlockIndices.setBytes(1, latest.cid.toBytes());
++                ResultSet res = oldBlockIndices.executeQuery();
++                Set<Long> oldVersionIndices = new HashSet<>();
++                while (res.next())
++                    oldVersionIndices.add(res.getLong(1));
++
++                if (!oldVersionIndices.isEmpty()) {
++                    // update all links that use old indices
++                    for (long old : oldVersionIndices) {
++                        linkParents.setLon

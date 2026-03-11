@@ -1,0 +1,120 @@
+@@ -150,6 +150,7 @@ class Flow : public GenericHashEntry {
+       dst2src_tcp_zero_window : 1, non_zero_payload_observed : 1,
+     is_periodic_flow : 1, ____notused:1;
+   u_int8_t iface_flow_accounted:1, _notused:7;
++  DropReason dropVerdictReason;
+ 
+   u_int8_t rtp_stream_type;
+ #ifdef ALERTED_FLOWS_DEBUG
+@@ -597,12 +598,12 @@ public:
+   inline u_int8_t getTcpFlagsSrv2Cli() const { return (dst2src_tcp_flags); };
+ #ifdef HAVE_NEDGE
+   bool checkPassVerdict(const struct tm *now);
+-  bool isPassVerdict() const;
++  bool isPassVerdict();
+   inline void setConntrackMarker(u_int32_t marker) { this->marker = marker; }
+   inline u_int32_t getConntrackMarker() { return (marker); }
+   void incFlowDroppedCounters();
+ #endif
+-  void setDropVerdict();
++  void setDropVerdict(DropReason reason);
+   u_int32_t getPid(bool client);
+   u_int32_t getFatherPid(bool client);
+   u_int32_t get_uid(bool client) const;
+
+
+
+
+@@ -1235,4 +1235,19 @@ typedef struct {
+   u_int16_t max_rtt, ideal_rtt, max_jitter, ideal_jitter;
+ } QoELimits;
+ 
++/* Keep in sync with flow_consts.drop_reason in flow_consts.lua */
++typedef enum {
++  DROP_REASON_UNKNOWN = 0,
++  DROP_REASON_USER_ACTION,
++  DROP_REASON_PROBE_VERDICT,
++  DROP_REASON_BLACKLISTED_FLOW,
++  DROP_REASON_QUOTA_EXCEEDED,
++  DROP_REASON_DROP_CLI,
++  DROP_REASON_DROP_SRV,
++  DROP_REASON_CLI2SRV_SHAPER,
++  DROP_REASON_SRV2CLI_SHAPER,
++  DROP_REASON_DEV_NOT_ALLOW_PROTO_CLI,
++  DROP_REASON_DEV_NOT_ALLOW_PROTO_SRV
++} DropReason;
++
+ #endif /* _NTOP_TYPEDEFS_H_ */
+
+
+
+
+@@ -232,6 +232,7 @@ Flow::Flow(NetworkInterface *_iface,
+ #endif
+ 
+   passVerdict = 1;
++  dropVerdictReason = DROP_REASON_UNKNOWN;
+ #ifdef ALERTED_FLOWS_DEBUG
+   iface_alert_inc = iface_alert_dec = false;
+ #endif
+@@ -1721,13 +1722,14 @@ char *Flow::print(char *buf, u_int buf_len, bool full_report) const {
+   if(iface->is_bridge_interface()) {
+     snprintf(
+ 	     shapers, sizeof(shapers),
+-	     "[pass_verdict: %s] "
++	     "[pass_verdict: %s (%d)] "
+ 	     "[shapers: cli2srv=%u/%u, srv2cli=%u/%u] "
+ 	     "[cli2srv_ingress shaping_enabled: %i max_rate: %lu] "
+ 	     "[cli2srv_egress shaping_enabled: %i max_rate: %lu] "
+ 	     "[srv2cli_ingress shaping_enabled: %i max_rate: %lu] "
+ 	     "[srv2cli_egress shaping_enabled: %i max_rate: %lu] ",
+ 	     passVerdict ? "PASS" : "DROP",
++             (int) dropVerdictReason,
+ 	     flowShaperIds.cli2srv.ingress
+ 	     ? flowShaperIds.cli2srv.ingress->get_shaper_id()
+ 	     : DEFAULT_SHAPER_ID,
+@@ -1851,13 +1853,14 @@ bool Flow::dump(time_t t, bool last_dump_before_free) {
+ 
+ /* *************************************** */
+ 
+-void Flow::setDropVerdict() {
++void Flow::setDropVerdict(DropReason reason) {
+ #if defined(HAVE_NEDGE)
+   if((iface->getIfType() == interface_type_NETFILTER) && (passVerdict == 1))
+     ((NetfilterInterface *)iface)->setPolicyChanged();
+ #endif
+ 
+   passVerdict = 0;
++  dropVerdictReason = reason;
+ }
+ 
+ /* *************************************** */
+@@ -2989,10 +2992,14 @@ void Flow::lua(lua_State *vm, AddressTree *ptree,
+ 			       : device_unknown);
+ 
+ #ifdef HAVE_NEDGE
+-    if(iface->is_bridge_interface())
++    if(iface->is_bridge_interface()) {
+       lua_push_bool_table_entry(vm, "verdict.pass", isPassVerdict() ? 1 : 0);
++      lua_push_int32_table_entry(vm, "verdict.reason", (int) dropVerdictReason);
++    }
+ #else
+-    if(!passVerdict) lua_push_bool_table_entry(vm, "verdict.pass", 0);
++    if(!passVerdict) {
++      lua_push_bool_table_entry(vm, "verdict.pass", 0);
++    }
+ #endif
+ 
+     if(get_protocol() == IPPROTO_TCP) lua_get_tcp_info(vm);
+@@ -3628,11 +3635,13 @@ void Flow::formatECSNetwork(json_object *my_object, const IpAddress *addr) {
+ #endif
+ 
+ #ifdef HAVE_NEDGE
+-    if(iface && iface->is_bridge_interface())
+-      json_object_object_add(
+-			     my_object, "verdict.pass",
++    if(iface && iface->is_bridge_interface()) {
++      json_object_object_add(my_object, "verdict.pass",
+ 			     json_object_new_boolean(isPassVerdict() ? (json_bool)1
+ 						     : (json_bool)0));
++      jso

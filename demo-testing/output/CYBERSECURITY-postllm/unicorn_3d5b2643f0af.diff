@@ -1,0 +1,112 @@
+@@ -399,6 +399,11 @@ struct uc_struct {
+     struct TranslationBlock *last_tb; // The real last tb we executed.
+ 
+     FlatView *empty_view; // Static function variable moved from flatviews_init
++
++#ifdef WIN32
++    PVOID seh_handle;
++    void* seh_closure;
++#endif
+ };
+ 
+ // Metadata stub for the variable-size cpu context used with uc_context_*()
+
+
+
+
+@@ -6,11 +6,4 @@
+ // #define CONFIG_INT128 1
+ #define CONFIG_CMPXCHG128 1
+ // #define CONFIG_ATOMIC64 1
+-#define CONFIG_PLUGIN 1
+-
+-// QEMU by default allocates (and commits) 1GB memory on Windows, and multiple Unicorn instances will result in OOM error easily.
+-// Unfortunately, Windows doesn't have a similar demand paging feature like mmap(), therefore a workaround is to use tcg regions mechanism.
+-// Note most Unicorn hacks (and even QEMU!) relies on the assumption that the translation memory won't run out and thus it might result
+-// in some unexpected errors. If that is case, define WIN32_QEMU_ALLOC_BUFFER to align with QEMU and Unicorn <= 2.0.1 behavior.
+-// 
+-// #define WIN32_QEMU_ALLOC_BUFFER
+\ No newline at end of file
++#define CONFIG_PLUGIN 1
+\ No newline at end of file
+
+
+
+
+@@ -869,35 +869,113 @@ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
+     return buf;
+ }
+ #elif defined(_WIN32)
+-#ifdef WIN32_QEMU_ALLOC_BUFFER
+-static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
++#define COMMIT_COUNT (1024) // Commit 4MB per exception
++#define CLOSURE_SIZE (4096)
++
++#ifdef _WIN64
++static LONG code_gen_buffer_handler(PEXCEPTION_POINTERS ptr, struct uc_struct *uc)
++#else
++/*
++The first two DWORD or smaller arguments that are found in the argument list
++from left to right are passed in ECX and EDX registers; all other arguments
++are passed on the stack from right to left.
++*/
++static LONG __fastcall code_gen_buffer_handler(PEXCEPTION_POINTERS ptr, struct uc_struct* uc)
++#endif
+ {
+-    TCGContext *tcg_ctx = uc->tcg_ctx;
+-    size_t size = tcg_ctx->code_gen_buffer_size;
+-    return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT,
+-                        PAGE_EXECUTE_READWRITE);
++    PEXCEPTION_RECORD record = ptr->ExceptionRecord;
++    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
++        uint8_t* base = (uint8_t*)(record->ExceptionInformation[1]);
++        uint8_t* left = uc->tcg_ctx->initial_buffer;
++        uint8_t* right = left + uc->tcg_ctx->initial_buffer_size;
++        if (left && base >= left && base < right) {
++            // It's our region
++            uint8_t* base_end = base + COMMIT_COUNT * 4096;
++            uint32_t size = COMMIT_COUNT * 4096;
++            if (base_end >= right) {
++                size = base_end - base;
++                // whoops, we are almost run out of memory! Commit all instead
++            }
++            if (VirtualAlloc(base, size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
++                return EXCEPTION_CONTINUE_EXECUTION;
++            } else {
++                return EXCEPTION_CONTINUE_SEARCH;
++            }
++        }
++    }
++    return EXCEPTION_CONTINUE_SEARCH;
+ }
+-#else
++
++static inline void may_remove_handler(struct uc_struct *uc) {
++    if (uc->seh_closure) {
++        if (uc->seh_handle) {
++            RemoveVectoredContinueHandler(uc->seh_handle);
++        }
++        VirtualFree(uc->seh_closure, 0, MEM_RELEASE);
++    }
++}
++
+ static inline void *alloc_code_gen_buffer(struct uc_struct *uc)
+ {
+     TCGContext *tcg_ctx = uc->tcg_ctx;
+     size_t size = tcg_ctx->code_gen_buffer_size;
++    uint8_t *closure, *data;
++    void* handler = code_gen_buffer_handler;
+ 
+-    void* ptr =  VirtualAlloc(NULL, size, MEM_RESERVE,
+-                        PAGE_EXECUTE_READWRITE);
++    may_remove_handler(uc);    
+ 
+-    // for prolog init
+-    VirtualAlloc(ptr, 
+-                 uc->qemu_real_host_page_size * UC_TCG_REGION_PAGES_COUNT,
+-                 MEM_COMMIT, 
+-                 PAGE_EXECUTE_READWRITE);
+-    return ptr;
+-}
++    // Naive trampoline implementation
++    closure = VirtualAlloc(NULL, CLOSURE_SIZE, 

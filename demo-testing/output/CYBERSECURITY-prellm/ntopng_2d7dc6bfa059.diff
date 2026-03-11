@@ -1,0 +1,126 @@
+@@ -204,6 +204,11 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   ProtoStats discardedProbingStats;
+ #ifdef NTOPNG_PRO
+   L7Policer *policer;
++
++#if defined(HAVE_KAFKA)
++  KafkaProducer *kafka;
++#endif
++  
+ #ifndef HAVE_NEDGE
+   FlowProfiles  *flow_profiles, *shadow_flow_profiles;
+   SubInterfaces *sub_interfaces;
+
+
+
+
+@@ -122,6 +122,9 @@ class Prefs {
+     , *pro_callbacks_dir
+ #endif
+     ;
++#if defined(HAVE_KAFKA) && defined(NTOPNG_PRO)
++  char *kafka_brokers_list, *kafka_topic, *kafka_options;
++#endif
+   char *categorization_key;
+   char *zmq_encryption_pwd;
+   char *zmq_encryption_priv_key;
+@@ -243,9 +246,14 @@ class Prefs {
+   inline bool  do_dump_flows_on_clickhouse()            { return(is_enterprise_m_edition() && dump_flows_on_clickhouse); };
+   inline bool  do_dump_alerts_on_clickhouse()           { return(do_dump_flows_on_clickhouse()); };
+   inline bool  do_dump_flows_on_syslog()                { return(dump_flows_on_syslog);   };
++  inline bool  do_dump_flows_on_kafka()                 { return((kafka_brokers_list && kafka_topic) ? true : false);   };
+   inline bool  do_dump_extended_json()                  { return(dump_ext_json);          };
+   inline bool  do_dump_json_flows_on_disk()             { return(dump_json_flows_on_disk);};
+-  inline bool  do_dump_flows()                          { return(do_dump_flows_on_es() || do_dump_flows_on_mysql() || do_dump_flows_on_clickhouse() || do_dump_flows_on_syslog()); };
++  inline bool  do_dump_flows()                          { return(do_dump_flows_on_es()
++								 || do_dump_flows_on_mysql()
++								 || do_dump_flows_on_clickhouse()
++								 || do_dump_flows_on_syslog()
++								 || do_dump_flows_on_kafka()); };
+ 
+ #ifdef NTOPNG_PRO
+   inline void  toggle_dump_flows_direct(bool enable)    { dump_flows_direct = enable; };
+@@ -461,6 +469,11 @@ class Prefs {
+ #endif
+   void setIEC104AllowedTypeIDs(const char * protos);
+   void validate();
++#if defined(HAVE_KAFKA) && defined(NTOPNG_PRO)
++  char* getKakfaBrokersList() { return(kafka_brokers_list); }
++  char* getKafkaTopic()       { return(kafka_topic);        }
++  char* getKafkaOptions()     { return(kafka_options);      }
++#endif
+ };
+ 
+ #endif /* _PREFS_H_ */
+
+
+
+
+@@ -238,7 +238,6 @@ using namespace std;
+ #include "NetworkInterfaceAlertableEntity.h"
+ #include "InterfaceMemberAlertableEntity.h"
+ #include "BehaviouralCounter.h"
+-
+ #ifdef NTOPNG_PRO
+ #include "BehaviorAnalysis.h"
+ #endif
+@@ -310,6 +309,9 @@ using namespace std;
+ #include "AlertStore.h"
+ #include "SQLiteAlertStore.h"
+ #include "DB.h"
++#ifdef HAVE_KAFKA
++#include "KafkaProducer.h"
++#endif
+ #ifdef HAVE_MYSQL
+ #include "MySQLDB.h"
+ #endif
+
+
+
+
+@@ -4557,7 +4557,7 @@ void Flow::setBittorrentHash(char *hash) {
+   for(i=0, j = 0; i<20; i++) {
+     u_char c = hash[i] & 0xFF;
+ 
+-    snprintf(&bittorrent_hash[j], 2, "%02x", c);
++    snprintf(&bittorrent_hash[j], 3, "%02x", (u_int8_t)c);
+     j += 2, n += c;
+   }
+ 
+
+
+
+
+@@ -999,7 +999,7 @@ int LuaEngine::handle_script_request(struct mg_connection *conn,
+ 	    num_uploaded_files = mg_upload(conn, upload_dir, fname, sizeof(fname));
+ 
+ 	    if(num_uploaded_files > 0) {
+-	      char uploaded_file[1024];
++	      char uploaded_file[2048];
+ 
+ 	      snprintf(uploaded_file, sizeof(uploaded_file), "%s/%s", upload_dir, fname);
+ 	      ntop->fixPath(uploaded_file);
+
+
+
+
+@@ -361,7 +361,9 @@ void NetworkInterface::init(const char *interface_name) {
+   ndpi_struct_shadow = NULL;
+   ndpi_struct = initnDPIStruct();
+   ndpi_finalize_initialization(ndpi_struct);
+-
++#if defined(HAVE_KAFKA) && defined(NTOPNG_PRO)
++  kafka = NULL;
++#endif
+   INTERFACE_PROFILING_INIT();
+ }
+ 
+@@ -868,6 +870,8 @@ NetworkInterface::~NetworkInterface() {
+   if(prev_host_checks_executor) delete prev_host_checks_executor;
+   if(host_checks_executor)      delete host_checks_executor;
+ 
++  /* Note do not need to delete kafka as it's shared with db */
++  
+   if(ndpi_struct) {
+     ndpi_exit_detection_module(ndpi_struct);
+     ndpi_struct = NULL

@@ -1,0 +1,93 @@
+@@ -44,4 +44,9 @@ public class IpfsUserTests extends UserTests {
+         System.out.println("Deleting " + peergosDir);
+         deleteFiles(peergosDir.toFile());
+     }
++
++    @Override
++    public Args getArgs() {
++        return args;
++    }
+ }
+
+
+
+
+@@ -42,6 +42,11 @@ public class RamUserTests extends UserTests {
+         });
+     }
+ 
++    @Override
++    public Args getArgs() {
++        return args;
++    }
++
+     @AfterClass
+     public static void cleanup() {
+         try {Thread.sleep(2000);}catch (InterruptedException e) {}
+
+
+
+
+@@ -7,6 +7,7 @@ import peergos.server.crypto.asymmetric.curve25519.*;
+ import peergos.server.crypto.hash.*;
+ import peergos.server.crypto.random.*;
+ import peergos.server.crypto.symmetric.*;
++import peergos.server.storage.auth.*;
+ import peergos.server.util.*;
+ 
+ import org.junit.*;
+@@ -53,6 +54,8 @@ public abstract class UserTests {
+         this.service = service;
+     }
+ 
++    public abstract Args getArgs();
++
+     public static Args buildArgs() {
+         try {
+             Path peergosDir = Files.createTempDirectory("peergos");
+@@ -914,6 +917,70 @@ public abstract class UserTests {
+         Assert.assertTrue("Has thumbnail", thumbnail.length() > 0);
+     }
+ 
++    @Test
++    public void legacyFileModification() throws Exception {
++        // test that a legacy file without BATs can be modified and extended, and all new chunks and fragments have BATs
++        String username = generateUsername();
++        String password = "test01";
++        UserContext context = PeergosNetworkUtils.ensureSignedUp(username, password, network, crypto);
++        FileWrapper userRoot = context.getUserRoot().get();
++
++        String filename = "mediumfile.bin";
++        byte[] data = new byte[4*1024*1024];
++        random.nextBytes(data);
++        FileWrapper userRoot2 = userRoot.uploadOrReplaceFile(filename, new AsyncReader.ArrayBacked(data), data.length,
++                context.network, context.crypto, l -> {}, crypto.random.randomBytes(32), Optional.empty(), Optional.empty()).get();
++
++        // Remove BATs from cryptree node and fragments in file
++        FileWrapper file = context.getByPath(Paths.get(username, filename)).join().get();
++        CborObject.CborMap cbor = (CborObject.CborMap) file.getPointer().fileAccess.toCbor();
++        Map<String, Cborable> modified = new LinkedHashMap<>();
++        cbor.applyToAll(modified::put);
++        CborObject.CborMap d = (CborObject.CborMap) modified.get("d");
++        d.put("bats", new CborObject.CborList(Collections.emptyList()));
++        modified.put("d", d);
++        modified.remove("bats");
++        CborObject.CborMap noBats = CborObject.CborMap.build(modified);
++        PublicKeyHash owner = file.owner();
++        WriterData wd = WriterData.getWriterData(owner, file.writer(), network.mutable, network.dhtClient).join().props;
++        Cid cryptreeCid = network.dhtClient.put(owner, file.signingPair(), noBats.serialize(), crypto.hasher,
++                TransactionId.build("hey")).join();
++        network.tree.put(wd, owner, file.signingPair(), file.readOnlyPointer().getMapKey(),
++                file.getPointer().fileAccess.committedHash(), cryptreeCid, TransactionId.build("hey")).join();
++
++        // check there are no BATs for this file
++        file = context.getByPath(Paths.get(username, filename)).join().get();
++        Assert.assertTrue(file.writableFilePointer().bat.isEmpty());
++        // simulate these blocks being present before server upgrade by adding them to legacy block store
++        JdbcLegacyRawBlockStore legacyBlockStore = new JdbcLegacyRawBlockStore(Main.getDBConnector(
++                getArgs().with("legacy-raw-blocks-file", "legacyraw.sql"), "legacy-raw-blocks-file"));
++        cbor.links().forEach(h -> legacyBlockStore.addBlock((Cid)h));
++
++        // Check fragments are retrievable without a BAT
++        Multihash originalFragment = file.getPointer().fileAccess.toCbor().links().get(0);
++        CompletableFuture<Optional<byte[]>> origina

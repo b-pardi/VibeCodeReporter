@@ -1,0 +1,147 @@
+@@ -88,6 +88,7 @@ typedef struct r_io_t {
+ 	RIDPool *map_ids;
+ 	SdbList *maps; //from tail backwards maps with higher priority are found
+ 	RPVector map_skyline; // map parts that are not covered by others
++	RPVector map_skyline_shadow; // map parts that are not covered by others
+ 	SdbList *sections;
+ 	RIDStorage *files;
+ 	RCache *buffer;
+@@ -305,8 +306,9 @@ R_API bool r_io_map_exists (RIO *io, RIOMap *map);
+ R_API bool r_io_map_exists_for_id (RIO *io, ut32 id);
+ R_API RIOMap *r_io_map_resolve (RIO *io, ut32 id);
+ R_API RIOMap *r_io_map_add(RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut64 size);
+-R_API RIOMap *r_io_map_get (RIO *io, ut64 addr);		//returns the map at vaddr with the highest priority
+-R_API RIOMap *r_io_map_get_paddr (RIO *io, ut64 paddr);		//returns the map at paddr with the highest priority
++R_API RIOMap *r_io_map_get(RIO *io, ut64 addr);		//returns the map at vaddr with the highest priority
++R_API bool r_io_map_is_mapped(RIO* io, ut64 addr);
++R_API RIOMap *r_io_map_get_paddr(RIO *io, ut64 paddr);		//returns the map at paddr with the highest priority
+ R_API void r_io_map_reset(RIO* io);
+ R_API bool r_io_map_del (RIO *io, ut32 id);
+ R_API bool r_io_map_del_for_fd (RIO *io, int fd);
+
+
+
+
+@@ -18,6 +18,20 @@ typedef struct r_interval_t {
+ 
+ typedef RInterval r_itv_t;
+ 
++static inline RInterval *r_itv_new(ut64 addr, ut64 size) {
++	RInterval *itv = R_NEW (RInterval);
++	if (itv) {
++		itv->addr = addr;
++		itv->size = size;
++	}
++	return itv;
++}
++
++static inline void r_itv_free(RInterval *itv) {
++	r_return_if_fail (itv);
++	free (itv);
++}
++
+ static inline ut64 r_itv_begin(RInterval itv) {
+ 	return itv.addr;
+ }
+
+
+
+
+@@ -106,6 +106,7 @@ R_API RIO* r_io_init(RIO* io) {
+ 	io->addrbytes = 1;
+ 	r_io_desc_init (io);
+ 	r_pvector_init (&io->map_skyline, free);
++	r_pvector_init (&io->map_skyline_shadow, free);
+ 	r_io_map_init (io);
+ 	r_io_section_init (io);
+ 	r_io_cache_init (io);
+
+
+
+
+@@ -139,6 +139,9 @@ R_API bool r_io_is_valid_offset(RIO* io, ut64 offset, int hasperm) {
+ 		return false;
+ 	}
+ 	if (io->va) {
++		if (!hasperm) {
++			return r_io_map_is_mapped (io, offset);
++		}
+ 		if ((map = r_io_map_get (io, offset))) {
+ 			return ((map->perm & hasperm) == hasperm);
+ 		}
+
+
+
+
+@@ -11,6 +11,9 @@
+ 
+ #define MAP_USE_HALF_CLOSED 0
+ 
++#define CMP_END_GT(addr, itv) \
++	(((addr) < r_itv_end (*(RInterval *)(itv))) ? -1 : (((addr) > r_itv_end (*(RInterval *)(itv))) ? 1 : 0))
++
+ struct map_event_t {
+ 	RIOMap *map;
+ 	ut64 addr;
+@@ -70,6 +73,7 @@ void io_map_calculate_skyline(RIO *io) {
+ 	struct map_event_t *ev;
+ 	bool *deleted = NULL;
+ 	r_pvector_clear (&io->map_skyline);
++	r_pvector_clear (&io->map_skyline_shadow);
+ 	r_pvector_init (&events, free);
+ 	if (!r_pvector_reserve (&events, ls_length (io->maps) * 2) ||
+ 			!(deleted = calloc (ls_length (io->maps), 1))) {
+@@ -139,8 +143,47 @@ void io_map_calculate_skyline(RIO *io) {
+ 			last_map = map;
+ 		}
+ 	}
+-
+ 	r_binheap_clear (&heap);
++
++	const RPVector *skyline = &io->map_skyline;
++	RPVector *shadow = &io->map_skyline_shadow;
++	RInterval *cur_itv = NULL;
++
++	for (i = 0; i < r_pvector_len (skyline); i++) {
++		const RIOMapSkyline *part = r_pvector_at (skyline, i);
++		if (!part) {
++			continue;
++		}
++
++		ut64 part_from = part->itv.addr;
++		ut64 part_size = part->itv.size;
++
++		if (!cur_itv) {
++			cur_itv = r_itv_new (part_from, part_size);
++			if (!cur_itv) {
++				break;
++			}
++			continue;
++		}
++
++		if (part_from == r_itv_end (*cur_itv)) {
++			cur_itv->size += part_size;
++		} else {
++			if (!r_pvector_push (shadow, cur_itv)) {
++				R_FREE (cur_itv);
++				break;
++			}
++			cur_itv = r_itv_new (part_from, part_size);
++			if (!cur_itv) {
++				break;
++			}
++		}
++	}
++	if (cur_itv) {
++		if (!r_pvector_push (shadow, cur_itv)) {
++			R_FREE (cur_itv);
++		}
++	}
+ out:
+ 	r_pvector_clear (&events);
+ 	free (deleted);
+@@ -277,11 +320,9 @@ R_API RIOMap *r_io_map_add(RIO *io, int fd, int perm, ut64 delta, ut64 addr, ut6
+ }
+ 
+ R_API RIOMap* r_io_map_get_paddr(RIO* io, ut64 paddr) {
++	r_return_val_if_fail (io, NULL)

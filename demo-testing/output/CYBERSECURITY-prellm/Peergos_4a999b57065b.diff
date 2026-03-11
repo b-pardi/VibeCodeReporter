@@ -1,0 +1,72 @@
+@@ -531,7 +531,7 @@ public class NetworkAccess {
+                         .thenApply(dataOpt -> {
+                             Optional<byte[]> bytes = dataOpt;
+                             bytes.ifPresent(arr -> monitor.accept((long)(arr.length / spaceIncreaseFactor)));
+-                            return bytes.map(data -> new FragmentWithHash(new Fragment(data), h));
++                            return bytes.map(data -> new FragmentWithHash(new Fragment(data), h.isIdentity() ? Optional.empty() : Optional.of(h)));
+                         }))
+                 .collect(Collectors.toList());
+ 
+
+
+
+
+@@ -22,10 +22,14 @@ public class FragmentedPaddedCipherText implements Cborable {
+ 
+     private final byte[] nonce;
+     private final List<Multihash> cipherTextFragments;
++    private final Optional<byte[]> inlinedCipherText;
+ 
+-    public FragmentedPaddedCipherText(byte[] nonce, List<Multihash> cipherTextFragments) {
++    public FragmentedPaddedCipherText(byte[] nonce, List<Multihash> cipherTextFragments, Optional<byte[]> inlinedCipherText) {
+         this.nonce = nonce;
+         this.cipherTextFragments = cipherTextFragments;
++        this.inlinedCipherText = inlinedCipherText;
++        if (inlinedCipherText.isPresent() && ! cipherTextFragments.isEmpty())
++            throw new IllegalStateException("Cannot have an inlined block and merkle linked blocks!");
+     }
+ 
+     @Override
+@@ -33,11 +37,15 @@ public class FragmentedPaddedCipherText implements Cborable {
+         SortedMap<String, Cborable> state = new TreeMap<>();
+         state.put("n", new CborObject.CborByteArray(nonce));
+         // The following change is because of a breaking change in ipfs to limit identity multihash size
+-        if (cipherTextFragments.size() == 1 && cipherTextFragments.get(0).isIdentity()) {
+-            state.put("f", new CborObject.CborList(cipherTextFragments
++        if (cipherTextFragments.size() == 1 && cipherTextFragments.get(0).isIdentity() || inlinedCipherText.isPresent()) {
++            List<CborObject.CborByteArray> legacy = cipherTextFragments
+                     .stream()
+                     .map(h -> new CborObject.CborByteArray(h.toBytes()))
+-                    .collect(Collectors.toList())));
++                    .collect(Collectors.toList());
++            List<CborObject.CborByteArray> value = inlinedCipherText
++                    .map(arr -> Collections.singletonList(new CborObject.CborByteArray(arr)))
++                    .orElse(legacy);
++            state.put("f", new CborObject.CborList(value));
+         } else {
+             state.put("f", new CborObject.CborList(cipherTextFragments
+                     .stream()
+@@ -56,11 +64,15 @@ public class FragmentedPaddedCipherText implements Cborable {
+         byte[] nonce =  m.getByteArray("n");
+         List<Multihash> fragmentHashes = m.getList("f").value
+                 .stream()
+-                .map(c -> c instanceof CborObject.CborMerkleLink ?
+-                        ((CborObject.CborMerkleLink)c).target :
+-                        Cid.cast(((CborObject.CborByteArray) c).value))
++                .filter(c -> c instanceof CborObject.CborMerkleLink)
++                .map(c -> ((CborObject.CborMerkleLink)c).target)
+                 .collect(Collectors.toList());
+-        return new FragmentedPaddedCipherText(nonce, fragmentHashes);
++        Optional<byte[]> inlinedCipherText = m.getList("f").value
++                .stream()
++                .filter(c -> c instanceof CborObject.CborByteArray)
++                .map(c -> ((CborObject.CborByteArray)c).value)
++                .findFirst();
++        return new FragmentedPaddedCipherText(nonce, fragmentHashes, inlinedCipherText);
+     }
+ 
+     protected static byte[] pad(byte[] input, int blockSize) {
+@@ -81,21 +93,21 @@ public class FragmentedPaddedCipherText implements Cborable {
+         byte[] cipherText = from.encrypt(pad(secret.serialize(), paddingBlockSize), nonce);
+ 
+         if (cipherText.length <= 4096 + TweetNaCl.SECR

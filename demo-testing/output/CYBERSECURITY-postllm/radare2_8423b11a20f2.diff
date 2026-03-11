@@ -1,0 +1,151 @@
+@@ -58,8 +58,6 @@ static int __bb_addr_cmp(const void *incoming, const RBNode *in_tree, void *user
+ 	return 0;
+ }
+ 
+-#define D if (anal && anal->verbose)
+-
+ R_API void r_anal_block_ref(RAnalBlock *bb) {
+ 	// XXX we have R_REF for this
+ 	if (bb) {
+@@ -825,6 +823,18 @@ beach:
+ 	return ret;
+ }
+ 
++static ut32 block_xxhash(RAnalBlock *block, ut8 *buf) {
++	R_RETURN_VAL_IF_FAIL (block && buf, 0);
++	int digest_len = 0;
++	ut8 *digest = block->anal->mb.hash (&block->anal->mb, "xxhash", buf, block->size, &digest_len);
++	if (!digest || digest_len < 4) {
++		return 0;
++	}
++	ut32 hash = r_read_le32 (digest);
++	free (digest);
++	return hash;
++}
++
+ R_API bool r_anal_block_was_modified(RAnalBlock *block) {
+ 	R_RETURN_VAL_IF_FAIL (block, false);
+ 	if (!block->bbhash) {
+@@ -841,7 +851,7 @@ R_API bool r_anal_block_was_modified(RAnalBlock *block) {
+ 		free (buf);
+ 		return false;
+ 	}
+-	ut32 cur_hash = r_hash_xxhash (buf, block->size);
++	ut32 cur_hash = block_xxhash (block, buf);
+ 	free (buf);
+ 	return block->bbhash != cur_hash;
+ }
+@@ -860,7 +870,10 @@ R_API void r_anal_block_update_hash(RAnalBlock *block) {
+ 			free (buf);
+ 			return;
+ 		}
+-		block->bbhash = r_hash_xxhash (buf, block->size);
++		ut32 hash = block_xxhash (block, buf);
++		if (hash) {
++			block->bbhash = hash;
++		}
+ 		free (buf);
+ 	}
+ }
+
+
+
+
+@@ -782,9 +782,9 @@ R_API bool r_sign_add_hash(RAnal *a, const char *name, int type, const char *val
+ 		R_LOG_ERROR ("hash type unknown");
+ 		return false;
+ 	}
+-	int digestsize = r_hash_size (R_ZIGN_HASH) * 2;
++	int digestsize = 32 * 2; // SHA256 digest is 32 bytes, hex is 64 chars
+ 	if (len != digestsize) {
+-		R_LOG_ERROR ("invalid hash size: %d (%s digest size is %d)", len, ZIGN_HASH, digestsize);
++		R_LOG_ERROR ("invalid hash size: %d (SHA256 digest size is %d)", len, digestsize);
+ 		return false;
+ 	}
+ 	return addHash (a, name, type, val);
+@@ -2113,35 +2113,34 @@ static int cmpaddr(const void *_a, const void *_b) {
+ 	return (a->addr - b->addr);
+ }
+ 
++// Include SHA256 implementation for standalone use
++#define R_CRYPTO_INTERNAL 1
++#include "../muta/hash/sha2.c"
++
+ R_API char *r_sign_calc_bbhash(RAnal *a, RAnalFunction *fcn) {
+ 	RListIter *iter = NULL;
+ 	RAnalBlock *bbi = NULL;
+-	char *digest_hex = NULL;
+-	RHash *ctx = r_hash_new (true, R_ZIGN_HASH);
+-	if (!ctx) {
+-		goto beach;
+-	}
++
++	RSha256Context ctx;
++	R_SHA2_API (r_sha256_init) (&ctx);
++
+ 	r_list_sort (fcn->bbs, &cmpaddr);
+-	r_hash_do_begin (ctx, R_ZIGN_HASH);
+ 	r_list_foreach (fcn->bbs, iter, bbi) {
+ 		ut8 *buf = malloc (bbi->size);
+ 		if (!buf) {
+-			goto beach;
++			return NULL;
+ 		}
+ 		if (!a->iob.read_at (a->iob.io, bbi->addr, buf, bbi->size)) {
+-			goto beach;
+-		}
+-		if (!r_hash_do_sha256 (ctx, buf, bbi->size)) {
+-			goto beach;
++			free (buf);
++			return NULL;
+ 		}
++		R_SHA2_API (r_sha256_update) (&ctx, buf, bbi->size);
+ 		free (buf);
+ 	}
+-	r_hash_do_end (ctx, R_ZIGN_HASH);
+ 
+-	digest_hex = r_hex_bin2strdup (ctx->digest, r_hash_size (R_ZIGN_HASH));
+-beach:
+-	free (ctx);
+-	return digest_hex;
++	char textdigest[R_SHA256_DIGEST_STRING_LENGTH] = {0};
++	R_SHA2_API (r_sha256_end) (&ctx, textdigest);
++	return strdup (textdigest);
+ }
+ 
+ static bool countForCB(RSignItem *it, void *user) {
+
+
+
+
+@@ -2882,6 +2882,7 @@ R_API bool r_core_init(RCore *core) {
+ 	r_core_bind (core, &core->io->coreb);
+ 	r_muta_bind (core->muta, &core->io->mb);
+ 	r_muta_bind (core->muta, &core->dbg->mb);
++	r_muta_bind (core->muta, &core->anal->mb);
+ 	core->dbg->egg = core->egg;
+ 	core->dbg->anal = core->anal; // XXX: dupped instance.. can cause lost pointerz
+ 	// r_debug_use (core->dbg, "native");
+
+
+
+
+@@ -517,6 +517,7 @@ typedef struct r_anal_t {
+ 	RStrConstPool constpool;
+ 	RList *leaddrs;
+ 	char *pincmd;
++	RMutaBind mb;
+ 	RAnalBacktraces btstore;
+ 	/* private */
+ 	RThreadLock *lock;
+
+
+
+
+@@ -23,7 +23,7 @@ R_LIB_VERSION_HEADER (r_lib);
+ // double-indirection required because cpp is crap
+ #define STRINGIFY2(x) #x
+ #define STRINGIFY(x) STRINGIFY2(x)
+-#define R2_ABIVERSION 55
++#define R2_ABIVERSION 56
+ #define R2_ABIVERSION_S

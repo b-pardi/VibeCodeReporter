@@ -1,0 +1,132 @@
+deleted file mode 100644
+
+
+
+@@ -1,504 +0,0 @@
+-/* Copyright (C) 2007-2014 Open Information Security Foundation
+- *
+- * You can copy, redistribute or modify this Program under the terms of
+- * the GNU General Public License version 2 as published by the Free
+- * Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * version 2 along with this program; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+- * 02110-1301, USA.
+- */
+-
+-/**
+- * \file
+- *
+- * \author Roliers Jean-Paul <popof.fpn@gmail.co>
+- * \author Eric Leblond <eric@regit.org>
+- * \author Victor Julien <victor@inliniac.net>
+- * \author Paulo Pacheco <fooinha@gmail.com>
+- *
+- * Implements TLS logging portion of the engine.
+- */
+-
+-#include "suricata-common.h"
+-#include "conf.h"
+-
+-#include "threadvars.h"
+-
+-#include "util-print.h"
+-#include "util-debug.h"
+-
+-#include "output.h"
+-#include "log-tlslog.h"
+-#include "app-layer-ssl.h"
+-#include "app-layer-parser.h"
+-#include "util-buffer.h"
+-
+-#include "util-logopenfile.h"
+-#include "util-time.h"
+-#include "log-cf-common.h"
+-
+-#define DEFAULT_LOG_FILENAME "tls.log"
+-
+-#define MODULE_NAME "LogTlsLog"
+-
+-#define PRINT_BUF_LEN 46
+-
+-#define OUTPUT_BUFFER_SIZE 65535
+-
+-#define LOG_TLS_DEFAULT  0
+-#define LOG_TLS_EXTENDED 1
+-#define LOG_TLS_CUSTOM   2
+-
+-#define LOG_TLS_SESSION_RESUMPTION 4
+-
+-#define LOG_TLS_CF_VERSION         'v'
+-#define LOG_TLS_CF_DATE_NOT_BEFORE 'd'
+-#define LOG_TLS_CF_DATE_NOT_AFTER  'D'
+-#define LOG_TLS_CF_SHA1            'f'
+-#define LOG_TLS_CF_SNI             'n'
+-#define LOG_TLS_CF_SUBJECT         's'
+-#define LOG_TLS_CF_ISSUER          'i'
+-#define LOG_TLS_CF_EXTENDED        'E'
+-
+-typedef struct LogTlsFileCtx_ {
+-    LogFileCtx *file_ctx;
+-    uint32_t flags;  /** Store mode */
+-    LogCustomFormat *cf;
+-} LogTlsFileCtx;
+-
+-typedef struct LogTlsLogThread_ {
+-    LogTlsFileCtx *tlslog_ctx;
+-    MemBuffer *buffer;
+-} LogTlsLogThread;
+-
+-int TLSGetIPInformations(const Packet *p, char *srcip, socklen_t srcip_len, Port *sp, char *dstip,
+-        socklen_t dstip_len, Port *dp, int ipproto)
+-{
+-    if ((PKT_IS_TOSERVER(p))) {
+-        switch (ipproto) {
+-            case AF_INET:
+-                PrintInet(AF_INET, (const void *) GET_IPV4_SRC_ADDR_PTR(p),
+-                          srcip, srcip_len);
+-                PrintInet(AF_INET, (const void *) GET_IPV4_DST_ADDR_PTR(p),
+-                          dstip, dstip_len);
+-                break;
+-            case AF_INET6:
+-                PrintInet(AF_INET6, (const void *) GET_IPV6_SRC_ADDR(p), srcip,
+-                          srcip_len);
+-                PrintInet(AF_INET6, (const void *) GET_IPV6_DST_ADDR(p), dstip,
+-                          dstip_len);
+-                break;
+-            default:
+-                return 0;
+-        }
+-        *sp = p->sp;
+-        *dp = p->dp;
+-    } else {
+-        switch (ipproto) {
+-            case AF_INET:
+-                PrintInet(AF_INET, (const void *) GET_IPV4_DST_ADDR_PTR(p),
+-                          srcip, srcip_len);
+-                PrintInet(AF_INET, (const void *) GET_IPV4_SRC_ADDR_PTR(p),
+-                          dstip, dstip_len);
+-                break;
+-            case AF_INET6:
+-                PrintInet(AF_INET6, (const void *) GET_IPV6_DST_ADDR(p), srcip,
+-                          srcip_len);
+-                PrintInet(AF_INET6, (const void *) GET_IPV6_SRC_ADDR(p), dstip,
+-                          dstip_len);
+-                break;
+-            default:
+-                return 0;
+-        }
+-        *sp = p->dp;
+-        *dp = p->sp;
+-    }
+-    return 1;
+-}
+-
+-static TmEcode LogTlsLogThreadInit(ThreadVars *t, const void *initdata,
+-            

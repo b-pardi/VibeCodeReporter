@@ -1,0 +1,154 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,425 @@
++/* Copyright (C) 2023 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ */
++
++#include "suricata-common.h"
++#include "packet.h"
++#include "detect.h"
++#include "flow.h"
++#include "conf.h"
++
++#include "threads.h"
++#include "tm-threads.h"
++#include "threadvars.h"
++#include "util-debug.h"
++
++#include "decode-ipv4.h"
++#include "detect-parse.h"
++#include "detect-engine.h"
++#include "detect-engine-mpm.h"
++#include "detect-reference.h"
++
++#include "output.h"
++#include "output-json.h"
++#include "output-json-flow.h"
++#include "output-eve-stream.h"
++
++#include "stream-tcp.h"
++
++#include "util-unittest.h"
++#include "util-unittest-helper.h"
++#include "util-classification-config.h"
++#include "util-privs.h"
++#include "util-print.h"
++#include "util-proto-name.h"
++#include "util-logopenfile.h"
++#include "util-time.h"
++#include "util-buffer.h"
++
++#include "action-globals.h"
++
++#define MODULE_NAME "EveStreamLog"
++
++#define LOG_DROP_ALERTS 1
++
++typedef struct EveStreamOutputCtx_ {
++    uint16_t trigger_flags; /**< presence of flags in packet trigger logging. 0xffff for all. */
++    OutputJsonCtx *eve_ctx;
++} EveStreamOutputCtx;
++
++typedef struct EveStreamLogThread_ {
++    EveStreamOutputCtx *stream_ctx;
++    OutputJsonThreadCtx *ctx;
++} EveStreamLogThread;
++
++static TmEcode EveStreamLogThreadInit(ThreadVars *t, const void *initdata, void **data)
++{
++    EveStreamLogThread *aft = SCCalloc(1, sizeof(EveStreamLogThread));
++    if (unlikely(aft == NULL))
++        return TM_ECODE_FAILED;
++
++    if (initdata == NULL) {
++        SCLogDebug("Error getting context for EveLogDrop.  \"initdata\" argument NULL");
++        goto error_exit;
++    }
++
++    /** Use the Ouptut Context (file pointer and mutex) */
++    aft->stream_ctx = ((OutputCtx *)initdata)->data;
++    aft->ctx = CreateEveThreadCtx(t, aft->stream_ctx->eve_ctx);
++    if (!aft->ctx) {
++        goto error_exit;
++    }
++
++    *data = (void *)aft;
++    return TM_ECODE_OK;
++
++error_exit:
++    SCFree(aft);
++    return TM_ECODE_FAILED;
++}
++
++static TmEcode EveStreamLogThreadDeinit(ThreadVars *t, void *data)
++{
++    EveStreamLogThread *aft = (EveStreamLogThread *)data;
++    if (aft == NULL) {
++        return TM_ECODE_OK;
++    }
++
++    FreeEveThreadCtx(aft->ctx);
++
++    /* clear memory */
++    memset(aft, 0, sizeof(*aft));
++
++    SCFree(aft);
++    return TM_ECODE_OK;
++}
++
++static void EveStreamOutputCtxFree(EveStreamOutputCtx *ctx)
++{
++    if (ctx != NULL) {
++        SCFree(ctx);
++    }
++}
++
++static void EveStreamLogDeInitCtxSub(OutputCtx *output_ctx)
++{
++    OutputDropLoggerDisable();
++
++    EveStreamOutputCtx *ctx = output_ctx->data;
++    SCFree(ctx);
++    SCLogDebug("cleaning up sub output_ctx %p", output_ctx);
++    SCFree(output_ctx);
++}
++
++static uint16_t SetFlag(ConfNode *conf, const char *opt, const uint16_t inflag)
++{
++    const char *v = ConfNodeLookupChildValue(conf, opt);
++    if (v != NULL && ConfValIsTrue(v)) {
++        return inflag;
++    }
++    return 0;
++}
++
++static OutputInitResult EveStreamLogInitCtxSub(ConfNode *conf, OutputCtx *parent_ctx)
++{
++    OutputInitResult result = { NULL, false };
++    OutputJsonCtx *ajt = parent_ctx->data;
++
++    EveStreamOutputCtx *ctx = SCCalloc(1, sizeof(*ctx));
++    if (ctx == NULL)
++        return result;
++
++    OutputCtx *output_ctx = SCCalloc(1, sizeof

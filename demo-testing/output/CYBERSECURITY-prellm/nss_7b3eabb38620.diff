@@ -1,0 +1,123 @@
+@@ -80,6 +80,32 @@ inline std::ostream& operator<<(std::ostream& os, SSLProtocolVariant v) {
+   return os << ((v == ssl_variant_stream) ? "TLS" : "DTLS");
+ }
+ 
++inline std::ostream& operator<<(std::ostream& os, SSLContentType v) {
++  switch (v) {
++    case ssl_ct_change_cipher_spec:
++      return os << "CCS";
++    case ssl_ct_alert:
++      return os << "alert";
++    case ssl_ct_handshake:
++      return os << "handshake";
++    case ssl_ct_application_data:
++      return os << "application data";
++    case ssl_ct_ack:
++      return os << "ack";
++  }
++  return os << "UNKNOWN content type " << static_cast<int>(v);
++}
++
++inline std::ostream& operator<<(std::ostream& os, SSLSecretDirection v) {
++  switch (v) {
++    case ssl_secret_read:
++      return os << "read";
++    case ssl_secret_write:
++      return os << "write";
++  }
++  return os << "UNKNOWN secret direction " << static_cast<int>(v);
++}
++
+ inline bool IsDtls(uint16_t version) { return (version & 0x8000) == 0x8000; }
+ 
+ inline uint16_t NormalizeTlsVersion(uint16_t version) {
+
+
+
+
+@@ -373,3 +373,15 @@ SECStatus SSLInt_GetEpochs(PRFileDesc *fd, PRUint16 *readEpoch,
+   ssl_ReleaseSpecReadLock(ss);
+   return SECSuccess;
+ }
++
++SECStatus SSLInt_HasPendingHandshakeData(PRFileDesc *fd, PRBool *pending) {
++  sslSocket *ss = ssl_FindSocket(fd);
++  if (!ss) {
++    return SECFailure;
++  }
++
++  ssl_GetSSL3HandshakeLock(ss);
++  *pending = ss->ssl3.hs.msg_body.len > 0;
++  ssl_ReleaseSSL3HandshakeLock(ss);
++  return SECSuccess;
++}
+
+
+
+
+@@ -41,6 +41,7 @@ SECStatus SSLInt_AdvanceWriteSeqByAWindow(PRFileDesc *fd, PRInt32 extra);
+ SSLKEAType SSLInt_GetKEAType(SSLNamedGroup group);
+ SECStatus SSLInt_GetEpochs(PRFileDesc *fd, PRUint16 *readEpoch,
+                            PRUint16 *writeEpoch);
++SECStatus SSLInt_HasPendingHandshakeData(PRFileDesc *fd, PRBool *pending);
+ 
+ SECStatus SSLInt_SetCipherSpecChangeFunc(PRFileDesc *fd,
+                                          sslCipherSpecChangedFunc func,
+
+
+
+
+@@ -14,6 +14,7 @@ extern "C" {
+ #include "libssl_internals.h"
+ }
+ 
++#include <queue>
+ #include "gtest_utils.h"
+ #include "nss_scoped_ptrs.h"
+ #include "tls_connect.h"
+@@ -50,8 +51,7 @@ class HandshakeSecretTracker {
+                      PK11SymKey* secret) {
+     if (g_ssl_gtest_verbose) {
+       std::cerr << agent_->role_str() << ": secret callback for "
+-                << (dir == ssl_secret_read ? "read" : "write") << " epoch "
+-                << epoch << std::endl;
++                << dir << " epoch " << epoch << std::endl;
+     }
+ 
+     EXPECT_TRUE(secret);
+@@ -162,4 +162,362 @@ TEST_F(TlsConnectTest, KeyUpdateSecrets) {
+   s.CheckCalled();
+ }
+ 
++// BadPrSocket is an instance of a PR IO layer that crashes the test if it is
++// ever used for reading or writing.  It does that by failing to overwrite any
++// of the DummyIOLayerMethods, which all crash when invoked.
++class BadPrSocket : public DummyIOLayerMethods {
++ public:
++  BadPrSocket(std::shared_ptr<TlsAgent>& agent) : DummyIOLayerMethods() {
++    static PRDescIdentity bad_identity = PR_GetUniqueIdentity("bad NSPR id");
++    fd_ = DummyIOLayerMethods::CreateFD(bad_identity, this);
++
++    // This is terrible, but NSPR doesn't provide an easy way to replace the
++    // bottom layer of an IO stack.  Take the DummyPrSocket and replace its
++    // NSPR method vtable with the ones from this object.
++    dummy_layer_ =
++        PR_GetIdentitiesLayer(agent->ssl_fd(), DummyPrSocket::LayerId());
++    original_methods_ = dummy_layer_->methods;
++    original_secret_ = dummy_layer_->secret;
++    dummy_layer_->methods = fd_->methods;
++    dummy_layer_->secret = reinterpret_cast<PRFilePrivate*>(this);
++  }
++
++  // This will be destroyed before the agent, so we need to restore the state
++  // before we tampered with it.
++  virtual ~BadPrSocket() {
++    dummy_layer_->methods = original_methods_;
++    dummy_layer_->secret = original_secret_;
++  }
++
++ private:
++  ScopedPRFileDesc fd_;
++  PRFileDesc* dummy_layer_;
++  const PRIOMethods* original_methods_;
++  P

@@ -1,0 +1,106 @@
+@@ -163,7 +163,7 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+   /** Delta builder for routes that must be propagated to the main RIB */
+   @Nonnull private RibDelta.Builder<BgpRoute<?, ?>> _changeSet = RibDelta.builder();
+ 
+-  /* Hacky way to not re-init the process across topology computations. Not a permanent solution */
++  /* Indicates whether this BGP process has been initialized. */
+   private boolean _initialized = false;
+ 
+   /**
+
+
+
+
+@@ -121,6 +121,20 @@ class IncrementalBdpEngine {
+       // TODO: eventually, IGP needs to be part of fixed-point below, because tunnels.
+       computeIgpDataPlane(nodes, initialTopologyContext, answerElement);
+ 
++      LOGGER.info("Initialize virtual routers before topology fixed point");
++      Span initializationSpan =
++          GlobalTracer.get().buildSpan("Initialize virtual routers for iBDP-external").start();
++      try (Scope innerScope = GlobalTracer.get().scopeManager().activate(initializationSpan)) {
++        assert innerScope != null; // avoid unused warning
++        nodes
++            .values()
++            .parallelStream()
++            .flatMap(n -> n.getVirtualRouters().values().stream())
++            .forEach(VirtualRouter::initForEgpComputationBeforeTopologyLoop);
++      } finally {
++        initializationSpan.finish();
++      }
++
+       /*
+        * Perform a fixed-point computation.
+        */
+@@ -716,16 +730,18 @@ class IncrementalBdpEngine {
+       /*
+        * Initialize all routers and their message queues (can be done as parallel as possible)
+        */
+-      LOGGER.info("Initialize virtual routers");
++      LOGGER.info("Initialize virtual routers with updated topologies");
+       Span initializationSpan =
+-          GlobalTracer.get().buildSpan("Initialize virtual routers for iBDP-external").start();
++          GlobalTracer.get()
++              .buildSpan("Initialize virtual routers with updated topologies")
++              .start();
+       try (Scope innerScope = GlobalTracer.get().scopeManager().activate(initializationSpan)) {
+         assert innerScope != null; // avoid unused warning
+         nodes
+             .values()
+             .parallelStream()
+             .flatMap(n -> n.getVirtualRouters().values().stream())
+-            .forEach(vr -> vr.initForEgpComputation(topologyContext));
++            .forEach(vr -> vr.initForEgpComputationWithNewTopology(topologyContext));
+       } finally {
+         initializationSpan.finish();
+       }
+
+
+
+
+@@ -338,22 +338,29 @@ public class VirtualRouter implements Serializable {
+   }
+ 
+   /**
+-   * Prepare for the EGP part of the computation
++   * Prepare for the EGP part of the computation. Handles updating routing processes given new
++   * topology information.
+    *
+    * @param topologyContext The various network topologies
+    */
+-  void initForEgpComputation(TopologyContext topologyContext) {
++  void initForEgpComputationWithNewTopology(TopologyContext topologyContext) {
+     initQueuesAndDeltaBuilders(topologyContext);
+-    // Handle BGP process state
+-    if (_bgpRoutingProcess != null && !_bgpRoutingProcess.isInitialized()) {
+-      _bgpRoutingProcess.initialize(_node);
+-    }
+     if (_bgpRoutingProcess != null) {
+       // If the process exists, update the topology
+       _bgpRoutingProcess.updateTopology(topologyContext.getBgpTopology());
+     }
+   }
+ 
++  /**
++   * Initialize for EGP computation. Handles any state that does <b>not</b> depend on neighbor
++   * relationships (i.e., purely local).
++   */
++  void initForEgpComputationBeforeTopologyLoop() {
++    if (_bgpRoutingProcess != null && !_bgpRoutingProcess.isInitialized()) {
++      _bgpRoutingProcess.initialize(_node);
++    }
++  }
++
+   /**
+    * Initializes RIB delta builders and protocol message queues.
+    *
+
+
+
+
+@@ -576,7 +576,7 @@ public class VirtualRouterTest {
+     vrs.values()
+         .forEach(
+             vr ->
+-                vr.initForEgpComputation(
++                vr.initForEgpComputationWithNewTopolo

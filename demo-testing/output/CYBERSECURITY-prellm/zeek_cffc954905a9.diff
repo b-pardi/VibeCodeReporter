@@ -1,0 +1,198 @@
+@@ -17,7 +17,7 @@ enum DefPointType {
+ 	// Used to capture the notion "the variable may have no definition
+ 	// at this point" (or "has no definition", depending on whether we're
+ 	// concerned with minimal or maximal RDs).
+-	NO_DEF,
++	NO_DEF_POINT,
+ 
+ 	// Assigned at the given statement.
+ 	STMT_DEF,
+@@ -49,7 +49,7 @@ public:
+ 	DefinitionPoint()
+ 		{
+ 		o = nullptr;
+-		t = NO_DEF;
++		t = NO_DEF_POINT;
+ 		}
+ 
+ 	DefinitionPoint(const Stmt* s)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,537 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/Expr.h"
++#include "zeek/Scope.h"
++#include "zeek/Reporter.h"
++#include "zeek/Desc.h"
++#include "zeek/script_opt/GenIDDefs.h"
++#include "zeek/script_opt/ScriptOpt.h"
++#include "zeek/script_opt/ExprOptInfo.h"
++#include "zeek/script_opt/StmtOptInfo.h"
++
++
++namespace zeek::detail {
++
++
++GenIDDefs::GenIDDefs(std::shared_ptr<ProfileFunc> _pf, const Func* f,
++	             ScopePtr scope, StmtPtr body)
++: pf(std::move(_pf))
++	{
++	TraverseFunction(f, scope, body);
++	}
++
++void GenIDDefs::TraverseFunction(const Func* f, ScopePtr scope, StmtPtr body)
++	{
++	func_flavor = f->Flavor();
++
++	// Establish the outermost barrior and associated set of
++	// identifiers.
++	barrier_blocks.push_back(0);
++
++	std::unordered_set<const ID*> empty_IDs;
++	modified_IDs.push_back(empty_IDs);
++
++	for ( const auto& g : pf->Globals() )
++		{
++		g->GetOptInfo()->Clear();
++		TrackID(g);
++		}
++
++	// Clear the locals before processing the arguments, since
++	// they're included among the locals.
++	for ( const auto& l : pf->Locals() )
++		l->GetOptInfo()->Clear();
++
++	const auto& args = scope->OrderedVars();
++	int nparam = f->GetType()->Params()->NumFields();
++
++	for ( const auto& a : args )
++		{
++		if ( --nparam < 0 )
++			break;
++
++		a->GetOptInfo()->Clear();
++		TrackID(a);
++		}
++
++	stmt_num = 0;	// 0 = "before the first statement"
++
++	body->Traverse(this);
++	}
++
++TraversalCode GenIDDefs::PreStmt(const Stmt* s)
++	{
++	curr_stmt = s;
++
++	auto si = s->GetOptInfo();
++	si->stmt_num = ++stmt_num;
++	si->block_level = confluence_blocks.size() + 1;
++
++	switch ( s->Tag() ) {
++	case STMT_CATCH_RETURN:
++		{
++		auto cr = s->AsCatchReturnStmt();
++		auto block = cr->Block();
++
++		StartConfluenceBlock(s);
++		block->Traverse(this);
++		EndConfluenceBlock();
++
++		auto retvar = cr->RetVar();
++		if ( retvar )
++			TrackID(retvar->Id());
++
++		return TC_ABORTSTMT;
++		}
++
++	case STMT_IF:
++		{
++		auto i = s->AsIfStmt();
++		auto cond = i->StmtExpr();
++		auto t_branch = i->TrueBranch();
++		auto f_branch = i->FalseBranch();
++        
++		cond->Traverse(this);
++
++		StartConfluenceBlock(s);
++
++		t_branch->Traverse(this);
++		if ( ! t_branch->NoFlowAfter(false) )
++			BranchBeyond(curr_stmt, s, true);
++
++		f_branch->Traverse(this);
++		if ( ! f_branch->NoFlowAfter(false) )
++			BranchBeyond(curr_stmt, s, true);
++
++		EndConfluenceBlock(true);
++
++		return TC_ABORTSTMT;
++		}
++
++	case STMT_SWITCH:
++		{
++		auto sw = s->AsSwitchStmt();
++		auto e = sw->StmtExpr();
++
++		e->Traverse(this);
++
++		StartConfluenceBlock(sw);
++
++		for ( const auto& c : *sw->Cases() )
++			{
++			auto body = c->Body();
++
++			auto exprs = c->ExprCases();
++			if ( exprs )
++				exprs->Traverse(this);
++
++			auto type_ids = c->TypeCases();
++			if ( type_ids )
++				{
++				for ( const auto& id : *type_ids )
++					if ( id->Name() )
++						TrackID(id);
++				}
++
++			body->Traverse(this);
++			}
++
++		EndConfluenceBlock(sw->HasDefault());
++
++		return TC_ABORTSTMT;
++		}
++
++	case STMT_FOR:
++		{
++		auto f = s->AsForStmt();
++
++		auto ids = f->LoopVars();
++		auto e = f->LoopExpr();
++		auto body = f->LoopBody();
++		auto val_var = f->ValueVar();
++
++		e->Traverse(this);
++
++		for ( const auto& id : *ids )
++			TrackID(id);
++
++		if ( val_var )
++			TrackID(val_var);
++
++		StartConfluenceBlock(s);
++		body->Traverse(this);
++
++		if ( ! body->NoFlowAfter(false) )
++			BranchBackTo(curr_stmt, s, true);
++
++		EndConfluenceBlock();
++
++		return TC_ABORTSTMT;
++		}
++
++	case STMT_WHILE:
++		{
++		auto w = s

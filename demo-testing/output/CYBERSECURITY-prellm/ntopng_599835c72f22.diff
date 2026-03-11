@@ -1,0 +1,126 @@
+@@ -36,7 +36,7 @@ class AlertsQueue {
+   AlertsQueue(NetworkInterface *iface);
+ 
+   void pushOutsideDhcpRangeAlert(u_int8_t* cli_mac, Mac *sender_mac,
+-    u_int32_t ip, u_int32_t router_ip, int vlan_id);
++				 u_int32_t ip, u_int32_t router_ip, int vlan_id);
+   void pushMacIpAssociationChangedAlert(u_int32_t ip, u_int8_t *old_mac, u_int8_t *new_mac);
+   void pushBroadcastDomainTooLargeAlert(const u_int8_t *src_mac, const u_int8_t *dst_mac, u_int32_t spa, u_int32_t tpa, int vlan_id);
+   void pushRemoteToRemoteAlert(Host *host);
+
+
+
+
+@@ -89,7 +89,7 @@ class Flow : public GenericHashEntry {
+   json_object *json_info;
+   ndpi_serializer *tlv_info;
+   char *host_server_name, *bt_hash;
+-  u_int64_t iec104_typeid_mask[2]; /* [0] = lower 64 bit [1] = upper 64 bit */
++  IEC104Stats *iec104;
+   OperatingSystem operating_system;
+ #ifdef HAVE_NEDGE
+   u_int32_t last_conntrack_update; 
+@@ -275,6 +275,7 @@ class Flow : public GenericHashEntry {
+   void updateEntropy(struct ndpi_analyze_struct *e, u_int8_t *payload, u_int payload_len);
+   void lua_entropy(lua_State* vm);
+   void luaScore(lua_State* vm);
++  void luaIEC104(lua_State* vm);
+   
+  public:
+   Flow(NetworkInterface *_iface,
+@@ -379,8 +380,9 @@ class Flow : public GenericHashEntry {
+ 		     u_int8_t *payload, u_int16_t payload_len);
+   void setMatchedPacketPayload(u_int8_t *payload, u_int16_t payload_len);
+   void processDNSPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time);
+-  void processIEC60870Packet(const u_char *ip_packet, u_int16_t ip_len,
+-			     const u_char *payload, u_int16_t payload_len, u_int64_t packet_time);
++  void processIEC60870Packet(bool src2dst_direction, const u_char *ip_packet, u_int16_t ip_len,
++			     const u_char *payload, u_int16_t payload_len,
++			     struct timeval *packet_time);
+   
+   void endProtocolDissection();
+   inline void setCustomApp(custom_app_t ca) {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,50 @@
++/*
++ *
++ * (C) 2013-20 - ntop.org
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++ *
++ */
++
++#ifndef _IEC104_STATS_H_
++#define _IEC104_STATS_H_
++
++#include "ntop_includes.h"
++
++class IEC104Stats {
++ private:
++  struct {
++    u_int32_t tx, rx;
++  } pkt_lost; /* Counter for packet loss sequences */
++  std::unordered_map<u_int16_t, u_int32_t> type_i_transitions;
++  std::unordered_map<u_int16_t, u_int32_t> typeid_uses;
++  u_int16_t last_type_i;
++  struct timeval last_i_apdu;
++  struct ndpi_analyze_struct *i_s_apdu;
++  u_int16_t tx_seq_num, rx_seq_num;
++
++ public:
++  IEC104Stats();
++  ~IEC104Stats();
++
++  void processPacket(Flow *f, bool tx_direction,
++		     const u_char *payload, u_int16_t payload_len,
++		     struct timeval *packet_time);
++
++  void lua(lua_State* vm);
++};
++
++#endif /* _IEC104_STATS_H_ */
+
+
+
+
+@@ -387,6 +387,7 @@ using namespace std;
+ #include "Host.h"
+ #include "LocalHost.h"
+ #include "RemoteHost.h"
++#include "IEC104Stats.h"
+ #include "Flow.h"
+ #include "FlowHash.h"
+ #include "MacHash.h"
+
+
+
+
+@@ -1,6 +1,6 @@
+ /*
+  *
+- * (C) 2019 - ntop.org
++ * (C) 2019-20 - ntop.org
+  *
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -53,7 +53,7 @@ void AlertsQueue::pushAlertJson(ndpi_serializer *alert, const char *atype, const
+ /* **************************************************** */
+ 
+ void AlertsQueue::pushOutsideDhcpRange

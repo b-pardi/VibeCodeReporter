@@ -1,0 +1,141 @@
+@@ -4,9 +4,6 @@
+ 
+ R_API RArchSession *r_arch_session(RArch *arch, RArchConfig *cfg, RArchPlugin *ap) {
+ 	RArchSession *ai = R_NEW0 (RArchSession);
+-	if (!ai) {
+-		return NULL;
+-	}
+ 	if (ai) {
+ 		ai->arch = arch;
+ 		ai->config = cfg;
+@@ -20,7 +17,6 @@ R_API RArchSession *r_arch_session(RArch *arch, RArchConfig *cfg, RArchPlugin *a
+ 			}
+ 		}
+ 	}
+-	// resolve and instantiate plugin by name (
+ 	return ai;
+ }
+ 
+
+similarity index 76%
+rename from libr/anal/p/anal_bf.c
+rename to libr/arch/p/bf/plugin.c
+
+
+
+@@ -1,13 +1,9 @@
+-/* radare2 - LGPL - Copyright 2011-2022 - pancake */
++/* radare2 - LGPL - Copyright 2011-2023 - pancake */
+ 
+-#include <string.h>
+-#include <r_types.h>
+-#include <r_lib.h>
+-#include <r_asm.h>
+-#include <r_anal.h>
++#include <r_arch.h>
+ 
+ static size_t countChar(const ut8 *buf, int len, char ch) {
+-	int i;
++	size_t i;
+ 	for (i = 0; i < len; i++) {
+ 		if (buf[i] != ch) {
+ 			break;
+@@ -79,63 +75,73 @@ static int disassemble(RAnalOp *op, const ut8 *buf, int len) {
+ 	return rep;
+ }
+ 
+-static bool _write_asm(ut8 *outbuf, int outbufsz, int value, int n) {
++static void _write_asm(ut8 *outbuf, size_t outbufsz, int value, int n) {
+ 	memset (outbuf, value, R_MIN (n, outbufsz));
+-	return n > outbufsz;
+ }
+ 
+-static int assemble(const char *buf, ut8 *outbuf, int outbufsz) {
++static int assemble(const char *buf, ut8 **outbuf) {
+ 	int n = 0;
+ 	if (buf[0] && buf[1] == ' ') {
+ 		buf += 2;
+ 	}
+ 	const char *arg = strchr (buf, ',');
+ 	const char *ref = strchr (buf, '[');
+-	bool write_err = false;
+ 	if (arg) {
+ 		n = atoi (arg + 1);
+ 	} else {
+ 		n = 1;
+ 	}
++
++	size_t outbufsz = n;
++	*outbuf = malloc (outbufsz);
++	if (!(*outbuf)) {
++		return 0;
++	}
++
+ 	if (r_str_startswith (buf, "trap")) {
+-		write_err = _write_asm (outbuf, outbufsz, 0xcc, n);
++		_write_asm (*outbuf, outbufsz, 0xcc, n);
+ 	} else if (r_str_startswith (buf, "nop")) {
+-		write_err = _write_asm (outbuf, outbufsz, 0x90, n);
++		_write_asm (*outbuf, outbufsz, 0x90, n);
+ 	} else if (r_str_startswith (buf, "inc")) {
+ 		char ch = ref? '+': '>';
+ 		n = 1;
+-		write_err = _write_asm (outbuf, outbufsz, ch, n);
++		_write_asm (*outbuf, outbufsz, ch, n);
+ 	} else if (r_str_startswith (buf, "dec")) {
+ 		char ch = ref? '-': '<';
+ 		n = 1;
+-		write_err = _write_asm (outbuf, outbufsz, ch, n);
++		_write_asm (*outbuf, outbufsz, ch, n);
+ 	} else if (r_str_startswith (buf, "sub")) {
+ 		char ch = ref? '-': '<';
+-		write_err = _write_asm (outbuf, outbufsz, ch, n);
++		_write_asm (*outbuf, outbufsz, ch, n);
+ 	} else if (r_str_startswith (buf, "add")) {
+ 		char ch = ref? '+': '>';
+-		write_err = _write_asm (outbuf, outbufsz, ch, n);
++		_write_asm (*outbuf, outbufsz, ch, n);
+ 	} else if (r_str_startswith (buf, "while")) {
+ 		n = 1;
+-		write_err = _write_asm (outbuf, outbufsz, '[', 1);
++		_write_asm (*outbuf, outbufsz, '[', 1);
+ 	} else if (r_str_startswith (buf, "loop")) {
+ 		n = 1;
+-		write_err = _write_asm (outbuf, outbufsz, ']', 1);
++		_write_asm (*outbuf, outbufsz, ']', 1);
+ 	} else if (r_str_startswith (buf, "in")) {
+-		write_err = _write_asm (outbuf, outbufsz, ',', n);
++		_write_asm (*outbuf, outbufsz, ',', n);
+ 	} else if (r_str_startswith (buf, "out")) {
+-		write_err = _write_asm (outbuf, outbufsz, '.', n);
++		_write_asm (*outbuf, outbufsz, '.', n);
+ 	} else {
++		R_FREE (*outbuf);
+ 		n = 0;
+ 	}
+-	if (write_err) {
+-		return 0;
+-	}
+ 	return n;
+ }
+ 
+ #define BUFSIZE_INC 32
+-static int bf_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *_buf, int len, RAnalOpMask mask) {
++static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
++	int len = op->size;
++	const ut8 *_buf = op->bytes;
++	const ut64 addr = op->addr;
++	if (len < 1) {
++		return false;
++	}
++
+ 	ut8 *buf = (ut8*)_buf; // XXX
+ 	ut64 dst = 0LL;
+ 	if (!op) {
+@@ -178,12 +184,12 @@ static int bf_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *_buf, int len,
+ 					op->type = R_ANAL_OP_TYPE_ILL;
+ 					goto beach;
+ 				}
+-				if (i == len - 1 && anal->read_at) {
++				if (i == len - 1) {
+ 					int new_buf_len = len + 1 + BUFSI

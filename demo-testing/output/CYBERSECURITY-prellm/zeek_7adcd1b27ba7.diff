@@ -1,0 +1,153 @@
+@@ -826,7 +826,16 @@ void TypeDecl::DescribeReST(ODesc* d, bool roles_only) const
+ RecordType::RecordType(type_decl_list* arg_types) : Type(TYPE_RECORD)
+ 	{
+ 	types = arg_types;
+-	num_fields = types ? types->length() : 0;
++
++	if ( types )
++		{
++		num_fields = types->length();
++
++		loop_over_list(*types, i)
++			AddField(i, (*types)[i]);
++		}
++	else
++		num_fields = 0;
+ 	}
+ 
+ // in this case the clone is actually not so shallow, since
+@@ -850,6 +859,13 @@ RecordType::~RecordType()
+ 		}
+ 	}
+ 
++void RecordType::AddField(unsigned int field, const TypeDecl* td)
++	{
++	ASSERT(field == managed_fields.size());
++
++	managed_fields.push_back(IsManagedType(td->type));
++	}
++
+ bool RecordType::HasField(const char* field) const
+ 	{
+ 	return FieldOffset(field) >= 0;
+@@ -1023,7 +1039,9 @@ const char* RecordType::AddFields(const type_decl_list& others,
+ 			td->attrs->AddAttr(make_intrusive<detail::Attr>(detail::ATTR_LOG));
+ 			}
+ 
++		int field = types->size();
+ 		types->push_back(td);
++		AddField(field, td);
+ 		}
+ 
+ 	num_fields = types->length();
+
+
+
+
+@@ -599,6 +599,11 @@ public:
+ 	const TypeDecl* FieldDecl(int field) const;
+ 	TypeDecl* FieldDecl(int field);
+ 
++	// Returns flags corresponding to which fields in the record
++	// have types requiring memory management (reference counting).
++	const std::vector<bool>& ManagedFields() const
++		{ return managed_fields; }
++
+ 	int NumFields() const			{ return num_fields; }
+ 
+ 	/**
+@@ -634,6 +639,12 @@ public:
+ protected:
+ 	RecordType() { types = nullptr; }
+ 
++	void AddField(unsigned int field, const TypeDecl* td);
++
++	// If we were willing to bound the size of records, then we could
++	// use std::bitset here instead.
++	std::vector<bool> managed_fields;
++
+ 	int num_fields;
+ 	type_decl_list* types;
+ };
+
+
+
+
+@@ -2785,10 +2785,11 @@ TableVal::TableRecordDependencies TableVal::parse_time_table_record_dependencies
+ 
+ RecordVal::RecordTypeValMap RecordVal::parse_time_records;
+ 
+-RecordVal::RecordVal(RecordTypePtr t, bool init_fields) : Val(std::move(t))
++RecordVal::RecordVal(RecordTypePtr t, bool init_fields)
++: Val(t), is_managed(t->ManagedFields())
+ 	{
+ 	origin = nullptr;
+-	rt = {NewRef{}, GetType()->AsRecordType()};
++	rt = std::move(t);
+ 
+ 	int n = rt->NumFields();
+ 
+@@ -2871,8 +2872,8 @@ RecordVal::~RecordVal()
+ 	auto n = record_val->size();
+ 
+ 	for ( unsigned int i = 0; i < n; ++i )
+-		if ( HasField(i) )
+-			DeleteIfManaged((*record_val)[i], rt->GetFieldType(i));
++		if ( HasField(i) && IsManaged(i) )
++			DeleteManagedType((*record_val)[i]);
+ 
+ 	delete record_val;
+ 	delete is_in_record;
+@@ -2887,6 +2888,8 @@ void RecordVal::Assign(int field, ValPtr new_val)
+ 	{
+ 	if ( new_val )
+ 		{
++		DeleteFieldIfManaged(field);
++
+ 		auto t = rt->GetFieldType(field);
+ 		(*record_val)[field] = ZVal(new_val, t);
+ 		(*is_in_record)[field] = true;
+@@ -2900,8 +2903,8 @@ void RecordVal::Remove(int field)
+ 	{
+ 	if ( HasField(field) )
+ 		{
+-		auto t = rt->GetFieldType(field);
+-		DeleteIfManaged((*record_val)[field], t);
++		if ( IsManaged(field) )
++			DeleteManagedType((*record_val)[field]);
+ 
+ 		(*record_val)[field] = ZVal();
+ 		(*is_in_record)[field] = false;
+
+
+
+
+@@ -1110,21 +1110,18 @@ public:
+ 	void AssignInterval(int field, double new_val)
+ 		{ Assign(field, new_val); }
+ 
+-	void Assign(int field, const char* new_val)
++	void Assign(int field, StringVal* new_val)
+ 		{
+-		(*record_val)[field].string_val = new StringVal(new_val);
++		DeleteManagedType((*record_val)[field]);
++		(*record_val)[field].string_val = new_val;
+ 		AddedField(field);
+ 		}
++	void Assign(int field, const char* new_val)
++		{ Assign(field, new StringVal(new_val)); }
+ 	void Assign(int field, const std::string& new_val)
+-		{
+-		(*record_val)[field].string_val = new StringVal(new_val);
+-		AddedField(field);
+-		}
++		{ Assign(field, new StringVal(new_val)); }
+ 	void Assign(int field, String* new_val)
+-		{
+-		(*record_val)[field].string_val = new StringVal(new_val);
+-		AddedField(field);
+-		}
++		{ Assign(field, new StringVal(new_val)); }
+ 
+ 	/**
+ 	 * Appends a value to t

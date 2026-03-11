@@ -1,0 +1,119 @@
+@@ -39,27 +39,26 @@ config config_from_data(
+     const std::unordered_map<std::uint32_t, std::string>& data_names,
+     const data& backing)
+ {
+-  config new_conf{0};
++  config new_conf;
+ 
+-  auto& bf = new_conf.blockfile();
+-  auto& rf = new_conf.recordfile();
+-  auto& dfs = new_conf.datafiles();
++  auto& bfs = new_conf.bfiles;
++  auto& rfs = new_conf.rfiles;
++  auto& dfs = new_conf.dfiles;
+ 
+-  bf = config::block_file{
++  bfs.push_back(config::block_file{
+       .relpath = block_names.at(0),
+       .Start = 0,
+       .End = backing.blocks.size(),
+       .Idx = 0,
+-  };
++  });
+ 
+-  rf = config::record_file{
++  rfs.push_back(config::record_file{
+       .relpath = record_names.at(0),
+       .Start = 0,
+       .End = backing.records.size(),
+       .Idx = 0,
+-  };
++  });
+ 
+-  dfs.clear();
+   for (auto [bsize, idx] : backing.bsize_to_idx) {
+     auto dfile = backing.idx_to_dfile.at(idx);
+     auto& df = backing.datafiles.at(dfile);
+@@ -226,12 +225,11 @@ volume::volume(open_type type, const char* path) : sys_path{path}
+     throw std::system_error(errno, std::generic_category(), errctx);
+   }
+ 
+-  config conf{LoadFile(conf_fd.fileno())};
+-
+-  block_names[conf.blockfile().Idx] = conf.blockfile().relpath;
+-  record_names[conf.recordfile().Idx] = conf.recordfile().relpath;
++  auto conf = config::deserialize(LoadFile(conf_fd.fileno()));
+ 
+-  for (auto& df : conf.datafiles()) { data_names[df.Idx] = df.relpath; }
++  for (auto& bf : conf.bfiles) { block_names[bf.Idx] = bf.relpath; }
++  for (auto& rf : conf.rfiles) { record_names[rf.Idx] = rf.relpath; }
++  for (auto& df : conf.dfiles) { data_names[df.Idx] = df.relpath; }
+ 
+   backing.emplace(
+       open_context{
+@@ -244,10 +242,19 @@ volume::volume(open_type type, const char* path) : sys_path{path}
+ 
+ data::data(open_context ctx, const config& conf)
+ {
+-  auto& bf = conf.blockfile();
++  if (conf.bfiles.size() != 1) {
++    throw std::runtime_error("bad config (num blockfiles ("
++                             + std::to_string(conf.bfiles.size()) + ") != 1)");
++  }
++  if (conf.rfiles.size() != 1) {
++    throw std::runtime_error("bad config (num recordfiles ("
++                             + std::to_string(conf.rfiles.size()) + ") != 1)");
++  }
++
++  auto& bf = conf.bfiles[0];
+   if (bf.Start != 0) { throw std::runtime_error("blockfile start != 0."); }
+ 
+-  auto& rf = conf.recordfile();
++  auto& rf = conf.rfiles[0];
+   if (rf.Start != 0) { throw std::runtime_error("recordfile start != 0."); }
+ 
+   raii_fd bfd = OpenRelative(ctx, bf.relpath.c_str());
+@@ -257,9 +264,7 @@ data::data(open_context ctx, const config& conf)
+   fds.emplace_back(std::move(bfd));
+   fds.emplace_back(std::move(rfd));
+ 
+-  auto& dfs = conf.datafiles();
+-
+-  for (auto& df : dfs) {
++  for (auto& df : conf.dfiles) {
+     raii_fd& fd = fds.emplace_back(OpenRelative(ctx, df.relpath.c_str()));
+     if (!ctx.read_only && df.ReadOnly) {
+       throw std::runtime_error("file '" + df.relpath + "' is readonly,"
+@@ -271,6 +276,10 @@ data::data(open_context ctx, const config& conf)
+     idx_to_dfile[df.Idx] = idx;
+     bsize_to_idx[df.BlockSize] = df.Idx;
+   }
++
++  if (bsize_to_idx.find(1) == bsize_to_idx.end()) {
++    throw std::runtime_error("bad config (no datafile with BlockSize 1).");
++  }
+ }
+ 
+ void volume::update_config()
+@@ -285,7 +294,7 @@ void volume::update_config()
+   config conf = config_from_data(block_names, record_names, data_names,
+                                  backing.value());
+ 
+-  auto serialized = conf.serialize();
++  auto serialized = config::serialize(conf);
+ 
+   WriteFile(conf_fd.fileno(), serialized);
+ }
+@@ -428,9 +437,9 @@ void volume::create_new(int creation_mode,
+     throw std::system_error(errno, std::generic_category(), errctx);
+   }
+ 
+-  config def{blocksize};
++  auto conf = config::make_default(blocksize);
+ 
+-  auto data = def.serialize();
++  auto data = config::serialize(conf);
+ 
+   raii_fd conf_fd = openat(dird.fileno(), "config", flags, creation_mode);
+   if (!conf_fd) {
+@@ -441,28 +450,31 @@ vo

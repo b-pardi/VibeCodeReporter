@@ -1,0 +1,100 @@
+@@ -26,6 +26,7 @@ import org.batfish.datamodel.BgpTieBreaker;
+ import org.batfish.datamodel.Bgpv4Route;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.EvpnRoute;
++import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.MultipathEquivalentAsPathMatchMode;
+ import org.batfish.datamodel.bgp.BgpTopology;
+ import org.batfish.datamodel.bgp.BgpTopology.EdgeId;
+@@ -39,7 +40,7 @@ import org.batfish.dataplane.rib.RouteAdvertisement;
+ @ParametersAreNonnullByDefault
+ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute> {
+   /** Configuration for this process */
+-  @Nonnull private final BgpProcess _process;
++  @Nonnull final BgpProcess _process;
+   /** Parent node configuration */
+   @Nonnull private final Configuration _c;
+   /** Name of our VRF */
+@@ -208,4 +209,20 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute> {
+     assert q != null; // Invariant of the session being up
+     q.addAll(routes);
+   }
++
++  /**
++   * Message passing method between BGP processes. Take a stream of BGP {@link RouteAdvertisement}s
++   * and puts them onto a local queue corresponding to the session between given neighbors.
++   */
++  void enqueueBgpMessages(
++      @Nonnull EdgeId edgeId, @Nonnull Stream<RouteAdvertisement<Bgpv4Route>> routes) {
++    Queue<RouteAdvertisement<Bgpv4Route>> q = _bgpv4IncomingRoutes.get(edgeId);
++    assert q != null; // Invariant of the session being up
++    routes.forEach(q::add);
++  }
++
++  @Nonnull
++  public Ip getRouterId() {
++    return _process.getRouterId();
++  }
+ }
+
+
+
+
+@@ -408,6 +408,16 @@ class IncrementalBdpEngine {
+       Map<String, Node> allNodes,
+       BgpTopology bgpTopology,
+       NetworkConfigurations networkConfigurations) {
++    try (ActiveSpan span =
++        GlobalTracer.get()
++            .buildSpan(iterationLabel + ": Init for new BGP iteration")
++            .startActive()) {
++      assert span != null;
++      nodes
++          .values()
++          .parallelStream()
++          .forEach(n -> n.getVirtualRouters().values().forEach(vr -> vr.bgpIteration(allNodes)));
++    }
+     try (ActiveSpan span =
+         GlobalTracer.get()
+             .buildSpan(iterationLabel + ": Init BGP generated/aggregate routes")
+@@ -430,7 +440,6 @@ class IncrementalBdpEngine {
+           .flatMap(n -> n.getVirtualRouters().values().stream())
+           .forEach(
+               vr -> {
+-                vr.bgpIteration(allNodes);
+                 Map<Bgpv4Rib, RibDelta<Bgpv4Route>> deltas =
+                     vr.processBgpMessages(bgpTopology, networkConfigurations, nodes);
+                 vr.finalizeBgpRoutesAndQueueOutgoingMessages(
+
+
+
+
+@@ -43,7 +43,6 @@ import javax.annotation.Nullable;
+ import org.batfish.common.BatfishException;
+ import org.batfish.datamodel.AbstractRoute;
+ import org.batfish.datamodel.AbstractRouteBuilder;
+-import org.batfish.datamodel.AbstractRouteDecorator;
+ import org.batfish.datamodel.AnnotatedRoute;
+ import org.batfish.datamodel.AsPath;
+ import org.batfish.datamodel.BgpActivePeerConfig;
+@@ -1353,103 +1352,132 @@ public class VirtualRouter implements Serializable {
+       BgpTopology bgpTopology,
+       NetworkConfigurations networkConfigurations) {
+     for (EdgeId edge : _bgpRoutingProcess._bgpv4IncomingRoutes.keySet()) {
+-      final BgpSessionProperties session = getBgpSessionProperties(bgpTopology, edge);
+-
+-      BgpPeerConfigId remoteConfigId = edge.tail();
+-      BgpPeerConfigId ourConfigId = edge.head();
+-      BgpPeerConfig ourConfig = networkConfigurations.getBgpPeerConfig(edge.head());
+-      BgpPeerConfig remoteConfig = networkConfigurations.getBgpPeerConfig(edge.tail());
+-      VirtualRouter remoteVirtualRouter = getRemoteBgpNeighborVR(remoteConfigId, allNodes);
+-      if (remoteVirtualRouter == null) {
+-        continue;
+-      }
++      queueOutgoingRoutesPerEdge(
++          edge,
++          ebgpBestPathDelta,
++          bgpDelta,
++          mainDelta,
++          allNodes,
++          bgpTopology

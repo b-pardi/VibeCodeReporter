@@ -1,0 +1,138 @@
+@@ -76,7 +76,9 @@ R_API int r_core_file_reopen(RCore *core, const char *args, int perm, int loadbi
+ 
+ 	if (isdebug) {
+ 		r_debug_kill (core->dbg, core->dbg->pid, core->dbg->tid, 9); // SIGKILL
+-		r_debug_continue (core->dbg);
++		do {
++			r_debug_continue (core->dbg);
++		} while (!r_debug_is_dead (core->dbg));
+ 		r_debug_detach (core->dbg, core->dbg->pid);
+ 		perm = 7;
+ 	} else {
+
+
+
+
+@@ -346,6 +346,7 @@ R_API RDebugMap *r_debug_map_get(RDebug *dbg, ut64 addr) {
+ 
+ R_API void r_debug_map_free(RDebugMap *map) {
+ 	free (map->name);
++	free (map->file);
+ 	free (map);
+ }
+ 
+
+
+
+
+@@ -291,9 +291,7 @@ static bool tracelib(RDebug *dbg, const char *mode, PLIB_ITEM item) {
+ 		case 'u': needle = dbg->glob_unlibs; break;
+ 		}
+ 	}
+-	//eprintf ("(%d) %sing library at %p (%s) %s\n", item->pid, mode,
+-		//item->BaseOfDll, item->Path, item->Name);
+-	r_cons_printf ("(%d) %sing library at %p (%s) %s\n", item->pid, mode,
++	r_cons_printf ("(%d) %sing library at 0x%p (%s) %s\n", item->pid, mode,
+ 		item->BaseOfDll, item->Path, item->Name);
+ 	r_cons_flush ();
+ 	if (needle && strlen (needle)) {
+
+
+
+
+@@ -75,12 +75,15 @@ R_API RList *r_w32_dbg_modules(RDebug *dbg) {
+ 		return NULL;
+ 	}
+ 	MODULEENTRY32 me;
+-	RList *list = r_list_newf (free);
++	RList *list = r_list_newf ((RListFree)r_debug_map_free);
+ 	DWORD flags = TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32;
+ 	HANDLE h_mod_snap = w32_CreateToolhelp32Snapshot (flags, dbg->pid);
+ 
+ 	if (h_mod_snap == INVALID_HANDLE_VALUE) {
+-		r_sys_perror ("r_w32_dbg_modules/CreateToolhelp32Snapshot");
++		// Suppress if process is still initializing
++		if (GetLastError () != ERROR_PARTIAL_COPY || r_list_length (dbg->threads) > 1) {
++			r_sys_perror ("r_w32_dbg_modules/CreateToolhelp32Snapshot");
++		}
+ 		goto err_w32_dbg_modules;
+ 	}
+ 	me.dwSize = sizeof (MODULEENTRY32);
+@@ -101,7 +104,7 @@ R_API RList *r_w32_dbg_modules(RDebug *dbg) {
+ 		}
+ 	} while (Module32Next (h_mod_snap, &me));
+ err_w32_dbg_modules:
+-	if (h_mod_snap) {
++	if (h_mod_snap && h_mod_snap != INVALID_HANDLE_VALUE) {
+ 		CloseHandle (h_mod_snap);
+ 	}
+ 	return list;
+@@ -245,7 +248,7 @@ R_API RList *r_w32_dbg_maps(RDebug *dbg) {
+ 	LPVOID cur_addr;
+ 	MEMORY_BASIC_INFORMATION mbi;
+ 	RWinModInfo mod_inf = {0};
+-	RList *map_list = r_list_new (), *mod_list = NULL;
++	RList *map_list = r_list_newf ((RListFree)r_debug_map_free), *mod_list = NULL;
+ 	W32DbgWInst *wrap = dbg->user;
+ 
+ 	GetSystemInfo (&si);
+
+
+
+
+@@ -1,9 +1,14 @@
+ /* radare - LGPL - Copyright 2019 - MapleLeaf-X */
+-#include <string.h>
++
++#include <ntstatus.h>
++#define WIN32_NO_STATUS
+ #include "windows_debug.h"
+ #include <w32dbg_wrap.h>
++#undef WIN32_NO_STATUS
+ 
+ const DWORD wait_time = 1000;
++static RList *lib_list = NULL;
++static PLIB_ITEM last_lib = NULL;
+ 
+ #define w32_PROCESS_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xFFF)
+ #define w32_THREAD_ALL_ACCESS w32_PROCESS_ALL_ACCESS
+@@ -32,9 +37,10 @@ int w32_init(RDebug *dbg) {
+ 	W32DbgWInst *wrap = dbg->user;
+ 	if (!wrap) {
+ 		if (dbg->iob.io->w32dbg_wrap) {
+-			wrap = dbg->iob.io->w32dbg_wrap;
++			wrap = (W32DbgWInst *)dbg->iob.io->w32dbg_wrap;
+ 		} else {
+-			wrap = dbg->iob.io->w32dbg_wrap = w32dbg_wrap_new ();
++			wrap = w32dbg_wrap_new ();
++			dbg->iob.io->w32dbg_wrap = (struct w32dbg_wrap_instance_t *)wrap;
+ 			wrap->pi.dwProcessId = dbg->pid;
+ 			wrap->pi.dwThreadId = dbg->tid;
+ 		}
+@@ -136,7 +142,6 @@ int w32_init(RDebug *dbg) {
+ 		return false;
+ 	}
+ 
+-	// wrap->dbgpriv = setup_debug_privileges (true);
+ 	return true;
+ }
+ 
+@@ -526,17 +531,18 @@ int w32_detach(RDebug *dbg, int pid) {
+ 		return false;
+ 	}
+ 
++	DebugSetProcessKillOnExit (FALSE);
+ 	W32DbgWInst *wrap = dbg->user;
+ 	bool ret = false;
+ 	wrap->pi.dwProcessId = pid;
+-	wrap->params.type = W32_DETTACH;
++	wrap->params.type = W32_DETACH;
+ 	w32dbg_wrap_wait_ret (wrap);
+ 	ret = wrap->params.ret;
+ 	if (wrap->pi.hProcess) {
+ 		CloseHandle (wrap->pi.hProcess);
+-		wrap->pi.hProcess = NULL;
+-		wrap->pi.dwProcessId = 0;
++		memset (&wrap->pi, 0, sizeof (wrap->pi));
+ 	}
++	DebugSetProcessKillOnExit (TRUE)

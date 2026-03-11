@@ -1,0 +1,80 @@
+@@ -9,13 +9,19 @@
+ # Contact: sm@keepersecurity.com
+ #
+ import argparse
++import asyncio
+ import json
+ import logging
++import queue
++import ssl
++import sys
++import threading
+ import os.path
+ from datetime import datetime
+ from typing import Dict, Optional, Any
+ 
+ import requests
++import websockets
+ from keeper_secrets_manager_core.utils import url_safe_str_to_bytes
+ 
+ from .base import Command, GroupCommand, dump_report_data, report_output_parser, field_to_title
+@@ -31,13 +37,17 @@ from .pam.pam_dto import GatewayActionGatewayInfo, GatewayActionDiscoverInputs,
+     GatewayActionRotateInputs, GatewayAction, GatewayActionJobInfoInputs, \
+     GatewayActionJobInfo, GatewayActionJobCancel
+ from .pam.router_helper import router_send_action_to_gateway, print_router_response, \
+-    router_get_connected_gateways, router_set_record_rotation_information, router_get_rotation_schedules, get_router_url
++    router_get_connected_gateways, router_set_record_rotation_information, router_get_rotation_schedules, \
++    get_router_url, router_send_message_to_gateway, get_router_ws_url, get_controller_cookie, request_cookie_jar_to_str
+ from .record_edit import RecordEditMixin
+-from .. import api, utils, vault_extensions, vault, record_management, attachment, record_facades
++from .tunnel.port_forward import tunnel_connected, endpoint
++from .. import api, utils, vault_extensions, vault, record_management, attachment, record_facades, rest_api, crypto
+ from ..display import bcolors
+ from ..error import CommandError
++from ..loginv3 import CommonHelperMethods
+ from ..params import KeeperParams, LAST_RECORD_UID
+ from ..proto import pam_pb2, router_pb2, record_pb2
++from ..proto.APIRequest_pb2 import GetKsmPublicKeysRequest, GetKsmPublicKeysResponse
+ from ..subfolder import find_parent_top_folder
+ 
+ 
+@@ -57,6 +67,7 @@ class PAMControllerCommand(GroupCommand):
+         self.register_command('config', PAMConfigurationsCommand(), 'Manage PAM Configurations', 'c')
+         self.register_command('rotation', PAMRotationCommand(), 'Manage Rotations', 'r')
+         self.register_command('action', GatewayActionCommand(), 'Execute action on the Gateway', 'a')
++        self.register_command('tunnel', PAMTunnelCommand(), 'Manage Tunnels', 't')
+ 
+ 
+ class PAMGatewayCommand(GroupCommand):
+@@ -71,6 +82,17 @@ class PAMGatewayCommand(GroupCommand):
+         self.default_verb = 'list'
+ 
+ 
++class PAMTunnelCommand(GroupCommand):
++
++    def __init__(self):
++        super(PAMTunnelCommand, self).__init__()
++        self.register_command('start', PAMTunnelStartCommand(), 'Start Tunnel', 's')
++        self.register_command('list', PAMTunnelListCommand(), 'List all Tunnels', 'l')
++        self.register_command('stop', PAMTunnelStopCommand(), 'Stop Tunnel to the server', 'x')
++        self.register_command('tail', PAMTunnelTailCommand(), 'View Tunnel Log', 't')
++        # self.default_verb = 'list'
++
++
+ class PAMConfigurationsCommand(GroupCommand):
+ 
+     def __init__(self):
+@@ -105,7 +127,6 @@ class GatewayActionCommand(GroupCommand):
+         self.register_command('job-cancel', PAMGatewayActionJobCommand(), 'View Job details', 'jc')
+ 
+         # self.register_command('job-list', DRCmdListJobs(), 'List Running jobs')
+-        # self.register_command('tunnel', DRTunnelCommand(), 'Tunnel to the server')
+ 
+ 
+ class PAMCmdListJobs(Command):
+@@ -139,7 +160,7 @@ class PAMCreateRecordRotationCommand(Command):
+     parser = argparse.ArgumentParser(prog='pam rotation new')
+     parser.add_argument('--record',       '-r',  required=True, dest='record_uid', action='store', help='Record UID that will be rotated manually or via schedule')
+     parser.add_argument('--config',       '-c',  required=True, dest='config_uid', action='store', help='UID of the PAM Configuration.')
+-    parser.add_argument('--resource',     '-rs',  required=False, dest='resource_uid', action='store', help='UID of the resource record.')
++    parser.add_argument('--resource',     '-rs',  required=False, dest='resource_

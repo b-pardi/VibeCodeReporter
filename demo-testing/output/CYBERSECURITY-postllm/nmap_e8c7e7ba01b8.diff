@@ -1,0 +1,120 @@
+@@ -219,7 +219,7 @@ struct dns_server {
+ };
+ 
+ struct request {
+-  Target *targ;
++  DNS::Request *targ;
+   struct timeval timeout;
+   int tries;
+   int servers_tried;
+@@ -447,7 +447,7 @@ static void do_possible_writes() {
+ 
+       if (tpreq) {
+         if (o.debugging >= TRACE_DEBUG_LEVEL)
+-           log_write(LOG_STDOUT, "mass_rdns: TRANSMITTING for <%s> (server <%s>)\n", tpreq->targ->targetipstr() , servI->hostname.c_str());
++           log_write(LOG_STDOUT, "mass_rdns: TRANSMITTING for <%s> (server <%s>)\n", tpreq->targ->repr(), servI->hostname.c_str());
+         stat_trans++;
+         put_dns_packet_on_wire(tpreq);
+       }
+@@ -483,8 +483,19 @@ static void put_dns_packet_on_wire(request *req) {
+   req->id = DNS::Factory::progressiveId;
+   req->curr_server->write_busy = 1;
+   req->curr_server->reqs_on_wire++;
++  DNS::Request &reqt = *req->targ;
+ 
+-  plen = DNS::Factory::buildReverseRequest(*req->targ->TargetSockAddr(), packet, maxlen);
++  switch(reqt.type) {
++    case DNS::A:
++    case DNS::AAAA:
++      plen = DNS::Factory::buildSimpleRequest(reqt.name, reqt.type, packet, maxlen);
++      break;
++    case DNS::PTR:
++      plen = DNS::Factory::buildReverseRequest(reqt.ss, packet, maxlen);
++      break;
++    default:
++      break;
++  }
+ 
+   memcpy(&now, nsock_gettimeofday(), sizeof(struct timeval));
+   TIMEVAL_MSEC_ADD(timeout, now, read_timeouts[read_timeout_index][req->tries]);
+@@ -551,7 +562,7 @@ static int deal_with_timedout_reads() {
+             // FIXME: Find a good compromise
+ 
+             // **** We've already tried all servers... give up
+-            if (o.debugging >= TRACE_DEBUG_LEVEL) log_write(LOG_STDOUT, "mass_rdns: *DR*OPPING <%s>\n", tpreq->targ->targetipstr());
++            if (o.debugging >= TRACE_DEBUG_LEVEL) log_write(LOG_STDOUT, "mass_rdns: *DR*OPPING <%s>\n", tpreq->targ->repr());
+ 
+             output_summary();
+             stat_dropped++;
+@@ -579,60 +590,67 @@ static int deal_with_timedout_reads() {
+ 
+ }
+ 
+-// After processing a DNS response, we search through the IPs we're
+-// looking for and update their results as necessary.
+-// Returns non-zero if this matches a query we're looking for
+-static int process_result(const sockaddr_storage &ip, const std::string &result, int action, u16 id)
+-{
+-  request *tpreq;
+-  std::map<u16, info>::iterator infoI;
+-  dns_server *server;
++static void process_request(int action, info &reqinfo) {
++  request *tpreq = reqinfo.tpreq;
++  dns_server *server = reqinfo.server;
+ 
+-  infoI = records.find(id);
+-
+-  if( infoI != records.end() ){
+-
+-    tpreq = infoI->second.tpreq;
+-    server = infoI->second.server;
+-
+-    if( !result.empty() && !sockaddr_storage_equal(&ip, tpreq->targ->TargetSockAddr()) )
+-      return 0;
+-
+-    if (action == ACTION_SYSTEM_RESOLVE || action == ACTION_FINISHED)
+-    {
++  switch (action) {
++    case ACTION_SYSTEM_RESOLVE:
++    case ACTION_FINISHED:
+       server->capacity += CAPACITY_UP_STEP;
+       check_capacities(&*server);
+-
+-      if(!result.empty())
+-      {
+-        tpreq->targ->setHostName(result.c_str());
+-        host_cache.add(* tpreq->targ->TargetSockAddr(), result);
+-      }
+-
+-      records.erase(infoI);
++      records.erase(tpreq->id);
+       server->in_process.remove(tpreq);
+       server->reqs_on_wire--;
+-
+       total_reqs--;
++      if (action == ACTION_SYSTEM_RESOLVE) {
++        deferred_reqs.push_back(tpreq);
++      }
++      else {
++        delete tpreq;
++      }
+ 
+-      if (action == ACTION_SYSTEM_RESOLVE) deferred_reqs.push_back(tpreq);
+-      if (action == ACTION_FINISHED) delete tpreq;
+-    }
+-    else
+-    {
++      break;
++    case ACTION_TIMEOUT:
+       memcpy(&tpreq->timeout, nsock_gettimeofday(), sizeof(struct timeval));
+       deal_with_timedout_reads();
++      break;
++    default:
++      assert(false);
++      break;
++  }
++}
++
++// After processing a DNS response, we search through the IPs we're
++// looking for and update their results as necessary.
++static int process_result(const sockaddr_storage &ip, const std::s

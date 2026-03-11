@@ -1,0 +1,98 @@
+@@ -639,6 +639,7 @@ extern RIOPlugin r_io_plugin_treebuf;
+ extern RIOPlugin r_io_plugin_sysgdb;
+ extern RIOPlugin r_io_plugin_serial;
+ extern RIOPlugin r_io_plugin_cyclic;
++extern RIOPlugin r_io_plugin_uf2;
+ 
+ #if __cplusplus
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,454 @@
++/* radare - LGPL - Copyright 2024 - aviciano */
++
++#include <r_io.h>
++
++// Little endian is used, as most microcontrollers are little endian.
++// https://github.com/Microsoft/uf2
++// https://github.com/raspberrypi/picotool/issues/8
++
++#define UF2_MAGIC_START0 0x0A324655UL // "UF2\n"
++#define UF2_MAGIC_START1 0x9E5D5157UL // Randomly selected
++#define UF2_MAGIC_END 0x0AB16F30UL    // Ditto
++
++enum UF2_Flags {
++	NOT_MAIN_FLASH = 0x1 << 0,
++	FILE_CONTAINER = 0x1 << 12,
++	FAMILY_ID      = 0x1 << 13,
++	MD5_CHECKSUM   = 0x1 << 14,
++	EXTENSION_TAGS = 0x1 << 15,
++};
++
++
++#define ETAG_DESCRIPTION 0x650d9d // description of device for which the firmware file is destined (UTF8)
++#define ETAG_FW_VERSION  0x9fc7bc // version of firmware file - UTF8 semver string
++#define ETAG_PAGE_SIZE   0x0be9f7 // page size of target device (32 bit unsigned number)
++#define ETAG_FW_CHECKSUM 0xb46db0 // SHA-2 checksum of firmware (can be of various size)
++#define ETAG_DEVICE_ID   0xc8a729 // device type identifier - a refinement of familyID meant to identify a kind of device (eg., a toaster with specific pinout and heating unit), not only MCU; 32 or 64 bit number; can be hash of 0x650d9d
++
++typedef struct {
++	// 32 byte header
++	ut32 magicStart0; // First magic number, 0x0A324655 ("UF2\n")
++	ut32 magicStart1; // Second magic number, 0x9E5D5157
++	ut32 flags;
++	ut32 targetAddr;  // Address in flash where the data should be written
++	ut32 payloadSize; // Number of bytes used in data (often 256)
++	ut32 blockNo;     // Sequential block number; starts at 0
++	ut32 numBlocks;   // Total number of blocks in file
++	ut32 fileSize;    // File size or board family ID or zero
++
++	// raw data
++	// ut8 data[476];    // Data, padded with zeros
++	ut8 *data;        // Data, padded with zeros
++
++	// store magic also at the end to limit damage from partial block reads
++	ut32 magicEnd;    // Final magic number, 0x0AB16F30
++} UF2_Block;
++
++#if 0
++static void dump(UF2_Block *block) {
++	eprintf ("===========[BLOCK]===========\n");
++	eprintf ("- magicStart0 : 0x%08x\n", block->magicStart0); // First magic number, 0x0A324655 ("UF2\n")
++	eprintf ("- magicStart1 : 0x%08x\n", block->magicStart1); // Second magic number, 0x9E5D5157
++	eprintf ("- flags       : 0x%08x (", block->flags);
++	eprintf ("%s", (block->flags & NOT_MAIN_FLASH) == 0 ? "" : " NOT_MAIN_FLASH");
++	eprintf ("%s", (block->flags & FILE_CONTAINER) == 0 ? "" : " FILE_CONTAINER");
++	eprintf ("%s", (block->flags & FAMILY_ID     ) == 0 ? "" : " FAMILY_ID");
++	eprintf ("%s", (block->flags & MD5_CHECKSUM  ) == 0 ? "" : " MD5_CHECKSUM");
++	eprintf ("%s", (block->flags & EXTENSION_TAGS) == 0 ? "" : " EXTENSION_TAGS");
++	eprintf (" )\n");
++	eprintf ("- targetAddr  : 0x%08x\n", block->targetAddr);  // Address in flash where the data should be written
++	eprintf ("- payloadSize : %u\n", block->payloadSize); // Number of bytes used in data (often 256)
++	eprintf ("- blockNo     : %u\n", block->blockNo);     // Sequential block number; starts at 0
++	eprintf ("- numBlocks   : %u\n", block->numBlocks);   // Total number of blocks in file
++	if ((block->flags & FAMILY_ID) == 0) {
++		eprintf ("- fileSize    : %u\n", block->fileSize);    // File size or board family ID or zero
++	} else {
++		eprintf ("- familyID    : 0x%08x\n", block->fileSize);    // File size or board family ID or zero
++	}
++	eprintf ("- data        : \n");        // Raw Data, padded with zeros 476
++	int i = 0;
++	while (i < block->payloadSize) {
++		eprintf ("%02x ", block->data[i++] & 0xff);
++		if (i % 16 == 0) {
++			eprintf("\n");
++		}
++	}
++	if (i % 16 != 0) {
++		eprintf("\n");
++	}
++	eprintf ("- magicEnd    : 0x%08x\n", block->magicEnd);    // Final magic number, 0x0AB16F30
++	eprintf ("\n");
++}
++#endif
++
++

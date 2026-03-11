@@ -1,0 +1,128 @@
+@@ -21,6 +21,7 @@ csv_file_suffix = ".csv"
+ json_file_suffix = ".json"
+ json_asff_file_suffix = ".asff.json"
+ config_yaml = "providers/aws/config.yaml"
++allowlist_yaml = "providers/aws/allowlist.yaml"
+ 
+ 
+ def change_config_var(variable, value):
+
+
+
+
+@@ -183,6 +183,7 @@ def set_output_options(
+     input_output_directory: str,
+     security_hub_enabled: bool,
+     output_filename: str,
++    allowlist_file: str,
+ ):
+     global output_options
+     output_options = Output_From_Options(
+@@ -191,6 +192,7 @@ def set_output_options(
+         output_directory=input_output_directory,
+         security_hub_enabled=security_hub_enabled,
+         output_filename=output_filename,
++        allowlist_file=allowlist_file,
+         # set input options here
+     )
+     return output_options
+
+
+
+
+@@ -15,6 +15,7 @@ class Output_From_Options:
+     output_directory: str
+     security_hub_enabled: bool
+     output_filename: str
++    allowlist_file: str
+ 
+ 
+ # Testing Pending
+
+
+
+
+@@ -24,12 +24,12 @@ from lib.outputs.models import (
+     Severity,
+ )
+ from lib.utils.utils import file_exists, hash_sha512, open_file
++from providers.aws.lib.allowlist.allowlist import is_allowlisted
+ from providers.aws.lib.security_hub.security_hub import send_to_security_hub
+ 
+ 
+ def report(check_findings, output_options, audit_info):
+     check_findings.sort(key=lambda x: x.region)
+-
+     csv_fields = []
+     # check output options
+     file_descriptors = {}
+@@ -46,6 +46,15 @@ def report(check_findings, output_options, audit_info):
+ 
+     if check_findings:
+         for finding in check_findings:
++            # Check if finding is allowlisted
++            if is_allowlisted(
++                output_options.allowlist_file,
++                audit_info.audited_account,
++                finding.check_metadata.CheckID,
++                finding.region,
++                finding.resource_id,
++            ):
++                finding.status = "WARNING"
+             # Print findings by stdout
+             color = set_report_color(finding.status)
+             if output_options.is_quiet and "FAIL" in finding.status:
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,105 @@
++import re
++import sys
++
++import yaml
++from boto3.dynamodb.conditions import Attr
++
++from lib.logger import logger
++
++
++def parse_allowlist_file(audit_info, allowlist_file):
++    try:
++        # Check if file is a S3 URI
++        if re.search("^s3://([^/]+)/(.*?([^/]+))$", allowlist_file):
++            bucket = allowlist_file.split("/")[2]
++            key = ("/").join(allowlist_file.split("/")[3:])
++            s3_client = audit_info.audit_session.client("s3")
++            allowlist = yaml.safe_load(
++                s3_client.get_object(Bucket=bucket, Key=key)["Body"]
++            )["Allowlist"]
++        # Check if file is a DynamoDB ARN
++        elif re.search(
++            "^arn:[aws\|aws\-cn\|aws\-us\-gov]+:dynamodb:[a-z]{2}-[north\|south\|east\|west\|central]+-[1-9]{1}:[0-9]{12}:table\/[a-zA-Z0-9._-]+$",
++            allowlist_file,
++        ):
++            allowlist = {"Accounts": {}}
++            table_region = allowlist_file.split(":")[3]
++            dynamodb_resource = audit_info.audit_session.resource(
++                "dynamodb", region_name=table_region
++            )
++            dynamo_table = dynamodb_resource.Table(allowlist_file.split("/")[1])
++            response = dynamo_table.scan(
++                FilterExpression=Attr("Accounts").is_in(
++                    [audit_info.audited_account, "*"]
++                )
++            )
++            dynamodb_items = response["Items"]
++            # Paginate through all results
++            while "LastEvaluatedKey" in dynamodb_items:
++                response = dynamo_table.scan(
++                    ExclusiveStartKey=response["LastEvaluatedKey"],
++                    FilterExpression=Attr("Accounts").is_in(
++                        [audit_info.audited_account, "*"]
++                    ),
++                )
++                dynamodb_items.update(

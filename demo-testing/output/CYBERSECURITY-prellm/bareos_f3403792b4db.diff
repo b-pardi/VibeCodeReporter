@@ -1,0 +1,149 @@
+@@ -24,6 +24,7 @@
+ #include "cats/cats.h"
+ #include "dird/dbconvert/database_column_descriptions.h"
+ 
++#include <algorithm>
+ #include <iostream>
+ 
+ DatabaseColumnDescriptions::DatabaseColumnDescriptions(BareosDb* db) : db_{db}
+@@ -39,6 +40,11 @@ void DatabaseColumnDescriptions::SelectTableDescriptions(
+     err += sql_query;
+     throw std::runtime_error(err);
+   }
++  std::sort(column_descriptions.begin(), column_descriptions.end(),
++            [](std::unique_ptr<ColumnDescription>& v1,
++               std::unique_ptr<ColumnDescription>& v2) {
++              return v1->column_name < v2->column_name;
++            });
+ }
+ 
+ int DatabaseColumnDescriptionsPostgresql::ResultHandler(void* ctx,
+
+
+
+
+@@ -32,8 +32,6 @@
+ #include "include/jcr.h"
+ #include "lib/parse_conf.h"
+ 
+-#include <map>
+-
+ class BareosDb;
+ class JobControlRecord;
+ 
+
+
+
+
+@@ -40,9 +40,14 @@ class DatabaseExport {
+       const DatabaseConnection& db_connection,
+       bool clear_tables = false);
+ 
+-  virtual void Start() = 0;
+-  virtual void operator<<(const RowData& data) = 0;
+-  virtual void End() = 0;
++  virtual void StartTable() = 0;
++  virtual void EndTable() = 0;
++
++  virtual void CopyStart() = 0;
++  virtual void CopyRow(const RowData& data) = 0;
++  virtual void CopyEnd() = 0;
++
++  virtual void CompareRow(const RowData& data) = 0;
+ 
+  protected:
+   BareosDb* db_{};
+
+
+
+
+@@ -52,29 +52,32 @@ DatabaseExportPostgresql::DatabaseExportPostgresql(
+   }
+ }
+ 
+-DatabaseExportPostgresql::~DatabaseExportPostgresql() = default;
++DatabaseExportPostgresql::~DatabaseExportPostgresql()
++{
++  if (transaction_) { db_->SqlQuery("ROLLBACK"); }
++}
+ 
+-void DatabaseExportPostgresql::operator<<(const RowData& data)
++void DatabaseExportPostgresql::CopyRow(const RowData& data)
+ {
+   std::string query{"INSERT INTO "};
+   query += data.table_name;
+   query += " (";
+-  for (const auto& r : data.row) {
+-    query += r.first;
++  for (const auto& c : data.column_descriptions) {
++    query += c->column_name;
+     query += ", ";
+   }
+-  query.erase(query.end() - 2);
++  query.resize(query.size() - 2);
+   query += ")";
+ 
+   query += " VALUES (";
+ 
+   for (const auto& r : data.row) {
+     query += "'";
+-    query += r.second.data_pointer;
++    query += r.data_pointer;
+     query += "',";
+   }
+ 
+-  query.erase(query.end() - 1);
++  query.resize(query.size() - 1);
+   query += ")";
+ #if 0
+   std::cout << query << std::endl;
+@@ -87,71 +90,154 @@ void DatabaseExportPostgresql::operator<<(const RowData& data)
+ #endif
+ }
+ 
+-void DatabaseExportPostgresql::Start()
++void DatabaseExportPostgresql::CopyStart() { SelectSequenceSchema(); }
++
++static void UpdateSequences(
++    BareosDb* db,
++    const DatabaseExportPostgresql::SequenceSchemaVector&
++        sequence_schema_vector)
+ {
+-  if (!db_->SqlQuery("BEGIN")) { throw std::runtime_error(db_->get_errmsg()); }
++  for (const auto& s : sequence_schema_vector) {
++    std::string sequence_schema_query{"select setval(' "};
++    sequence_schema_query += s.sequence_name;
++    sequence_schema_query += "', (select max(";
++    sequence_schema_query += s.column_name;
++    sequence_schema_query += ") from ";
++    sequence_schema_query += s.table_name;
++    sequence_schema_query += "))";
++    if (!db->SqlQuery(sequence_schema_query.c_str())) {
++      throw std::runtime_error(
++          "DatabaseExportPostgresql: Could not set sequence");
++    }
++#if 0
++    std::cout << "Updating sequence for table: " << s.table_name <<
++    std::endl;
++#endif
++  }
+ }
+ 
+-struct SequenceSchema {
+-  std::string table_name;
+-  std::string column_name;
+-  std::string sequence_name;
+-};
++void DatabaseExportPostgresql::CopyEnd()
++{
++  UpdateSequences(db_, sequence_schema_vector_);
++}
++
++void DatabaseExportPostgresql::CursorStartTable(const std::string& table_name)
++{
++  const DatabaseTableDescriptions::TableDescription* table{
++      table_descriptions_->GetTableDescription(table_name)};
+ 
++  if (table == nullptr) {
++    std::string err{
++        "DatabaseExportPostgresql: Could not get table descri

@@ -1,0 +1,87 @@
+@@ -48,8 +48,9 @@ class MainRouter:
+         return db == self.admin_db
+ 
+     def allow_relation(self, obj1, obj2, **hints):  # noqa: F841
+-        # Allow relations if both objects are in either "default" or "admin" db connectors
+-        if {obj1._state.db, obj2._state.db} <= {self.default_db, self.admin_db}:
++        # Allow relations when both objects originate from allowed connectors
++        allowed_dbs = {self.default_db, self.admin_db, self.replica_db}
++        if {obj1._state.db, obj2._state.db} <= allowed_dbs:
+             return True
+         return None
+ 
+
+
+
+
+@@ -5,7 +5,7 @@ from celery.utils.log import get_task_logger
+ from config.django.base import DJANGO_FINDINGS_BATCH_SIZE
+ from tasks.utils import batched
+ 
+-from api.db_router import READ_REPLICA_ALIAS
++from api.db_router import READ_REPLICA_ALIAS, MainRouter
+ from api.db_utils import rls_transaction
+ from api.models import Finding, Integration, Provider
+ from api.utils import initialize_prowler_integration, initialize_prowler_provider
+@@ -179,7 +179,7 @@ def get_security_hub_client_from_integration(
+         if the connection was successful and the SecurityHub client or connection object.
+     """
+     # Get the provider associated with this integration
+-    with rls_transaction(tenant_id):
++    with rls_transaction(tenant_id, using=READ_REPLICA_ALIAS):
+         provider_relationship = integration.integrationproviderrelationship_set.first()
+         if not provider_relationship:
+             return Connection(
+@@ -208,7 +208,7 @@ def get_security_hub_client_from_integration(
+             regions_status[region] = region in connection.enabled_regions
+ 
+         # Save regions information in the integration configuration
+-        with rls_transaction(tenant_id):
++        with rls_transaction(tenant_id, using=MainRouter.default_db):
+             integration.configuration["regions"] = regions_status
+             integration.save()
+ 
+@@ -223,7 +223,7 @@ def get_security_hub_client_from_integration(
+         return True, security_hub
+     else:
+         # Reset regions information if connection fails
+-        with rls_transaction(tenant_id):
++        with rls_transaction(tenant_id, using=MainRouter.default_db):
+             integration.configuration["regions"] = {}
+             integration.save()
+ 
+@@ -334,8 +334,11 @@ def upload_security_hub_integration(
+                                         f"Security Hub connection failed for integration {integration.id}: "
+                                         f"{security_hub.error}"
+                                     )
+-                                    integration.connected = False
+-                                    integration.save()
++                                    with rls_transaction(
++                                        tenant_id, using=MainRouter.default_db
++                                    ):
++                                        integration.connected = False
++                                        integration.save()
+                                     break  # Skip this integration
+ 
+                                 security_hub_client = security_hub
+
+
+
+
+@@ -9,6 +9,7 @@ from tasks.jobs.integrations import (
+     upload_security_hub_integration,
+ )
+ 
++from api.db_router import READ_REPLICA_ALIAS, MainRouter
+ from api.models import Integration
+ from api.utils import prowler_integration_connection_test
+ from prowler.providers.aws.lib.security_hub.security_hub import SecurityHubConnection
+@@ -880,7 +881,8 @@ class TestSecurityHubIntegrationUploads:
+         # Verify RLS transaction was used correctly
+         # Should be called twice: once for getting provider info, once for resetting regions
+         assert mock_rls.call_count == 2
+-        mock_rls.assert_any_call(tenant_id)
++        mock_rls.assert_any_call(tenant_id, using=READ_REPLICA_ALIAS)
++        mock_rls.assert_any_call(tenant_id, using=MainRouter.default_db)
+ 
+         # Verify test_connection was called with integration credentials (

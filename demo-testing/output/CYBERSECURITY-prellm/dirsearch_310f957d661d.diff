@@ -1,0 +1,118 @@
+@@ -26,18 +26,18 @@ if sys.version_info < (3, 7):
+ 
+ class Program(object):
+     def __init__(self):
+-        from lib.core.options import Options
++        from lib.core.options import options
+ 
+-        options = Options()
++        options = options()
+ 
+         from lib.controller.controller import Controller
+ 
+-        if options.quiet:
++        if options["quiet"]:
+             from lib.output.silent import Output
+         else:
+             from lib.output.verbose import Output
+ 
+-        output = Output(options.color)
++        output = Output(options["color"])
+ 
+         Controller(options, output)
+ 
+
+
+
+
+@@ -16,13 +16,14 @@
+ #
+ #  Author: Mauro Soria
+ 
++import ast
+ import gc
+ import time
+ import re
+ import threading
+ 
+ from urllib.parse import urljoin, urlparse
+-from queue import Queue
++from queue import Queue, deque
+ 
+ from lib.connection.requester import Requester
+ from lib.connection.exception import RequestException
+@@ -30,7 +31,7 @@ from lib.controller.exception import SkipTargetInterrupt
+ from lib.core.dictionary import Dictionary
+ from lib.core.fuzzer import Fuzzer
+ from lib.core.report_manager import Report, ReportManager
+-from lib.core.settings import SCRIPT_PATH, BANNER, NEW_LINE, DEFAULT_HEADERS
++from lib.core.settings import SCRIPT_PATH, BANNER, NEW_LINE, DEFAULT_HEADERS, EXCLUDED_EXPORT_VARIABLES, DEFAULT_SESSION_FILE
+ from lib.parse.raw import parse_raw
+ from lib.utils.file import FileUtils
+ from lib.utils.fmt import get_valid_filename, human_size
+@@ -54,170 +55,236 @@ class EmptyReport:
+ 
+ class Controller(object):
+     def __init__(self, options, output):
++        self.url_list = Queue()
+         self.directories = Queue()
++        self.threads_lock = threading.Lock()
++        self.report_manager = EmptyReportManager()
++        self.report = EmptyReport()
+         self.output = output
++
++        if options["session_file"]:
++            self._import(FileUtils.read(options["session_file"]))
++            self.from_export = True
++        else:
++            self.setup(options)
++            self.from_export = False
++
++        self.output.header(BANNER)
++        self.output.config(
++            ', '.join(self.options["extensions"]),
++            ', '.join(self.options["prefixes"]),
++            ', '.join(self.options["suffixes"]),
++            str(self.options["threads_count"]),
++            str(len(self.dictionary)),
++            str(self.options["httpmethod"]),
++        )
++
++        self.setup_reports()
++        self.output.log_file(FileUtils.get_abs_path(options["log_file"]))
++
++        try:
++            self.run()
++        except KeyboardInterrupt:
++            self.close("Canceled by the user")
++
++    def setup(self, options):
+         self.options = options
+-        self.pass_dirs = ["/"]
++        self.url_list.queue = deque(options["url_list"])
++        self.pass_dirs = ['']
+ 
+-        if options.raw_file:
+-            options.__dict__.update(
+-                zip(["url_list", "httpmethod", "headers", "data"], parse_raw(options.raw_file))
++        if options["raw_file"]:
++            self.options.update(
++                zip(["url_list", "httpmethod", "headers", "data"], parse_raw(options["raw_file"]))
+             )
+         else:
+-            options.headers = {**DEFAULT_HEADERS, **options.headers}
+-            if options.cookie:
+-                options.headers["Cookie"] = options.cookie
+-            if options.useragent:
+-                options.headers["User-Agent"] = options.useragent
++            self.options["headers"] = {**DEFAULT_HEADERS, **options["headers"]}
++            if options["cookie"]:
++                self.options["headers"]["Cookie"] = options["cookie"]
++            if options["useragent"]:
++                self.options["headers"]["User-Agent"] = options["useragent"]
+ 
+         self.random_agents = None
+-        if options.use_random_agents:
++        if options["use_random_agents"]:
+             self.random_agents = FileUtils.get_lines(
+                 FileUtils.build_path(SCRIPT_PAT

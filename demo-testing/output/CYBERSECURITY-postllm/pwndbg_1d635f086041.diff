@@ -1,0 +1,121 @@
+@@ -15,6 +15,7 @@ import pwndbg.commands
+ import pwndbg.gdblib.kernel.slab
+ from pwndbg.commands import CommandCategory
+ from pwndbg.gdblib.kernel.slab import CpuCache
++from pwndbg.gdblib.kernel.slab import NodeCache
+ from pwndbg.gdblib.kernel.slab import Slab
+ from pwndbg.gdblib.kernel.slab import find_containing_slab_cache
+ from pwndbg.gdblib.symbol import parse_and_eval
+@@ -133,6 +134,21 @@ def print_cpu_cache(cpu_cache: CpuCache, verbose: bool, indent) -> None:
+             print_slab(partial_slab, indent, verbose)
+ 
+ 
++def print_node_cache(node_cache: NodeCache, verbose: bool, indent) -> None:
++    indent.print(
++        f"{C.green('kmem_cache_node')} @ {_yx(node_cache.address)} [NUMA node {node_cache.node}]:"
++    )
++    with indent:
++        partial_slabs = node_cache.partial_slabs
++        if not partial_slabs:
++            indent.print("Partial Slabs: (none)")
++            return
++
++        indent.print(f"{C.green('Partial Slabs')}:")
++        for slab in partial_slabs:
++            print_slab(slab, indent, verbose)
++
++
+ def slab_info(name: str, verbose: bool) -> None:
+     slab_cache = pwndbg.gdblib.kernel.slab.get_cache(name)
+ 
+@@ -159,7 +175,8 @@ def slab_info(name: str, verbose: bool) -> None:
+         for cpu_cache in slab_cache.cpu_caches:
+             print_cpu_cache(cpu_cache, verbose, indent)
+ 
+-        # TODO: print_node_cache
++        for node_cache in slab_cache.node_caches:
++            print_node_cache(node_cache, verbose, indent)
+ 
+ 
+ def slab_list(filter_) -> None:
+
+
+
+
+@@ -447,3 +447,17 @@ def paging_enabled() -> bool:
+         return Aarch64Ops.paging_enabled()
+     else:
+         raise NotImplementedError()
++
++
++@requires_debug_syms()
++def num_numa_nodes() -> int:
++    """Returns the number of NUMA nodes that are online on the system"""
++    kc = kconfig()
++    if "CONFIG_NUMA" not in kc:
++        return 1
++
++    max_nodes = 1 << int(kc["CONFIG_NODES_SHIFT"])
++    if max_nodes == 1:
++        return 1
++
++    return int(gdb.lookup_global_symbol("nr_online_nodes").value())
+
+
+
+
+@@ -151,6 +151,12 @@ class SlabCache:
+             cpu_cache = kernel.per_cpu(self._slab_cache["cpu_slab"], cpu=cpu)
+             yield CpuCache(cpu_cache, self, cpu)
+ 
++    @property
++    def node_caches(self) -> Generator["NodeCache", None, None]:
++        """returns node caches for all NUMA nodes"""
++        for node in range(kernel.num_numa_nodes()):
++            yield NodeCache(self._slab_cache["node"][node], self, node)
++
+     @property
+     def cpu_partial(self) -> int:
+         return int(self._slab_cache["cpu_partial"])
+@@ -196,7 +202,7 @@ class CpuCache:
+         _slab = self._cpu_cache[slab_key]
+         if not _slab:
+             return None
+-        return Slab(_slab.dereference(), self)
++        return Slab(_slab.dereference(), self, self.slab_cache)
+ 
+     @property
+     def partial_slabs(self) -> List["Slab"]:
+@@ -204,16 +210,40 @@ class CpuCache:
+         cur_slab = self._cpu_cache["partial"]
+         while cur_slab:
+             _slab = cur_slab.dereference()
+-            partial_slabs.append(Slab(_slab, self, is_partial=True))
++            partial_slabs.append(Slab(_slab, self, self.slab_cache, is_partial=True))
+             cur_slab = _slab["next"]
+         return partial_slabs
+ 
+ 
++class NodeCache:
++    def __init__(self, node_cache: gdb.Value, slab_cache: SlabCache, node: int):
++        self._node_cache = node_cache
++        self.slab_cache = slab_cache
++        self.node = node
++
++    @property
++    def address(self) -> int:
++        return int(self._node_cache)
++
++    @property
++    def partial_slabs(self) -> List["Slab"]:
++        ret = []
++        for slab in for_each_entry(self._node_cache["partial"], "struct slab", "slab_list"):
++            ret.append(Slab(slab.dereference(), None, self.slab_cache, is_partial=True))
++        return ret
++
++
+ class Slab:
+-    def __init__(self, slab: gdb.Value, cpu_cache: CpuCache, is_partial: bool = False) -> None:
++    def __init__(
++        self,
++        slab: gdb.Va

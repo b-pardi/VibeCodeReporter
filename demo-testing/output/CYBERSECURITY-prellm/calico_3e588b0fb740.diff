@@ -1,0 +1,108 @@
+@@ -313,206 +313,50 @@ static CALI_BPF_INLINE void calico_ct_v4_tcp_delete(
+ 	CALI_DEBUG("CT-TCP delete result: %d\n", rc);
+ }
+ 
+-static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_tcp_lookup(
+-		__be32 ip_src, __be32 ip_dst, __u16 sport, __u16 dport,
+-		struct tcphdr *tcp_header, enum calico_tc_flags flags)
++#define CALI_CT_LOG(level, fmt, ...) \
++	CALI_LOG_IF_FLAG(level, flags, "CT-%d "fmt, proto, ## __VA_ARGS__)
++#define CALI_CT_DEBUG(fmt, ...) \
++	CALI_CT_LOG(CALI_LOG_LEVEL_DEBUG, fmt, ## __VA_ARGS__)
++#define CALI_CT_VERB(fmt, ...) \
++	CALI_CT_LOG(CALI_LOG_LEVEL_VERB, fmt, ## __VA_ARGS__)
++
++static CALI_BPF_INLINE void ct_tcp_entry_update(struct tcphdr *tcp_header,
++						struct calico_ct_leg *src_to_dst,
++						struct calico_ct_leg *dst_to_src,
++						enum calico_tc_flags flags)
+ {
+-	CALI_DEBUG("CT-TCP lookup from %x:%d\n", be32_to_host(ip_src), sport);
+-	CALI_DEBUG("CT-TCP lookup to   %x:%d\n", be32_to_host(ip_dst), dport);
+-	CALI_VERB("CT-TCP   packet seq = %u\n", tcp_header->seq);
+-	CALI_VERB("CT-TCP   packet ack_seq = %u\n", tcp_header->ack_seq);
+-	CALI_VERB("CT-TCP   packet syn = %d\n", tcp_header->syn);
+-	CALI_VERB("CT-TCP   packet ack = %d\n", tcp_header->ack);
+-	CALI_VERB("CT-TCP   packet fin = %d\n", tcp_header->fin);
+-	CALI_VERB("CT-TCP   packet rst = %d\n", tcp_header->rst);
+-
+-	struct calico_ct_result result = {};
+-
+-	if (tcp_header->syn && !tcp_header->ack) {
+-		// SYN should always go through policy.
+-		CALI_DEBUG("CT-TCP Packet is a SYN, short-circuiting lookup.\n");
+-		goto out_lookup_fail;
+-	}
+-
+-	bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
+-	struct calico_ct_key k;
+-	if (srcLTDest) {
+-		k = (struct calico_ct_key) {
+-			.protocol = IPPROTO_TCP,
+-			.addr_a = ip_src, .port_a = sport,
+-			.addr_b = ip_dst, .port_b = dport,
+-		};
+-	} else  {
+-		k = (struct calico_ct_key) {
+-			.protocol = IPPROTO_TCP,
+-			.addr_a = ip_dst, .port_a = dport,
+-			.addr_b = ip_src, .port_b = sport,
+-		};
+-	}
+-	dump_ct_key(&k, flags);
+-
+-	struct calico_ct_value *v = bpf_map_lookup_elem(&calico_ct_map_v4, &k);
+-	if (!v) {
+-		CALI_DEBUG("CT-TCP Miss.\n");
+-		goto out_lookup_fail;
+-	}
+-
+-	__u64 now = bpf_ktime_get_ns();
+-	v->last_seen = now;
+-
+-	struct calico_ct_leg *src_to_dst, *dst_to_src;
+-
+-	struct calico_ct_value *tracking_v;
+-	switch (v->type) {
+-	case CALI_CT_TYPE_NAT_FWD:
+-		// This is a forward NAT entry; since we do the bookkeeping on the
+-		// reverse entry, we need to do a second lookup.
+-		CALI_DEBUG("CT-TCP Hit! NAT FWD entry, doing secondary lookup.\n");
+-		tracking_v = bpf_map_lookup_elem(&calico_ct_map_v4, &v->nat_rev_key);
+-		if (!tracking_v) {
+-			CALI_DEBUG("CT-TCP Miss when looking for secondary entry.\n");
+-			goto out_lookup_fail;
+-		}
+-		// Record timestamp.
+-		tracking_v->last_seen = now;
+-
+-		if (ip_src == v->nat_rev_key.addr_a && sport == v->nat_rev_key.port_a) {
+-			src_to_dst = &tracking_v->a_to_b;
+-			dst_to_src = &tracking_v->b_to_a;
+-			result.nat_ip = v->nat_rev_key.addr_b;
+-			result.nat_port = v->nat_rev_key.port_b;
+-		} else {
+-			src_to_dst = &tracking_v->b_to_a;
+-			dst_to_src = &tracking_v->a_to_b;
+-			result.nat_ip = v->nat_rev_key.addr_a;
+-			result.nat_port = v->nat_rev_key.port_a;
+-		}
+-
+-		if (CALI_TC_FLAGS_TO_HOST(flags)) {
+-			// Since we found a forward NAT entry, we know that it's the destination
+-			// that needs to be NATted.
+-			result.rc =	CALI_CT_ESTABLISHED_DNAT;
+-		} else {
+-			result.rc =	CALI_CT_ESTABLISHED;
+-		}
+-		break;
+-	case CALI_CT_TYPE_NAT_REV:
+-		// A reverse NAT entry; this means that the conntrack entry was keyed on the post-NAT
+-		// IPs.  We _want_ to hit this entry at ingress to the source workload (i.e. reply packets
+-		// that need to be SNATted back to the service IP before they reach the workload).  However,
+-		// we also hit this for request packets that traverse more than one endpoint on the same
+-		// host so we need to distinguish those cases.
+-
+-		if (srcLTDest) {
+-			src_to_dst = &v->a_to_b;
+-			dst_to_src = &v-

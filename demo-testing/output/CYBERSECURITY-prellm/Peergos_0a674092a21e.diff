@@ -1,0 +1,79 @@
+@@ -324,16 +324,21 @@ public class Builder {
+             SigningKeyPair pkiKeys = new SigningKeyPair(pkiPublic, pkiSecretKey);
+             PublicKeyHash pkiPublicHash = ContentAddressedStorage.hashKey(pkiKeys.publicSigningKey);
+ 
+-            MaybeMultihash currentPkiRoot = mutable.getPointerTarget(peergosIdentity, pkiPublicHash, dht).get();
++            PointerUpdate currentPkiPointer = mutable.getPointerTarget(peergosIdentity, pkiPublicHash, dht).join();
++            Optional<Long> currentPkiSequence = currentPkiPointer.sequence;
++            MaybeMultihash currentPkiRoot = currentPkiPointer.updated;
+             SigningPrivateKeyAndPublicHash pkiSigner = new SigningPrivateKeyAndPublicHash(pkiPublicHash, pkiSecretKey);
+-            if (! currentPkiRoot.isPresent())
+-                currentPkiRoot = IpfsTransaction.call(peergosIdentity,
++            if (! currentPkiRoot.isPresent()) {
++                CommittedWriterData committed = IpfsTransaction.call(peergosIdentity,
+                         tid -> WriterData.createEmpty(peergosIdentity, pkiSigner, dht, crypto.hasher, tid).join()
+-                                .commit(peergosIdentity, pkiSigner, MaybeMultihash.empty(), mutable, dht, crypto.hasher, tid)
+-                                .thenApply(version -> version.get(pkiSigner).hash), dht).join();
++                                .commit(peergosIdentity, pkiSigner, MaybeMultihash.empty(), Optional.empty(), mutable, dht, crypto.hasher, tid)
++                                .thenApply(version -> version.get(pkiSigner)), dht).join();
++                currentPkiRoot = committed.hash;
++                currentPkiSequence = committed.sequence;
++            }
+ 
+-            return new IpfsCoreNode(pkiSigner, a.getInt("max-daily-signups"), currentPkiRoot, dht, crypto.hasher,
+-                    mutable, account, batCave, peergosIdentity);
++            return new IpfsCoreNode(pkiSigner, a.getInt("max-daily-signups"), currentPkiRoot, currentPkiSequence,
++                    dht, crypto.hasher, mutable, account, batCave, peergosIdentity);
+         } catch (Exception e) {
+             throw new RuntimeException(e);
+         }
+
+
+
+
+@@ -183,9 +183,9 @@ public class Mirror {
+         Optional<byte[]> existing = targetPointers.getPointer(writer).join();
+         // First pin the new root, then commit updated pointer
+         MaybeMultihash existingTarget = existing.isPresent() ?
+-                MutablePointers.parsePointerTarget(existing.get(), writer, storage).join() :
++                MutablePointers.parsePointerTarget(existing.get(), writer, storage).join().updated :
+                 MaybeMultihash.empty();
+-        MaybeMultihash updatedTarget = MutablePointers.parsePointerTarget(newPointer, writer, storage).join();
++        MaybeMultihash updatedTarget = MutablePointers.parsePointerTarget(newPointer, writer, storage).join().updated;
+         // use a mirror call to distinguish from normal pin calls
+         TransactionId tid = transactions.startTransaction(owner);
+         try {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,230 @@
++package peergos.server;
++
++import peergos.shared.*;
++import peergos.shared.cbor.*;
++import peergos.shared.crypto.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.hamt.*;
++import peergos.shared.io.ipfs.cid.*;
++import peergos.shared.mutable.*;
++import peergos.shared.storage.*;
++import peergos.shared.storage.auth.*;
++import peergos.shared.user.*;
++import peergos.shared.user.fs.*;
++import peergos.shared.util.*;
++
++import java.net.*;
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.stream.*;
++
++public class UserGC {
++
++    public static void main(String[] args) throws Exception {
++        Crypto crypto = Main.initCrypto();
++        NetworkAccess network = Builder.buildJavaNetworkAccess(new URL("https://peergos.net"), true).get();
++        String username = args[0];
++        String password = args[1];
++        UserContext context = UserContext.signIn(username, password, network, c

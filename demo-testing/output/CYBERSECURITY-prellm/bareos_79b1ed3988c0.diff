@@ -1,0 +1,96 @@
+@@ -40,6 +40,7 @@ import signal
+ import ssl
+ import socket
+ import hashlib
++import re
+ from sys import version_info
+ 
+ try:
+@@ -50,6 +51,8 @@ except ImportError:
+ from pyVim.connect import SmartConnect, SmartConnectNoSSL, Disconnect
+ from pyVmomi import vim
+ from pyVmomi import vmodl
++from pyVim.task import WaitForTask
++from pyVmomi.VmomiSupport import VmomiJSONEncoder
+ 
+ # if OrderedDict is not available from collection (eg. SLES11),
+ # the additional package python-ordereddict must be used
+@@ -88,6 +91,7 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+         self.events = []
+         self.events.append(bareosfd.bEventStartBackupJob)
+         self.events.append(bareosfd.bEventStartRestoreJob)
++        self.events.append(bareosfd.bEventEndRestoreJob)
+         bareosfd.RegisterEvents(self.events)
+         self.mandatory_options_default = ["vcserver", "vcuser", "vcpass"]
+         self.mandatory_options_vmname = ["dc", "folder", "vmname"]
+@@ -100,6 +104,12 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+             "vadp_dumper_verbose",
+             "verifyssl",
+             "quiesce",
++            "cleanup_tmp_files",
++            "restore_esxhost",
++            "restore_cluster",
++            "restore_resource_pool",
++            "restore_datastore",
++            "restore_powerstate",
+         ]
+         self.utf8_options = ["vmname", "folder"]
+         self.config = None
+@@ -107,6 +117,8 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+ 
+         self.vadp = BareosVADPWrapper()
+         self.vadp.plugin = self
++        self.vm_config_info_saved = False
++        self.current_object_index = -1
+ 
+     def parse_plugin_definition(self, plugindef):
+         """
+@@ -259,6 +271,22 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+                     "Type of option %s is %s\n" % (option, type(self.options[option])),
+                 )
+ 
++            # strip trailing "/" from folder option value value
++            if "folder" in self.options:
++                self.options["folder"] = self.options["folder"].rstrip("/")
++
++            if self.options.get("restore_powerstate"):
++                if self.options["restore_powerstate"] not in ["on", "off", "previous"]:
++                    bareosfd.JobMessage(
++                        bareosfd.M_FATAL,
++                        "Invalid value '%s' for restore_powerstate, valid: on, off or previous.\n"
++                        % self.options["restore_powerstate"],
++                    )
++                    return bareosfd.bRC_Error
++            else:
++                # restore previous power state by default
++                self.options["restore_powerstate"] = "previous"
++
+             bareosfd.DebugMessage(
+                 100,
+                 "Using Option %s=%s\n"
+@@ -288,6 +316,15 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+         if not self.vadp.connect_vmware():
+             return bareosfd.bRC_Error
+ 
++        if "uuid" in self.options:
++            self.vadp.backup_path = "/VMS/%s" % (self.options["uuid"])
++        else:
++            self.vadp.backup_path = "/VMS/%s/%s/%s" % (
++                self.options["dc"],
++                self.options["folder"].strip("/"),
++                self.options["vmname"],
++            )
++
+         return self.vadp.prepare_vm_backup()
+ 
+     def start_backup_file(self, savepkt):
+@@ -299,24 +336,14 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+         if not self.vadp.files_to_backup:
+             self.vadp.disk_device_to_backup = self.vadp.disk_devices.pop(0)
+             self.vadp.files_to_backup = []
+-            if "uuid" in self.options:
+-                self.vadp.files_to_backup.append(
+-                    "/VMS/%s/%s"
+-                    % (
+-                        self.options["uuid"],
+-                        self.vadp.disk_device_to_backu

@@ -1,0 +1,96 @@
+@@ -26,6 +26,7 @@ from ipaddress import IPv4Address, AddressValueError
+ # Add to path the "one directory above the current file location"
+ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+ import common.config
++import common.task_queue
+ from common.utils import ipstr2int, int2ipstr, parse_rfc_time
+ from shodan_rpc_client import ShodanRpcClient
+ 
+@@ -60,6 +61,15 @@ config_tags = common.config.read_config(tags_cfg_file)
+ bl_cfg_file = os.path.join(cfg_dir, config.get('bl_config'))
+ config_bl = common.config.read_config(bl_cfg_file)
+ 
++# Read Task queue config
++config_nerdd = common.config.read_config("/etc/nerd/nerdd.yml")
++rabbit_config = config.get('rabbitmq')
++num_processes = config_nerdd.get('worker_processes')
++
++# Init Task queue
++task_queue_writer = common.task_queue.TaskQueueWriter(num_processes, rabbit_config)
++task_queue_writer.connect()
++
+ 
+ # Create event database driver (according to config)
+ EVENTDB_TYPE = config.get('eventdb', 'psql')
+@@ -415,6 +425,32 @@ def store_user_info():
+         g.user, g.ac = get_user_info(session)
+ 
+ 
++def exceeded_rate_limit(user_id):
++    if request.path.startswith("/api"):
++        # API -> return error in JSON
++        err = {
++            'err_n': 429,
++            'error': "Too many requests",
++        }
++        return Response(json.dumps(err), 429, mimetype='application/json')
++    else:
++        # Web -> return HTML with more information
++        bs, tps = rate_limiter.get_user_params(user_id)
++        if g.user:
++            message = "You are only allowed to make {} requests per second.".format(tps)
++        else:
++            message = "We only allow {} requests per second per IP address for not logged in users.".format(tps)
++        return make_response(render_template('429.html', message=message), 429)
++
++
++def get_user_id():
++    # Get user ID (username or IP address)
++    if g.user:
++        return g.user['fullid']
++    else:
++        return 'ip:' + request.remote_addr
++
++
+ @app.before_request
+ def rate_limit():
+     """Check if user hasn't exceeded its rate-limit"""
+@@ -422,30 +458,12 @@ def rate_limit():
+         # Ignore requests in some paths
+         if request.path.startswith("/static/") or request.path.startswith("/login/") or request.path == "/logout":
+             return None
+-        # Get user ID (username or IP address)
+-        if g.user:
+-            id = g.user['fullid']
+-        else:
+-            id = 'ip:' + request.remote_addr
++        user_id = get_user_id()
+         # TODO set different cost for some endpoints
+-        ok = rate_limiter.try_request(id, cost=1)
++        ok = rate_limiter.try_request(user_id, cost=1)
+         if not ok:
+             # Rate-limit exceeded, return error message
+-            if request.path.startswith("/api"):
+-                # API -> return error in JSON
+-                err = {
+-                    'err_n': 429,
+-                    'error': "Too many requests",
+-                }
+-                return Response(json.dumps(err), 429, mimetype='application/json')
+-            else:
+-                # Web -> return HTML with more information
+-                bs, tps = rate_limiter.get_user_params(id)
+-                if g.user:
+-                    message = "You are only allowed to make {} requests per second.".format(tps)
+-                else:
+-                    message = "We only allow {} requests per second per IP address for not logged in users.".format(tps)
+-                return make_response(render_template('429.html', message=message), 429)
++            return exceeded_rate_limit(user_id)
+     except Exception as e:
+         # If anything fails, log error and continue - web shouldn't stop working
+         # just because an error in the rate-limiter
+@@ -894,6 +912,21 @@ def ips_count():
+ class SingleIPForm(FlaskForm):
+     ip = TextField('IP address', [validator_optional, validators.IPAddress(message="Invalid IPv4 address")], filters=[strip_whitespace])
+ 
++@a

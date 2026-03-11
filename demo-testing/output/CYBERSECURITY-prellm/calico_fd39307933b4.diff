@@ -1,0 +1,99 @@
+@@ -162,6 +162,10 @@ class CalicoEtcdWatcher(etcdutils.EtcdWatcher):
+         # changes, the subnet watcher will tell _this_ watcher to resync.
+         self.subnet_watcher = SubnetWatcher(self)
+ 
++        # Cache of the ports that we've asked Dnsmasq to handle, for each
++        # network ID.
++        self._last_dnsmasq_ports = {}
++
+     def start(self):
+         eventlet.spawn(self.subnet_watcher.start)
+         super(CalicoEtcdWatcher, self).start()
+@@ -399,14 +403,27 @@ class CalicoEtcdWatcher(etcdutils.EtcdWatcher):
+         net = self.agent.cache.get_network_by_id(network_id)
+         LOG.debug("Net: %s", net)
+ 
+-        # Start, restart or stop Dnsmasq for that network ID.
+-        if [port for port in net.ports if port.device_id.startswith('tap')]:
+-            self.agent.call_driver('restart', net)
+-        else:
+-            # No ports left, so also remove this network from the cache.
+-            self._fix_network_cache_port_lookup(net.id)
+-            self.agent.cache.remove(net)
+-            self.agent.call_driver('disable', net)
++        # Compute the set of ports that we need Dnsmasq to handle for this
++        # network ID.
++        ports_needed = [
++            port for port in net.ports if port.device_id.startswith('tap')
++        ]
++        ports_needed.sort(key=lambda port: port.id)
++
++        # Compare that against what we've last asked Dnsmasq to handle.
++        if ports_needed != self._last_dnsmasq_ports.get(network_id):
++            # Requirements have changed, so start, restart or stop Dnsmasq for
++            # that network ID.
++            if ports_needed:
++                self.agent.call_driver('restart', net)
++            else:
++                # No ports left, so also remove this network from the cache.
++                self._fix_network_cache_port_lookup(net.id)
++                self.agent.cache.remove(net)
++                self.agent.call_driver('disable', net)
++
++            # Remember what we've asked Dnsmasq for.
++            self._last_dnsmasq_ports[network_id] = ports_needed
+ 
+     def on_endpoint_delete(self, response_ignored, name):
+         """Handler for endpoint deletion."""
+
+
+
+
+@@ -66,7 +66,7 @@ class PathDispatcher(object):
+     def handle_event(self, response):
+         """handle_event
+ 
+-        :param EtcdResponse: A python-etcd response object for a watch.
++        :param Response: A python-etcd response object for a watch.
+         """
+         LOG.debug("etcd event %s for key %s", response.action, response.key)
+         key_parts = response.key.strip("/").split("/")
+@@ -95,7 +95,7 @@ class PathDispatcher(object):
+ 
+ 
+ Response = collections.namedtuple(
+-    'Response', ['action', 'key', 'value']
++    'Response', ['action', 'key', 'value', 'mod_revision']
+ )
+ 
+ 
+@@ -108,9 +108,10 @@ class EtcdWatcher(object):
+     - watcher.stop()
+     """
+ 
+-    def __init__(self, prefix):
++    def __init__(self, prefix, round_trip_suffix=None):
+         LOG.debug("Creating EtcdWatcher for %s", prefix)
+         self.prefix = prefix
++        self.round_trip_suffix = round_trip_suffix
+         self.dispatcher = PathDispatcher()
+         self._stopped = False
+ 
+@@ -127,6 +128,9 @@ class EtcdWatcher(object):
+         LOG.info("Start watching %s", self.prefix)
+         self._stopped = False
+ 
++        # The current etcd cluster ID.
++        current_cluster_id = None
++
+         while not self._stopped:
+             # Get the current etcdv3 cluster ID and revision, so (a) we can
+             # detect if the cluster ID changes, and (b) we know when to start
+@@ -136,6 +140,18 @@ class EtcdWatcher(object):
+                 last_revision = int(last_revision)
+                 LOG.info("Current cluster_id %s, revision %d",
+                          cluster_id, last_revision)
++                if cluster_id != current_cluster_id:
++                    # No particular handling here; but keep track of the
++                    # current cluster ID and log if it changes.  (In the
++                    # circumstan

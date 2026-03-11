@@ -1,0 +1,164 @@
+@@ -22,51 +22,432 @@
+ extern "C" {
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <sys/stat.h>
+ }
+ 
++#include <system_error>
++#include <cerrno>
++
+ #include "volume.h"
++#include "util.h"
+ 
+ namespace dedup {
+ namespace {
++struct raii_fd {
++  raii_fd(int fd) : fd{fd} {}
++
++  int fileno() { return fd; }
++
++  int release()
++  {
++    auto old = fd;
++    fd = -1;
++    return old;
++  }
++
++  operator bool() const { return fd >= 0; }
++
++  ~raii_fd()
++  {
++    if (fd >= 0) { close(fd); }
++  }
++
++  int fd{-1};
++};
++std::vector<char> LoadFile(int fd)
++{
++  std::vector<char> loaded;
++
++  auto current_size = loaded.size();
++  for (;;) {
++    auto next_size = current_size + 1024 * 1024;
++
++    loaded.resize(next_size);
++
++    auto res = read(fd, loaded.data() + current_size, next_size - current_size);
++
++    if (res < 0) {
++      std::string errctx = "while reading";
++      throw std::system_error(errno, std::generic_category(), errctx);
++    } else if (res == 0) {
++      break;
++    } else {
++      current_size += res;
++    }
++  }
+ 
++  loaded.resize(current_size);
++  return loaded;
+ };
+ 
+-volume::volume(open_type type,
+-               int creation_mode,
+-               const char* path,
+-               std::size_t blocksize)
+-    : sys_path{path}, blocksize{blocksize}
++void WriteFile(int fd, const std::vector<char>& written)
+ {
+-  int dir_mode
+-      = creation_mode | S_IXUSR;  // directories need execute permissions
++  std::size_t progress = 0;
++  while (progress < written.size()) {
++    auto res = write(fd, written.data() + progress, written.size() - progress);
++    if (res < 0) {
++      std::string errctx = "while writing";
++      throw std::system_error(errno, std::generic_category(), errctx);
++    } else if (res == 0) {
++      break;
++    } else {
++      progress += res;
++    }
++  }
++}
++
++int OpenRelative(open_context ctx, const char* path)
++{
++  int fd = openat(ctx.dird, path, ctx.flags);
+ 
+-  int flags = 0;
++  if (fd < 0) {
++    std::string errctx = "while opening '";
++    errctx += path;
++    errctx += "'";
++    throw std::system_error(errno, std::generic_category(), errctx);
++  }
++
++  return fd;
++}
++
++};  // namespace
++
++volume::volume(open_type type, const char* path) : sys_path{path}
++{
+   bool read_only = type == open_type::ReadOnly;
+-  if (read_only) {
+-    flags |= O_RDONLY;
++  int flags = (read_only) ? O_RDONLY : O_RDWR;
++  int dir_flags = O_RDONLY | O_DIRECTORY;
++  dird = open(path, dir_flags);
++
++  if (dird < 0) {
++    std::string errctx = "Cannot open '";
++    errctx += path;
++    errctx += "'";
++    throw std::system_error(errno, std::generic_category(), errctx);
++  }
++
++  if (raii_fd conf_fd = openat(dird, "config", flags); conf_fd) {
++    conf.emplace(LoadFile(conf_fd.fileno()));
+   } else {
+-    flags |= O_RDWR | O_CREAT;
++    std::string errctx = "Cannot open '";
++    errctx += path;
++    errctx += "/config'";
++    throw std::system_error(errno, std::generic_category(), errctx);
++  }
++
++  backing.emplace(
++      open_context{
++          .read_only = read_only,
++          .flags = flags,
++          .dird = dird,
++      },
++      conf.value());
++}
++
++data::data(open_context ctx, const config& conf)
++{
++  auto& bf = conf.blockfile();
++  if (bf.Start != 0) { throw std::runtime_error("blockfile start != 0."); }
++
++  auto& rf = conf.recordfile();
++  if (rf.Start != 0) { throw std::runtime_error("recordfile start != 0."); }
++
++  auto& dfs = conf.datafiles();
++  if (dfs.size() != 2) { throw std::runtime_error("too many datafiles."); }
++  const config::data_file* unalf = nullptr;
++  const config::data_file* alf = nullptr;
++
++  for (auto& df : dfs) {
++    if (df.BlockSize == 1) {
++      unalf = &df;
++    } else if (df.BlockSize > 1) {
++      alf = &df;
++    }
+   }
+ 
+-  int dir_flags = flags | O_DIRECTORY;
+-  dird = open(path, dir_flags, dir_mode);
++  if (!unalf) { throw std::runtime_error("no unaligned file."); }
+ 
+-  if (dird < 0) { throw std::invalid_argument("dird < 0"); }
++  if (!alf) { throw std::runtime_error("no alig

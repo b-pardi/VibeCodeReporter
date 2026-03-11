@@ -1,0 +1,142 @@
+@@ -366,11 +366,13 @@ static void get_strings_range(RBinFile *bf, RList *list, int min, int raw, ut64
+ 	if (min < 0) {
+ 		return;
+ 	}
+-	if (!to || to > r_buf_size (bf->buf)) {
+-		to = r_buf_size (bf->buf);
+-	}
+-	if (!to) {
+-		return;
++	if (!bf->rbin->is_debugger) {
++		if (!to || to > r_buf_size (bf->buf)) {
++			to = r_buf_size (bf->buf);
++		}
++		if (!to) {
++			return;
++		}
+ 	}
+ 	if (raw != 2) {
+ 		ut64 size = to - from;
+
+
+
+
+@@ -3277,6 +3277,7 @@ R_API int r_core_config_init(RCore *core) {
+ 		r_config_set_i (cfg, "dbg.follow", 32);
+ 	}
+ 	r_config_desc (cfg, "dbg.follow", "Follow program counter when pc > core->offset + dbg.follow");
++	SETPREF ("dbg.rebase", "true", "Rebase anal/meta/comments/flags when reopening file in debugger");
+ 	SETCB ("dbg.swstep", "false", &cb_swstep, "Force use of software steps (code analysis+breakpoint)");
+ 	SETPREF ("dbg.trace.inrange", "false", "While tracing, avoid following calls outside specified range");
+ 	SETPREF ("dbg.trace.libs", "true", "Trace library code too");
+
+
+
+
+@@ -93,6 +93,23 @@ R_API int r_core_file_reopen(RCore *core, const char *args, int perm, int loadbi
+ 
+ 	// r_str_trim (path);
+ 	file = r_core_file_open (core, path, perm, laddr);
++
++	if (isdebug) {
++		int newtid = newpid;
++		// XXX - select the right backend
++		if (core->file) {
++			newpid = r_io_fd_get_pid (core->io, core->file->fd);
++			newtid = r_io_fd_get_tid (core->io, core->file->fd);
++#if __linux__
++			core->dbg->main_pid = newpid;
++			newtid = newpid;
++#endif
++		}
++		//reopen and attach
++		r_core_setup_debugger (core, "native", true);
++		r_debug_select (core->dbg, newpid, newtid);
++	}
++
+ 	if (file) {
+ 		bool had_rbin_info = false;
+ 
+@@ -110,9 +127,13 @@ R_API int r_core_file_reopen(RCore *core, const char *args, int perm, int loadbi
+ 			(perm & R_PERM_W)? "read-write": "read-only");
+ 
+ 		if (loadbin && (loadbin == 2 || had_rbin_info)) {
+-			ut64 baddr = r_config_get_i (core->config, "bin.baddr");
+-			if (new_baddr != UT64_MAX) {
++			ut64 baddr;
++			if (isdebug) {
++				baddr = r_debug_get_baddr (core->dbg, path);
++			} else if (new_baddr != UT64_MAX) {
+ 				baddr = new_baddr;
++			} else {
++				baddr = r_config_get_i (core->config, "bin.baddr");
+ 			}
+ 			ret = r_core_bin_load (core, obinfilepath, baddr);
+ 			r_core_bin_update_arch_bits (core);
+@@ -136,26 +157,6 @@ R_API int r_core_file_reopen(RCore *core, const char *args, int perm, int loadbi
+ 	} else {
+ 		eprintf ("Cannot reopen\n");
+ 	}
+-	if (isdebug) {
+-		int newtid = newpid;
+-		// XXX - select the right backend
+-		if (core->file) {
+-			newpid = r_io_fd_get_pid (core->io, core->file->fd);
+-			newtid = r_io_fd_get_tid (core->io, core->file->fd);
+-#if __linux__
+-			core->dbg->main_pid = newpid;
+-			newtid = newpid;
+-#endif
+-// TODO: fix debugger-concept in core
+-#if __WINDOWS__
+-			r_debug_select (core->dbg, newpid, newtid);
+-			core->dbg->reason.type = R_DEBUG_REASON_NONE;
+-#endif
+-		}
+-		//reopen and attach
+-		r_core_setup_debugger (core, "native", true);
+-		r_debug_select (core->dbg, newpid, newtid);
+-	}
+ 	if (core->file) {
+ 		r_io_use_fd (core->io, core->file->fd);
+ 		core->switch_file_view = 1;
+
+
+
+
+@@ -900,6 +900,169 @@ R_API void r_core_file_reopen_in_malloc(RCore *core) {
+ 	}
+ }
+ 
++static RList *__save_old_sections(RCore *core) {
++	// Do I really need this?
++	RList *sections = r_bin_get_sections (core->bin);
++	RListIter *it;
++	RBinSection *sec;
++	RList *old_sections = r_list_new ();
++	old_sections->free = sections->free;
++	r_list_foreach (sections, it, sec) {
++		RBinSection *old_sec = R_NEW0 (RBinSection);
++		if (!old_sec) {
++			break;
++		}
++		*old_sec = *sec;
++		old_sec->name = strdup (sec->name);
++		old_sec->format = NULL;
++		r_list_append (old_sections, old_sec);
++	}
++	return old_sections;
++}
++
++struct __rebase_struct {
++	RCore *core;
++	RList *old_sections;
++	ut64 old_base;
++	ut64 diff;
++	int type;
++};
++
++#define __is_inside_section(item_addr, section)\
++		(item_addr >= old_base + section->vaddr && item_addr <= old_base + section->vaddr + section->vsize)
++
++st

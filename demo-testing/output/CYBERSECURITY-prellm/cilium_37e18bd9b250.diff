@@ -1,0 +1,130 @@
+@@ -220,7 +220,25 @@ ct_recreate6:
+ 			ep_tail_call(skb, CILIUM_CALL_IPV6_NODEPORT_REVNAT);
+ 			return DROP_MISSED_TAIL_CALL;
+ 		}
+-#endif
++# ifdef ENABLE_DSR
++		if (ct_state.dsr) {
++			struct ipv6_ct_tuple nat_tup = *tuple;
++			struct ipv6_nat_entry *entry;
++
++			nat_tup.flags = NAT_DIR_EGRESS;
++			nat_tup.sport = tuple->dport;
++			nat_tup.dport = tuple->sport;
++			entry = snat_v6_lookup(&nat_tup);
++			if (entry) {
++				ret = snat_v6_rewrite_egress(skb, &nat_tup,
++								  entry, l4_off);
++				if (ret != 0) {
++					return ret;
++				}
++			}
++		}
++# endif /* ENABLE_DSR */
++#endif /* ENABLE_NODEPORT */
+ 		if (ct_state.rev_nat_index) {
+ 			ret = lb6_rev_nat(skb, l4_off, &csum_off,
+ 					  ct_state.rev_nat_index, tuple, 0);
+@@ -800,6 +818,7 @@ ipv6_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, __u8 *reason)
+ 	bool skip_ingress_proxy = false;
+ 	union v6addr orig_dip, orig_sip;
+ 	__u32 monitor = 0;
++	bool dsr = false;
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+@@ -878,9 +897,35 @@ ipv6_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, __u8 *reason)
+ 		verdict = 0;
+ 
+ 	if (ret == CT_NEW) {
++#ifdef ENABLE_DSR
++		struct dst_opt_v6 opt = {};
++
++		if (!revalidate_data(skb, &data, &data_end, &ip6))
++			return DROP_INVALID;
++
++		// TODO(brb) iterate over all extension headers
++		if (ip6->nexthdr == NEXTHDR_DEST) {
++			if (skb_load_bytes(skb, ETH_HLEN + sizeof(*ip6), &opt,
++					   sizeof(opt)) < 0) {
++				return DROP_INVALID;
++			}
++			if (opt.len == DSR_IPV6_EXT_LEN &&
++			    opt.opt_type == DSR_IPV6_OPT_TYPE &&
++			    opt.opt_len == DSR_IPV6_OPT_LEN) {
++				dsr = true;
++
++				if (snat_v6_create_dsr(skb, &opt.addr,
++						       opt.port) < 0) {
++					return DROP_INVALID;
++				}
++			}
++		}
++#endif /* ENABLE_DSR */
++
+ 		ct_state_new.orig_dport = tuple.dport;
+ 		ct_state_new.src_sec_id = src_label;
+ 		ct_state_new.node_port = ct_state.node_port;
++		ct_state_new.dsr = dsr;
+ 		ret = ct_create6(get_ct_map6(&tuple), &tuple, skb, CT_INGRESS, &ct_state_new, verdict > 0);
+ 		if (IS_ERR(ret))
+ 			return ret;
+
+
+
+
+@@ -90,7 +90,8 @@
+ #define CILIUM_CALL_IPV6_NODEPORT_REVNAT	18
+ #define CILIUM_CALL_ENCAP_NODEPORT_NAT		19
+ #define CILIUM_CALL_IPV4_NODEPORT_DSR		20
+-#define CILIUM_CALL_SIZE			21
++#define CILIUM_CALL_IPV6_NODEPORT_DSR		21
++#define CILIUM_CALL_SIZE			22
+ 
+ typedef __u64 mac_t;
+ 
+@@ -397,6 +398,18 @@ enum {
+ #define DSR_IPV4_OPT_MASK	0xffff0000
+ #define DSR_IPV4_DPORT_MASK	0x0000ffff
+ 
++/* IPv6 option type of Destination Option used to carry service IPv6 addr and
++ * port for DSR.
++ *
++ * 0b00		- "skip over this option and continue processing the header"
++ *     0	- "Option Data does not change en-route"
++ *      11011   - Unassigned [1]
++ *
++ * [1]:  https://www.iana.org/assignments/ipv6-parameters/ipv6-parameters.xhtml#ipv6-parameters-2
++ */
++#define DSR_IPV6_OPT_TYPE	0x1B
++#define DSR_IPV6_OPT_LEN	0x14	// to store ipv6 addr + port
++#define DSR_IPV6_EXT_LEN	0x2	// = (sizeof(dsr_opt_v6) - 8) / 8
+ /**
+  * get_identity - returns source identity from the mark field
+  */
+@@ -472,13 +485,17 @@ static inline void __inline__ set_encrypt_key_cb(struct __sk_buff *skb, __u8 key
+ /* skb->cb[] usage: */
+ enum {
+ 	CB_SRC_LABEL,
+-#define CB_SVC_PORT	CB_SRC_LABEL	/* Alias, non-overlapping */
++#define	CB_SVC_PORT		CB_SRC_LABEL	/* Alias, non-overlapping */
+ 	CB_IFINDEX,
+-#define	CB_SVC_ADDR_V4	CB_IFINDEX	/* Alias, non-overlapping */
++#define	CB_SVC_ADDR_V4		CB_IFINDEX	/* Alias, non-overlapping */
++#define	CB_SVC_ADDR_V6_1	CB_IFINDEX	/* Alias, non-overlapping */
+ 	CB_POLICY,
++#define	CB_SVC_ADDR_V6_2	CB_POLICY	/* Alias, non-overlapping */
+ 	CB_NAT46_STATE,
+-#define CB_NAT		CB_NAT46_STATE	/* Alias, non-overlapping */
++#define CB_NAT			CB_NAT46_STATE	/* Alias, non-overlapping */
++#define	CB_SVC_ADDR_V6_3	CB_NAT46_STATE	/* Alias, non-overlapping */
+ 	CB_CT_STATE,
++#define	CB_SVC_ADDR_V6_4	CB_CT_STATE	/* Alias, non-overlapping */
+ };
+ 
+ /* State values for NAT46 */
+
+
+
+
+@@ -667,6 +667,7 @@ static inl

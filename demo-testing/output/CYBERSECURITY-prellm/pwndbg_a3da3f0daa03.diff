@@ -1,0 +1,142 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,3 @@
++int main() {
++  while(1);
++}
+
+
+
+
+@@ -21,8 +21,14 @@ except ImportError:
+ 
+ pwndbg.config.Parameter('syntax-highlight', True, 'Source code / assembly syntax highlight')
+ style = theme.Parameter('syntax-highlight-style', 'monokai', 'Source code / assembly syntax highlight stylename of pygments module')
++
++formatter = pygments.formatters.Terminal256Formatter(style=str(style))
++pwntools_lexer = PwntoolsLexer()
++lexer_cache = {}
++
+ @pwndbg.config.Trigger([style])
+ def check_style():
++    global formatter
+     try:
+         formatter = pygments.formatters.Terminal256Formatter(
+             style=str(style)
+@@ -40,20 +46,17 @@ def syntax_highlight(code, filename='.asm'):
+ 
+     filename = os.path.basename(filename)
+ 
+-    formatter = pygments.formatters.Terminal256Formatter(
+-        style=str(style)
+-    )
+-
+-    lexer = None
++    lexer = lexer_cache.get(filename, None)
+ 
+     # If source code is asm, use our customized lexer.
+     # Note: We can not register our Lexer to pygments and use their APIs,
+     # since the pygment only search the lexers installed via setuptools.
+-    for glob_pat in PwntoolsLexer.filenames:
+-        pat = '^' + glob_pat.replace('.', r'\.').replace('*', r'.*') + '$'
+-        if re.match(pat, filename):
+-            lexer = PwntoolsLexer()
+-            break
++    if not lexer:
++        for glob_pat in PwntoolsLexer.filenames:
++            pat = '^' + glob_pat.replace('.', r'\.').replace('*', r'.*') + '$'
++            if re.match(pat, filename):
++                lexer = pwntools_lexer
++                break
+ 
+     if not lexer:
+         try:
+@@ -63,6 +66,7 @@ def syntax_highlight(code, filename='.asm'):
+             pass
+ 
+     if lexer:
++        lexer_cache[filename] = lexer
+         code = pygments.highlight(code, lexer, formatter).rstrip()
+ 
+     return code
+
+
+
+
+@@ -10,6 +10,7 @@ from __future__ import unicode_literals
+ 
+ import binascii
+ import inspect
++import re
+ 
+ import capstone as C
+ import gdb
+@@ -21,6 +22,19 @@ import pwndbg.emu.emulator
+ import pwndbg.memory
+ import pwndbg.regs
+ 
++
++def parse_consts(u_consts):
++    """
++    Unicorn "consts" is a python module consisting of a variable definition
++    for each known entity. We repack it here as a dict for performance.
++    """
++    consts = {}
++    for name in dir(u_consts):
++        if name.startswith('UC_'):
++            consts[name] = getattr(u_consts, name)
++    return consts
++
++
+ # Map our internal architecture names onto Unicorn Engine's architecture types.
+ arch_to_UC = {
+     'i386':    U.UC_ARCH_X86,
+@@ -33,12 +47,12 @@ arch_to_UC = {
+ }
+ 
+ arch_to_UC_consts = {
+-    'i386':    U.x86_const,
+-    'x86-64':  U.x86_const,
+-    'mips':    U.mips_const,
+-    'sparc':   U.sparc_const,
+-    'arm':     U.arm_const,
+-    'aarch64': U.arm64_const,
++    'i386':    parse_consts(U.x86_const),
++    'x86-64':  parse_consts(U.x86_const),
++    'mips':    parse_consts(U.mips_const),
++    'sparc':   parse_consts(U.sparc_const),
++    'arm':     parse_consts(U.arm_const),
++    'aarch64': parse_consts(U.arm64_const),
+ }
+ 
+ # Map our internal architecture names onto Unicorn Engine's architecture types.
+@@ -98,6 +112,7 @@ e = pwndbg.emu.emulator.Emulator()
+ e.until_jump()
+ '''
+ 
++
+ class Emulator(object):
+     def __init__(self):
+         self.arch = pwndbg.arch.current
+@@ -107,6 +122,14 @@ class Emulator(object):
+ 
+         self.consts = arch_to_UC_consts[self.arch]
+ 
++        # Just registers, for faster lookup
++        self.const_regs = {}
++        r = re.compile(r'^UC_.*_REG_(.*)$')
++        for k,v in self.consts.items():
++            m = r.match(k)
++            if m:
++                self.const_regs[m.group(1)] = v
++
+         self.uc_mode = self.get_uc_mode()
+         debug("# Instantiating Unicorn for %s" % self.arch)
+         debug("uc = U.Uc(%r, %r)" % (arch_to_UC[self.arch], self.uc_mode))
+@@ -261,8 +284,9 @@ class Emulator(object):
+         #  'eax' ==> enum
+         #
+         if reg in self.regs.all:
+-         

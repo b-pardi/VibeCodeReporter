@@ -1,0 +1,131 @@
+@@ -62,6 +62,8 @@ class Flow : public GenericHashEntry {
+   u_int16_t cli_port, srv_port, vlanId;
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
++  u_int16_t alert_score;
++  FlowStatus last_status;
+   struct ndpi_flow_struct *ndpiFlow;
+ 
+   /* When the interface isViewed(), the corresponding view needs to acknowledge the purge
+@@ -520,12 +522,16 @@ class Flow : public GenericHashEntry {
+   inline u_int32_t getFlowDeviceIp()       { return flow_device.device_ip; };
+   inline u_int16_t getFlowDeviceInIndex()  { return flow_device.in_index;  };
+   inline u_int16_t getFlowDeviceOutIndex() { return flow_device.out_index; };
++
++  inline void setScore(u_int16_t score)    { alert_score = score; };
++  inline u_int16_t getScore()              { return(alert_score); };
++  inline bool hasScore()                   { return(alert_score != ((u_int16_t)-1)); };
++  bool shouldRecheckScore();
++
+ #ifdef HAVE_NEDGE
+   inline void setLastConntrackUpdate(u_int32_t when) { last_conntrack_update = when; }
+   bool isNetfilterIdleFlow();
+-#endif
+-  
+-#ifdef HAVE_NEDGE
++
+   void setPacketsBytes(time_t now, u_int32_t s2d_pkts, u_int32_t d2s_pkts, u_int64_t s2d_bytes, u_int64_t d2s_bytes);  
+   void getFlowShapers(bool src2dst_direction, TrafficShaper **shaper_ingress, TrafficShaper **shaper_egress) {
+     if(src2dst_direction) {
+
+
+
+
+@@ -651,6 +651,7 @@ class NetworkInterface : public AlertableEntity {
+   void checkHostsAlerts(ScriptPeriodicity p);
+   void checkNetworksAlerts(ScriptPeriodicity p);
+   void checkInterfaceAlerts(ScriptPeriodicity p);
++  bool checkFlowsScore();
+   bool isHiddenFromTop(Host *host);
+   virtual bool areTrafficDirectionsSupported() { return(false); };
+ 
+
+
+
+
+@@ -604,6 +604,7 @@ class SNMP;
+ /* Forward class declarations for the Lua context */
+ class NetworkStats;
+ class Host;
++class Flow;
+ 
+ struct ntopngLuaContext {
+   char *allowed_ifname, *user, *group;
+@@ -619,6 +620,7 @@ struct ntopngLuaContext {
+ #endif
+   Host *host;
+   NetworkStats *network;
++  Flow *flow;
+   bool localuser;
+ 
+   /* Packet capture */
+
+
+
+
+@@ -50,7 +50,8 @@ AlertCheckLuaEngine::AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodi
+ 	     lua_file);
+     ntop->fixPath(script_path);
+ 
+-    load_script(script_path, iface);
++    if(load_script(script_path, iface) < 0)
++      return;
+ 
+     lua_getglobal(L, "setup");         /* Called function   */
+     lua_pushstring(L, Utils::periodicityToScriptName(p)); /* push 1st argument */
+
+
+
+
+@@ -46,6 +46,8 @@ Flow::Flow(NetworkInterface *_iface,
+     cli_host = srv_host = NULL, good_low_flow_detected = false,
+     srv2cli_last_goodput_bytes = cli2srv_last_goodput_bytes = 0, good_ssl_hs = true,
+     flow_alerted = flow_dropped_counts_increased = false, vrfId = 0;
++    alert_score = (u_int16_t)-1;
++    last_status = status_normal;
+   
+   purge_acknowledged_mark = detection_completed = update_flow_port_stats = false;
+   ndpiDetectedProtocol = ndpiUnknownProtocol;
+@@ -1826,6 +1828,7 @@ void Flow::lua(lua_State* vm, AddressTree * ptree,
+ 
+     lua_push_uint64_table_entry(vm, "cli2srv.fragments", ip_stats_s2d.pktFrag);
+     lua_push_uint64_table_entry(vm, "srv2cli.fragments", ip_stats_d2s.pktFrag);
++    lua_push_int32_table_entry(vm, "score", hasScore() ? alert_score : -1);
+ 
+     if(isICMP()) {
+       lua_newtable(vm);
+@@ -4205,3 +4208,19 @@ void Flow::dissectSSL(char *payload, u_int16_t payload_len) {
+     free(_payload);
+   }
+ }
++
++/* ***************************************************** */
++
++bool Flow::shouldRecheckScore() {
++  FlowStatus status = getFlowStatus();
++
++  if(status != last_status) {
++    last_status = status;
++    return(true);
++  }
++
++  if(isDetectionCompleted() && !hasScore())
++    return(true);
++
++  return(false);
++}
+
+
+
+
+@@ -2444,7 +2444,8 @@ static int ntop_check_hosts_alerts(lua_State* vm, ScriptPeriodicity p) {
+     return(CONST_LUA_ERROR);
+   else
+     ntop_interface->checkHostsAlerts(p);
+-  
++
++  lua_pushnil(vm);
+   return(CONST_LUA_OK);
+ }
+ 
+@@ -2462,7 +2463,8 

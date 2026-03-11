@@ -1,0 +1,124 @@
+@@ -112,6 +112,7 @@ class Utils {
+   static const char* policySource2Str(L7PolicySource_t policy_source);
+   static const char* captureDirection2Str(pcap_direction_t dir);
+   static bool shouldResolveHost(const char *host_ip);
++  static bool mg_write_retry(struct mg_connection *conn, u_char *b, int len);
+ 
+   /* Patricia Tree */
+   static patricia_node_t* ptree_match(patricia_tree_t *tree, int family, void *addr, int bits);
+
+
+
+
+@@ -250,6 +250,8 @@
+ #define CONST_MAX_NUM_PACKETS_PER_LIVE 100000 /* live captures via HTTP */
+ #define CONST_MAX_DUMP                 500000000
+ 
++#define CONST_MAX_NUM_LIVE_EXTRACTIONS 2
++
+ #define CONST_MAX_EXTR_PCAP_MBYTES NTOPNG_PREFS_PREFIX".max_extracted_pcap_mbytes"
+ #define CONST_DEFAULT_MAX_EXTR_PCAP_MBYTES 100
+ 
+
+
+
+
+@@ -36,6 +36,8 @@ extern "C" {
+ 
+ struct keyval string_to_replace[MAX_NUM_HTTP_REPLACEMENTS] = { { NULL, NULL } };
+ static Mutex rrd_lock;
++static int live_extraction_num = 0;
++static Mutex live_extraction_num_lock;
+ static std::list<char*> new_custom_categories, custom_categories_to_purge;
+ 
+ /* ******************************* */
+@@ -5632,6 +5634,7 @@ static int ntop_run_live_extraction(lua_State *vm) {
+   TimelineExtract timeline;
+   time_t time_from, time_to;
+   char *filter;
++  bool allow = false, success = false;
+ 
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);  
+ 
+@@ -5661,9 +5664,22 @@ static int ntop_run_live_extraction(lua_State *vm) {
+   time_to = lua_tointeger(vm, 2);
+   if ((filter = (char *) lua_tostring(vm, 3)) == NULL)  return(CONST_LUA_PARAM_ERROR);
+ 
+-  timeline.extractLive(c->conn, iface, time_from, time_to, filter);
++  live_extraction_num_lock.lock(__FILE__, __LINE__);
++  if (live_extraction_num < CONST_MAX_NUM_LIVE_EXTRACTIONS) {
++    allow = true;
++    live_extraction_num++;
++  }
++  live_extraction_num_lock.unlock(__FILE__, __LINE__);
+ 
+-  lua_pushnil(vm);
++  if (allow) {
++    success = timeline.extractLive(c->conn, iface, time_from, time_to, filter);
++
++    live_extraction_num_lock.lock(__FILE__, __LINE__);
++    live_extraction_num--;
++    live_extraction_num_lock.unlock(__FILE__, __LINE__);
++  }
++
++  lua_pushboolean(vm, success);
+   return(CONST_LUA_OK);
+ }
+ 
+
+
+
+
+@@ -170,19 +170,6 @@ bool TimelineExtract::extractToDisk(u_int32_t id, NetworkInterface *iface,
+ 
+ /* ********************************************* */
+ 
+-bool __mg_write(struct mg_connection *conn, u_char *b, int len) {
+-  int ret, sent = 0;
+-  while (!ntop->getGlobals()->isShutdown()) {
+-    ret = mg_write_async(conn, &b[sent], len-sent);
+-    if (ret < 0)
+-      return false;
+-    sent += ret;
+-    if (sent == len) return true;
+-    usleep(100);
+-  }
+-  return false;
+-}
+-
+ bool TimelineExtract::extractLive(struct mg_connection *conn, NetworkInterface *iface, time_t from, time_t to, const char *bpf_filter) {
+   bool completed = false;
+ #ifdef HAVE_PF_RING
+@@ -199,7 +186,7 @@ bool TimelineExtract::extractLive(struct mg_connection *conn, NetworkInterface *
+ 
+   Utils::init_pcap_header(&pcaphdr, iface);
+ 
+-  if (!__mg_write(conn, (u_char *) &pcaphdr, sizeof(pcaphdr)))
++  if (!Utils::mg_write_retry(conn, (u_char *) &pcaphdr, sizeof(pcaphdr)))
+     http_client_disconnected = true;
+ 
+   handle = openTimeline(iface, from, to, bpf_filter);
+@@ -216,8 +203,8 @@ bool TimelineExtract::extractLive(struct mg_connection *conn, NetworkInterface *
+     pkthdr.caplen = h.caplen;
+     pkthdr.len = h.len;
+ 
+-    if (!__mg_write(conn, (u_char *) &pkthdr, sizeof(pkthdr)) ||
+-        !__mg_write(conn, (u_char *) packet, h.caplen))
++    if (!Utils::mg_write_retry(conn, (u_char *) &pkthdr, sizeof(pkthdr)) ||
++        !Utils::mg_write_retry(conn, (u_char *) packet, h.caplen))
+       http_client_disconnected = true;
+ 
+     stats.packets++;
+
+
+
+
+@@ -3438,3 +3438,24 @@ bool Utils::shouldResolveHost(const char *host_ip) {
+ 
+   return true;
+ }
++
++/* ****************************************************** */
++
++bool Utils::mg_write_retry(struct mg_connection *conn, u_char *b, int len) {
++  int ret, sent

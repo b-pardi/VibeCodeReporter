@@ -1,0 +1,125 @@
+@@ -172,11 +172,20 @@ void EventGroup::UpdateFuncBodies() {
+     static auto is_group_disabled = [](const auto& g) { return g->IsDisabled(); };
+ 
+     for ( auto& func : funcs ) {
+-        for ( auto& b : func->bodies )
++        bool func_changed = false;
++        for ( auto& b : func->bodies ) {
++            auto prev = b.disabled;
+             b.disabled = std::any_of(b.groups.cbegin(), b.groups.cend(), is_group_disabled);
++            if ( prev != b.disabled )
++                func_changed = true;
++        }
++
++        if ( ! func_changed )
++            continue;
+ 
+         static auto is_body_enabled = [](const auto& b) { return ! b.disabled; };
+         func->has_enabled_bodies = std::any_of(func->bodies.cbegin(), func->bodies.cend(), is_body_enabled);
++        func->all_bodies_enabled = std::all_of(func->bodies.cbegin(), func->bodies.cend(), is_body_enabled);
+     }
+ }
+ 
+
+
+
+
+@@ -84,6 +84,13 @@ public:
+      */
+     bool HasEnabledBodies() const { return ! bodies.empty() && has_enabled_bodies; };
+ 
++    /**
++     * Is every body enabled?
++     *
++     * @return  true if all bodies are enabled. (If no bodies, then true.)
++     */
++    bool HasAllBodiesEnabled() const { return all_bodies_enabled; };
++
+     /**
+      * Calls a Zeek function.
+      * @param args  the list of arguments to the function call.
+@@ -152,6 +159,7 @@ private:
+     // expose accessors in the zeek:: public interface.
+     friend class EventGroup;
+     bool has_enabled_bodies = true;
++    bool all_bodies_enabled = true;
+ };
+ 
+ namespace detail {
+
+
+
+
+@@ -3,6 +3,8 @@
+ #include "zeek/script_opt/Inline.h"
+ 
+ #include "zeek/Desc.h"
++#include "zeek/EventRegistry.h"
++#include "zeek/module_util.h"
+ #include "zeek/script_opt/ProfileFunc.h"
+ #include "zeek/script_opt/ScriptOpt.h"
+ #include "zeek/script_opt/StmtOptInfo.h"
+@@ -99,13 +101,13 @@ void Inliner::Analyze() {
+     }
+ 
+     for ( auto& f : funcs ) {
++        if ( f.ShouldSkip() )
++            continue;
++
+         const auto& func_ptr = f.FuncPtr();
+         const auto& func = func_ptr.get();
+         const auto& body = f.Body();
+ 
+-        if ( ! should_analyze(func_ptr, body) )
+-            continue;
+-
+         // Candidates are non-event, non-hook, non-recursive,
+         // non-compiled functions ...
+         if ( func->Flavor() != FUNC_FLAVOR_FUNCTION )
+@@ -120,33 +122,171 @@ void Inliner::Analyze() {
+         inline_ables[func] = f.Profile();
+     }
+ 
++    CoalesceEventHandlers();
++
+     for ( auto& f : funcs )
+-        if ( should_analyze(f.FuncPtr(), f.Body()) )
++        if ( f.ShouldAnalyze() )
+             InlineFunction(&f);
+ }
+ 
+-void Inliner::InlineFunction(FuncInfo* f) {
+-    max_inlined_frame_size = 0;
++void Inliner::CoalesceEventHandlers() {
++    std::unordered_map<ScriptFunc*, size_t> event_handlers;
++    BodyInfo body_to_info;
++    for ( size_t i = 0U; i < funcs.size(); ++i ) {
++        auto& f = funcs[i];
++        if ( ! f.ShouldAnalyze() )
++            continue;
++
++        auto& func_ptr = f.FuncPtr();
++        const auto& func = func_ptr.get();
++        const auto& func_type = func->GetType();
++
++        if ( func_type->AsFuncType()->Flavor() != FUNC_FLAVOR_EVENT )
++            continue;
++
++        // Special-case: zeek_init both has tons of event handlers (even
++        // with -b), such that it inevitably blows out the inlining budget,
++        // *and* only runs once, such that even if we could inline it, if
++        // it takes more time to compile it than to just run it via the
++        // interpreter, it's a lose.
++        static std::string zeek_init_name = "zeek_init";
++        if ( func->Name() == zeek_init_name )
++            continue;
++
++        const auto& body = f.Body();
++
++        if ( func->GetKind() == Func::SCRIPT_FUNC && func->GetBodies().size() > 1 ) {
++            if ( event_handlers.count(func) == 0 )
++                event_handlers[func] = 1;
++            else
++                ++event_handlers[func];
++            ASSERT(body_to_info.count(body.get()) == 0);
++     

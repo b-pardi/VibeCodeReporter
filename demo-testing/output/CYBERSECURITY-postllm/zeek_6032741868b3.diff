@@ -1,0 +1,119 @@
+@@ -65,7 +65,7 @@ zeek::RecordValPtr make_event(zeek::ArgsSpan args) {
+     }
+ 
+     const auto func = zeek::FuncValPtr{zeek::NewRef{}, maybe_func_val->AsFuncVal()};
+-    auto checked_args = cluster::detail::check_args(func, args.subspan(1));
++    auto checked_args = zeek::cluster::detail::check_args(func, args.subspan(1));
+     if ( ! checked_args )
+         return rec;
+ 
+@@ -109,7 +109,7 @@ zeek::ValPtr publish_event(const zeek::ValPtr& topic, zeek::ArgsSpan args) {
+     }
+     else if ( args[0]->GetType()->Tag() == zeek::TYPE_RECORD ) {
+         if ( args[0]->GetType() == cluster_event_type ) { // Handling Cluster::Event record type
+-            auto ev = to_cluster_event(cast_intrusive<zeek::RecordVal>(args[0]));
++            auto ev = to_cluster_event(zeek::cast_intrusive<zeek::RecordVal>(args[0]));
+             if ( ! ev )
+                 return zeek::val_mgr->False();
+ 
+@@ -148,4 +148,32 @@ bool is_cluster_pool(const zeek::Val* pool) {
+ 
+     return pool->GetType() == pool_type;
+ }
++
++zeek::RecordValPtr make_endpoint_info(const std::string& id, const std::string& address, uint32_t port,
++                                      TransportProto proto) {
++    static const auto ep_info_type = zeek::id::find_type<zeek::RecordType>("Cluster::EndpointInfo");
++    static const auto net_info_type = zeek::id::find_type<zeek::RecordType>("Cluster::NetworkInfo");
++
++    auto net_rec = zeek::make_intrusive<zeek::RecordVal>(net_info_type);
++    net_rec->Assign(0, address);
++    net_rec->Assign(1, zeek::val_mgr->Port(port, proto));
++
++    auto ep_rec = zeek::make_intrusive<zeek::RecordVal>(ep_info_type);
++    ep_rec->Assign(0, id);
++    ep_rec->Assign(1, net_rec);
++
++    return ep_rec;
++}
++
++zeek::VectorValPtr make_string_vec(zeek::Span<const std::string> strings) {
++    static const auto string_vec_type = zeek::id::find_type<zeek::VectorType>("string_vec");
++    auto vec = zeek::make_intrusive<zeek::VectorVal>(string_vec_type);
++    vec->Reserve(strings.size());
++
++    for ( const auto& s : strings )
++        vec->Append(zeek::make_intrusive<zeek::StringVal>(s));
++
++    return vec;
++}
++
+ } // namespace zeek::cluster::detail::bif
+
+
+
+
+@@ -4,6 +4,7 @@
+ 
+ #include "zeek/IntrusivePtr.h"
+ #include "zeek/Span.h"
++#include "zeek/net_util.h"
+ 
+ // Helpers for cluster.bif
+ 
+@@ -15,6 +16,8 @@ class Frame;
+ 
+ class RecordVal;
+ using RecordValPtr = IntrusivePtr<RecordVal>;
++class VectorVal;
++using VectorValPtr = IntrusivePtr<VectorVal>;
+ 
+ class Val;
+ using ValPtr = IntrusivePtr<Val>;
+@@ -46,6 +49,28 @@ zeek::ValPtr publish_event(const zeek::ValPtr& topic, zeek::ArgsSpan args);
+ 
+ bool is_cluster_pool(const zeek::Val* pool);
+ 
++/**
++ * Create a Cluster::EndpointInfo record with a nested Cluster::NetworkInfo record.
++ *
++ * @param id The string to use as id in the record.
++ * @param address The string to use as address in the network record.
++ * @param port The port to use in the network record.
++ * @param proto The proto for the given port value.
++ *
++ * @returns A record value of type Cluster::EndpointInfo filled with the provided info.
++ */
++zeek::RecordValPtr make_endpoint_info(const std::string& id, const std::string& address, uint32_t port,
++                                      TransportProto proto);
++
++/**
++ * Helper to go from a vector or array of std::strings to a zeek::VectorVal.
++ *
++ * @param strings The std::string instances.
++ *
++ * @return a VectorVal instance of type string_vec filled with strings.
++ */
++zeek::VectorValPtr make_string_vec(zeek::Span<const std::string> strings);
++
+ } // namespace cluster::detail::bif
+ 
+ } // namespace zeek
+
+
+
+
+@@ -2,7 +2,10 @@
+ 
+ #include "zeek/cluster/Manager.h"
+ 
++#include "zeek/Func.h"
+ #include "zeek/cluster/Serializer.h"
++#include "zeek/cluster/websocket/WebSocket.h"
++#include "zeek/util.h"
+ 
+ using namespace zeek::cluster;
+ 
+@@ -11,6 +14,15 @@ Manager::Manager()
+       event_serializers(plugin::ComponentManager<EventSerializerComponent>("Cluster", "EventSerializerTag")),
+       log_serializers(

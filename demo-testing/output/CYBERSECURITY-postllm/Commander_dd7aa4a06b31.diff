@@ -1,0 +1,113 @@
+@@ -8,7 +8,7 @@
+ # Copyright 2021 Keeper Security Inc.
+ # Contact: ops@keepersecurity.com
+ #
+-
++import abc
+ import argparse
+ import base64
+ import datetime
+@@ -16,16 +16,17 @@ import io
+ import json
+ import logging
+ import os
+-import requests
+-from typing import Iterable, Union, Optional, Dict, List
++from typing import Iterable, Union, Optional, Dict, List, Set, Any, Callable
+ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+ 
++import requests
++
+ from .base import user_choice, dump_report_data, report_output_parser, field_to_title, GroupCommand
+ from .enterprise import TeamApproveCommand, EnterpriseCommand
+ from .. import api, utils, vault, attachment, vault_extensions
+ from ..display import bcolors
+-from ..params import KeeperParams
+ from ..error import CommandError
++from ..params import KeeperParams
+ 
+ scim_list_parser = argparse.ArgumentParser(prog='scim list', parents=[report_output_parser],
+                                            description='Display a list of available SCIM endpoints.')
+@@ -314,6 +315,34 @@ class ScimGroup:
+         return 'SCIM GROUP: ' + json.dumps(scim_group)
+ 
+ 
++class ICrmDataSource(abc.ABC):
++    def __init__(self):
++        self._load_errors = False     # type: bool
++        self._debug_logger = ICrmDataSource.null_logger     # type: Callable[[str], None]
++
++    @staticmethod
++    def null_logger(message):
++        pass
++
++    @abc.abstractmethod
++    def populate(self):        # type: () -> Iterable[Union[ScimGroup, ScimUser]]
++        pass
++
++    @property
++    def load_errors(self):     # type: () -> bool
++        return self._load_errors
++
++    @property
++    def debug_logger(self):    # type: () -> Callable[[str], None]
++        return self._debug_logger
++
++    @debug_logger.setter
++    def debug_logger(self, value):    # type: (Callable[[str], None]) -> None
++        if value is None:
++            value = ICrmDataSource.null_logger
++        self._debug_logger = value
++
++
+ class ScimPushCommand(EnterpriseCommand):
+     def get_parser(self):
+         return scim_push_parser
+@@ -347,6 +376,8 @@ class ScimPushCommand(EnterpriseCommand):
+             if not isinstance(record, vault.TypedRecord):
+                 raise CommandError('', f'Cannot find SCIM record with URL: {scim_url}')
+ 
++        destructive = 0
++        verbose = False
+         field = next((x for x in record.fields if x.type == 'password'), None)
+         if not field:
+             raise CommandError('', f'"Password" field not found on record "{record.title}"')
+@@ -354,6 +385,21 @@ class ScimPushCommand(EnterpriseCommand):
+         if not token:
+             raise CommandError('', f'"Password" field is empty on record "{record.title}"')
+ 
++        field = record.get_typed_field('text', 'Destructive')
++        if field:
++            sv = field.get_default_value(str)
++            if sv and sv.isnumeric():
++                destructive = int(sv)
++        field = record.get_typed_field('text', 'Verbose')
++        if field:
++            sv = field.get_default_value(str)
++            if sv and sv.lower() in ('true', 'yes', 'on', '1'):
++                verbose = True
++
++        def verbose_logging(message):
++            if verbose:
++                logging.info(message)
++
+         keeper_users = {}  # type: Dict[str, ScimUser]
+         keeper_groups = {}  # type: Dict[str, ScimGroup]
+         logging.debug('SCIM Query Keeper')
+@@ -365,32 +411,102 @@ class ScimPushCommand(EnterpriseCommand):
+                 keeper_groups[element.id] = element
+                 logging.debug(str(element))
+ 
+-        external_func = None
+         source = kwargs.get('source')
+         if not source:
+             raise CommandError('', f'SCIM source {source} cannot be empty')
++
++        # SCIM group
++        scim_groups = []    # type: List[str]
++        for cf in record.custom:
++            if not cf.label:
++                continue
++            label = cf.label.lower().strip()
++            if label.startswith('scim group'):
++         

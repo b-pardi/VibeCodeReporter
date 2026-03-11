@@ -1,0 +1,129 @@
+@@ -7,11 +7,32 @@
+ 
+ namespace zeek::detail {
+ 
++// Class for tracking whether a given expression has side effects. Currently,
++// we just need to know whether Yes-it-does or No-it-doesn't, so the structure
++// is very simple.
++
++class ExprSideEffects {
++public:
++    ExprSideEffects(bool _has_side_effects) : has_side_effects(_has_side_effects) {}
++
++    bool HasSideEffects() const { return has_side_effects; }
++
++protected:
++    bool has_side_effects;
++};
++
+ class ExprOptInfo {
+ public:
+     // The AST number of the statement in which this expression
+     // appears.
+     int stmt_num = -1; // -1 = not assigned yet
++
++    auto& SideEffects() { return side_effects; }
++
++protected:
++    // This optional value missing means "we haven't yet determined the
++    // side effects".
++    std::optional<ExprSideEffects> side_effects;
+ };
+ 
+ } // namespace zeek::detail
+
+
+
+
+@@ -8,6 +8,7 @@
+ #include "zeek/Desc.h"
+ #include "zeek/Func.h"
+ #include "zeek/Stmt.h"
++#include "zeek/script_opt/FuncInfo.h"
+ #include "zeek/script_opt/IDOptInfo.h"
+ 
+ namespace zeek::detail {
+@@ -85,7 +86,16 @@ TraversalCode ProfileFunc::PreStmt(const Stmt* s) {
+         case STMT_INIT:
+             for ( const auto& id : s->AsInitStmt()->Inits() ) {
+                 inits.insert(id.get());
+-                TrackType(id->GetType());
++
++                auto& t = id->GetType();
++                TrackType(t);
++
++                auto attrs = id->GetAttrs();
++                if ( attrs )
++                    constructor_attrs[attrs.get()] = t;
++
++                if ( t->Tag() == TYPE_RECORD )
++                    CheckRecordConstructor(t);
+             }
+ 
+             // Don't traverse further into the statement, since we
+@@ -147,6 +157,14 @@ TraversalCode ProfileFunc::PreStmt(const Stmt* s) {
+                 expr_switches.insert(sw);
+         } break;
+ 
++        case STMT_ADD:
++        case STMT_DELETE: {
++            auto ad_stmt = static_cast<const AddDelStmt*>(s);
++            auto ad_e = ad_stmt->StmtExpr();
++            auto& lhs_t = ad_e->GetOp1()->GetType();
++            aggr_mods.insert(lhs_t.get());
++        } break;
++
+         default: break;
+     }
+ 
+@@ -221,32 +239,89 @@ TraversalCode ProfileFunc::PreExpr(const Expr* e) {
+             }
+             break;
+ 
++        case EXPR_INDEX: {
++            auto lhs_t = e->GetOp1()->GetType();
++            if ( lhs_t->Tag() == TYPE_TABLE )
++                tbl_refs.insert(lhs_t.get());
++        } break;
++
+         case EXPR_INCR:
+         case EXPR_DECR:
+         case EXPR_ADD_TO:
+         case EXPR_REMOVE_FROM:
+         case EXPR_ASSIGN: {
+-            if ( e->GetOp1()->Tag() != EXPR_REF )
+-                // this isn't a direct assignment
+-                break;
++            auto lhs = e->GetOp1();
+ 
+-            auto lhs = e->GetOp1()->GetOp1();
+-            if ( lhs->Tag() != EXPR_NAME )
+-                break;
++            if ( lhs->Tag() == EXPR_REF )
++                lhs = lhs->GetOp1();
+ 
+-            auto id = lhs->AsNameExpr()->Id();
+-            TrackAssignment(id);
++            else if ( e->Tag() == EXPR_ASSIGN )
++                // This isn't a direct assignment, but instead an overloaded
++                // use of "=" such as in a table constructor.
++                break;
+ 
+-            if ( e->Tag() == EXPR_ASSIGN ) {
+-                auto a_e = static_cast<const AssignExpr*>(e);
+-                auto& av = a_e->AssignVal();
+-                if ( av )
+-                    // This is a funky "local" assignment
+-                    // inside a when clause.
+-                    when_locals.insert(id);
++            auto lhs_t = lhs->GetType();
++
++            switch ( lhs->Tag() ) {
++                case EXPR_NAME: {
++                    auto id = lhs->AsNameExpr()->Id();
++                    TrackAssignment(id);
++
++                    if ( e->Tag() == EXPR_ASSIGN ) {
++                        auto a_e = static_cast<const AssignExpr*>(e);
++                        auto& av = a_e->AssignVal();
++              

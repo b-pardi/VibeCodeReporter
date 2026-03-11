@@ -1,0 +1,95 @@
+@@ -29,7 +29,6 @@ class CarInterface(CarInterfaceBase):
+   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
+     ret.brand = "ford"
+ 
+-    ret.radarUnavailable = Bus.radar not in DBC[candidate]
+     ret.steerControlType = structs.CarParams.SteerControlType.angle
+     ret.steerActuatorDelay = 0.2
+     ret.steerLimitTimer = 1.0
+@@ -38,10 +37,14 @@ class CarInterface(CarInterfaceBase):
+     ret.longitudinalTuning.kiBP = [0.]
+     ret.longitudinalTuning.kiV = [0.5]
+ 
+-    if not ret.radarUnavailable and DBC[candidate][Bus.radar] == RADAR.DELPHI_MRR:
++    # TODO: verify MRR_64 before it's used for longitudinal control
++    if DBC[candidate][Bus.radar] == RADAR.DELPHI_MRR:
+       # average of 33.3 Hz radar timestep / 4 scan modes = 60 ms
+       # MRR_Header_Timestamps->CAN_DET_TIME_SINCE_MEAS reports 61.3 ms
+       ret.radarDelay = 0.06
++    elif DBC[candidate][Bus.radar] == RADAR.DELPHI_MRR_64:
++      # average of 20 Hz radar timestep / 4 scan modes = 100 ms
++      ret.radarDelay = 0.1
+ 
+     CAN = CanBus(fingerprint=fingerprint)
+     cfgs = [get_safety_config(structs.CarParams.SafetyModel.ford)]
+@@ -49,8 +52,10 @@ class CarInterface(CarInterfaceBase):
+       cfgs.insert(0, get_safety_config(structs.CarParams.SafetyModel.noOutput))
+     ret.safetyConfigs = cfgs
+ 
+-    ret.alphaLongitudinalAvailable = ret.radarUnavailable
+-    if alpha_long or not ret.radarUnavailable:
++    # For now continue to allow the user to still fall back to Ford Long
++    # for  CANFD platforms - in case radar is not fully reliable
++    ret.alphaLongitudinalAvailable = bool(ret.flags & FordFlags.CANFD)
++    if alpha_long or not bool(ret.flags & FordFlags.CANFD):
+       ret.safetyConfigs[-1].safetyParam |= FordSafetyFlags.LONG_CONTROL.value
+       ret.openpilotLongitudinalControl = True
+ 
+
+
+
+
+@@ -15,6 +15,7 @@ DELPHI_ESR_RADAR_MSGS = list(range(0x500, 0x540))
+ DELPHI_MRR_RADAR_START_ADDR = 0x120
+ DELPHI_MRR_RADAR_HEADER_ADDR = 0x174  # MRR_Header_SensorCoverage
+ DELPHI_MRR_RADAR_MSG_COUNT = 64
++DELPHI_MRR_RADAR_MSG_COUNT_64 = 22  # 22 messages in CANFD
+ 
+ DELPHI_MRR_RADAR_RANGE_COVERAGE = {0: 42, 1: 164, 2: 45, 3: 175}  # scan index to detection range (m)
+ DELPHI_MRR_MIN_LONG_RANGE_DIST = 30  # meters
+@@ -89,6 +90,16 @@ def _create_delphi_mrr_radar_can_parser(CP) -> CANParser:
+   return CANParser(RADAR.DELPHI_MRR, messages, CanBus(CP).radar)
+ 
+ 
++def _create_delphi_mrr_radar_can_parser_64(CP) -> CANParser:
++  messages = []
++
++  for i in range(1, DELPHI_MRR_RADAR_MSG_COUNT_64 + 1):
++    msg = f"MRR_Detection_{i:03d}"
++    messages += [(msg, 20)]
++
++  return CANParser(RADAR.DELPHI_MRR_64, messages, CanBus(CP).radar)
++
++
+ class RadarInterface(RadarInterfaceBase):
+   def __init__(self, CP):
+     super().__init__(CP)
+@@ -111,6 +122,9 @@ class RadarInterface(RadarInterfaceBase):
+     elif self.radar == RADAR.DELPHI_MRR:
+       self.rcp = _create_delphi_mrr_radar_can_parser(CP)
+       self.trigger_msg = DELPHI_MRR_RADAR_HEADER_ADDR
++    elif self.radar == RADAR.DELPHI_MRR_64:
++      self.rcp = _create_delphi_mrr_radar_can_parser_64(CP)
++      self.trigger_msg = DELPHI_MRR_RADAR_START_ADDR + DELPHI_MRR_RADAR_MSG_COUNT_64 - 1
+     else:
+       raise ValueError(f"Unsupported radar: {self.radar}")
+ 
+@@ -135,6 +149,10 @@ class RadarInterface(RadarInterfaceBase):
+       _update = self._update_delphi_mrr(ret)
+       if not _update:
+         return None
++    elif self.radar == RADAR.DELPHI_MRR_64:
++      _update = self._update_delphi_mrr_64(ret)
++      if not _update:
++        return None
+ 
+     ret.points = list(self.pts.values())
+     return ret
+@@ -212,6 +230,7 @@ class RadarInterface(RadarInterfaceBase):
+ 
+       valid = bool(msg[f"CAN_DET_VALID_LEVEL_{ii:02d}"])
+ 
++      # TODO: verify this is correct for CANFD as well - copied from CAN version
+       # Long range measurement mode is more sensitive and can detect the road surface
+       dist = msg[f"CAN_DET_RANGE_{ii:02d}"]  # m [0|255.984]
+    

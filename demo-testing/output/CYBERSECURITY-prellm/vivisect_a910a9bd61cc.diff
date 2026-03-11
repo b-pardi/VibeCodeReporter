@@ -1,0 +1,106 @@
+@@ -389,6 +389,7 @@ class PE(object):
+         object.__init__(self)
+         self.inmem = inmem
+         self.filesize = None
++        self.min_rva = None
+         self.max_rva = None
+ 
+         if not inmem:
+@@ -495,6 +496,17 @@ class PE(object):
+     def getSections(self):
+         return self.sections
+ 
++    def vaToRva(self, va):
++        rva = va - self.IMAGE_NT_HEADERS.OptionalHeader.ImageBase
++        assert rva >= 0
++        return rva
++
++    def vaToOffset(self, va):
++        if self.inmem:
++            return va
++
++        return self.rvaToOffset(self.vaToRva(va))
++ 
+     def rvaToOffset(self, rva):
+         if self.inmem:
+             return rva
+@@ -729,6 +741,10 @@ class PE(object):
+         fbytes = self.readAtRva(rva, size)
+         return struct.unpack(fmt, fbytes)
+ 
++    def readAtVa(self, va, size, shortok=False):
++        offset = self.vaToOffset(va)
++        return self.readAtOffset(offset, size, shortok)
++         
+     def readAtRva(self, rva, size, shortok=False):
+         offset = self.rvaToOffset(rva)
+         return self.readAtOffset(offset, size, shortok)
+@@ -760,10 +776,22 @@ class PE(object):
+             fmt = "<Q"
+         return struct.unpack(fmt, self.readAtOffset(off, self.psize))[0]
+ 
++    def readPointerAtVa(self, va):
++        off = self.vaToOffset(va)
++        return self.readPointerAtOffset(off)
++
+     def readPointerAtRva(self, rva):
+         off = self.rvaToOffset(rva)
+         return self.readPointerAtOffset(off)
+ 
++    def getMinRva(self):
++        '''
++        Minimum RVA is the smallest virtual address that might be observed.
++        '''
++        if not self.min_rva:
++            self.min_rva = min(map(lambda sec: sec.VirtualAddress, self.getSections()))
++        return self.min_rva
++
+     def getMaxRva(self):
+         '''
+         Maximum RVA is the largest virtual address that might be observed.
+@@ -810,6 +838,9 @@ class PE(object):
+             ret += x
+             rva += 1
+         return ret
++ 
++    def readStringAtVa(self, va, maxsize=None):
++        return self.readStringAtRva(self.vaToRva(va), maxsize=maxsize)
+ 
+     def parseImports(self):
+         idir = self.getDataDirectory(IMAGE_DIRECTORY_ENTRY_IMPORT)
+@@ -821,7 +852,7 @@ class PE(object):
+             self.imports = []
+             return
+ 
+-        self.imports = self.parseImportTable(x, irva, is_imports=True)
++        self.imports = self.parseImportTable(x, irva, flavor="import table", uses_rva=True)
+ 
+     def parseDelayImports(self):
+         didir = self.getDataDirectory(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)
+@@ -833,68 +864,244 @@ class PE(object):
+             self.delayImports = []
+             return
+ 
+-        self.delayImports = self.parseImportTable(x, irva, is_imports=False)
++        # `doesDelayImportTableUseRVAs` modifies the given vstruct,
++        # so we parse and provide another copy.
++        y = self.readStructAtRva(irva, 'pe.IMAGE_DELAY_IMPORT_DIRECTORY', check=True)
++        uses_rva = self.doesDelayImportTableUseRVAs(y, irva)
++        if not uses_rva:
++            logger.debug("delayed imports: delay import table uses VAs (unusual, might be VS6)")
++
++        self.delayImports = self.parseImportTable(x, irva, flavor="delay import table", uses_rva=uses_rva)
+ 
+-    def parseImportTable(self, x, irva, is_imports=True):
++    def doesDelayImportTableUseRVAs(self, x, irva):
++        """
++        return True if the delay import table at the given irva appears to use RVAs.
++        this is the common case. but, VS6 had a bug in which the delay import table used VAs, instead.
++        there's no standard, because its up to the compiler to insert the delayed import handling code.
++        ref: https://stackoverflow.com/questions/40570909/difference-between-bound-imports-and-delayed-imports-in-pe-header
++        """
++        isize = len(x)
++
++        # we'll loop through all the DLL entries in the delay import table
++        # casting a vote if the name pointer appears to be an RVA or not.
++        # then th

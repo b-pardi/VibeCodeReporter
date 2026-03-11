@@ -1,0 +1,115 @@
+@@ -22,7 +22,6 @@ from vulnerabilities.importers import gentoo
+ from vulnerabilities.importers import github_osv
+ from vulnerabilities.importers import istio
+ from vulnerabilities.importers import mozilla
+-from vulnerabilities.importers import nvd
+ from vulnerabilities.importers import openssl
+ from vulnerabilities.importers import oss_fuzz
+ from vulnerabilities.importers import postgresql
+@@ -41,10 +40,10 @@ from vulnerabilities.pipelines import github_importer
+ from vulnerabilities.pipelines import gitlab_importer
+ from vulnerabilities.pipelines import nginx_importer
+ from vulnerabilities.pipelines import npm_importer
++from vulnerabilities.pipelines import nvd_importer
+ from vulnerabilities.pipelines import pypa_importer
+ 
+ IMPORTERS_REGISTRY = [
+-    nvd.NVDImporter,
+     pysec.PyPIImporter,
+     alpine_linux.AlpineImporter,
+     openssl.OpensslImporter,
+@@ -78,6 +77,7 @@ IMPORTERS_REGISTRY = [
+     nginx_importer.NginxImporterPipeline,
+     gitlab_importer.GitLabImporterPipeline,
+     github_importer.GitHubAPIImporterPipeline,
++    nvd_importer.NVDImporterPipeline,
+ ]
+ 
+ IMPORTERS_REGISTRY = {
+
+
+
+
+@@ -14,7 +14,6 @@ from django.db.models import Q
+ from django.db.models.query import QuerySet
+ 
+ from vulnerabilities.importer import AdvisoryData
+-from vulnerabilities.importers.nvd import NVDImporter
+ from vulnerabilities.improver import Improver
+ from vulnerabilities.improver import Inference
+ from vulnerabilities.models import Advisory
+@@ -22,6 +21,7 @@ from vulnerabilities.models import Alias
+ from vulnerabilities.models import Vulnerability
+ from vulnerabilities.models import VulnerabilityChangeLog
+ from vulnerabilities.models import VulnerabilityStatusType
++from vulnerabilities.pipelines.nvd_importer import NVDImporterPipeline
+ from vulnerabilities.utils import fetch_response
+ from vulnerabilities.utils import get_item
+ 
+@@ -38,7 +38,7 @@ class VulnerabilityStatusImprover(Improver):
+     @property
+     def interesting_advisories(self) -> QuerySet:
+         return (
+-            Advisory.objects.filter(Q(created_by=NVDImporter.qualified_name))
++            Advisory.objects.filter(Q(created_by=NVDImporterPipeline.qualified_name))
+             .distinct("aliases")
+             .paginated()
+         )
+
+similarity index 88%
+rename from vulnerabilities/importers/nvd.py
+rename to vulnerabilities/pipelines/nvd_importer.py
+
+
+
+@@ -9,7 +9,10 @@
+ 
+ import gzip
+ import json
++import logging
+ from datetime import date
++from traceback import format_exc as traceback_format_exc
++from typing import Iterable
+ 
+ import attr
+ import requests
+@@ -17,14 +20,16 @@ from dateutil import parser as dateparser
+ 
+ from vulnerabilities import severity_systems
+ from vulnerabilities.importer import AdvisoryData
+-from vulnerabilities.importer import Importer
+ from vulnerabilities.importer import Reference
+ from vulnerabilities.importer import VulnerabilitySeverity
++from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipeline
+ from vulnerabilities.utils import get_cwe_id
+ from vulnerabilities.utils import get_item
+ 
+ 
+-class NVDImporter(Importer):
++class NVDImporterPipeline(VulnerableCodeBaseImporterPipeline):
++    """Collect advisories from NVD."""
++
+     # See https://github.com/nexB/vulnerablecode/issues/665 for follow up
+     spdx_license_expression = (
+         "LicenseRef-scancode-us-govt-public-domain  AND LicenseRef-scancode-cve-tou"
+@@ -61,19 +66,46 @@ class NVDImporter(Importer):
+     """
+     importer_name = "NVD Importer"
+ 
+-    def advisory_data(self):
+-        for _year, cve_data in fetch_cve_data_1_1():
++    @classmethod
++    def steps(cls):
++        return (
++            cls.collect_and_store_advisories,
++            cls.import_new_advisories,
++        )
++
++    def advisories_count(self):
++        url = "https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=1"
++
++        advisory_count = 0
++        try:
++            response = requests.get(url)
++            response.raise_for_status()
++            data = response.json()

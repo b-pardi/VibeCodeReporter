@@ -1,0 +1,128 @@
+@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
+ 	}
+ 	atexit (r2r_subprocess_fini);
+ 
+-	R2RState state = { 0 };
++	R2RState state = {{0}};
+ 	state.run_config.r2_cmd = "radare2";
+ 	state.run_config.rasm2_cmd = "rasm2";
+ 	state.verbose = verbose;
+
+
+
+
+@@ -517,6 +517,10 @@ R_API bool r_anal_noreturn_add(RAnal *anal, const char *name, ut64 addr) {
+ 	char *fnl_name = NULL;
+ 	if (addr != UT64_MAX) {
+ 		if (sdb_bool_set (TDB, K_NORET_ADDR (addr), true, 0)) {
++			RAnalFunction *fcn = r_anal_get_function_at (anal, addr);
++			if (fcn) {
++				fcn->is_noreturn = true;
++			}
+ 			return true;
+ 		}
+ 	}
+@@ -530,6 +534,9 @@ R_API bool r_anal_noreturn_add(RAnal *anal, const char *name, ut64 addr) {
+ 			return false;
+ 		}
+ 		tmp_name = fcn ? fcn->name: fi->name;
++		if (fcn) {
++			fcn->is_noreturn = true;
++		}
+ 	}
+ 	if (r_type_func_exist (TDB, tmp_name)) {
+ 		fnl_name = strdup (tmp_name);
+
+
+
+
+@@ -111,6 +111,7 @@ R_API bool r_anal_add_function(RAnal *anal, RAnalFunction *fcn) {
+ 	if (anal->flg_fcn_set) {
+ 		anal->flg_fcn_set (anal->flb.f, fcn->name, fcn->addr, r_anal_function_size_from_entry (fcn));
+ 	}
++	fcn->is_noreturn = r_anal_noreturn_at_addr (anal, fcn->addr);
+ 	r_list_append (anal->fcns, fcn);
+ 	ht_pp_insert (anal->ht_name_fun, fcn->name, fcn);
+ 	ht_up_insert (anal->ht_addr_fun, fcn->addr, fcn);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2019 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2020 - pancake, nibble */
+ 
+ #include <r_types.h>
+ #include <r_list.h>
+@@ -2815,6 +2815,7 @@ static int fcn_print_json(RCore *core, RAnalFunction *fcn, PJ *pj) {
+ 	pj_kn (pj, "size", r_anal_function_linear_size (fcn));
+ 	pj_ks (pj, "is-pure", r_str_bool (r_anal_function_purity (fcn)));
+ 	pj_kn (pj, "realsz", r_anal_function_realsize (fcn));
++	pj_kb (pj, "noreturn", fcn->is_noreturn);
+ 	pj_ki (pj, "stackframe", fcn->maxstack);
+ 	if (fcn->cc) {
+ 		pj_ks (pj, "calltype", fcn->cc); // calling conventions
+@@ -3089,6 +3090,7 @@ static int fcn_print_legacy(RCore *core, RAnalFunction *fcn) {
+ 					refi->type == R_ANAL_REF_TYPE_CALL?'C':'J');
+ 		}
+ 	}
++	r_cons_printf ("\nnoreturn: %s", r_str_bool (fcn->is_noreturn));
+ 	r_cons_printf ("\nin-degree: %d", indegree);
+ 	r_cons_printf ("\nout-degree: %d", outdegree);
+ 	r_cons_printf ("\ndata-xrefs:");
+@@ -5537,35 +5539,33 @@ R_API void r_core_anal_inflags(RCore *core, const char *glob) {
+ 	free (anal_in);
+ }
+ 
+-static bool is_noreturn_function(RCore *core, RAnalFunction *f) {
++static bool analyze_noreturn_function(RCore *core, RAnalFunction *f) {
+ 	RListIter *iter;
+ 	RAnalBlock *bb;
+ 	r_list_foreach (f->bbs, iter, bb) {
+-		ut64 opaddr;
+-
+-		opaddr = r_anal_bb_opaddr_i (bb, bb->ninstr - 1);
++		ut64 opaddr = r_anal_bb_opaddr_i (bb, bb->ninstr - 1);
+ 		if (opaddr == UT64_MAX) {
+ 			return false;
+ 		}
+ 
+ 		// get last opcode
+-		RAnalOp *op = r_core_op_anal (core, opaddr);
++		RAnalOp *op = r_core_op_anal (core, opaddr, R_ANAL_OP_MASK_HINT);
+ 		if (!op) {
+ 			eprintf ("Cannot analyze opcode at 0x%08" PFMT64x "\n", opaddr);
+ 			return false;
+ 		}
+ 
+ 		switch (op->type & R_ANAL_OP_TYPE_MASK) {
+-			case R_ANAL_OP_TYPE_ILL:
+-			case R_ANAL_OP_TYPE_RET:
++		case R_ANAL_OP_TYPE_ILL:
++		case R_ANAL_OP_TYPE_RET:
++			r_anal_op_free (op);
++			return false;
++		case R_ANAL_OP_TYPE_JMP:
++			if (!r_anal_function_contains (f, op->jump)) {
+ 				r_anal_op_free (op);
+ 				return false;
+-			case R_ANAL_OP_TYPE_JMP:
+-				if (!r_anal_function_contains (f, op->jump)) {
+-					r_anal_op_free (op);
+-					return false;
+-				}
+-				break;
++			}
++			break;
+ 		}
+ 		r_anal_op_free (op);
+ 	}
+@@ -5606,7 +5606,7 @@ R_API void r_core_anal_propagate_noreturn(RCore *core, ut64 addr) {
+ 		RList *xrefs = r_anal_xrefs_get (core->anal, noret_addr);
+ 		RAnalRef *xref;
+ 		r_list_foreach (xrefs, iter, xref) {
+-			RAnalOp *xrefop = r_core_op_anal (core, xref->addr);
++			RAnalOp *xrefop = r_core_op_anal (core, xref->addr, R_ANAL_OP_MASK_ALL);
+ 			if (!xrefop) {
+ 				eprintf ("Cannot analyze opcode at 0x%08" PFMT64x "\n", xref->addr);
+ 				continue;

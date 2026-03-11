@@ -1,0 +1,122 @@
+@@ -1657,6 +1657,13 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+     res = load_memop(haddr, op);
+ 
+ _out:
++    // mmio error check
++    if (uc->invalid_error != UC_ERR_OK) {
++        uc->invalid_addr = addr;
++        cpu_exit(uc->cpu);
++        return 0;
++    }
++
+     // Unicorn: callback on successful data read
+     if (!code_read) {
+         if (!uc->size_recur_mem) { // disabling read callback if in recursive call
+
+
+
+
+@@ -88,6 +88,7 @@ static uint64_t mmio_read_wrapper(struct uc_struct *uc, void *opaque, hwaddr add
+     if (cbs->read) {
+         return cbs->read(uc, addr, size, cbs->user_data_read);
+     } else {
++        uc->invalid_error = UC_ERR_READ_PROT;
+         return 0;
+     }
+ }
+@@ -100,6 +101,8 @@ static void mmio_write_wrapper(struct uc_struct *uc, void *opaque, hwaddr addr,
+     addr = addr & ( (target_ulong)(-1) );
+     if (cbs->write) {
+         cbs->write(uc, addr, size, data, cbs->user_data_write);
++    } else {
++        uc->invalid_error = UC_ERR_WRITE_PROT;
+     }
+ }
+ 
+@@ -123,7 +126,9 @@ MemoryRegion *memory_map_io(struct uc_struct *uc, ram_addr_t begin, size_t size,
+     memset(ops, 0, sizeof(*ops));
+ 
+     ops->read = mmio_read_wrapper;
++    ops->read_with_attrs = NULL;
+     ops->write = mmio_write_wrapper;
++    ops->write_with_attrs = NULL;
+     ops->endianness = DEVICE_NATIVE_ENDIAN;
+ 
+     memory_region_init_io(uc, mmio, ops, opaques, size);
+
+
+
+
+@@ -219,6 +219,43 @@ static void test_mem_protect_remove_exec(void)
+     OK(uc_close(uc));
+ }
+ 
++static uint64_t test_mem_protect_mmio_read_cb(struct uc_struct *uc, uint64_t addr, unsigned size, void *user_data) {
++    TEST_CHECK(addr == 0x20); // note, it's not 0x1020
++
++    *(uint64_t*)user_data = *(uint64_t*)user_data + 1;
++    return 0x114514;
++}
++
++static void test_mem_protect_mmio_write_cb(struct uc_struct *uc, uint64_t addr, unsigned size, uint64_t data, void *user_data) {
++    TEST_CHECK(false);
++    return;
++}
++
++
++static void test_mem_protect_mmio(void)
++{
++    uc_engine *uc;
++    // mov eax, [0x2020]; mov [0x2020], eax
++    char code[] = "\xa1\x20\x20\x00\x00\x00\x00\x00\x00\xa3\x20\x20\x00\x00\x00\x00\x00\x00";
++    uint64_t called = 0;
++    uint64_t r_eax;
++    
++    OK(uc_open(UC_ARCH_X86, UC_MODE_64, &uc));
++    OK(uc_mem_map(uc, 0x8000, 0x1000, UC_PROT_ALL));
++    OK(uc_mem_write(uc, 0x8000, code, sizeof(code) - 1));
++
++    OK(uc_mmio_map(uc, 0x1000, 0x3000, test_mem_protect_mmio_read_cb, (void*)&called, test_mem_protect_mmio_write_cb, (void*)&called));
++    OK(uc_mem_protect(uc, 0x2000, 0x1000, UC_PROT_READ));
++
++    uc_assert_err(UC_ERR_WRITE_PROT, uc_emu_start(uc, 0x8000, 0x8000 + sizeof(code) - 1, 0, 0));
++    OK(uc_reg_read(uc, UC_X86_REG_RAX, &r_eax));
++
++    TEST_CHECK(called == 1);
++    TEST_CHECK(r_eax == 0x114514);
++
++    OK(uc_close(uc));
++}
++
+ TEST_LIST = {{"test_map_correct", test_map_correct},
+              {"test_map_wrapping", test_map_wrapping},
+              {"test_mem_protect", test_mem_protect},
+@@ -229,4 +266,5 @@ TEST_LIST = {{"test_map_correct", test_map_correct},
+              {"test_map_wrap", test_map_wrap},
+              {"test_map_big_memory", test_map_big_memory},
+              {"test_mem_protect_remove_exec", test_mem_protect_remove_exec},
++             {"test_mem_protect_mmio", test_mem_protect_mmio},
+              {NULL, NULL}};
+
+
+
+
+@@ -1114,15 +1114,13 @@ static uint8_t *copy_region(struct uc_struct *uc, MemoryRegion *mr)
+ /*
+     This function is similar to split_region, but for MMIO memory.
+ 
+-    This function would delete the region unconditionally.
+-
+     Note this function may be called recursively.
+ */
+ static bool split_mmio_region(struct uc_struct *uc, MemoryRegion *mr,
+-                              uint64_t address, size_t size)
++                              uint64_t address, size_t size, bool do_delete)
+ {
+     uint64_t begin, end, chunk_end;
+-    size_t l_size, r_size;
++    size_t l_size, r_size, m_size;
+     mmio_cbs backup;
+ 
+     chunk_end = address + size;
+@@ -1165,6 

@@ -1,0 +1,92 @@
+@@ -13,6 +13,7 @@ from select import select
+ 
+ import array
+ import ctypes
++import itertools
+ import os
+ import socket
+ import struct
+@@ -132,7 +133,8 @@ def _get_if_list():
+     """
+     try:
+         with open("/proc/net/dev", "r") as f:
+-            return [line.split(':', 1)[0].strip() for line in f.readlines()[2:]]
++            return [line.split(':', 1)[0].strip()
++                    for line in itertools.islice(f, 2, None)]
+     except IOError:
+         log_loading.critical("Can't open /proc/net/dev !")
+         return []
+@@ -228,66 +230,89 @@ def get_alias_address(iface_name,  # type: str
+ 
+ def read_routes():
+     # type: () -> List[Tuple[int, int, str, str, str, int]]
++    """
++    Read routes from /proc/net/route
++    """
+     try:
+-        with open("/proc/net/route", "r") as f:
+-            entries = [line.split() for line in f]
++        with open("/proc/net/route", "r", errors='replace') as f:
++            routes = []
++            # Loopback route
++            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++            try:
++                ifreq = ioctl(s, SIOCGIFADDR,
++                              struct.pack("16s16x", conf.loopback_name.encode("utf8")))
++                addrfamily = struct.unpack("h", ifreq[16:18])[0]
++                if addrfamily == socket.AF_INET:
++                    ifreq2 = ioctl(
++                        s, SIOCGIFNETMASK,
++                        struct.pack("16s16x", conf.loopback_name.encode("utf8"))
++                    )
++                    msk = socket.ntohl(struct.unpack("I", ifreq2[20:24])[0])
++                    dst = socket.ntohl(struct.unpack("I", ifreq[20:24])[0]) & msk
++                    ifaddr = scapy.utils.inet_ntoa(ifreq[20:24])
++                    routes.append((dst, msk, "0.0.0.0", conf.loopback_name,
++                                   ifaddr, 1))
++                else:
++                    warning("Interface %s: unknown address family (%i)" % (
++                        conf.loopback_name, addrfamily
++                    ))
++            except IOError as err:
++                if err.errno == 99:
++                    warning("Interface %s: no address assigned" % conf.loopback_name)
++                else:
++                    warning("Interface %s: failed to get address config (%s)" % (
++                        conf.loopback_name, str(err))
++                    )
++
++            # Load routes
++            for line in (x.split() for x in itertools.islice(f, 1, None)):
++                # line = iff, dst, gw, flags, _, _, metric, msk, _, _, _
++                iff, gw = line[0], line[2]
++                dst, flags, msk = tuple(
++                    int(x, 16) for x in [line[1], line[3], line[7]]
++                )
++                metric = int(line[6])
++                # Check iface flags
++                if flags & RTF_UP == 0:
++                    continue
++                if flags & RTF_REJECT:
++                    continue
++                try:
++                    ifreq = ioctl(s, SIOCGIFADDR,
++                                  struct.pack("16s16x", iff.encode("utf8")))
++                except IOError:
++                    # interface is present in routing tables but does not
++                    # have any assigned IP
++                    ifaddr = "0.0.0.0"
++                    ifaddr_int = 0
++                else:
++                    addrfamily = struct.unpack("h", ifreq[16:18])[0]
++                    if addrfamily == socket.AF_INET:
++                        ifaddr = scapy.utils.inet_ntoa(ifreq[20:24])
++                        ifaddr_int = struct.unpack("!I", ifreq[20:24])[0]
++                    else:
++                        warning("Interface %s: unknown address family (%i)", iff, addrfamily)  # noqa: E501
++                        continue
++
++                # Attempt to detect an interface alias based on addresses
++                # inconsistencies
++                dst = socket.htonl(dst) & 0xffffffff
++                msk = socket.htonl(msk) & 0xfff

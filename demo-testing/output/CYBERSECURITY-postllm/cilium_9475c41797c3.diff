@@ -1,0 +1,153 @@
+@@ -6,6 +6,7 @@
+ 
+ #include <bpf/config/node.h>
+ #include <bpf/config/global.h>
++#include <bpf/config/overlay.h>
+ #include <netdev_config.h>
+ 
+ #define IS_BPF_OVERLAY 1
+@@ -530,6 +531,21 @@ int cil_from_overlay(struct __ctx_buff *ctx)
+ 		goto out;
+ 	}
+ 
++#if defined(ENABLE_WIREGUARD) && defined(ENABLE_IDENTITY_MARK)
++	/* When wireguard is enabled we should drop any traffic coming through the tunnel
++	 * that previously wasn't marked as decrypted by cilium.
++	 */
++	if (CONFIG(encryption_strict_ingress) && !ctx_is_decrypt(ctx)) {
++		ret = DROP_UNENCRYPTED_TRAFFIC;
++		goto out;
++	}
++	/* We only needed the mark to decide if we need to drop the packet here.
++	 * To not cause any further collision with the `decrypted` variable,
++	 * clear the decrypted bit.
++	 */
++	ctx->mark &= ~MARK_MAGIC_HOST_MASK;
++#endif
++
+ 	switch (proto) {
+ #if defined(ENABLE_IPV4) || defined(ENABLE_IPV6)
+  #ifdef ENABLE_IPV6
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++/* This configuration data is specific to overlay traffic (bpf_overlay.c). Do not
++ * import into any other program.
++ */
++
++ #pragma once
++
++ #include <lib/static_data.h>
++
++/* Strict mode configuration */
++DECLARE_CONFIG(bool, encryption_strict_ingress, "Enable strict encryption for ingress traffic")
+
+
+
+
+@@ -11,3 +11,4 @@ from ipv6_ndp_pkt_defs import *
+ from tc_l2_announce_pkt_defs import *
+ from tc_l2_announce6_pkt_defs import *
+ from wg_from_netdev_pkt_defs import *
++from tc_wireguard_from_overlay_pkt_defs import *
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,25 @@
++# Copyright Authors of Cilium
++# SPDX-License-Identifier: Apache-2.0
++
++from scapy.all import *
++
++from pkt_defs_common import *
++
++## Wireguard from overlay (tc_wireguard_from_overlay.c)
++
++# TCP packet from pod to pod through overlay network (input packet)
++v4_overlay_tcp_packet = (
++    Ether(dst=mac_two, src=mac_one) /
++    IP(src=v4_pod_one, dst=v4_pod_two) /
++    TCP(sport=tcp_src_one, dport=tcp_dst_one)
++)
++
++# Expected packet after MAC rewriting for local delivery
++# MACs are rewritten: src=mac_four (DEST_NODE_MAC), dst=mac_three (DEST_EP_MAC)
++# TTL is decremented by 1 during forwarding (64 -> 63)
++# IP checksum is recalculated to reflect TTL change
++v4_overlay_tcp_packet_rewritten = (
++    Ether(dst=mac_three, src=mac_four) /
++    IP(src=v4_pod_one, dst=v4_pod_two, ttl=63) /
++    TCP(sport=tcp_src_one, dport=tcp_dst_one)
++)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#define ENABLE_IPV4
++#define ENABLE_IPV6
++#define ENABLE_WIREGUARD 1
++#define ENABLE_IDENTITY_MARK 1
++#define TUNNEL_MODE
++#define ENCAP_IFINDEX 4
++#define DEST_IFINDEX 5
++#define DEST_LXC_ID 0
++
++#include <bpf/ctx/skb.h>
++#include "common.h"
++#include "pktgen.h"
++#include "scapy.h"
++
++#define skb_change_type mock_skb_change_type
++int mock_skb_change_type(__maybe_unused struct __sk_buff *skb, __u32 type)
++{
++	if (type != PACKET_HOST)
++		return -1;
++	return 0;
++}
++
++#define skb_get_tunnel_key mock_skb_get_tunnel_key
++int mock_skb_get_tunnel_key(__maybe_unused struct __sk_buff *skb,
++			    struct bpf_tunnel_key *to,
++			    __maybe_unused __u32 size,
++			    __maybe_unused __u32 flags)
++{
++	to->remote_ipv4 = v4_node_one;
++	/* 0xfffff is the default SECLABEL */
++	to->tunnel_id = 0xfffff;
++	return 0;
++}
++
++__section_entry
++int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
++{
++	return TC_ACT_OK;
++}
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 1);
++	__array(values, int());
++} mock_policy_call_map __section(".maps") = {
++	.values = {
++		[DEST_LXC_ID] = &mock_handle_policy,
++	},
++};
++
++#define tail_call_dynamic mock_tail_call_dynamic
++static __always_inline __maybe_unused void
++mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
++		       const void *map __maybe_unused, __u32 slot __maybe_unuse

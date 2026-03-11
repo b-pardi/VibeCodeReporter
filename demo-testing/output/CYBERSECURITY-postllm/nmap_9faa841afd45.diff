@@ -1,0 +1,116 @@
+@@ -15,6 +15,7 @@ extern "C" {
+ #include "nse_nsock.h"
+ #include "nse_utility.h"
+ #include "nbase.h"
++#include "nmap_error.h"
+ 
+ #include <fcntl.h>
+ #include <assert.h>
+@@ -43,17 +44,27 @@ enum {
+     SSH2_UDATA = lua_upvalueindex(1)
+ };
+ 
+-#ifdef WIN32
++struct userauth_context {
++    const char *username;
++    size_t username_len;
++    const char *privkey; // or password
++    size_t privkey_len;
++    const char *pubkey;
++    size_t pubkey_len;
++    const char *passphrase;
++    int kbdint_callback_ref;
++};
++
+ struct ssh_userdata {
++#ifdef WIN32
+     SOCKET sp[2];
+-    LIBSSH2_SESSION *session;
+-};
+ #else
+-struct ssh_userdata {
+     int sp[2];
++#endif
+     LIBSSH2_SESSION *session;
++    lua_State *L;
++    userauth_context userauth;
+ };
+-#endif
+ 
+ 
+ #if defined(_MSC_VER) && _MSC_VER < 1900
+@@ -341,9 +352,10 @@ static int l_session_open (lua_State *L) {
+     state = (ssh_userdata *)lua_newuserdatauv(L, sizeof(ssh_userdata), 1); /* index 3 */
+ 
+     assert(lua_gettop(L) == 3);
+-    state->session = NULL;
++    memset(state, 0, sizeof(ssh_userdata));
+     state->sp[0] = -1;
+     state->sp[1] = -1;
++    state->L = L;
+     lua_pushvalue(L, lua_upvalueindex(1)); /* metatable */
+     lua_setmetatable(L, 3);
+ 
+@@ -352,7 +364,7 @@ static int l_session_open (lua_State *L) {
+     lua_getuservalue(L, 3); /* index 4 - a table associated with userdata*/
+     assert(lua_gettop(L) == 4);
+ 
+-    state->session = libssh2_session_init();
++    state->session = libssh2_session_init_ex(NULL, NULL, NULL, state);
+ 
+     if (state->session == NULL) {
+         // A session could not be created because of memory limit
+@@ -504,32 +516,21 @@ static int l_userauth_banner (lua_State *L) {
+     return userauth_banner(L, 0, 0);
+ }
+ 
+-struct publickey_ctx {
+-  struct ssh_userdata *state;
+-  const char *username;
+-  size_t username_len;
+-  const char *privkey;
+-  size_t privkey_len;
+-  const char *pubkey;
+-  size_t pubkey_len;
+-  const char *passphrase;
+-};
+-
+-static void validate_publickey_params(lua_State *L, struct publickey_ctx *ctx) {
+-  memset(ctx, 0, sizeof(struct publickey_ctx));
+-  ctx->state = (struct ssh_userdata *) nseU_checkudata(L, 1, SSH2_UDATA, "ssh2");
+-  ctx->username = luaL_checklstring(L, 2, &ctx->username_len);
+-  ctx->privkey = luaL_checklstring(L, 3, &ctx->privkey_len);
+-
+-  ctx->passphrase = lua_isstring(L, 4) ? lua_tostring(L, 4) : NULL;
+-  ctx->pubkey = lua_isstring(L, 5) ? lua_tolstring(L, 5, &ctx->pubkey_len) : NULL;
++static void validate_publickey_params(lua_State *L, ssh_userdata *state, int params_idx) {
++  userauth_context *ctx = &state->userauth;
++  memset(ctx, 0, sizeof(userauth_context));
++  ctx->username = luaL_checklstring(L, params_idx, &ctx->username_len);
++  ctx->privkey = luaL_checklstring(L, params_idx + 1, &ctx->privkey_len);
++  ctx->passphrase = lua_tostring(L, params_idx + 2);
++  ctx->pubkey = lua_tolstring(L, params_idx + 3, &ctx->pubkey_len);
+ }
+ 
+ static int userauth_publickey (lua_State *L, int status, lua_KContext ctx) {
+-    struct publickey_ctx *context = (struct publickey_ctx *)ctx;
++    ssh_userdata *state = (ssh_userdata *)ctx;
++    userauth_context *context = &state->userauth;
+     int rc;
+     DO_OR_YIELD((rc = libssh2_userauth_publickey_fromfile_ex(
+-        context->state->session, context->username, context->username_len,
++        state->session, context->username, context->username_len,
+         context->pubkey, context->privkey, context->passphrase
+         )),
+         1, userauth_publickey, ctx);
+@@ -540,17 +541,17 @@ static int userauth_publickey (lua_State *L, int status, lua_KContext ctx) {
+ }
+ 
+ static int l_userauth_publickey (lua_State *L) {
+-  publickey_ctx *params = NULL;
+-  params = (publickey_ctx *)lua_newuserdatauv(L, sizeof(publickey_ctx), 0);
+-  validate_publickey_params(L, params);
+-  return userauth_publickey(L, 0, (lua_KContext) params);
++  ssh_userdata *state = (ssh_userdata *) nseU_checkudata(L, 1, SSH2_UDATA, "ssh2");
++  validate_publickey_params(L, state, 2);
++  return userauth_pub

@@ -1,0 +1,126 @@
+@@ -1,6 +1,10 @@
+ /* radare - LGPL - Copyright 2019 - condret */
+ 
++//#include <r_util.h>
+ #include <r_anal.h>
++//#include <r_reg.h>
++//#include <sdb.h>
++
+ 
+ typedef struct esil_dfg_reg_var_t {
+ 	ut32 from;
+@@ -8,12 +12,21 @@ typedef struct esil_dfg_reg_var_t {
+ 	RGraphNode *node;
+ } EsilDFGRegVar;
+ 
++
+ typedef struct r_anal_esil_dfg_filter_t {
+ 	RAnalEsilDFG *dfg;
+ 	RContRBTree *tree;
+ 	Sdb *results;
+ } RAnalEsilDFGFilter;
+ 
++// TODO: simple const propagation - use node->type of srcs to propagate consts of pushed vars
++
++R_API RAnalEsilDFGNode *r_anal_esil_dfg_node_new(RAnalEsilDFG *edf, const char *c) {
++	RAnalEsilDFGNode *ret = R_NEW0 (RAnalEsilDFGNode);
++	ret->content = r_strbuf_new (c);
++	ret->idx = edf->idx++;
++	return ret;
++}
+ 
+ static void _dfg_node_free (RAnalEsilDFGNode *free_me) {
+ 	if (free_me) {
+@@ -22,9 +35,15 @@ static void _dfg_node_free (RAnalEsilDFGNode *free_me) {
+ 	}
+ }
+ 
++
+ static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
+ 	EsilDFGRegVar *rv_incoming = (EsilDFGRegVar *)incoming;
+ 	EsilDFGRegVar *rv_in = (EsilDFGRegVar *)in;
++	RAnalEsilDFG *dfg = (RAnalEsilDFG *)user;
++
++	if (dfg->malloc_failed) {
++		return -1;
++	}
+ 
+ 	// first handle the simple cases without intersection
+ 	if (rv_incoming->to < rv_in->from) {
+@@ -36,7 +55,6 @@ static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
+ 	if (rv_in->from == rv_incoming->from && rv_in->to == rv_incoming->to) {
+ 		return 0;
+ 	}
+-	RAnalEsilDFG *dfg = (RAnalEsilDFG *)user;
+ 
+ 	/*
+ 	the following cases are about intersection, here some ascii-art, so you understand what I do
+@@ -53,6 +71,10 @@ static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
+ 
+ 	if (rv_in->from < rv_incoming->from && rv_incoming->to < rv_in->to) {
+ 		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		if (!rv) {
++			dfg->malloc_failed = true;
++			return -1;
++		}
+ 		rv[0] = rv_in[0];
+ 		rv_in->to = rv_incoming->from - 1;
+ 		rv->from = rv_incoming->to + 1;
+@@ -70,11 +92,19 @@ static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
+ 	if (rv_incoming->from < rv_in->from && rv_in->to < rv_incoming->to) {
+ 		// lower part
+ 		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		if (!rv) {
++			dfg->malloc_failed = true;
++			return -1;
++		}
+ 		rv[0] = rv_incoming[0];
+ 		rv->to = rv_in->from - 1;
+ 		r_queue_enqueue (dfg->todo, rv);
+ 		// upper part
+ 		rv = R_NEW (EsilDFGRegVar);
++		if (!rv) {
++			dfg->malloc_failed = true;
++			return -1;
++		}
+ 		rv[0] = rv_incoming[0];
+ 		rv->from = rv_in->to + 1;
+ 		r_queue_enqueue (dfg->todo, rv);
+@@ -90,6 +120,10 @@ static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
+ 
+ 	if (rv_incoming->from == rv_in->from && rv_in->to < rv_incoming->to) {
+ 		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		if (!rv) {
++			dfg->malloc_failed = true;
++			return -1;
++		}
+ 		rv[0] = rv_incoming[0];
+ 		rv->from = rv_in->to + 1;
+ 		r_queue_enqueue (dfg->todo, rv);
+@@ -103,6 +137,10 @@ static int _rv_del_alloc_cmp (void *incoming, void *in, void *user) {
+ 
+ 	if (rv_incoming->from < rv_in->from && rv_in->to == rv_incoming->to) {
+ 		EsilDFGRegVar *rv = R_NEW (EsilDFGRegVar);
++		if (!rv) {
++			dfg->malloc_failed = true;
++			return -1;
++		}
+ 		rv[0] = rv_incoming[0];
+ 		rv->to = rv_in->from - 1;
+ 		r_queue_enqueue (dfg->todo, rv);
+@@ -145,7 +183,7 @@ static int _rv_ins_cmp (void *incoming, void *in, void *user) {
+ }
+ 
+ static bool _edf_reg_set (RAnalEsilDFG *dfg, const char *reg, RGraphNode *node) {
+-	r_return_val_if_fail (dfg && reg, false);
++	r_return_val_if_fail (dfg && !dfg->malloc_failed && reg, false);
+ 	const ut32 _reg_strlen = 4 + strlen (reg);
+ 	char *_reg = R_NEWS0 (char, _reg_strlen + 1);
+ 	if (!_reg) {
+@@ -169,16 +207,22 @@ static bool _edf_reg_set (RAnalEsilDFG *dfg, const char *reg, RGraphNode *node)
+ 	rv->from = (v & (UT64_MAX ^ UT32_MAX)) >> 32;
+ 	rv->to = v & UT32_MAX;
+ 	r_queue_enqueue (dfg->todo, rv);
+-	while (!r_queue_is_empty (dfg->todo)) {
++	while (!r_queue_is_empty (dfg->todo) && !dfg->malloc_failed) {
+ 		/

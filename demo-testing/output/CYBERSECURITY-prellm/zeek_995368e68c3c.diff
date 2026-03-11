@@ -1,0 +1,156 @@
+@@ -1075,27 +1075,5 @@ void Connection::CheckFlowLabel(bool is_orig, uint32 flow_label)
+ bool Connection::PermitWeird(const char* name, uint64 threshold, uint64 rate,
+                              double duration)
+ 	{
+-	auto& state = weird_state[name];
+-	++state.count;
+-
+-	if ( state.count <= threshold )
+-		return true;
+-
+-	if ( state.count == threshold + 1)
+-		state.sampling_start_time = network_time;
+-	else
+-		{
+-		if ( network_time > state.sampling_start_time + duration )
+-			{
+-			state.sampling_start_time = 0;
+-			state.count = 1;
+-			return true;
+-			}
+-		}
+-
+-	auto num_above_threshold = state.count - threshold;
+-	if ( rate )
+-		return num_above_threshold % rate == 0;
+-	else
+-		return false;
++	return ::PermitWeird(weird_state, name, threshold, rate, duration);
+ 	}
+
+
+
+
+@@ -17,6 +17,7 @@
+ #include "IPAddr.h"
+ #include "TunnelEncapsulation.h"
+ #include "UID.h"
++#include "WeirdState.h"
+ 
+ #include "analyzer/Tag.h"
+ #include "analyzer/Analyzer.h"
+@@ -345,14 +346,7 @@ protected:
+ 	analyzer::pia::PIA* primary_PIA;
+ 
+ 	Bro::UID uid;	// Globally unique connection ID.
+-
+-	struct WeirdState {
+-		WeirdState() { count = 0; sampling_start_time = 0; }
+-		uint64 count = 0;
+-		double sampling_start_time = 0;
+-	};
+-
+-	std::unordered_map<std::string, WeirdState> weird_state;
++	WeirdStateMap weird_state;
+ };
+ 
+ class ConnectionTimer : public Timer {
+
+
+
+
+@@ -288,7 +288,7 @@ RecordVal* IPv6_Hdr::BuildRecordVal(VectorVal* chain) const
+ 			}
+ 
+ 		default:
+-			reporter->Weird(fmt("unknown_mobility_type_%d", mob->ip6mob_type));
++			reporter->Weird(fmt("unknown_mobility_type", mob->ip6mob_type));
+ 			break;
+ 		}
+ 
+@@ -553,7 +553,7 @@ void IPv6_Hdr_Chain::ProcessRoutingHeader(const struct ip6_rthdr* r, uint16 len)
+ #endif
+ 
+ 	default:
+-		reporter->Weird(fmt("unknown_routing_type_%d", r->ip6r_type));
++		reporter->Weird(SrcAddr(), DstAddr(), "unknown_routing_type");
+ 		break;
+ 	}
+ 	}
+
+
+
+
+@@ -13,6 +13,7 @@
+ #include "Timer.h"
+ #include "plugin/Plugin.h"
+ #include "plugin/Manager.h"
++#include "file_analysis/File.h"
+ 
+ #ifdef SYSLOG_INT
+ extern "C" {
+@@ -213,12 +214,14 @@ void Reporter::Syslog(const char* fmt, ...)
+ 	va_end(ap);
+ 	}
+ 
+-void Reporter::WeirdHelper(EventHandlerPtr event, Val* conn_val, const char* addl, const char* fmt_name, ...)
++void Reporter::WeirdHelper(EventHandlerPtr event, Val* conn_val, file_analysis::File* f, const char* addl, const char* fmt_name, ...)
+ 	{
+ 	val_list* vl = new val_list(1);
+ 
+ 	if ( conn_val )
+ 		vl->append(conn_val);
++	else if ( f )
++		vl->append(f->GetVal()->Ref());
+ 
+ 	if ( addl )
+ 		vl->append(new StringVal(addl));
+@@ -339,7 +342,21 @@ void Reporter::Weird(const char* name)
+ 			return;
+ 		}
+ 
+-	WeirdHelper(net_weird, 0, 0, "%s", name);
++	WeirdHelper(net_weird, 0, 0, 0, "%s", name);
++	}
++
++void Reporter::Weird(file_analysis::File* f, const char* name, const char* addl)
++	{
++	UpdateWeirdStats(name);
++
++	if ( ! WeirdOnSamplingWhiteList(name) )
++		{
++		if ( ! f->PermitWeird(name, weird_sampling_threshold,
++		                      weird_sampling_rate, weird_sampling_duration) )
++			return;
++		}
++
++	WeirdHelper(file_weird, 0, f, addl, "%s", name);
+ 	}
+ 
+ void Reporter::Weird(Connection* conn, const char* name, const char* addl)
+@@ -353,7 +370,7 @@ void Reporter::Weird(Connection* conn, const char* name, const char* addl)
+ 			return;
+ 		}
+ 
+-	WeirdHelper(conn_weird, conn->BuildConnVal(), addl, "%s", name);
++	WeirdHelper(conn_weird, conn->BuildConnVal(), 0, addl, "%s", name);
+ 	}
+ 
+ void Reporter::Weird(const IPAddr& orig, const IPAddr& resp, const char* name)
+
+
+
+
+@@ -17,6 +17,7 @@
+ #include "IPAddr.h"
+ 
+ namespace analyzer { class Analyzer; }
++namespace file_analysis { class File; }
+ class Connection;
+ class Location;
+ class Reporter;
+@@ -84,6 +85,7 @@ public:
+ 	// Report a traffic weirdness, i.e., an unexpected protocol situation
+ 	// that may lead to incorrectly processing a connnection.
+ 	void Weird(const char* name);	// Raises net_weird().
++	void Weird(file_analysis::File* f, const char* name, const char* addl = 

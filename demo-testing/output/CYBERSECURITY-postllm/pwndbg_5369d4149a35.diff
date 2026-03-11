@@ -1,0 +1,119 @@
+@@ -7,6 +7,7 @@ import random
+ import re
+ import shlex
+ import sys
++from asyncio import CancelledError
+ from contextlib import contextmanager
+ from typing import Any
+ from typing import Awaitable
+@@ -1866,6 +1867,9 @@ class LLDB(pwndbg.dbg_mod.Debugger):
+     # Relay used for exceptions originating from commands called through LLDB.
+     _exception_relay: BaseException | None
+ 
++    in_lldb_command_handler: bool
++    "Whether an LLDB command handler is currently running"
++
+     # temporarily suspend context output
+     should_suspend_ctx: bool
+ 
+@@ -1880,6 +1884,7 @@ class LLDB(pwndbg.dbg_mod.Debugger):
+         self.controllers = []
+         self._current_process_is_gdb_remote = False
+         self._exception_relay = None
++        self.in_lldb_command_handler = False
+         self.should_suspend_ctx = False
+ 
+         import pwndbg
+@@ -1917,6 +1922,10 @@ class LLDB(pwndbg.dbg_mod.Debugger):
+         e = self._exception_relay
+         self._exception_relay = None
+         if e is not None:
++            if isinstance(e, CancelledError):
++                # Cancellations are meaningful to the CLI, raise them unchanged.
++                raise e
++
+             raise pwndbg.dbg_mod.Error(e)
+ 
+     def _execute_lldb_command(self, command: str) -> str:
+@@ -1950,13 +1959,15 @@ class LLDB(pwndbg.dbg_mod.Debugger):
+             def __call__(self, _, command, exe_context, result):
+                 try:
+                     debugger.exec_states.append(exe_context)
++                    debugger.in_lldb_command_handler = True
+                     handler(debugger, command, True)
++                except BaseException as e:
++                    debugger._exception_relay = e
++                finally:
++                    debugger.in_lldb_command_handler = False
+                     assert (
+                         debugger.exec_states.pop() == exe_context
+                     ), "Execution state mismatch on command handler"
+-                except BaseException as e:
+-                    debugger._exception_relay = e
+-                    raise
+ 
+         # LLDB is very particular with the object paths it will accept. It is at
+         # its happiest when its pulling objects straight off the module that was
+
+
+
+
+@@ -44,6 +44,7 @@ import shutil
+ import signal
+ import sys
+ import threading
++from asyncio import CancelledError
+ from contextlib import contextmanager
+ from io import BytesIO
+ from io import TextIOBase
+@@ -85,6 +86,17 @@ else:
+     from pwndbg.dbg.lldb.repl.readline import wrap_with_history
+ 
+ 
++class UserCancelledError(CancelledError):
++    """
++    Internal cancellation exception used by the LLDB CLI.
++
++    Sometimes, it's necessary to cancel both commands and subroutines mid-execution. This is an internal exception type
++    that is used in these conditions.
++    """
++
++    pass
++
++
+ def print_error(msg: str, *args):
+     """
+     Print an error message in the style of the LLDB CLI.
+@@ -325,10 +337,7 @@ def run(
+     # Set ourselves up to respond to SIGINT by interrupting the process if it is
+     # running, and doing nothing otherwise.
+     def handle_sigint(_sig, _frame):
+-        driver.cancel()
+-        if driver.has_process():
+-            driver.interrupt()
+-            print()
++        driver.interrupt(in_lldb_command_handler=dbg.in_lldb_command_handler)
+ 
+     signal.signal(signal.SIGINT, handle_sigint)
+ 
+@@ -340,79 +349,82 @@ def run(
+     last_exc: Exception | None = None
+ 
+     while True:
+-        # Execute the prompt hook.
+-        dbg._fire_prompt_hook()
+-
+         try:
+-            if last_exc is not None:
+-                action = coroutine.throw(last_exc)
+-            else:
+-                action = coroutine.send(last_result)
+-        except StopIteration:
+-            # Nothing else for us to do.
+-            break
+-        except asyncio.CancelledError:
+-            # We requested a cancellation that wasn't overwritten.
+-            break
+-        finally:
+-            last_exc = None
+-            last_result = N

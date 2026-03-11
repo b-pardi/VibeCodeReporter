@@ -1,0 +1,149 @@
+@@ -19,7 +19,6 @@
+ #include <kd.h>
+ 
+ static WindCtx *wctx = NULL;
+-static bool dbreak = false;
+ 
+ static int r_debug_windbg_step(RDebug *dbg) {
+ 	return true;
+@@ -54,27 +53,15 @@ static int r_debug_windbg_continue(RDebug *dbg, int pid, int tid, int sig) {
+ 	return windbg_continue(wctx);
+ }
+ 
+-#if 0
+-static void wstatic_debug_break(void *u) {
+-	dbreak = true;
+-	windbg_break_read (wctx);
+-}
+-#endif
+-
+ static RDebugReasonType r_debug_windbg_wait(RDebug *dbg, int pid) {
+ 	RDebugReasonType reason = R_DEBUG_REASON_UNKNOWN;
+ 	kd_packet_t *pkt = NULL;
+ 	kd_stc_64 *stc;
+-	dbreak = false;
+-
++	r_cons_break_push (windbg_break, wctx);
+ 	for (;;) {
++		void *bed = r_cons_sleep_begin ();
+ 		int ret = windbg_wait_packet (wctx, KD_PACKET_TYPE_STATE_CHANGE64, &pkt);
+-		if (dbreak) {
+-			dbreak = false;
+-			windbg_break (wctx);
+-			R_FREE (pkt);
+-			continue;
+-		}
++		r_cons_sleep_end (bed);
+ 		if (ret != KD_E_OK || !pkt) {
+ 			reason = R_DEBUG_REASON_ERROR;
+ 			break;
+@@ -95,6 +82,7 @@ static RDebugReasonType r_debug_windbg_wait(RDebug *dbg, int pid) {
+ 		}
+ 		R_FREE (pkt);
+ 	}
++	r_cons_break_pop ();
+ 	free (pkt);
+ 	return reason;
+ }
+
+
+
+
+@@ -13,7 +13,7 @@ static void *iob_pipe_open(const char *path) {
+ 	HANDLE hPipe;
+ 	LPTSTR path_ = r_sys_conv_utf8_to_win (path);
+ 
+-	hPipe = CreateFile (path_, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
++	hPipe = CreateFile (path_, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+ 	free (path_);
+ 	return hPipe != INVALID_HANDLE_VALUE? (void *)(HANDLE)hPipe : NULL;
+ }
+@@ -24,17 +24,29 @@ static int iob_pipe_close(void *p) {
+ 
+ static int iob_pipe_read(void *p, uint8_t *buf, const uint64_t count, const int timeout) {
+ 	DWORD c = 0;
+-	if (!ReadFile (p, buf, count, &c, NULL)) {
++	OVERLAPPED ov = {0};
++	if (!ReadFile (p, buf, count, NULL, &ov) &&
++		GetLastError () != ERROR_IO_PENDING) {
++		r_sys_perror ("ReadFile");
+ 		return -1;
+ 	}
++	if (!GetOverlappedResultEx (p, &ov, &c, timeout, FALSE)
++		&& GetLastError () == WAIT_TIMEOUT) {
++		CancelIo (p);
++		GetOverlappedResult (p, &ov, &c, TRUE);
++	}
+ 	return c;
+ }
+ 
+ static int iob_pipe_write(void *p, const uint8_t *buf, const uint64_t count, const int timeout) {
+ 	DWORD cbWrited = 0;
+-	if (!WriteFile (p, buf, count, &cbWrited, NULL)) {
++	OVERLAPPED ov = {0};
++	if (!WriteFile (p, buf, count, NULL, &ov) &&
++		GetLastError () != ERROR_IO_PENDING) {
++		r_sys_perror ("WriteFile");
+ 		return -1;
+ 	}
++	GetOverlappedResult (p, &ov, &cbWrited, TRUE);
+ 	return cbWrited;
+ }
+ #else
+@@ -63,10 +75,6 @@ static void *iob_pipe_open(const char *path) {
+ 		close (sock);
+ 		return 0;
+ 	}
+-	//struct timeval tv;
+-	//tv.tv_sec = 5;
+-	//tv.tv_usec = 0;
+-	//setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(struct timeval));
+ 	return (void *) (size_t) sock;
+ }
+ 
+@@ -78,16 +86,19 @@ static int iob_pipe_read(void *p, uint8_t *buf, const uint64_t count, const int
+ 	int result;
+ 	fd_set readset;
+ 	int fd = (int) (size_t) p;
++	struct timeval tv;
++	tv.tv_sec = 0;
++	tv.tv_usec = timeout;
+ 	for (;;) {
+ 		FD_ZERO (&readset);
+ 		FD_SET (fd, &readset);
+-		result = select (fd + 1, &readset, NULL, NULL, NULL);
++		result = select (fd + 1, &readset, NULL, NULL, &tv);
+ 		if (result < 1) {
+ 			if (errno == EINTR) continue;
+ 			return -1;
+ 		}
+ 		if (FD_ISSET (fd, &readset)) {
+-			return  recv ((int) (size_t) p, buf, count, 0);
++			return recv ((int) (size_t) p, buf, count, 0);
+ 		}
+ 	}
+ 	return EINTR;
+
+
+
+
+@@ -5,6 +5,8 @@
+ #include "transport.h"
+ #include "kd.h"
+ 
++#define KD_DBG if (false)
++
+ uint32_t kd_data_checksum(const uint8_t *buf, const uint64_t buf_len) {
+ 	uint32_t i, acc;
+ 
+@@ -83,8 +85,33 @@ int kd_read_packet(void *fp, kd_packet_t **p) {
+ 	}
+ 
+ 	if (!kd_packet_is_valid (&pkt)) {
+-		eprintf ("invalid leader %08x\n", pkt.leader);
+-		return KD_E_MALFORMED;
++		KD_DBG eprintf ("invalid leader %08x, trying to recover\n", pkt.leader);
++		char ch;
++		while (!kd_packet_is_valid (&pkt)) {
++			kd_send_ctrl_packet (fp, KD_PACKET_TYPE_RESEND, 0);
++			char
