@@ -22,8 +22,8 @@ from transformers import (
 )
 
 from common import (
-    CodeDataset, compute_metrics, print_eval_report,
-    cmd_eval_test, cmd_eval_daniotti,
+    CodeDataset, ParquetDataset, compute_metrics, print_eval_report,
+    cmd_eval_test, cmd_eval_diffs, cmd_eval_daniotti,
 )
 
 
@@ -35,13 +35,8 @@ def cmd_train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    data_path = Path(args.data_dir)
-    train_path = data_path / 'CONF' / 'training_data'
-    test_path = data_path / 'CONF' / 'testing_data'
     model_dir = Path(args.output_dir) / 'final_model'
-
-    if not train_path.exists():
-        raise FileNotFoundError(f"Training data not found at {train_path}")
+    use_parquet = args.train_parquet is not None
 
     print("Loading CodeBERT model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
@@ -49,19 +44,45 @@ def cmd_train(args):
         "microsoft/codebert-base", num_labels=2)
     model.to(device)
 
-    print("\nLoading training data...")
-    train_dataset = CodeDataset(
-        train_path, tokenizer, max_length=512,
-        max_samples=args.max_samples, seed=args.seed)
+    if use_parquet:
+        print("\nLoading training data (parquet)...")
+        train_dataset = ParquetDataset(
+            args.train_parquet, tokenizer, max_length=512,
+            max_samples=args.max_samples, seed=args.seed)
 
-    test_max = None
-    if args.max_samples:
-        test_max = max(1000, args.max_samples // 4)
+        test_parquet = args.test_parquet
+        if not test_parquet:
+            test_parquet = str(Path(args.train_parquet).parent / 'test.parquet')
 
-    print("\nLoading validation data...")
-    val_dataset = CodeDataset(
-        test_path, tokenizer, max_length=512,
-        max_samples=test_max, seed=args.seed)
+        test_max = None
+        if args.max_samples:
+            test_max = max(1000, args.max_samples // 4)
+
+        print("\nLoading validation data (parquet)...")
+        val_dataset = ParquetDataset(
+            test_parquet, tokenizer, max_length=512,
+            max_samples=test_max, seed=args.seed)
+    else:
+        data_path = Path(args.data_dir)
+        train_path = data_path / 'CONF' / 'training_data'
+        test_path = data_path / 'CONF' / 'testing_data'
+
+        if not train_path.exists():
+            raise FileNotFoundError(f"Training data not found at {train_path}")
+
+        print("\nLoading training data...")
+        train_dataset = CodeDataset(
+            train_path, tokenizer, max_length=512,
+            max_samples=args.max_samples, seed=args.seed)
+
+        test_max = None
+        if args.max_samples:
+            test_max = max(1000, args.max_samples // 4)
+
+        print("\nLoading validation data...")
+        val_dataset = CodeDataset(
+            test_path, tokenizer, max_length=512,
+            max_samples=test_max, seed=args.seed)
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -131,6 +152,10 @@ def main():
     p_train = sub.add_parser('train', help='Train a new model')
     p_train.add_argument('--data-dir', default='data/humanvsaicode_python',
                          help='Path to dataset directory (containing CONF/)')
+    p_train.add_argument('--train-parquet', default=None,
+                         help='Train parquet file (overrides --data-dir)')
+    p_train.add_argument('--test-parquet', default=None,
+                         help='Test parquet file (default: test.parquet next to train)')
     p_train.add_argument('--output-dir', default='./gptsniffer_output',
                          help='Output directory for model and logs')
     p_train.add_argument('--max-samples', type=int, default=None,
@@ -154,6 +179,17 @@ def main():
     p_et.add_argument('--batch-size', type=int, default=16, help='Batch size')
     p_et.add_argument('--seed', type=int, default=42, help='Random seed')
 
+    # -- eval-diffs --
+    p_edf = sub.add_parser('eval-diffs',
+                           help='Evaluate on diffs directory or parquet')
+    p_edf.add_argument('--model-dir', default='gptsniffer_diffs_output/final_model',
+                       help='Path to saved model directory')
+    p_edf.add_argument('--diffs', required=True,
+                       help='Diffs directory or parquet file')
+    p_edf.add_argument('--max-samples', type=int, default=None,
+                       help='Max samples (default: all)')
+    p_edf.add_argument('--batch-size', type=int, default=16, help='Batch size')
+
     # -- eval-daniotti --
     p_ed = sub.add_parser('eval-daniotti',
                           help='Evaluate on Daniotti real-world parquet')
@@ -170,6 +206,8 @@ def main():
         cmd_train(args)
     elif args.command == 'eval-test':
         cmd_eval_test(args, max_length=512, batch_size=16)
+    elif args.command == 'eval-diffs':
+        cmd_eval_diffs(args, max_length=512, batch_size=16)
     elif args.command == 'eval-daniotti':
         cmd_eval_daniotti(args, max_length=512, batch_size=16)
 

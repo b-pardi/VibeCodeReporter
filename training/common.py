@@ -83,6 +83,52 @@ class CodeDataset(Dataset):
         }
 
 
+class ParquetDataset(Dataset):
+    """Dataset backed by a parquet file with 'text' and 'label' columns.
+
+    Labels follow HumanVsAICode convention: 0=AI, 1=human.
+    """
+
+    def __init__(self, parquet_path, tokenizer, max_length=512,
+                 max_samples=None, seed=42):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        df = pd.read_parquet(parquet_path)
+        self.texts = df['text'].tolist()
+        self.labels = df['label'].tolist()
+
+        print(f"Loaded {len(self.texts)} samples from {parquet_path}")
+
+        if max_samples and max_samples < len(self.texts):
+            random.seed(seed)
+            indices = list(range(len(self.texts)))
+            random.shuffle(indices)
+            indices = indices[:max_samples]
+            self.texts = [self.texts[i] for i in indices]
+            self.labels = [self.labels[i] for i in indices]
+            print(f"Subsampled to {len(self.texts)} samples")
+
+        label_counts = {}
+        for label in self.labels:
+            label_counts[label] = label_counts.get(label, 0) + 1
+        print(f"Label distribution: {label_counts}")
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, index):
+        inputs = self.tokenizer(
+            self.texts[index], padding='max_length', max_length=self.max_length,
+            truncation=True, return_tensors=None,
+        )
+        return {
+            'input_ids': torch.tensor(inputs['input_ids'], dtype=torch.long),
+            'attention_mask': torch.tensor(inputs['attention_mask'], dtype=torch.long),
+            'labels': torch.tensor(self.labels[index], dtype=torch.long),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -129,7 +175,8 @@ def print_eval_report(y_true, y_pred, target_names):
     print(f"\nConfusion Matrix:")
     print(confusion_matrix(y_true, y_pred))
     print(f"\nClassification Report:")
-    print(classification_report(y_true, y_pred, target_names=target_names))
+    print(classification_report(y_true, y_pred, target_names=target_names,
+                                zero_division=0))
 
 
 def load_model(model_dir, tokenizer_fallback=None):
@@ -185,6 +232,100 @@ def cmd_eval_test(args, max_length=512, batch_size=16, tokenizer_fallback=None):
     preds = predict_batch(codes, model, tokenizer, device,
                           max_length=ml, batch_size=bs)
     print_eval_report(labels, preds, target_names=LABEL_NAMES)
+
+
+def cmd_eval_diffs(args, max_length=512, batch_size=16, tokenizer_fallback=None):
+    """Evaluate on a diffs directory or parquet from the collector pipeline.
+
+    Reads JSON files from a directory or a parquet with 'text' and 'label' columns.
+    Collector labels (1=AI, 0=human) are flipped to harness convention (0=AI, 1=human).
+    """
+    import json
+
+    model, tokenizer, device = load_model(args.model_dir, tokenizer_fallback)
+
+    per_repo = getattr(args, 'per_repo', False)
+
+    path = Path(args.diffs)
+    if path.suffix == '.parquet':
+        df = pd.read_parquet(path)
+        codes = df['text'].tolist()
+        labels = df['label'].tolist()
+        repos = df['repo'].tolist() if 'repo' in df.columns else None
+    else:
+        # Read JSON files from directory
+        files = sorted(path.glob("*.json"))
+        codes = []
+        labels = []
+        repos = []
+        for f in files:
+            d = json.loads(f.read_text())
+            diff = d.get("diff", "")
+            if not diff:
+                continue
+            codes.append(diff)
+            # Flip collector convention (1=AI,0=human) to harness (0=AI,1=human)
+            labels.append(0 if d.get("label", 0) == 1 else 1)
+            repos.append(d.get("repo", "unknown"))
+
+    n_human = labels.count(1)
+    n_ai = labels.count(0)
+    print(f"Loaded {len(codes)} samples (human={n_human}, ai={n_ai})")
+
+    if args.max_samples and args.max_samples < len(codes):
+        import random
+        random.seed(42)
+        indices = random.sample(range(len(codes)), args.max_samples)
+        codes = [codes[i] for i in indices]
+        labels = [labels[i] for i in indices]
+        if repos:
+            repos = [repos[i] for i in indices]
+        n_human = labels.count(1)
+        n_ai = labels.count(0)
+        print(f"Subsampled to {len(codes)} (human={n_human}, ai={n_ai})")
+
+    print(f"\n{'='*60}")
+    print("Diffs Evaluation")
+    print(f"{'='*60}")
+    ml = getattr(args, 'max_length', max_length)
+    bs = args.batch_size if args.batch_size else batch_size
+    preds = predict_batch(codes, model, tokenizer, device,
+                          max_length=ml, batch_size=bs)
+    print_eval_report(labels, preds, target_names=LABEL_NAMES)
+
+    if per_repo and repos:
+        print(f"\n{'='*60}")
+        print("Per-Repo Breakdown")
+        print(f"{'='*60}")
+        # Group by repo
+        repo_data = {}
+        for i, repo in enumerate(repos):
+            if repo not in repo_data:
+                repo_data[repo] = {'labels': [], 'preds': []}
+            repo_data[repo]['labels'].append(labels[i])
+            repo_data[repo]['preds'].append(preds[i])
+
+        rows = []
+        for repo in sorted(repo_data):
+            rd = repo_data[repo]
+            y_true = rd['labels']
+            y_pred = rd['preds']
+            n = len(y_true)
+            n_h = y_true.count(1)
+            n_a = y_true.count(0)
+            acc = accuracy_score(y_true, y_pred)
+            # Human FPR: human samples predicted as AI
+            h_as_ai = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
+            h_fpr = h_as_ai / n_h if n_h else 0
+            rows.append((repo, n, n_h, n_a, acc, h_fpr, h_as_ai))
+
+        # Print table
+        max_name = max(len(r[0]) for r in rows)
+        hdr = f"{'Repo':<{max_name}}  {'N':>6}  {'Human':>6}  {'AI':>5}  {'Acc':>6}  {'H→AI':>6}  {'FPR':>6}"
+        print(hdr)
+        print("-" * len(hdr))
+        for repo, n, n_h, n_a, acc, h_fpr, h_as_ai in rows:
+            print(f"{repo:<{max_name}}  {n:>6}  {n_h:>6}  {n_a:>5}  {acc:>6.1%}  {h_as_ai:>6}  {h_fpr:>6.1%}")
 
 
 def cmd_eval_daniotti(args, max_length=512, batch_size=16, tokenizer_fallback=None):
