@@ -398,6 +398,24 @@ def strip_diff_headers(diff: str) -> str:
     return DIFF_HEADER_RE.sub("", diff).strip()
 
 
+def strip_diff_to_code(diff: str) -> str:
+    """Extract plain code from a diff by removing all diff markers.
+
+    Keeps added lines (strip leading '+') and context lines (strip leading ' ').
+    Drops removed lines ('-'), hunk headers ('@@'), and 'No newline' markers.
+    This produces the new/unchanged code content suitable for models that
+    expect plain source code rather than unified diff format.
+    """
+    lines = []
+    for line in diff.splitlines():
+        if line.startswith('+'):
+            lines.append(line[1:])
+        elif line.startswith(' '):
+            lines.append(line[1:])
+        # '-' lines (removed code), '@@' hunk headers, '\' markers: skip
+    return '\n'.join(lines).strip()
+
+
 def scan_repo(repo_dir: Path, seen_shas: set, max_commits: int = 0,
               after: str | None = None, before: str | None = None,
               exts: list[str] | None = None):
@@ -964,6 +982,47 @@ def cmd_export(args):
           file=sys.stderr)
 
 
+def cmd_code_export(args):
+    """Convert diff parquets to code-only parquets by stripping diff markers.
+
+    Reads train/test parquets produced by 'export' and applies strip_diff_to_code()
+    to the 'text' column. Row order is preserved so the output parquets align
+    perfectly with the diff parquets for paired McNemar statistical tests.
+
+    Records where the code-only text falls below --min-chars are dropped and
+    their count is reported to stderr.
+    """
+    import pandas as pd
+
+    pairs = [
+        ('train', args.train_parquet, args.train_out),
+        ('test',  args.test_parquet,  args.test_out),
+    ]
+
+    for split_name, in_path, out_path in pairs:
+        print(f"Reading {split_name}: {in_path} ...", file=sys.stderr)
+        df = pd.read_parquet(in_path)
+        original_n = len(df)
+
+        df['text'] = df['text'].apply(strip_diff_to_code)
+
+        mask = df['text'].str.len() >= args.min_chars
+        dropped = int((~mask).sum())
+        df = df[mask].reset_index(drop=True)
+
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(out, index=False)
+
+        label_counts = df['label'].value_counts().to_dict()
+        print(
+            f"  {split_name}: {original_n} -> {len(df)} rows "
+            f"(dropped {dropped} with < {args.min_chars} chars) "
+            f"[AI={label_counts.get(0,0)}, human={label_counts.get(1,0)}] -> {out}",
+            file=sys.stderr,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1066,6 +1125,23 @@ def main():
                     help="Load test repo list from file (overrides --test-split)")
     e.add_argument("--seed", type=int, default=42, help="Random seed")
     e.set_defaults(func=cmd_export)
+
+    # code-export
+    ce = sub.add_parser(
+        "code-export",
+        help="Convert diff parquets to code-only parquets (strip diff markers)",
+    )
+    ce.add_argument("--train-parquet", required=True,
+                    help="Input train.parquet from 'export' step")
+    ce.add_argument("--test-parquet", required=True,
+                    help="Input test.parquet from 'export' step")
+    ce.add_argument("--train-out", required=True,
+                    help="Output path for train_code.parquet")
+    ce.add_argument("--test-out", required=True,
+                    help="Output path for test_code.parquet")
+    ce.add_argument("--min-chars", type=int, default=50,
+                    help="Min characters after stripping; shorter records are dropped (default: 50)")
+    ce.set_defaults(func=cmd_code_export)
 
     args = p.parse_args()
     if not args.cmd:

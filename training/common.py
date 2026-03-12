@@ -202,6 +202,29 @@ def load_model(model_dir, tokenizer_fallback=None):
     return model, tokenizer, device
 
 
+def save_predictions(y_true, y_pred, out_path, sha=None, repo=None, date=None):
+    """Save predictions CSV with columns: sha, repo, date, label, pred.
+
+    Rows are sorted by sha for deterministic alignment across models in
+    downstream statistical tests (McNemar requires paired samples).
+    Pass None for sha/repo/date if metadata is unavailable (e.g. .py file eval).
+    """
+    n = len(y_true)
+    data = {
+        'sha':   sha   if sha   is not None else [''] * n,
+        'repo':  repo  if repo  is not None else [''] * n,
+        'date':  date  if date  is not None else [''] * n,
+        'label': list(y_true),
+        'pred':  list(y_pred),
+    }
+    df = pd.DataFrame(data)
+    if sha is not None:
+        df = df.sort_values('sha').reset_index(drop=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"Predictions saved to {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Shared eval subcommands
 # ---------------------------------------------------------------------------
@@ -247,11 +270,15 @@ def cmd_eval_diffs(args, max_length=512, batch_size=16, tokenizer_fallback=None)
     per_repo = getattr(args, 'per_repo', False)
 
     path = Path(args.diffs)
+    shas = None
+    dates = None
     if path.suffix == '.parquet':
         df = pd.read_parquet(path)
         codes = df['text'].tolist()
         labels = df['label'].tolist()
         repos = df['repo'].tolist() if 'repo' in df.columns else None
+        shas  = df['sha'].tolist()  if 'sha'  in df.columns else None
+        dates = df['date'].tolist() if 'date' in df.columns else None
     else:
         # Read JSON files from directory
         files = sorted(path.glob("*.json"))
@@ -292,6 +319,11 @@ def cmd_eval_diffs(args, max_length=512, batch_size=16, tokenizer_fallback=None)
     preds = predict_batch(codes, model, tokenizer, device,
                           max_length=ml, batch_size=bs)
     print_eval_report(labels, preds, target_names=LABEL_NAMES)
+
+    save_preds_path = getattr(args, 'save_preds', None)
+    if save_preds_path:
+        save_predictions(labels, preds, save_preds_path,
+                         sha=shas, repo=repos, date=dates)
 
     if per_repo and repos:
         print(f"\n{'='*60}")

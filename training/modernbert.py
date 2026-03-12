@@ -26,7 +26,7 @@ from transformers import (
 
 from common import (
     CodeDataset, ParquetDataset, compute_metrics, print_eval_report,
-    cmd_eval_test, cmd_eval_diffs, cmd_eval_daniotti,
+    cmd_eval_test, cmd_eval_diffs, cmd_eval_daniotti, save_predictions,
 )
 
 
@@ -211,6 +211,8 @@ def main():
     p_edf.add_argument('--batch-size', type=int, default=8, help='Batch size')
     p_edf.add_argument('--per-repo', action='store_true',
                         help='Show per-repo breakdown')
+    p_edf.add_argument('--save-preds', default=None,
+                       help='Save predictions CSV to this path (for statistical comparison)')
 
     # -- eval-daniotti --
     p_ed = sub.add_parser('eval-daniotti',
