@@ -1,0 +1,128 @@
+@@ -57,14 +57,14 @@ class BrokerState {
+ public:
+ 	BrokerState(BrokerConfig config, size_t congestion_queue_size)
+ 		: endpoint(std::move(config)),
+-		  subscriber(endpoint.make_subscriber({}, congestion_queue_size)),
+-		  status_subscriber(endpoint.make_status_subscriber(true))
++		  subscriber(endpoint.make_subscriber({broker::topics::statuses,
++		                                       broker::topics::errors},
++		                                      congestion_queue_size))
+ 		{
+ 		}
+ 
+ 	broker::endpoint endpoint;
+ 	broker::subscriber subscriber;
+-	broker::status_subscriber status_subscriber;
+ };
+ 
+ const broker::endpoint_info Manager::NoPeer{{}, {}};
+@@ -114,15 +114,18 @@ static std::string RenderMessage(const broker::vector& xs)
+ 	return broker::to_string(xs);
+ 	}
+ 
+-static std::string RenderMessage(const broker::status& s)
++static std::string RenderMessage(broker::status_view s)
+ 	{
+ 	return broker::to_string(s.code());
+ 	}
+ 
+-static std::string RenderMessage(const broker::error& e)
++static std::string RenderMessage(broker::error_view e)
+ 	{
+-	return util::fmt("%s (%s)", broker::to_string(e.code()).c_str(),
+-		   caf::to_string(e.context()).c_str());
++	if ( auto ctx = e.context() )
++		return util::fmt("%s (%s)", to_string(e.code()).c_str(),
++			             to_string(*ctx).c_str());
++	else
++		return util::fmt("%s (null)", to_string(e.code()).c_str());
+ 	}
+ 
+ #endif
+@@ -213,8 +216,6 @@ void Manager::InitPostScript()
+ 
+ 	if ( ! iosource_mgr->RegisterFd(bstate->subscriber.fd(), this) )
+ 		reporter->FatalError("Failed to register broker subscriber with iosource_mgr");
+-	if ( ! iosource_mgr->RegisterFd(bstate->status_subscriber.fd(), this) )
+-		reporter->FatalError("Failed to register broker status subscriber with iosource_mgr");
+ 
+ 	bstate->subscriber.add_topic(broker::topics::store_events, true);
+ 
+@@ -270,7 +271,6 @@ void Manager::Terminate()
+ 	FlushLogBuffers();
+ 
+ 	iosource_mgr->UnregisterFd(bstate->subscriber.fd(), this);
+-	iosource_mgr->UnregisterFd(bstate->status_subscriber.fd(), this);
+ 
+ 	vector<string> stores_to_close;
+ 
+@@ -924,37 +924,44 @@ void Manager::Process()
+ 	if ( use_real_time )
+ 		run_state::detail::update_network_time(util::current_time());
+ 
+-	bool had_input = false;
++	auto messages = bstate->subscriber.poll();
+ 
+-	auto status_msgs = bstate->status_subscriber.poll();
++	bool had_input = ! messages.empty();
+ 
+-	for ( auto& status_msg : status_msgs )
++	for ( auto& message : messages )
+ 		{
+-		had_input = true;
++		auto& topic = broker::get_topic(message);
+ 
+-		if ( auto stat = caf::get_if<broker::status>(&status_msg) )
++		if ( broker::topics::statuses.prefix_of(topic) )
+ 			{
+-			ProcessStatus(std::move(*stat));
++			if ( auto stat = broker::make_status_view(get_data(message)) )
++				{
++				ProcessStatus(stat);
++				}
++			else
++				{
++				auto str = to_string(message);
++				reporter->Warning("ignoring malformed Broker status event: %s",
++				                  str.c_str());
++				}
+ 			continue;
+ 			}
+ 
+-		if ( auto err = caf::get_if<broker::error>(&status_msg) )
++		if ( broker::topics::errors.prefix_of(topic) )
+ 			{
+-			ProcessError(std::move(*err));
++			if ( auto err = broker::make_error_view(get_data(message)) )
++				{
++				ProcessError(err);
++				}
++			else
++				{
++				auto str = to_string(message);
++				reporter->Warning("ignoring malformed Broker error event: %s",
++				                  str.c_str());
++				}
+ 			continue;
+ 			}
+ 
+-		reporter->InternalWarning("ignoring status_subscriber message with unexpected type");
+-		}
+-
+-	auto messages = bstate->subscriber.poll();
+-
+-	for ( auto& message : messages )
+-		{
+-		had_input = true;
+-
+-		auto& topic = broker::get_topic(message);
+-
+ 		if ( broker::topics::store_events.prefix_of(topic) )
+ 			{
+ 			ProcessStoreEvent(broker::move_data(message));
+@@ -1407,11 +1414,11 @@ bool Manager::ProcessIdentifierUpdate(broker::zeek::IdentifierUpdate iu)
+ 	return true;
+ 	}
+ 
+-void Manager::ProcessStatus(broker::status stat)
++void Manager::ProcessStatus(broker::status_view sta

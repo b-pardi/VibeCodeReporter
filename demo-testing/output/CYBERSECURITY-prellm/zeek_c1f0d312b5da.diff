@@ -1,0 +1,143 @@
+@@ -13,6 +13,7 @@
+ #include "zeek/analyzer/protocol/stepping-stone/SteppingStone.h"
+ #include "zeek/analyzer/protocol/tcp/TCP.h"
+ #include "zeek/analyzer/protocol/udp/UDP.h"
++#include "zeek/packet_analysis/protocol/ip/IPBasedAnalyzer.h"
+ 
+ #include "zeek/plugin/Manager.h"
+ 
+@@ -498,6 +499,57 @@ bool Manager::BuildInitialAnalyzerTree(Connection* conn)
+ 	return true;
+ 	}
+ 
++bool Manager::BuildSessionAnalyzerTree(Connection* conn, packet_analysis::IP::IPBasedAnalyzer* analyzer)
++	{
++	packet_analysis::IP::IPBasedTransportAnalyzer* root = nullptr;
++	analyzer::pia::PIA* pia = nullptr;
++	bool check_port = false;
++
++	analyzer->CreateTransportAnalyzer(conn, root, pia, check_port);
++
++	bool scheduled = ApplyScheduledAnalyzers(conn, false, root);
++
++	// Hmm... Do we want *just* the expected analyzer, or all
++	// other potential analyzers as well?  For now we only take
++	// the scheduled ones.
++	if ( ! scheduled )
++		{ // Let's see if it's a port we know.
++		if ( check_port && ! zeek::detail::dpd_ignore_ports )
++			{
++			int resp_port = ntohs(conn->RespPort());
++			tag_set* ports = LookupPort(conn->ConnTransport(), resp_port, false);
++
++			if ( ports )
++				{
++				for ( tag_set::const_iterator j = ports->begin(); j != ports->end(); ++j )
++					{
++					Analyzer* analyzer = analyzer_mgr->InstantiateAnalyzer(*j, conn);
++
++					if ( ! analyzer )
++						continue;
++
++					root->AddChildAnalyzer(analyzer, false);
++					DBG_ANALYZER_ARGS(conn, "activated %s analyzer due to port %d",
++					                  analyzer_mgr->GetComponentName(*j).c_str(), resp_port);
++					}
++				}
++			}
++		}
++
++	root->AddExtraAnalyzers(conn);
++
++	if ( pia )
++		root->AddChildAnalyzer(pia->AsAnalyzer());
++
++	conn->SetRootAnalyzer(root, pia);
++	root->Init();
++	root->InitChildren();
++
++	PLUGIN_HOOK_VOID(HOOK_SETUP_ANALYZER_TREE, HookSetupAnalyzerTree(conn));
++
++	return true;
++	}
++
+ void Manager::ExpireScheduledAnalyzers()
+ 	{
+ 	if ( ! run_state::network_time )
+
+
+
+
+@@ -35,6 +35,9 @@
+ #include "zeek/analyzer/analyzer.bif.h"
+ 
+ namespace zeek {
++
++namespace packet_analysis::IP { class IPBasedAnalyzer; }
++
+ namespace analyzer {
+ 
+ /**
+@@ -244,11 +247,23 @@ public:
+ 	 *
+ 	 * @param conn The connection to add the initial set of analyzers to.
+ 	 *
+-	 * @return False if the tree cannot be build; that's usually an
+-	 * internally error.
++	 * @return False if the tree cannot be built; that's usually an
++	 * internal error.
+ 	 */
+ 	bool BuildInitialAnalyzerTree(Connection* conn);
+ 
++	/**
++	 * Builds the analyzer tree used by transport-layer analyzers in the
++	 * packet analysis framework.
++	 *
++	 * @param conn The connection to add the initial set of analyzers to.
++	 * @param analyzer The packet analyzer requesting the tree.
++	 * @return False if the tree cannot be built; that's usually an
++	 * internal error.
++	 */
++	bool BuildSessionAnalyzerTree(Connection* conn,
++	                              packet_analysis::IP::IPBasedAnalyzer* analyzer);
++
+ 	/**
+ 	 * Schedules a particular analyzer for an upcoming connection. Once
+ 	 * the connection is seen, BuildInitAnalyzerTree() will add the
+
+
+
+
+@@ -189,6 +189,13 @@ public:
+ 	 */
+ 	mutable bool dump_packet;
+ 
++	/**
++	 * Indicates the amount of data to be dumped. If only a header is needed,
++	 * set this to the size of the header. Setting it to zero will dump the
++	 * entire packet.
++	 */
++	mutable int dump_size = 0;
++
+ 	// These are fields passed between various packet analyzers. They're best
+ 	// stored with the packet so they stay available as the packet is passed
+ 	// around.
+
+
+
+
+@@ -10,7 +10,8 @@
+ 
+ namespace zeek::packet_analysis {
+ 
+-Analyzer::Analyzer(std::string name)
++Analyzer::Analyzer(std::string name, bool report_unknown_protocols) :
++	report_unknown_protocols(report_unknown_protocols)
+ 	{
+ 	Tag t = packet_mgr->GetComponentTag(name);
+ 
+@@ -80,10 +81,15 @@ bool Analyzer::ForwardPacket(size_t len, const uint8_t* data, Packet* packet,
+ 
+ 	if ( inner_analyzer == nullptr )
+ 		{
+-		DBG_LOG(DBG_PACKET_ANALYSIS, "Analysis in %s failed

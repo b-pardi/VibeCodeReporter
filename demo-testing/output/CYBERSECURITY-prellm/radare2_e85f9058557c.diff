@@ -1,0 +1,111 @@
+@@ -200,6 +200,7 @@ R_API RAnal *r_anal_new() {
+ 	anal->lineswidth = 0;
+ 	anal->fcns = r_anal_fcn_list_new ();
+ 	anal->fcn_tree = NULL;
++	anal->fcn_addr_tree = NULL;
+ 	anal->refs = r_anal_ref_list_new ();
+ 	r_anal_set_bits (anal, 32);
+ 	anal->plugins = r_list_newf ((RListFree) r_anal_plugin_free);
+@@ -513,6 +514,7 @@ R_API int r_anal_purge (RAnal *anal) {
+ 	r_list_free (anal->fcns);
+ 	anal->fcns = r_anal_fcn_list_new ();
+ 	anal->fcn_tree = NULL;
++	anal->fcn_addr_tree = NULL;
+ 	r_list_free (anal->refs);
+ 	anal->refs = r_anal_ref_list_new ();
+ 	return 0;
+
+
+
+
+@@ -35,6 +35,7 @@
+ #define VERBOSE_DELAY if (0)
+ 
+ #define FCN_CONTAINER(x) container_of ((RBNode*)(x), RAnalFunction, rb)
++#define ADDR_FCN_CONTAINER(x) container_of ((RBNode*)(x), RAnalFunction, addr_rb)
+ #define fcn_tree_foreach_intersect(root, it, data, from, to)										\
+ 	for ((it) = _fcn_tree_iter_first (root, from, to); (it).cur && ((data) = FCN_CONTAINER ((it).cur), 1); _fcn_tree_iter_next (&(it), from, to))
+ 
+@@ -76,12 +77,37 @@ R_API void r_anal_fcn_update_tinyrange_bbs(RAnalFunction *fcn) {
+ 	}
+ }
+ 
+-// _fcn_tree_{cmp_addr,calc_max_addr,free,probe} are used by interval tree.
+-static int _fcn_tree_cmp_addr(const void *a_, const RBNode *b_) {
++static void set_meta_min_if_needed(RAnalFunction *x) {
++	if (x->meta.min == UT64_MAX) {
++		if (r_list_length (x->bbs) == 0) {
++			x->meta.min = x->addr;
++		} else {
++			ut64 min = UT64_MAX;
++			ut64 max = UT64_MIN;
++			RListIter *bbs_iter;
++			RAnalBlock *bbi;
++			r_list_foreach (x->bbs, bbs_iter, bbi) {
++				if (min > bbi->addr) {
++					min = bbi->addr;
++				}
++				if (max < bbi->addr + bbi->size) {
++					max = bbi->addr + bbi->size;
++				}
++			}
++			x->meta.min = min;
++			x->_size = max - min; // HACK TODO Fix af size calculation
++		}
++	}
++}
++
++// _fcn_tree_{cmp,calc_max_addr,free,probe} are used by interval tree.
++static int _fcn_tree_cmp(const void *a_, const RBNode *b_) {
+ 	const RAnalFunction *a = (const RAnalFunction *)a_;
+ 	const RAnalFunction *b = FCN_CONTAINER (b_);
+-	ut64 from0 = a->addr, to0 = a->addr + a->_size,
+-		from1 = b->addr, to1 = b->addr + b->_size;
++	set_meta_min_if_needed ((RAnalFunction *)a);
++	set_meta_min_if_needed ((RAnalFunction *)b);
++	ut64 from0 = a->meta.min, to0 = a->meta.min + a->_size,
++		from1 = b->meta.min, to1 = b->meta.min + b->_size;
+ 	if (from0 != from1) {
+ 		return from0 < from1 ? -1 : 1;
+ 	}
+@@ -91,10 +117,21 @@ static int _fcn_tree_cmp_addr(const void *a_, const RBNode *b_) {
+ 	return 0;
+ }
+ 
++static int _fcn_addr_tree_cmp(const void *a_, const RBNode *b_) {
++	const RAnalFunction *a = (const RAnalFunction *)a_;
++	const RAnalFunction *b = ADDR_FCN_CONTAINER (b_);
++	ut64 from0 = a->addr, from1 = b->addr;
++	if (from0 != from1) {
++		return from0 < from1 ? -1 : 1;
++	}
++	return 0;
++}
++
+ static void _fcn_tree_calc_max_addr(RBNode *node) {
+ 	int i;
+ 	RAnalFunction *fcn = FCN_CONTAINER (node);
+-	fcn->rb_max_addr = fcn->addr + (fcn->_size == 0 ? 0 : fcn->_size - 1);
++	set_meta_min_if_needed (fcn);
++	fcn->rb_max_addr = fcn->meta.min + (fcn->_size == 0 ? 0 : fcn->_size - 1);
+ 	for (i = 0; i < 2; i++) {
+ 		if (node->child[i]) {
+ 			RAnalFunction *fcn1 = FCN_CONTAINER (node->child[i]);
+@@ -124,8 +161,8 @@ static RBNode *_fcn_tree_probe(FcnTreeIter *it, RBNode *x_, ut64 from, ut64 to)
+ 			x = y;
+ 			continue;
+ 		}
+-		if (x->addr <= to - 1) {
+-			if (from <= x->addr + (x->_size == 0 ? 0 : x->_size - 1)) {
++		if (x->meta.min <= to - 1) {
++			if (from <= x->meta.min + (x->_size == 0 ? 0 : x->_size - 1)) {
+ 				return x_;
+ 			}
+ 			if ((y_ = x_->child[1])) {
+@@ -141,15 +178,19 @@ static RBNode *_fcn_tree_probe(FcnTreeIter *it, RBNode *x_, ut64 from, ut64 to)
+ }
+ 
+ R_API bool r_anal_fcn_tree_delete(RAnal *anal, RAnalFunction *data) {
+-	return r_rbtree_aug_delete (&anal->fcn_tree, data, _fcn_tree_cmp_addr, _fcn_tree_free, _fcn_tree_calc_max_addr);
++	bool ret_min = !!r_rbtree_aug_delete (&anal->fcn_tree, data, _fcn_tree_cmp, _fcn_tree_free, _fcn_tree_calc_max_addr);
++	bool ret_addr = !!r_rbtree_delete (

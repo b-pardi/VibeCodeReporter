@@ -1,0 +1,92 @@
+@@ -64,6 +64,7 @@
+ 
+ #define ANOMALY_EVENT_TYPE      "anomaly"
+ #define LOG_JSON_PACKETHDR      BIT_U16(0)
++#define TX_ID_UNUSED UINT64_MAX
+ 
+ typedef struct AnomalyJsonOutputCtx_ {
+     LogFileCtx* file_ctx;
+@@ -104,7 +105,6 @@ static int AnomalyDecodeEventJson(ThreadVars *tv, JsonAnomalyLogThread *aft,
+         if (!is_ip_pkt) {
+             json_object_set_new(js, "timestamp", json_string(timebuf));
+         } else {
+-            JsonFiveTuple((const Packet *)p, LOG_DIR_PACKET, js);
+             JsonAddCommonOptions(&aft->json_output_ctx->cfg, p, p->flow, js);
+         }
+ 
+@@ -120,12 +120,8 @@ static int AnomalyDecodeEventJson(ThreadVars *tv, JsonAnomalyLogThread *aft,
+                                     json_string("packet") : json_string("stream"));
+             json_object_set_new(ajs, "event", json_string(event));
+         } else {
+-            /* include event code with unrecognized events */
+-            uint32_t offset = 0;
+-            char unknown_event_buf[8];
+             json_object_set_new(ajs, "type", json_string("unknown"));
+-            PrintBufferData(unknown_event_buf, &offset, 8, "%d", event_code);
+-            json_object_set_new(ajs, "code", json_string(unknown_event_buf));
++            json_object_set_new(ajs, "code", json_integer(event_code));
+         }
+ 
+         /* anomaly */
+@@ -143,13 +139,23 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
+                         const Packet *p, AppLayerDecoderEvents *decoder_events,
+                         bool is_applayer, const char *layer, uint64_t tx_id)
+ {
+-    const char *alprotoname;
+-    alprotoname = AppLayerGetProtoName(p->flow->alproto);
++    const char *alprotoname = AppLayerGetProtoName(p->flow->alproto);
++
++    SCLogDebug("decoder_events %p event_count %d (last logged %d) %s",
++                decoder_events, decoder_events->cnt,
++                decoder_events->event_last_logged,
++                tx_id != TX_ID_UNUSED ? "tx" : "no-tx");
+ 
+-    for (int i = 0; i < decoder_events->cnt; i++) {
++    for (int i = decoder_events->event_last_logged; i < decoder_events->cnt; i++) {
+         MemBufferReset(aft->json_buffer);
+ 
+-        json_t *js = CreateJSONHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE);
++        json_t *js;
++        if (tx_id != TX_ID_UNUSED) {
++            js = CreateJSONHeaderWithTxId(p, LOG_DIR_PACKET,
++                                          ANOMALY_EVENT_TYPE, tx_id);
++        } else {
++            js = CreateJSONHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE);
++        }
+         if (unlikely(js == NULL)) {
+             return TM_ECODE_OK;
+         }
+@@ -160,7 +166,6 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
+             return TM_ECODE_OK;
+         }
+ 
+-        JsonFiveTuple((const Packet *)p, LOG_DIR_PACKET, js);
+         JsonAddCommonOptions(&aft->json_output_ctx->cfg, p, p->flow, js);
+ 
+         /* Use app layer proto name if available */
+@@ -191,15 +196,11 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
+             json_object_set_new(ajs, "code", json_integer(event_code));
+         }
+ 
+-        /* log event number (and total */
+-        uint32_t offset = 0;
+-        char event_no_buf[32];
+-        PrintBufferData(event_no_buf, &offset, 32, "%d (of %d)",
++        /* log event number (and total) */
++        char event_no_buf[16];
++        snprintf(event_no_buf, sizeof(event_no_buf), "%d (of %d)",
+                         i+1, decoder_events->cnt);
+         json_object_set_new(ajs, "event_no", json_string(event_no_buf));
+-
+-        if (tx_id != (uint64_t) -1)
+-            json_object_set_new(ajs, "tx_id", json_integer(tx_id));
+         json_object_set_new(ajs, "layer", json_string(layer));
+ 
+         /* anomaly */
+@@ -208,6 +209,9 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
+ 
+         json_object_clear(js);
+         json_decref(js);
++
++        /* Current implementation assumes a single owner for this value */
++      

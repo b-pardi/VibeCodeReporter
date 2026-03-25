@@ -1,0 +1,93 @@
+@@ -1,9 +1,8 @@
+-/* radare - LGPL - Copyright 2010-2020 - nibble, alvaro, pancake */
++/* radare - LGPL - Copyright 2010-2021 - nibble, alvaro, pancake */
+ 
+ #include <r_anal.h>
+ #include <r_parse.h>
+ #include <r_util.h>
+-#include <r_list.h>
+ 
+ #define READ_AHEAD 1
+ #define SDB_KEY_BB "bb.0x%"PFMT64x ".0x%"PFMT64x
+@@ -11,6 +10,7 @@
+ #define JMPTBLSZ 512
+ #define JMPTBL_LEA_SEARCH_SZ 64
+ #define JMPTBL_MAXFCNSIZE 4096
++#define R_ANAL_MAX_INCSTACK 8096
+ #define BB_ALIGN 0x10
+ #define MAX_SCAN_SIZE 0x7ffffff
+ 
+@@ -289,13 +289,14 @@ static bool regs_exist(RAnalValue *src, RAnalValue *dst) {
+ 
+ // 0 if not skipped; 1 if skipped; 2 if skipped before
+ static int skip_hp(RAnal *anal, RAnalFunction *fcn, RAnalOp *op, RAnalBlock *bb, ut64 addr,
+-                   char *tmp_buf, int oplen, int un_idx, int *idx) {
++                   int oplen, int un_idx, int *idx) {
+ 	// this step is required in order to prevent infinite recursion in some cases
+ 	if ((addr + un_idx - oplen) == fcn->addr) {
+ 		// use addr instead of op->addr to mark repeat
+ 		if (!anal->flb.exist_at (anal->flb.f, "skip", 4, addr)) {
+-			snprintf (tmp_buf + 5, MAX_FLG_NAME_SIZE - 6, "%"PFMT64u, addr);
+-			anal->flb.set (anal->flb.f, tmp_buf, addr, oplen);
++			char *name = r_str_newf ("skip.%"PFMT64u, addr);
++			anal->flb.set (anal->flb.f, name, addr, oplen);
++			free (name);
+ 			fcn->addr += oplen;
+ 			r_anal_block_relocate (bb, bb->addr + oplen, bb->size - oplen);
+ 			*idx = un_idx;
+@@ -515,14 +516,23 @@ static inline bool does_arch_destroys_dst(const char *arch) {
+ }
+ 
+ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth) {
+-	const int continue_after_jump = anal->opt.afterjmp;
++#if 0
++	if (depth < 1) {
++		if (anal->verbose) {
++			eprintf ("Too deep fcn_recurse at 0x%"PFMT64x "\n", addr);
++		}
++		return R_ANAL_RET_ERROR; // MUST BE TOO DEEP
++	}
++	// TODO Store all this stuff in the heap so we save memory in the stack
++#endif
++	RAnalOp *op = NULL;
++	const bool continue_after_jump = anal->opt.afterjmp;
+ 	const int addrbytes = anal->iob.io ? anal->iob.io->addrbytes : 1;
+ 	char *last_reg_mov_lea_name = NULL;
+ 	RAnalBlock *bb = NULL;
+ 	RAnalBlock *bbg = NULL;
+ 	int ret = R_ANAL_RET_END, skip_ret = 0;
+ 	bool overlapped = false;
+-	RAnalOp op = {0};
+ 	int oplen, idx = 0;
+ 	static ut64 cmpval = UT64_MAX; // inherited across functions, otherwise it breaks :?
+ 	bool varset = false;
+@@ -537,11 +547,10 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 		0
+ 	};
+ 	bool arch_destroys_dst = does_arch_destroys_dst (anal->cur->arch);
+-	bool is_arm = anal->cur->arch && !strncmp (anal->cur->arch, "arm", 3);
+-	char tmp_buf[MAX_FLG_NAME_SIZE + 5] = "skip";
+-	bool is_x86 = is_arm ? false: anal->cur->arch && !strncmp (anal->cur->arch, "x86", 3);
+-	bool is_amd64 = is_x86 ? fcn->cc && !strcmp (fcn->cc, "amd64") : false;
+-	bool is_dalvik = is_x86? false: anal->cur->arch && !strncmp (anal->cur->arch, "dalvik", 6);
++	const bool is_arm = anal->cur->arch && !strncmp (anal->cur->arch, "arm", 3);
++	const bool is_x86 = is_arm ? false: anal->cur->arch && !strncmp (anal->cur->arch, "x86", 3);
++	const bool is_amd64 = is_x86 ? fcn->cc && !strcmp (fcn->cc, "amd64") : false;
++	const bool is_dalvik = is_x86? false: anal->cur->arch && !strncmp (anal->cur->arch, "dalvik", 6);
+ 	RRegItem *variadic_reg = NULL;
+ 	if (is_amd64) {
+ 		variadic_reg = r_reg_get (anal->reg, "rax", R_REG_TYPE_GPR);
+@@ -594,7 +603,7 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 			return R_ANAL_RET_END;
+ 		}
+ 		if (anal->verbose) {
+-			eprintf ("r_anal_fcn_bb() fails at 0x%"PFMT64x ".\n", addr);
++			eprintf ("r_anal_fcn_bb() fails at 0x%"PFMT64x "\n", addr);
+ 		}
+ 		return R_ANAL_RET_ERROR; // MUST BE NOT DUP
+ 	}
+@@ -629,7 +638,6 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 		r_list_free (list);
+ 	}
+ 	ut64 movdisp = UT64_MAX; // used by jmptbl when coded as "mov reg,[R*4+B]"
+-	ut8 buf[32]; // 32

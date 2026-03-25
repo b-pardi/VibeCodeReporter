@@ -1,0 +1,146 @@
+@@ -400,6 +400,16 @@ void ZAMCompiler::ComputeFrameLifetimes()
+ 				}
+ 				break;
+ 
++			case OP_NEXT_VECTOR_ITER_VAL_VAR_VVVV:
++				{
++				CheckSlotAssignment(inst->v2, inst);
++
++				auto depth = inst->loop_depth;
++				ExtendLifetime(inst->v1, EndOfLoop(inst, depth));
++				ExtendLifetime(inst->v2, EndOfLoop(inst, depth));
++				}
++				break;
++
+ 			case OP_NEXT_VECTOR_ITER_VVV:
+ 			case OP_NEXT_STRING_ITER_VVV:
+ 				// Sometimes loops are written that don't actually
+@@ -916,6 +926,9 @@ bool ZAMCompiler::VarIsAssigned(int slot, const ZInstI* i) const
+ 		// *does* also assign to slot 1.
+ 		}
+ 
++	if ( i->op == OP_NEXT_VECTOR_ITER_VAL_VAR_VVVV && i->v2 == slot )
++		return true;
++
+ 	if ( i->op_type == OP_VV_FRAME )
+ 		// We don't want to consider these as assigning to the
+ 		// variable, since the point of this method is to figure
+
+
+
+
+@@ -171,8 +171,8 @@ void ZAMCompiler::SetV4(ZAMStmt s, const InstLabel l)
+ 
+ 	auto ot = inst->op_type;
+ 
+-	ASSERT(ot == OP_VVVV || ot == OP_VVVV_I4);
+-	if ( ot != OP_VVVV_I4 )
++	ASSERT(ot == OP_VVVV || ot == OP_VVVV_I4 || ot == OP_VVVV_I3_I4);
++	if ( ot == OP_VVVV )
+ 		inst->op_type = OP_VVVV_I4;
+ 	}
+ 
+
+
+
+
+@@ -864,6 +864,7 @@ const ZAMStmt ZAMCompiler::LoopOverVector(const ForStmt* f, const NameExpr* val)
+ 	{
+ 	auto loop_vars = f->LoopVars();
+ 	auto loop_var = (*loop_vars)[0];
++	auto value_var = f->ValueVar();
+ 
+ 	int iter_slot = num_step_iters++;
+ 
+@@ -873,8 +874,20 @@ const ZAMStmt ZAMCompiler::LoopOverVector(const ForStmt* f, const NameExpr* val)
+ 	auto init_end = AddInst(z);
+ 	auto iter_head = StartingBlock();
+ 
+-	z = ZInstI(OP_NEXT_VECTOR_ITER_VVV, FrameSlot(loop_var), iter_slot, 0);
+-	z.op_type = OP_VVV_I2_I3;
++	if ( value_var )
++		{
++		z = ZInstI(OP_NEXT_VECTOR_ITER_VAL_VAR_VVVV, FrameSlot(loop_var), FrameSlot(value_var),
++		           iter_slot, 0);
++		z.t = value_var->GetType();
++		z.is_managed = ZVal::IsManagedType(z.t);
++		z.op_type = OP_VVVV_I3_I4;
++		}
++
++	else
++		{
++		z = ZInstI(OP_NEXT_VECTOR_ITER_VVV, FrameSlot(loop_var), iter_slot, 0);
++		z.op_type = OP_VVV_I2_I3;
++		}
+ 
+ 	return FinishLoop(iter_head, z, f->LoopBody(), iter_slot, false);
+ 	}
+@@ -944,7 +957,9 @@ const ZAMStmt ZAMCompiler::FinishLoop(const ZAMStmt iter_head, ZInstI& iter_stmt
+ 	auto final_stmt = AddInst(z);
+ 
+ 	auto ot = iter_stmt.op_type;
+-	if ( ot == OP_VVV_I3 || ot == OP_VVV_I2_I3 )
++	if ( ot == OP_VVVV_I3_I4 )
++		SetV4(loop_iter, GoToTarget(final_stmt));
++	else if ( ot == OP_VVV_I3 || ot == OP_VVV_I2_I3 )
+ 		SetV3(loop_iter, GoToTarget(final_stmt));
+ 	else
+ 		SetV2(loop_iter, GoToTarget(final_stmt));
+
+
+
+
+@@ -331,9 +331,16 @@ string ZInstI::VName(int n, const FrameMap* frame_ids, const FrameReMap* remappi
+ 		auto inst_num_u = static_cast<zeek_uint_t>(inst_num);
+ 		for ( i = 0; i < map.id_start.size(); ++i )
+ 			{
+-			// See discussion for ZInst::VName.
+-			if ( (n == 1 && map.id_start[i] > inst_num_u) ||
+-			     (n > 1 && map.id_start[i] >= inst_num_u) )
++			// See discussion for ZInst::VName, though this is
++			// a tad different since we have the general notion
++			// of AssignsToSlot().
++			if ( AssignsToSlot(n) )
++				{
++				if ( map.id_start[i] > inst_num_u )
++					break;
++				}
++
++			else if ( map.id_start[i] >= inst_num_u )
+ 				// Went too far.
+ 				break;
+ 			}
+@@ -441,6 +448,18 @@ bool ZInstI::AssignsToSlot1() const
+ 	return false;
+ 	}
+ 
++bool ZInstI::AssignsToSlot(int slot) const
++	{
++	switch ( op )
++		{
++		case OP_NEXT_VECTOR_ITER_VAL_VAR_VVVV:
++			return slot == 1 || slot == 2;
++
++		default:
++			return slot == 1 && AssignsToSlot1();
++		}
++	}
++
+ bool ZInstI::UsesSlot(int slot) const
+ 	{
+ 	auto fl = op1_flavor[op];
+
+
+
+
+@@ -222,6 +222,10 @@ public:
+ 	// given by slot 1 (v1).
+ 	bool AssignsToSlot1() const;
+ 
++	// True if the given instruction assigns to the frame location
++	// corresponding to the given slot.
++	bool AssignsToSlot(int slot) const;
++
+ 	// True if the given instruction uses the value in the given frame
+ 	// slot. (Assigning to the slot does not constitute using the value.)
+ 	bool UsesSlot(int sl

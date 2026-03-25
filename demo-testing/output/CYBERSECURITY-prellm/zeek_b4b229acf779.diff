@@ -1,0 +1,176 @@
+@@ -16,6 +16,15 @@ namespace {
+ 	const unsigned char LF = '\n';
+ }
+ 
++binpac::FlowBuffer::Policy binpac::FlowBuffer::policy = {
++	// max_capacity
++	10 * 1024 * 1024,
++	// min_capacity
++	512,
++	// contract_threshold
++	2 * 1024 * 1024,
++};
++
+ FlowBuffer::FlowBuffer(LineBreakStyle linebreak_style)
+ 	{
+ 	buffer_length_ = 0;
+@@ -75,6 +84,7 @@ void FlowBuffer::NewMessage()
+ 
+ 	buffer_n_ = 0;
+ 	message_complete_ = false;
++	ContractBuffer();
+ 	}
+ 
+ void FlowBuffer::ResetLineState()
+@@ -99,23 +109,41 @@ void FlowBuffer::ExpandBuffer(int length)
+ 	{
+ 	if ( buffer_length_ >= length )
+ 		return;
+-	// So length > 0
+-	if ( length < 512 )
+-		length = 512;
++
++	if ( length < policy.min_capacity )
++		length = policy.min_capacity;
+ 
+ 	if ( length < buffer_length_ * 2 )
+ 		length = buffer_length_ * 2;
+ 
++	if ( length > policy.max_capacity )
++		{
++		std::string reason = strfmt("expand past max capacity %d/%zu",
++		                            length, policy.max_capacity);
++		throw ExceptionFlowBufferAlloc(reason.c_str());
++		}
++
+ 	// Allocate a new buffer and copy the existing contents
+ 	buffer_length_ = length;
+ 	unsigned char* new_buf = (unsigned char *) realloc(buffer_, buffer_length_);
+-	BINPAC_ASSERT(new_buf);
+-#if 0
+-	unsigned char* new_buf = new unsigned char[buffer_length_];
+-	if ( buffer_ && buffer_n_ > 0 )
+-		memcpy(new_buf, buffer_, buffer_n_);
+-	delete [] buffer_;
+-#endif
++
++	if ( ! new_buf )
++		throw ExceptionFlowBufferAlloc("expand realloc OOM");
++
++	buffer_ = new_buf;
++	}
++
++void FlowBuffer::ContractBuffer()
++	{
++	if ( buffer_length_ < policy.contract_threshold )
++		return;
++
++	buffer_length_ = policy.min_capacity;
++	unsigned char* new_buf = (unsigned char *) realloc(buffer_, buffer_length_);
++
++	if ( ! new_buf )
++		throw ExceptionFlowBufferAlloc("contract realloc OOM");
++
+ 	buffer_ = new_buf;
+ 	}
+ 
+@@ -186,6 +214,7 @@ void FlowBuffer::DiscardData()
+ 
+ 	buffer_n_ = 0;
+ 	frame_length_ = 0;
++	ContractBuffer();
+ 	}
+ 
+ void FlowBuffer::set_eof()
+
+
+
+
+@@ -8,6 +8,12 @@ namespace binpac {
+ 
+ class FlowBuffer {
+ public:
++	struct Policy {
++		int max_capacity;
++		int min_capacity;
++		int contract_threshold;
++	};
++
+ 	enum LineBreakStyle {
+ 		CR_OR_LF, 	// CR or LF or CRLF
+ 		STRICT_CRLF, 	// CR followed by LF
+@@ -95,6 +101,9 @@ public:
+ 
+ 	bool have_pending_request() const { return have_pending_request_; }
+ 
++	static void init(Policy p)
++		{ policy = p; }
++
+ protected:
+ 	// Reset the buffer for a new message
+ 	void NewMessage();
+@@ -106,6 +115,13 @@ protected:
+ 	// buffer.
+ 	void ExpandBuffer(int length);
+ 
++	// Contract the buffer to some minimum capacity.
++	// Existing contents in the buffer are preserved (but only usage
++	// at the time of creation this function is when the contents
++	// are being discarded due to parsing exception or have already been
++	// copied out after parsing a complete unit).
++	void ContractBuffer();
++
+ 	// Reset line state when transit from frame mode to line mode.
+ 	void ResetLineState();
+ 
+@@ -153,6 +169,8 @@ protected:
+ 	int 	data_seq_at_orig_data_end_;
+ 	bool 	eof_;
+ 	bool    have_pending_request_;
++
++	static Policy policy;
+ };
+ 
+ typedef FlowBuffer *flow_buffer_t;
+
+
+
+
+@@ -116,6 +116,15 @@ public:
+ 		}
+ };
+ 
++class ExceptionFlowBufferAlloc : public Exception
++{
++public:
++	ExceptionFlowBufferAlloc(const char* reason)
++		{
++		append(binpac_fmt("flowbuffer allocation failed: %s", reason));
++		}
++};
++
+ }
+ 
+ #endif  // binpac_exception_h
+
+
+
+
+@@ -13,7 +13,8 @@ namespace binpac
+ //
+ // Note, this must be declared/defined here, and inline, because the RE
+ // functionality can only be used when compiling from inside Bro.
+-inline void init();
++// A copy is made of any FlowBuffer policy struct data passed.
++inline void init(FlowBuffer::Policy* fbp = 0);
+ 
+ // Internal vector recording not yet compiled matchers.
+ extern std::vector<RE_Matcher*>* uncompiled_re_matchers;
+@@ -42,7 +43,7 @@ public:
+ 		}
+ 
+ private:
+-	friend void ::binpac::init();
++	friend void ::binpac::init(FlowBuffer::Policy*);
+ 
+ 	// Function, and state, for c

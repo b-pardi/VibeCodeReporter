@@ -1,0 +1,92 @@
+@@ -60,10 +60,15 @@
+ 
+ #define MODULE_NAME "JsonAnomalyLog"
+ 
+-#ifdef HAVE_LIBJANSSON
+-
+ #define ANOMALY_EVENT_TYPE      "anomaly"
+-#define LOG_JSON_PACKETHDR      BIT_U16(0)
++#define LOG_JSON_DECODE_TYPE    BIT_U16(0)
++#define LOG_JSON_STREAM_TYPE    BIT_U16(1)
++#define LOG_JSON_APPLAYER_TYPE  BIT_U16(2)
++#define LOG_JSON_PACKETHDR      BIT_U16(3)
++
++#define LOG_JSON_PACKET_TYPE   (LOG_JSON_DECODE_TYPE | LOG_JSON_STREAM_TYPE)
++#define ANOMALY_DEFAULTS       LOG_JSON_APPLAYER_TYPE
++
+ #define TX_ID_UNUSED UINT64_MAX
+ 
+ typedef struct AnomalyJsonOutputCtx_ {
+@@ -87,7 +92,17 @@ static int AnomalyDecodeEventJson(ThreadVars *tv, JsonAnomalyLogThread *aft,
+     char timebuf[64];
+     CreateIsoTimeString(&p->ts, timebuf, sizeof(timebuf));
+ 
++    uint16_t log_type = aft->json_output_ctx->flags;
++    bool log_stream = log_type & LOG_JSON_STREAM_TYPE;
++    bool log_decode = log_type & LOG_JSON_DECODE_TYPE;
+     for (int i = 0; i < p->events.cnt; i++) {
++        uint8_t event_code = p->events.events[i];
++        bool is_decode = EVENT_IS_DECODER_PACKET_ERROR(event_code);
++        if (is_decode && !log_decode)
++            continue;
++        if (!is_decode && !log_stream)
++            continue;
++
+         MemBufferReset(aft->json_buffer);
+ 
+         json_t *js = CreateJSONHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE);
+@@ -112,12 +127,11 @@ static int AnomalyDecodeEventJson(ThreadVars *tv, JsonAnomalyLogThread *aft,
+             JsonPacket(p, js, GET_PKT_LEN(p) < 32 ? GET_PKT_LEN(p) : 32);
+         }
+ 
+-        uint8_t event_code = p->events.events[i];
+         if (event_code < DECODE_EVENT_MAX) {
+             const char *event = DEvents[event_code].event_name;
+             json_object_set_new(ajs, "type",
+                                 EVENT_IS_DECODER_PACKET_ERROR(event_code) ? 
+-                                    json_string("packet") : json_string("stream"));
++                                    json_string("decode") : json_string("stream"));
+             json_object_set_new(ajs, "event", json_string(event));
+         } else {
+             json_object_set_new(ajs, "type", json_string("unknown"));
+@@ -212,11 +226,15 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
+ static int JsonAnomalyTxLogger(ThreadVars *tv, void *thread_data, const Packet *p,
+                                Flow *f, void *state, void *tx, uint64_t tx_id)
+ {
++    JsonAnomalyLogThread *aft = thread_data;
++    if (!(aft->json_output_ctx->flags & LOG_JSON_APPLAYER_TYPE)) {
++        return TM_ECODE_OK;
++    }
++
+     AppLayerDecoderEvents *decoder_events;
+     decoder_events = AppLayerParserGetEventsByTx(f->proto, f->alproto, tx);
+     if (decoder_events && decoder_events->event_last_logged < decoder_events->cnt) {
+         SCLogDebug("state %p, tx: %p, tx_id: %"PRIu64, state, tx, tx_id);
+-        JsonAnomalyLogThread *aft = thread_data;
+         AnomalyAppLayerDecoderEventJson(aft, p, decoder_events, false,
+                                         "proto_parser", tx_id);
+     }
+@@ -239,23 +257,29 @@ static int AnomalyJson(ThreadVars *tv, JsonAnomalyLogThread *aft, const Packet *
+ 
+     int rc = TM_ECODE_OK;
+ 
+-    if (p->events.cnt) {
+-        rc = AnomalyDecodeEventJson(tv, aft, p);
++    /* decode or stream */
++    if (aft->json_output_ctx->flags & LOG_JSON_PACKET_TYPE) {
++        if (p->events.cnt) {
++            rc = AnomalyDecodeEventJson(tv, aft, p);
++        }
+     }
+ 
+-    /* app layer events */
+-    if (rc == TM_ECODE_OK && AnomalyHasPacketAppLayerEvents(p)) {
+-        rc = AnomalyAppLayerDecoderEventJson(aft, p, p->app_layer_events,
+-                                             true, "proto_detect", TX_ID_UNUSED);
+-    }
++    /* applayer */
++    if (aft->json_output_ctx->flags & LOG_JSON_APPLAYER_TYPE) {
++        /* app layer proto detect events */
++        if (rc == TM_ECODE_OK && AnomalyHasPacketAppLayerEvents(p)) {
++            rc = AnomalyAppLayerDecoderEventJson(aft, p, p->app_layer_events,
++                                       

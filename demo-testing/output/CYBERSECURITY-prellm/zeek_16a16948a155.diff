@@ -1,0 +1,119 @@
+@@ -670,7 +670,15 @@ void ZAMCompiler::ReMapVar(const ID* id, int slot, bro_uint_t inst)
+ 	// powerful allocation method like graph coloring.  However, far and
+ 	// away the bulk of our variables are short-lived temporaries,
+ 	// for which greedy should work fine.
+-	bool is_managed = ZVal::IsManagedType(id->GetType());
++	//
++	// Note, we also need to make sure that denizens sharing a slot
++	// are all consistently either managed, or non-managed, types.
++	// One subtlety in this regard is that identifiers that are types
++	// should always be deemed "managed", even if the type they refer
++	// to is not managed, because what matters for uses of those
++	// identifiers is interpreting them as "any" values having an
++	// internal type of TYPE_TYPE.
++	bool is_managed = ZVal::IsManagedType(id->GetType()) || id->IsType();
+ 
+ 	int apt_slot = -1;
+ 	for ( unsigned int i = 0; i < shared_frame_denizens.size(); ++i )
+
+
+
+
+@@ -178,6 +178,8 @@ private:
+ 
+ 	const ZAMStmt CompileIncrExpr(const IncrExpr* e);
+ 	const ZAMStmt CompileAppendToExpr(const AppendToExpr* e);
++	const ZAMStmt CompileAddToExpr(const AddToExpr* e);
++	const ZAMStmt CompileRemoveFromExpr(const RemoveFromExpr* e);
+ 	const ZAMStmt CompileAssignExpr(const AssignExpr* e);
+ 	const ZAMStmt CompileAssignToIndex(const NameExpr* lhs, const IndexExpr* rhs);
+ 	const ZAMStmt CompileFieldLHSAssignExpr(const FieldLHSAssignExpr* e);
+@@ -233,9 +235,6 @@ private:
+ 	const ZAMStmt AssignVecElems(const Expr* e);
+ 	const ZAMStmt AssignTableElem(const Expr* e);
+ 
+-	const ZAMStmt AppendToField(const NameExpr* n1, const NameExpr* n2, const ConstExpr* c,
+-	                            int offset);
+-
+ 	const ZAMStmt ConstructTable(const NameExpr* n, const Expr* e);
+ 	const ZAMStmt ConstructSet(const NameExpr* n, const Expr* e);
+ 	const ZAMStmt ConstructRecord(const NameExpr* n, const Expr* e);
+
+
+
+
+@@ -20,6 +20,12 @@ const ZAMStmt ZAMCompiler::CompileExpr(const Expr* e)
+ 		case EXPR_APPEND_TO:
+ 			return CompileAppendToExpr(static_cast<const AppendToExpr*>(e));
+ 
++		case EXPR_ADD_TO:
++			return CompileAddToExpr(static_cast<const AddToExpr*>(e));
++
++		case EXPR_REMOVE_FROM:
++			return CompileRemoveFromExpr(static_cast<const RemoveFromExpr*>(e));
++
+ 		case EXPR_ASSIGN:
+ 			return CompileAssignExpr(static_cast<const AssignExpr*>(e));
+ 
+@@ -76,44 +82,72 @@ const ZAMStmt ZAMCompiler::CompileIncrExpr(const IncrExpr* e)
+ 
+ const ZAMStmt ZAMCompiler::CompileAppendToExpr(const AppendToExpr* e)
+ 	{
+-	auto op1 = e->GetOp1();
++	auto n1 = e->GetOp1()->AsNameExpr();
+ 	auto op2 = e->GetOp2();
++	auto n2 = op2->Tag() == EXPR_NAME ? op2->AsNameExpr() : nullptr;
++	auto cc = op2->Tag() != EXPR_NAME ? op2->AsConstExpr() : nullptr;
++
++	if ( n1->GetType()->Yield()->Tag() == TYPE_ANY )
++		return n2 ? AppendToAnyVecVV(n1, n2) : AppendToAnyVecVC(n1, cc);
++
++	return n2 ? AppendToVV(n1, n2) : AppendToVC(n1, cc);
++	}
++
++const ZAMStmt ZAMCompiler::CompileAddToExpr(const AddToExpr* e)
++	{
++	auto op1 = e->GetOp1();
++	auto t1 = op1->GetType()->Tag();
+ 
++	auto op2 = e->GetOp2();
+ 	auto n2 = op2->Tag() == EXPR_NAME ? op2->AsNameExpr() : nullptr;
+ 	auto cc = op2->Tag() != EXPR_NAME ? op2->AsConstExpr() : nullptr;
+ 
+ 	if ( op1->Tag() == EXPR_FIELD )
+ 		{
++		assert(t1 == TYPE_PATTERN);
+ 		auto f = op1->AsFieldExpr()->Field();
+ 		auto n1 = op1->GetOp1()->AsNameExpr();
+-		return AppendToField(n1, n2, cc, f);
++
++		ZInstI z;
++
++		if ( n2 )
++			{
++			z = ZInstI(OP_ADDPATTERNTOFIELD_VVi, FrameSlot(n1), FrameSlot(n2), f);
++			z.op_type = OP_VVV_I3;
++			}
++		else
++			{
++			z = ZInstI(OP_ADDPATTERNTOFIELD_VCi, FrameSlot(n1), f, cc);
++			z.op_type = OP_VVC_I2;
++			}
++
++		z.SetType(n2 ? n2->GetType() : cc->GetType());
++
++		return AddInst(z);
+ 		}
+ 
+ 	auto n1 = op1->AsNameExpr();
+ 
+-	return n2 ? AppendToVV(n1, n2) : AppendToVC(n1, cc);
++	if ( t1 == TYPE_PATTERN )
++		return n2 ? ExtendPatternVV(n1, n2) : ExtendPatternVC(n1, cc);
++
++	if ( t1 == TYPE_VECTOR )
++		return n2 ? AddVecToVecVV(n1, n2) : AddVecToVecVC(n1, cc);
++
++	assert(t1 == TYPE_TABLE);
++
++	ret

@@ -1,0 +1,80 @@
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2007-2020 Open Information Security Foundation
++/* Copyright (C) 2007-2021 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -431,19 +431,50 @@ static InspectionBuffer *HttpServerBodyGetDataCallback(DetectEngineThreadCtx *de
+ 
+ /* file API based inspection */
+ 
++static inline InspectionBuffer *FiledataWithXformsGetDataCallback(DetectEngineThreadCtx *det_ctx,
++        const DetectEngineTransforms *transforms, const int list_id, int local_file_id,
++        InspectionBuffer *base_buffer, const bool first)
++{
++    InspectionBufferMultipleForList *fb = InspectionBufferGetMulti(det_ctx, list_id);
++    InspectionBuffer *buffer = InspectionBufferMultipleForListGet(fb, local_file_id);
++    if (buffer == NULL) {
++        SCLogDebug("list_id: %d: no buffer", list_id);
++        return NULL;
++    }
++    if (!first && buffer->inspect != NULL) {
++        SCLogDebug("list_id: %d: returning %p", list_id, buffer);
++        return buffer;
++    }
++
++    InspectionBufferSetup(det_ctx, list_id, buffer, base_buffer->inspect, base_buffer->inspect_len);
++    buffer->inspect_offset = base_buffer->inspect_offset;
++    InspectionBufferApplyTransforms(buffer, transforms);
++    SCLogDebug("xformed buffer %p size %u", buffer, buffer->inspect_len);
++    SCReturnPtr(buffer, "InspectionBuffer");
++}
++
+ static InspectionBuffer *FiledataGetDataCallback(DetectEngineThreadCtx *det_ctx,
+-        const DetectEngineTransforms *transforms,
+-        Flow *f, uint8_t flow_flags, File *cur_file,
+-        int list_id, int local_file_id, bool first)
++        const DetectEngineTransforms *transforms, Flow *f, uint8_t flow_flags, File *cur_file,
++        const int list_id, const int base_id, int local_file_id, bool first)
+ {
+     SCEnter();
++    SCLogDebug(
++            "starting: list_id %d base_id %d first %s", list_id, base_id, first ? "true" : "false");
+ 
+-    InspectionBufferMultipleForList *fb = InspectionBufferGetMulti(det_ctx, list_id);
++    InspectionBufferMultipleForList *fb = InspectionBufferGetMulti(det_ctx, base_id);
+     InspectionBuffer *buffer = InspectionBufferMultipleForListGet(fb, local_file_id);
++    SCLogDebug("base: fb %p buffer %p", fb, buffer);
+     if (buffer == NULL)
+         return NULL;
+-    if (!first && buffer->inspect != NULL)
++    if (base_id != list_id && buffer->inspect != NULL) {
++        SCLogDebug("handle xform %s", (list_id != base_id) ? "true" : "false");
++        return FiledataWithXformsGetDataCallback(
++                det_ctx, transforms, list_id, local_file_id, buffer, first);
++    }
++    if (!first && buffer->inspect != NULL) {
++        SCLogDebug("base_id: %d, not first: use %p", base_id, buffer);
+         return buffer;
++    }
+ 
+     const uint64_t file_size = FileDataSize(cur_file);
+     const DetectEngineCtx *de_ctx = det_ctx->de_ctx;
+@@ -489,16 +520,21 @@ static InspectionBuffer *FiledataGetDataCallback(DetectEngineThreadCtx *det_ctx,
+                "; data_len %" PRIu32 "; file_size %" PRIu64,
+             list_id, buffer->inspect_offset, buffer->inspect_len, data_len, file_size);
+     buffer->inspect_offset = cur_file->content_inspected;
+-    InspectionBufferApplyTransforms(buffer, transforms);
+-    SCLogDebug("[list %d] [after] buffer offset %" PRIu64 "; buffer len %" PRIu32, list_id,
+-            buffer->inspect_offset, buffer->inspect_len);
+-
+-    SCLogDebug("[list %d] content_inspected %" PRIu64, list_id, cur_file->content_inspected);
+ 
+-    SCLogDebug("[list %d] file_data buffer %p, data %p len %u offset %" PRIu64, list_id, buffer,
+-            buffer->inspect, buffer->inspect_len, buffer->inspect_offset);
++    /* update inspected tracker */
++    cur_file->content_inspected = buffer->inspect_len + buffer->inspect_offset;
++    SCLogDebug("content inspected: %" PRIu64, cur_file->content_inspected);
+ 
+-    SCReturnPtr(buffer, "InspectionBuffer");
++    /*

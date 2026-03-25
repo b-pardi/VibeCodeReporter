@@ -1,0 +1,116 @@
+@@ -427,6 +427,7 @@ class _ATMT_supersocket(SuperSocket, SelectableObject):
+         # Register recv hook
+         self.spb.register_hook(self.call_release)
+         kargs["external_fd"] = {ioevent: (self.spa, self.spb)}
++        kargs["is_atmt_socket"] = True
+         self.atmt = automaton(*args, **kargs)
+         self.atmt.runbg()
+ 
+@@ -730,6 +731,7 @@ class Automaton(six.with_metaclass(Automaton_metaclass)):
+         external_fd = kargs.pop("external_fd", {})
+         self.send_sock_class = kargs.pop("ll", conf.L3socket)
+         self.recv_sock_class = kargs.pop("recvsock", conf.L2listen)
++        self.is_atmt_socket = kargs.pop("is_atmt_socket", False)
+         self.started = threading.Lock()
+         self.threadid = None
+         self.breakpointed = None
+
+
+
+
+@@ -1703,6 +1703,9 @@ class TCP_client(Automaton):
+         >>> a = TCP_client.tcplink(HTTP, "www.google.com", 80)
+         >>> a.send(HTTPRequest())
+         >>> a.recv()
++
++    :param ip: the ip to connect to
++    :param port:
+     """
+     def parse_args(self, ip, port, *args, **kargs):
+         from scapy.sessions import TCPSession
+@@ -1714,7 +1717,7 @@ class TCP_client(Automaton):
+         self.src = self.l4.src
+         self.sack = self.l4[TCP].ack
+         self.rel_seq = None
+-        self.rcvbuf = TCPSession(self._transmit_packet, False)
++        self.rcvbuf = TCPSession(prn=self._transmit_packet, store=False)
+         bpf = "host %s  and host %s and port %i and port %i" % (self.src,
+                                                                 self.dst,
+                                                                 self.sport,
+
+
+
+
+@@ -1547,8 +1547,8 @@ class NetflowSession(IPSession):
+     """Session used to defragment NetflowV9/10 packets on the flow.
+     See help(scapy.layers.netflow) for more infos.
+     """
+-    def __init__(self, *args):
+-        IPSession.__init__(self, *args)
++    def __init__(self, *args, **kwargs):
++        IPSession.__init__(self, *args, **kwargs)
+         self.definitions = {}
+         self.definitions_opts = {}
+         self.ignored = set()
+
+
+
+
+@@ -7,6 +7,8 @@
+ The _TLSAutomaton class provides methods common to both TLS client and server.
+ """
+ 
++import select
++import socket
+ import struct
+ 
+ from scapy.automaton import Automaton
+@@ -63,6 +65,8 @@ class _TLSAutomaton(Automaton):
+ 
+     def parse_args(self, mycert=None, mykey=None, **kargs):
+ 
++        self.verbose = kargs.pop("verbose", True)
++
+         super(_TLSAutomaton, self).parse_args(**kargs)
+ 
+         self.socket = None
+@@ -83,8 +87,6 @@ class _TLSAutomaton(Automaton):
+         else:
+             self.mykey = None
+ 
+-        self.verbose = kargs.get("verbose", True)
+-
+     def get_next_msg(self, socket_timeout=2, retry=2):
+         """
+         The purpose of the function is to make next message(s) available in
+@@ -105,7 +107,6 @@ class _TLSAutomaton(Automaton):
+             # A message is already available.
+             return
+ 
+-        self.socket.settimeout(socket_timeout)
+         is_sslv2_msg = False
+         still_getting_len = True
+         grablen = 2
+@@ -133,15 +134,27 @@ class _TLSAutomaton(Automaton):
+             if grablen == len(self.remain_in):
+                 break
+ 
++            final = False
+             try:
+-                tmp = self.socket.recv(grablen - len(self.remain_in))
++                tmp, _, _ = select.select([self.socket], [], [],
++                                          socket_timeout)
+                 if not tmp:
+                     retry -= 1
+                 else:
+-                    self.remain_in += tmp
+-            except Exception:
+-                self.vprint("Could not join host ! Retrying...")
++                    data = tmp[0].recv(grablen - len(self.remain_in))
++                    if not data:
++                        # Socket peer was closed
++                        self.vprint("Peer socket closed !")
++                        final = True
++                    else:
++                        self.remain_in += data
++ 

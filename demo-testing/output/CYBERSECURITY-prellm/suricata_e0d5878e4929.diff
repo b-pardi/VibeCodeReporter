@@ -1,0 +1,97 @@
+@@ -125,6 +125,14 @@ typedef struct SMTPInput_ {
+     int32_t consumed;
+ } SMTPInput;
+ 
++typedef struct SMTPLine_ {
++    /** current line extracted by the parser from the call to SMTPGetline() */
++    const uint8_t *buf;
++    /** length of the line in current_line.  Doesn't include the delimiter */
++    int32_t len;
++    uint8_t delim_len;
++} SMTPLine;
++
+ SCEnumCharMap smtp_decoder_event_table[] = {
+     { "INVALID_REPLY", SMTP_DECODER_EVENT_INVALID_REPLY },
+     { "UNABLE_TO_MATCH_REPLY_WITH_REQUEST", SMTP_DECODER_EVENT_UNABLE_TO_MATCH_REPLY_WITH_REQUEST },
+@@ -629,7 +637,7 @@ int SMTPProcessDataChunk(const uint8_t *chunk, uint32_t len,
+  * \retval -1 Either when we don't have any new lines to supply anymore or
+  *            on failure.
+  */
+-static AppLayerResult SMTPGetLine(SMTPState *state, SMTPInput *input)
++static AppLayerResult SMTPGetLine(SMTPState *state, SMTPInput *input, SMTPLine *line)
+ {
+     SCEnter();
+ 
+@@ -641,31 +649,31 @@ static AppLayerResult SMTPGetLine(SMTPState *state, SMTPInput *input)
+ 
+     if (lf_idx == NULL) {
+         if (!state->discard_till_lf && input->len >= SMTP_LINE_BUFFER_LIMIT) {
+-            state->current_line = input->buf;
+-            state->current_line_len = SMTP_LINE_BUFFER_LIMIT;
+-            state->current_line_delimiter_len = 0;
++            line->buf = input->buf;
++            line->len = SMTP_LINE_BUFFER_LIMIT;
++            line->delim_len = 0;
+             SCReturnStruct(APP_LAYER_OK);
+         }
+         SCReturnStruct(APP_LAYER_INCOMPLETE(input->consumed, input->len + 1));
+     } else {
+         uint32_t o_consumed = input->consumed;
+         input->consumed = lf_idx - input->buf + 1;
+-        state->current_line_len = input->consumed - o_consumed;
+-        input->len -= state->current_line_len;
++        line->len = input->consumed - o_consumed;
++        input->len -= line->len;
+         DEBUG_VALIDATE_BUG_ON((input->consumed + input->len) != input->orig_len);
+         if (state->discard_till_lf) {
+             // Whatever came in with first LF should also get discarded
+             state->discard_till_lf = false;
+-            state->current_line_len = 0;
++            line->len = 0;
+             SCReturnStruct(APP_LAYER_OK);
+         }
+-        state->current_line = input->buf + o_consumed;
++        line->buf = input->buf + o_consumed;
+         if (input->consumed >= 2 && input->buf[input->consumed - 2] == 0x0D) {
+-            state->current_line_delimiter_len = 2;
+-            state->current_line_len -= 2;
++            line->delim_len = 2;
++            line->len -= 2;
+         } else {
+-            state->current_line_delimiter_len = 1;
+-            state->current_line_len -= 1;
++            line->delim_len = 1;
++            line->len -= 1;
+         }
+         SCReturnStruct(APP_LAYER_OK);
+     }
+@@ -715,13 +723,12 @@ static int SMTPInsertCommandIntoCommandBuffer(uint8_t command, SMTPState *state,
+     return 0;
+ }
+ 
+-static int SMTPProcessCommandBDAT(SMTPState *state, Flow *f,
+-                                  AppLayerParserState *pstate)
++static int SMTPProcessCommandBDAT(
++        SMTPState *state, Flow *f, AppLayerParserState *pstate, SMTPLine *line)
+ {
+     SCEnter();
+ 
+-    state->bdat_chunk_idx += (state->current_line_len +
+-                              state->current_line_delimiter_len);
++    state->bdat_chunk_idx += (line->len + line->delim_len);
+     if (state->bdat_chunk_idx > state->bdat_chunk_len) {
+         state->parser_state &= ~SMTP_PARSER_STATE_COMMAND_DATA_MODE;
+         /* decoder event */
+@@ -782,8 +789,8 @@ static inline void SMTPTransactionComplete(SMTPState *state)
+  *  \retval 0 ok
+  *  \retval -1 error
+  */
+-static int SMTPProcessCommandDATA(SMTPState *state, Flow *f,
+-                                  AppLayerParserState *pstate)
++static int SMTPProcessCommandDATA(
++        SMTPState *state, Flow *f, AppLayerParserState *pstate, SMTPLine *line)
+ {
+     SCEnter();
+ 
+@@ -792,7 +799,7 @@ static int SMTPProcessCommandDATA(SMTPState *state, Flow *f,
+ 

@@ -1,0 +1,153 @@
+@@ -8,7 +8,6 @@
+ #include "zeek/RunState.h"
+ 
+ #include "zeek/analyzer/protocol/conn-size/ConnSize.h"
+-#include "zeek/analyzer/protocol/icmp/ICMP.h"
+ #include "zeek/analyzer/protocol/pia/PIA.h"
+ #include "zeek/analyzer/protocol/stepping-stone/SteppingStone.h"
+ #include "zeek/analyzer/protocol/tcp/TCP.h"
+@@ -383,12 +382,6 @@ bool Manager::BuildInitialAnalyzerTree(Connection* conn)
+ 		DBG_ANALYZER(conn, "activated UDP analyzer");
+ 		break;
+ 
+-	case TRANSPORT_ICMP: {
+-		root = new analyzer::icmp::ICMP_Analyzer(conn);
+-		DBG_ANALYZER(conn, "activated ICMP analyzer");
+-		break;
+-		}
+-
+ 	default:
+ 		reporter->InternalWarning("unknown protocol can't build analyzer tree");
+ 		return false;
+
+deleted file mode 100644
+
+
+
+@@ -1,908 +0,0 @@
+-// See the file "COPYING" in the main distribution directory for copyright.
+-
+-#include "zeek/zeek-config.h"
+-#include "zeek/analyzer/protocol/icmp/ICMP.h"
+-
+-#include <netinet/icmp6.h>
+-#include <algorithm>
+-
+-#include "zeek/IP.h"
+-#include "zeek/RunState.h"
+-#include "zeek/NetVar.h"
+-#include "zeek/Event.h"
+-#include "zeek/Conn.h"
+-#include "zeek/Desc.h"
+-#include "zeek/Reporter.h"
+-
+-#include "zeek/analyzer/protocol/icmp/events.bif.h"
+-
+-namespace zeek::analyzer::icmp {
+-
+-ICMP_Analyzer::ICMP_Analyzer(Connection* c)
+-	: TransportLayerAnalyzer("ICMP", c),
+-	icmp_conn_val(), type(), code(), request_len(-1), reply_len(-1)
+-	{
+-	c->SetInactivityTimeout(zeek::detail::icmp_inactivity_timeout);
+-	}
+-
+-void ICMP_Analyzer::Done()
+-	{
+-	TransportLayerAnalyzer::Done();
+-	icmp_conn_val = nullptr;
+-	matcher_state.FinishEndpointMatcher();
+-	}
+-
+-void ICMP_Analyzer::DeliverPacket(int len, const u_char* data,
+-			bool is_orig, uint64_t seq, const IP_Hdr* ip, int caplen)
+-	{
+-	assert(ip);
+-
+-	TransportLayerAnalyzer::DeliverPacket(len, data, is_orig, seq, ip, caplen);
+-
+-	// We need the min() here because Ethernet frame padding can lead to
+-	// caplen > len.
+-	if ( packet_contents )
+-		// Subtract off the common part of ICMP header.
+-		PacketContents(data + 8, std::min(len, caplen) - 8);
+-
+-	const struct icmp* icmpp = (const struct icmp*) data;
+-
+-	if ( ! zeek::detail::ignore_checksums &&
+-	     ! zeek::id::find_val<TableVal>("ignore_checksums_nets")->Contains(ip->IPHeaderSrcAddr()) &&
+-	     caplen >= len )
+-		{
+-		int chksum = 0;
+-
+-		switch ( ip->NextProto() )
+-		{
+-		case IPPROTO_ICMP:
+-			chksum = icmp_checksum(icmpp, len);
+-			break;
+-
+-		case IPPROTO_ICMPV6:
+-			chksum = icmp6_checksum(icmpp, ip, len);
+-			break;
+-
+-		default:
+-			reporter->AnalyzerError(
+-				this, "unexpected IP proto in ICMP analyzer: %d", ip->NextProto());
+-			return;
+-		}
+-
+-		if ( chksum != 0xffff )
+-			{
+-			Weird("bad_ICMP_checksum");
+-			return;
+-			}
+-		}
+-
+-	Conn()->SetLastTime(run_state::current_timestamp);
+-
+-	if ( zeek::detail::rule_matcher )
+-		{
+-		if ( ! matcher_state.MatcherInitialized(is_orig) )
+-			matcher_state.InitEndpointMatcher(this, ip, len, is_orig, nullptr);
+-		}
+-
+-	type = icmpp->icmp_type;
+-	code = icmpp->icmp_code;
+-
+-	// Move past common portion of ICMP header.
+-	data += 8;
+-	caplen -= 8;
+-	len -= 8;
+-
+-	int& len_stat = is_orig ? request_len : reply_len;
+-	if ( len_stat < 0 )
+-		len_stat = len;
+-	else
+-		len_stat += len;
+-
+-	if ( ip->NextProto() == IPPROTO_ICMP )
+-		NextICMP4(run_state::current_timestamp, icmpp, len, caplen, data, ip);
+-	else if ( ip->NextProto() == IPPROTO_ICMPV6 )
+-		NextICMP6(run_state::current_timestamp, icmpp, len, caplen, data, ip);
+-	else
+-		{
+-		reporter->AnalyzerError(
+-			this, "expected ICMP as IP packet's protocol, got %d", ip->NextProto());
+-		return;
+-		}
+-
+-
+-	if ( caplen >= len )
+-		ForwardPacket(len, data, is_orig, seq, ip, caplen);
+-
+-	if ( zeek::detail::rule_matcher )
+-		matcher_state.Match(zeek::detail::Rule::PAYLOAD, data, len, is_orig,
+-		                    false, false, true);
+-	}
+-
+-void ICMP_Analyzer::NextICMP4(double t, const struct icmp* icmpp, int len, int caplen,
+-		const u_char*& data, const IP_Hdr* ip_hdr )
+-	{
+-	switch ( icmpp->icmp_type )
+-		{
+-		case ICMP_ECHO:

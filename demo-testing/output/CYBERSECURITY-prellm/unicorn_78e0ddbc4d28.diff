@@ -1,0 +1,152 @@
+@@ -46,6 +46,15 @@
+ 
+ struct TranslationBlock;
+ 
++// Place the struct here since we need it in uc.c
++typedef struct _mmio_cbs {
++    uc_cb_mmio_read_t read;
++    void *user_data_read;
++    uc_cb_mmio_write_t write;
++    void *user_data_write;
++    MemoryRegionOps ops;
++} mmio_cbs;
++
+ typedef uc_err (*query_t)(struct uc_struct *uc, uc_query_type type,
+                           size_t *result);
+ 
+
+
+
+
+@@ -77,14 +77,6 @@ MemoryRegion *memory_map_ptr(struct uc_struct *uc, hwaddr begin, size_t size, ui
+     return ram;
+ }
+ 
+-typedef struct _mmio_cbs {
+-    uc_cb_mmio_read_t read;
+-    void *user_data_read;
+-    uc_cb_mmio_write_t write;
+-    void *user_data_write;
+-    MemoryRegionOps ops;
+-} mmio_cbs;
+-
+ static uint64_t mmio_read_wrapper(struct uc_struct *uc, void *opaque, hwaddr addr, unsigned size)
+ {
+     mmio_cbs* cbs = (mmio_cbs*)opaque;
+
+
+
+
+@@ -74,15 +74,46 @@ static void test_splitting_mem_unmap()
+     OK(uc_close(uc));
+ }
+ 
++static uint64_t test_splitting_mmio_unmap_read_callback(uc_engine *uc,
++                                                        uint64_t offset,
++                                                        unsigned size,
++                                                        void *user_data)
++{
++    TEST_CHECK(offset == 4);
++    TEST_CHECK(size == 4);
++
++    return 0x19260817;
++}
++
+ static void test_splitting_mmio_unmap()
+ {
+     uc_engine *uc;
++    // mov ecx, [0x3004] <-- normal read
++    // mov ebx, [0x4004] <-- mmio read
++    char code[] = "\x8b\x0d\x04\x30\x00\x00\x8b\x1d\x04\x40\x00\x00";
++    int r_ecx, r_ebx;
++    int bytes = 0xdeadbeef;
+ 
+     OK(uc_open(UC_ARCH_X86, UC_MODE_32, &uc));
+ 
+-    OK(uc_mmio_map(uc, 0x3000, 0x2000, NULL, NULL, NULL, NULL));
++    OK(uc_mem_map(uc, 0x1000, 0x1000, UC_PROT_ALL));
++    OK(uc_mem_write(uc, 0x1000, code, sizeof(code) - 1));
+ 
++    OK(uc_mmio_map(uc, 0x3000, 0x2000, test_splitting_mmio_unmap_read_callback,
++                   NULL, NULL, NULL));
++
++    // Map a ram area instead
+     OK(uc_mem_unmap(uc, 0x3000, 0x1000));
++    OK(uc_mem_map(uc, 0x3000, 0x1000, UC_PROT_ALL));
++    OK(uc_mem_write(uc, 0x3004, &bytes, 4));
++
++    OK(uc_emu_start(uc, 0x1000, 0x1000 + sizeof(code) - 1, 0, 0));
++
++    OK(uc_reg_read(uc, UC_X86_REG_ECX, &r_ecx));
++    OK(uc_reg_read(uc, UC_X86_REG_EBX, &r_ebx));
++
++    TEST_CHECK(r_ecx == 0xdeadbeef);
++    TEST_CHECK(r_ebx == 0x19260817);
+ 
+     OK(uc_close(uc));
+ }
+
+
+
+
+@@ -1045,6 +1045,79 @@ static uint8_t *copy_region(struct uc_struct *uc, MemoryRegion *mr)
+     return block;
+ }
+ 
++/*
++    This function is similar to split_region, but for MMIO memory.
++
++    This function would delete the region unconditionally.
++
++    Note this function may be called recursively.
++*/
++static bool split_mmio_region(struct uc_struct *uc, MemoryRegion *mr,
++                              uint64_t address, size_t size)
++{
++    uint64_t begin, end, chunk_end;
++    size_t l_size, r_size;
++    mmio_cbs backup;
++
++    chunk_end = address + size;
++
++    // This branch also break recursion.
++    if (address <= mr->addr && chunk_end >= mr->end) {
++        return true;
++    }
++
++    if (size == 0) {
++        return false;
++    }
++
++    begin = mr->addr;
++    end = mr->end;
++
++    memcpy(&backup, mr->opaque, sizeof(mmio_cbs));
++
++    /* overlapping cases
++     *               |------mr------|
++     * case 1    |---size--|            // Is it possible???
++     * case 2           |--size--|
++     * case 3                  |---size--|
++     */
++
++    // unmap this region first, then do split it later
++    if (uc_mem_unmap(uc, mr->addr, (size_t)int128_get64(mr->size)) !=
++        UC_ERR_OK) {
++        return false;
++    }
++
++    // adjust some things
++    if (address < begin) {
++        address = begin;
++    }
++    if (chunk_end > end) {
++        chunk_end = end;
++    }
++
++    // compute sub region sizes
++    l_size = (size_t)(address - begin);
++    r_size = (size_t)(end - chunk_end);
++
++    if (l_size > 0) {
++        if (uc_mmio_map(uc, begin, l_size, backup.read

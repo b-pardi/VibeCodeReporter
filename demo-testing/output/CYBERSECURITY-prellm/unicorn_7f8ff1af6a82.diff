@@ -1,0 +1,115 @@
+@@ -10,6 +10,9 @@ from unicorn.arm64_const import *
+ # code to be emulated
+ ARM64_CODE = b"\xab\x05\x00\xb8\xaf\x05\x40\x38" # str x11, [x13]; ldrb x15, [x13]
+ 
++# MSR code
++ARM64_MRS_CODE = b"\x62\xd0\x3b\xd5" # mrs        x2, tpidrro_el0
++
+ # memory address where emulation starts
+ ADDRESS    = 0x10000
+ 
+@@ -82,7 +85,40 @@ def test_arm64_read_sctlr():
+     except UcError as e:
+         print("ERROR: %s" % e)
+ 
++def test_arm64_hook_mrs():
++    def _hook_mrs(uc, reg, cp_reg, _):
++        print(f">>> Hook MRS instruction: reg = 0x{reg:x}(UC_ARM64_REG_X2) cp_reg = {cp_reg}")
++        uc.reg_write(reg, 0x114514)
++        print(">>> Write 0x114514 to X")
++
++        # Skip MRS instruction
++        return True
++
++    print("Test hook MRS instruction")
++    try:
++        # Initialize emulator in ARM mode
++        mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
++
++        # Map an area for code
++        mu.mem_map(0x1000, 0x1000)
++
++        # Write code
++        mu.mem_write(0x1000, ARM64_MRS_CODE)
++
++        # Hook MRS instruction
++        mu.hook_add(UC_HOOK_INSN, _hook_mrs, None, 1, 0, UC_ARM64_INS_MRS)
++
++        # Start emulation
++        mu.emu_start(0x1000, 0x1000 + len(ARM64_MRS_CODE))
++
++        print(f">>> X2 = {mu.reg_read(UC_ARM64_REG_X2):x}")
++
++    except UcError as e:
++        print("ERROR: %s" % e)
++
+ if __name__ == '__main__':
+     test_arm64()
+     print("=" * 26)
+     test_arm64_read_sctlr()
++    print("=" * 26)
++    test_arm64_hook_mrs()
+
+
+
+
+@@ -10,6 +10,7 @@ import os.path
+ import sys
+ import weakref
+ import functools
++from collections import namedtuple
+ 
+ from . import x86_const, arm_const, arm64_const, unicorn_const as uc
+ 
+@@ -182,6 +183,7 @@ UC_HOOK_INSN_OUT_CB = ctypes.CFUNCTYPE(
+     ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p
+ )
+ UC_HOOK_INSN_SYSCALL_CB = ctypes.CFUNCTYPE(None, uc_engine, ctypes.c_void_p)
++UC_HOOK_INSN_SYS_CB = ctypes.CFUNCTYPE(ctypes.c_uint32, uc_engine, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p)
+ UC_MMIO_READ_CB = ctypes.CFUNCTYPE(
+     ctypes.c_uint64, uc_engine, ctypes.c_uint64, ctypes.c_int, ctypes.c_void_p
+ )
+@@ -666,6 +668,16 @@ class Uc(object):
+         (cb, data) = self._callbacks[user_data]
+         return cb(self, port, size, data)
+ 
++    @_catch_hook_exception
++    def _hook_insn_sys_cb(self, handle, reg, pcp_reg, user_data):
++        cp_reg = ctypes.cast(pcp_reg, ctypes.POINTER(uc_arm64_cp_reg)).contents
++
++        uc_arm64_cp_reg_tuple = namedtuple("uc_arm64_cp_reg_tuple", ["crn", "crm", "op0", "op1", "op2", "val"])
++
++        (cb, data) = self._callbacks[user_data]
++
++        return cb(self, reg, uc_arm64_cp_reg_tuple(cp_reg.crn, cp_reg.crm, cp_reg.op0, cp_reg.op1, cp_reg.op2, cp_reg.val), data)
++
+     @_catch_hook_exception
+     def _hook_insn_out_cb(self, handle, port, size, value, user_data):
+         # call user's callback with self object
+@@ -773,6 +785,8 @@ class Uc(object):
+                 cb = ctypes.cast(UC_HOOK_INSN_OUT_CB(self._hook_insn_out_cb), UC_HOOK_INSN_OUT_CB)
+             if arg1 in (x86_const.UC_X86_INS_SYSCALL, x86_const.UC_X86_INS_SYSENTER):  # SYSCALL/SYSENTER instruction
+                 cb = ctypes.cast(UC_HOOK_INSN_SYSCALL_CB(self._hook_insn_syscall_cb), UC_HOOK_INSN_SYSCALL_CB)
++            if arg1 in (arm64_const.UC_ARM64_INS_MRS, arm64_const.UC_ARM64_INS_MSR, arm64_const.UC_ARM64_INS_SYS, arm64_const.UC_ARM64_INS_SYSL):
++                cb = ctypes.cast(UC_HOOK_INSN_SYS_CB(self._hook_insn_sys_cb), UC_HOOK_INSN_SYS_CB)
+             status = _uc.uc_hook_add(
+                 self._uch, ctypes.byref(_h2), htype, cb,
+                 ctypes.cast(self._callback_count, ctypes.c_void_p),
+
+
+
+
+@@ -14,6 +14,9 @@
+ // ldrb w15, [x13]
+ #define ARM64_CODE_EB ARM64_CODE
+ 
++// mrs        x2, tpidrro_el0
++#define ARM64_MRS_CODE "\x62\xd0\x3b\xd5"
++
+ // memory address where emulation starts
+ #define ADDRESS 0x10000
+ 
+@@ -204,7 +207,7 @@ static void test_arm64_sctlr()
+ 
+     err = uc_open(UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN | UC_MODE_ARM, &uc);
+     if (err != UC_E

@@ -1,0 +1,136 @@
+@@ -273,6 +273,21 @@ public:
+ 	IPPair endpoints;
+ };
+ 
++class ConnTupleWeirdTimer final : public Timer {
++public:
++	using ConnTuple = Reporter::ConnTuple;
++
++	ConnTupleWeirdTimer(double t, ConnTuple id, double timeout)
++		: Timer(t + timeout, TIMER_CONN_TUPLE_WEIRD_EXPIRE),
++		  conn_id(std::move(id))
++		{}
++
++	void Dispatch(double t, bool is_expire) override
++		{ reporter->ResetExpiredConnWeird(conn_id); }
++
++	ConnTuple conn_id;
++};
++
+ void Reporter::ResetNetWeird(const std::string& name)
+ 	{
+ 	net_weird_state.erase(name);
+@@ -283,6 +298,11 @@ void Reporter::ResetFlowWeird(const IPAddr& orig, const IPAddr& resp)
+ 	flow_weird_state.erase(std::make_pair(orig, resp));
+ 	}
+ 
++void Reporter::ResetExpiredConnWeird(const ConnTuple& id)
++	{
++	expired_conn_weird_state.erase(id);
++	}
++
+ bool Reporter::PermitNetWeird(const char* name)
+ 	{
+ 	auto& count = net_weird_state[name];
+@@ -325,6 +345,35 @@ bool Reporter::PermitFlowWeird(const char* name,
+ 		return false;
+ 	}
+ 
++bool Reporter::PermitExpiredConnWeird(const char* name, const RecordVal& conn_id)
++	{
++	auto conn_tuple = std::make_tuple(conn_id.GetField("orig_h")->AsAddr(),
++	                                  conn_id.GetField("resp_h")->AsAddr(),
++	                                  conn_id.GetField("orig_p")->AsPortVal()->Port(),
++	                                  conn_id.GetField("resp_p")->AsPortVal()->Port(),
++	                                  conn_id.GetField("resp_p")->AsPortVal()->PortType());
++
++	auto& map = expired_conn_weird_state[conn_tuple];
++
++	if ( map.empty() )
++		timer_mgr->Add(new ConnTupleWeirdTimer(network_time,
++		                                       std::move(conn_tuple),
++		                                       weird_sampling_duration));
++
++	auto& count = map[name];
++	++count;
++
++	if ( count <= weird_sampling_threshold )
++		return true;
++
++	auto num_above_threshold = count - weird_sampling_threshold;
++
++	if ( weird_sampling_rate )
++		return num_above_threshold % weird_sampling_rate == 0;
++	else
++		return false;
++	}
++
+ void Reporter::Weird(const char* name, const char* addl)
+ 	{
+ 	UpdateWeirdStats(name);
+@@ -368,6 +417,22 @@ void Reporter::Weird(Connection* conn, const char* name, const char* addl)
+ 	            "%s", name);
+ 	}
+ 
++void Reporter::Weird(IntrusivePtr<RecordVal> conn_id, IntrusivePtr<StringVal> uid,
++                     const char* name, const char* addl)
++	{
++	UpdateWeirdStats(name);
++
++	if ( ! WeirdOnSamplingWhiteList(name) )
++		{
++		if ( ! PermitExpiredConnWeird(name, *conn_id) )
++			return;
++		}
++
++	WeirdHelper(expired_conn_weird,
++	            {conn_id.release(), uid.release(), new StringVal(addl)},
++	            "%s", name);
++	}
++
+ void Reporter::Weird(const IPAddr& orig, const IPAddr& resp, const char* name, const char* addl)
+ 	{
+ 	UpdateWeirdStats(name);
+
+
+
+
+@@ -7,11 +7,13 @@
+ #include <list>
+ #include <utility>
+ #include <string>
++#include <tuple>
+ #include <map>
+ #include <unordered_set>
+ #include <unordered_map>
+ 
+ #include "BroList.h"
++#include "net_util.h"
+ 
+ namespace analyzer { class Analyzer; }
+ namespace file_analysis { class File; }
+@@ -19,6 +21,10 @@ class Connection;
+ class Location;
+ class Reporter;
+ class EventHandlerPtr;
++class RecordVal;
++class StringVal;
++
++template <class T> class IntrusivePtr;
+ 
+ // One cannot raise this exception directly, go through the
+ // Reporter's methods instead.
+@@ -44,8 +50,10 @@ ZEEK_FORWARD_DECLARE_NAMESPACED(Expr, zeek::detail);
+ class Reporter {
+ public:
+ 	using IPPair = std::pair<IPAddr, IPAddr>;
++	using ConnTuple = std::tuple<IPAddr, IPAddr, uint32_t, uint32_t, TransportProto>;
+ 	using WeirdCountMap = std::unordered_map<std::string, uint64_t>;
+ 	using WeirdFlowMap = std::map<IPPair, WeirdCountMap>;
++	using WeirdConnTupleMap = std::map<ConnTuple, WeirdCountMap>;
+ 	using WeirdSet = std::unordered_set<std::string>;
+ 
+ 	Reporter(bool abort_on_scripting_errors);
+@@ -89,6 +97,8 @@ public:
+ 	void Weird(const char* name, const char* addl = "");	// Raises net_weird().
+ 	void Weird(file_analysis::

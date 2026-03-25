@@ -1,0 +1,123 @@
+@@ -22,6 +22,7 @@ from scapy.arch.common import get_if, compile_filter, _iff_flags
+ from scapy.arch.unix import in6_getifaddr
+ from scapy.compat import plain_str
+ from scapy.config import conf
++from scapy.consts import LINUX
+ from scapy.data import ARPHDR_LOOPBACK, ARPHDR_ETHER
+ from scapy.error import Scapy_Exception, warning
+ from scapy.interfaces import InterfaceProvider, IFACES, NetworkInterface, \
+@@ -29,6 +30,9 @@ from scapy.interfaces import InterfaceProvider, IFACES, NetworkInterface, \
+ from scapy.pton_ntop import inet_ntop
+ from scapy.modules.six.moves import range
+ 
++if LINUX:
++    raise OSError("BPF conflicts with Linux")
++
+ 
+ # ctypes definitions
+ 
+
+
+
+
+@@ -379,7 +379,7 @@ class L3bpfSocket(L2bpfSocket):
+         # Use the routing table to find the output interface
+         iff = pkt.route()[0]
+         if iff is None:
+-            iff = conf.iface
++            iff = network_name(conf.iface)
+ 
+         # Assign the network interface to the BPF handle
+         if self.assigned_interface != iff:
+
+
+
+
+@@ -600,7 +600,7 @@ class L3PacketSocket(L2Socket):
+         # type: (Packet) -> int
+         iff = x.route()[0]
+         if iff is None:
+-            iff = conf.iface
++            iff = network_name(conf.iface)
+         sdto = (iff, self.type)
+         self.outs.bind(sdto)
+         sn = self.outs.getsockname()
+
+
+
+
+@@ -886,9 +886,6 @@ class AlarmCRBlockReq(Block):
+         # Set the LT based on transport
+         if self.AlarmCRProperties_Transport == 0x1:
+             p = p[:8] + struct.pack("!H", 0x0800) + p[10:]
+-            print("p[:8]={}".format(bytes(p[:8]).hex()))
+-            print("p[10:]={}".format(bytes(p[10:]).hex()))
+-            print("p={}".format(bytes(p).hex()))
+ 
+         return Block.post_build(self, p, pay)
+ 
+
+
+
+
+@@ -24,7 +24,7 @@ from scapy.data import ARPHDR_ETHER, ARPHDR_LOOPBACK, ARPHDR_METRICOM, \
+     DLT_ETHERNET_MPACKET, DLT_LINUX_IRDA, DLT_LINUX_SLL, DLT_LOOP, \
+     DLT_NULL, ETHER_ANY, ETHER_BROADCAST, ETHER_TYPES, ETH_P_ARP, \
+     ETH_P_MACSEC
+-from scapy.error import warning, ScapyNoDstMacException
++from scapy.error import warning, ScapyNoDstMacException, log_runtime
+ from scapy.fields import (
+     BCDFloatField,
+     BitField,
+@@ -478,7 +478,7 @@ class ARP(Packet):
+         return self_psrc[:len(other_pdst)] == other_pdst[:len(self_psrc)]
+ 
+     def route(self):
+-        # type: () -> Tuple[Union[NetworkInterface, str, None], Optional[str], Optional[str]] # noqa: E501
++        # type: () -> Tuple[Optional[str], Optional[str], Optional[str]]
+         fld, dst = cast(Tuple[MultipleTypeField, str],
+                         self.getfield_and_val("pdst"))
+         fld_inner, dst = fld._find_fld_pkt_val(self, dst)
+@@ -506,7 +506,14 @@ class ARP(Packet):
+ 
+ def l2_register_l3_arp(l2, l3):
+     # type: (Type[Packet], Type[Packet]) -> Optional[str]
+-    return getmacbyip(l3.pdst)
++    # TODO: support IPv6?
++    if l3.plen == 4:
++        return getmacbyip(l3.pdst)
++    log_runtime.warning(
++        "Unable to guess L2 MAC address from an ARP packet with a "
++        "non-IPv4 pdst. Provide it manually !"
++    )
++    return None
+ 
+ 
+ conf.neighbor.register_l3(Ether, ARP, l2_register_l3_arp)
+
+
+
+
+@@ -1361,7 +1361,7 @@ values.
+         return self.haslayer(cls)
+ 
+     def route(self):
+-        # type: () -> Tuple[Any, Optional[str], Optional[str]]
++        # type: () -> Tuple[Optional[str], Optional[str], Optional[str]]
+         return self.payload.route()
+ 
+     def fragment(self, *args, **kargs):
+
+
+
+
+@@ -795,6 +795,7 @@ def srploop(pkts,  # type: _PacketIterable
+ def sndrcvflood(pks,  # type: SuperSocket
+                 pkt,  # type: _PacketIterable
+                 inter=0,  # type: int
++                maxretries=None,  # type: Optional[int]
+                 verbose=None,  # type: Optional[int]
+                 chainCC=False,  # type: bool
+                 timeout=None  # type: Optional[int]
+@@ -807,7 +808,11 @@ def sndrcvflood(pks,  # type: SuperSocket
+         # type: (_PacketIterable, Event)

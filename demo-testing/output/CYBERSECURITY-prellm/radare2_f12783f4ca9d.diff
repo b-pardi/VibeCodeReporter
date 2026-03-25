@@ -1,0 +1,170 @@
+@@ -45,6 +45,14 @@ static RList* r_debug_gdb_threads(RDebug *dbg, int pid) {
+ 	return list;
+ }
+ 
++static RList* r_debug_gdb_pids(RDebug *dbg, int pid) {
++	RList *list;
++	if ((list = gdbr_pids_list (desc, pid))) {
++		list->free = (RListFree) &r_debug_pid_free;
++	}
++	return list;
++}
++
+ static int r_debug_gdb_reg_read(RDebug *dbg, int type, ut8 *buf, int size) {
+ 	int copy_size;
+ 	int buflen = 0;
+@@ -1111,6 +1119,7 @@ RDebugPlugin r_debug_plugin_gdb = {
+ 	.attach = &r_debug_gdb_attach,
+ 	.detach = &r_debug_gdb_detach,
+ 	.threads = &r_debug_gdb_threads,
++	.pids = &r_debug_gdb_pids,
+ 	.canstep = 1,
+ 	.wait = &r_debug_gdb_wait,
+ 	.map_get = r_debug_gdb_map_get,
+
+
+
+
+@@ -131,6 +131,11 @@ int gdbr_close_file(libgdbr_t *g);
+  */
+ RList* gdbr_threads_list(libgdbr_t *g, int pid);
+ 
++/*!
++ * \brief get a list of the child processes of the given pid
++ */
++RList* gdbr_pids_list(libgdbr_t *g, int pid);
++
+ /*!
+  * Get absolute name of file executed to create a process
+  */
+
+
+
+
+@@ -6,5 +6,6 @@
+ #include "libgdbr.h"
+ 
+ int gdbr_read_target_xml(libgdbr_t *g);
++int gdbr_read_processes_xml(libgdbr_t *g, int pid, RList* list);
+ 
+ #endif  // GDBCLIENT_XML_H
+
+
+
+
+@@ -1723,12 +1723,119 @@ end:
+ 	return ret;
+ }
+ 
++RList* gdbr_pids_list(libgdbr_t *g, int pid) {
++	int ret = -1;
++	RList *list = NULL;
++	int tpid = -1, ttid = -1;
++	char *ptr, *ptr2, *exec_file;
++	RDebugPid *dpid;
++	RListIter *iter;
++
++	if (!g) {
++		return NULL;
++	}
++
++	if (!gdbr_lock_enter (g)) {
++		goto end;
++	}
++	if (!(list = r_list_new ())) {
++		ret = -1;
++		goto end;
++	}
++	// Use qfThreadInfo as a fallback since it doesn't actually show all children
++	if (g->stub_features.qXfer_threads_read) {
++		if (gdbr_read_processes_xml(g, pid, list) == 0) {
++			ret = 0;
++			goto end;
++		}
++	}
++	// Child processes will only show up in ThreadInfo if gdbr is currently processing a
++	// fork/vfork/exec event or if the children weren't detached yet. This is intended
++	// gdb `info inferiors` behavior that can only be avoided using xml.
++	eprintf ("WARNING: Showing possibly incomplete pid list due to xml protocol failure\n");
++
++	if (!g->stub_features.qXfer_exec_file_read
++		    || !(exec_file = gdbr_exec_file_read (g, pid))) {
++		exec_file = "";
++	}
++	if (send_msg (g, "qfThreadInfo") < 0 || read_packet (g, false) < 0 || send_ack (g) < 0
++		    || g->data_len == 0 || g->data[0] != 'm') {
++		ret = -1;
++		goto end;
++	}
++	while (1) {
++		g->data[g->data_len] = '\0';
++		ptr = g->data + 1;
++		while (ptr) {
++			if ((ptr2 = strchr (ptr, ','))) {
++				*ptr2 = '\0';
++				ptr2++;
++			}
++			if (read_thread_id (ptr, &tpid, &ttid, g->stub_features.multiprocess) < 0) {
++				ptr = ptr2;
++				continue;
++			}
++			// Avoid adding the same pid twice(could show more than once if it has threads)
++			r_list_foreach (list, iter, dpid) {
++				if (tpid == dpid->pid) {
++					continue;
++				}
++			}
++			if (!(dpid = R_NEW0 (RDebugPid)) || !(dpid->path = strdup (exec_file))) {
++				ret = -1;
++				goto end;
++			}
++			dpid->pid = tpid;
++			// If the pid isn't the debugged pid it must be a child pid
++			if (tpid != g->pid) {
++				dpid->ppid = g->pid;
++			}
++			dpid->uid = dpid->gid = -1;
++			dpid->runnable = true;
++			dpid->status = R_DBG_PROC_STOP;
++			r_list_append (list, dpid);
++			ptr = ptr2;
++		}
++		if (send_msg (g, "qsThreadInfo") < 0 || read_packet (g, false) < 0
++			    || send_ack (g) < 0 || g->data_len == 0
++			    || (g->data[0] != 'm' && g->data[0] != 'l')) {
++			ret = -1;
++			goto end;
++		}
++		if (g->data[0] == 'l') {
++			break;
++		}
++	}
++
++	ret = 0;
++end:
++	gdbr_lock_leave (g);
++	if (ret != 0) {
++		if (dpid) {
++			free (dpid);
++		}
++		// We can't use r_debug_pid_free here
++		if (list) {
++			r_list_foreach (list, iter, dpid) {
++				if (dpid->path) {
++					free (dpid->path);
++				}
++				free (dpid);
++			}
++			r_list_free (list);
++		}
++		return NULL;
++	}
++	return list;
++}
++
+ RList* gdbr_threads_list(libgdbr_t *g, int pid) {
+ 	int ret = -1;
+ 	RList *list = NULL;
+ 	int tpid = -1, ttid = -1;
+ 	char *ptr, *ptr2, *exec_file;
+ 	RDebu

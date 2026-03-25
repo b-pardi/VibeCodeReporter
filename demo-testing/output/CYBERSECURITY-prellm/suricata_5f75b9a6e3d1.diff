@@ -1,0 +1,121 @@
+@@ -99,6 +99,10 @@ StreamingBufferConfig htp_sbcfg = STREAMING_BUFFER_CONFIG_INITIALIZER;
+ /** Limit to the number of libhtp messages that can be handled */
+ #define HTP_MAX_MESSAGES 512
+ 
++/** a boundary should be smaller in size */
++// RFC 2046 states that max boundary size is 70
++#define HTP_BOUNDARY_MAX 200U
++
+ SC_ATOMIC_DECLARE(uint32_t, htp_config_flags);
+ 
+ #ifdef DEBUG
+@@ -368,8 +372,8 @@ static void HtpTxUserDataFree(HtpState *state, HtpTxUserData *htud)
+         if (htud->response_headers_raw)
+             HTPFree(htud->response_headers_raw, htud->response_headers_raw_len);
+         AppLayerDecoderEventsFreeEvents(&htud->tx_data.events);
+-        if (htud->boundary)
+-            HTPFree(htud->boundary, htud->boundary_len);
++        if (htud->mime_state)
++            rs_mime_state_free(htud->mime_state);
+         if (htud->tx_data.de_state != NULL) {
+             DetectEngineStateFree(htud->tx_data.de_state);
+         }
+@@ -1114,92 +1118,6 @@ static int HTTPParseContentDispositionHeader(uint8_t *name, size_t name_len,
+     return 0;
+ }
+ 
+-/**
+- *  \param name /Lowercase/ version of the variable name
+- */
+-static int HTTPParseContentTypeHeader(uint8_t *name, size_t name_len,
+-        uint8_t *data, size_t len, uint8_t **retptr, size_t *retlen)
+-{
+-    SCEnter();
+-#ifdef PRINT
+-    printf("DATA START: \n");
+-    PrintRawDataFp(stdout, data, len);
+-    printf("DATA END: \n");
+-#endif
+-    size_t x;
+-    int quote = 0;
+-
+-    for (x = 0; x < len; x++) {
+-        if (!(isspace(data[x])))
+-            break;
+-    }
+-
+-    if (x >= len) {
+-        SCReturnInt(0);
+-    }
+-
+-    uint8_t *line = data+x;
+-    size_t line_len = len-x;
+-    size_t offset = 0;
+-#ifdef PRINT
+-    printf("LINE START: \n");
+-    PrintRawDataFp(stdout, line, line_len);
+-    printf("LINE END: \n");
+-#endif
+-    for (x = 0 ; x < line_len; x++) {
+-        if (x > 0) {
+-            if (line[x - 1] != '\\' && line[x] == '\"') {
+-                quote++;
+-            }
+-
+-            if (((line[x - 1] != '\\' && line[x] == ';') || ((x + 1) == line_len)) && (quote == 0 || quote % 2 == 0)) {
+-                uint8_t *token = line + offset;
+-                size_t token_len = x - offset;
+-
+-                if ((x + 1) == line_len) {
+-                    token_len++;
+-                }
+-
+-                offset = x + 1;
+-
+-                while (offset < line_len && isspace(line[offset])) {
+-                    x++;
+-                    offset++;
+-                }
+-#ifdef PRINT
+-                printf("TOKEN START: \n");
+-                PrintRawDataFp(stdout, token, token_len);
+-                printf("TOKEN END: \n");
+-#endif
+-                if (token_len > name_len) {
+-                    if (name == NULL || SCMemcmpLowercase(name, token, name_len) == 0) {
+-                        uint8_t *value = token + name_len;
+-                        size_t value_len = token_len - name_len;
+-
+-                        if (value[0] == '\"') {
+-                            value++;
+-                            value_len--;
+-                        }
+-                        if (value[value_len-1] == '\"') {
+-                            value_len--;
+-                        }
+-#ifdef PRINT
+-                        printf("VALUE START: \n");
+-                        PrintRawDataFp(stdout, value, value_len);
+-                        printf("VALUE END: \n");
+-#endif
+-                        *retptr = value;
+-                        *retlen = value_len;
+-                        SCReturnInt(1);
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    SCReturnInt(0);
+-}
+-
+ /**
+  *  \brief setup multipart parsing: extract boundary and store it
+  *
+@@ -1218,123 +1136,15 @@ static int HtpRequestBodySetupMultipart(htp_tx_t *tx, HtpTxUserData *htud)
+     htp_header_t *h = (htp_header_t *)htp_table_get_c(tx->request_headers,
+             "Content-Type");
+     if (h != NULL && bstr_len(h->value) > 0) {
+-        uint8_t *boundary = NULL;
+-        size_t boundary

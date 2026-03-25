@@ -1,0 +1,145 @@
+@@ -376,12 +376,6 @@ DNS_Mgr::DNS_Mgr(DNS_MgrMode arg_mode)
+ 
+ 	mode = arg_mode;
+ 
+-	char err[NB_DNS_ERRSIZE];
+-	nb_dns = nb_dns_init(err);
+-
+-	if ( ! nb_dns )
+-		reporter->Warning("problem initializing NB-DNS: %s", err);
+-
+ 	dns_mapping_valid = dns_mapping_unverified = dns_mapping_new_name =
+ 		dns_mapping_lost_name = dns_mapping_name_changed =
+ 			dns_mapping_altered =  0;
+@@ -410,6 +404,35 @@ void DNS_Mgr::InitPostScript()
+ 	if ( did_init )
+ 		return;
+ 
++	auto dns_resolver_id = global_scope()->Lookup("dns_resolver");
++	auto dns_resolver_addr = dns_resolver_id->ID_Val()->AsAddr();
++	char err[NB_DNS_ERRSIZE];
++
++	if ( dns_resolver_addr == IPAddr("::") )
++		nb_dns = nb_dns_init(err);
++	else
++		{
++		struct sockaddr_storage ss = {0};
++
++		if ( dns_resolver_addr.GetFamily() == IPv4 )
++			{
++			struct sockaddr_in* sa = (struct sockaddr_in*)&ss;
++			sa->sin_family = AF_INET;
++			dns_resolver_addr.CopyIPv4(&sa->sin_addr);
++			}
++		else
++			{
++			struct sockaddr_in6* sa = (struct sockaddr_in6*)&ss;
++			sa->sin6_family = AF_INET6;
++			dns_resolver_addr.CopyIPv6(&sa->sin6_addr);
++			}
++
++		nb_dns = nb_dns_init2(err, (struct sockaddr*)&ss);
++		}
++
++	if ( ! nb_dns )
++		reporter->Warning("problem initializing NB-DNS: %s", err);
++
+ 	const char* cache_dir = dir ? dir : ".";
+ 
+ 	if ( mode == DNS_PRIME && ! ensure_dir(cache_dir) )
+@@ -471,15 +494,15 @@ static const char* fake_addr_lookup_result(const IPAddr& addr)
+ 
+ TableVal* DNS_Mgr::LookupHost(const char* name)
+ 	{
++	if ( mode == DNS_FAKE )
++		return fake_name_lookup_result(name);
++
+ 	if ( ! nb_dns )
+ 		return empty_addr_set();
+ 
+ 	if ( ! did_init )
+ 		Init();
+ 
+-	if ( mode == DNS_FAKE )
+-		return fake_name_lookup_result(name);
+-
+ 	if ( mode != DNS_PRIME )
+ 		{
+ 		HostMap::iterator it = host_mappings.find(name);
+
+
+
+
+@@ -86,7 +86,7 @@ struct nb_dns_hostent {
+ 
+ struct nb_dns_info {
+ 	int s;				/* Resolver file descriptor */
+-	struct sockaddr_in server;	/* server address to bind to */
++	struct sockaddr_storage server;	/* server address to bind to */
+ 	struct nb_dns_entry *list;	/* outstanding requests */
+ 	struct nb_dns_hostent dns_hostent;
+ };
+@@ -109,6 +109,18 @@ my_strerror(int errnum)
+ #endif
+ }
+ 
++static const char* sa_ntop(struct sockaddr* sa, char* buf, int len)
++	{
++	if ( sa->sa_family == AF_INET )
++		return inet_ntop(sa->sa_family,
++		                 &(((struct sockaddr_in*)sa)->sin_addr),
++		                 buf, len);
++	else
++		return inet_ntop(sa->sa_family,
++		                 &(((struct sockaddr_in6*)sa)->sin6_addr),
++		                 buf, len);
++	}
++
+ struct nb_dns_info *
+ nb_dns_init(char *errstr)
+ {
+@@ -136,13 +148,12 @@ nb_dns_init(char *errstr)
+ 
+ 	for ( i = 0; i < _res.nscount; ++i )
+ 		{
+-		nd->server = _res.nsaddr_list[i];
+-
++		memcpy(&nd->server, &_res.nsaddr_list[i], sizeof(struct sockaddr_in));
+ 		/* XXX support IPv6 */
+-		if ( nd->server.sin_family != AF_INET )
++		if ( nd->server.ss_family != AF_INET )
+ 			continue;
+ 
+-		nd->s = socket(nd->server.sin_family, SOCK_DGRAM, 0);
++		nd->s = socket(nd->server.ss_family, SOCK_DGRAM, 0);
+ 
+ 		if ( nd->s < 0 )
+ 			{
+@@ -153,10 +164,14 @@ nb_dns_init(char *errstr)
+ 			}
+ 
+ 		if ( connect(nd->s, (struct sockaddr *)&nd->server,
+-		             sizeof(struct sockaddr)) < 0 )
++	                 nd->server.ss_family == AF_INET ?
++	                           sizeof(struct sockaddr_in) :
++	                           sizeof(struct sockaddr_in6)) < 0 )
+ 			{
+-			snprintf(errstr, NB_DNS_ERRSIZE, "connect(%s): %s",
+-			         inet_ntoa(nd->server.sin_addr), my_strerror(errno));
++			char s[INET6_ADDRSTRLEN];
++			sa_ntop((struct sockaddr*)&nd->server, s, INET6_ADDRSTRLEN);
++			snprintf(errstr, NB_DNS_ERRSIZE, "connect(%s): %s", s,
++			         my_strerror(errno));
+ 			close(nd->s);
+ 			free(nd);
+ 			return (NULL);
+@@ -170,6 +185,58 @@ nb_dns_init(char *errstr)
+ 	return (NULL);
+ }
+ 
++struct nb_dns_info *
++nb_dns_init2(char *errstr, struct sockaddr* sa)
++{
++	register struct nb_dns_info *nd;
++
++	nd = (struct nb_dns_info *)malloc(sizeof(*

@@ -1,0 +1,137 @@
+@@ -4,37 +4,6 @@
+ 
+ #define NAME_BUF_SIZE 64
+ 
+-/*
+-	RTTI Parsing Information
+-	MSVC(Microsoft visual studio compiler) rtti structure
+-	information:
+-*/
+-
+-typedef struct base_class_descriptor_t {
+-	//Type descriptor of current base class
+-	//type_descriptor* typeDescriptor;
+-
+-	//Number of direct bases
+-	//of this base class
+-	int numContainedBases;
+-
+-	//vftable offset
+-	int mdisp;
+-
+-	// vbtable offset
+-	int pdisp;
+-
+-	//displacement of the base class
+-	//vftable pointer inside the vbtable
+-	int vdisp;
+-
+-	//don't know what's this
+-	int attributes;
+-
+-	//class hierarchy descriptor
+-	//of this base class
+-	//class_hierarchy_descriptor* classDescriptor;
+-} base_class_descriptor;
+ 
+ typedef struct run_time_type_information_t {
+ 	ut64 vtable_start_addr;
+@@ -57,6 +26,17 @@ typedef struct rtti_class_hierarchy_descriptor_t {
+ 	ut64 base_class_array_addr;
+ } rtti_class_hierarchy_descriptor;
+ 
++typedef struct rtti_base_class_descriptor_t {
++	ut64 type_descriptor_addr;
++	ut32 num_contained_bases;
++	struct {
++		st32 mdisp; // member displacement
++		st32 pdisp; // vbtable displacement
++		st32 vdisp; // displacement inside vbtable
++	} where;
++	ut32 attributes;
++} rtti_base_class_descriptor;
++
+ typedef struct rtti_type_descriptor_t {
+ 	ut64 vtable_addr;
+ 	ut64 spare;
+@@ -108,6 +88,66 @@ static bool rtti_msvc_read_class_hierarchy_descriptor(RVTableContext *context, u
+ 	return true;
+ }
+ 
++static ut64 rtti_msvc_base_class_descriptor_size(RVTableContext *context) {
++	return context->word_size + 5 * sizeof (ut32);
++}
++
++static bool rtti_msvc_read_base_class_descriptor(RVTableContext *context, ut64 addr, rtti_base_class_descriptor *bcd) {
++	ut8 buf[sizeof (ut64) + 5 * sizeof (ut32)];
++	int bcdSize = (int) rtti_msvc_base_class_descriptor_size (context);
++	if (bcdSize > sizeof (buf)) {
++		return false;
++	}
++
++	if (!context->anal->iob.read_at (context->anal->iob.io, addr, buf, bcdSize)) {
++		return false;
++	}
++
++	ut32 (*read_at_32)(const void *src, size_t offset) = context->anal->big_endian ? r_read_at_be32 : r_read_at_le32;
++	bcd->type_descriptor_addr = r_read_ble (buf, (bool) context->anal->big_endian, context->word_size * 8);
++	size_t offset = context->word_size;
++	bcd->num_contained_bases = read_at_32 (buf, offset);
++	bcd->where.mdisp = read_at_32 (buf, offset + sizeof (ut32));
++	bcd->where.pdisp = read_at_32 (buf, offset + 2 * sizeof (ut32));
++	bcd->where.vdisp = read_at_32 (buf, offset + 3 * sizeof (ut32));
++	bcd->attributes = read_at_32 (buf, offset + 4 * sizeof (ut32));
++	return true;
++}
++
++static RList *rtti_msvc_read_base_class_array(RVTableContext *context, ut32 num_base_classes, ut64 addr) {
++	RList *ret = r_list_new ();
++	if (!ret) {
++		return NULL;
++	}
++	ret->free = free;
++
++	while (num_base_classes > 0) {
++		ut64 bcdAddr;
++		if (!context->read_addr (context->anal, addr, &bcdAddr)) {
++			break;
++		}
++		rtti_base_class_descriptor *bcd = malloc (sizeof (rtti_base_class_descriptor));
++		if (!bcd) {
++			break;
++		}
++		if (!rtti_msvc_read_base_class_descriptor (context, bcdAddr, bcd)) {
++			free (bcd);
++			break;
++		}
++		r_list_append (ret, bcd);
++		addr += context->word_size;
++		num_base_classes--;
++	}
++
++	if (num_base_classes > 0) {
++		// there was an error in the loop above
++		r_list_free (ret);
++		return NULL;
++	}
++
++	return ret;
++}
++
+ static bool rtti_msvc_read_type_descriptor(RVTableContext *context, ut64 addr, rtti_type_descriptor *td) {
+ 	if (!context->read_addr (context->anal, addr, &td->vtable_addr)) {
+ 		return false;
+@@ -116,7 +156,7 @@ static bool rtti_msvc_read_type_descriptor(RVTableContext *context, ut64 addr, r
+ 		return false;
+ 	}
+ 
+-	ut64 nameAddr = addr + 2*context->word_size;
++	ut64 nameAddr = addr + 2 * context->word_size;
+ 	ut8 buf[NAME_BUF_SIZE];
+ 	ut64 bufOffset = 0;
+ 	size_t nameLen = 0;
+@@ -161,47 +201,110 @@ static bool rtti_msvc_read_type_descriptor(RVTableContext *context, ut64 addr, r
+ 	return true;
+ }
+ 
++static void rtti_msvc_print_complete_object_locator (rtti_complete_object_locator *col, ut64 addr, cons

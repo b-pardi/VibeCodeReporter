@@ -1,0 +1,99 @@
+@@ -170,6 +170,7 @@ if conf.crypto_valid:
+     from cryptography.exceptions import InvalidTag
+     from cryptography.hazmat.backends import default_backend
+     from cryptography.hazmat.primitives.ciphers import (
++        aead,
+         Cipher,
+         algorithms,
+         modes,
+@@ -225,11 +226,18 @@ class CryptAlgo(object):
+         self.mode = mode
+         self.icv_size = icv_size
+ 
+-        if modes and self.mode is not None:
+-            self.is_aead = issubclass(self.mode,
+-                                      modes.ModeWithAuthenticationTag)
+-        else:
+-            self.is_aead = False
++        self.is_aead = False
++        # If using cryptography.hazmat.primitives.cipher.aead
++        self.ciphers_aead_api = False
++
++        if modes:
++            if self.mode is not None:
++                self.is_aead = issubclass(self.mode,
++                                          modes.ModeWithAuthenticationTag)
++            elif self.cipher in (aead.AESGCM, aead.AESCCM,
++                                 aead.ChaCha20Poly1305):
++                self.is_aead = True
++                self.ciphers_aead_api = True
+ 
+         if block_size is not None:
+             self.block_size = block_size
+@@ -339,36 +347,49 @@ class CryptAlgo(object):
+ 
+         return esp
+ 
+-    def encrypt(self, sa, esp, key, esn_en=False, esn=0):
++    def encrypt(self, sa, esp, key, icv_size=None, esn_en=False, esn=0):
+         """
+         Encrypt an ESP packet
+ 
+         :param sa:   the SecurityAssociation associated with the ESP packet.
+         :param esp:  an unencrypted _ESPPlain packet with valid padding
+         :param key:  the secret key used for encryption
++        :param icv_size: the length of the icv used for integrity check
+         :esn_en:     extended sequence number enable which allows to use 64-bit
+                      sequence number instead of 32-bit when using an AEAD
+                      algorithm
+         :esn:        extended sequence number (32 MSB)
+         :return:    a valid ESP packet encrypted with this algorithm
+         """
++        if icv_size is None:
++            icv_size = self.icv_size if self.is_aead else 0
+         data = esp.data_for_encryption()
+ 
+         if self.cipher:
+             mode_iv = self._format_mode_iv(algo=self, sa=sa, iv=esp.iv)
+-            cipher = self.new_cipher(key, mode_iv)
+-            encryptor = cipher.encryptor()
+-
++            aad = None
+             if self.is_aead:
+                 if esn_en:
+                     aad = struct.pack('!LLL', esp.spi, esn, esp.seq)
+                 else:
+                     aad = struct.pack('!LL', esp.spi, esp.seq)
+-                encryptor.authenticate_additional_data(aad)
+-                data = encryptor.update(data) + encryptor.finalize()
+-                data += encryptor.tag[:self.icv_size]
++            if self.ciphers_aead_api:
++                # New API
++                if self.cipher == aead.AESCCM:
++                    cipher = self.cipher(key, tag_length=icv_size)
++                else:
++                    cipher = self.cipher(key)
++                data = cipher.encrypt(mode_iv, data, aad)
+             else:
+-                data = encryptor.update(data) + encryptor.finalize()
++                cipher = self.new_cipher(key, mode_iv)
++                encryptor = cipher.encryptor()
++
++                if self.is_aead:
++                    encryptor.authenticate_additional_data(aad)
++                    data = encryptor.update(data) + encryptor.finalize()
++                    data += encryptor.tag[:icv_size]
++                else:
++                    data = encryptor.update(data) + encryptor.finalize()
+ 
+         return ESP(spi=esp.spi, seq=esp.seq, data=esp.iv + data)
+ 
+@@ -397,21 +418,33 @@ class CryptAlgo(object):
+ 
+         if self.cipher:
+             mode_iv = self._format_mode_iv(sa=sa, iv=iv)
+-            cipher = self.new_cipher(key, mode_iv, icv)
+-            decryptor = cipher.decryptor()
+-
++            aad = None
+             if 

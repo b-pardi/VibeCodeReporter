@@ -1,0 +1,152 @@
+@@ -246,6 +246,25 @@ static RBNode *list2rbtree(RList *relocs) {
+ 	return res;
+ }
+ 
++static void r_bin_object_rebuild_classes_ht(RBinObject *o) {
++	ht_pp_free (o->classes_ht);
++	ht_pp_free (o->methods_ht);
++	o->classes_ht = ht_pp_new0 ();
++	o->methods_ht = ht_pp_new0 ();
++
++	RListIter *it, *it2;
++	RBinClass *klass;
++	RBinSymbol *method;
++	r_list_foreach (o->classes, it, klass) {
++		ht_pp_insert (o->classes_ht, klass->name, klass);
++
++		r_list_foreach (klass->methods, it2, method) {
++			const char *name = sdb_fmt ("%s::%s", klass->name, method->name);
++			ht_pp_insert (o->methods_ht, name, method);
++		}
++	}
++}
++
+ R_API int r_bin_object_set_items(RBinFile *bf, RBinObject *o) {
+ 	r_return_val_if_fail (bf && o && o->plugin, false);
+ 
+@@ -355,6 +374,7 @@ R_API int r_bin_object_set_items(RBinFile *bf, RBinObject *o) {
+ 				// XXX we should probably merge them instead
+ 				r_list_free (o->classes);
+ 				o->classes = classes;
++				r_bin_object_rebuild_classes_ht (o);
+ 			}
+ 			isSwift = r_bin_lang_swift (bf);
+ 			if (isSwift) {
+
+
+
+
+@@ -303,6 +303,23 @@ typedef struct
+ 	uint32_t reExportsStartArrayIndex;
+ } cache_imgxtr_t;
+ 
++typedef struct
++{
++	uint32_t nlistOffset;
++	uint32_t nlistCount;
++	uint32_t stringsOffset;
++	uint32_t stringsSize;
++	uint32_t entriesOffset;
++	uint32_t entriesCount;
++} cache_locsym_info_t;
++
++typedef struct
++{
++	uint32_t dylibOffset;
++	uint32_t nlistStartIndex;
++	uint32_t nlistCount;
++} cache_locsym_entry_t;
++
+ #define DYLD_CACHE_SLIDE_PAGE_ATTRS 0xC000
+ #define DYLD_CACHE_SLIDE_PAGE_ATTR_EXTRA 0x8000
+ #define DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE 0x4000
+
+
+
+
+@@ -62,6 +62,15 @@ typedef struct {
+ 	ut32 entries_size;
+ } RDyldRebaseInfo1;
+ 
++typedef struct {
++	char *strings;
++	ut64 strings_size;
++	struct MACH0_(nlist) *nlists;
++	ut64 nlists_count;
++	cache_locsym_entry_t *entries;
++	ut64 entries_count;
++} RDyldLocSym;
++
+ typedef struct _r_dyldcache {
+ 	ut8 magic[8];
+ 	RList *bins;
+@@ -71,6 +80,7 @@ typedef struct _r_dyldcache {
+ 	cache_hdr_t *hdr;
+ 	cache_map_t *maps;
+ 	cache_accel_t *accel;
++	RDyldLocSym *locsym;
+ } RDyldCache;
+ 
+ typedef struct _r_bin_image {
+@@ -80,6 +90,8 @@ typedef struct _r_bin_image {
+ 
+ static RList * pending_bin_files = NULL;
+ 
++static ut64 va2pa(uint64_t addr, cache_hdr_t *hdr, cache_map_t *maps, RBuffer *cache_buf, ut64 slide, ut32 *offset, ut32 *left);
++
+ static void free_bin(RDyldBinImage *bin) {
+ 	if (!bin) {
+ 		return;
+@@ -138,6 +150,151 @@ static void rebase_info_free(RDyldRebaseInfo *rebase_info) {
+ 	}
+ }
+ 
++static RDyldLocSym *r_dyld_locsym_new(RBuffer *cache_buf, cache_hdr_t *hdr) {
++	if (!cache_buf || !hdr || !hdr->localSymbolsSize || !hdr->localSymbolsOffset) {
++		return NULL;
++	}
++
++	cache_locsym_info_t *info = NULL;
++	char *strings = NULL;
++	cache_locsym_entry_t *entries = NULL;
++	struct MACH0_(nlist) *nlists = NULL;
++
++	ut64 info_size = sizeof (cache_locsym_info_t);
++	info = R_NEW0 (cache_locsym_info_t);
++	if (!info) {
++		goto beach;
++	}
++	if (r_buf_fread_at (cache_buf, hdr->localSymbolsOffset, (ut8*) info, "6i", 1) != info_size) {
++		goto beach;
++	}
++
++	ut64 nlists_size = sizeof (struct MACH0_(nlist)) * info->nlistCount;
++	nlists = R_NEWS0 (struct MACH0_(nlist), info->nlistCount);
++	if (!nlists) {
++		goto beach;
++	}
++	if (r_buf_fread_at (cache_buf, hdr->localSymbolsOffset + info->nlistOffset, (ut8*) nlists, "iccsl",
++			info->nlistCount) != nlists_size) {
++		goto beach;
++	}
++
++	strings = malloc (info->stringsSize);
++	if (!strings) {
++		goto beach;
++	}
++	if (r_buf_read_at (cache_buf, hdr->localSymbolsOffset + info->stringsOffset, (ut8*) strings,
++			info->stringsSize) != info->stringsSize) {
++		goto beach;
++	}
++
++	ut64 entries_size = sizeof (cache_locsym_entry_t) * info->entriesCount;
++	entries = R_NEWS0 (cache_locsym_entry_t, info->entriesCount);
++	if (!entries) {
++		goto beach;
++	}
++	if (r_buf_fread_at (cache_buf, hdr->localSymbolsOffset + info->entriesOffset, (ut8*) entries, "3i",
++			info->entriesCount) != entries_size) {
++		goto beach;
++	}
++
++	RDyldLocSym * locsym = R_NEW0 

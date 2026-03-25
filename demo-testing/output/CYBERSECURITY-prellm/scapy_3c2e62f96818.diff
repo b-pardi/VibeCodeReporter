@@ -1,0 +1,143 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,773 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++# This file is part of Scapy
++# See https://scapy.net/ for more information
++
++# scapy.contrib.description = Postgres PSQL Binary Protocol
++# scapy.contrib.status = loads
++
++import struct
++
++from scapy.compat import Optional, Callable, Any, \
++    Tuple  # noqa: F401
++from scapy.fields import (
++    ByteField,
++    CharEnumField,
++    Field,
++    FieldLenField,
++    FieldListField,
++    IntEnumField,
++    PacketListField,
++    ShortField,
++    SignedIntField,
++    SignedShortField,
++    StrField,
++    StrLenField,
++    StrNullField,
++)
++from scapy.packet import Packet, bind_layers
++from scapy.layers.inet import TCP
++
++AUTH_CODES = {
++    0: "AuthenticationOk",
++    1: "AuthenticationKerberosV4",
++    2: "AuthenticationKerberosV5",
++    3: "AuthenticationCleartextPassword",
++    4: "AuthenticationCryptPassword",
++    5: "AuthenticationMD5Password",
++    6: "AuthenticationSCMCredential",
++    7: "AuthenticationGSS",
++    8: "AuthenticationGSSContinue",
++    9: "AuthenticationSSPI",
++    10: "AuthenticationSASL",
++    11: "AuthenticationSASLContinue",
++    12: "AuthenticationSASLFinal",
++}
++
++
++class KeepAlive(Packet):
++    name = "Keep Alive"
++    fields_desc = [
++        SignedIntField("len", 4),
++    ]
++
++
++class SSLRequest(Packet):
++    name = "SSL request code message"
++    fields_desc = [
++        FieldLenField("length", None, fmt="I"),
++        SignedIntField("request_code", 80877103),
++    ]
++
++
++class _DictStrField(StrField):
++    """Takes a dictionary as an argument and packs back into a byte string."""
++
++    def i2m(self, pkt, x):
++        if isinstance(x, bytes):
++            return x
++        if isinstance(x, dict):
++            result = bytes()
++            for k, v in x.items():
++                result += k + b"\x00" + v + b"\x00"
++            return result + b"\x00"
++        else:
++            return super(_DictStrField, self).i2m(pkt, x)
++
++    def i2len(self, pkt, x):
++        # type: (Optional[Packet], Any) -> int
++        if x is None:
++            return 0
++        return len(self.i2m(pkt, x))
++
++
++class Startup(Packet):
++    name = "Startup Request Packet"
++    fields_desc = [
++        FieldLenField(
++            "len", None, length_of="options",
++            fmt="I", adjust=lambda pkt, x: x + 8
++        ),
++        ShortField("protocol_version_major", 3),
++        ShortField("protocol_version_minor", 0),
++        _DictStrField("options", None),
++    ]
++
++
++class _FieldsLenField(Field[int, int]):
++    """Same as FieldLenField but takes a tuple of fields for length_of."""
++
++    __slots__ = ["length_of", "adjust"]
++
++    def __init__(
++        self,
++        name,  # type: str
++        default,  # type: Optional[Any]
++        length_of=None,  # type: Optional[Tuple[str]]
++        fmt="H",  # type: str
++        adjust=lambda pkt, x: x,  # type: Callable[[Packet, int], int]
++    ):
++        # type: (...) -> None
++        super(_FieldsLenField, self).__init__(name, default, fmt)
++        self.length_of = length_of
++        self.adjust = adjust
++
++    def i2m(self, pkt, x):
++        # type: (Optional[Packet], Optional[int]) -> int
++        if x is None and pkt is not None:
++            if self.length_of is not None:
++                f = 0
++                for length_of_field in self.length_of:
++                    fld, fval = pkt.getfield_and_val(length_of_field)
++                    f += fld.i2len(pkt, fval)
++            else:
++                raise ValueError(
++                    "Field should have either length_of or count_of")
++            x = self.adjust(pkt, f)
++        elif x is None:
++            x = 0
++        return x
++
++
++def determine_pg_field(pkt, lst, cur, remain):
++    key = b""
++    if remain:
++        key = remain[0:1]  # Python 2/3 compat
++    if key in pkt.cls_mapping:
++        return pkt.cls_mapping[key]
++    elif remain[0:1] == b"\x00" and len(remain) >= 4:
++        length = struct.unpack("!I", remain[0:

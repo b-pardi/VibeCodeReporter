@@ -1,0 +1,172 @@
+@@ -1,5 +1,7 @@
+ // See the file "COPYING" in the main distribution directory for copyright.
+ 
++#include <unistd.h>
++
+ #include "zeek/script_opt/ProfileFunc.h"
+ #include "zeek/Desc.h"
+ #include "zeek/Stmt.h"
+@@ -9,27 +11,97 @@
+ namespace zeek::detail {
+ 
+ 
+-TraversalCode ProfileFunc::PreStmt(const Stmt* s)
++// Computes the profiling hash of a Obj based on its (deterministic)
++// description.
++p_hash_type p_hash(const Obj* o)
++	{
++	ODesc d;
++	d.SetDeterminism(true);
++	o->Describe(&d);
++	return p_hash(d.Description());
++	}
++
++std::string script_specific_filename(const StmtPtr& body)
++	{
++	// The specific filename is taken from the location filename, making
++	// it absolute if necessary.
++	auto body_loc = body->GetLocationInfo();
++	auto bl_f = body_loc->filename;
++	ASSERT(bl_f != nullptr);
++
++	if ( bl_f[0] == '.' &&
++	     (bl_f[1] == '/' || (bl_f[1] == '.' && bl_f[2] == '/')) )
++		{
++		// Add working directory to avoid collisions over the
++		// same relative name.
++		static std::string working_dir;
++		if ( working_dir.size() == 0 )
++			{
++			char buf[8192];
++			getcwd(buf, sizeof buf);
++			working_dir = buf;
++			}
++
++		return working_dir + "/" + bl_f;
++		}
++
++	return bl_f;
++	}
++
++p_hash_type script_specific_hash(const StmtPtr& body, p_hash_type generic_hash)
+ 	{
+-	++num_stmts;
++	auto bl_f = script_specific_filename(body);
++	return merge_p_hashes(generic_hash, p_hash(bl_f));
++	}
+ 
+-	auto tag = s->Tag();
+ 
+-	if ( compute_hash )
+-		UpdateHash(int(tag));
++ProfileFunc::ProfileFunc(const Func* func, const StmtPtr& body)
++	{
++	Profile(func->GetType().get(), body);
++	}
+ 
+-	if ( tag == STMT_INIT )
++ProfileFunc::ProfileFunc(const Expr* e)
++	{
++	if ( e->Tag() == EXPR_LAMBDA )
+ 		{
++		auto func = e->AsLambdaExpr();
++
++		for ( auto oid : func->OuterIDs() )
++			captures.insert(oid);
++
++		Profile(func->GetType()->AsFuncType(), func->Ingredients().body);
++		}
++
++	else
++		// We don't have a function type, so do the traversal
++		// directly.
++		e->Traverse(this);
++	}
++
++void ProfileFunc::Profile(const FuncType* ft, const StmtPtr& body)
++	{
++	num_params = ft->Params()->NumFields();
++	TrackType(ft);
++	body->Traverse(this);
++	}
++
++TraversalCode ProfileFunc::PreStmt(const Stmt* s)
++	{
++	stmts.push_back(s);
++
++	switch ( s->Tag() ) {
++	case STMT_INIT:
+ 		for ( const auto& id : s->AsInitStmt()->Inits() )
++			{
+ 			inits.insert(id.get());
++			TrackType(id->GetType());
++			}
+ 
+-		// Don't recurse into these, as we don't want to consider
+-		// a local that only appears in an initialization as a
+-		// relevant local.
++		// Don't traverse further into the statement, since we
++		// don't want to view the identifiers as locals unless
++		// they're also used elsewhere.
+ 		return TC_ABORTSTMT;
+-		}
+ 
+-	switch ( tag ) {
+ 	case STMT_WHEN:
+ 		++num_when_stmts;
+ 
+@@ -39,7 +111,8 @@ TraversalCode ProfileFunc::PreStmt(const Stmt* s)
+ 
+ 		// It doesn't do any harm for us to re-traverse the
+ 		// conditional, so we don't bother hand-traversing the
+-		// rest of the when but just let the usual processing do it.
++		// rest of the "when", but just let the usual processing
++		// do it.
+ 		break;
+ 
+ 	case STMT_FOR:
+@@ -67,15 +140,24 @@ TraversalCode ProfileFunc::PreStmt(const Stmt* s)
+ 		// incomplete list of locals that need to be tracked.
+ 
+ 		auto sw = s->AsSwitchStmt();
++		bool is_type_switch = false;
++
+ 		for ( auto& c : *sw->Cases() )
+ 			{
+ 			auto idl = c->TypeCases();
+-			if ( idl ) 
++			if ( idl )
+ 				{
+ 				for ( auto id : *idl )
+ 					locals.insert(id);
++
++				is_type_switch = true;
+ 				}
+ 			}
++
++		if ( is_type_switch )
++			type_switches.insert(sw);
++		else
++			expr_switches.insert(sw);
+ 		}
+ 		break;
+ 
+@@ -88,37 +170,74 @@ TraversalCode ProfileFunc::PreStmt(const Stmt* s)
+ 
+ TraversalCode ProfileFunc::PreExpr(const Expr* e)
+ 	{
+-	++num_exprs;
++	exprs.push_back(e);
+ 
+-	auto tag = e->Tag();
++	TrackType(e->GetType());
+ 
+-	if ( compute_hash )
+-		UpdateHash(int(tag));
+-
+-	switch ( tag ) {
++	switch ( e->Tag() ) {
+ 	case EXPR_CONST:
+-		if ( compute_hash )
+-			{
+-			

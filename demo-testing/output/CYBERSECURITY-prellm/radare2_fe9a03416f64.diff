@@ -1,0 +1,140 @@
+@@ -1,6 +1,7 @@
+ /* radare - LGPL - Copyright 2009-2018 - pancake, jduck, TheLemonMan, saucec0de */
+ 
+ #include <r_debug.h>
++#include <r_drx.h>
+ #include <r_core.h>
+ #include <signal.h>
+ 
+@@ -45,6 +46,13 @@ R_API void r_debug_bp_update(RDebug *dbg) {
+ 	}
+ }
+ 
++static int r_debug_drx_at(RDebug *dbg, ut64 addr) {
++	if (dbg && dbg->h && dbg->h->drx) {
++		return dbg->h->drx (dbg, 0, addr, 0, 0, 0, DRX_API_GET_BP);
++	}
++	return -1;
++}
++
+ /*
+  * Recoiling after a breakpoint has two stages:
+  * 1. remove the breakpoint and fix the program counter.
+@@ -102,6 +110,12 @@ static int r_debug_bp_hit(RDebug *dbg, RRegItem *pc_ri, ut64 pc, RBreakpointItem
+ 			/* Some targets set pc to breakpoint */
+ 			b = r_bp_get_at (dbg->bp, pc);
+ 			if (!b) {
++				/* handle the case of hw breakpoints - notify the user */
++				int drx_reg_idx = r_debug_drx_at (dbg, pc);
++				if (drx_reg_idx != -1) {
++					eprintf ("hit hardware breakpoint %d at: %" PFMT64x "\n",
++						drx_reg_idx, pc);
++				}
+ 				/* Couldn't find the break point. Nothing more to do... */
+ 				return true;
+ 			}
+@@ -1613,20 +1627,20 @@ R_API int r_debug_map_protect(RDebug *dbg, ut64 addr, int size, int perms) {
+ 
+ R_API void r_debug_drx_list(RDebug *dbg) {
+ 	if (dbg && dbg->h && dbg->h->drx) {
+-		dbg->h->drx (dbg, 0, 0, 0, 0, 0);
++		dbg->h->drx (dbg, 0, 0, 0, 0, 0, DRX_API_LIST);
+ 	}
+ }
+ 
+ R_API int r_debug_drx_set(RDebug *dbg, int idx, ut64 addr, int len, int rwx, int g) {
+ 	if (dbg && dbg->h && dbg->h->drx) {
+-		return dbg->h->drx (dbg, idx, addr, len, rwx, g);
++		return dbg->h->drx (dbg, idx, addr, len, rwx, g, DRX_API_SET_BP);
+ 	}
+ 	return false;
+ }
+ 
+ R_API int r_debug_drx_unset(RDebug *dbg, int idx) {
+ 	if (dbg && dbg->h && dbg->h->drx) {
+-		return dbg->h->drx (dbg, idx, 0, -1, 0, 0);
++		return dbg->h->drx (dbg, idx, 0, -1, 0, 0, DRX_API_REMOVE_BP);
+ 	}
+ 	return false;
+ }
+
+
+
+
+@@ -2,6 +2,7 @@
+ 
+ #include <r_userconf.h>
+ #include <r_debug.h>
++#include <r_drx.h>
+ #include <r_asm.h>
+ #include <r_core.h>
+ #include <r_reg.h>
+@@ -1506,9 +1507,14 @@ static int r_debug_native_init (RDebug *dbg) {
+ #endif
+ }
+ 
+-static int r_debug_native_drx (RDebug *dbg, int n, ut64 addr, int sz, int rwx, int g) {
++static void sync_drx_regs (RDebug *dbg, drxt *regs, size_t num_regs) {
+ #if __i386__ || __x86_64__
+-	drxt regs[8] = {0};
++	/* sanity check, we rely on this assumption */
++	if (num_regs != NUM_DRX_REGISTERS) {
++		eprintf ("drx: Unsupported number of registers for get_debug_regs\n");
++		return;
++	}
++
+ 	// sync drx regs
+ #define R dbg->reg
+ 	regs[0] = r_reg_getv (R, "dr0");
+@@ -1522,24 +1528,64 @@ static int r_debug_native_drx (RDebug *dbg, int n, ut64 addr, int sz, int rwx, i
+ */
+ 	regs[6] = r_reg_getv (R, "dr6");
+ 	regs[7] = r_reg_getv (R, "dr7");
++#else
++	eprintf ("drx sync_drx_regs: Unsupported platform\n");
++#endif
++}
+ 
+-	if (sz == 0) {
+-		drx_list ((drxt*)&regs);
+-		return false;
+-	}
+-	if (sz < 0) { // remove
+-		drx_set (regs, n, addr, -1, 0, 0);
+-	} else {
+-		drx_set (regs, n, addr, sz, rwx, g);
++static void set_drx_regs (RDebug *dbg, drxt *regs, size_t num_regs) {
++#if __i386__ || __x86_64__
++	/* sanity check, we rely on this assumption */
++	if (num_regs != NUM_DRX_REGISTERS){
++		eprintf ("drx: Unsupported number of registers for get_debug_regs\n");
++		return;
+ 	}
+-	r_reg_setv (R, "dr0", regs[0]);
++
++#define R dbg->reg
++ 	r_reg_setv (R, "dr0", regs[0]);
+ 	r_reg_setv (R, "dr1", regs[1]);
+ 	r_reg_setv (R, "dr2", regs[2]);
+ 	r_reg_setv (R, "dr3", regs[3]);
+ 	r_reg_setv (R, "dr6", regs[6]);
+ 	r_reg_setv (R, "dr7", regs[7]);
++#else
++	eprintf ("drx set_drx_regs: Unsupported platform\n");
++#endif
++}
+ 
+-	return true;
++static int r_debug_native_drx (RDebug *dbg, int n, ut64 addr, int sz, int rwx, int g, int api_type) {
++#if __i386__ || __x86_64__
++	int retval = false;
++	drxt regs[NUM_DRX_REGISTERS] = {0};
++	// sync drx regs
++	sync_drx_regs (dbg, regs, NUM_DRX_REGISTERS);
++
++	switch (api_type) {
++	case DRX_API_LIST:
++		drx_list (regs);
++		retval = false;
++	case DRX_API_GET_BP:
++		/* get the index of th

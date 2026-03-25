@@ -1,0 +1,182 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,690 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/Stmt.h"
++#include "zeek/Desc.h"
++#include "zeek/Reporter.h"
++#include "zeek/script_opt/Reduce.h"
++#include "zeek/script_opt/UseDefs.h"
++#include "zeek/script_opt/ScriptOpt.h"
++
++
++namespace zeek::detail {
++
++
++void UseDefSet::Dump() const
++	{
++	for ( const auto& u : IterateOver() )
++		printf(" %s", u->Name());
++	}
++
++
++UseDefs::UseDefs(StmtPtr _body, std::shared_ptr<Reducer> _rc)
++	{
++	body = std::move(_body);
++	rc = std::move(_rc);
++	}
++
++
++void UseDefs::Analyze()
++	{
++	// Start afresh.
++	use_defs_map.clear();
++	UDs_are_copies.clear();
++	stmts.clear();
++	successor.clear();
++	successor2.clear();
++
++	(void) PropagateUDs(body, nullptr, nullptr, false);
++	}
++
++void UseDefs::RemoveUnused()
++	{
++	int iter = 0;
++	while ( RemoveUnused(++iter) )
++		{
++		body = rc->Reduce(body);
++		Analyze();
++
++		if ( reporter->Errors() > 0 )
++			break;
++		}
++	}
++
++void UseDefs::Dump()
++	{
++	for ( int i = stmts.size(); --i >= 0; )
++		{
++		const auto& s = stmts[i];
++		auto uds = FindUsage(s);
++		auto are_copies =
++			(UDs_are_copies.find(s) != UDs_are_copies.end());
++
++		printf("UDs (%s) for %s:\n", are_copies ? "copy" : "orig",
++			obj_desc(s).c_str());
++
++		if ( uds )
++			uds->Dump();
++		else
++			printf(" <none>");
++
++		printf("\n\n");
++		}
++	}
++
++bool UseDefs::RemoveUnused(int iter)
++	{
++	rc->ResetAlteredStmts();
++
++	bool did_omission = false;
++
++	for ( unsigned int i = 0; i < stmts.size(); ++i )
++		{
++		const auto& s = stmts[i];
++
++		if ( s->Tag() == STMT_INIT )
++			{
++			auto init = s->AsInitStmt();
++			const auto& inits = init->Inits();
++			std::vector<IDPtr> used_ids;
++
++			for ( auto id : inits )
++				if ( is_atomic_type(id->GetType()) ||
++				     ! CheckIfUnused(s, id.get(), false) )
++					used_ids.emplace_back(id);
++
++			if ( used_ids.size() == 0 )
++				{ // There aren't any ID's to keep.
++				rc->AddStmtToOmit(s);
++				continue;
++				}
++
++			if ( used_ids.size() < inits.size() )
++				{
++				// Need to replace the current Init statement
++				// with one that only includes the actually
++				// used identifiers.
++
++				auto new_init = make_intrusive<InitStmt>(used_ids);
++				rc->AddStmtToReplace(s, std::move(new_init));
++				}
++
++			continue;
++			}
++
++		// The only other statements we might revise or remove
++		// are assignments.
++
++		if ( s->Tag() != STMT_EXPR )
++			continue;
++
++		auto s_e = s->AsExprStmt();
++		auto e = s_e->StmtExpr();
++
++		if ( e->Tag() != EXPR_ASSIGN )
++			continue;
++
++		auto a = e->AsAssignExpr();
++		auto r = a->GetOp1();
++
++		// Because we're dealing with reduced statements, the
++		// assignment expression should be to a simple variable.
++		if ( r->Tag() != EXPR_REF )
++			reporter->InternalError("lhs ref inconsistency in UseDefs::FindUnused");
++
++		auto n = r->AsRefExprPtr()->GetOp1();
++		if ( n->Tag() != EXPR_NAME )
++			reporter->InternalError("lhs name inconsistency in UseDefs::FindUnused");
++
++		auto id = n->AsNameExpr()->Id();
++
++		auto rhs = a->GetOp2();
++		auto rt = rhs->Tag();
++
++		if ( rt == EXPR_CALL && ! rhs->IsPure() )
++			// Need to do the call for the side effects.
++			// Could prune out the assignment and just
++			// keep the call, but not clear that that's
++			// worth the complexity.
++			continue;
++
++		if ( rt == EXPR_EVENT || rt == EXPR_SCHEDULE )
++			// These always have side effects.
++			continue;
++
++		// Check for degenerate assignment "x = x".
++		bool degen = rt == EXPR_NAME && id == rhs->AsNameExpr()->Id();
++
++		if ( CheckIfUnused(s, id, iter == 1) || degen )
++			{
++			rc->AddStmtToOmit(s);
++			did_omission = true;
++			}
++		}
++
++	return did_omission;
++	}
++
++bool UseDefs::CheckIfUnused(const Stmt* s, const ID* id, bool report)
++	{
++	if ( id->IsGlobal() )
++		return false;
++
++	auto uds = FindSuccUsage(s);
++	if ( ! uds || ! uds->HasID(id) )
++		{
++		if ( report && analysis_options.usage_issues > 0 &&
++		     ! rc->IsTemporary(id) && ! rc->IsConstantVar(id) &&
++		     ! 

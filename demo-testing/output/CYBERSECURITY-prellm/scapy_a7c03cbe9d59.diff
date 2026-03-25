@@ -1,0 +1,137 @@
+@@ -122,7 +122,7 @@ class BGPFieldIPv4(Field):
+         return self.i2h(pkt, i)
+ 
+     def i2len(self, pkt, i):
+-        mask, ip = i
++        mask, _ = i
+         return self.mask2iplen(mask) + 1
+ 
+     def i2m(self, pkt, i):
+@@ -198,56 +198,122 @@ def has_extended_length(flags):
+     return flags & _BGP_PA_EXTENDED_LENGTH == _BGP_PA_EXTENDED_LENGTH
+ 
+ 
++def detect_add_path_prefix46(s, max_bit_length):
++    """
++    Detect IPv4/IPv6 prefixes conform to BGP Additional Path but NOT conform
++    to standard BGP..
++
++    This is an adapted version of wireshark's detect_add_path_prefix46
++    https://github.com/wireshark/wireshark/blob/ed9e958a2ed506220fdab320738f1f96a3c2ffbb/epan/dissectors/packet-bgp.c#L2905
++    Kudos to them !
++    """
++    # Must be compatible with BGP Additional Path
++    i = 0
++    while i + 4 < len(s):
++        i += 4
++        prefix_len = orb(s[i])
++        if prefix_len > max_bit_length:
++            return False
++        addr_len = (prefix_len + 7) // 8
++        i += 1 + addr_len
++        if i > len(s):
++            return False
++        if prefix_len % 8:
++            if orb(s[i - 1]) & (0xFF >> (prefix_len % 8)):
++                return False
++    # Must NOT be compatible with standard BGP
++    i = 0
++    while i + 4 < len(s):
++        prefix_len = orb(s[i])
++        if prefix_len == 0 and len(s) > 1:
++            return True
++        if prefix_len > max_bit_length:
++            return True
++        addr_len = (prefix_len + 7) // 8
++        i += 1 + addr_len
++        if i > len(s):
++            return True
++        if prefix_len % 8:
++            if orb(s[i - 1]) & (0xFF >> (prefix_len % 8)):
++                return True
++    return False
++
++
+ class BGPNLRI_IPv4(Packet):
+     """
+     Packet handling IPv4 NLRI fields.
+     """
+-
+     name = "IPv4 NLRI"
+     fields_desc = [BGPFieldIPv4("prefix", "0.0.0.0/0")]
+ 
++    def default_payload_class(self, payload):
++        return conf.padding_layer
++
+ 
+ class BGPNLRI_IPv6(Packet):
+     """
+     Packet handling IPv6 NLRI fields.
+     """
+-
+     name = "IPv6 NLRI"
+     fields_desc = [BGPFieldIPv6("prefix", "::/0")]
+ 
++    def default_payload_class(self, payload):
++        return conf.padding_layer
++
++
++class BGPNLRI_IPv4_AP(BGPNLRI_IPv4):
++    """
++    Packet handling IPv4 NLRI fields WITH BGP ADDITIONAL PATH
++    """
++
++    name = "IPv4 NLRI (Additional Path)"
++    fields_desc = [IntField("nlri_path_id", 0),
++                   BGPFieldIPv4("prefix", "0.0.0.0/0")]
++
++
++class BGPNLRI_IPv6_AP(BGPNLRI_IPv6):
++    """
++    Packet handling IPv6 NLRI fields WITH BGP ADDITIONAL PATH
++    """
++
++    name = "IPv6 NLRI (Additional Path)"
++    fields_desc = [IntField("nlri_path_id", 0),
++                   BGPFieldIPv6("prefix", "::/0")]
++
+ 
+ class BGPNLRIPacketListField(PacketListField):
+     """
+     PacketListField handling NLRI fields.
+     """
++    __slots__ = ["max_bit_length", "cls_group", "no_length"]
+ 
+-    def getfield(self, pkt, s):
+-        lst = []
+-        length = None
+-        ret = b""
+-
+-        if self.length_from is not None:
+-            length = self.length_from(pkt)
++    def __init__(self, name, default, ip_mode, **kwargs):
++        super(BGPNLRIPacketListField, self).__init__(
++            name, default, Packet, **kwargs
++        )
++        self.max_bit_length, self.cls_group = {
++            "IPv4": (32, [BGPNLRI_IPv4, BGPNLRI_IPv4_AP]),
++            "IPv6": (128, [BGPNLRI_IPv6, BGPNLRI_IPv6_AP]),
++        }[ip_mode]
++        self.no_length = "length_from" not in kwargs
+ 
+-        if length is not None:
+-            remain, ret = s[:length], s[length:]
+-        else:
++    def getfield(self, pkt, s):
++        if self.no_length:
+             index = s.find(_BGP_HEADER_MARKER)
++            if index == 0:
++                return s, []
+             if index != -1:
+-                remain = s[:index]
+-                ret = s[index:]
+-            else:
+-                remain = s
+-
+-        while remain:
+-            mask_length_in_bits = orb(remain[0])

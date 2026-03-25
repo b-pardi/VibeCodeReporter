@@ -1,0 +1,177 @@
+@@ -420,6 +420,7 @@ static int arm64_reg_width(int reg) {
+ 	case ARM64_REG_S28:
+ 	case ARM64_REG_S29:
+ 	case ARM64_REG_S30:
++	case ARM64_REG_S31:
+ 		return 32;
+ 		break;
+ 	default:
+@@ -523,6 +524,68 @@ static const char *vas_name(arm64_vas vas) {
+ 	}
+ }
+ 
++static const int vas_size(arm64_vas vas) {
++	switch (vas) {
++	case ARM64_VAS_8B:
++	case ARM64_VAS_16B:
++		return 8;
++	case ARM64_VAS_4H:
++	case ARM64_VAS_8H:
++		return 16;
++	case ARM64_VAS_2S:
++	case ARM64_VAS_4S:
++		return 32;
++	case ARM64_VAS_2D:
++	case ARM64_VAS_1D:
++		return 64;
++	case ARM64_VAS_1Q:
++		return 128;
++#if CS_API_MAJOR > 4
++	case ARM64_VAS_1B:
++	case ARM64_VAS_4B:
++		return 8;
++	case ARM64_VAS_2H:
++	case ARM64_VAS_1H:
++		return 16;
++	case ARM64_VAS_1S:
++		return 32;
++#endif
++	default:
++		return 64;
++	}
++}
++
++static const int vas_count(arm64_vas vas) {
++	switch (vas) {
++	case ARM64_VAS_16B:
++		return 16;
++	case ARM64_VAS_8B:
++	case ARM64_VAS_8H:
++		return 8;
++	case ARM64_VAS_4S:
++	case ARM64_VAS_4H:
++		return 4;
++	case ARM64_VAS_2D:
++	case ARM64_VAS_2S:
++		return 2;
++	case ARM64_VAS_1D:
++	case ARM64_VAS_1Q:
++		return 1;
++#if CS_API_MAJOR > 4
++	case ARM64_VAS_4B:
++		return 4;
++	case ARM64_VAS_2H:
++		return 2;
++	case ARM64_VAS_1B:
++	case ARM64_VAS_1H:
++	case ARM64_VAS_1S:
++		return 1;
++#endif
++	default:
++		return 64;
++	}
++}
++
+ #if CS_API_MAJOR == 4
+ static const char *vess_name(arm64_vess vess) {
+ 	switch (vess) {
+@@ -540,6 +603,23 @@ static const char *vess_name(arm64_vess vess) {
+ }
+ #endif
+ 
++#if CS_API_MAJOR == 4
++static const int vess_size(arm64_vess vess) {
++	switch (vess) {
++	case ARM64_VESS_B:
++		return 8;
++	case ARM64_VESS_H:
++		return 16;
++	case ARM64_VESS_S:
++		return 32;
++	case ARM64_VESS_D:
++		return 64;
++	default:
++		return 64;
++	}
++}
++#endif
++
+ static void opex64(RStrBuf *buf, csh handle, cs_insn *insn) {
+ 	int i;
+ 	PJ *pj = pj_new ();
+@@ -791,6 +871,16 @@ static int regsize64(cs_insn *insn, int n) {
+ #define REGSIZE64(x) regsize64 (insn, x)
+ #define REGSIZE32(x) regsize32 (insn, x)
+ 
++static int vector_size(cs_arm64_op *op) {
++	if (op->vess) {
++		return vess_size(op->vess);
++	} else if (op->vas) {
++		return vas_size(op->vas);
++	} else {
++		return 64;
++	}
++}
++
+ // return postfix
+ const char* arm_prefix_cond(RAnalOp *op, int cond_type) {
+ 	const char *close_cond[2];
+@@ -907,26 +997,90 @@ static const char *arg(RAnal *a, csh *handle, cs_insn *insn, char *buf, int n) {
+ 
+ #define ARG(x) arg(a, handle, insn, str[x], x)
+ 
+-#define SHIFTED_REG64_APPEND(sb, n) shifted_reg64_append(sb, handle, insn, n)
++#define VEC64(n) insn->detail->arm64.operands[n].vess
++#define VEC64_APPEND(sb, n, i) vector64_append(sb, handle, insn, n, i)
++#define VEC64_MASK(sh, sz) (bitmask_by_width[63]^(bitmask_by_width[sz-1]<<sh))
++
++static void vector64_append(RStrBuf *sb, csh *handle, cs_insn *insn, int n, int i) {
++	cs_arm64_op op = INSOP64 (n);
++
++	if (op.vector_index != -1) {
++		i = op.vector_index;
++	}
++
++	if ((op.vess || op.vas) && i != -1) {
++		int size = vector_size(&op);
++		int shift = i * size;
++		char *regc = "l";
++		if (shift >= 64) {
++			shift -= 64;
++			regc = "h";
++		}
++
++		if (shift > 0) {
++			r_strbuf_appendf (sb, "0x%"PFMT64x",%d,%s%s,>>,&", 
++				bitmask_by_width[size-1], shift, REG64 (n), regc);
++		} else {
++			r_strbuf_appendf (sb, "0x%"PFMT64x",%s%s,&", 
++				bitmask_by_width[size-1], REG64 (n), regc);
++		}
++	} else {
++		r_strbuf_appendf (sb, "%s", REG64 (n));
++	}
++}
++
++#define VEC64_DST_APPEND(sb, n, i) vector64_dst_append(sb, handle, insn, n, i)
++
++static void vector64_dst_append(RStrBuf *sb, csh *handle, cs_insn *insn, int n, int i) {
++	cs_arm64_op op = INSOP64 (n);
++
++	if (op.vector_index != -1) {
++		i = op.vector_index;
++	}
++
++	if ((op.vess || op.vas) && i != -1) {
++		int size = vector_size(&op);
++		int shift = i * size;
++		char *regc = "l";
++		ut64 mask = bitmask_by_width[size-1];
++		if (shift >= 64) {
++			shift -= 64;
++			regc = "h";
++		}
++
++		if (shift > 0) {
++			r_strbuf_appendf (sb, "%d,SWAP,0x%"PFMT64x",&,<<,%s%s,0x%"PFMT64x",&,|,%s%s", 
++				shi

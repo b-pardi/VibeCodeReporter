@@ -1,0 +1,128 @@
+@@ -8,7 +8,7 @@ from __future__ import absolute_import
+ from scapy.config import conf
+ from scapy.error import Scapy_Exception, warning
+ from scapy.data import ARPHDR_LOOPBACK, ARPHDR_ETHER
+-from scapy.arch.common import get_if, get_bpf_pointer
++from scapy.arch.common import get_if, compile_filter
+ from scapy.consts import LOOPBACK_NAME
+ 
+ from scapy.arch.bpf.consts import BIOCSETF, SIOCGIFFLAGS, BIOCSETIF
+@@ -98,23 +98,9 @@ def get_dev_bpf():
+     raise Scapy_Exception("No /dev/bpf handle is available !")
+ 
+ 
+-def attach_filter(fd, iface, bpf_filter_string):
++def attach_filter(fd, bpf_filter, iface):
+     """Attach a BPF filter to the BPF file descriptor"""
+-
+-    # Retrieve the BPF byte code in decimal
+-    cmd_fmt = "%s -p -i %s -ddd -s 1600 '%s'"
+-    command = cmd_fmt % (conf.prog.tcpdump, iface, bpf_filter_string)
+-    try:
+-        f = os.popen(command)
+-    except OSError as msg:
+-        raise Scapy_Exception("Failed to execute tcpdump: (%s)" % msg)
+-
+-    # Convert the byte code to a BPF program structure
+-    lines = f.readlines()
+-    if lines == []:
+-        raise Scapy_Exception("Got an empty BPF filter from tcpdump !")
+-
+-    bp = get_bpf_pointer(lines)
++    bp = compile_filter(bpf_filter, iface)
+     # Assign the BPF program to the interface
+     ret = LIBC.ioctl(c_int(fd), BIOCSETF, cast(pointer(bp), c_char_p))
+     if ret < 0:
+
+
+
+
+@@ -110,7 +110,7 @@ class _L2bpfSocket(SuperSocket):
+                 else:
+                     filter = "not (%s)" % conf.except_filter
+             if filter is not None:
+-                attach_filter(self.ins, self.iface, filter)
++                attach_filter(self.ins, filter, self.iface)
+ 
+         # Set the guessed packet class
+         self.guessed_cls = self.guess_cls()
+
+
+
+
+@@ -10,6 +10,7 @@ Functions common to different architectures
+ # Important Note: This file is not needed on Windows, and mustn't be loaded
+ 
+ import socket
++import subprocess
+ from fcntl import ioctl
+ import os
+ import struct
+@@ -17,8 +18,22 @@ import ctypes
+ from ctypes import POINTER, Structure
+ from ctypes import c_uint, c_uint32, c_ushort, c_ubyte
+ from scapy.config import conf
++from scapy.data import MTU
++from scapy.error import Scapy_Exception
+ import scapy.modules.six as six
+ 
++# BOOT
++
++
++def _check_tcpdump():
++    with open(os.devnull, 'wb') as devnull:
++        proc = subprocess.Popen([conf.prog.tcpdump, "--version"],
++                                stdout=devnull, stderr=subprocess.STDOUT)
++    return proc.wait() == 0
++
++
++TCPDUMP = _check_tcpdump()
++
+ # UTILS
+ 
+ 
+@@ -95,3 +110,32 @@ def get_bpf_pointer(tcpdump_lines):
+ 
+     # Create the BPF program
+     return bpf_program(size, bip)
++
++
++def compile_filter(bpf_filter, iface=None):
++    """Asks Tcpdump to parse the filter, then build the matching
++    BPF bytecode using get_bpf_pointer.
++    """
++    if not TCPDUMP:
++        raise Scapy_Exception("tcpdump is not available. Cannot use filter !")
++    try:
++        process = subprocess.Popen([
++            conf.prog.tcpdump,
++            "-p",
++            "-i", (conf.iface if iface is None else iface),
++            "-ddd",
++            "-s", str(MTU),
++            bpf_filter],
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE
++        )
++    except OSError as ex:
++        raise Scapy_Exception("Failed to attach filter: %s" % ex)
++    lines, err = process.communicate()
++    ret = process.returncode
++    if ret:
++        raise Scapy_Exception(
++            "Failed to attach filter: tcpdump returned: %s" % err
++        )
++    lines = lines.strip().split(b"\n")
++    return get_bpf_pointer(lines)
+
+
+
+
+@@ -29,9 +29,9 @@ from scapy.packet import Packet, Padding
+ from scapy.config import conf
+ from scapy.data import MTU, ETH_P_ALL
+ from scapy.supersocket import SuperSocket
+-from scapy.error import warning, Scapy_Exception, log_interactive, \
+-    log_loading, ScapyInvalidPlatformException
+-from scapy.arch.common import get_if, get_bpf_pointer
++from scapy.error import warning, S

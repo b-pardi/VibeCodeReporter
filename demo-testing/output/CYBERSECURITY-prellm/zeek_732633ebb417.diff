@@ -1,0 +1,125 @@
+@@ -93,6 +93,7 @@ void usage(const char* prog, int code)
+ 	fprintf(stderr, "    -r|--readfile <readfile>       | read from given tcpdump file (only one allowed, pass '-' as the filename to read from stdin)\n");
+ 	fprintf(stderr, "    -s|--rulefile <rulefile>       | read rules from given file\n");
+ 	fprintf(stderr, "    -t|--tracefile <tracefile>     | activate execution tracing\n");
++	fprintf(stderr, "    -u|--usage-issues              | find variable usage issues and exit; use -uu for deeper/more expensive analysis\n");
+ 	fprintf(stderr, "    -v|--version                   | print version and exit\n");
+ 	fprintf(stderr, "    -w|--writefile <writefile>     | write to given tcpdump file\n");
+ #ifdef DEBUG
+@@ -286,6 +287,7 @@ Options parse_cmdline(int argc, char** argv)
+ 		{"rulefile",		required_argument,	nullptr,	's'},
+ 		{"tracefile",		required_argument,	nullptr,	't'},
+ 		{"writefile",		required_argument,	nullptr,	'w'},
++		{"usage-issues",	no_argument,		nullptr,	'u'},
+ 		{"version",		no_argument,		nullptr,	'v'},
+ 		{"no-checksums",	no_argument,		nullptr,	'C'},
+ 		{"force-dns",		no_argument,		nullptr,	'F'},
+@@ -322,7 +324,7 @@ Options parse_cmdline(int argc, char** argv)
+ 	};
+ 
+ 	char opts[256];
+-	util::safe_strncpy(opts, "B:e:f:G:H:I:i:j::n:O:o:p:r:s:T:t:U:w:X:CDFNPQSWabdhv",
++	util::safe_strncpy(opts, "B:e:f:G:H:I:i:j::n:O:o:p:r:s:T:t:U:w:X:CDFNPQSWabdhuv",
+ 	                         sizeof(opts));
+ 
+ #ifdef USE_PERFTOOLS_DEBUG
+@@ -407,6 +409,9 @@ Options parse_cmdline(int argc, char** argv)
+ 		case 't':
+ 			rval.debug_script_tracing_file = optarg;
+ 			break;
++		case 'u':
++			++rval.analysis_options.usage_issues;
++			break;
+ 		case 'v':
+ 			rval.print_version = true;
+ 			break;
+
+
+
+
+@@ -12,6 +12,8 @@
+ namespace zeek::detail {
+ 
+ 
++AnalyOpt analysis_options;
++
+ std::unordered_set<const Func*> non_recursive_funcs;
+ 
+ // Tracks all of the loaded functions (including event handlers and hooks).
+@@ -104,10 +106,8 @@ static void check_env_opt(const char* opt, bool& opt_flag)
+ 		opt_flag = true;
+ 	}
+ 
+-void analyze_scripts(Options& opts)
++void analyze_scripts()
+ 	{
+-	auto& analysis_options = opts.analysis_options;
+-
+ 	static bool did_init = false;
+ 
+ 	if ( ! did_init )
+@@ -116,6 +116,11 @@ void analyze_scripts(Options& opts)
+ 		check_env_opt("ZEEK_INLINE", analysis_options.inliner);
+ 		check_env_opt("ZEEK_XFORM", analysis_options.activate);
+ 
++		auto usage = getenv("ZEEK_USAGE_ISSUES");
++
++		if ( usage )
++			analysis_options.usage_issues = atoi(usage) > 1 ? 2 : 1;
++
+ 		if ( ! analysis_options.only_func )
+ 			{
+ 			auto zo = getenv("ZEEK_ONLY");
+@@ -123,7 +128,8 @@ void analyze_scripts(Options& opts)
+ 				analysis_options.only_func = zo;
+ 			}
+ 
+-		if ( analysis_options.only_func )
++		if ( analysis_options.only_func ||
++		     analysis_options.usage_issues > 0 )
+ 			analysis_options.activate = true;
+ 
+ 		did_init = true;
+
+
+
+
+@@ -36,8 +36,18 @@ struct AnalyOpt {
+ 	// If true, report which functions are directly and indirectly
+ 	// recursive, and exit.  Only germane if running the inliner.
+ 	bool report_recursive = false;
++
++	// If non-zero, looks for variables that are used-but-possibly-not-set,
++	// or set-but-not-used.
++	//
++	// If > 1, also reports on uses of uninitialized record fields and
++	// analyzes nested records in depth.  Warning: with the current
++	// data structures this greatly increases analysis time.
++	int usage_issues = 0;
+ };
+ 
++extern AnalyOpt analysis_options;
++
+ 
+ class ProfileFunc;
+ 
+@@ -81,7 +91,7 @@ extern std::unordered_set<const Func*> non_recursive_funcs;
+ extern void analyze_func(ScriptFuncPtr f);
+ 
+ // Analyze all of the parsed scripts collectively for optimization.
+-extern void analyze_scripts(Options& opts);
++extern void analyze_scripts();
+ 
+ 
+ } // namespace zeek::detail
+
+
+
+
+@@ -781,9 +781,11 @@ SetupResult setup(int argc, char** argv, Options* zopts)
+ 			}
+ 		}
+ 
+-	analyze_scripts(options);
++	// Set up the global that facilitates access to analysis/optimization
++	// options from deep within some modules

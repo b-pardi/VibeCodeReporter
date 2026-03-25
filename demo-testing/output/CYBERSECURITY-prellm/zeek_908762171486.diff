@@ -1,0 +1,139 @@
+@@ -8,9 +8,11 @@
+ #include <fcntl.h>
+ #include <poll.h>
+ 
++#include <cstdio>
+ #include <csignal>
+ #include <cstdarg>
+ #include <sstream>
++#include <variant>
+ 
+ #include "iosource/Manager.h"
+ #include "ZeekString.h"
+@@ -74,7 +76,7 @@ struct Stem {
+ 
+ 	void Reap();
+ 
+-	std::optional<Supervisor::SupervisedNode> Spawn(Supervisor::Node* node);
++	std::variant<bool, Supervisor::SupervisedNode> Spawn(Supervisor::Node* node);
+ 
+ 	int AliveNodeCount() const;
+ 
+@@ -129,13 +131,13 @@ static RETSIGTYPE supervisor_signal_handler(int signo)
+ 	return RETSIGVAL;
+ 	}
+ 
+-static std::vector<std::string> extract_messages(std::string* buffer)
++static std::vector<std::string> extract_msgs(std::string* buffer, char delim)
+ 	{
+ 	std::vector<std::string> rval;
+ 
+ 	for ( ; ; )
+ 		{
+-		auto msg_end = buffer->find('\0');
++		auto msg_end = buffer->find(delim);
+ 
+ 		if ( msg_end == std::string::npos )
+ 			// Don't have any full messages left
+@@ -182,6 +184,13 @@ void zeek::detail::ParentProcessCheckTimer::Dispatch(double t, bool is_expire)
+ Supervisor::Supervisor(Supervisor::Config cfg, StemHandle sh)
+ 	: config(std::move(cfg)), stem_pid(sh.pid), stem_pipe(std::move(sh.pipe))
+ 	{
++	stem_stdout.pipe = std::move(sh.stdout_pipe);
++	stem_stdout.prefix = "[supervisor:STDOUT] ";
++	stem_stdout.stream = stdout;
++	stem_stderr.pipe = std::move(sh.stderr_pipe);
++	stem_stderr.prefix = "[supervisor:STDERR] ";
++	stem_stderr.stream = stderr;
++
+ 	DBG_LOG(DBG_SUPERVISOR, "forked stem process %d", stem_pid);
+ 	setsignal(SIGCHLD, supervisor_signal_handler);
+ 
+@@ -246,6 +255,9 @@ Supervisor::~Supervisor()
+ 			}
+ 		}
+ 
++	stem_stdout.Drain();
++	stem_stderr.Drain();
++
+ 	while ( ProcessMessages() != 0 );
+ 	}
+ 
+@@ -293,6 +305,55 @@ void Supervisor::ReapStem()
+ 		                " of stem process for unknown reason");
+ 	}
+ 
++struct ForkResult {
++	pid_t pid;
++	std::unique_ptr<zeek::detail::Pipe> stdout_pipe;
++	std::unique_ptr<zeek::detail::Pipe> stderr_pipe;
++};
++
++static ForkResult fork_with_stdio_redirect(const char* where)
++	{
++	auto out = std::make_unique<zeek::detail::Pipe>(FD_CLOEXEC, FD_CLOEXEC,
++	                                                O_NONBLOCK, O_NONBLOCK);
++	auto err = std::make_unique<zeek::detail::Pipe>(FD_CLOEXEC, FD_CLOEXEC,
++	                                                O_NONBLOCK, O_NONBLOCK);
++	auto pid = fork();
++
++	if ( pid == 0 )
++		{
++		while ( dup2(out->WriteFD(), STDOUT_FILENO) == -1 )
++			{
++			if ( errno == EINTR )
++				continue;
++
++			fprintf(stderr,
++			        "Supervisor %s fork() stdout redirect failed: %s\n",
++			        where, strerror(errno));
++			}
++
++		while ( dup2(err->WriteFD(), STDERR_FILENO) == -1 )
++			{
++			if ( errno == EINTR )
++				continue;
++
++			fprintf(stderr,
++			        "Supervisor %s fork() stderr redirect failed: %s\n",
++			        where, strerror(errno));
++			}
++
++		// Default buffering for stdout may be fully-buffered if not a TTY,
++		// so set line-buffering since the Supervisor/Stem has to emit
++		// only line-buffered messages anyway.
++		setlinebuf(stdout);
++		// Default buffering for stderr may be unbuffered, but since
++		// Supervisor/Stem has to emit line-buffered messages, just set
++		// it to line-buffered as well.
++		setlinebuf(stderr);
++		}
++
++	return {pid, std::move(out), std::move(err)};
++	}
++
+ void Supervisor::HandleChildSignal()
+ 	{
+ 	if ( last_signal >= 0 )
+@@ -316,7 +377,8 @@ void Supervisor::HandleChildSignal()
+ 
+ 	// Revive the Stem process
+ 	auto stem_ppid = getpid();
+-	stem_pid = fork();
++	auto fork_res = fork_with_stdio_redirect("stem revival");
++	stem_pid = fork_res.pid;
+ 
+ 	if ( stem_pid == -1 )
+ 		{
+@@ -359,6 +421,29 @@ void Supervisor::HandleChildSignal()
+ 		        strerror(errno));
+ 		exit(1);
+ 		}
++	else
++		{
++		if ( ! iosource_mgr->UnregisterFd(stem_stdout.pipe->ReadFD(), this) )
++			reporter->FatalError("Revived supervisor stem failed to unregister "
++								 "redirected stdout pipe");
++
++		if ( ! iosource_mgr->UnregisterFd(stem_stderr.pipe->ReadFD(), this) )
++			reporter->FatalError("Revi

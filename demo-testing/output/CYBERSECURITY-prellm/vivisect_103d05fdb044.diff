@@ -1,0 +1,106 @@
+@@ -4,7 +4,10 @@ country looking for pointers to interesting things.
+ 
+ in a previous life, this analysis code lived inside VivWorkspace.analyze()
+ """
+-from vivisect.const import RTYPE_BASEPTR
++import logging
++from vivisect.const import RTYPE_BASEPTR, LOC_POINTER
++
++logger = logging.getLogger(__name__)
+ 
+ def analyze(vw):
+ 
+@@ -19,6 +22,31 @@ def analyze(vw):
+         for xfr, xto, xtype, xinfo in vw.getXrefsFrom(rva):
+             vw.analyzePointer(xto)
+ 
++    # Now, we'll analyze the pointers placed by the file wrapper (ELF, PE, MACHO, etc...)
++    for pva, tva, pname in vw.getVaSetRows('PointersFromFile'):
++        if vw.getLocation(pva) is None:
++            if tva is None:
++                logger.info('making pointer 0x%x (%r)', pva, pname)
++            else:
++                logger.info('making pointer 0x%x -> 0x%x (%r)', pva, tva, pname)
++            vw.makePointer(pva, tva, follow=True)
++
++    for lva, lsz, lt, li in vw.getLocations(LOC_POINTER):
++        tva = vw.readMemoryPtr(lva)
++        if not vw.isValidPointer(tva):
++            continue
++
++        if vw.getLocation(tva) is not None:
++            continue
++
++        logger.info('following previously discovered pointer 0x%x -> 0x%x', lva, tva)
++        try:
++            vw.followPointer(tva)
++        except Exception:
++            if vw.verbose:
++                vw.vprint("followPointer() failed for 0x%.8x (pval: 0x%.8x)" % (lva, tva))
++
++
+     # Now, lets find likely free-hanging pointers
+     for addr, pval in vw.findPointers():
+         if vw.isDeadData(pval):
+
+
+
+
+@@ -80,6 +80,26 @@ def makeRelocTable(vw, va, maxva, addbase, baseaddr):
+         vw.setComment(va, tname)
+         va += len(s)
+ 
++def makeFunctionTable(elf, vw, tbladdr, size, tblname, funcs, ptrs, baseaddr=0):
++    psize = vw.getPointerSize()
++    pfmt = e_bits.le_fmt_chars[psize]   #FIXME: make Endian-aware (needs plumbing through ELF)
++    secbytes = elf.readAtRva(tbladdr, size)
++    tbladdr += baseaddr
++
++    ptr_count = 0
++    for off in range(0, size, psize):
++        addr, = struct.unpack_from(pfmt, secbytes, off)
++        addr += baseaddr
++        
++        nstub = tblname + "_%d"
++        pname = nstub % ptr_count
++
++        vw.makeName(addr, pname, filelocal=True)
++        ptrs.append((tbladdr + off, addr, pname))
++        funcs.append((pname, addr))
++        ptr_count += 1
++
++
+ arch_names = {
+     Elf.EM_ARM:'arm',
+     Elf.EM_386:'i386',
+@@ -216,46 +236,14 @@ def loadElfIntoWorkspace(vw, elf, filename=None, baseaddr=None):
+             new_functions.append(("init_function", sva))
+ 
+         elif sname == ".init_array":
+-            # handle pseudo-fixups first: these pointers require base-addresses
+-            psize = vw.getPointerSize()
+-            pfmt = e_bits.le_fmt_chars[psize]   #FIXME: make Endian-aware (needs plumbing through ELF)
+-            secbytes = elf.readAtRva(sec.sh_addr, size)
+-            sh_addr = sec.sh_addr
+-            if addbase: sh_addr += baseaddr
+-
+-            ptr_count = 0
+-            for off in range(0, size, psize):
+-                addr, = struct.unpack_from(pfmt, secbytes, off)
+-                if addbase: addr += baseaddr
+-                
+-                new_pointers.append((sh_addr + off, addr))
+-                vw.makeName(addr, "init_function_%d" % ptr_count, filelocal=True)
+-                vw.addXref(sh_addr + off, addr, REF_PTR)
+-                new_functions.append(("init_function", addr))
+-                ptr_count += 1
++            makeFunctionTable(elf, vw, sec.sh_addr, size, 'init_function', new_functions, new_pointers, baseaddr)
+ 
+         elif sname == ".fini":
+             vw.makeName(sva, "fini_function", filelocal=True)
+             new_functions.append(("fini_function", sva))
+ 
+         elif sname == ".fini_array":
+-            # handle pseudo-fixups first: these pointers require base-addresses
+-            psize = vw.getPointerSize()
+-            pfmt = e_bits.le_fmt_chars[psize]   #FIXME: make Endian-aware (needs plumbing through

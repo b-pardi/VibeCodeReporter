@@ -1,0 +1,104 @@
+@@ -107,6 +107,8 @@ typedef uint64_t (*uc_mem_redirect_t)(uint64_t address);
+ // validate if Unicorn supports hooking a given instruction
+ typedef bool (*uc_insn_hook_validate)(uint32_t insn_enum);
+ 
++typedef bool (*uc_opcode_hook_validate_t)(uint32_t op, uint32_t flags);
++
+ // init target page
+ typedef void (*uc_target_page_init)(struct uc_struct *);
+ 
+@@ -127,6 +129,8 @@ struct hook {
+     int type;       // UC_HOOK_*
+     int insn;       // instruction for HOOK_INSN
+     int refs;       // reference count to free hook stored in multiple lists
++    int op;         // opcode for HOOK_TCG_OPCODE
++    int op_flags;   // opcode flags for HOOK_TCG_OPCODE
+     bool to_delete; // set to true when the hook is deleted by the user. The
+                     // destruction of the hook is delayed.
+     uint64_t begin, end; // only trigger if PC or memory access is in this
+@@ -158,6 +162,7 @@ typedef enum uc_hook_idx {
+     UC_HOOK_MEM_READ_AFTER_IDX,
+     UC_HOOK_INSN_INVALID_IDX,
+     UC_HOOK_EDGE_GENERATED_IDX,
++    UC_HOOK_TCG_OPCODE_IDX,
+ 
+     UC_HOOK_MAX,
+ } uc_hook_idx;
+@@ -252,6 +257,7 @@ struct uc_struct {
+     CPUState *cpu;
+ 
+     uc_insn_hook_validate insn_hook_validate;
++    uc_opcode_hook_validate_t opcode_hook_invalidate;
+ 
+     MemoryRegion *system_memory;    // qemu/exec.c
+     MemoryRegion *system_io;        // qemu/exec.c
+
+
+
+
+@@ -248,6 +248,18 @@ typedef struct uc_tb {
+ typedef void (*uc_hook_edge_gen_t)(uc_engine *uc, uc_tb *cur_tb, uc_tb *prev_tb,
+                                    void *user_data);
+ 
++/*
++  Callback function for tcg opcodes that fits in two arguments.
++
++  @address: Current pc.
++  @arg1: The first argument.
++  @arg2: The second argument.
++*/
++typedef void (*uc_hook_tcg_op_2)(uc_engine *uc, uint64_t address, uint64_t arg1,
++                                 uint64_t arg2, void *user_data);
++
++typedef uc_hook_tcg_op_2 uc_hook_tcg_sub;
++
+ /*
+   Callback function for MMIO read
+ 
+@@ -284,6 +296,26 @@ typedef enum uc_mem_type {
+     UC_MEM_READ_AFTER,     // Memory is read from (successful access)
+ } uc_mem_type;
+ 
++// These are all op codes we support to hook for UC_HOOK_TCG_OP_CODE.
++// Be cautious since it may bring much more overhead than UC_HOOK_CODE without
++// proper flags.
++// TODO: Tracing UC_TCG_OP_CALL should be interesting.
++typedef enum uc_tcg_op_code {
++    UC_TCG_OP_SUB = 0, // Both sub_i32 and sub_i64
++} uc_tcg_op_code;
++
++// These are extra flags to be paired with uc_tcg_op_code which is helpful to
++// instrument in some certain cases.
++typedef enum uc_tcg_op_flag {
++    // Only instrument opcode if one of the arguments is an immediate value.
++    UC_TCG_OP_FLAG_IMM = 1 << 0,
++    // Only instrument opcode if it would set cc_dst, i.e. cmp instruction.
++    UC_TCG_OP_FLAG_CMP = 1 << 1,
++    // Only instrument opcode which is directly translated. i.e. x86 sub -> tcg
++    // sub_i32/64
++    UC_TCG_OP_FLAG_DIRECT = 1 << 2
++} uc_tcg_op_flag;
++
+ // All type of hooks for uc_hook_add() API.
+ typedef enum uc_hook_type {
+     // Hook all interrupt/syscall events
+@@ -323,7 +355,10 @@ typedef enum uc_hook_type {
+     // NOTE: This is different from UC_HOOK_BLOCK in 2 ways:
+     //       1. The hook is called before executing code.
+     //       2. The hook is only called when generation is triggered.
+-    UC_HOOK_EDGE_GENERATED = 1 << 15
++    UC_HOOK_EDGE_GENERATED = 1 << 15,
++    // Hook on specific tcg op code. The usage of this hook is similar to
++    // UC_HOOK_INSN.
++    UC_HOOK_TCG_OPCODE = 1 << 16,
+ } uc_hook_type;
+ 
+ // Hook type for all events of unmapped memory access
+@@ -771,6 +806,8 @@ uc_err uc_emu_stop(uc_engine *uc);
+  @...: variable arguments (depending on @type)
+    NOTE: if @type = UC_HOOK_INSN, this is the instruction ID.
+          currently, only x86 in, out, syscall, sysenter, cpuid are supported.
++   NOTE: if @type = UC_HOOK_TCG_OPCODE, arguments are @opcode and @flags. See
++ @uc_tcg_op_code and @uc_tcg_op_flag for details.
+ 
+  @return UC_ERR_OK on success, or other value on fai

@@ -1,0 +1,121 @@
+@@ -12,6 +12,9 @@
+ #include "unicorn/unicorn.h"
+ #include "list.h"
+ 
++// The max recursive nested uc_emu_start levels
++#define UC_MAX_NESTED_LEVEL (64)
++
+ // These are masks of supported modes for each cpu/arch.
+ // They should be updated when changes are made to the uc_mode enum typedef.
+ #define UC_MODE_ARM_MASK                                                       \
+@@ -342,6 +345,9 @@ struct uc_struct {
+     bool no_exit_request;       // Disable check_exit_request temporarily. A
+                           // workaround to treat the IT block as a whole block.
+     bool init_done; // Whether the initialization is done.
++
++    sigjmp_buf jmp_bufs[UC_MAX_NESTED_LEVEL]; // To support nested uc_emu_start
++    int nested_level;                         // Current nested_level
+ };
+ 
+ // Metadata stub for the variable-size cpu context used with uc_context_*()
+
+
+
+
+@@ -40,7 +40,7 @@ void cpu_loop_exit(CPUState *cpu)
+     tb_exec_unlock(cpu->uc->tcg_ctx);
+     /* Undo the setting in cpu_tb_exec.  */
+     cpu->can_do_io = 1;
+-    siglongjmp(cpu->jmp_env, 1);
++    siglongjmp(cpu->uc->jmp_bufs[cpu->uc->nested_level - 1], 1);
+ }
+ 
+ void cpu_loop_exit_restore(CPUState *cpu, uintptr_t pc)
+
+
+
+
+@@ -551,8 +551,10 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
+      */
+     // init_delay_params(&sc, cpu);
+ 
++    // Unicorn: We would like to support nested uc_emu_start calls.
+     /* prepare setjmp context for exception handling */
+-    if (sigsetjmp(cpu->jmp_env, 0) != 0) {
++    // if (sigsetjmp(cpu->jmp_env, 0) != 0) {
++    if (sigsetjmp(uc->jmp_bufs[uc->nested_level - 1], 0) != 0) {
+ #if defined(__clang__) || !QEMU_GNUC_PREREQ(4, 6)
+         /* Some compilers wrongly smash all local variables after
+          * siglongjmp. There were bug reports for gcc 4.5.0 and clang.
+
+
+
+
+@@ -813,6 +813,39 @@ static void test_x86_cmpxchg()
+     OK(uc_close(uc));
+ }
+ 
++static void test_x86_nested_emu_start_cb(uc_engine *uc, uint64_t addr,
++                                         size_t size, void *data)
++{
++    OK(uc_emu_start(uc, code_start + 1, code_start + 2, 0, 0));
++}
++
++static void test_x86_nested_emu_start()
++{
++    uc_engine *uc;
++    char code[] = "\x41\x4a"; // INC ecx; DEC edx;
++    int r_ecx = 0x1234;
++    int r_edx = 0x7890;
++    uc_hook h;
++
++    uc_common_setup(&uc, UC_ARCH_X86, UC_MODE_32, code, sizeof(code) - 1);
++    OK(uc_reg_write(uc, UC_X86_REG_ECX, &r_ecx));
++    OK(uc_reg_write(uc, UC_X86_REG_EDX, &r_edx));
++    // Emulate DEC in the nested hook.
++    OK(uc_hook_add(uc, &h, UC_HOOK_CODE, test_x86_nested_emu_start_cb, NULL,
++                   code_start, code_start));
++
++    // Emulate INC
++    OK(uc_emu_start(uc, code_start, code_start + 1, 0, 0));
++
++    OK(uc_reg_read(uc, UC_X86_REG_ECX, &r_ecx));
++    OK(uc_reg_read(uc, UC_X86_REG_EDX, &r_edx));
++
++    TEST_CHECK(r_ecx == 0x1235);
++    TEST_CHECK(r_edx == 0x788f);
++
++    OK(uc_close(uc));
++}
++
+ TEST_LIST = {{"test_x86_in", test_x86_in},
+              {"test_x86_out", test_x86_out},
+              {"test_x86_mem_hook_all", test_x86_mem_hook_all},
+@@ -838,4 +871,5 @@ TEST_LIST = {{"test_x86_in", test_x86_in},
+              {"test_x86_clear_empty_tb", test_x86_clear_empty_tb},
+              {"test_x86_hook_tcg_op", test_x86_hook_tcg_op},
+              {"test_x86_cmpxchg", test_x86_cmpxchg},
++             {"test_x86_nested_emu_start", test_x86_nested_emu_start},
+              {NULL, NULL}};
+\ No newline at end of file
+
+
+
+
+@@ -700,6 +700,14 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+ 
+     UC_INIT(uc);
+ 
++    // Advance the nested levels. We must decrease the level count by one when
++    // we return from uc_emu_start.
++    if (uc->nested_level >= UC_MAX_NESTED_LEVEL) {
++        // We can't support so many nested levels.
++        return UC_ERR_RESOURCE;
++    }
++    uc->nested_level++;
++
+     switch (uc->arch) {
+     default:
+         break;
+@@ -786,6 +794,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+         // restore to append

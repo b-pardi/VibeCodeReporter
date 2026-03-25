@@ -1,0 +1,134 @@
+@@ -291,6 +291,7 @@ extern void nd_pop_all_packet_info(netdissect_options *);
+ #define PT_PTP		18	/* PTP */
+ #define PT_SOMEIP	19	/* Autosar SOME/IP Protocol */
+ #define PT_DOMAIN	20	/* Domain Name System (DNS) */
++#define PT_QUIC		21	/* QUIC */
+ 
+ #define ND_MIN(a,b) ((a)>(b)?(b):(a))
+ #define ND_MAX(a,b) ((b)>(a)?(b):(a))
+@@ -692,6 +693,8 @@ extern int print_unknown_data(netdissect_options *, const u_char *, const char *
+ extern void ptp_print(netdissect_options *, const u_char *, u_int);
+ extern const char *q922_string(netdissect_options *, const u_char *, u_int);
+ extern void q933_print(netdissect_options *, const u_char *, u_int);
++extern int quic_detect(netdissect_options *, const u_char *, const u_int);
++extern void quic_print(netdissect_options *, const u_char *, const u_int);
+ extern void radius_print(netdissect_options *, const u_char *, u_int);
+ extern void resp_print(netdissect_options *, const u_char *, u_int);
+ extern void rip_print(netdissect_options *, const u_char *, u_int);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,289 @@
++/*
++ * Copyright (c) 2021 Apple, Inc.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in
++ *     the documentation and/or other materials provided with the
++ *     distribution.
++ *  3. The names of the authors may not be used to endorse or promote
++ *     products derived from this software without specific prior
++ *     written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
++ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
++ */
++
++/* \summary: QUIC Protocol printer */
++/* specification: https://www.rfc-editor.org/rfc/rfc9000.txt */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "netdissect-stdinc.h"
++#include "netdissect-alloc.h"
++#include "netdissect.h"
++#include "extract.h"
++
++#define QUIC_MAX_CID_LENGTH	20
++
++typedef uint8_t quic_cid[QUIC_MAX_CID_LENGTH];
++
++struct quic_cid_array {
++	uint8_t cid[QUIC_MAX_CID_LENGTH];
++	uint8_t length;
++};
++
++enum quic_lh_packet_type {
++	QUIC_LH_TYPE_INITIAL = 0,
++	QUIC_LH_TYPE_0RTT = 1,
++	QUIC_LH_TYPE_HANDSHAKE = 2,
++	QUIC_LH_TYPE_RETRY = 3
++};
++
++static void
++hexprint(netdissect_options *ndo, const uint8_t *cp, size_t len)
++{
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		ND_PRINT("%02x", cp[i]);
++}
++
++#define QUIC_CID_LIST_MAX	512
++
++static struct quic_cid_array quic_cid_array[QUIC_CID_LIST_MAX];
++
++static struct quic_cid_array *
++lookup_quic_cid(const u_char *cid, size_t length)
++{
++	for (unsigned int i = 0; i < QUIC_CID_LIST_MAX; i++) {
++		if (quic_cid_array[i].length > length) {
++			continue;
++		}
++		if (quic_cid_array[i].length == 0) {
++			break;
++		}
++		if (memcmp(quic_cid_array[i].cid, cid,
++			   quic_cid_array[i].length) == 0) {
++			/*
++			 * Swap the entries so that it behaves like an
++			 * LRU cache.
++			 */
++			if (i != 0) {
++				struct quic_cid_array tmp = quic_cid_array[i];
++				quic_cid_array[i] = quic_cid_array[0];
++				quic_cid_array[0] = tmp;
++			}
++
++			return &quic_cid_array[0];
++		}
++	}
++
++	return NULL;
++}
++
++static void
++register_quic_cid(const quic_cid cid, uint8_t length)
++{
++	static uint16_t next_cid = 0;
++
++	if (length == 0 ||
++	    lookup_quic_cid(cid, length) != NULL) {
++		return;
++	}
++	memcpy(&quic_cid_array[next_cid].cid, cid, QUIC_MAX_CID_LENGTH);
++	quic_cid_array[next_cid].length = length;
++	next_cid = (next_cid + 1) % QUIC_CID_LIST_MAX;
++}
++
++/* Returns 1 if the first octet looks like a QUIC packet. */
++int
++quic_detect(netdissect_options *ndo, const u_char *p, const u_int len)
++{
++	uint8_t fir

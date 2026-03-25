@@ -1,0 +1,107 @@
+@@ -23,6 +23,12 @@ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+         self.set_type_class('super_block', extensions.super_block)
+         self.set_type_class('task_struct', extensions.task_struct)
+         self.set_type_class('vm_area_struct', extensions.vm_area_struct)
++        self.set_type_class('qstr', extensions.qstr)
++        self.set_type_class('dentry', extensions.dentry)
++        self.set_type_class('fs_struct', extensions.fs_struct)
++        self.set_type_class('files_struct', extensions.files_struct)
++        self.set_type_class('vfsmount', extensions.vfsmount)
++        self.set_type_class('mount', extensions.mount)
+ 
+     @classmethod
+     def get_requirements(cls) -> typing.List[interfaces.configuration.RequirementInterface]:
+
+
+
+
+@@ -2,14 +2,13 @@ import collections.abc
+ import typing
+ 
+ from volatility.framework import constants
+-from volatility.framework import objects, interfaces
++from volatility.framework import exceptions, objects, interfaces
+ from volatility.framework.objects import utility
+ from volatility.framework.symbols import generic
+ 
+ 
+ # Keep these in a basic module, to prevent import cycles when symbol providers require them
+ 
+-
+ class task_struct(generic.GenericIntelProcess):
+     def add_process_layer(self,
+                           config_prefix: str = None,
+@@ -33,6 +32,151 @@ class task_struct(generic.GenericIntelProcess):
+         # Add the constructed layer and return the name
+         return self._add_process_layer(self._context, dtb, config_prefix, preferred_name)
+ 
++    # based on __d_path from the Linux kernel
++    def _do_get_path(self, rdentry, rmnt, dentry, vfsmnt) -> str:
++        try:
++            rdentry.validate()
++            dentry.validate()
++        except InvalidDataException:
++            return ""
++
++        ret_path = [] # type: typing.List[str]
++
++        try:
++            inode = dentry.d_inode
++            ino = inode.i_ino
++        except exceptions.InvalidAddressException:
++            ino = 0
++
++        while dentry != rdentry or vfsmnt != rmnt: 
++            dname = dentry.path()
++            if dname == "":
++                break
++
++            ret_path.insert(0, dname.strip('/'))
++            if dentry == vfsmnt.get_mnt_root() or dentry == dentry.d_parent:
++                if vfsmnt.get_mnt_parent() == vfsmnt:
++                    break
++
++                dentry = vfsmnt.get_mnt_mountpoint()
++                vfsmnt = vfsmnt.get_mnt_parent()
++
++                continue
++
++            parent = dentry.d_parent
++            dentry = parent
++
++        if ret_path == []:
++            return ""
++
++        ret_val = '/'.join([str(p) for p in ret_path if p != ""])
++
++        if ret_val.startswith(("socket:", "pipe:")):
++            if ret_val.find("]") == -1:
++                ret_val = ret_val[:-1] + ":[{0}]".format(ino)
++            else:
++                ret_val = ret_val.replace("/", "")
++
++        elif ret_val != "inotify":
++            ret_val = '/' + ret_val
++
++        return ret_val
++         
++    # old method
++    def _get_path_file(self, filp) -> str:
++        rdentry = self.fs.get_root_dentry()
++        rmnt    = self.fs.get_root_mnt()
++        dentry  = filp.dentry
++        vfsmnt  = filp.vfsmnt
++    
++        return self._do_get_path(rdentry, rmnt, dentry, vfsmnt)
++
++    def _get_new_sock_pipe_path(self, filp, layer_name) -> str:
++        dentry = filp.dentry
++
++        sym_addr = dentry.d_op.d_dname
++
++        # BUG  - ikelos please read 
++        # layer.address_mask is currently a @propery so the code is awkward, such as:
++        # sym_addr = sym_addr | self._context.memory[layer_name].address_mask
++        # is there a reason it couldn't just be a normal function so address_mask(sym_addr) would work?
++        # the second issue is that the mask I am getting is 0x1ffffffff, when I really need it OR'd with 0xffffffff00000000 in order to get the correct value
++        # third - having to pass in 'layer_name' way from the plugin is 

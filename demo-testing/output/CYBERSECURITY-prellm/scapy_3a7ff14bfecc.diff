@@ -1,0 +1,102 @@
+@@ -14,6 +14,7 @@ import inspect
+ import socket
+ import struct
+ import time
++from types import MethodType
+ 
+ 
+ from scapy.config import conf
+@@ -396,6 +397,30 @@ class ReversePadField(PadField):
+         return s + struct.pack("%is" % (self.padlen(len(s))), self._padwith) + sval  # noqa: E501
+ 
+ 
++class FCSField(Field):
++    """Special Field that gets its value from the end of the *packet*
++    (Note: not layer, but packet).
++
++    Mostly used for FCS
++    """
++    def getfield(self, pkt, s):
++        val = self.m2i(pkt, struct.unpack(self.fmt, s[-self.sz:])[0])
++        return s[:-self.sz], val
++
++    def addfield(self, pkt, s, val):
++        previous_post_build = pkt.post_build
++        value = struct.pack(self.fmt, self.i2m(pkt, val))
++
++        def _post_build(self, p, pay):
++            pay += value
++            return previous_post_build(p, pay)
++        pkt.post_build = MethodType(_post_build, pkt)
++        return s
++
++    def i2repr(self, pkt, x):
++        return lhex(self.i2h(pkt, x))
++
++
+ class DestField(Field):
+     __slots__ = ["defaultdst"]
+     # Each subclass must have its own bindings attribute
+
+
+
+
+@@ -34,8 +34,8 @@ from scapy.fields import ByteField, LEShortField, BitField, LEShortEnumField, \
+     ByteEnumField, X3BytesField, FlagsField, LELongField, StrField, \
+     StrLenField, IntField, XByteField, LEIntField, StrFixedLenField, \
+     LESignedIntField, ReversePadField, ConditionalField, PacketListField, \
+-    ShortField, BitEnumField, XLEIntField, FieldLenField, LEFieldLenField, \
+-    FieldListField, XStrFixedLenField, PacketField
++    ShortField, BitEnumField, FieldLenField, LEFieldLenField, \
++    FieldListField, XStrFixedLenField, PacketField, FCSField
+ from scapy.ansmachine import AnsweringMachine
+ from scapy.plist import PacketList
+ from scapy.layers.l2 import Ether, LLC, MACField
+@@ -288,7 +288,7 @@ class Dot11(Packet):
+                                     "Reserved"]),
+         BitField("proto", 0, 2),
+         FlagsField("FCfield", 0, 8, ["to-DS", "from-DS", "MF", "retry",
+-                                     "pw-mgt", "MD", "wep", "order"]),
++                                     "pw-mgt", "MD", "protected", "order"]),
+         ShortField("ID", 0),
+         MACField("addr1", ETHER_ANY),
+         ConditionalField(
+@@ -315,8 +315,11 @@ class Dot11(Packet):
+     def guess_payload_class(self, payload):
+         if self.type == 0x02 and (0x08 <= self.subtype <= 0xF and self.subtype != 0xD):  # noqa: E501
+             return Dot11QoS
+-        elif self.FCfield & 0x40:
+-            return Dot11WEP
++        elif self.FCfield.protected:
++            # When a frame is handled by encryption, the Protected Frame bit
++            # (previously called WEP bit) is set to 1, and the Frame Body
++            # begins with the appropriate cryptographic header.
++            return Dot11Encrypted
+         else:
+             return Packet.guess_payload_class(self, payload)
+ 
+@@ -356,26 +359,16 @@ class Dot11(Packet):
+ class Dot11FCS(Dot11):
+     name = "802.11-FCS"
+     match_subclass = True
+-    fields_desc = Dot11.fields_desc + [XLEIntField("fcs", None)]  # Automatically moved to the end of the packet  # noqa: E501
++    fields_desc = Dot11.fields_desc + [FCSField("fcs", None, fmt="<I")]
+ 
+     def compute_fcs(self, s):
+         return struct.pack("!I", crc32(s) & 0xffffffff)[::-1]
+ 
+     def post_build(self, p, pay):
+-        # Switch payload and frame check sequence
+-        return p[:-4] + pay + (p[-4:] if self.fcs is not None else self.compute_fcs(p[:-4] + pay))  # noqa: E501
+-
+-    def post_dissect(self, s):
+-        self.raw_packet_cache = None  # Reset packet to allow post_build
+-        return s
+-
+-    def pre_dissect(self, s):
+-        # Get the frame check sequence
+-        sty = orb(s[0])
+-        ty = orb(s[1]) >> 2
+-        fc = struct.unpack("!H", s[2:4])[0]
+-        length = 12 + 6 * ((ty != 1 or sty in [0x8, 0x9, 0xa, 0xb, 0xe, 0xf]) + (ty in [0, 2]) + (ty == 2 and fc & 3 == 3))  # noqa: E501
+-      

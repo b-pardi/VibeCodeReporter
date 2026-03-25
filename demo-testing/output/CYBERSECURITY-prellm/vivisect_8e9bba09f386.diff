@@ -1,0 +1,99 @@
+@@ -19,8 +19,7 @@ def firethread(func):
+     and callers may not expect sync behavior!
+     '''
+     def dothread(*args, **kwargs):
+-        thr = threading.Thread(target=func, args=args, kwargs=kwargs)
+-        thr.setDaemon(True)
++        thr = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
+         thr.start()
+         return thr
+     functools.update_wrapper(dothread, func)
+@@ -44,8 +43,7 @@ def maintthread(stime):
+                 time.sleep(stime)
+ 
+         def dothread(*args, **kwargs):
+-            thr = threading.Thread(target=maintloop, args=args, kwargs=kwargs)
+-            thr.setDaemon(True)
++            thr = threading.Thread(target=maintloop, args=args, kwargs=kwargs, daemon=True)
+             thr.start()
+ 
+         functools.update_wrapper(dothread, func)
+
+
+
+
+@@ -492,7 +492,8 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+             trace.setMeta('PendingBreak', False)
+             bp = trace.getCurrentBreakpoint()
+             if bp:
+-                self.vprint("Thread: %d Hit Break: %s" % (tid, repr(bp)))
++                if not bp.silent:
++                    self.vprint("Thread: %d Hit Break: %s" % (tid, repr(bp)))
+                 cmdstr = self.bpcmds.get(bp.id, None)
+                 if cmdstr is not None:
+                     self.onecmd(cmdstr)
+@@ -574,7 +575,7 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+         if dohex:
+             memstr = binascii.unhexlify(memstr)
+         if douni:
+-            memstr = ("\x00".join(memstr)) + "\x00"
++            memstr = (b"\x00".join(memstr)) + b"\x00"
+ 
+         addr = self.parseExpression(exprstr)
+         self.memobj.writeMemory(addr, memstr)
+@@ -1861,6 +1862,8 @@ class Vdb(e_cli.EnviMutableCli, v_notif.Notifier, v_util.TraceManager):
+ 
+         self.vprint(" [ Breakpoints ]")
+         for bp in self.trace.getBreakpoints():
++            if bp.untouchable:  # don't list untouchable bp's
++                continue
+             self._print_bp(bp)
+ 
+     def _print_bp(self, bp):
+
+
+
+
+@@ -156,6 +156,11 @@ class Trace(e_mem.IMemory, e_reg.RegisterContext, e_resolv.SymbolResolver, objec
+         # Add event numbers to here for auto-continue
+         self.auto_continue = [NOTIFY_LOAD_LIBRARY, NOTIFY_CREATE_THREAD, NOTIFY_UNLOAD_LIBRARY, NOTIFY_EXIT_THREAD, NOTIFY_DEBUG_PRINT]
+ 
++        # Create a LoadLibrary hook to enable simple and consistent 
++        # Break-On-Load/Init functionality. This is also necessary for
++        # resolving symbols on new library loads.
++        self.registerNotifier(NOTIFY_LOAD_LIBRARY, LibraryNotifier())
++
+     def execute(self, cmdline):
+         """
+         Start a new process and debug it
+@@ -694,7 +699,7 @@ class Trace(e_mem.IMemory, e_reg.RegisterContext, e_resolv.SymbolResolver, objec
+         """
+         self.requireAttached()
+         bp = self.bpbyid.pop(id, None)
+-        if bp is not None:
++        if bp is not None and not bp.untouchable:
+             bp.deactivate(self)
+             if bp in self.deferred:
+                 self.deferred.remove(bp)
+@@ -708,6 +713,20 @@ class Trace(e_mem.IMemory, e_reg.RegisterContext, e_resolv.SymbolResolver, objec
+         # Remove cached breakpoint code
+         Breakpoint.bpcodeobj.pop(id, None)
+ 
++    def _updateBreakAddresses(self):
++        """
++        Update breakpoint address resolution (in unresolved breakpoints).
++        Intended to be run after events which change the namespace, such as
++        NOTIFY_LOAD_LIBRARY events
++        """
++        for bp in self.deferred:
++            bp.resolveAddress(self)
++            if bp.address is not None:
++                self.breakpoints[bp.address] = bp
++                self.deferred.remove(bp)
++                bp.activate(self)
++                logger.warning("Resolved bp address: %r", bp)
++
+     def getCurrentBreakpoint(self):
+         """
+         Return the current breakpoint otherwise None
+@@ -755,7 +774,7 @@ class Trace(e_mem.IMemory, e_reg.Regi

@@ -1,0 +1,112 @@
+@@ -137,6 +137,16 @@ SOCK_FAMILY = (
+     "AF_XDP",
+ )
+ 
++# Socket states
++# ref: include/uapi/linux/net.h
++SOCKET_STATES = (
++    "FREE",
++    "UNCONNECTED",
++    "CONNECTING",
++    "CONNECTED",
++    "DISCONNECTING"
++)
++
+ # Netlink protocols
+ # ref: include/uapi/linux/netlink.h
+ NETLINK_PROTOCOLS = (
+
+
+
+
+@@ -92,7 +92,8 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
+         # Even if the sock family is not supported, or the required types
+         # are not present in the symbols, we can still show some general
+         # information about the socket that may be helpful.
+-        saddr_tag = daddr_tag = state = "?"
++        saddr_tag = daddr_tag = "?"
++        state = sock.get_state()
+ 
+         sock_stat = saddr_tag, daddr_tag, state
+ 
+@@ -237,7 +238,7 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
+         sport = vsock_sock.local_addr.svm_port
+         daddr = vsock_sock.remote_addr.svm_cid
+         dport = vsock_sock.remote_addr.svm_port
+-        state = ""  # Protocol is always 0
++        state = vsock_sock.get_state()
+ 
+         saddr_tag = f"{saddr}:{sport}"
+         daddr_tag = f"{daddr}:{dport}"
+@@ -337,7 +338,7 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
+         else:
+             vollog.log(constants.LOGLEVEL_V, "Unsupported bluetooth protocol '%s'", bt_protocol)
+ 
+-        state = bt_sock.state
++        state = bt_sock.get_state()
+         sock_stat = saddr_tag, daddr_tag, state
+         return bt_sock, sock_stat
+ 
+
+
+
+
+@@ -32,10 +32,12 @@ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+ 
+         # Network
+         self.set_type_class('net', extensions.net)
++        self.set_type_class('socket', extensions.socket)
+         self.set_type_class('sock', extensions.sock)
+         self.set_type_class('inet_sock', extensions.inet_sock)
+         self.set_type_class('unix_sock', extensions.unix_sock)
+         self.set_type_class('netlink_sock', extensions.netlink_sock)
++        self.set_type_class('vsock_sock', extensions.vsock_sock)
+         self.set_type_class('packet_sock', extensions.packet_sock)
+         if 'bt_sock' in self.types:
+             self.set_type_class('bt_sock', extensions.bt_sock)
+
+
+
+
+@@ -4,7 +4,7 @@
+ 
+ import collections.abc
+ import logging
+-import socket
++import socket as socket_module
+ from typing import Generator, Iterable, Iterator, Optional, Tuple
+ 
+ from volatility3.framework import constants
+@@ -12,7 +12,7 @@ from volatility3.framework.constants.linux import SOCK_TYPES, SOCK_FAMILY
+ from volatility3.framework.constants.linux import IP_PROTOCOLS, IPV6_PROTOCOLS
+ from volatility3.framework.constants.linux import TCP_STATES, NETLINK_PROTOCOLS
+ from volatility3.framework.constants.linux import ETH_PROTOCOLS, BLUETOOTH_STATES
+-from volatility3.framework.constants.linux import BLUETOOTH_PROTOCOLS
++from volatility3.framework.constants.linux import BLUETOOTH_PROTOCOLS, SOCKET_STATES
+ from volatility3.framework import exceptions, objects, interfaces, symbols
+ from volatility3.framework.layers import linear
+ from volatility3.framework.objects import utility
+@@ -606,8 +606,8 @@ class net(objects.StructType):
+         else:
+             raise AttributeError("Unable to find net_namespace inode")
+ 
+-class sock(objects.StructType):
+-    def _get_vol_kernel_module_name(self):
++class socket(objects.StructType):
++    def _get_vol_kernel(self):
+         symbol_table_arr = self.vol.type_name.split("!", 1)
+         symbol_table = symbol_table_arr[0] if len(symbol_table_arr) == 2 else None
+ 
+@@ -615,8 +615,29 @@ class sock(objects.StructType):
+         if not module_names:
+             raise ValueError(f"No module using the symbol table {symbol_table}")
+ 
+-        return module_names[0]
++        kernel_module_name = module_names[0]
++        kernel = self._context.modules[kernel_module_name]
++        return kernel
++
++    def get_inode(self):
++        try:
++            kernel = self._get_vol_kernel()
++        except ValueError:

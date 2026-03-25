@@ -1,0 +1,103 @@
+@@ -43,6 +43,9 @@ def addAnalysisModules(vw):
+         # run imports after emucode
+         if arch == 'i386':
+             vw.addAnalysisModule("vivisect.analysis.i386.importcalls")
++            vw.addAnalysisModule("vivisect.analysis.i386.golang")
++        elif arch == 'amd64':
++            vw.addAnalysisModule("vivisect.analysis.amd64.golang")
+ 
+         vw.addFuncAnalysisModule("vivisect.analysis.generic.codeblocks")
+         vw.addFuncAnalysisModule("vivisect.analysis.generic.impapi")
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,318 @@
++'''
++Perform further analysis on 64-bit GO language executables.
++
++This module extends code flow analysis to runtime_main for Windows PE binaries.
++GO binaries start from a single export and proceed thru several functions
++that initialize GO.  Specific application code is launched from the GO function
++runtime_main(), which is invoked by "call rax" with an address placed on the
++stack many calls earlier.  Vivisect code flow analysis does not track the
++address; this module finds the address and invokes makeFunction(va).
++
++Samples have been found with different instruction sequences for reaching the
++address of runtime_main(); this module attempts all observed sequences.
++'''
++
++import envi
++import envi.archs.amd64.disasm
++import envi.archs.i386.disasm
++
++
++def analyze(vw):
++    '''
++    Perform further analysis on GO language executables.
++    '''
++    # Make sure it is a PE file, with "Go build ID:" in the first few bytes
++    # of the .text segment (versus a .upxN segment of a packed sample).
++    has_go_build = False
++    for segment in vw.getSegments():
++        va, size, name, filename = segment
++        if name == '.text':
++            bytez = vw.readMemory(va, 10000)
++            k1 = bytez.find(b'Go build ID: ')
++            if k1 != -1:
++                has_go_build = True
++                break
++    if not has_go_build:
++        return
++
++    # Search the entry point (public export) for the pointer to runtime_main().
++    # Most GO executables have a single entry point, but some are more complex.
++    ep = vw.getEntryPoints()
++    ptr_va, runtime_va = golang_search_eps(vw, ep, filename)
++    if runtime_va is None:
++        return
++
++    # Invoke codeflow on runtime_main().
++    vw.addEntryPoint(runtime_va)
++    vw.makeFunction(runtime_va)
++
++    # Also mark the ptr_va as a pointer to runtime_va.
++    vw.makePointer(ptr_va, tova=runtime_va)
++
++
++_GOLANG_AMD64_MEP1A_INSTRS \
++    = ['sub', 'mov', 'mov', 'call', 'call', 'nop', 'nop', 'add', 'ret']
++_GOLANG_AMD64_MEP1B_INSTRS \
++    = ['sub', 'mov', 'call', 'call', 'nop', 'nop', 'add', 'ret']
++_GOLANG_AMD64_MEP2A_INSTRS \
++    = ['mov', 'mov', 'call', 'mov', 'mov', 'mov', 'mov', 'mov', 'mov', 'mov',
++       'call', 'mov', 'mov', 'test', 'jz']
++_GOLANG_AMD64_MEP2B_INSTRS \
++    = ['mov', 'mov', 'call', 'mov', 'mov', 'mov', 'mov', 'mov', 'mov',
++       'call', 'mov', 'mov', 'test', 'jz']
++def golang_search_eps(vw, ep , filename):
++    '''
++    Search over all entry points to find main(), and then look for the
++    function that calls runtime_main().
++    Return two pointers, or None, None if not found.
++    '''
++    if len(ep) == 1:
++        ep_va = ep[0]
++        bblocks = vw.getFunctionBlocks(ep_va)
++        if not bblocks:
++            return None, None
++        ptr_va, runtime_va = extract_golang_mainmain(vw, bblocks, filename)
++        return ptr_va, runtime_va
++
++    # Look for an entry point with a single basic block with a specific set
++    # of instructions.  One of the call instructions has the next function.
++    # There can be multiple candidate functions meeting this criteria.
++    candidate_fns_1 = set()
++    for next_ep in ep:
++        bblocks = vw.getFunctionBlocks(next_ep)
++        if (not bblocks) or (len(bblocks) != 1):
++            continue
++        instrs = golang_collect_opcodes(vw, bblocks[0])
++        if (len(instrs) != len(_GOLANG_AMD64_MEP1A_INSTRS)) and \
++           (len(instrs) != len(_GOLANG_AMD64_MEP1B_INSTRS)):

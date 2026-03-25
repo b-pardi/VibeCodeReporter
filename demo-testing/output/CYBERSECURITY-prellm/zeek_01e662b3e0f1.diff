@@ -1,0 +1,182 @@
+@@ -6,6 +6,147 @@
+ #include "probabilistic/BloomFilter.h"
+ #include "probabilistic/CardinalityCounter.h"
+ 
++// Helper to retrieve a broker value out of a broker::vector at a specified
++// index, and casted to the expected destination type.
++template<typename S, typename V, typename D>
++inline bool get_vector_idx(const V& v, unsigned int i, D* dst)
++	{
++	if ( i >= v.size() )
++		return false;
++
++	auto x = caf::get_if<S>(&v[i]);
++	if ( ! x )
++		return false;
++
++	*dst = static_cast<D>(*x);
++	return true;
++	}
++
++OpaqueMgr* OpaqueMgr::mgr()
++	{
++	static OpaqueMgr mgr;
++	return &mgr;
++	}
++
++OpaqueVal::OpaqueVal(OpaqueType* t) : Val(t)
++	{
++	}
++
++OpaqueVal::~OpaqueVal()
++	{
++	}
++
++const std::string& OpaqueMgr::TypeID(const OpaqueVal* v) const
++	{
++	auto x = _types.find(v->OpaqueName());
++
++	if ( x == _types.end() )
++		reporter->InternalError(fmt("OpaqueMgr::TypeID: opaque type %s not registered",
++					v->OpaqueName()));
++
++	return x->first;
++	}
++
++OpaqueVal* OpaqueMgr::Instantiate(const std::string& id) const
++	{
++	auto x = _types.find(id);
++	return x != _types.end() ? (*x->second)() : nullptr;
++	}
++
++broker::expected<broker::data> OpaqueVal::Serialize() const
++	{
++	auto type = OpaqueMgr::mgr()->TypeID(this);
++
++	auto d = DoSerialize();
++	if ( d == broker::none() )
++		return broker::ec::invalid_data; // Cannot serialize
++
++	return {broker::vector{std::move(type), std::move(d)}};
++	}
++
++OpaqueVal* OpaqueVal::Unserialize(const broker::data& data)
++	{
++	auto v = caf::get_if<broker::vector>(&data);
++
++	if ( ! (v && v->size() == 2) )
++		return nullptr;
++
++	auto type = caf::get_if<std::string>(&(*v)[0]);
++	if ( ! type )
++		return nullptr;
++
++	auto val = OpaqueMgr::mgr()->Instantiate(*type);
++	if ( ! val )
++		return nullptr;
++
++	if ( ! val->DoUnserialize((*v)[1]) )
++		{
++		Unref(val);
++		return nullptr;
++		}
++
++	return val;
++	}
++
++broker::data OpaqueVal::SerializeType(BroType* t)
++	{
++	if ( t->InternalType() == TYPE_INTERNAL_ERROR )
++		return broker::none();
++
++	if ( t->InternalType() == TYPE_INTERNAL_OTHER )
++		{
++		// Serialize by name.
++		assert(t->GetName().size());
++		return broker::vector{true, t->GetName()};
++		}
++
++	// A base type.
++	return broker::vector{false, static_cast<uint64>(t->Tag())};
++	}
++
++BroType* OpaqueVal::UnserializeType(const broker::data& data)
++	{
++	auto v = caf::get_if<broker::vector>(&data);
++	if ( ! (v && v->size() == 2) )
++		return nullptr;
++
++	auto by_name = caf::get_if<bool>(&(*v)[0]);
++	if ( ! by_name )
++		return nullptr;
++
++	if ( *by_name )
++		{
++		auto name = caf::get_if<std::string>(&(*v)[1]);
++		if ( ! name )
++			return nullptr;
++
++		ID* id = global_scope()->Lookup(name->c_str());
++                if ( ! id )
++			return nullptr;
++
++                BroType* t = id->AsType();
++                if ( ! t )
++			return nullptr;
++
++                return t->Ref();
++		}
++
++	auto tag = caf::get_if<uint64>(&(*v)[1]);
++	if ( ! tag )
++		return nullptr;
++
++	return base_type(static_cast<TypeTag>(*tag));
++	}
++
++Val* OpaqueVal::DoClone(CloneState* state)
++	{
++	auto d = OpaqueVal::Serialize();
++	if ( ! d )
++		return nullptr;
++
++	return OpaqueVal::Unserialize(std::move(*d));
++	}
++
+ bool HashVal::IsValid() const
+ 	{
+ 	return valid;
+@@ -145,6 +286,75 @@ StringVal* MD5Val::DoGet()
+ 	return new StringVal(md5_digest_print(digest));
+ 	}
+ 
++IMPLEMENT_OPAQUE_VALUE(MD5Val)
++
++broker::data MD5Val::DoSerialize() const
++	{
++	if ( ! IsValid() )
++		return broker::vector{false};
++
++	MD5_CTX* md = (MD5_CTX*) EVP_MD_CTX_md_data(ctx);
++
++	broker::vector d = {
++	    true,
++	    static_cast<uint64>(md->A),
++	    static_cast<uint64>(md->B),
++	    static_cast<uint64>(md->C),
++	    static_cast<uint64>(md->D),
++	    static_cast<uint64>(md->Nl),
++	    static_cast<uint64>(md->Nh),
++	    static_cast<uint64>(md->num)
++	};
++
++	for ( int i = 0; i < MD5_LBLOCK; ++i )
++		d.emplace_back(static_cast<uint64>(md->data[i]));
++
++	return d;
++	}
++
++bool MD5Val::DoUnserialize(const broker::data& data)
++	{
++	auto d = caf::get_if<broker::vector>(&data);
++	if ( ! d 

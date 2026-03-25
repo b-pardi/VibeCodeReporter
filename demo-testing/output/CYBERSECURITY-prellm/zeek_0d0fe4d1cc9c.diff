@@ -1,0 +1,170 @@
+@@ -18,6 +18,36 @@ extern "C" {
+ #include "setsignal.h"
+ }
+ 
++struct StemState {
++	StemState(std::unique_ptr<bro::PipePair> p);
++
++	~StemState();
++
++	std::string Run();
++
++	void Reap();
++
++	std::string Revive();
++
++	bool Spawn(zeek::Supervisor::Node* node);
++
++	std::vector<std::string> ExtractMessages(std::string* buffer) const;
++
++	std::unique_ptr<bro::Flare> signal_flare;
++	std::unique_ptr<bro::PipePair> pipe;
++	std::map<std::string, zeek::Supervisor::Node> nodes;
++	std::string msg_buffer;
++};
++
++static StemState* stem_state = nullptr;
++
++static RETSIGTYPE stem_sig_handler(int signo)
++	{
++	printf("Stem received SIGCHLD signal: %d\n", signo);
++	stem_state->signal_flare->Fire();
++	return RETSIGVAL;
++	}
++
+ static RETSIGTYPE supervisor_sig_handler(int signo)
+ 	{
+ 	DBG_LOG(DBG_SUPERVISOR, "received SIGCHLD signal: %d", signo);
+@@ -38,6 +68,8 @@ zeek::Supervisor::Supervisor(zeek::Supervisor::Config cfg,
+ 
+ zeek::Supervisor::~Supervisor()
+ 	{
++	setsignal(SIGCHLD, SIG_DFL);
++
+ 	if ( ! stem_pid )
+ 		{
+ 		DBG_LOG(DBG_SUPERVISOR, "shutdown, stem process already exited");
+@@ -101,21 +133,24 @@ void zeek::Supervisor::HandleChildSignal()
+ 		reporter->Error("Supervisor failed to get exit status"
+ 			            " of stem process: %s", tmp);
+ 		}
+-	else if ( WIFEXITED(status) )
+-		{
+-		DBG_LOG(DBG_SUPERVISOR, "stem process exited with status %d",
+-			    WEXITSTATUS(status));
+-		stem_pid = 0;
+-		}
+-	else if ( WIFSIGNALED(status) )
++	else
+ 		{
+-		DBG_LOG(DBG_SUPERVISOR, "stem process terminated by signal %d",
+-			    WTERMSIG(status));
+ 		stem_pid = 0;
++
++		if ( WIFEXITED(status) )
++			{
++			DBG_LOG(DBG_SUPERVISOR, "stem process exited with status %d",
++			        WEXITSTATUS(status));
++			}
++		else if ( WIFSIGNALED(status) )
++			{
++			DBG_LOG(DBG_SUPERVISOR, "stem process terminated by signal %d",
++			       WTERMSIG(status));
++			}
++		else
++			reporter->Error("Supervisor failed to get exit status"
++			                " of stem process for unknown reason");
+ 		}
+-	else
+-		reporter->Error("Supervisor failed to get exit status"
+-			            " of stem process for unknown reason");
+ 
+ 	if ( ! stem_pid )
+ 		{
+@@ -194,10 +229,124 @@ void zeek::Supervisor::Process()
+ 		}
+ 	}
+ 
+-std::string zeek::Supervisor::RunStem(std::unique_ptr<bro::PipePair> pipe)
++StemState::StemState(std::unique_ptr<bro::PipePair> p)
++	: signal_flare(new bro::Flare()), pipe(std::move(p))
+ 	{
+ 	zeek::set_thread_name("zeek.stem");
+ 	pipe->Swap();
++	stem_state = this;
++	setsignal(SIGCHLD, stem_sig_handler);
++	}
++
++StemState::~StemState()
++	{
++	setsignal(SIGCHLD, SIG_DFL);
++	}
++
++void StemState::Reap()
++	{
++	for ( auto& n : nodes )
++		{
++		auto& node = n.second;
++
++		if ( ! node.pid )
++			continue;
++
++		int status;
++		auto res = waitpid(node.pid, &status, WNOHANG);
++
++		if ( res == 0 )
++			// It's still alive.
++			continue;
++
++		if ( res == -1 )
++			{
++			fprintf(stderr, "Stem failed to get node exit status %s (%d): %s\n",
++			        node.name.data(), node.pid, strerror(errno));
++			continue;
++			}
++
++		if ( WIFEXITED(status) )
++			{
++			node.exit_status = WEXITSTATUS(status);
++			// TODO: may be some cases where the node is intended to exit
++			printf("node '%s' exited with status %d\n",
++			       node.name.data(), node.exit_status);
++			}
++		else if ( WIFSIGNALED(status) )
++			{
++			node.signal_number = WTERMSIG(status);
++			printf("node '%s' terminated by signal %d\n",
++			       node.name.data(), node.signal_number);
++			}
++		else
++			fprintf(stderr, "Stem failed to get node exit status %s (%d)\n",
++			        node.name.data(), node.pid);
++
++		node.pid = 0;
++		}
++	}
++
++std::string StemState::Revive()
++	{
++	for ( auto& n : nodes )
++		{
++		auto& node = n.second;
++
++		if ( node.pid )
++			continue;
++
++		if ( Spawn(&node) )
++			return node.name;
++		}
++
++	return "";
++	}
++
++bool StemState::Spawn(zeek::Supervisor::Node* node)
++	{
++	auto node_pid = fork();
++
++	if ( node_pid == -1 )
++		{
++		fprintf(stderr, "failed to fork Zeek node '%s': %s\n",
++		        node->name.data(), strer

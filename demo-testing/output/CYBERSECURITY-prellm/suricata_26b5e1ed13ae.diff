@@ -1,0 +1,137 @@
+@@ -1204,9 +1204,7 @@ static int FlowMgrTest02 (void)
+ 
+     TimeGet(&ts);
+     TCP_SEG_LEN(&seg) = 3;
+-    seg.next = NULL;
+-    seg.prev = NULL;
+-    client.seg_list = &seg;
++    TCPSEG_RB_INSERT(&client.seg_tree, &seg);
+     ssn.client = client;
+     ssn.server = client;
+     ssn.state = TCP_ESTABLISHED;
+@@ -1310,9 +1308,7 @@ static int FlowMgrTest04 (void)
+ 
+     TimeGet(&ts);
+     TCP_SEG_LEN(&seg) = 3;
+-    seg.next = NULL;
+-    seg.prev = NULL;
+-    client.seg_list = &seg;
++    TCPSEG_RB_INSERT(&client.seg_tree, &seg);
+     ssn.client = client;
+     ssn.server = client;
+     ssn.state = TCP_ESTABLISHED;
+
+
+
+
+@@ -44,7 +44,8 @@
+  *  \retval 0 shared data is the same (or no data is shared)
+  *  \retval 1 shared data is different
+  */
+-int StreamTcpInlineSegmentCompare(TcpStream *stream, Packet *p, TcpSegment *seg)
++int StreamTcpInlineSegmentCompare(const TcpStream *stream,
++        const Packet *p, const TcpSegment *seg)
+ {
+     SCEnter();
+ 
+@@ -108,7 +109,8 @@ int StreamTcpInlineSegmentCompare(TcpStream *stream, Packet *p, TcpSegment *seg)
+  *  \todo What about reassembled fragments?
+  *  \todo What about unwrapped tunnel packets?
+  */
+-void StreamTcpInlineSegmentReplacePacket(TcpStream *stream, Packet *p, TcpSegment *seg)
++void StreamTcpInlineSegmentReplacePacket(const TcpStream *stream,
++        Packet *p, const TcpSegment *seg)
+ {
+     SCEnter();
+ 
+
+
+
+
+@@ -26,8 +26,10 @@
+ 
+ #include "stream-tcp-private.h"
+ 
+-int StreamTcpInlineSegmentCompare(TcpStream *, Packet *, TcpSegment *);
+-void StreamTcpInlineSegmentReplacePacket(TcpStream *, Packet *, TcpSegment *);
++int StreamTcpInlineSegmentCompare(const TcpStream *,
++        const Packet *, const TcpSegment *);
++void StreamTcpInlineSegmentReplacePacket(const TcpStream *,
++        Packet *, const TcpSegment *);
+ 
+ void StreamTcpInlineRegisterTests(void);
+ 
+
+
+
+
+@@ -31,8 +31,6 @@
+ #include "util-print.h"
+ #include "util-validate.h"
+ 
+-//static void PrintList2(TcpSegment *seg);
+-
+ static void StreamTcpRemoveSegmentFromStream(TcpStream *stream, TcpSegment *seg);
+ 
+ static int check_overlap_different_data = 0;
+@@ -46,6 +44,23 @@ void StreamTcpReassembleConfigEnableOverlapCheck(void)
+  *  Inserts and overlap handling
+  */
+ 
++RB_GENERATE(TCPSEG, TcpSegment, rb, TcpSegmentCompare);
++
++int TcpSegmentCompare(struct TcpSegment *a, struct TcpSegment *b)
++{
++    if (SEQ_GT(a->seq, b->seq))
++        return 1;
++    else if (SEQ_LT(a->seq, b->seq))
++        return -1;
++    else {
++        if (a->payload_len == b->payload_len)
++            return 0;
++        else if (a->payload_len > b->payload_len)
++            return 1;
++        else
++            return -1;
++    }
++}
+ 
+ /** \internal
+  *  \brief insert segment data into the streaming buffer
+@@ -98,22 +113,55 @@ static inline int InsertSegmentDataCustom(TcpStream *stream, TcpSegment *seg, ui
+ }
+ 
+ /** \internal
+- *  \brief insert the segment into the proper place in the list
++ *  \brief check if this segments overlaps with an in-tree seg.
++ *  \retval true
++ *  \retval false
++ */
++static inline bool CheckOverlap(struct TCPSEG *tree, TcpSegment *seg)
++{
++    const uint32_t re = SEG_SEQ_RIGHT_EDGE(seg);
++    SCLogDebug("start. SEQ %u payload_len %u. Right edge: %u. Seg %p",
++            seg->seq, seg->payload_len, re, seg);
++
++    /* check forward */
++    TcpSegment *next = TCPSEG_RB_NEXT(seg);
++    if (next) {
++        // next has same seq, so data must overlap
++        if (SEQ_EQ(next->seq, seg->seq))
++            return true;
++        // our right edge is beyond next seq, overlap
++        if (SEQ_GT(re, next->seq))
++            return true;
++    }
++    /* check backwards */
++    TcpSegment *prev = TCPSEG_RB_PREV(seg);
++    if (prev) {
++        // prev has same seq, so data must overlap
++        if (SEQ_EQ(prev->seq, seg->seq))
++            return true;
++        // prev's right edge is beyond our seq, overlap
++        const uint32_t prev_re = SEG_SEQ_RIGHT_EDGE(prev);
++        if (SEQ_GT(prev_re, prev->seq))
++            return true;
++    }
++

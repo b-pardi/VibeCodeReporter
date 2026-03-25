@@ -1,0 +1,164 @@
+@@ -20,6 +20,7 @@
+ #include "zeek/zeekygen/ScriptInfo.h"
+ #include "zeek/zeekygen/utils.h"
+ #include "zeek/module_util.h"
++#include "zeek/script_opt/IDOptInfo.h"
+ 
+ namespace zeek {
+ 
+@@ -119,6 +120,8 @@ ID::ID(const char* arg_name, IDScope arg_scope, bool arg_is_export)
+ 	is_type = false;
+ 	offset = 0;
+ 
++	opt_info = new IDOptInfo(this);
++
+ 	infer_return_type = false;
+ 
+ 	SetLocationInfo(&start_location, &end_location);
+@@ -127,6 +130,7 @@ ID::ID(const char* arg_name, IDScope arg_scope, bool arg_is_export)
+ ID::~ID()
+ 	{
+ 	delete [] name;
++	delete opt_info;
+ 	}
+ 
+ std::string ID::ModuleName() const
+@@ -285,11 +289,6 @@ const AttrPtr& ID::GetAttr(AttrTag t) const
+ 	return attrs ? attrs->Find(t) : Attr::nil;
+ 	}
+ 
+-void ID::AddInitExpr(ExprPtr init_expr)
+-	{
+-	init_exprs.emplace_back(std::move(init_expr));
+-	}
+-
+ bool ID::IsDeprecated() const
+ 	{
+ 	return GetAttr(ATTR_DEPRECATED) != nullptr;
+@@ -676,6 +675,12 @@ std::vector<Func*> ID::GetOptionHandlers() const
+ 	return v;
+ 	}
+ 
++
++void IDOptInfo::AddInitExpr(ExprPtr init_expr)
++	{
++	init_exprs.emplace_back(std::move(init_expr));
++	}
++
+ } // namespace detail
+ 
+ } // namespace zeek
+
+
+
+
+@@ -7,7 +7,6 @@
+ #include <string_view>
+ #include <vector>
+ 
+-#include "zeek/IntrusivePtr.h"
+ #include "zeek/Obj.h"
+ #include "zeek/Attr.h"
+ #include "zeek/Notifier.h"
+@@ -44,6 +43,8 @@ enum IDScope { SCOPE_FUNCTION, SCOPE_MODULE, SCOPE_GLOBAL };
+ class ID;
+ using IDPtr = IntrusivePtr<ID>;
+ 
++class IDOptInfo;
++
+ class ID final : public Obj, public notifier::detail::Modifiable {
+ public:
+ 	static inline const IDPtr nil;
+@@ -112,10 +113,6 @@ public:
+ 
+ 	const AttrPtr& GetAttr(AttrTag t) const;
+ 
+-	void AddInitExpr(ExprPtr init_expr);
+-	const std::vector<ExprPtr>& GetInitExprs() const
+-		{ return init_exprs; }
+-
+ 	bool IsDeprecated() const;
+ 
+ 	void MakeDeprecated(ExprPtr deprecation);
+@@ -144,6 +141,8 @@ public:
+ 	void AddOptionHandler(FuncPtr callback, int priority);
+ 	std::vector<Func*> GetOptionHandlers() const;
+ 
++	IDOptInfo* GetOptInfo() const			{ return opt_info; }
++
+ protected:
+ 	void EvalFunc(ExprPtr ef, ExprPtr ev);
+ 
+@@ -161,15 +160,15 @@ protected:
+ 	ValPtr val;
+ 	AttributesPtr attrs;
+ 
+-	// Expressions used to initialize the identifier, for use by
+-	// the scripts-to-C++ compiler.  We need to track all of them
+-	// because it's possible that a global value gets created using
+-	// one of the earlier instances rather than the last one.
+-	std::vector<ExprPtr> init_exprs;
+-
+ 	// contains list of functions that are called when an option changes
+ 	std::multimap<int, FuncPtr> option_handlers;
+ 
++	// Information managed by script optimization.  We package this
++	// up into a separate object for purposes of modularity, and,
++	// via the associated pointer, to allow it to be modified in
++	// contexts where the ID is itself "const".
++	IDOptInfo* opt_info;
++
+ };
+ 
+ } // namespace zeek::detail
+
+
+
+
+@@ -6,6 +6,7 @@
+ 
+ #include "zeek/module_util.h"
+ #include "zeek/script_opt/ProfileFunc.h"
++#include "zeek/script_opt/IDOptInfo.h"
+ #include "zeek/script_opt/CPP/Compile.h"
+ 
+ 
+@@ -122,7 +123,7 @@ void CPPCompile::GenGlobalInit(const ID* g, string& gl, const ValPtr& v)
+ 		// expression anyway.)
+ 
+ 		// Use the final initialization expression.
+-		auto& init_exprs = g->GetInitExprs();
++		auto& init_exprs = g->GetOptInfo()->GetInitExprs();
+ 		init_val = GenExpr(init_exprs.back(), GEN_VAL_PTR, false);
+ 		}
+ 	else
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,523 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/Stmt.h"
++#include "zeek/Expr.h"
++#include "zeek/Desc.h"
++#include "zeek/script_opt/IDOptInfo.h"
++#include "zeek/script_opt/StmtOptInfo.h"
++
++
++namespace zeek::detail {
++
++const char* trace_ID = nullptr;
++
++IDDefRegion::IDDefRegion(const Stmt* s, bool maybe, int def)
++	{
++	start_stmt = s->GetOptInfo()->stmt_num;
++	block_level = s->GetOptInfo()->block_level;
++
++	Init(maybe, def);
++	}
++
++IDDefRegion::IDDefRegion(int stmt_num, int level, bool maybe, int def)
++	{
++	start_s

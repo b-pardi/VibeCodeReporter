@@ -1,0 +1,83 @@
+@@ -364,6 +364,7 @@ R_API void r_io_bank_fini(RIO *io);
+ R_API RIOBank *r_io_bank_get(RIO *io, const ut32 bankid);
+ R_API bool r_io_bank_map_add_top(RIO *io, const ut32 bankid, const ut32 mapid);
+ R_API bool r_io_bank_map_priorize (RIO *io, const ut32 bankid, const ut32 mapid);
++R_API bool r_io_bank_update_map_location(RIO *io, const ut32 bankid, const ut32 mapid, ut64 oaddr);
+ R_API bool r_io_bank_locate(RIO *io, const ut32 bankid, const ut64 size, ut64 *addr);
+ R_API bool r_io_bank_read_at(RIO *io, const ut32 bankid, ut64 addr, ut8 *buf, int len);
+ R_API bool r_io_bank_write_at(RIO *io, const ut32 bankid, ut64 addr, ut8 *buf, int len);
+
+
+
+
+@@ -297,6 +297,246 @@ found:
+ 	return r_rbtree_cont_insert (bank->submaps, sm, _find_sm_by_vaddr_cb, NULL);
+ }
+ 
++
++// deletes submaps that belong to a mapref with a specified priority from the submap tree of a bank.
++// the mapref is accessed by it's iter from the priority list in the bank,
++// so that the function can insert new submaps that fill the gaps. The iter represents the priority of the mapref.
++// this function DOES NOT delete the iter from the list. (that way it can be used for delete and relocate)
++static void _delete_submaps_from_bank_tree(RIO *io, RIOBank *bank, RListIter *prio, RIOMap *map) {
++	RIOSubMap fake_sm;
++	fake_sm.itv = map->itv;
++	fake_sm.mapref.id = map->id;
++	RContRBNode *entry = _find_entry_submap_node (bank, &fake_sm);
++	RIOSubMap *bd = (RIOSubMap *)entry->data;
++	while (bd && r_io_submap_overlap (bd, (&fake_sm))) {
++		// this loop deletes all affected submaps from the rbtree
++		// and also enqueues them in bank->todo
++		RContRBNode *next = r_rbtree_cont_node_next (entry);
++		if (bd->mapref.id == fake_sm.mapref.id) {
++			r_queue_enqueue (bank->todo, R_NEWCOPY (RIOSubMap, bd));
++			r_rbtree_cont_delete (bank->submaps, bd, _find_sm_by_vaddr_cb, NULL);
++		}
++		entry = next;
++		bd = entry ? (RIOSubMap *)entry->data : NULL;
++	}
++	RListIter *iter = prio;
++	while (!r_queue_is_empty (bank->todo)) {
++		// now check for each deleted submap if a lower map intersects with it
++		// and create new submaps accordingly, and fill the gaps
++		RIOSubMap *sm = r_queue_dequeue (bank->todo);
++		RListIter *ator = r_list_iter_get_prev (iter);
++		while (ator) {
++			map = r_io_map_get_by_ref (io, (RIOMapRef *)ator->data);
++			ator = r_list_iter_get_prev (ator);
++			if (!map) {
++				// if this happens, something is fucked up, and no submap should be inserted
++				continue;
++			}
++			// if the map and sm intersect, the intersecting submap needs to be inserted in the tree
++			// there are 5 cases to consider here
++			// 1. no intersection: just continue to the next iteration
++			// 2. map overlaps sm on both ends: insert submap for map with boundaries of sm
++			// 3. map overlaps sm on the upper end: insert submap for map accordingly and adjust sm boundaries
++			// 4. map overlaps sm on the lower end: insert submap for map accordingly and adjust sm boundaries
++			// 5. sm overlaps sm on both ends: split sm into 2 submaps and enqueue new one in banks->todo; insert submap for map; adjust sm boundaries
++			if (r_io_submap_to (sm) < r_io_map_from (map) || r_io_submap_from (sm) > r_io_map_to (map)) {
++				// case 1
++				continue;
++			}
++			RIOMapRef *mapref = _mapref_from_map (map);
++			bd = r_io_submap_new (io, mapref);
++			free (mapref);
++			if (r_io_submap_from (sm) >= r_io_map_from (map)) {
++				// case 4 and 2
++				r_io_submap_set_from (bd, r_io_submap_from (sm));
++				r_rbtree_cont_insert (bank->submaps, bd, _find_sm_by_vaddr_cb, NULL);
++				if (r_io_submap_to (sm) <= r_io_map_to (map)) {
++					// case 2
++					r_io_submap_set_to (bd, r_io_submap_to (sm));
++					break;
++				}
++				// case 4
++				r_io_submap_set_from (sm, r_io_submap_to (bd) + 1);
++				continue;
++			}
++			if (r_io_submap_to (sm) <= r_io_map_to (map)) {
++				// case 3
++				r_io_submap_set_to (bd, r_io_submap_to (sm));
++				r_io_submap_set_to (sm, r_io_submap_from (bd) - 1);
++				r_rbtree_cont_insert (bank->submaps, bd, _fi

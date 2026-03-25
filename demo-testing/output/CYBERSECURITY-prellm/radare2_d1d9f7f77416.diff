@@ -1,0 +1,95 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,2910 @@
++/* radare2 - LGPL - Copyright 2020-2021 - aemitt, pancake */
++
++#include <r_anal.h>
++#include <r_lib.h>
++#include <ht_uu.h>
++#include <r_util/r_assert.h>
++#include "encodings_dec.h"
++#include "encodings_fmt.h"
++#include "operations.h"
++#include "arm64dis.h"
++
++#define BITMASK_BY_WIDTH_COUNT 64
++static const ut64 bitmask_by_width[BITMASK_BY_WIDTH_COUNT] = {
++	0x1, 0x3, 0x7, 0xf, 0x1f, 0x3f, 0x7f, 0xff, 0x1ff, 0x3ff, 0x7ff,
++	0xfff, 0x1fff, 0x3fff, 0x7fff, 0xffff, 0x1ffff, 0x3ffff, 0x7ffff,
++	0xfffff, 0x1fffff, 0x3fffff, 0x7fffff, 0xffffff, 0x1ffffffLL, 0x3ffffffLL,
++	0x7ffffffLL, 0xfffffffLL, 0x1fffffffLL, 0x3fffffffLL, 0x7fffffffLL, 0xffffffffLL,
++	0x1ffffffffLL, 0x3ffffffffLL, 0x7ffffffffLL, 0xfffffffffLL, 0x1fffffffffLL,
++	0x3fffffffffLL, 0x7fffffffffLL, 0xffffffffffLL, 0x1ffffffffffLL, 0x3ffffffffffLL,
++	0x7ffffffffffLL, 0xfffffffffffLL, 0x1fffffffffffLL, 0x3fffffffffffLL, 0x7fffffffffffLL,
++	0xffffffffffffLL, 0x1ffffffffffffLL, 0x3ffffffffffffLL, 0x7ffffffffffffLL,
++	0xfffffffffffffLL, 0x1fffffffffffffLL, 0x3fffffffffffffLL, 0x7fffffffffffffLL,
++	0xffffffffffffffLL, 0x1ffffffffffffffLL, 0x3ffffffffffffffLL, 0x7ffffffffffffffLL,
++	0xfffffffffffffffLL, 0x1fffffffffffffffLL, 0x3fffffffffffffffLL, 0x7fffffffffffffffLL, 0xffffffffffffffffLL
++};
++
++#define esilprintf(op, fmt, ...) r_strbuf_setf (&op->esil, fmt, ##__VA_ARGS__)
++
++#define ISIMM64(x) (insn->operands[x].operandClass == IMM32 || insn->operands[x].operandClass == IMM64  || insn->operands[x].operandClass == FIMM32)
++#define ISREG64(x) (insn->operands[x].operandClass == REG || insn->operands[x].operandClass == MEM_REG)
++#define ISMEM64(x) is_mem(insn->operands[x].operandClass)
++#define ISCOND64(x) (insn->operands[x].operandClass == CONDITION)
++#define REGID64(x) (insn->operands[x].reg[0])
++
++static bool is_mem(OperandClass op) {
++	return (
++		op == MEM_REG      ||
++		op == MEM_PRE_IDX  ||
++		op == MEM_POST_IDX ||
++		op == MEM_OFFSET   ||
++		op == MEM_EXTENDED // dunno what these are
++	);
++}
++
++#define REG64(x) (get_register_name(insn->operands[x].reg[0]))
++#define REGSIZE64(x) (get_register_size(insn->operands[x].reg[0]))
++#define REGBITS64(x) ((int)get_register_size(insn->operands[x].reg[0])*8)
++#define GETIMM64(x) ((ut64)insn->operands[x].immediate)
++
++#define MEMBASE64(x) (get_register_name(insn->operands[x].reg[0]))
++#define MEMINDEX64(x) (get_register_name(insn->operands[x].reg[1]))
++#define HASMEMINDEX64(x) (insn->operands[x].reg[1]) // uhh idk
++#define MEMDISP64(x) ((ut64)insn->operands[x].immediate)
++
++#define INSOP64(x) insn->operands[x]
++#define OPCOUNT64() get_op_count(insn)
++
++// #define ISWRITEBACK64() 0
++#define ISPREINDEX32() ((OPCOUNT64() == 2) && (insn->operands[1].operandClass == MEM_PRE_IDX))
++#define ISPOSTINDEX32() ((OPCOUNT64() == 3) && (insn->operands[1].operandClass == MEM_POST_IDX))
++#define ISPREINDEX64() ((OPCOUNT64() == 3) && (insn->operands[2].operandClass == MEM_PRE_IDX))
++#define ISPOSTINDEX64() ((OPCOUNT64() == 4) && (insn->operands[2].operandClass == MEM_POST_IDX))
++
++static ut8 get_op_count(Instruction* insn) {
++	ut8 i = 0;
++	while (insn->operands[i].operandClass != NONE) i++;
++	return i;
++}
++
++static int vas_size(ArrangementSpec vas) {
++	switch (vas) {
++	case ARRSPEC_NONE:
++		return 0;
++	case ARRSPEC_FULL: /* 128-bit v-reg unsplit, eg: REG_V0_Q0 */
++		return 128;
++
++	/* 128 bit v-reg considered as... */
++	case ARRSPEC_2DOUBLES: /* (.2d) two 64-bit double-precision: REG_V0_D1, REG_V0_D0 */
++		return 64;
++	case ARRSPEC_4SINGLES: /* (.4s) four 32-bit single-precision: REG_V0_S3, REG_V0_S2, REG_V0_S1, REG_V0_S0 */
++		return 32;
++	case ARRSPEC_8HALVES: /* (.8h) eight 16-bit half-precision: REG_V0_H7, REG_V0_H6, (..., REG_V0_H0 */
++		return 16;
++	case ARRSPEC_16BYTES: /* (.16b) sixteen 8-bit values: REG_V0_B15, REG_V0_B14, (..., REG_V0_B01 */
++		return 8;
++
++	/* low 64-bit of v-reg considered as... */
++	case ARRSPEC_1DOUBLE: /* (.d) one 64-bit double-precision: REG_V0_D0 */
++		return 64;
++	case ARR

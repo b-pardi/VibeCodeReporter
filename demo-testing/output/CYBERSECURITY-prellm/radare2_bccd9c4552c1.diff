@@ -1,0 +1,152 @@
+@@ -11,7 +11,9 @@ typedef enum optype_t {
+ 	ARM_GPR = 1,
+ 	ARM_CONSTANT = 2,
+ 	ARM_FP = 4,
+-	ARM_MEM_OPT = 8
++	ARM_MEM_OPT = 8,
++	ARM_SHIFT = 16,
++	ARM_EXTEND = 32
+ } OpType;
+ 
+ typedef enum regtype_t {
+@@ -24,11 +26,18 @@ typedef enum regtype_t {
+ } RegType;
+ 
+ typedef enum shifttype_t {
+-	ARM_NO_SHIFT = -1,
+ 	ARM_LSL = 0,
+ 	ARM_LSR = 1,
+ 	ARM_ASR = 2,
+-	ARM_ROR = 3
++	ARM_ROR = 3,
++	ARM_UXTB,
++	ARM_UXTH,
++	ARM_UXTW,
++	ARM_UXTX,
++	ARM_SXTB,
++	ARM_SXTH,
++	ARM_SXTW,
++	ARM_SXTX
+ } ShiftType;
+ 
+ typedef enum logicalop_t {
+@@ -48,11 +57,13 @@ typedef struct operand_t {
+ 		};
+ 		struct {
+ 			ut64 immediate;
+-			int sign;
++			bool sign;
++			bool preindex;
+ 		};
+ 		struct {
+ 			ut64 shift_amount;
+ 			ShiftType shift;
++			bool amount_present;
+ 		};
+ 		struct {
+ 			ut32 mem_option;
+@@ -67,6 +78,7 @@ typedef struct Opcode_t {
+ 	ut32 op[3];
+ 	size_t op_len;
+ 	ut8 opcode[3];
++	bool writeback;
+ 	int operands_count;
+ 	Operand operands[MAX_OPERANDS];
+ } ArmOp;
+@@ -288,7 +300,7 @@ static ut32 cmp(ArmOp *op) {
+ 
+ 	data = k | (op->operands[0].reg & 0x18) << 13 | op->operands[0].reg << 29 | op->operands[1].reg << 8;
+ 
+-	if (op->operands[2].shift != ARM_NO_SHIFT) {
++	if (op->operands[2].type != ARM_SHIFT) {
+ 		data |= op->operands[2].shift_amount << 18 | op->operands[2].shift << 14;
+ 	}
+ 	return data;
+@@ -394,72 +406,147 @@ static ut32 reglsop(ArmOp *op, int k) {
+ 	return data;
+ }
+ 
+-// Byte load/store ops
+-static ut32 bytelsop(ArmOp *op, int k) {
++// load/store ops
++static ut32 lsop(ArmOp *op, int k, ut64 addr) {
+ 	ut32 data = UT32_MAX;
+-
+-	if (op->operands[0].reg_type & ARM_REG64) {
+-		return data;
++	int op_count = op->operands_count;
++	if (k == 0x00000098) { // ldrsw
++		if (op->operands[0].type & ARM_GPR
++			&& op->operands[1].type & ARM_CONSTANT) { // (literal)
++			st64 offset = op->operands[1].immediate - addr;
++			if (op->operands[0].reg_type & ARM_REG32 || offset & 0x3
++				|| offset >= 0x100000 || offset < -0x100000) {
++				return data;
++			}
++			offset >>= 2;
++			data = k | (offset & 0x7f800) >> 3 | (offset & 0x7f8) << 13
++				| (offset & 0x7) << 29 | op->operands[0].reg << 24;
++			return data;
++		}
++		k = 0x000080b8;
+ 	}
+-	if (op->operands[1].reg_type & ARM_REG32) {
++	if (op->operands[0].type != ARM_GPR || op->operands[1].type != ARM_GPR
++		|| op->operands[1].reg_type & ARM_REG32) {
+ 		return data;
+ 	}
++	k |= op->operands[0].reg << 24 | (op->operands[1].reg & 0x7) << 29 | (op->operands[1].reg & 0x18) << 13;
++	if (!strcmp (op->mnemonic, "ldrb") || !strcmp (op->mnemonic, "ldrh")
++		|| !strcmp (op->mnemonic, "strb") || !strcmp (op->mnemonic, "strh")) {
++		if (op->operands[0].reg_type & ARM_REG64) {
++			return data;
++		}
++	} else if (!strcmp (op->mnemonic, "ldrsw")) {
++		if (op->operands[0].reg_type & ARM_REG32) {
++			return data;
++		}
++	} else { // ldrsh, ldrsb
++		if (op->operands[0].reg_type & ARM_REG32) {
++			k |= 0x00004000;
++		}
++	}
++	char width = op->mnemonic[strlen (op->mnemonic) - 1];
+ 	if (op->operands[2].type & ARM_GPR) {
+-		if ((k & 0xf) != 8) {
+-			k--;
++		k |= 0x00482000;
++		if (op->operands[3].type == ARM_EXTEND) {
++			switch (op->operands[3].shift) {
++			case ARM_SXTW:
++				k |= 0x00800000;
++			// fall through
++			case ARM_UXTW:
++				if (op->operands[2].reg_type & ARM_REG64) {
++					return data;
++				}
++				break;
++			case ARM_SXTX:
++				k |= 0x00a00000;
++				if (op->operands[2].reg_type & ARM_REG32) {
++					return data;
++				}
++				break;
++			default:
++				return data;
++			}
++		} else if (op->operands[3].type == ARM_SHIFT) {
++			if (op->operands[3].shift != ARM_LSL
++				|| op->operands[2].reg_type & ARM_REG32) {
++				return data;
++			}
++			k |= 0x00200000;
+ 		}
+-		k += 0x00682000;
+-		data = k | op->operands[0].reg << 24 | op->operands[1].reg << 29 | (op->operands[1].reg & 56) << 13;
+-		data |= op->operands[2].reg << 8;
++		if (op->operands[3].type == ARM_EXTEND || op->operands[3].type == ARM_SHIFT) {
++			if (width == 'b') {
++				if (op->operands[3].shift_amount) {
++					return data;
++				}
++				if (op->operands[3].amount_prese

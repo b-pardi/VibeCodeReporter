@@ -1,0 +1,141 @@
+@@ -65,6 +65,7 @@ elif SOLARIS:
+     from scapy.arch.solaris import *  # noqa F403
+ elif WINDOWS:
+     from scapy.arch.windows import *  # noqa F403
++    from scapy.arch.windows.native import *  # noqa F403
+ 
+ if conf.iface is None:
+     conf.iface = scapy.consts.LOOPBACK_INTERFACE
+
+
+
+
+@@ -7,21 +7,23 @@
+ Functions common to different architectures
+ """
+ 
+-# Important Note: This file is not needed on Windows, and mustn't be loaded
+-
+-import socket
+-import subprocess
+-from fcntl import ioctl
++import ctypes
+ import os
++import socket
+ import struct
+-import ctypes
++import subprocess
++import time
+ from ctypes import POINTER, Structure
+ from ctypes import c_uint, c_uint32, c_ushort, c_ubyte
++from scapy.consts import WINDOWS
+ from scapy.config import conf
+ from scapy.data import MTU
+ from scapy.error import Scapy_Exception
+ import scapy.modules.six as six
+ 
++if not WINDOWS:
++    from fcntl import ioctl
++
+ # BOOT
+ 
+ 
+@@ -38,7 +40,8 @@ def _check_tcpdump():
+     return proc.wait() == 0
+ 
+ 
+-TCPDUMP = _check_tcpdump()
++# This won't be used on Windows
++TCPDUMP = WINDOWS or _check_tcpdump()
+ 
+ # UTILS
+ 
+@@ -51,6 +54,29 @@ def get_if(iff, cmd):
+     sck.close()
+     return ifreq
+ 
++
++# SOCKET UTILS
++
++class TimeoutElapsed(Scapy_Exception):
++    pass
++
++
++def _select_nonblock(sockets, remain=None):
++    """This function is called during sendrecv() routine to select
++    the available sockets.
++    """
++    # pcap sockets aren't selectable, so we return all of them
++    # and ask the selecting functions to use nonblock_recv instead of recv
++    def _sleep_nonblock_recv(self):
++        try:
++            res = self.nonblock_recv()
++            if res is None:
++                time.sleep(conf.recv_poll_rate)
++            return res
++        except TimeoutElapsed:
++            return None
++    return sockets, _sleep_nonblock_recv
++
+ # BPF HANDLERS
+ 
+ 
+
+
+
+
+@@ -14,15 +14,16 @@ import struct
+ import time
+ from ctypes import c_ubyte, cast
+ 
+-from scapy.data import MTU, ETH_P_ALL, ARPHDR_ETHER, ARPHDR_LOOPBACK
++from scapy.automaton import SelectableObject
++from scapy.arch.common import _select_nonblock, TimeoutElapsed
+ from scapy.compat import raw, plain_str, chb
+ from scapy.config import conf
+ from scapy.consts import WINDOWS
++from scapy.data import MTU, ETH_P_ALL, ARPHDR_ETHER, ARPHDR_LOOPBACK
+ from scapy.utils import mac2str
+ from scapy.supersocket import SuperSocket
+ from scapy.error import Scapy_Exception, log_loading, warning
+ from scapy.pton_ntop import inet_ntop
+-from scapy.automaton import SelectableObject
+ import scapy.consts
+ 
+ if not scapy.consts.WINDOWS:
+@@ -37,12 +38,8 @@ if not scapy.consts.WINDOWS:
+ BIOCIMMEDIATE = -2147204496
+ 
+ 
+-class PcapTimeoutElapsed(Scapy_Exception):
+-    pass
+-
+-
+ class _L2pcapdnetSocket(SuperSocket, SelectableObject):
+-    read_allowed_exceptions = (PcapTimeoutElapsed,)
++    read_allowed_exceptions = (TimeoutElapsed,)
+ 
+     def check_recv(self):
+         return True
+@@ -63,7 +60,7 @@ class _L2pcapdnetSocket(SuperSocket, SelectableObject):
+             if pkt is not None:
+                 ts, pkt = pkt
+             if pkt is None and scapy.consts.WINDOWS:
+-                raise PcapTimeoutElapsed  # To understand this behavior, have a look at L2pcapListenSocket's note  # noqa: E501
++                raise TimeoutElapsed  # To understand this behavior, have a look at L2pcapListenSocket's note  # noqa: E501
+             if pkt is None:
+                 return None, None, None
+         return cls, pkt, ts
+@@ -78,27 +75,13 @@ class _L2pcapdnetSocket(SuperSocket, SelectableObject):
+ 
+     @staticmethod
+     def select(sockets, remain=None):
+-        """This function is called during sendrecv() routine to select
+-        the available sockets.
+-        """
+-        # pcap sockets aren't selectable, so we return all of them
+-        # and ask the selecting functions to use nonblock_recv instead of recv
+-        def _sleep_nonblock_recv(self):
+-            try:
+-                res = self.nonblock_recv()
+-             

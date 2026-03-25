@@ -1,0 +1,140 @@
+@@ -23,6 +23,17 @@ typedef enum uc_cpu_aarch64 {
+     UC_CPU_AARCH64_MAX
+ } uc_cpu_aarch64;
+ 
++// ARM64 coprocessor registers, use this with UC_ARM64_REG_CP_REG to
++// in call to uc_reg_write/read() to access the registers.
++typedef struct uc_arm64_cp_reg {
++    int crn;      // Coprocessor register number
++    int crm;      // Coprocessor register number
++    int op0;      // Opcode0
++    int op1;      // Opcode1
++    int op2;      // Opcode2
++    uint64_t val; // The value to read/write
++} uc_arm64_cp_reg;
++
+ //> ARM64 registers
+ typedef enum uc_arm64_reg {
+     UC_ARM64_REG_INVALID = 0,
+@@ -293,26 +304,26 @@ typedef enum uc_arm64_reg {
+ 
+     UC_ARM64_REG_CPACR_EL1,
+ 
+-    //> thread registers
++    //> thread registers, depreciated, use UC_ARM64_REG_CP_REG instead
+     UC_ARM64_REG_TPIDR_EL0,
+     UC_ARM64_REG_TPIDRRO_EL0,
+     UC_ARM64_REG_TPIDR_EL1,
+ 
+     UC_ARM64_REG_PSTATE,
+ 
+-    //> exception link registers
++    //> exception link registers, depreciated, use UC_ARM64_REG_CP_REG instead
+     UC_ARM64_REG_ELR_EL0,
+     UC_ARM64_REG_ELR_EL1,
+     UC_ARM64_REG_ELR_EL2,
+     UC_ARM64_REG_ELR_EL3,
+ 
+-    //> stack pointers registers
++    //> stack pointers registers, depreciated, use UC_ARM64_REG_CP_REG instead
+     UC_ARM64_REG_SP_EL0,
+     UC_ARM64_REG_SP_EL1,
+     UC_ARM64_REG_SP_EL2,
+     UC_ARM64_REG_SP_EL3,
+ 
+-    //> other CP15 registers
++    //> other CP15 registers, depreciated, use UC_ARM64_REG_CP_REG instead
+     UC_ARM64_REG_TTBR0_EL1,
+     UC_ARM64_REG_TTBR1_EL1,
+ 
+@@ -335,6 +346,8 @@ typedef enum uc_arm64_reg {
+     UC_ARM64_REG_VBAR_EL2,
+     UC_ARM64_REG_VBAR_EL3,
+ 
++    UC_ARM64_REG_CP_REG,
++
+     UC_ARM64_REG_ENDING, // <-- mark the end of the list of registers
+ 
+     //> alias registers
+
+
+
+
+@@ -6,6 +6,7 @@
+ #include "unicorn/unicorn.h"
+ #include "sysemu/cpus.h"
+ #include "cpu.h"
++#include "kvm-consts.h"
+ #include "unicorn_common.h"
+ #include "uc_priv.h"
+ #include "unicorn.h"
+@@ -90,8 +91,52 @@ void arm64_reg_reset(struct uc_struct *uc)
+     env->pc = 0;
+ }
+ 
+-static void reg_read(CPUARMState *env, unsigned int regid, void *value)
++static uc_err read_cp_reg(CPUARMState *env, uc_arm64_cp_reg *cp)
+ {
++    ARMCPU *cpu = ARM_CPU(env->uc->cpu);
++    const ARMCPRegInfo *ri = get_arm_cp_reginfo(
++        cpu->cp_regs, ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, cp->crn,
++                                         cp->crm, cp->op0, cp->op1, cp->op2));
++
++    if (!ri) {
++        return UC_ERR_ARG;
++    }
++
++    cp->val = read_raw_cp_reg(env, ri);
++
++    return UC_ERR_OK;
++}
++
++static uc_err write_cp_reg(CPUARMState *env, uc_arm64_cp_reg *cp)
++{
++    ARMCPU *cpu = ARM_CPU(env->uc->cpu);
++    const ARMCPRegInfo *ri = get_arm_cp_reginfo(
++        cpu->cp_regs, ENCODE_AA64_CP_REG(CP_REG_ARM64_SYSREG_CP, cp->crn,
++                                         cp->crm, cp->op0, cp->op1, cp->op2));
++
++    if (!ri) {
++        return UC_ERR_ARG;
++    }
++
++    if (ri->raw_writefn) {
++        ri->raw_writefn(env, ri, cp->val);
++    } else if (ri->writefn) {
++        ri->writefn(env, ri, cp->val);
++    } else {
++        if (cpreg_field_is_64bit(ri)) {
++            CPREG_FIELD64(env, ri) = cp->val;
++        } else {
++            CPREG_FIELD32(env, ri) = cp->val;
++        }
++    }
++
++    return UC_ERR_OK;
++}
++
++static uc_err reg_read(CPUARMState *env, unsigned int regid, void *value)
++{
++    uc_err ret = UC_ERR_OK;
++
+     if (regid >= UC_ARM64_REG_V0 && regid <= UC_ARM64_REG_V31) {
+         regid += UC_ARM64_REG_Q0 - UC_ARM64_REG_V0;
+     }
+@@ -172,14 +217,19 @@ static void reg_read(CPUARMState *env, unsigned int regid, void *value)
+         case UC_ARM64_REG_MAIR_EL1:
+             *(uint64_t *)value = env->cp15.mair_el[1];
+             break;
++        case UC_ARM64_REG_CP_REG:
++            ret = read_cp_reg(env, (uc_arm64_cp_reg *)value);
++            break;
+         }
+     }
+ 
+-    return;
++    return ret;
+ }
+ 
+-static void reg_write(CPUARMState *env, unsigned int regid, const void *value)
++static uc_err reg_write(CPUARMState *env, u

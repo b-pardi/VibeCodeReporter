@@ -1,0 +1,162 @@
+@@ -43,7 +43,20 @@ typedef struct r_diff_t {
+ 	int (*callback)(struct r_diff_t *diff, void *user, RDiffOp *op);
+ } RDiff;
+ 
+-typedef int (*RDiffCallback)(RDiff *diff, void *user, RDiffOp *op);
++typedef enum {
++	LEVEND, // array terminator
++	LEVNOP, // no change
++	LEVSUB, // substitution
++	LEVADD, // add byte in bufb to bufa
++	LEVDEL // delete byte from bufa
++} RLevOp;
++
++typedef struct r_lev_buf {
++	ut8 *buf, *mask;
++	ut32 len;
++} RLevBuf;
++
++typedef int (*RDiffCallback) (RDiff *diff, void *user, RDiffOp *op);
+ 
+ typedef struct r_diffchar_t {
+ 	const ut8 *align_a;
+@@ -77,6 +90,7 @@ R_API int r_diff_gdiff(const char *file1, const char *file2, int rad, int va);
+ R_API RDiffChar *r_diffchar_new(const ut8 *a, const ut8 *b);
+ R_API void r_diffchar_print(RDiffChar *diffchar);
+ R_API void r_diffchar_free(RDiffChar *diffchar);
++R_API st32 r_diff_levenshtein_path(RLevBuf *bufa, RLevBuf *bufb, ut32 maxdst, RLevOp **chgs);
+ #endif
+ 
+ #ifdef __cplusplus
+
+
+
+
+@@ -38,6 +38,147 @@ R_API int r_diff_set_delta(RDiff *d, int delta) {
+ 	return 1;
+ }
+ 
++typedef struct levrow {
++	ut32 *changes;
++	ut32 start, end;
++} Levrow;
++
++static void lev_matrix_free(Levrow *matrix, ut32 len) {
++	size_t i;
++	for (i = 0; i < len; i++) {
++		free (matrix[i].changes);
++	}
++	free (matrix);
++}
++
++static inline int lev_byte_diff(RLevBuf *a, RLevBuf *b, ut32 ia, ut32 ib) {
++	if (a->mask) {
++		if ((a->buf[ia] & a->mask[ia]) == (b->buf[ib] & b->mask[ib])) {
++			return 0;
++		}
++	} else {
++		if (a->buf[ia] == b->buf[ib]) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static inline Levrow *lev_row_init(Levrow *matrix, ut32 maxdst, ut32 rownum, ut32 buflen, ut32 delta) {
++	r_return_val_if_fail (matrix && !matrix[rownum].changes, false);
++	Levrow *row = matrix + rownum;
++
++	delta += rownum;
++	ut64 end = (ut64)delta + maxdst;
++	row->end = R_MIN (end, buflen);
++	row->start = delta <= maxdst? 0: delta - maxdst;
++
++	if ((row->changes = R_NEWS (ut32, row->end - row->start + 1)) == NULL) {
++		return NULL;
++	}
++	return row;
++}
++
++static inline ut32 lev_get_val(Levrow *row, ut32 i) {
++	if (i >= row->start && i <= row->end) {
++		return row->changes[i - row->start];
++	}
++	return UT32_MAX - 1; // -1 so a +1 with sub weight does not overflow
++}
++
++// obtains array of operations, in reverse order, to get from column to row of
++// matrix
++static st32 lev_parse_matrix(Levrow *matrix, ut32 len, bool invert, RLevOp **chgs) {
++	r_return_val_if_fail (len >= 2 && matrix && chgs && !*chgs, -1);
++	Levrow *row = matrix + len - 1;
++	Levrow *prev_row = row - 1;
++	RLevOp a = LEVADD;
++	RLevOp d = LEVDEL;
++	if (invert) {
++		a = LEVDEL;
++		d = LEVADD;
++	}
++
++	const size_t overflow = (size_t)-1 / (2 * sizeof (RLevOp));
++	int j = row->end;
++	size_t size = j;
++	RLevOp *changes = R_NEWS (RLevOp, size);
++	if (!changes) {
++		return -1;
++	}
++
++	size_t insert = 0;
++	while (row != matrix) { // matrix[0] is not processed
++		ut32 sub = lev_get_val (prev_row, j - 1);
++		ut32 del = lev_get_val (prev_row, j);
++		ut32 add = lev_get_val (row, j - 1);
++
++		if (insert >= size) {
++			if (size >= overflow) {
++				// overflow paranoia
++				free (changes);
++				return -1;
++			}
++			size *= 2;
++			RLevOp *tmp = realloc (changes, size * sizeof (RLevOp));
++			if (!tmp) {
++				free (changes);
++				return -1;
++			}
++			changes = tmp;
++		}
++
++		if (sub <= del && sub <= add) {
++			if (sub == lev_get_val (row, j)) {
++				changes[insert++] = LEVNOP;
++			} else {
++				changes[insert++] = LEVSUB;
++			}
++			j--;
++		} else if (del <= add && del <= sub) {
++			changes[insert++] = d;
++		} else {
++			changes[insert++] = a;
++			j--;
++			continue; // continue with same rows
++		}
++		free (row->changes);
++		row->changes = NULL;
++		row = prev_row--;
++	}
++	if (j > 0) {
++		if (j >= size) {
++			if (size >= overflow) {
++				// overflow paranoia
++				free (changes);
++				return -1;
++			}
++			size = 2 * size - j;
++			RLevOp *tmp = realloc (changes, size * sizeof (RLevOp));
++			if (!tmp) {
++				free (changes);
++				return -1;
++			}
++			changes = tmp;
++		}
++		

@@ -1,0 +1,111 @@
+@@ -2794,6 +2794,59 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+         # Snapin our analysis modules
+         self._snapInAnalysisModules()
+ 
++    def writeMemory(self, va, bytez):
++        '''
++        Override writeMemory to hook into the Event subsystem.
++        '''
++        fname = self.getFileByVa(va)
++        fileva = self.getFileMeta(fname, 'imagebase')
++        off = va - fileva
++        self._fireEvent(VWE_WRITEMEM, (fname, off, bytez, self._supervisor))
++
++    def connectImportsWithExports(self):
++        """
++        Look for any "imported" symbols that are satisfied by current exports.
++        Wire up the connection.
++
++        Currently this is simply a pointer write at the location of the Import.
++        If this behavior is ever insufficient, we'll want to track the special
++        nature through the Export/Import events.
++        """
++        # store old setting and set _supervisor mode (so we can write wherever
++        # we want, regardless of permissions)
++        oldsup = self._supervisor
++        self._supervisor = True
++
++        for iva, isz, itype, isym in self.getImports():
++            impfname, impsym = isym.split('.', 1)
++            for eva, num, esym, efname in self.getExports():
++                if impsym != esym:
++                    continue
++
++                if impfname not in (efname, '*'):
++                    continue
++
++                # file and symbol name match.  apply the magic.
++                # do we ever *not* write in the full address at the import site?
++                self.writeMemoryPtr(iva, eva)
++
++                # check if any xrefs to the import are branches and make code-xrefs for them
++                for xrfr, xrto, xrt, xrflags in self.getXrefsTo(iva):
++                    loc = self.getLocation(xrfr)
++                    if not loc:
++                        continue
++
++                    lva, lsz, ltype, ltinfo = loc
++                    if ltype != LOC_OP:
++                        logger.warning("XREF not from an Opcode: 0x%x -> 0x%x  (%r)", lva, eva, loc)
++                        continue
++
++                    op = self.parseOpcode(lva)
++                    self.addXref(lva, eva, REF_CODE)
++
++        # restore previous supervisor mode
++        self._supervisor = oldsup
++
+     def getFiles(self):
+         """
+         Return the current list of file objects in this
+
+
+
+
+@@ -526,6 +526,18 @@ class VivWorkspaceCore(viv_impapi.ImportApi):
+         '''
+         pass
+ 
++    def _handleWRITEMEM(self, einfo):
++        '''
++        Handle permanent writes to a memory map after initialization
++        (fname, off, bytez, supv) where supv is supervisor mode...
++        '''
++        fname, off, bytez, supv = einfo
++        imgbase = self.getFileMeta(fname, 'imagebase')
++        savesupv = self._supervisor
++        self._supervisor = True
++        e_mem.MemoryObject.writeMemory(self, imgbase + off, bytez)
++        self._supervisor = savesupv
++
+     def _initEventHandlers(self):
+         self.ehand = [None for x in range(VWE_MAX)]
+         self.ehand[VWE_ADDLOCATION] = self._handleADDLOCATION
+@@ -569,6 +581,7 @@ class VivWorkspaceCore(viv_impapi.ImportApi):
+         self.ehand[VWE_CHAT]     = self._handleCHAT
+         self.ehand[VWE_SYMHINT]  = self._handleSYMHINT
+         self.ehand[VWE_AUTOANALFIN] = self._handleAUTOANALFIN
++        self.ehand[VWE_WRITEMEM] = self._handleWRITEMEM
+ 
+         self.thand = [None for x in range(VTE_MAX)]
+         self.thand[VTE_IAMLEADER] = self._handleIAMLEADER
+
+
+
+
+@@ -71,7 +71,9 @@ VWE_CHAT            = 40 # (username, message)
+ VWE_SYMHINT         = 41 # (va, idx, hint)
+ VWE_AUTOANALFIN     = 42 # (starttime, endtime)
+ 
+-VWE_MAX             = 43
++VWE_WRITEMEM        = 43 # (mapva, offset, bytes)
++
++VWE_MAX             = 44
+ 
+ # Constants for vivisect "transient" events which flow through
+ # the event subsystem but are not recorded to the workspace.
+
+
+
+
+@@ -13,6 +13,7 @@ import vtrace  # needed only for setting th

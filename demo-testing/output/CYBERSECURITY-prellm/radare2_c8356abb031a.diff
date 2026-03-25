@@ -1,0 +1,168 @@
+@@ -5,6 +5,7 @@
+ #include <r_search.h>
+ #include <r_util.h>
+ #include <r_core.h>
++#include <r_hash.h>
+ 
+ R_LIB_VERSION (r_sign);
+ 
+@@ -85,9 +86,9 @@ static bool deserialize(RAnal *a, RSignItem *it, const char *k, const char *v) {
+ 	// name (2)
+ 	it->name = r_str_new (r_str_word_get0 (k2, 2));
+ 
+-	// Deserialize val: size|bytes|mask|graph|offset|refs
++	// Deserialize val: size|bytes|mask|graph|offset|refs|bbhash
+ 	n = r_str_split (v2, '|');
+-	if (n != 6) {
++	if (n != 7) {
+ 		retval = false;
+ 		goto out;
+ 	}
+@@ -145,6 +146,16 @@ static bool deserialize(RAnal *a, RSignItem *it, const char *k, const char *v) {
+ 			r_list_append (it->refs, r_str_newf (r_str_word_get0 (refs, i)));
+ 		}
+ 	}
++
++	// basic blocks hash (6)
++	token = r_str_word_get0 (v2, 6);
++	if (token[0] != 0) {
++		it->hash = R_NEW0 (RSignHash);
++		if (!it->hash) {
++			goto out;
++		}
++		it->hash->bbhash = r_str_new (token);
++	}
+ out:
+ 	free (k2);
+ 	free (v2);
+@@ -169,6 +180,7 @@ static void serialize(RAnal *a, RSignItem *it, char *k, char *v) {
+ 	int i = 0, len = 0;
+ 	RSignBytes *bytes = it->bytes;
+ 	RSignGraph *graph = it->graph;
++	RSignHash *hash = it->hash;
+ 
+ 	if (k) {
+ 		serializeKey (a, it->space, it->name, k);
+@@ -196,13 +208,14 @@ static void serialize(RAnal *a, RSignItem *it, char *k, char *v) {
+ 			i++;
+ 		}
+ 
+-		snprintf (v, R_SIGN_VAL_MAXSZ, "%d|%s|%s|%s|%"PFMT64d"|%s",
++		snprintf (v, R_SIGN_VAL_MAXSZ, "%d|%s|%s|%s|%"PFMT64d"|%s|%s",
+ 			bytes? bytes->size: 0,
+ 			bytes? hexbytes: "",
+ 			bytes? hexmask: "",
+ 			graph? hexgraph: "",
+ 			it->offset,
+-			refs? refs: "");
++			refs? refs: "",
++			hash? hash->bbhash: "");
+ 
+ 		free (hexbytes);
+ 		free (hexmask);
+@@ -262,6 +275,18 @@ static void mergeItem(RSignItem *dst, RSignItem *src) {
+ 			r_list_append (dst->refs, r_str_new (ref));
+ 		}
+ 	}
++
++	if (src->hash) {
++		if (!dst->hash) {
++			dst->hash = R_NEW0 (RSignHash);
++		}
++			if (!dst->hash) {
++				return;
++			}
++		if (src->hash->bbhash) {
++			dst->hash->bbhash = strdup (src->hash->bbhash);
++		}
++	}
+ }
+ 
+ static bool addItem(RAnal *a, RSignItem *it) {
+@@ -292,6 +317,61 @@ out:
+ 	return retval;
+ }
+ 
++static bool addHash(RAnal *a, const char *name, int type, const char *val) {
++	RSignItem *it = r_sign_item_new ();
++	if (!it) {
++		r_sign_item_free (it);
++		return false;
++	}
++	it->name = r_str_new (name);
++	if (!it->name) {
++		r_sign_item_free (it);
++		return false;
++	}
++	it->hash = R_NEW0 (RSignHash);
++	if (!it->hash) {
++		r_sign_item_free (it);
++		return false;
++	}
++
++	switch (type) {
++	case R_SIGN_BBHASH:
++		it->hash->bbhash = strdup(val);
++		break;
++	}
++
++	bool retval = addItem (a, it);
++	r_sign_item_free (it);
++	return retval;
++}
++
++static bool addBBHash(RAnal *a, RAnalFunction *fcn, const char *name) {
++	bool retval = false;
++	RSignItem *it = r_sign_item_new ();
++	if (!it) {
++		goto beach;
++	}
++	it->name = r_str_new (name);
++	if (!it->name) {
++		goto beach;
++	}
++	it->hash = R_NEW0 (RSignHash);
++	if (!it->hash) {
++		goto beach;
++	}
++
++	char *digest_hex = r_sign_calc_bbhash (a, fcn);
++	if (!digest_hex) {
++		free (digest_hex);
++		goto beach;
++	}
++	it->hash->bbhash = digest_hex;
++	retval = addItem (a, it);
++beach:
++	r_sign_item_free (it);
++	return retval;
++}
++
+ static bool addBytes(RAnal *a, const char *name, ut64 size, const ut8 *bytes, const ut8 *mask) {
+ 	bool retval = true;
+ 
+@@ -341,6 +421,28 @@ fail:
+ 	return false;
+ }
+ 
++R_API bool r_sign_add_hash(RAnal *a, const char *name, int type, const char *val, int len) {
++	if (!a || !name || !type || !val || !len) {
++		return false;
++	}
++	if (type != R_SIGN_BBHASH) {
++		eprintf ("error: hash type unknown");
++	}
++	int digestsize = r_hash_size (R_ZIGN_HASH) * 2;
++	if (len != digestsize) {
++		eprintf ("error: invalid hash size: %d (%s digest size is %d)\n", len, ZIGN_HASH, digestsize);
++		return false;
++	}
++	return addHash (a, name, type, val);
++}
++
++R_API bool r_sign_add_bb_hash(RAnal *a, RAnalFunction *fcn, const char *name) {
++	if (!a || !fcn || !name) {
++		return false;
++	}
++	return addBBHash (a, fcn, name);
++}

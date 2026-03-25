@@ -1,0 +1,110 @@
+@@ -2,11 +2,15 @@
+ 
+ #include "zeek/telemetry/Manager.h"
+ 
++#include <fnmatch.h>
+ #include <thread>
++#include <variant>
+ 
+ #include "zeek/3rdparty/doctest.h"
++#include "zeek/ID.h"
+ #include "zeek/broker/Manager.h"
+ #include "zeek/telemetry/Timer.h"
++#include "zeek/telemetry/telemetry.bif.h"
+ 
+ #include "broker/telemetry/metric_registry.hh"
+ 
+@@ -15,6 +19,33 @@ namespace
+ using NativeManager = broker::telemetry::metric_registry;
+ using NativeManagerImpl = broker::telemetry::metric_registry_impl;
+ using NativeManagerImplPtr = zeek::IntrusivePtr<NativeManagerImpl>;
++using DoubleValPtr = zeek::IntrusivePtr<zeek::DoubleVal>;
++
++std::vector<std::string_view> extract_label_values(broker::telemetry::const_label_list labels)
++	{
++	auto get_value = [](const auto& label)
++	{
++		return label.second;
++	};
++	std::vector<std::string_view> v;
++	std::transform(labels.begin(), labels.end(), std::back_inserter(v), get_value);
++	return v;
++	}
++
++// Convert an int64_t or double to a DoubleValPtr. int64_t is casted.
++template <typename T> DoubleValPtr as_double_val(T val)
++	{
++	if constexpr ( std::is_same_v<T, int64_t> )
++		{
++		return zeek::make_intrusive<zeek::DoubleVal>(static_cast<double>(val));
++		}
++	else
++		{
++		static_assert(std::is_same_v<T, double>);
++		return zeek::make_intrusive<zeek::DoubleVal>(val);
++		}
++	};
++
+ 	}
+ 
+ namespace zeek::telemetry
+@@ -38,6 +69,432 @@ void Manager::InitPostBrokerSetup(broker::endpoint& ep)
+ 	pimpl.swap(ptr);
+ 	}
+ 
++// -- collect metric stuff -----------------------------------------------------
++
++template <typename T>
++zeek::RecordValPtr Manager::GetMetricOptsRecord(Manager::MetricType metric_type,
++                                                const broker::telemetry::metric_family_hdl* family)
++	{
++	static auto string_vec_type = zeek::id::find_type<zeek::VectorType>("string_vec");
++	static auto metric_opts_type = zeek::id::find_type<zeek::RecordType>("Telemetry::MetricOpts");
++
++	static auto prefix_idx = metric_opts_type->FieldOffset("prefix");
++	static auto name_idx = metric_opts_type->FieldOffset("name");
++	static auto help_text_idx = metric_opts_type->FieldOffset("help_text");
++	static auto unit_idx = metric_opts_type->FieldOffset("unit");
++	static auto is_total_idx = metric_opts_type->FieldOffset("is_total");
++	static auto labels_idx = metric_opts_type->FieldOffset("labels");
++	static auto bounds_idx = metric_opts_type->FieldOffset("bounds");
++	static auto metric_type_idx = metric_opts_type->FieldOffset("metric_type");
++
++	if ( const auto& it = metric_opts_cache.find(family); it != metric_opts_cache.end() )
++		return it->second;
++
++	auto r = make_intrusive<zeek::RecordVal>(metric_opts_type);
++	r->Assign(prefix_idx, make_intrusive<zeek::StringVal>(broker::telemetry::prefix(family)));
++	r->Assign(name_idx, make_intrusive<zeek::StringVal>(broker::telemetry::name(family)));
++	r->Assign(help_text_idx, make_intrusive<zeek::StringVal>(broker::telemetry::helptext(family)));
++	r->Assign(unit_idx, make_intrusive<zeek::StringVal>(broker::telemetry::unit(family)));
++	r->Assign(is_total_idx, val_mgr->Bool(broker::telemetry::is_sum(family)));
++
++	auto label_names_vec = make_intrusive<zeek::VectorVal>(string_vec_type);
++	for ( const auto& l : broker::telemetry::label_names(family) )
++		label_names_vec->Append(make_intrusive<StringVal>(l));
++
++	r->Assign(labels_idx, label_names_vec);
++
++	// This is mapping Manager.h enums to bif values depending on
++	// the template type and whether this is a counter, gauge or
++	// histogram.
++	zeek_int_t metric_type_int = -1;
++	if constexpr ( std::is_same<T, double>::value )
++		{
++		switch ( metric_type )
++			{
++			case MetricType::Counter:
++				metric_type_int = BifEnum::Telemetry::MetricType::DOUBLE_COUNTER;
++				break;
++			case MetricType::Gauge:
++				metric_type_int = BifEnum::Telemetry::MetricType::DOUBLE_GAUGE;
++				break;
++			case MetricType::Histogram:
++				metric_type_int = BifEnum::Telemetry::MetricType::DOUBLE_HISTOGRAM;
++				break;
++			}
++		}
++	else
++		{
++		switch ( 

@@ -1,0 +1,136 @@
+@@ -585,10 +585,6 @@ private:
+ 	// function name, and maps to the C++ name.
+ 	std::unordered_map<std::string, std::string> compiled_simple_funcs;
+ 
+-	// Maps those to their associated files - used to make add-C++ body
+-	// hashes distinct.
+-	std::unordered_map<std::string, std::string> cf_locs;
+-
+ 	// Maps function bodies to the names we use for them.
+ 	std::unordered_map<const Stmt*, std::string> body_names;
+ 
+
+
+
+
+@@ -99,9 +99,6 @@ void CPPCompile::CreateFunction(const FuncTypePtr& ft, const ProfileFunc* pf, co
+ 		// for lambdas that don't take any arguments, but that
+ 		// seems potentially more confusing than beneficial.
+ 		compiled_funcs.emplace(fname);
+-
+-		auto loc_f = script_specific_filename(body);
+-		cf_locs[fname] = loc_f;
+ 		}
+ 
+ 	auto h = pf->HashVal();
+
+
+
+
+@@ -197,10 +197,10 @@ void CPPCompile::Compile(bool report_uncompilable)
+ 
+ void CPPCompile::GenProlog()
+ 	{
+-	if ( addl_tag == 0 )
+-		{
++	if ( addl_tag <= 1 )
++		// This is either a compilation via gen-C++, or
++		// one using add-C++ and an empty CPP-gen.cc file.
+ 		Emit("#include \"zeek/script_opt/CPP/Runtime.h\"\n");
+-		}
+ 
+ 	Emit("namespace zeek::detail { //\n");
+ 	Emit("namespace CPP_%s { // %s\n", Fmt(addl_tag), working_dir);
+@@ -292,13 +292,6 @@ void CPPCompile::RegisterCompiledBody(const string& f)
+ 
+ 	events = string("{") + events + "}";
+ 
+-	if ( addl_tag > 0 )
+-		// Hash in the location associated with this compilation
+-		// pass, to get a final hash that avoids conflicts with
+-		// identical-but-in-a-different-context function bodies
+-		// when compiling potentially conflicting additional code.
+-		h = merge_p_hashes(h, p_hash(cf_locs[f]));
+-
+ 	auto fi = func_index.find(f);
+ 	ASSERT(fi != func_index.end());
+ 	auto type_signature = casting_index[fi->second];
+
+
+
+
+@@ -105,6 +105,7 @@ struct CompiledScript
+ 	CPPStmtPtr body;
+ 	int priority;
+ 	std::vector<std::string> events;
++	void (*finish_init_func)();
+ 	};
+ 
+ // Maps hashes to compiled information.
+
+
+
+
+@@ -239,14 +239,14 @@ void FuncConstInfo::InitializerVals(std::vector<std::string>& ivs) const
+ 	{
+ 	auto f = fv->AsFunc();
+ 	const auto& fn = f->Name();
++	const auto& bodies = f->GetBodies();
+ 
+ 	ivs.emplace_back(Fmt(type));
+ 	ivs.emplace_back(Fmt(c->TrackString(fn)));
++	ivs.emplace_back(to_string(bodies.size()));
+ 
+ 	if ( ! c->NotFullyCompilable(fn) )
+ 		{
+-		const auto& bodies = f->GetBodies();
+-
+ 		for ( const auto& b : bodies )
+ 			{
+ 			auto h = c->BodyHash(b.stmts.get());
+
+
+
+
+@@ -62,9 +62,10 @@ void register_type__CPP(TypePtr t, const string& name)
+ 	id->MakeType();
+ 	}
+ 
+-void register_body__CPP(CPPStmtPtr body, int priority, p_hash_type hash, vector<string> events)
++void register_body__CPP(CPPStmtPtr body, int priority, p_hash_type hash, vector<string> events,
++                        void (*finish_init)())
+ 	{
+-	compiled_scripts[hash] = {move(body), priority, move(events)};
++	compiled_scripts[hash] = {move(body), priority, move(events), finish_init};
+ 	}
+ 
+ void register_lambda__CPP(CPPStmtPtr body, p_hash_type hash, const char* name, TypePtr t,
+@@ -89,7 +90,7 @@ void register_lambda__CPP(CPPStmtPtr body, p_hash_type hash, const char* name, T
+ 	if ( ! has_captures )
+ 		// Note, no support for lambdas that themselves refer
+ 		// to events.
+-		register_body__CPP(body, 0, hash, {});
++		register_body__CPP(body, 0, hash, {}, nullptr);
+ 	}
+ 
+ void register_scripts__CPP(p_hash_type h, void (*callback)())
+@@ -190,11 +191,12 @@ Func* lookup_bif__CPP(const char* bif)
+ 	return b ? b->GetVal()->AsFunc() : nullptr;
+ 	}
+ 
+-FuncValPtr lookup_func__CPP(string name, vector<p_hash_type> hashes, const TypePtr& t)
++FuncValPtr lookup_func__CPP(string name, int num_bodies, vector<p_hash_type> hashes,
++                            const TypePtr& t)
+ 	{
+ 	auto ft = cast_intrusive<FuncType>(t);
+ 
+-	if ( hashes.empty() )
++	if ( static_cast<int>(hashes.size()) < num_bodies )
+ 		{
+ 		// This happens for functions that have at least one
+ 		// uncompilable body.
+
+
+
+
+@@ -37,7 +37,7 @@ extern void register_type__CPP(TypePtr t, 

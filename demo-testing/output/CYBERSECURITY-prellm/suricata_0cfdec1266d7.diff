@@ -1,0 +1,129 @@
+@@ -231,6 +231,7 @@
+ #include "detect-transform-dotprefix.h"
+ #include "detect-transform-pcrexform.h"
+ #include "detect-transform-urldecode.h"
++#include "detect-transform-xor.h"
+ 
+ #include "util-rule-vars.h"
+ 
+@@ -659,6 +660,7 @@ void SigTableSetup(void)
+     DetectTransformDotPrefixRegister();
+     DetectTransformPcrexformRegister();
+     DetectTransformUrlDecodeRegister();
++    DetectTransformXorRegister();
+ 
+     /* close keyword registration */
+     DetectBufferTypeCloseRegistration();
+
+
+
+
+@@ -300,6 +300,7 @@ enum DetectKeywordId {
+     DETECT_TRANSFORM_DOTPREFIX,
+     DETECT_TRANSFORM_PCREXFORM,
+     DETECT_TRANSFORM_URL_DECODE,
++    DETECT_TRANSFORM_XOR,
+ 
+     DETECT_AL_IKE_EXCH_TYPE,
+     DETECT_AL_IKE_SPI_INITIATOR,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,144 @@
++/* Copyright (C) 2021 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Philippe Antoine <contact@catenacyber.fr>
++ *
++ * Implements the xor transform keyword with option support
++ */
++
++#include "suricata-common.h"
++#include "detect.h"
++#include "detect-engine.h"
++#include "detect-parse.h"
++#include "detect-transform-xor.h"
++
++typedef struct DetectTransformXorData {
++    uint8_t *key;
++    // limit the key length
++    uint8_t length;
++} DetectTransformXorData;
++
++static int DetectTransformXorSetup(DetectEngineCtx *, Signature *, const char *);
++static void DetectTransformXorFree(DetectEngineCtx *, void *);
++static void DetectTransformXor(InspectionBuffer *buffer, void *options);
++#ifdef UNITTESTS
++void DetectTransformXorRegisterTests(void);
++#endif
++
++void DetectTransformXorRegister(void)
++{
++    sigmatch_table[DETECT_TRANSFORM_XOR].name = "xor";
++    sigmatch_table[DETECT_TRANSFORM_XOR].desc = "modify buffer via XOR decoding before inspection";
++    sigmatch_table[DETECT_TRANSFORM_XOR].url = "/rules/transforms.html#xor";
++    sigmatch_table[DETECT_TRANSFORM_XOR].Transform = DetectTransformXor;
++    sigmatch_table[DETECT_TRANSFORM_XOR].Free = DetectTransformXorFree;
++    sigmatch_table[DETECT_TRANSFORM_XOR].Setup = DetectTransformXorSetup;
++#ifdef UNITTESTS
++    sigmatch_table[DETECT_TRANSFORM_XOR].RegisterTests = DetectTransformXorRegisterTests;
++#endif
++    sigmatch_table[DETECT_TRANSFORM_XOR].flags |= SIGMATCH_QUOTES_MANDATORY;
++}
++
++static void DetectTransformXorFree(DetectEngineCtx *de_ctx, void *ptr)
++{
++    if (ptr != NULL) {
++        DetectTransformXorData *pxd = (DetectTransformXorData *)ptr;
++        SCFree(pxd->key);
++        SCFree(pxd);
++    }
++}
++
++/**
++ *  \internal
++ *  \brief Apply the xor keyword to the last pattern match
++ *  \param det_ctx detection engine ctx
++ *  \param s signature
++ *  \param optstr options string
++ *  \retval 0 ok
++ *  \retval -1 failure
++ */
++static int DetectTransformXorSetup(DetectEngineCtx *de_ctx, Signature *s, const char *optstr)
++{
++    SCEnter();
++
++    // Create pxd from optstr
++    DetectTransformXorData *pxd = SCCalloc(1, sizeof(*pxd));
++    if (pxd == NULL) {
++        SCLogError(SC_ERR_MEM_ALLOC, "memory allocation failed");
++        SCReturnInt(-1);
++    }
++
++    size_t keylen = strlen(optstr);
++    if (keylen % 2 == 1) {
++        SCLogError(SC_ERR_INVALID_SIGNATURE, "XOR transform key's length must be an even number");
++        DetectTransformXorFree(de_ctx, pxd);
++        SCReturnInt(-1);
++    }
++    if (keylen / 2 > UINT8_MAX) {
++  

@@ -1,0 +1,121 @@
+@@ -283,6 +283,7 @@ typedef struct PacketAlert_ {
+     uint8_t flags;
+     const struct Signature_ *s;
+     uint64_t tx_id;
++    int64_t frame_id;
+ } PacketAlert;
+ 
+ /* flag to indicate the rule action (drop/pass) needs to be applied to the flow */
+@@ -295,6 +296,8 @@ typedef struct PacketAlert_ {
+ #define PACKET_ALERT_FLAG_TX            0x08
+ /** action was changed by rate_filter */
+ #define PACKET_ALERT_RATE_FILTER_MODIFIED   0x10
++/** alert is in a frame, frame_id set */
++#define PACKET_ALERT_FLAG_FRAME 0x20
+ 
+ #define PACKET_ALERT_MAX 15
+ 
+
+
+
+
+@@ -204,6 +204,8 @@ int PacketAlertAppend(DetectEngineThreadCtx *det_ctx, const Signature *s,
+         p->alerts.alerts[p->alerts.cnt].flags = flags;
+         p->alerts.alerts[p->alerts.cnt].s = s;
+         p->alerts.alerts[p->alerts.cnt].tx_id = tx_id;
++        p->alerts.alerts[p->alerts.cnt].frame_id =
++                (flags & PACKET_ALERT_FLAG_FRAME) ? det_ctx->frame_id : 0;
+     } else {
+         /* We need to make room for this s->num
+          (a bit ugly with memcpy but we are planning changes here)*/
+@@ -218,6 +220,7 @@ int PacketAlertAppend(DetectEngineThreadCtx *det_ctx, const Signature *s,
+         p->alerts.alerts[i].flags = flags;
+         p->alerts.alerts[i].s = s;
+         p->alerts.alerts[i].tx_id = tx_id;
++        p->alerts.alerts[i].frame_id = (flags & PACKET_ALERT_FLAG_FRAME) ? det_ctx->frame_id : 0;
+     }
+ 
+     /* Update the count */
+
+
+
+
+@@ -1071,12 +1071,13 @@ typedef struct DetectEngineThreadCtx_ {
+ 
+     /* used to discontinue any more matching */
+     uint16_t discontinue_matching;
+-    uint16_t flags;
++    uint16_t flags; /**< DETECT_ENGINE_THREAD_CTX_* flags */
+ 
+     /* true if tx_id is set */
+     bool tx_id_set;
+     /** ID of the transaction currently being inspected. */
+     uint64_t tx_id;
++    int64_t frame_id;
+     Packet *p;
+ 
+     SC_ATOMIC_DECLARE(int, so_far_used_by_detect);
+
+
+
+
+@@ -50,6 +50,7 @@
+ #include "app-layer-htp.h"
+ #include "app-layer-htp-xff.h"
+ #include "app-layer-ftp.h"
++#include "app-layer-frames.h"
+ #include "util-classification-config.h"
+ #include "util-syslog.h"
+ #include "util-logopenfile.h"
+@@ -73,6 +74,7 @@
+ #include "output-json-mqtt.h"
+ #include "output-json-ike.h"
+ #include "output-json-modbus.h"
++#include "output-json-frame.h"
+ 
+ #include "util-byte.h"
+ #include "util-privs.h"
+@@ -581,6 +583,32 @@ static void AlertAddFiles(const Packet *p, JsonBuilder *jb, const uint64_t tx_id
+     }
+ }
+ 
++static void AlertAddFrame(const Packet *p, JsonBuilder *jb, const int64_t frame_id)
++{
++    if (p->flow == NULL || p->flow->protoctx == NULL)
++        return;
++
++    FramesContainer *frames_container = AppLayerFramesGetContainer(p->flow);
++    if (frames_container == NULL)
++        return;
++
++    Frames *frames;
++    TcpSession *ssn = p->flow->protoctx;
++    TcpStream *stream;
++    if (PKT_IS_TOSERVER(p)) {
++        stream = &ssn->client;
++        frames = &frames_container->toserver;
++    } else {
++        stream = &ssn->server;
++        frames = &frames_container->toclient;
++    }
++
++    Frame *frame = FrameGetById(frames, frame_id);
++    if (frame != NULL) {
++        FrameJsonLogOneFrame(frame, p->flow, stream, p, jb);
++    }
++}
++
+ static int AlertJson(ThreadVars *tv, JsonAlertLogThread *aft, const Packet *p)
+ {
+     MemBuffer *payload = aft->payload_buffer;
+@@ -704,6 +732,10 @@ static int AlertJson(ThreadVars *tv, JsonAlertLogThread *aft, const Packet *p)
+             jb_set_uint(jb, "stream", stream);
+         }
+ 
++        if (pa->flags & PACKET_ALERT_FLAG_FRAME) {
++            AlertAddFrame(p, jb, pa->frame_id);
++        }
++
+         /* base64-encoded full packet */
+         if (json_output_ctx->flags & LOG_JSON_PACKET) {
+             EvePacket(p, jb, 0);

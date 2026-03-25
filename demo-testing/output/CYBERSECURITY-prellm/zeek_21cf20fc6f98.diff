@@ -1,0 +1,145 @@
+@@ -1,6 +1,9 @@
+ #ifndef binpac_exception_h
+ #define binpac_exception_h
+ 
++#include <stdint.h>
++#include <inttypes.h>
++
+ namespace binpac {
+ 
+ class Exception
+@@ -45,19 +48,19 @@ class ExceptionInvalidCase : public Exception
+ {
+ public:
+ 	ExceptionInvalidCase(const char* location, 
+-			int index,
++			int64_t index,
+ 			const char *expected)
+ 		: location_(location), 
+ 		  index_(index), 
+ 		  expected_(expected)
+ 		{
+-		append(binpac_fmt("invalid case: %s: %d (%s)",
++		append(binpac_fmt("invalid case: %s: %" PRIi64 " (%s)",
+ 			location, index, expected));
+ 		}
+ 
+ protected:
+ 	const char* location_;
+-	int index_;
++	int64_t index_;
+ 	string expected_;
+ };
+ 
+@@ -65,17 +68,17 @@ class ExceptionInvalidCaseIndex : public Exception
+ {
+ public:
+ 	ExceptionInvalidCaseIndex(const char* location, 
+-			int index)
++			int64_t index)
+ 		: location_(location), 
+ 		  index_(index)
+ 		{
+-		append(binpac_fmt("invalid index for case: %s: %d",
++		append(binpac_fmt("invalid index for case: %s: %" PRIi64,
+ 			location, index));
+ 		}
+ 
+ protected:
+ 	const char* location_;
+-	int index_;
++	int64_t index_;
+ };
+ 
+ class ExceptionInvalidOffset : public Exception
+
+
+
+
+@@ -5,9 +5,13 @@
+ #include "pac_output.h"
+ #include "pac_typedecl.h"
+ #include "pac_utils.h"
++#include "pac_btype.h"
+ 
+ #include "pac_case.h"
+ 
++#include <limits>
++#include <cstdint>
++
+ CaseType::CaseType(Expr* index_expr, CaseFieldList* cases)
+ 	: Type(CASE), index_expr_(index_expr), cases_(cases) 
+ 	{
+@@ -64,7 +68,9 @@ void CaseType::Prepare(Env* env, int flags)
+ 	ASSERT(flags & TO_BE_PARSED);
+ 
+ 	index_var_ = new ID(strfmt("%s_case_index", value_var()->Name()));
+-	env->AddID(index_var_, MEMBER_VAR, extern_type_int);
++	// Unable to get the type for index_var_ at this moment, but we'll
++	// generate the right type based on index_expr_ later.
++	env->AddID(index_var_, MEMBER_VAR, 0);
+ 
+ 	// Sort the cases_ to put the default case at the end of the list
+ 	CaseFieldList::iterator default_case_it = 
+@@ -100,13 +106,25 @@ void CaseType::Prepare(Env* env, int flags)
+ 
+ void CaseType::GenPrivDecls(Output* out_h, Env* env)
+ 	{
+-	out_h->println("int %s;", env->LValue(index_var_));
++	Type* t = index_expr_->DataType(env);
++
++	if ( t->tot() != Type::BUILTIN )
++		// It's a Type::EXTERN with a C++ type of "int", "bool", or "enum",
++		// any of which will convert consistently using an int as storage type.
++		t = extern_type_int;
++
++	out_h->println("%s %s;", t->DataTypeStr().c_str(), env->LValue(index_var_));
+ 	Type::GenPrivDecls(out_h, env);
+ 	}
+ 
+ void CaseType::GenPubDecls(Output* out_h, Env* env)
+ 	{
+-	out_h->println("int %s const	{ return %s; }",
++	Type* t = index_expr_->DataType(env);
++
++	if ( t->tot() != Type::BUILTIN )
++		t = extern_type_int;
++
++	out_h->println("%s %s const	{ return %s; }", t->DataTypeStr().c_str(),
+ 		env->RValue(index_var_), env->LValue(index_var_));
+ 	Type::GenPubDecls(out_h, env);
+ 	}
+@@ -168,7 +186,7 @@ void CaseType::DoGenParseCode(Output* out_cc, Env* env,
+ 		{
+ 		out_cc->println("default:");
+ 		out_cc->inc_indent();
+-		out_cc->println("throw binpac::ExceptionInvalidCaseIndex(\"%s\", %s);",
++		out_cc->println("throw binpac::ExceptionInvalidCaseIndex(\"%s\", (int64)%s);",
+ 			decl_id()->Name(), env->RValue(index_var_));
+ 		out_cc->println("break;");
+ 		out_cc->dec_indent();
+@@ -248,18 +266,80 @@ CaseField::~CaseField()
+ 	delete_list(ExprList, index_);
+ 	}
+ 
+-void GenCaseStr(ExprList *index_list, Output *out_cc, Env *env)
++void GenCaseStr(ExprList *index_list, Output *out_cc, Env *env, Type* switch_type)
+ 	{
+ 	if ( index_list )
+ 		{
+ 		foreach(i, ExprList, index_list)
+ 			{
+ 			Expr *index_expr = *i;
++
++			Type* case_type = index_expr->DataType(env);
++
++			if ( case_type->tot() == Type::BUILTIN && case_type->StaticSize(env) > 4 )
++				throw ExceptionInvalidCaseSizeExpr(index_expr);
++
+ 			int index_const;
+ 			
+ 			if ( ! index_expr->ConstFold(env, &index_const) )
+ 				throw ExceptionNonConstExpr(index_expr);
+-			out_cc->println("case %d:", index_const);
++
++			// External C++ typ

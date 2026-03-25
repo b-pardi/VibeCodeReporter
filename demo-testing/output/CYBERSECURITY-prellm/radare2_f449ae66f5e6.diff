@@ -1,0 +1,155 @@
+@@ -360,7 +360,7 @@ static bool run_commands(RList *cmds, RList *files, bool quiet) {
+ 	/* -c */
+ 	r_list_foreach (cmds, iter, cmdn) {
+ 		//r_core_cmd0 (&r, cmdn);
+-		r_core_cmd_task_sync (&r, cmdn);
++		r_core_cmd_task_sync (&r, cmdn, false);
+ 		r_cons_flush ();
+ 	}
+ 	if (quiet) {
+
+
+
+
+@@ -3353,13 +3353,6 @@ R_API int r_core_cmd(RCore *core, const char *cstr, int log) {
+ 	char *cmd, *ocmd, *ptr, *rcmd;
+ 	int ret = false, i;
+ 
+-	if (r_list_empty (core->tasks)) {
+-		r_th_lock_enter (core->lock);
+-	} else {
+-		if (!r_core_task_self (core)) {
+-			r_core_task_pause (core, NULL, true);
+-		}
+-	}
+ 	if (core->cmdfilter) {
+ 		const char *invalid_chars = ";|>`@";
+ 		for (i = 0; invalid_chars[i]; i++) {
+@@ -3744,16 +3737,19 @@ R_API void r_core_cmd_repeat(RCore *core, int next) {
+ 	}
+ }
+ 
+-R_API void r_core_cmd_task_sync(RCore *core, const char *cmd) {
++/* run cmd in the main task synchronously */
++R_API int r_core_cmd_task_sync(RCore *core, const char *cmd, bool log) {
+ 	RCoreTask *task = core->main_task;
+ 	char *s = strdup (cmd);
+ 	if (!s) {
+ 		return 0;
+ 	}
+ 	task->msg->text = s;
++	task->cmd_log = log;
+ 	task->state = R_CORE_TASK_STATE_BEFORE_START;
+-	r_core_task_run_sync (core, task);
++	int res = r_core_task_run_sync (core, task);
+ 	free (s);
++	return res;
+ }
+ 
+ static int cmd_ox(void *data, const char *input) {
+
+
+
+
+@@ -2218,7 +2218,7 @@ R_API int r_core_prompt(RCore *r, int sync) {
+ }
+ 
+ R_API int r_core_prompt_exec(RCore *r) {
+-	r_core_cmd_task_sync (r, r->cmdqueue);
++	int ret = r_core_cmd_task_sync (r, r->cmdqueue, true);
+ 	//int ret = r_core_cmd (r, r->cmdqueue, true);
+ 	if (r->cons && r->cons->use_tts) {
+ 		const char *buf = r_cons_get_buffer();
+@@ -2229,7 +2229,7 @@ R_API int r_core_prompt_exec(RCore *r) {
+ 	if (r->cons && r->cons->line && r->cons->line->zerosep) {
+ 		r_cons_zero ();
+ 	}
+-	return 0;
++	return ret;
+ }
+ 
+ R_API int r_core_seek_size(RCore *core, ut64 addr, int bsize) {
+
+
+
+
+@@ -63,6 +63,7 @@ R_API RCoreTask *r_core_task_new (RCore *core, const char *cmd, RCoreTaskCallbac
+ 	}
+ 
+ 	task->msg = r_th_msg_new (cmd, r_core_task_thread);
++	task->cmd_log = false;
+ 	task->dispatch_cond = r_th_cond_new ();
+ 	task->dispatch_lock = r_th_lock_new (false);
+ 	if (!task->msg || !task->dispatch_cond || !task->dispatch_cond) {
+@@ -158,19 +159,21 @@ static int task_run(RCoreTask *task) {
+ 	task_begin (task);
+ 
+ 	// close (2); // no stderr
+-	char *res;
++	char *res_str;
++	int res;
+ 	if (task == task->core->main_task) {
+-		r_core_cmd0 (core, task->msg->text);
+-		res = NULL;
++		res = r_core_cmd (core, task->msg->text, task->cmd_log);
++		res_str = NULL;
+ 	} else {
+-		res = r_core_cmd_str (core, task->msg->text);
++		res = 0;
++		res_str = r_core_cmd_str (core, task->msg->text);
+ 	}
+-	task->msg->res = res;
++	task->msg->res = res_str;
+ 
+ 	eprintf ("\nTask %d finished\n", task->id);
+ 
+ 	task_end (task);
+-	return 0;
++	return res;
+ }
+ 
+ static int task_run_thread(RThread *th) {
+@@ -184,9 +187,9 @@ R_API void r_core_task_enqueue(RCore *core, RCoreTask *task) {
+ 	r_th_lock_leave (core->tasks_lock);
+ }
+ 
+-R_API void r_core_task_run_sync(RCore *core, RCoreTask *task) {
++R_API int r_core_task_run_sync(RCore *core, RCoreTask *task) {
+ 	task->msg->th = NULL;
+-	task_run (task);
++	return task_run (task);
+ }
+ 
+ R_API const char *r_core_task_status (RCoreTask *task) {
+@@ -216,26 +219,6 @@ R_API RCoreTask *r_core_task_self (RCore *core) {
+ 	return core->main_task;
+ }
+ 
+-R_API bool r_core_task_pause (RCore *core, RCoreTask *task, bool enable) {
+-	if (!core) {
+-		return false;
+-	}
+-	if (task) {
+-		if (task->state != 'd' && task->msg) {
+-			r_th_pause (task->msg->th, enable);
+-		}
+-	} else {
+-		RListIter *iter;
+-		r_list_foreach (core->tasks, iter, task) {
+-			// XXX: this lock pauses the whole r2
+-			if (task) {
+-				r_core_task_pause (core, task, enable);
+-			}
+-		}
+-	}
+-	return true;
+-}
+-
+ R_API int r_core_task_cat (RCore *core, int id) {
+ 	RCoreTask *task = r_core_task_get (core, id);
+ 	r_cons_println (task->msg->res);
+
+
+
+
+@@ -250,7 +250,7 @@ R_API bool r_core

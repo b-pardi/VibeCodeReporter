@@ -1,0 +1,125 @@
+@@ -2,9 +2,14 @@
+ 
+ #include "zeek/file_analysis/Analyzer.h"
+ 
++#include "zeek/Event.h"
+ #include "zeek/Val.h"
++#include "zeek/file_analysis/File.h"
+ #include "zeek/file_analysis/Manager.h"
+ 
++// For analyzer_violation_info
++#include "event.bif.netvar_h"
++
+ namespace zeek::file_analysis
+ 	{
+ 
+@@ -23,7 +28,7 @@ void Analyzer::SetAnalyzerTag(const zeek::Tag& arg_tag)
+ 
+ Analyzer::Analyzer(zeek::Tag arg_tag, RecordValPtr arg_args, File* arg_file)
+ 	: tag(arg_tag), args(std::move(arg_args)), file(arg_file), got_stream_delivery(false),
+-	  skip(false)
++	  skip(false), analyzer_confirmed(false)
+ 	{
+ 	id = ++id_counter;
+ 	}
+@@ -33,4 +38,44 @@ Analyzer::Analyzer(RecordValPtr arg_args, File* arg_file)
+ 	{
+ 	}
+ 
++void Analyzer::AnalyzerConfirmation(zeek::Tag arg_tag)
++	{
++	if ( analyzer_confirmed )
++		return;
++
++	analyzer_confirmed = true;
++
++	if ( ! analyzer_confirmation_info )
++		return;
++
++	static auto info_type = zeek::id::find_type<RecordType>("AnalyzerConfirmationInfo");
++	static auto info_f_idx = info_type->FieldOffset("f");
++
++	auto info = zeek::make_intrusive<RecordVal>(info_type);
++	info->Assign(info_f_idx, GetFile()->ToVal());
++
++	const auto& tval = arg_tag ? arg_tag.AsVal() : tag.AsVal();
++	event_mgr.Enqueue(analyzer_confirmation_info, tval, info);
++	}
++
++void Analyzer::AnalyzerViolation(const char* reason, const char* data, int len, zeek::Tag arg_tag)
++	{
++	if ( ! analyzer_violation_info )
++		return;
++
++	static auto info_type = zeek::id::find_type<RecordType>("AnalyzerViolationInfo");
++	static auto info_reason_idx = info_type->FieldOffset("reason");
++	static auto info_f_idx = info_type->FieldOffset("f");
++	static auto info_data_idx = info_type->FieldOffset("data");
++
++	auto info = zeek::make_intrusive<RecordVal>(info_type);
++	info->Assign(info_reason_idx, make_intrusive<StringVal>(reason));
++	info->Assign(info_f_idx, GetFile()->ToVal());
++	if ( data && len )
++		info->Assign(info_data_idx, make_intrusive<StringVal>(len, data));
++
++	const auto& tval = arg_tag ? arg_tag.AsVal() : tag.AsVal();
++	event_mgr.Enqueue(analyzer_violation_info, tval, info);
++	}
++
+ 	} // namespace zeek::file_analysis
+
+
+
+
+@@ -133,6 +133,38 @@ public:
+ 	 */
+ 	bool Skipping() const { return skip; }
+ 
++	/**
++	 * Signals to Zeek that the analyzer has recognized the input to indeed
++	 * conform to the expected format. This should be called as early as
++	 * possible during file analysis. It may turn into \c analyzer_confirmation_info
++	 * events at the script-layer (but only once per file , even if the method is
++	 * called multiple times).
++	 *
++	 * If tag is given, it overrides the analyzer tag passed to the
++	 * scripting layer; the default is the one of the analyzer itself.
++	 */
++	virtual void AnalyzerConfirmation(zeek::Tag tag = zeek::Tag());
++
++	/**
++	 * Signals to Zeek that the analyzer has found a sever violation
++	 * that could indicate it's not parsing the expected file format.
++	 * This turns into \c analyzer_violation_info events at the script-layer
++	 * (one such event is raised for each call to this method so that the
++	 * script-layer can built up a notion of how prevalent violations are; the
++	 * more, the less likely it's the right format).
++	 *
++	 * @param reason A textual description of the error encountered.
++	 *
++	 * @param data An optional pointer to the malformed data.
++	 *
++	 * @param len If \a data is given, the length of it.
++	 *
++	 * @param tag If tag is given, it overrides the analyzer tag passed to the
++	 * scripting layer; the default is the one of the analyzer itself.
++	 */
++	virtual void AnalyzerViolation(const char* reason, const char* data = nullptr, int len = 0,
++	                               zeek::Tag tag = zeek::Tag());
++
+ protected:
+ 	/**
+ 	 * Constructor.  Only derived classes are meant to be instantiated.
+@@ -161,6 +193,7 @@ private:
+ 	File* file; /**< The file to which the analyzer is attached. */
+ 	bool got_stream_delivery;
+ 	bool skip;
++	bool analyzer_confirmed;
+ 
+ 	static ID id_counter;
+ 	};
+
+
+
+
+@@ -30,6 +30,7 @@

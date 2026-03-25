@@ -1,0 +1,137 @@
+@@ -89,8 +89,10 @@ int DecodeUDP(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p, uint8_t *pkt, ui
+         FlowSetupPacket(p);
+         return TM_ECODE_OK;
+     }
+-    /* TODO hardcoded port 4789 - to avoid spending time on non-VXLAN */
+-    if (UDP_GET_DST_PORT(p) == 4789 && unlikely(DecodeVXLAN(tv, dtv, p, pkt,len, pq) == TM_ECODE_OK)) {
++
++    /* Handle VXLAN if configured */
++    if (DecodeVXLANEnabledForPort(p->sp, p->dp) &&
++            unlikely(DecodeVXLAN(tv, dtv, p, p->payload, p->payload_len, pq) == TM_ECODE_OK)) {
+         /* Here we have a VXLAN packet and don't need to handle app
+          * layer */
+         FlowSetupPacket(p);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2014 Open Information Security Foundation
++/* Copyright (C) 2019 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -27,9 +27,8 @@
+ #include "decode.h"
+ #include "decode-vxlan.h"
+ #include "decode-events.h"
+-#include "decode-udp.h"
+ 
+-#include "decode-ethernet.h"
++#include "detect-engine-port.h"
+ 
+ #include "flow.h"
+ 
+@@ -40,9 +39,51 @@
+ #include "util-profiling.h"
+ #include "host.h"
+ 
+-#define VXLAN_HEADER_LEN         8
++#define VXLAN_HEADER_LEN        8
++#define VXLAN_DEFAULT_PORT      4789
++#define VXLAN_DEFAULT_PORT_S    "4789"
+ 
+ static bool g_vxlan_enabled = true;
++static int g_vxlan_ports[4] = { VXLAN_DEFAULT_PORT, -1, -1, -1 };
++static int g_vxlan_ports_idx = 0;
++
++bool DecodeVXLANEnabledForPort(const uint16_t sp, const uint16_t dp)
++{
++    SCLogDebug("ports %u->%u ports %d %d %d %d", sp, dp,
++            g_vxlan_ports[0], g_vxlan_ports[1],
++            g_vxlan_ports[2], g_vxlan_ports[3]);
++
++    if (g_vxlan_enabled) {
++        for (int i = 0; i < g_vxlan_ports_idx; i++) {
++            if (g_vxlan_ports[i] == -1)
++                return false;
++            const int port = g_vxlan_ports[i];
++            if (port == (const int)sp ||
++                port == (const int)dp)
++                return true;
++        }
++    }
++    return false;
++}
++
++static void DecodeVXLANConfigPorts(const char *pstr)
++{
++    SCLogDebug("parsing \'%s\'", pstr);
++
++    DetectPort *head = NULL;
++    DetectPortParse(NULL, &head, pstr);
++
++    g_vxlan_ports_idx = 0;
++    for (DetectPort *p = head; p != NULL; p = p->next) {
++        if (g_vxlan_ports_idx >= 4) {
++            SCLogWarning(SC_ERR_INVALID_YAML_CONF_ENTRY,
++                    "more than 4 VXLAN ports defined");
++            break;
++        }
++        g_vxlan_ports[g_vxlan_ports_idx++] = (int)p->port;
++    }
++    DetectPortCleanupList(NULL, head);
++}
+ 
+ void DecodeVXLANConfig(void)
+ {
+@@ -54,78 +95,86 @@ void DecodeVXLANConfig(void)
+             g_vxlan_enabled = false;
+         }
+     }
+-}
+ 
+-static int DecodeVXLANPacket(ThreadVars *t, Packet *p, uint8_t *pkt, uint16_t len)
+-{
+-    if (unlikely(len < UDP_HEADER_LEN)) {
+-        ENGINE_SET_INVALID_EVENT(p, UDP_HLEN_TOO_SMALL);
+-        return -1;
++    if (g_vxlan_enabled) {
++        ConfNode *node = ConfGetNode("decoder.vxlan.ports");
++        if (node && node->val) {
++            DecodeVXLANConfigPorts(node->val);
++        } else {
++            DecodeVXLANConfigPorts(VXLAN_DEFAULT_PORT_S);
++        }
+     }
+-
+-    p->udph = (UDPHdr *)pkt;
+-
+-    SET_UDP_SRC_PORT(p,&p->sp);
+-    SET_UDP_DST_PORT(p,&p->dp);
+-
+-    p->payload = pkt + UDP_HEADER_LEN;
+-    p->payload_len = len - UDP_HEADER_LEN;
+-    p->proto = IPPROTO_UDP;
+-
+-    return 0;
+ }
+ 
++typedef struct VXLANHeader_ {
++    uint8_t flags[2];
++    uint16_t gdp;
++    uint8_t vni[3];
++    uint8_t res;
++} VXLANHeader;
++
++/** \param pkt payload data directly above UDP header
++ *  \param len length in bytes of pkt
++ */
+ int DecodeVXLAN(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p, uint8_t *pkt,
+         uint32_t len, PacketQueue *pq)
+ {
+-    if (!g_vxlan_enabled)
++    if (unlikely(!g_vxlan_enabled))
+         return TM_ECODE_FAILED;
+ 
+-    /* Is this packet to short to contai

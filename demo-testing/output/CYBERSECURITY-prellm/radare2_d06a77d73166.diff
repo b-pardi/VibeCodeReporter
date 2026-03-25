@@ -1,0 +1,166 @@
+@@ -588,11 +588,16 @@ R_IPI bool r_bin_file_set_cur_binfile_obj(RBin *bin, RBinFile *bf, RBinObject *o
+ 	bin->narch = bf->narch;
+ 	if (obj) {
+ 		bf->o = obj;
++	} else {
++		obj = bf->o;
+ 	}
+ 	RBinPlugin *plugin = r_bin_file_cur_plugin (bf);
+ 	if (bin->minstrlen < 1) {
+ 		bin->minstrlen = plugin? plugin->minstrlen: bin->minstrlen;
+ 	}
++	if (obj && !obj->info->lang) {
++		obj->info->lang = r_bin_lang_tostring (obj->lang);
++	}
+ 	return true;
+ }
+ 
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2018 - pancake */
++/* radare2 - LGPL - Copyright 2018-2019 - pancake */
+ 
+ #include <r_bin.h>
+ 
+@@ -40,16 +40,21 @@ static bool check_swift(RBinSymbol *sym) {
+ 	return false;
+ }
+ 
+-static bool check_cxx(RBinSymbol *sym) {
+-	if (!strncmp (sym->name, "_Z", 2)) {
++static inline bool is_cxx_symbol (const char *name) {
++	r_return_val_if_fail (name, false);
++	if (!strncmp (name, "_Z", 2)) {
+ 		return true;
+ 	}
+-	if (!strncmp (sym->name, "__Z", 3)) {
++	if (!strncmp (name, "__Z", 3)) {
+ 		return true;
+ 	}
+ 	return false;
+ }
+ 
++static bool check_cxx(RBinSymbol *sym) {
++	return is_cxx_symbol (sym->name);
++}
++
+ static bool check_msvc(RBinSymbol *sym) {
+ 	return *sym->name == '?';
+ }
+@@ -75,11 +80,19 @@ R_API int r_bin_load_languages(RBinFile *binfile) {
+ 	bool isMacho = strstr (ft, "mach");
+ 	bool isElf = strstr (ft, "elf");
+ 	bool isPe = strstr (ft, "pe");
++	bool isBlocks = false;
+ 
+ 	if (unknownType || !(isMacho || isElf || isPe)) {
+ 		return R_BIN_NM_NONE;
+ 	}
+ 
++	// check in imports . can be slow
++	r_list_foreach (o->imports, iter, sym) {
++		if (!strcmp (sym->name, "_NSConcreteGlobalBlock")) {
++			isBlocks = true;
++		}
++	}
++
+ 	r_list_foreach (o->symbols, iter, sym) {
+ 		char *lib;
+ 		if (!cantbe.rust) {
+@@ -154,13 +167,12 @@ R_API int r_bin_load_languages(RBinFile *binfile) {
+ 		}
+ 	}
+ 	if (canBeCxx) {
+-		info->lang = "c++";
+-		return R_BIN_NM_CXX;
++		return R_BIN_NM_CXX | (isBlocks?R_BIN_NM_BLOCKS:0);
+ 	}
+ 	if (isMsvc) {
+ 		return R_BIN_NM_MSVC;
+ 	}
+-	return R_BIN_NM_NONE;
++	return R_BIN_NM_C | (isBlocks?R_BIN_NM_BLOCKS:0);
+ }
+ 
+ R_IPI int r_bin_lang_type(RBinFile *binfile, const char *def, const char *sym) {
+@@ -188,3 +200,26 @@ R_IPI int r_bin_lang_type(RBinFile *binfile, const char *def, const char *sym) {
+ 	}
+ 	return type;
+ }
++
++R_API const char *r_bin_lang_tostring(int lang) {
++	switch (lang & 0xffff) {
++	case R_BIN_NM_SWIFT:
++		return "swift";
++	case R_BIN_NM_JAVA:
++		return "java";
++	case R_BIN_NM_C:
++		return (lang&R_BIN_NM_BLOCKS)? "c with blocks": "c";
++	case R_BIN_NM_CXX:
++		return (lang&R_BIN_NM_BLOCKS)? "c++ with blocks": "c++";
++	case R_BIN_NM_DLANG:
++		return "d";
++	case R_BIN_NM_OBJC:
++		return "objc";
++	case R_BIN_NM_MSVC:
++		return "msvc";
++	case R_BIN_NM_RUST:
++		return "rust";
++	}
++	return NULL;
++}
++
+
+
+
+
+@@ -4,10 +4,10 @@
+ #include <r_util.h>
+ #include "i/private.h"
+ 
+-static void mem_free(void *data) {
++R_API void r_bin_mem_free(void *data) {
+ 	RBinMem *mem = (RBinMem *)data;
+ 	if (mem && mem->mirrors) {
+-		mem->mirrors->free = mem_free;
++		mem->mirrors->free = r_bin_mem_free;
+ 		r_list_free (mem->mirrors);
+ 		mem->mirrors = NULL;
+ 	}
+@@ -48,9 +48,6 @@ static void object_delete_items(RBinObject *o) {
+ 	ht_pp_free (o->methods_ht);
+ 	r_list_free (o->lines);
+ 	sdb_free (o->kv);
+-	if (o->mem) {
+-		o->mem->free = mem_free;
+-	}
+ 	r_list_free (o->mem);
+ 	for (i = 0; i < R_BIN_SYM_LAST; i++) {
+ 		free (o->binsym[i]);
+@@ -59,13 +56,12 @@ static void object_delete_items(RBinObject *o) {
+ 
+ R_IPI void r_bin_object_free(void /*RBinObject*/ *o_) {
+ 	RBinObject *o = o_;
+-	if (!o) {
+-		return;
++	if (o) {
++		free (o->regstate);
++		r_bin_info_free (o->info);
++		object_delete_items (o);
++		free (o);
+ 	}
+-	free (o->regstate);
+-	r_bin_info_free (o->info);
+-	object_delete_items (o);
+-	free (o);
+ }
+ 
+ static char *swiftField(const char *dn, const char *cn) {
+@@ -144,7 +140,7 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *bf, RBinPlugin *plugin, ut64 basead
+ 	o->boffset = offset;
+ 	o->strings_db = ht_up_new0 ();
+ 	o->regstate = NULL;
+-	o->kv = s

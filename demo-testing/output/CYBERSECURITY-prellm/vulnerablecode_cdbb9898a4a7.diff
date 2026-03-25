@@ -1,0 +1,119 @@
+@@ -239,7 +239,10 @@ IMPORTER_REGISTRY = [
+         "license": "mpl-2.0",
+         "last_run": None,
+         "data_source": "MozillaDataSource",
+-        "data_source_cfg": {},
++        "data_source_cfg": {
++            "branch": None,
++            "repository_url": "https://github.com/mozilla/foundation-security-advisories",
++        },
+     },
+ ]
+ 
+
+
+
+
+@@ -1,19 +1,20 @@
+-from typing import Set, List
++from typing import Set, List, Generator
+ 
+ import re
++import asyncio
+ from bs4 import BeautifulSoup
+ from packageurl import PackageURL
+ import requests
+ 
+-from github import Github
+ import yaml
+ from markdown import markdown
+ 
+ from vulnerabilities.data_source import Advisory
+-from vulnerabilities.data_source import DataSource
++from vulnerabilities.data_source import GitDataSource
+ from vulnerabilities.data_source import Reference
+ from vulnerabilities.data_source import VulnerabilitySeverity
+ from vulnerabilities.severity_systems import scoring_systems
++from vulnerabilities.package_managers import GitHubTagsAPI
+ from vulnerabilities.helpers import is_cve
+ 
+ 
+@@ -21,51 +22,70 @@ REPOSITORY = "mozilla/foundation-security-advisories"
+ MFSA_FILENAME_RE = re.compile(r"mfsa(\d{4}-\d{2,3})\.(md|yml)$")
+ 
+ 
+-class MozillaDataSource(DataSource):
++class MozillaDataSource(GitDataSource):
++    def __enter__(self):
++        super(MozillaDataSource, self).__enter__()
++
++        if not getattr(self, "_added_files", None):
++            self._added_files, self._updated_files = self.file_changes(
++                recursive=True, subdir="announce"
++            )
++
++        # Do we need this ?
++        # self.version_api = GitHubTagsAPI()
++        # self.set_api()
++
++    def set_api(self):
++        repository = "/".join(self.config.repository_url.split("/")[-2:])
++        asyncio.run(self.version_api.load_api([repository]))
++
++    def added_advisories(self) -> Set[Advisory]:
++        return self._load_advisories(self._added_files)
++
+     def updated_advisories(self) -> Set[Advisory]:
+-        advisories = []
+-        advisory_links = self.fetch_advisory_links()
+-        for link in advisory_links:
+-            advisories.extend(self.to_advisories(link))
+-        return self.batch_advisories(advisories)
+-
+-    def fetch_advisory_links(self):
+-        links = []
+-        # TODO: Migrate to GitDataSource
+-        g = Github("ffa10510de8dfa1bad60cd3963c45d2db2035287")
+-        repo = g.get_repo(REPOSITORY)
+-        years = repo.get_contents("announce")
+-        for year in years:
+-            if year.type != "dir":
+-                continue
+-            advisories = repo.get_contents(year.path)
+-            links.extend([advisory.download_url for advisory in advisories])
+-        return links
++        return self._load_advisories(self._updated_files)
++
++    def _load_advisories(self, files) -> Set[Advisory]:
++        """
++        Yields list of advisories of batch size
++        """
++        files = [
++            f for f in files if f.endswith(".md") or f.endswith(".yml")
++        ]  # skip irrelevant files
+ 
+-    def to_advisories(self, link: str) -> Set[Advisory]:
+         advisories = []
++        for path in files:
++            for advisory in self._to_advisories(path):
++                advisories.append(advisory)
++                if len(advisories) >= self.batch_size:
++                    yield advisories
++                    advisories = []
++
++    def _to_advisories(self, path: str) -> List[Advisory]:
++        """
++        Convert a file to corresponding advisories.
++        This calls proper method to handle yml/md files.
++        """
++        mfsa_id = self._mfsa_id_from_filename(path)
+ 
+-        if link.endswith(".md"):
+-            advisories.extend(self.parse_md(link))
+-        elif link.endswith(".yml"):
+-            advisories.extend(self.parse_yml(link))
++        with open(path) as lines:
++            if path.endswith(".md"):
++                return self._parse_md(mfsa_id, lines)
++            elif path.endswith(".yml"):
++                

@@ -1,0 +1,105 @@
+@@ -19,6 +19,7 @@
+ #  for any legal advice.
+ #  VulnerableCode is a free software code scanning tool from nexB Inc. and others.
+ #  Visit https://github.com/nexB/vulnerablecode/ for support and download.
++import os
+ import asyncio
+ import dataclasses
+ import xml.etree.ElementTree as ET
+@@ -30,6 +31,7 @@ from typing import Mapping
+ from typing import Set
+ 
+ from aiohttp import ClientSession
++import aiohttp
+ from aiohttp.client_exceptions import ClientResponseError
+ from aiohttp.client_exceptions import ServerDisconnectedError
+ from bs4 import BeautifulSoup
+@@ -48,6 +50,10 @@ class VersionResponse:
+     newer_versions: Set[str] = dataclasses.field(default_factory=set)
+ 
+ 
++class GraphQLError(Exception):
++    pass
++
++
+ class VersionAPI:
+     def __init__(self, cache: Mapping[str, Set[Version]] = None):
+         self.cache = cache or {}
+@@ -377,21 +383,92 @@ class ComposerVersionAPI(VersionAPI):
+ class GitHubTagsAPI(VersionAPI):
+ 
+     package_type = "github"
++    GQL_QUERY = """
++    query getTags($name: String!, $owner: String!, $after: String)
++    {
++        repository(name: $name, owner: $owner) {
++            refs(refPrefix: "refs/tags/", first: 100, after: $after) {
++                totalCount
++                pageInfo {
++                    endCursor
++                    hasNextPage
++                }
++                nodes {
++                    name
++                    target {
++                        ... on Commit {
++                            committedDate
++                        }
++                        ... on Tag {
++                                target {
++                                ... on Commit {
++                                    committedDate
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }"""
+ 
+-    async def fetch(self, owner_repo: str, session) -> None:
++    def __init__(self, cache: Mapping[str, Set[Version]] = None):
++        self.gh_token = os.getenv("GH_TOKEN")
++        super().__init__(cache=cache)
++
++    async def fetch(self, owner_repo: str, session: aiohttp.ClientSession) -> None:
+         """
+         owner_repo is a string of format "{repo_owner}/{repo_name}"
+         Example value of owner_repo = "nexB/scancode-toolkit"
+         """
+         self.cache[owner_repo] = set()
+-        endpoint = f"https://github.com/{owner_repo}"
+-
+-        tags_xml = check_output(["svn", "ls", "--xml", f"{endpoint}/tags"], text=True)
+-        elements = ET.fromstring(tags_xml)
+-        for entry in elements.iter("entry"):
+-            name = entry.find("name").text
+-            release_date = dateparser.parse(entry.find("commit/date").text)
+-            self.cache[owner_repo].add(Version(value=name, release_date=release_date))
++        if self.gh_token:
++            # graphql api cannot work without api token
++            session.headers["Authorization"] = "token " + self.gh_token
++            endpoint = f"https://api.github.com/graphql"
++            owner, name = owner_repo.split("/")
++            query = {"query": self.GQL_QUERY, "variables": {"name": name, "owner": owner}}
++
++            while True:
++                response = await session.post(endpoint, json=query)
++                resp_json = await response.json()
++
++                if "errors" in resp_json:
++                    raise GraphQLError(resp_json["errors"])
++
++                refs = resp_json["data"]["repository"]["refs"]
++
++                for entry in refs["nodes"]:
++                    name = entry["name"]
++                    target = entry["target"]
++                    # in case the tag is a signed tag, then the commit info is in target['target']
++                    if "committedDate" not in target:
++                        target = target["target"]
++                    if "committedDate" in target:
++                        release_date = dateparser.parse(target["committedDate"])
++                    else:
++       

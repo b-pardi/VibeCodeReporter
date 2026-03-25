@@ -1,0 +1,177 @@
+@@ -289,6 +289,7 @@ static char *dex_get_proto(RBinDexObj *bin, int proto_id) {
+ 	if (typeidx_bufsize > 0) {
+ 		ut8 *typeidx_buf = malloc (typeidx_bufsize);
+ 		if (!typeidx_buf || !r_buf_read_at (bin->b, params_off + 4, typeidx_buf, typeidx_bufsize)) {
++			r_strbuf_free (sig);
+ 			return NULL;
+ 		}
+ 		size_t off;
+
+
+
+
+@@ -255,7 +255,7 @@ R_API const char *r_run_help(void);
+ R_API int r_run_config_env(RRunProfile *p);
+ R_API int r_run_start(RRunProfile *p);
+ R_API void r_run_reset(RRunProfile *p);
+-R_API int r_run_parsefile(RRunProfile *p, const char *b);
++R_API bool r_run_parsefile(RRunProfile *p, const char *b);
+ 
+ /* rapipe */
+ R_API R2Pipe *rap_open(const char *cmd);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2007-2019 - pancake */
++/* radare - LGPL - Copyright 2007-2020 - pancake */
+ 
+ #include <errno.h>
+ #include <r_io.h>
+
+
+
+
+@@ -1486,8 +1486,8 @@ beach:
+ 	//r_core_file_close (r, fh);
+ 	r_core_free (r);
+ 	r_cons_set_raw (0);
+-	free (file);
+ 	r_cons_free ();
+ 	LISTS_FREE ();
++	R_FREE (pfile);
+ 	return ret;
+ }
+
+
+
+
+@@ -139,7 +139,7 @@ R_API int r_main_ragg2(int argc, const char **argv) {
+ 	const char *ofile = NULL;
+ 	int ofileauto = 0;
+ 	RBuffer *b;
+-	int c, i;
++	int c, i, fd = -1;
+ 	REgg *egg = r_egg_new ();
+ 
+ 	RGetopt opt;
+@@ -469,6 +469,7 @@ R_API int r_main_ragg2(int argc, const char **argv) {
+ 		if (len > 0) {
+ 			if (!r_egg_raw (egg, b, len)) {
+ 				eprintf ("Unknown '%s'\n", shellcode);
++				free (b);
+ 				goto fail;
+ 			}
+ 		} else {
+@@ -481,7 +482,6 @@ R_API int r_main_ragg2(int argc, const char **argv) {
+ 
+ 	/* set output (create output file if needed) */
+ 	if (ofileauto) {
+-		int fd;
+ 		if (file) {
+ 			char *o, *q, *p = strdup (file);
+ 			if ((o = strchr (p, '.'))) {
+@@ -501,9 +501,11 @@ R_API int r_main_ragg2(int argc, const char **argv) {
+ 			eprintf ("cannot open file '%s'\n", opt.arg);
+ 			goto fail;
+ 		}
++		close (fd);
+ 	}
+ 	if (ofile) {
+-		if (openfile (ofile, ISEXEC) == -1) {
++		fd = openfile (ofile, ISEXEC);
++		if (fd == -1) {
+ 			eprintf ("cannot open file '%s'\n", ofile);
+ 			goto fail;
+ 		}
+@@ -610,10 +612,16 @@ R_API int r_main_ragg2(int argc, const char **argv) {
+ 			r_print_free (p);
+ 		}
+ 	}
++	if (fd != -1) {
++		close (fd);
++	}
+ 	free (sequence);
+ 	r_egg_free (egg);
+ 	return 0;
+ fail:
++	if (fd != -1) {
++		close (fd);
++	}
+ 	free (sequence);
+ 	r_egg_free (egg);
+ 	return 1;
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2014-2017 - pancake */
++/* radare - LGPL - Copyright 2014-2020 - pancake */
+ 
+ /* this helper api is here because it depends on r_util and r_socket */
+ /* we should find a better place for it. r_io? */
+@@ -56,7 +56,13 @@
+ #include <process.h>  // to compile execv in msvc windows
+ #endif
+ 
++#if EMSCRIPTEN
++#undef HAVE_PTY
++#define HAVE_PTY 0
++#else
+ #define HAVE_PTY __UNIX__ && !__ANDROID__ && LIBC_HAVE_FORK && !__sun
++#endif
++
+ 
+ #if HAVE_PTY
+ static int (*dyn_openpty)(int *amaster, int *aslave, char *name, struct termios *termp, struct winsize *winp) = NULL;
+@@ -76,29 +82,25 @@ static void dyn_init(void) {
+ 
+ #endif
+ 
+-#if EMSCRIPTEN
+-#undef HAVE_PTY
+-#define HAVE_PTY 0
+-#endif
+-
+ R_API RRunProfile *r_run_new(const char *str) {
+ 	RRunProfile *p = R_NEW0 (RRunProfile);
+ 	if (p) {
+ 		r_run_reset (p);
+-		r_run_parsefile (p, str);
++		if (str) {
++			r_run_parsefile (p, str);
++		}
+ 	}
+ 	return p;
+ }
+ 
+ R_API void r_run_reset(RRunProfile *p) {
++	r_return_if_fail (p);
+ 	memset (p, 0, sizeof (RRunProfile));
+ 	p->_aslr = -1;
+ }
+ 
+ R_API bool r_run_parse(RRunProfile *pf, const char *profile) {
+-	if (!pf || !profile) {
+-		return false;
+-	}
++	r_return_val_if_fail (pf && profile, false);
+ 	char *p, *o, *str = strdup (profile);
+ 	if (!str) {
+ 		return false;
+@@ -112,20 +114,22 @@ R_API bool r_run_parse(RRunProfile *pf, const char *profile) {
+ 	return true;
+ }
+ 
+-R_API void r_run_free (RRunProfile *r) {
+-	free (r->_system);
+-	free (r->_program);
+-	free (r->_runlib);
+-	free (r->_runlib_fcn);
+-	free (r->_stdio);
+-	free (r->_stdin);
+-	free (r->_stdout);
+-	free (r->_stderr);
+-	free (r->_chgdir);

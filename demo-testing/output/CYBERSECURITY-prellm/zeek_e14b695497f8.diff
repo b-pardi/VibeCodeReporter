@@ -1,0 +1,72 @@
+@@ -415,7 +415,11 @@ public:
+ 	uint16_t PayloadLen() const
+ 		{
+ 		if ( ip4 )
+-			return ntohs(ip4->ip_len) - ip4->ip_hl * 4;
++			{
++			// prevent overflow in case of segment offloading/zeroed header length.
++			auto total_len = ntohs(ip4->ip_len);
++			return total_len ? total_len - ip4->ip_hl * 4 : 0;
++			}
+ 
+ 		return ntohs(ip6->ip6_plen) + 40 - ip6_hdrs->TotalLength();
+ 		}
+
+
+
+
+@@ -81,8 +81,13 @@ bool IPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet)
+ 		// TCP segmentation offloading can zero out the ip_len field.
+ 		Weird("ip_hdr_len_zero", packet);
+ 
+-		// Cope with the zero'd out ip_len field by using the caplen.
+-		total_len = packet->cap_len - hdr_size;
++		if ( detail::ignore_checksums )
++			// Cope with the zero'd out ip_len field by using the caplen.
++			total_len = packet->cap_len - hdr_size;
++		else
++			// If this is caused by segmentation offloading, the checksum will
++			// also be incorrect. If checksum validation is enabled - jus tbail here.
++			return false;
+ 		}
+ 
+ 	if ( packet->len < total_len + hdr_size )
+@@ -236,7 +241,7 @@ bool IPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet)
+ 	packet->proto = proto;
+ 
+ 	// Double check the lengths one more time before forwarding this on.
+-	if ( packet->ip_hdr->TotalLen() < packet->ip_hdr->HdrLen() )
++	if ( total_len < packet->ip_hdr->HdrLen() )
+ 		{
+ 		Weird("bogus_IP_header_lengths", packet);
+ 		return false;
+
+
+
+
+@@ -115,7 +115,9 @@ bool IPBasedAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* pkt
+ 
+ bool IPBasedAnalyzer::CheckHeaderTrunc(size_t min_hdr_len, size_t remaining, Packet* packet)
+ 	{
+-	if ( packet->ip_hdr->PayloadLen() < min_hdr_len )
++	// If segment offloading or similar is enabled, the payload len will return 0.
++	// Thus, let's ignore that case.
++	if ( packet->ip_hdr->PayloadLen() && packet->ip_hdr->PayloadLen() < min_hdr_len )
+ 		{
+ 		Weird("truncated_header", packet);
+ 		return false;
+
+
+
+
+@@ -96,6 +96,10 @@ void TCPAnalyzer::DeliverPacket(Connection* c, double t, bool is_orig, int remai
+ 	{
+ 	const u_char* data = pkt->ip_hdr->Payload();
+ 	int len = pkt->ip_hdr->PayloadLen();
++	// If the header length is zero, tcp checksum offloading is probably enabled
++	// In this case, let's fix up the length.
++	if ( pkt->ip_hdr->TotalLen() == 0 )
++		len = remaining;
+ 	auto* adapter = static_cast<TCPSessionAdapter*>(c->GetSessionAdapter());
+ 
+ 	const struct tcphdr* tp = ExtractTCP_Header(data, len, remaining, adapter);

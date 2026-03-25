@@ -1,0 +1,153 @@
+@@ -33,6 +33,7 @@
+ #include "iosource/PktDumper.h"
+ #include "plugin/Manager.h"
+ #include "broker/Manager.h"
++#include "Supervisor.h"
+ 
+ extern "C" {
+ #include "setsignal.h"
+@@ -288,6 +289,9 @@ void net_run()
+ 	while ( iosource_mgr->Size() ||
+ 		(BifConst::exit_only_after_terminate && ! terminating) )
+ 		{
++		if ( zeek::supervised_node && getppid() == 1 )
++			zeek_terminate_loop("supervised cluster node was orphaned");
++
+ 		double ts;
+ 		iosource::IOSource* src = iosource_mgr->FindSoonest(&ts);
+ 
+@@ -361,13 +365,11 @@ void net_run()
+ 		current_dispatched = 0;
+ 		current_iosrc = 0;
+ 
+-		// Should we put the signal handling into an IOSource?
+-		extern void termination_signal();
+-
+ 		if ( signal_val == SIGTERM || signal_val == SIGINT )
+ 			// We received a signal while processing the
+ 			// current packet and its related events.
+-			termination_signal();
++			// Should we put the signal handling into an IOSource?
++			zeek_terminate_loop("received termination signal");
+ 
+ 		if ( ! reading_traces )
+ 			// Check whether we have timers scheduled for
+
+
+
+
+@@ -24,7 +24,7 @@ extern void net_update_time(double new_network_time);
+ extern void net_packet_dispatch(double t, const Packet* pkt,
+ 			iosource::PktSrc* src_ps);
+ extern void expire_timers(iosource::PktSrc* src_ps = 0);
+-extern void termination_signal();
++extern void zeek_terminate_loop(const char* reason);
+ 
+ // Functions to temporarily suspend processing of live input (network packets
+ // and remote events/state). Turning this is on is sure to lead to data loss!
+
+
+
+
+@@ -14,6 +14,8 @@
+ #include "zeek-config.h"
+ #include "util.h"
+ 
++#include "3rdparty/json.hpp"
++
+ extern "C" {
+ #include "setsignal.h"
+ }
+@@ -24,13 +26,13 @@ struct Stem {
+ 
+ 	~Stem();
+ 
+-	std::string Run();
++	zeek::Supervisor::Node* Run();
+ 
+-	std::string Poll();
++	zeek::Supervisor::Node* Poll();
+ 
+-	void Reap();
++	zeek::Supervisor::Node* Revive();
+ 
+-	std::string Revive();
++	void Reap();
+ 
+ 	bool Spawn(zeek::Supervisor::Node* node);
+ 
+@@ -60,6 +62,7 @@ static Stem* stem = nullptr;
+ 
+ static RETSIGTYPE stem_sig_handler(int signo)
+ 	{
++	// TODO: signal safety
+ 	printf("Stem received signal: %d\n", signo);
+ 
+ 	if ( stem->shutting_down )
+@@ -75,6 +78,7 @@ static RETSIGTYPE stem_sig_handler(int signo)
+ 
+ static RETSIGTYPE supervisor_sig_handler(int signo)
+ 	{
++	// TODO: signal safety
+ 	DBG_LOG(DBG_SUPERVISOR, "received signal: %d", signo);
+ 	zeek::supervisor->ObserveChildSignal();
+ 	return RETSIGVAL;
+@@ -191,8 +195,15 @@ void zeek::Supervisor::ReapStem()
+ 
+ void zeek::Supervisor::HandleChildSignal()
+ 	{
+-	signal_flare.Extinguish();
+-	ReapStem();
++	bool had_child_signal = signal_flare.Extinguish();
++
++	if ( had_child_signal )
++		{
++		ReapStem();
++
++		DBG_LOG(DBG_SUPERVISOR, "processed SIGCHLD %s",
++		        stem_pid ? "(spurious)" : "");
++		}
+ 
+ 	if ( stem_pid )
+ 		return;
+@@ -233,9 +244,10 @@ void zeek::Supervisor::HandleChildSignal()
+ 		exit(1);
+ 		}
+ 
++	DBG_LOG(DBG_SUPERVISOR, "stem process revived, new pid: %d", stem_pid);
++
+ 	// Parent supervisor process resends node configurations to recreate
+ 	// the desired process hierarchy
+-	DBG_LOG(DBG_SUPERVISOR, "stem process revived, new pid: %d", stem_pid);
+ 
+ 	// TODO: probably a preferred order in which to create nodes
+ 	// e.g. logger, manager, proxy, worker
+@@ -402,7 +414,7 @@ void Stem::Destroy(zeek::Supervisor::Node* node) const
+ 		}
+ 	}
+ 
+-std::string Stem::Revive()
++zeek::Supervisor::Node* Stem::Revive()
+ 	{
+ 	constexpr auto attempts_before_delay_increase = 3;
+ 	constexpr auto delay_increase_factor = 2;
+@@ -437,12 +449,12 @@ std::string Stem::Revive()
+ 			node.revival_delay *= delay_increase_factor;
+ 
+ 		if ( Spawn(&node) )
+-			return node.name;
++			return new zeek::Supervisor::Node(node);
+ 
+ 		ReportStatus(node);
+ 		}
+ 
+-	return "";
++	return {};
+ 	}
+ 
+ bool Stem::Spawn(zeek::Supervisor::Node* node)
+@@ -494,10 +506,15 @@ void Stem::Shutdown(int exit_code)
+ 	for ( ; ; )
+ 		{
+ 		auto sig = kill_attempts++ < max_term_attempts ? SIGTERM : SIGKILL;
+-		printf("Stem killed

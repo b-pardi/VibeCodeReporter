@@ -1,0 +1,146 @@
+@@ -390,8 +390,16 @@ void get_final_stats()
+ 		                         ? ((double)s.dropped / ((double)s.received + (double)s.dropped)) *
+ 		                               100.0
+ 		                         : 0.0;
+-		reporter->Info("%" PRIu64 " packets received on interface %s, %" PRIu64 " (%.2f%%) dropped",
+-		               s.received, ps->Path().c_str(), s.dropped, dropped_pct);
++
++		uint64_t not_processed = packet_mgr->GetUnprocessedCount();
++		double unprocessed_pct = not_processed > 0
++		                             ? ((double)not_processed / (double)s.received) * 100.0
++		                             : 0.0;
++
++		reporter->Info("%" PRIu64 " packets received on interface %s, %" PRIu64
++		               " (%.2f%%) dropped, %" PRIu64 " (%.2f%%) not processed",
++		               s.received, ps->Path().c_str(), s.dropped, dropped_pct, not_processed,
++		               unprocessed_pct);
+ 		}
+ 	}
+ 
+
+
+
+
+@@ -68,6 +68,8 @@ void Packet::Init(int arg_link_type, pkt_timeval* arg_ts, uint32_t arg_caplen, u
+ 	tunnel_type = BifEnum::Tunnel::IP;
+ 	gre_version = -1;
+ 	gre_link_type = DLT_RAW;
++
++	processed = false;
+ 	}
+ 
+ Packet::~Packet()
+@@ -146,6 +148,33 @@ RecordValPtr Packet::ToRawPktHdrVal() const
+ 		return pkt_hdr;
+ 	}
+ 
++RecordValPtr Packet::ToVal(const Packet* p)
++	{
++	static auto pcap_packet = zeek::id::find_type<zeek::RecordType>("pcap_packet");
++	auto val = zeek::make_intrusive<zeek::RecordVal>(pcap_packet);
++
++	if ( p )
++		{
++		val->Assign(0, static_cast<uint32_t>(p->ts.tv_sec));
++		val->Assign(1, static_cast<uint32_t>(p->ts.tv_usec));
++		val->Assign(2, p->cap_len);
++		val->Assign(3, p->len);
++		val->Assign(4, zeek::make_intrusive<zeek::StringVal>(p->cap_len, (const char*)p->data));
++		val->Assign(5, zeek::BifType::Enum::link_encap->GetEnumVal(p->link_type));
++		}
++	else
++		{
++		val->Assign(0, 0);
++		val->Assign(1, 0);
++		val->Assign(2, 0);
++		val->Assign(3, 0);
++		val->Assign(4, zeek::val_mgr->EmptyString());
++		val->Assign(5, zeek::BifType::Enum::link_encap->GetEnumVal(BifEnum::LINK_UNKNOWN));
++		}
++
++	return val;
++	}
++
+ ValPtr Packet::FmtEUI48(const u_char* mac) const
+ 	{
+ 	char buf[20];
+
+
+
+
+@@ -122,6 +122,12 @@ public:
+ 	 */
+ 	RecordValPtr ToRawPktHdrVal() const;
+ 
++	/**
++	 * Returns a RecordVal that represents the Packet. This is used
++	 * by the get_current_packet bif.
++	 */
++	static RecordValPtr ToVal(const Packet* p);
++
+ 	/**
+ 	 * Maximal length of a layer 2 address.
+ 	 */
+@@ -241,6 +247,14 @@ public:
+ 	 */
+ 	int gre_link_type = DLT_RAW;
+ 
++	/**
++	 * This flag indicates whether a packet has been processed. This can
++	 * mean different things depending on the traffic, but generally it
++	 * means that a packet has been logged in some way. We default to
++	 * false, and this can be set to true for any number of reasons.
++	 */
++	bool processed = false;
++
+ private:
+ 	// Renders an MAC address into its ASCII representation.
+ 	ValPtr FmtEUI48(const u_char* mac) const;
+
+
+
+
+@@ -7,6 +7,7 @@
+ #include "zeek/iosource/PktDumper.h"
+ #include "zeek/packet_analysis/Analyzer.h"
+ #include "zeek/packet_analysis/Dispatcher.h"
++#include "zeek/plugin/Manager.h"
+ #include "zeek/zeek-bif.h"
+ 
+ using namespace zeek::packet_analysis;
+@@ -106,6 +107,16 @@ void Manager::ProcessPacket(Packet* packet)
+ 	// Start packet analysis
+ 	root_analyzer->ForwardPacket(packet->cap_len, packet->data, packet, packet->link_type);
+ 
++	if ( ! packet->processed )
++		{
++		if ( packet_not_processed )
++			event_mgr.Enqueue(packet_not_processed, Packet::ToVal(packet));
++
++		plugin_mgr->HookUnprocessedPacket(packet);
++
++		total_not_processed++;
++		}
++
+ 	if ( raw_packet )
+ 		event_mgr.Enqueue(raw_packet, packet->ToRawPktHdrVal());
+ 
+
+
+
+
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include "zeek/Func.h"
+ #include "zeek/PacketFilter.h"
+ #include "zeek/iosource/Packet.h"
+ #include "zeek/packet_analysis/Component.h"
+@@ -126,6 +127,12 @@ public:
+ 		return pkt_filter;
+ 		}
+ 
++	/**
++	 * Returns the total number of packets received that weren't considered
++	 * processed by some analyzer.

@@ -1,0 +1,153 @@
+@@ -27,7 +27,7 @@ void FragTimer::Dispatch(double t, int /* is_expire */)
+ 
+ FragReassembler::FragReassembler(NetSessions* arg_s,
+ 			const IP_Hdr* ip, const u_char* pkt,
+-			HashKey* k, double t)
++			const FragReassemblerKey& k, double t)
+ 	: Reassembler(0, REASSEM_FRAG)
+ 	{
+ 	s = arg_s;
+@@ -68,7 +68,6 @@ FragReassembler::~FragReassembler()
+ 	DeleteTimer();
+ 	delete [] proto_hdr;
+ 	delete reassembled_pkt;
+-	delete key;
+ 	}
+ 
+ void FragReassembler::AddFragment(double t, const IP_Hdr* ip, const u_char* pkt)
+
+
+
+
+@@ -3,6 +3,8 @@
+ #ifndef frag_h
+ #define frag_h
+ 
++#include <tuple>
++
+ #include "util.h"
+ #include "IP.h"
+ #include "Net.h"
+@@ -17,10 +19,12 @@ class FragTimer;
+ 
+ typedef void (FragReassembler::*frag_timer_func)(double t);
+ 
++using FragReassemblerKey = std::tuple<IPAddr, IPAddr, bro_uint_t>;
++
+ class FragReassembler : public Reassembler {
+ public:
+ 	FragReassembler(NetSessions* s, const IP_Hdr* ip, const u_char* pkt,
+-			HashKey* k, double t);
++			const FragReassemblerKey& k, double t);
+ 	~FragReassembler() override;
+ 
+ 	void AddFragment(double t, const IP_Hdr* ip, const u_char* pkt);
+@@ -30,7 +34,7 @@ public:
+ 	void ClearTimer()	{ expire_timer = 0; }
+ 
+ 	const IP_Hdr* ReassembledPkt()	{ return reassembled_pkt; }
+-	HashKey* Key() const	{ return key; }
++	const FragReassemblerKey& Key() const	{ return key; }
+ 
+ protected:
+ 	void BlockInserted(DataBlock* start_block) override;
+@@ -43,7 +47,7 @@ protected:
+ 	NetSessions* s;
+ 	uint64_t frag_size;	// size of fully reassembled fragment
+ 	uint16_t next_proto; // first IPv6 fragment header's next proto field
+-	HashKey* key;
++	FragReassemblerKey key;
+ 
+ 	FragTimer* expire_timer;
+ };
+
+
+
+
+@@ -87,17 +87,6 @@ void IPTunnelTimer::Dispatch(double t, int is_expire)
+ 
+ NetSessions::NetSessions()
+ 	{
+-	TypeList* t = new TypeList();
+-	t->Append(base_type(TYPE_ADDR));	// source IP address
+-	t->Append(base_type(TYPE_ADDR));	// dest IP address
+-	t->Append(base_type(TYPE_COUNT));	// source and dest ports
+-
+-	ch = new CompositeHash(t);
+-
+-	Unref(t);
+-
+-	fragments.SetDeleteFunc(bro_obj_delete_func);
+-
+ 	if ( stp_correlate_pair )
+ 		stp_manager = new analyzer::stepping_stone::SteppingStoneManager();
+ 	else
+@@ -131,7 +120,6 @@ NetSessions::NetSessions()
+ 
+ NetSessions::~NetSessions()
+ 	{
+-	delete ch;
+ 	delete packet_filter;
+ 	delete pkt_profiler;
+ 	Unref(arp_analyzer);
+@@ -144,6 +132,8 @@ NetSessions::~NetSessions()
+ 		Unref(entry.second);
+ 	for ( const auto& entry : icmp_conns )
+ 		Unref(entry.second);
++	for ( const auto& entry : fragments )
++		Unref(entry.second);
+ 	}
+ 
+ void NetSessions::Done()
+@@ -939,27 +929,22 @@ FragReassembler* NetSessions::NextFragment(double t, const IP_Hdr* ip,
+ 	{
+ 	uint32_t frag_id = ip->ID();
+ 
+-	ListVal* key = new ListVal(TYPE_ANY);
+-	key->Append(new AddrVal(ip->SrcAddr()));
+-	key->Append(new AddrVal(ip->DstAddr()));
+-	key->Append(val_mgr->GetCount(frag_id));
++	FragReassemblerKey key = std::make_tuple(ip->SrcAddr(), ip->DstAddr(), frag_id);
+ 
+-	HashKey* h = ch->ComputeHash(key, 1);
+-	if ( ! h )
+-		reporter->InternalError("hash computation failed");
++	FragReassembler* f = nullptr;
++	auto it = fragments.find(key);
++	if ( it != fragments.end() )
++		f = it->second;
+ 
+-	FragReassembler* f = fragments.Lookup(h);
+ 	if ( ! f )
+ 		{
+-		f = new FragReassembler(this, ip, pkt, h, t);
+-		fragments.Insert(h, f);
+-		Unref(key);
++		f = new FragReassembler(this, ip, pkt, key, t);
++		fragments[key] = f;
++		if ( fragments.size() > stats.max_fragments )
++			stats.max_fragments = fragments.size();
+ 		return f;
+ 		}
+ 
+-	delete h;
+-	Unref(key);
+-
+ 	f->AddFragment(t, ip, pkt);
+ 	return f;
+ 	}
+@@ -1097,15 +1082,8 @@ void NetSessions::Remove(FragReassembler* f)
+ 	if ( ! f )
+ 		return;
+ 
+-	HashKey* k = f->Key();
+-
+-	if ( k )
+-		{
+-		if ( ! fragments.RemoveEntry(k) )
+-			reporter->InternalWarning("fragment reassembler not in dict");
+-		}
+-	else
+-		reporter->InternalWarning("missing fragment reassembler hash key");
++	if ( fragments.erase(f->Key()) == 0 )
++		reporter->InternalWarning("fragment r

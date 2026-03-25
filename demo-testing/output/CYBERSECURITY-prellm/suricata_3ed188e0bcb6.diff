@@ -1,0 +1,111 @@
+@@ -196,10 +196,41 @@ static inline int SafeMemcpy(void *dst, size_t dst_offset, size_t dst_size,
+     return -1;
+ }
+ 
++#ifdef DEBUG_VALIDATION
++#define ValidateRecordState(connp)                                              \
++    do {                                                                        \
++        DEBUG_VALIDATE_BUG_ON(((connp)->record_length + SSLV3_RECORD_HDR_LEN) < \
++                (connp)->bytes_processed);                                      \
++    } while(0);
++#else
++#define ValidateRecordState(...)
++#endif
++
++#ifdef DEBUG_VALIDATION
++#define ValidateTrecBuffer(connp)                                               \
++    do {                                                                        \
++        DEBUG_VALIDATE_BUG_ON((connp)->trec_pos > (connp)->trec_len);           \
++        DEBUG_VALIDATE_BUG_ON((connp)->trec == NULL && (connp)->trec_len > 0);  \
++        DEBUG_VALIDATE_BUG_ON((connp)->trec == NULL && (connp)->trec_pos > 0);  \
++    } while(0)
++#else
++#define ValidateTrecBuffer(...)
++#endif
++
++#define SSLParserHSReset(connp)             \
++    do {                                    \
++        (connp)->trec_pos = 0;              \
++        (connp)->handshake_type = 0;        \
++        (connp)->hs_bytes_processed = 0;    \
++        (connp)->message_length = 0;        \
++        (connp)->message_start = 0;         \
++    } while(0)
++
+ #define SSLParserReset(state)                       \
+     do {                                            \
+         SCLogDebug("resetting state");              \
+         (state)->curr_connp->bytes_processed = 0;   \
++        SSLParserHSReset((state)->curr_connp);      \
+     } while(0)
+ 
+ void SSLSetEvent(SSLState *ssl_state, uint8_t event)
+@@ -490,7 +521,6 @@ static int TlsDecodeHSCertificate(SSLState *ssl_state,
+ {
+     const uint8_t *input = (uint8_t *)initial_input;
+     uint32_t err_code = 0;
+-
+     X509 *x509 = NULL;
+ 
+     if (!(HAS_SPACE(3)))
+@@ -507,6 +537,7 @@ static int TlsDecodeHSCertificate(SSLState *ssl_state,
+     while (processed_len < cert_chain_len)
+     {
+         err_code = 0;
++        int rc = 0;
+ 
+         if (!(HAS_SPACE(3)))
+             goto invalid_cert;
+@@ -517,16 +548,12 @@ static int TlsDecodeHSCertificate(SSLState *ssl_state,
+         if (!(HAS_SPACE(cert_len)))
+             goto invalid_cert;
+ 
+-        // uint32_t err = 0;
+-        int rc = 0;
+-
+         /* only store fields from the first certificate in the chain */
+         if (processed_len == 0 &&
+                 ssl_state->server_connp.cert0_subject == NULL &&
+                 ssl_state->server_connp.cert0_issuerdn == NULL &&
+                 ssl_state->server_connp.cert0_serial == NULL)
+         {
+-            char * str;
+             int64_t not_before, not_after;
+ 
+             x509 = rs_x509_decode(input, cert_len, &err_code);
+@@ -535,7 +562,7 @@ static int TlsDecodeHSCertificate(SSLState *ssl_state,
+                 goto next;
+             }
+ 
+-            str = rs_x509_get_subject(x509);
++            char *str = rs_x509_get_subject(x509);
+             if (str == NULL) {
+                 err_code = ERR_EXTRACT_SUBJECT;
+                 goto error;
+@@ -568,13 +595,17 @@ static int TlsDecodeHSCertificate(SSLState *ssl_state,
+             x509 = NULL;
+ 
+             rc = TlsDecodeHSCertificateFingerprint(ssl_state, input, cert_len);
+-            if (rc != 0)
++            if (rc != 0) {
++                SCLogDebug("TlsDecodeHSCertificateFingerprint failed with %d", rc);
+                 goto error;
++            }
+         }
+ 
+         rc = TlsDecodeHSCertificateAddCertToChain(ssl_state, input, cert_len);
+-        if (rc != 0)
++        if (rc != 0) {
++            SCLogDebug("TlsDecodeHSCertificateAddCertToChain failed with %d", rc);
+             goto error;
++        }
+ 
+ next:
+         input += cert_len;
+@@ -1373,20 +1404,67 @@ end:
+     return 0;
+ }
+ 
++/** \internal
++ *  \brief Get Certificates len so we can know now much (more) we need to buffer
++ *  If we already

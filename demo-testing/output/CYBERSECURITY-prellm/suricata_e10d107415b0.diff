@@ -1,0 +1,145 @@
+@@ -28,6 +28,7 @@
+ #define COUNTERS
+ 
+ #include "suricata-common.h"
++#include "suricata-plugin.h"
+ #include "threadvars.h"
+ #include "util-debug.h"
+ #include "decode-events.h"
+@@ -479,6 +480,9 @@ typedef struct Packet_
+         WinDivertPacketVars windivert_v;
+ #endif /* WINDIVERT */
+ 
++        /* A chunk of memory that a plugin can use for its packet vars. */
++        uint8_t plugin_v[PLUGIN_VAR_SIZE];
++
+         /** libpcap vars: shared by Pcap Live mode and Pcap File mode */
+         PcapPacketVars pcap_v;
+     };
+
+
+
+
+@@ -573,7 +573,7 @@ static TmEcode UnixSocketPcapFilesCheck(void *data)
+ 
+     PreRunInit(RUNMODE_PCAP_FILE);
+     PreRunPostPrivsDropInit(RUNMODE_PCAP_FILE);
+-    RunModeDispatch(RUNMODE_PCAP_FILE, NULL);
++    RunModeDispatch(RUNMODE_PCAP_FILE, NULL, NULL, NULL);
+ 
+     /* Un-pause all the paused threads */
+     TmThreadWaitOnThreadInit();
+
+
+
+
+@@ -38,6 +38,7 @@
+ #include "runmodes.h"
+ #include "util-unittest.h"
+ #include "util-misc.h"
++#include "util-plugin.h"
+ 
+ #include "output.h"
+ 
+@@ -54,6 +55,8 @@
+ #include "flow-bypass.h"
+ #include "counters.h"
+ 
++#include "suricata-plugin.h"
++
+ int debuglog_enabled = 0;
+ int threading_set_cpu_affinity = FALSE;
+ 
+@@ -122,6 +125,8 @@ static const char *RunModeTranslateModeToName(int runmode)
+ #else
+             return "PFRING(DISABLED)";
+ #endif
++        case RUNMODE_PLUGIN:
++            return "PLUGIN";
+         case RUNMODE_NFQ:
+             return "NFQ";
+         case RUNMODE_NFLOG:
+@@ -275,7 +280,8 @@ void RunModeListRunmodes(void)
+ 
+ /**
+  */
+-void RunModeDispatch(int runmode, const char *custom_mode)
++void RunModeDispatch(int runmode, const char *custom_mode,
++    const char *capture_plugin_name, const char *capture_plugin_args)
+ {
+     char *local_custom_mode = NULL;
+ 
+@@ -301,6 +307,15 @@ void RunModeDispatch(int runmode, const char *custom_mode)
+                 custom_mode = RunModeIdsPfringGetDefaultMode();
+                 break;
+ #endif
++            case RUNMODE_PLUGIN: {
++                SCCapturePlugin *plugin = SCPluginFindCaptureByName(capture_plugin_name);
++                if (plugin == NULL) {
++                    FatalError(SC_ERR_PLUGIN, "No capture plugin found with name %s",
++                            capture_plugin_name);
++                }
++                custom_mode = (const char *)plugin->GetDefaultMode();
++                break;
++            }
+             case RUNMODE_NFQ:
+                 custom_mode = RunModeIpsNFQGetDefaultMode();
+                 break;
+
+
+
+
+@@ -40,6 +40,7 @@ enum RunModes {
+     RUNMODE_NAPATECH,
+     RUNMODE_UNIX_SOCKET,
+     RUNMODE_WINDIVERT,
++    RUNMODE_PLUGIN,
+     RUNMODE_USER_MAX, /* Last standard running mode */
+     RUNMODE_LIST_KEYWORDS,
+     RUNMODE_LIST_APP_LAYERS,
+@@ -77,7 +78,7 @@ char *RunmodeGetActive(void);
+ const char *RunModeGetMainMode(void);
+ 
+ void RunModeListRunmodes(void);
+-void RunModeDispatch(int, const char *);
++void RunModeDispatch(int, const char *, const char *capture_plugin_name, const char *capture_plugin_args);
+ void RunModeRegisterRunModes(void);
+ void RunModeRegisterNewRunMode(enum RunModes, const char *, const char *,
+                                int (*RunModeFunc)(void));
+
+
+
+
+@@ -25,6 +25,12 @@
+ 
+ #include "conf.h"
+ 
++/**
++ * The size of the data chunk inside each packet structure a plugin
++ * has for private data (Packet->plugin_v).
++ */
++#define PLUGIN_VAR_SIZE 64
++
+ /**
+  * Structure to define a Suricata plugin.
+  */
+@@ -50,4 +56,13 @@ typedef struct SCPluginFileType_ {
+ 
+ bool SCPluginRegisterFileType(SCPluginFileType *);
+ 
++typedef struct SCCapturePlugin_ {
++    char *name;
++    void (*Init)(const char *args, int plugin_slot, int receive_slot, int decode_slot);
++    const char *(*GetDefaultMode)(void);
++    TAILQ_ENTRY(SCCapturePlugin_) entries;
++} SCCapturePlugin;
++
++int SCPluginRegisterCapture(SCCapturePlugin *);
++
+ #endif /* __SURICATA_PLUGIN_H */
+
+
+
+
+@@ -1202,6 +1202,9 @@ static TmEcode ParseCommandLine(int argc, char** argv, SCInstance *suri)
+         {"no-random", 0, 

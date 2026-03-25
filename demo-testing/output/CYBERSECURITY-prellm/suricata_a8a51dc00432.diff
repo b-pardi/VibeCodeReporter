@@ -1,0 +1,135 @@
+@@ -72,6 +72,7 @@
+ #include "output-json-rfb.h"
+ #include "output-json-mqtt.h"
+ #include "output-json-ike.h"
++#include "output-json-modbus.h"
+ 
+ #include "util-byte.h"
+ #include "util-privs.h"
+@@ -547,6 +548,12 @@ static void AlertAddAppLayer(const Packet *p, JsonBuilder *jb,
+         case ALPROTO_RDP:
+             AlertJsonRDP(p->flow, tx_id, jb);
+             break;
++        case ALPROTO_MODBUS:
++            jb_get_mark(jb, &mark);
++            if (!JsonModbusAddMetadata(p->flow, tx_id, jb)) {
++                jb_restore_mark(jb, &mark);
++            }
++            break;
+         default:
+             break;
+     }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,160 @@
++/* Copyright (C) 2019-2020 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++#include "suricata-common.h"
++#include "debug.h"
++#include "detect.h"
++#include "pkt-var.h"
++#include "conf.h"
++#include "threads.h"
++#include "threadvars.h"
++#include "tm-threads.h"
++#include "util-unittest.h"
++#include "util-buffer.h"
++#include "util-debug.h"
++#include "util-byte.h"
++#include "output.h"
++#include "output-json.h"
++#include "app-layer.h"
++#include "app-layer-parser.h"
++#include "output-json-modbus.h"
++#include "rust.h"
++
++typedef struct LogModbusFileCtx_ {
++    LogFileCtx *file_ctx;
++    OutputJsonCtx *eve_ctx;
++} LogModbusFileCtx;
++
++typedef struct JsonModbusLogThread_ {
++    LogModbusFileCtx *modbuslog_ctx;
++    OutputJsonThreadCtx *ctx;
++} JsonModbusLogThread;
++
++static int JsonModbusLogger(ThreadVars *tv, void *thread_data, const Packet *p, Flow *f,
++        void *state, void *tx, uint64_t tx_id)
++{
++    JsonModbusLogThread *thread = thread_data;
++
++    JsonBuilder *js =
++            CreateEveHeader(p, LOG_DIR_FLOW, "modbus", NULL, thread->modbuslog_ctx->eve_ctx);
++    if (unlikely(js == NULL)) {
++        return TM_ECODE_OK;
++    }
++    if (!rs_modbus_to_json(tx, js)) {
++        jb_free(js);
++        return TM_ECODE_FAILED;
++    }
++    OutputJsonBuilderBuffer(js, thread->ctx);
++
++    jb_free(js);
++    return TM_ECODE_OK;
++}
++
++static void OutputModbusLogDeInitCtxSub(OutputCtx *output_ctx)
++{
++    LogModbusFileCtx *modbuslog_ctx = (LogModbusFileCtx *)output_ctx->data;
++    SCFree(modbuslog_ctx);
++    SCFree(output_ctx);
++}
++
++static OutputInitResult OutputModbusLogInitSub(ConfNode *conf, OutputCtx *parent_ctx)
++{
++    OutputInitResult result = { NULL, false };
++    OutputJsonCtx *ajt = parent_ctx->data;
++
++    LogModbusFileCtx *modbuslog_ctx = SCCalloc(1, sizeof(*modbuslog_ctx));
++    if (unlikely(modbuslog_ctx == NULL)) {
++        return result;
++    }
++    modbuslog_ctx->file_ctx = ajt->file_ctx;
++    modbuslog_ctx->eve_ctx = ajt;
++
++    OutputCtx *output_ctx = SCCalloc(1, sizeof(*output_ctx));
++    if (unlikely(output_ctx == NULL)) {
++        SCFree(modbuslog_ctx);
++        return result;
++    }
++    output_ctx->data = modbuslog_ctx;
++    output_ctx->DeInit = OutputModbusLogDeInitCtxSub;
++
++    AppLayerParserRegisterLogger(IPPROTO_TCP, ALPROTO_MODBUS);
++
++    SCLogDebug("modbus log sub-module initialized.");
++
++    result.ctx = output_ctx;
++    result.ok = true;
++    return result;
++}
++
++static TmEcode JsonModbusLogThreadInit(ThreadVars *t, const void *initdata, void **data)
++{
++    if (initdata == NULL) {
++        SCLogDebug("Error getting context for EveLogModbus. \"initdata\" is NULL.");
++        return TM_ECODE_FAILED;
++    

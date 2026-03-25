@@ -1,0 +1,144 @@
+@@ -55,7 +55,7 @@ const char* expr_name(BroExprTag t)
+ 		"inline()",
+ 		"[]=", "$=",
+ 		"vec+=",
+-		"to_any_coerce", "from_any_coerce",
++		"to_any_coerce", "from_any_coerce", "from_any_vec_coerce",
+ 		"any[]",
+ 		"nop",
+ 
+@@ -5274,17 +5274,29 @@ ExprPtr get_assign_expr(ExprPtr op1, ExprPtr op2, bool is_init)
+ 
+ ExprPtr check_and_promote_expr(Expr* const e, zeek::Type* t)
+ 	{
++	ExprPtr e_ptr{NewRef{}, e};
+ 	const auto& et = e->GetType();
+ 	TypeTag e_tag = et->Tag();
+ 	TypeTag t_tag = t->Tag();
+ 
+-	if ( t->Tag() == TYPE_ANY )
+-		return {NewRef{}, e};
++	if ( t_tag == TYPE_ANY )
++		{
++		if ( e_tag != TYPE_ANY )
++			e_ptr = make_intrusive<CoerceToAnyExpr>(e_ptr);
++
++		return e_ptr;
++		}
++
++	if ( e_tag == TYPE_ANY )
++		{
++		TypePtr t_ptr{NewRef{}, t};
++		return make_intrusive<CoerceFromAnyExpr>(e_ptr, t_ptr);
++		}
+ 
+ 	if ( EitherArithmetic(t_tag, e_tag) )
+ 		{
+ 		if ( e_tag == t_tag )
+-			return {NewRef{}, e};
++			return e_ptr;
+ 
+ 		if ( ! BothArithmetic(t_tag, e_tag) )
+ 			{
+
+
+
+
+@@ -72,7 +72,7 @@ enum BroExprTag : int {
+ 	// ASTs produced by parsing .zeek script files.
+ 	EXPR_INDEX_ASSIGN, EXPR_FIELD_LHS_ASSIGN,
+ 	EXPR_APPEND_TO,
+-	EXPR_TO_ANY_COERCE, EXPR_FROM_ANY_COERCE,
++	EXPR_TO_ANY_COERCE, EXPR_FROM_ANY_COERCE, EXPR_FROM_ANY_VEC_COERCE,
+ 	EXPR_ANY_INDEX,
+ 
+ 	EXPR_NOP,
+@@ -1622,6 +1622,20 @@ protected:
+ 	ExprPtr Duplicate() override;
+ };
+ 
++// ... and for conversion from a "vector of any" type.
++class CoerceFromAnyVecExpr : public UnaryExpr {
++public:
++	// to_type is yield type, not VectorType.
++	CoerceFromAnyVecExpr(ExprPtr op, TypePtr to_type);
++
++	// Can't use UnaryExpr's Eval() because it will do folding
++	// over the individual vector elements.
++	ValPtr Eval(Frame* f) const override;
++
++protected:
++	ExprPtr Duplicate() override;
++};
++
+ // Expression used to explicitly capture [a, b, c, ...] = x assignments.
+ class AnyIndexExpr : public UnaryExpr {
+ public:
+
+
+
+
+@@ -1568,15 +1568,20 @@ bool AssignExpr::IsReduced(Reducer* c) const
+ 		// Cascaded assignments are never reduced.
+ 		return false;
+ 
+-	auto lhs_is_any = op1->GetType()->Tag() == TYPE_ANY;
+-	auto rhs_is_any = op2->GetType()->Tag() == TYPE_ANY;
++	const auto& t1 = op1->GetType();
++	const auto& t2 = op2->GetType();
++
++	auto lhs_is_any = t1->Tag() == TYPE_ANY;
++	auto rhs_is_any = t2->Tag() == TYPE_ANY;
+ 
+ 	if ( lhs_is_any != rhs_is_any && op2->Tag() != EXPR_CONST )
+ 		return NonReduced(this);
+ 
+-	auto t1 = op1->Tag();
++	if ( t1->Tag() == TYPE_VECTOR && t1->Yield()->Tag() != TYPE_ANY &&
++	     t2->Yield() && t2->Yield()->Tag() == TYPE_ANY )
++		return NonReduced(this);
+ 
+-	if ( t1 == EXPR_REF &&
++	if ( op1->Tag() == EXPR_REF &&
+ 	     op2->HasConstantOps() && op2->Tag() != EXPR_TO_ANY_COERCE )
+ 		// We are not reduced because we should instead
+ 		// be folded.
+@@ -1618,8 +1623,11 @@ ExprPtr AssignExpr::Reduce(Reducer* c, StmtPtr& red_stmt)
+ 		// These are generated for reduced expressions.
+ 		return ThisPtr();
+ 
+-	auto lhs_is_any = op1->GetType()->Tag() == TYPE_ANY;
+-	auto rhs_is_any = op2->GetType()->Tag() == TYPE_ANY;
++	auto& t1 = op1->GetType();
++	auto& t2 = op2->GetType();
++
++	auto lhs_is_any = t1->Tag() == TYPE_ANY;
++	auto rhs_is_any = t2->Tag() == TYPE_ANY;
+ 
+ 	StmtPtr rhs_reduce;
+ 
+@@ -1637,12 +1645,20 @@ ExprPtr AssignExpr::Reduce(Reducer* c, StmtPtr& red_stmt)
+ 				op2 = make_intrusive<CoerceToAnyExpr>(red_rhs);
+ 			}
+ 		else
+-			op2 = make_intrusive<CoerceFromAnyExpr>(red_rhs,
+-								op1->GetType());
++			op2 = make_intrusive<CoerceFromAnyExpr>(red_rhs, t1);
+ 
+ 		op2->SetLocationInfo(op2_loc);
+ 		}
+ 
++	if ( t1->Tag() == TYPE_VECTOR && t1->Yield()->Tag() != TYPE_ANY &&
++	     t2->Yield() && t2->Yield()->Tag() == TYPE_ANY )
++		{
++		auto op2_loc = op2->GetLocationInfo();
++		ExprPtr red_rhs = op2->ReduceToSingleton(c, rhs_reduce);
++		op2 = make_intrusive<CoerceFromAnyVecExpr>(red_rhs, t1);
++		op2->SetLocationInfo(op2_loc);
++		}
++
+ 	auto lhs_ref = op1->AsRefExprPtr();
+ 	auto lhs_expr = lhs_ref->GetOp1();
+ 
+@@ -2881,7 +2897,7 @@ ExprPtr CoerceToAnyExpr::Duplicate()
+ C

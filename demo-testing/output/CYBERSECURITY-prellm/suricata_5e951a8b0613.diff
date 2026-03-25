@@ -1,0 +1,103 @@
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2007-2010 Open Information Security Foundation
++/* Copyright (C) 2007-2018 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -152,80 +152,77 @@ static uint8_t *GetBufferForTX(htp_tx_t *tx, uint64_t tx_id,
+     return buf->buffer;
+ }
+ 
+-/** \brief HTTP Headers Mpm prefilter callback
+- *
+- *  \param det_ctx detection engine thread ctx
+- *  \param p packet to inspect
+- *  \param f flow to inspect
+- *  \param txv tx to inspect
+- *  \param pectx inspection context
++/** \internal
++ *  \brief custom inspect function to utilize the cached headers
+  */
+-static void PrefilterTxHttpRequestHeaders(DetectEngineThreadCtx *det_ctx,
+-        const void *pectx,
+-        Packet *p, Flow *f, void *txv,
+-        const uint64_t idx, const uint8_t flags)
++static int DetectEngineInspectBufferHttpHeader(
++        DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx,
++        const DetectEngineAppInspectionEngine *engine,
++        const Signature *s,
++        Flow *f, uint8_t flags, void *alstate, void *txv, uint64_t tx_id)
+ {
+     SCEnter();
+ 
+-    const MpmCtx *mpm_ctx = (MpmCtx *)pectx;
+-    htp_tx_t *tx = (htp_tx_t *)txv;
+-
+-    if (tx->request_headers == NULL)
+-        return;
++    const int list_id = engine->sm_list;
++    InspectionBuffer *buffer = InspectionBufferGet(det_ctx, list_id);
++    if (buffer->inspect == NULL) {
++        SCLogDebug("setting up inspect buffer %d", list_id);
+ 
+-    uint32_t buffer_len = 0;
+-    const uint8_t *buffer = GetBufferForTX(tx, idx,
+-            det_ctx, f, flags, &buffer_len);
++        /* if prefilter didn't already run, we need to consider transformations */
++        const DetectEngineTransforms *transforms = NULL;
++        if (!engine->mpm) {
++            transforms = engine->v2.transforms;
++        }
+ 
+-    if (buffer_len >= mpm_ctx->minlen) {
+-        (void)mpm_table[mpm_ctx->mpm_type].Search(mpm_ctx,
+-                &det_ctx->mtcu, &det_ctx->pmq, buffer, buffer_len);
++        uint32_t rawdata_len = 0;
++        uint8_t *rawdata = GetBufferForTX(txv, tx_id, det_ctx,
++                f, flags, &rawdata_len);
++        if (rawdata_len == 0) {
++            SCLogDebug("no data");
++            goto end;
++        }
++        /* setup buffer and apply transforms */
++        InspectionBufferSetup(buffer, rawdata, rawdata_len);
++        InspectionBufferApplyTransforms(buffer, transforms);
+     }
+-}
+-
+-static void PrefilterTxHttpRequestTrailers(DetectEngineThreadCtx *det_ctx,
+-        const void *pectx,
+-        Packet *p, Flow *f, void *txv,
+-        const uint64_t idx, const uint8_t flags)
+-{
+-    SCEnter();
+ 
+-    const MpmCtx *mpm_ctx = (MpmCtx *)pectx;
+-    htp_tx_t *tx = (htp_tx_t *)txv;
+-
+-    if (tx->request_headers == NULL)
+-        return;
+-    const HtpTxUserData *htud = (const HtpTxUserData *)htp_tx_get_user_data(tx);
+-    /* if the request wasn't flagged as having a trailer, we skip */
+-    if (htud && !htud->request_has_trailers)
+-        return;
++    const uint32_t data_len = buffer->inspect_len;
++    const uint8_t *data = buffer->inspect;
++    const uint64_t offset = buffer->inspect_offset;
+ 
+-    uint32_t buffer_len = 0;
+-    const uint8_t *buffer = GetBufferForTX(tx, idx,
+-            det_ctx, f, flags, &buffer_len);
++    det_ctx->discontinue_matching = 0;
++    det_ctx->buffer_offset = 0;
++    det_ctx->inspection_recursion_counter = 0;
+ 
+-    if (buffer_len >= mpm_ctx->minlen) {
+-        (void)mpm_table[mpm_ctx->mpm_type].Search(mpm_ctx,
+-                &det_ctx->mtcu, &det_ctx->pmq, buffer, buffer_len);
++    /* Inspect all the uricontents fetched on each
++     * transaction at the app layer */
++    int r = DetectEngineContentInspection(de_ctx, det_ctx,
++                                          s, engine->smd,
++                                          f,
++                                          (uint8_t *)data, data_len, offs

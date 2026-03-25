@@ -1,0 +1,114 @@
+@@ -121,8 +121,7 @@ typedef void (*uc_invalidate_tb_t)(struct uc_struct *uc, uint64_t start,
+                                    size_t len);
+ 
+ // Request generating TB at given address
+-typedef struct TranslationBlock *(*uc_gen_tb_t)(struct uc_struct *uc,
+-                                                uint64_t pc);
++typedef uc_err (*uc_gen_tb_t)(struct uc_struct *uc, uint64_t pc, uc_tb *out_tb);
+ 
+ struct hook {
+     int type;       // UC_HOOK_*
+
+
+
+
+@@ -391,6 +391,13 @@ typedef enum uc_query_type {
+                       // result = True)
+ } uc_query_type;
+ 
++// Represent a TranslationBlock.
++typedef struct uc_tb {
++    uint64_t pc;
++    uint16_t icount;
++    uint16_t size;
++} uc_tb;
++
+ // The implementation of uc_ctl is like what Linux ioctl does but slightly
+ // different.
+ //
+@@ -461,7 +468,7 @@ typedef enum uc_control_type {
+     // Read:  @args = (int)
+     UC_CTL_CPU_MODEL,
+     // Request a tb cache at a specific address
+-    // Read: @args = (uint64_t)
++    // Read: @args = (uint64_t, uc_tb*)
+     UC_CTL_TB_REQUEST_CACHE,
+     // Invalidate a tb cache at a specific address
+     // Read: @args = (uint64_t)
+@@ -493,8 +500,8 @@ typedef enum uc_control_type {
+     uc_ctl(uc, UC_CTL_WRITE(UC_CTL_CPU_MODEL, 1), (model))
+ #define uc_ctl_remove_cache(uc, address)                                       \
+     uc_ctl(uc, UC_CTL_READ(UC_CTL_TB_REMOVE_CACHE, 1), (address))
+-#define uc_ctl_request_cache(uc, address)                                      \
+-    uc_ctl(uc, UC_CTL_READ(UC_CTL_TB_REQUEST_CACHE, 1), (address))
++#define uc_ctl_request_cache(uc, address, tb)                                  \
++    uc_ctl(uc, UC_CTL_READ_WRITE(UC_CTL_TB_REQUEST_CACHE, 2), (address), (tb))
+ 
+ // Opaque storage for CPU context, used with uc_context_*()
+ struct uc_context;
+
+
+
+
+@@ -999,7 +999,7 @@ static void uc_invalidate_tb(struct uc_struct *uc, uint64_t start_addr, size_t l
+     tb_invalidate_phys_range(uc, start, end);
+ }
+ 
+-static TranslationBlock* uc_gen_tb(struct uc_struct *uc, uint64_t addr) 
++static uc_err uc_gen_tb(struct uc_struct *uc, uint64_t addr, uc_tb *out_tb) 
+ {
+     TranslationBlock *tb;
+     target_ulong cs_base, pc;
+@@ -1024,31 +1024,37 @@ static TranslationBlock* uc_gen_tb(struct uc_struct *uc, uint64_t addr)
+     cflags &= ~CF_CLUSTER_MASK;
+     cflags |= cpu->cluster_index << CF_CLUSTER_SHIFT;
+ 
+-    if (likely(tb &&
+-               tb->pc == pc &&
+-               tb->cs_base == cs_base &&
+-               tb->flags == flags &&
+-               tb->trace_vcpu_dstate == *cpu->trace_dstate &&
+-               (tb_cflags(tb) & (CF_HASH_MASK | CF_INVALID)) == cflags)) {
+-        return tb;
+-    }
++    if (unlikely(!(tb &&
++                   tb->pc == pc &&
++                   tb->cs_base == cs_base &&
++                   tb->flags == flags &&
++                   tb->trace_vcpu_dstate == *cpu->trace_dstate &&
++                   (tb_cflags(tb) & (CF_HASH_MASK | CF_INVALID)) == cflags))) {
+ 
+-    tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
+-    cpu->tb_jmp_cache[hash] = tb;
++        tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
++        cpu->tb_jmp_cache[hash] = tb;
+ 
+-    if (tb != NULL) {
+-        return tb;
++        if (tb == NULL) {
++            mmap_lock();
++            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
++            mmap_unlock();
++            /* We add the TB in the virtual pc hash table for the fast lookup */
++            cpu->tb_jmp_cache[hash] = tb;
++        }
+     }
+ 
++    // If we still couldn't generate a TB, it must be out of memory.
+     if (tb == NULL) {
+-        mmap_lock();
+-        tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+-        mmap_unlock();
+-        /* We add the TB in the virtual pc hash table for the fast lookup */
+-        cpu->tb_jmp_cache[hash] = tb;
++        return UC_ERR_NOMEM;
+     }
+ 
+-    return tb;
++    if (out_tb != NULL) {
++        out_tb->pc = tb->pc;
++        out_tb->size = tb->size;
++        out_tb->icount = tb->icount;
++    }
++
++    retur
