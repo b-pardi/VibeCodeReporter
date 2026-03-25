@@ -4,6 +4,7 @@ Shared utilities.
 Labels follow HumanVsAICode convention: 0=AI, 1=human.
 """
 
+import json
 import random
 from pathlib import Path
 
@@ -39,7 +40,8 @@ class CodeDataset(Dataset):
         self.labels = []
 
         directory = Path(directory)
-        all_files = list(directory.glob("*.py"))
+        all_files = [f for f in directory.iterdir()
+                     if f.is_file() and not f.name.startswith('.')]
         for fp in all_files:
             label = int(fp.name.split('_')[0])
             self.file_paths.append(fp)
@@ -86,47 +88,102 @@ class CodeDataset(Dataset):
 class ParquetDataset(Dataset):
     """Dataset backed by a parquet file with 'text' and 'label' columns.
 
+    Tokenizes the entire dataset upfront in batches so __getitem__ is a
+    zero-cost numpy slice — no per-step CPU tokenization blocking the GPU.
+
     Labels follow HumanVsAICode convention: 0=AI, 1=human.
     """
 
     def __init__(self, parquet_path, tokenizer, max_length=512,
-                 max_samples=None, seed=42):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
+                 max_samples=None, seed=42, tokenize_batch=4096):
         df = pd.read_parquet(parquet_path)
-        self.texts = df['text'].tolist()
-        self.labels = df['label'].tolist()
+        texts = df['text'].tolist()
+        labels = df['label'].tolist()
 
-        print(f"Loaded {len(self.texts)} samples from {parquet_path}")
+        print(f"Loaded {len(texts)} samples from {parquet_path}")
 
-        if max_samples and max_samples < len(self.texts):
+        if max_samples and max_samples < len(texts):
             random.seed(seed)
-            indices = list(range(len(self.texts)))
+            indices = list(range(len(texts)))
             random.shuffle(indices)
             indices = indices[:max_samples]
-            self.texts = [self.texts[i] for i in indices]
-            self.labels = [self.labels[i] for i in indices]
-            print(f"Subsampled to {len(self.texts)} samples")
+            texts = [texts[i] for i in indices]
+            labels = [labels[i] for i in indices]
+            print(f"Subsampled to {len(texts)} samples")
 
         label_counts = {}
-        for label in self.labels:
+        for label in labels:
             label_counts[label] = label_counts.get(label, 0) + 1
         print(f"Label distribution: {label_counts}")
 
+        # Pre-tokenize in batches — eliminates per-step CPU tokenization
+        n = len(texts)
+        self.input_ids = np.zeros((n, max_length), dtype=np.int32)
+        self.attention_masks = np.zeros((n, max_length), dtype=np.int32)
+        self.labels = labels
+
+        for i in tqdm(range(0, n, tokenize_batch),
+                      desc="Tokenizing", unit="batch"):
+            batch = texts[i: i + tokenize_batch]
+            enc = tokenizer(batch, padding='max_length', max_length=max_length,
+                            truncation=True)
+            end = min(i + tokenize_batch, n)
+            self.input_ids[i:end] = enc['input_ids']
+            self.attention_masks[i:end] = enc['attention_mask']
+
     def __len__(self):
-        return len(self.texts)
+        return len(self.labels)
 
     def __getitem__(self, index):
-        inputs = self.tokenizer(
-            self.texts[index], padding='max_length', max_length=self.max_length,
-            truncation=True, return_tensors=None,
-        )
         return {
-            'input_ids': torch.tensor(inputs['input_ids'], dtype=torch.long),
-            'attention_mask': torch.tensor(inputs['attention_mask'], dtype=torch.long),
+            'input_ids': torch.tensor(self.input_ids[index], dtype=torch.long),
+            'attention_mask': torch.tensor(self.attention_masks[index], dtype=torch.long),
             'labels': torch.tensor(self.labels[index], dtype=torch.long),
         }
+
+
+# ---------------------------------------------------------------------------
+# Training arg persistence (resume consistency)
+# ---------------------------------------------------------------------------
+
+# Keys that directly affect model training dynamics — warn if they change on resume
+_CRITICAL_TRAIN_KEYS = ['batch_size', 'learning_rate', 'max_length', 'epochs']
+
+
+def save_train_args(output_dir: str, args) -> None:
+    """Persist training args to <output_dir>/train_args.json on first run."""
+    path = Path(output_dir) / 'train_args.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(vars(args), indent=2))
+
+
+def check_resume_args(output_dir: str, args) -> None:
+    """Warn if current args differ from the saved args on a resumed run.
+
+    Tokenization args (max_length) and training dynamics (batch_size,
+    learning_rate, epochs) are critical — changing them mid-run produces
+    inconsistent results because the checkpoint's optimizer/scheduler state
+    was computed under the original settings, and tokens are re-computed
+    fresh each run so max_length changes DO affect what the model sees.
+    """
+    path = Path(output_dir) / 'train_args.json'
+    if not path.exists():
+        print(f"Warning: no train_args.json in {output_dir} — cannot verify arg consistency.")
+        return
+    saved = json.loads(path.read_text())
+    mismatches = [
+        (k, saved[k], getattr(args, k, None))
+        for k in _CRITICAL_TRAIN_KEYS
+        if k in saved and getattr(args, k, None) != saved[k]
+    ]
+    if mismatches:
+        print("\n" + "="*60)
+        print("WARNING: args differ from the original run:")
+        for key, orig, curr in mismatches:
+            print(f"  --{key.replace('_', '-')}: original={orig}  current={curr}")
+        print("Resuming with mismatched critical args may produce inconsistent results.")
+        print(f"Original args: {path}")
+        print("="*60 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +248,13 @@ def load_model(model_dir, tokenizer_fallback=None):
     print(f"Loading model from {model_dir} ...")
     if tokenizer_fallback:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+            tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
         except (OSError, ValueError):
             print(f"  Tokenizer not in checkpoint, falling back to {tokenizer_fallback}")
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_fallback)
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_fallback, trust_remote_code=True)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-    model = AutoModelForSequenceClassification.from_pretrained(str(model_dir))
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    model = AutoModelForSequenceClassification.from_pretrained(str(model_dir), trust_remote_code=True)
     model.to(device)
     return model, tokenizer, device
 
@@ -237,7 +294,7 @@ def cmd_eval_test(args, max_length=512, batch_size=16, tokenizer_fallback=None):
     model, tokenizer, device = load_model(args.model_dir, tokenizer_fallback)
 
     test_path = Path(args.data_dir) / 'CONF' / 'testing_data'
-    files = list(test_path.glob('*.py'))
+    files = [f for f in test_path.iterdir() if f.is_file() and not f.name.startswith('.')]
     if args.max_samples and args.max_samples < len(files):
         random.seed(args.seed)
         files = random.sample(files, args.max_samples)
@@ -246,6 +303,11 @@ def cmd_eval_test(args, max_length=512, batch_size=16, tokenizer_fallback=None):
         codes.append(fp.read_text(encoding='utf-8', errors='ignore'))
         labels.append(int(fp.name.split('_')[0]))
     print(f"HumanVsAICode test: {len(codes)} samples")
+
+    if not codes:
+        print(f"  No files found in {test_path} — skipping eval.")
+        print(f"  Download the dataset first (see pipeline.md Phase 5).")
+        return
 
     print(f"\n{'='*60}")
     print("HumanVsAICode Test Evaluation")

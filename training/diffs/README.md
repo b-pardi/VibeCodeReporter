@@ -5,7 +5,6 @@ training a binary classifier. End-to-end pipeline from raw GitHub data to
 train/test parquet files.
 
 ## Full Replication
-
 ```bash
 # 1. Mine AI commits from GH Archive (Sept 2025, last month with data)
 python collect.py mine --date 2025-09-01 --hours 720

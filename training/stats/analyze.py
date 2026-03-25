@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     cohen_kappa_score, classification_report,
@@ -137,7 +138,7 @@ def compute_all_metrics(y_true, y_pred, n_bootstrap=10000, seed=42):
     def rec_ai(yt, yp):     return recall_score(yt, yp, pos_label=0, average='binary', zero_division=0)
     def rec_human(yt, yp):  return recall_score(yt, yp, pos_label=1, average='binary', zero_division=0)
 
-    for name, fn in [
+    for name, fn in tqdm([
         ('accuracy',      acc_fn),
         ('f1_macro',      f1_mac),
         ('f1_ai',         f1_ai),
@@ -146,7 +147,7 @@ def compute_all_metrics(y_true, y_pred, n_bootstrap=10000, seed=42):
         ('precision_human', prec_human),
         ('recall_ai',     rec_ai),
         ('recall_human',  rec_human),
-    ]:
+    ], desc="Bootstrapping metrics", leave=False):
         pt, lo, hi = bootstrap_ci(y_true, y_pred, fn,
                                   n_bootstrap=n_bootstrap, seed=seed)
         metrics[name] = {'point': pt, 'lo': lo, 'hi': hi}
@@ -174,17 +175,29 @@ def fmt_h(h):
 # ---------------------------------------------------------------------------
 
 def load_predictions(path):
-    """Load predictions CSV (sha, repo, date, label, pred)."""
+    """Load predictions CSV (sha, repo, date, label, pred).
+
+    Deduplicates by SHA, keeping the first occurrence per SHA.
+    Duplicate SHAs arise when the same commit exists in multiple cloned repos
+    (fork scenario). Deduplication ensures McNemar's test sees each commit once,
+    preserving the independence assumption.
+    """
     df = pd.read_csv(path)
     required = {'sha', 'label', 'pred'}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns in {path}: {missing}")
+    n_before = len(df)
+    df = df.drop_duplicates(subset='sha', keep='first').reset_index(drop=True)
+    n_dropped = n_before - len(df)
+    if n_dropped:
+        print(f"  Deduplicated {path}: {n_before} → {len(df)} rows "
+              f"({n_dropped} duplicate SHAs removed)", file=sys.stderr)
     return df
 
 
 def align_predictions(*dfs):
-    """Merge multiple prediction DataFrames on 'sha'. Assert no duplicates."""
+    """Inner-join multiple prediction DataFrames on 'sha'."""
     base = dfs[0][['sha', 'label']].copy()
     for i, df in enumerate(dfs):
         base = base.merge(
@@ -226,7 +239,7 @@ def run_analysis(models, out_dir, n_bootstrap=10000, seed=42):
     print(f"Computing metrics (n_bootstrap={n_bootstrap}) ...", file=sys.stderr)
     all_metrics = {}
     all_preds = {}
-    for i, name in enumerate(names):
+    for i, name in enumerate(tqdm(names, desc="Models")):
         y_pred = aligned[f'pred_{i}'].tolist()
         all_preds[name] = y_pred
         print(f"  {name} ...", file=sys.stderr)

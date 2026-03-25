@@ -24,6 +24,7 @@ from transformers import (
 from common import (
     CodeDataset, ParquetDataset, compute_metrics, print_eval_report,
     cmd_eval_test, cmd_eval_diffs, cmd_eval_daniotti, save_predictions,
+    save_train_args, check_resume_args,
 )
 
 
@@ -32,7 +33,11 @@ def cmd_train(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cuda = device.type == 'cuda'
     print(f"Using device: {device}")
 
     model_dir = Path(args.output_dir) / 'final_model'
@@ -44,15 +49,21 @@ def cmd_train(args):
         "microsoft/codebert-base", num_labels=2)
     model.to(device)
 
+    print(f"\nMax token length: {args.max_length}")
+
     if use_parquet:
         print("\nLoading training data (parquet)...")
         train_dataset = ParquetDataset(
-            args.train_parquet, tokenizer, max_length=512,
+            args.train_parquet, tokenizer, max_length=args.max_length,
             max_samples=args.max_samples, seed=args.seed)
 
         test_parquet = args.test_parquet
         if not test_parquet:
-            test_parquet = str(Path(args.train_parquet).parent / 'test.parquet')
+            # Mirror the train parquet name: train_code.parquet → test_code.parquet,
+            # train.parquet → test.parquet
+            train_name = Path(args.train_parquet).name
+            test_name = train_name.replace('train', 'test', 1)
+            test_parquet = str(Path(args.train_parquet).parent / test_name)
 
         test_max = None
         if args.max_samples:
@@ -60,7 +71,7 @@ def cmd_train(args):
 
         print("\nLoading validation data (parquet)...")
         val_dataset = ParquetDataset(
-            test_parquet, tokenizer, max_length=512,
+            test_parquet, tokenizer, max_length=args.max_length,
             max_samples=test_max, seed=args.seed)
     else:
         data_path = Path(args.data_dir)
@@ -72,7 +83,7 @@ def cmd_train(args):
 
         print("\nLoading training data...")
         train_dataset = CodeDataset(
-            train_path, tokenizer, max_length=512,
+            train_path, tokenizer, max_length=args.max_length,
             max_samples=args.max_samples, seed=args.seed)
 
         test_max = None
@@ -81,27 +92,33 @@ def cmd_train(args):
 
         print("\nLoading validation data...")
         val_dataset = CodeDataset(
-            test_path, tokenizer, max_length=512,
+            test_path, tokenizer, max_length=args.max_length,
             max_samples=test_max, seed=args.seed)
+
+    grad_accum = max(1, 16 // args.batch_size)
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        warmup_steps=100,
+        gradient_accumulation_steps=grad_accum,
+        warmup_ratio=0.1,
         weight_decay=0.01,
         logging_dir=f'{args.output_dir}/logs',
         logging_steps=50,
         eval_strategy='epoch',
-        save_strategy='epoch',
-        load_best_model_at_end=True,
-        metric_for_best_model='accuracy',
+        save_strategy='steps',
+        save_steps=args.save_steps,
+        load_best_model_at_end=False,
         optim='adamw_torch',
         learning_rate=args.learning_rate,
-        save_total_limit=2,
+        gradient_checkpointing=args.gradient_checkpointing,
+        save_total_limit=3,
         report_to='none',
-        fp16=torch.cuda.is_available(),
+        bf16=args.bf16 and cuda,
+        fp16=(not args.bf16) and cuda,
+        torch_compile=args.torch_compile,
     )
 
     trainer = Trainer(
@@ -112,17 +129,28 @@ def cmd_train(args):
         compute_metrics=compute_metrics,
     )
 
+    if args.resume:
+        check_resume_args(args.output_dir, args)
+    else:
+        save_train_args(args.output_dir, args)
+
     print(f"\n{'='*50}")
     print(f"Starting training:")
     print(f"  Model: microsoft/codebert-base")
     print(f"  Training samples: {len(train_dataset)}")
     print(f"  Validation samples: {len(val_dataset)}")
     print(f"  Epochs: {args.epochs}")
-    print(f"  Batch size: {args.batch_size}")
+    print(f"  Batch size: {args.batch_size} (effective: {args.batch_size * grad_accum})")
+    print(f"  Gradient accumulation: {grad_accum}")
     print(f"  Learning rate: {args.learning_rate}")
     print(f"{'='*50}\n")
 
-    trainer.train()
+    try:
+        trainer.train(resume_from_checkpoint=args.resume or None)
+    except KeyboardInterrupt:
+        print(f"\nTraining interrupted. Latest checkpoint in: {args.output_dir}")
+        print(f"Resume with the same command plus --resume")
+        return
 
     # Final validation
     print("\n" + "="*50)
@@ -150,7 +178,7 @@ def main():
 
     # -- train --
     p_train = sub.add_parser('train', help='Train a new model')
-    p_train.add_argument('--data-dir', default='data/humanvsaicode_python',
+    p_train.add_argument('--data-dir', default='data/humanvsaicode_java',
                          help='Path to dataset directory (containing CONF/)')
     p_train.add_argument('--train-parquet', default=None,
                          help='Train parquet file (overrides --data-dir)')
@@ -163,8 +191,20 @@ def main():
     p_train.add_argument('--epochs', type=int, default=3,
                          help='Number of training epochs')
     p_train.add_argument('--batch-size', type=int, default=16, help='Batch size')
+    p_train.add_argument('--max-length', type=int, default=512,
+                         help='Max token length (CodeBERT supports up to 512)')
     p_train.add_argument('--learning-rate', type=float, default=5e-5,
                          help='Learning rate')
+    p_train.add_argument('--gradient-checkpointing', action='store_true',
+                         help='Enable gradient checkpointing to save VRAM at cost of ~20%% slower training')
+    p_train.add_argument('--bf16', action='store_true',
+                         help='Use bf16 instead of fp16 (recommended on Ampere+ GPUs, e.g. 3080 Ti)')
+    p_train.add_argument('--torch-compile', action='store_true',
+                         help='Enable torch.compile for kernel fusion (15-30%% speedup, slower first few steps)')
+    p_train.add_argument('--save-steps', type=int, default=500,
+                         help='Save a checkpoint every N steps (default: 500)')
+    p_train.add_argument('--resume', action='store_true',
+                         help='Resume from the latest checkpoint in --output-dir')
     p_train.add_argument('--seed', type=int, default=42, help='Random seed')
 
     # -- eval-test --
@@ -172,7 +212,7 @@ def main():
                           help='Evaluate on HumanVsAICode test split')
     p_et.add_argument('--model-dir', default='gptsniffer_output/final_model',
                       help='Path to saved model directory')
-    p_et.add_argument('--data-dir', default='data/humanvsaicode_python',
+    p_et.add_argument('--data-dir', default='data/humanvsaicode_java',
                       help='Path to dataset directory')
     p_et.add_argument('--max-samples', type=int, default=None,
                       help='Max test samples (default: all)')

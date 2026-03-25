@@ -27,6 +27,7 @@ from transformers import (
 from common import (
     CodeDataset, ParquetDataset, compute_metrics, print_eval_report,
     cmd_eval_test, cmd_eval_diffs, cmd_eval_daniotti, save_predictions,
+    save_train_args, check_resume_args,
 )
 
 
@@ -37,6 +38,11 @@ def cmd_train(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # Set TF32 via the new API before anything else touches it.
+    # torch.compile (inductor) conflicts if the legacy and new APIs are mixed.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -106,14 +112,17 @@ def cmd_train(args):
         logging_dir=f'{args.output_dir}/logs',
         logging_steps=50,
         eval_strategy='epoch',
-        save_strategy='epoch',
-        load_best_model_at_end=True,
-        metric_for_best_model='f1',
+        save_strategy='steps',
+        save_steps=args.save_steps,
+        load_best_model_at_end=False,
         optim='adamw_torch',
         learning_rate=args.learning_rate,
-        save_total_limit=2,
+        gradient_checkpointing=args.gradient_checkpointing,
+        save_total_limit=3,
         report_to='none',
-        fp16=torch.cuda.is_available(),
+        bf16=args.bf16 and torch.cuda.is_available(),
+        fp16=(not args.bf16) and torch.cuda.is_available(),
+        torch_compile=args.torch_compile,
     )
 
     trainer = Trainer(
@@ -123,6 +132,11 @@ def cmd_train(args):
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
     )
+
+    if args.resume:
+        check_resume_args(args.output_dir, args)
+    else:
+        save_train_args(args.output_dir, args)
 
     print(f"\n{'='*50}")
     print(f"Starting training:")
@@ -136,7 +150,12 @@ def cmd_train(args):
     print(f"  Learning rate: {args.learning_rate}")
     print(f"{'='*50}\n")
 
-    trainer.train()
+    try:
+        trainer.train(resume_from_checkpoint=args.resume or None)
+    except KeyboardInterrupt:
+        print(f"\nTraining interrupted. Latest checkpoint in: {args.output_dir}")
+        print(f"Resume with the same command plus --resume")
+        return
 
     # Final validation
     print("\n" + "="*50)
@@ -164,7 +183,7 @@ def main():
 
     # -- train --
     p_train = sub.add_parser('train', help='Train a new model')
-    p_train.add_argument('--data-dir', default='data/humanvsaicode_python',
+    p_train.add_argument('--data-dir', default='data/humanvsaicode_java',
                          help='Path to dataset directory (containing CONF/)')
     p_train.add_argument('--train-parquet', default=None,
                          help='Train parquet file (overrides --data-dir)')
@@ -181,6 +200,16 @@ def main():
                          help='Max token length (up to 8192)')
     p_train.add_argument('--learning-rate', type=float, default=2e-5,
                          help='Learning rate')
+    p_train.add_argument('--gradient-checkpointing', action='store_true',
+                         help='Enable gradient checkpointing to save VRAM at cost of ~20%% slower training')
+    p_train.add_argument('--bf16', action='store_true',
+                         help='Use bf16 instead of fp16 (recommended on Ampere+ GPUs, e.g. 3080 Ti)')
+    p_train.add_argument('--torch-compile', action='store_true',
+                         help='Enable torch.compile for kernel fusion (15-30%% speedup, slower first few steps)')
+    p_train.add_argument('--save-steps', type=int, default=500,
+                         help='Save a checkpoint every N steps (default: 500)')
+    p_train.add_argument('--resume', action='store_true',
+                         help='Resume from the latest checkpoint in --output-dir')
     p_train.add_argument('--seed', type=int, default=42, help='Random seed')
 
     # -- eval-test --
@@ -188,7 +217,7 @@ def main():
                           help='Evaluate on HumanVsAICode test split')
     p_et.add_argument('--model-dir', default='modernbert_output/final_model',
                       help='Path to saved model directory')
-    p_et.add_argument('--data-dir', default='data/humanvsaicode_python',
+    p_et.add_argument('--data-dir', default='data/humanvsaicode_java',
                       help='Path to dataset directory')
     p_et.add_argument('--max-length', type=int, default=1024,
                       help='Max token length (up to 8192)')
