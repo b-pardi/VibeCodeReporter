@@ -1,0 +1,77 @@
+@@ -394,10 +394,12 @@ public class NetworkAccess {
+                                                                        ProgressConsumer<Long> monitor,
+                                                                        double spaceIncreaseFactor) {
+         List<CompletableFuture<Optional<FragmentWithHash>>> futures = hashes.stream().parallel()
+-                .map(h -> ((h instanceof Cid) && ((Cid) h).codec == Cid.Codec.Raw ?
+-                        dhtClient.getRaw(h) :
+-                        dhtClient.get(h)
+-                                .thenApply(cborOpt -> cborOpt.map(cbor -> ((CborObject.CborByteArray) cbor).value))) // for backwards compatibility
++                .map(h -> (h.isIdentity() ?
++                        CompletableFuture.completedFuture(Optional.of(h.getHash())) :
++                        (h instanceof Cid) && ((Cid) h).codec == Cid.Codec.Raw ?
++                                dhtClient.getRaw(h) :
++                                dhtClient.get(h)
++                                        .thenApply(cborOpt -> cborOpt.map(cbor -> ((CborObject.CborByteArray) cbor).value))) // for backwards compatibility
+                         .thenApply(dataOpt -> {
+                             Optional<byte[]> bytes = dataOpt;
+                             bytes.ifPresent(arr -> monitor.accept((long)(arr.length / spaceIncreaseFactor)));
+
+
+
+
+@@ -66,12 +66,12 @@ public class FragmentedPaddedCipherText implements Cborable {
+             throw new IllegalStateException("Invalid padding block size: " + paddingBlockSize);
+         byte[] nonce = from.createNonce();
+         byte[] cipherText = from.encrypt(pad(secret.serialize(), paddingBlockSize), nonce);
+-        // disabled until we fix large identity multihashes (toBytes())
+-//        if (cipherText.length <= 4096 + TweetNaCl.SECRETBOX_OVERHEAD_BYTES) {
+-//            // use inline identity hash for small amount of data (small files or directories)
+-//            FragmentWithHash frag = new FragmentWithHash(new Fragment(cipherText), hasher.identityHash(cipherText, true));
+-//            return new Pair<>(new FragmentedPaddedCipherText(nonce, Collections.singletonList(frag.hash)), Collections.singletonList(frag));
+-//        }
++
++        if (cipherText.length <= 4096 + TweetNaCl.SECRETBOX_OVERHEAD_BYTES) {
++            // use inline identity hash for small amount of data (small files or directories)
++            FragmentWithHash frag = new FragmentWithHash(new Fragment(cipherText), hasher.identityHash(cipherText, true));
++            return new Pair<>(new FragmentedPaddedCipherText(nonce, Collections.singletonList(frag.hash)), Collections.singletonList(frag));
++        }
+ 
+         byte[][] split = split(cipherText, maxFragmentSize);
+ 
+
+
+
+
+@@ -63,15 +63,16 @@ public class Cid extends Multihash {
+         return super.toBytes();
+     }
+ 
+-    private static final int MAX_VARINT_LEN64 = 10;
+-
+     private byte[] toBytesV1() {
+-        byte[] hashBytes = super.toBytes();
+-        byte[] res = new byte[2 * MAX_VARINT_LEN64 + hashBytes.length];
+-        int index = putUvarint(res, 0, version);
+-        index = putUvarint(res, index, codec.type);
+-        System.arraycopy(hashBytes, 0, res, index, hashBytes.length);
+-        return Arrays.copyOfRange(res, 0, index + hashBytes.length);
++        try {
++            ByteArrayOutputStream res = new ByteArrayOutputStream();
++            putUvarint(res, version);
++            putUvarint(res, codec.type);
++            super.serialize(res);
++            return res.toByteArray();
++        } catch (IOException e) {
++            throw new RuntimeException(e);
++        }
+     }
+ 
+     @Override
+@@ -150,43 +151,11 @@ public class Cid extends Multihash {
+                 throw new CidEncodingException("Invalid Cid version number: " + version);
+ 
+             long codec = readVarint(in);
+-            if (version != 0 && version != 1)
+-                throw new CidEncodingException("Invalid Cid version number: " + version);
+-
+-       

@@ -1,0 +1,89 @@
+@@ -2,6 +2,7 @@ from base64 import b64encode, b64decode
+ from enum import Enum
+ from random import randint
+ from datetime import datetime
++from importlib import import_module
+ 
+ import yaml
+ 
+@@ -79,3 +80,8 @@ class BaseService:
+         FACT_DEPENDENCY = 2
+         OP_RUNNING = 3
+         UNTRUSTED = 4
++
++    @staticmethod
++    async def load_module(module_type, module_info):
++        module = import_module(module_info['module'])
++        return getattr(module, module_type)(module_info)
+
+
+
+
+@@ -23,7 +23,7 @@ class ParsingService(BaseService):
+                     continue
+                 blob = b64decode(result['output']).decode('utf-8')
+                 parser_info['used_facts'] = await self.data_svc.explode_used(dict(link_id=result['link_id']))
+-                parser = await self._load_parser(parser_info)
++                parser = await self.load_module('Parser', parser_info)
+                 relationships = parser.parse(blob=blob)
+ 
+                 await self._update_scores(link_id=result['link_id'], increment=len(relationships))
+@@ -34,11 +34,6 @@ class ParsingService(BaseService):
+ 
+     """ PRIVATE """
+ 
+-    @staticmethod
+-    async def _load_parser(parser_info):
+-        parsing_module = import_module(parser_info['module'])
+-        return getattr(parsing_module, 'Parser')(parser_info)
+-
+     async def _create_relationships(self, relationships, operation, result):
+         source = (await self.data_svc.explode_sources(dict(name=operation['name'])))[0]
+         for relationship in relationships:
+
+
+
+
+@@ -3,6 +3,7 @@ import itertools
+ import re
+ from base64 import b64decode
+ from datetime import datetime
++from importlib import import_module
+ 
+ from app.service.base_service import BaseService
+ from app.utility.rule import RuleSet
+@@ -37,7 +38,8 @@ class PlanningService(BaseService):
+                 dict(op_id=operation['id'], paw=agent['paw'], ability=a['id'], command=a['test'], score=0,
+                      status=link_status, decide=datetime.now(), executor=a['executor'],
+                      jitter=self.jitter(operation['jitter']), adversary_map_id=a['adversary_map_id']))
+-        links[:] = await self._trim_links(operation, links, agent)
++        ability_requirements = {ab['id']: ab.get('requirements', []) for ab in phase_abilities}
++        links[:] = await self._trim_links(operation, links, agent, ability_requirements)
+         return await self._sort_links(links)
+ 
+     async def select_cleanup_links(self, operation, agent):
+@@ -70,16 +72,16 @@ class PlanningService(BaseService):
+         """
+         return sorted(links, key=lambda k: (-k['score'], k['adversary_map_id']))
+ 
+-    async def _trim_links(self, operation, links, agent):
++    async def _trim_links(self, operation, links, agent, ability_requirements=None):
+         host_already_ran = [l['command'] for l in operation['chain'] if l['paw'] == agent['paw']]
+-        links[:] = await self._add_test_variants(links, agent, operation)
++        links[:] = await self._add_test_variants(links, agent, operation, ability_requirements)
+         links[:] = [l for l in links if l['command'] not in host_already_ran]
+         links[:] = [l for l in links if
+                     not re.findall(r'#{(.*?)}', b64decode(l['command']).decode('utf-8'), flags=re.DOTALL)]
+         self.log.debug('Created %d links for %s' % (len(links), agent['paw']))
+         return links
+ 
+-    async def _add_test_variants(self, links, agent, operation):
++    async def _add_test_variants(self, links, agent, operation, ability_requirements=None):
+         """
+         Create a list of all possible links for a given phase
+         """
+@@ -92,9 +94,10 @@ class PlanningService(BaseService):
+                 relevant_facts = await self._build_relevant_facts(variables, operation.get('facts', []), agent_facts)
+                 valid_facts = await RuleSet(rules=operation.get('rules', [])).apply_rules(facts=relevant_facts[0])
+                 for combo in list(itertools.product(*valid_facts)):
++    

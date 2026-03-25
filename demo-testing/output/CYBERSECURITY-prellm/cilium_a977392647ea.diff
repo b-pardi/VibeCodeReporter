@@ -1,0 +1,130 @@
+@@ -37,6 +37,8 @@ static int BPF_FUNC(skb_change_proto, struct __sk_buff *skb, __u32 proto,
+ 		    __u32 flags);
+ static int BPF_FUNC(skb_change_tail, struct __sk_buff *skb, __u32 nlen,
+ 		    __u32 flags);
++static int BPF_FUNC(skb_change_head, struct __sk_buff *skb, __u32 head_room,
++		    __u64 flags);
+ 
+ static int BPF_FUNC(skb_pull_data, struct __sk_buff *skb, __u32 len);
+ 
+
+
+
+
+@@ -29,7 +29,12 @@
+  */
+ 
+ #define ETH_ALEN	6		/* Octets in one ethernet addr	 */
+-#define ETH_HLEN	14		/* Total octets in header.	 */
++/* __ETH_HLEN is out of sync with the kernel's if_ether.h. In Cilium datapath
++ * we use ETH_HLEN which can be loaded via static data, and for L2-less devs
++ * it's 0. To avoid replacing every occurrence of ETH_HLEN in the datapath,
++ * we prefixed the kernel's ETH_HLEN instead.
++ */
++#define __ETH_HLEN	14		/* Total octets in header.	 */
+ #define ETH_ZLEN	60		/* Min. octets in frame sans FCS */
+ #define ETH_DATA_LEN	1500		/* Max. octets in payload	 */
+ #define ETH_FRAME_LEN	1514		/* Max. octets in frame sans FCS */
+
+
+
+
+@@ -12,6 +12,7 @@
+ #include <linux/in.h>
+ #include <linux/socket.h>
+ 
++#include "eth.h"
+ #include "endian.h"
+ #include "mono.h"
+ #include "config.h"
+@@ -118,6 +119,14 @@ static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
+ 	void *data_end = ctx_data_end(ctx);
+ 	struct ethhdr *eth = data;
+ 
++	if (ETH_HLEN == 0) {
++		/* The packet is received on L2-less device. Determine L3
++		 * protocol from skb->protocol.
++		 */
++		*proto = ctx_get_protocol(ctx);
++		return true;
++	}
++
+ 	if (data + ETH_HLEN > data_end)
+ 		return false;
+ 	*proto = eth->h_proto;
+@@ -127,10 +136,11 @@ static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
+ }
+ 
+ static __always_inline __maybe_unused bool
+-__revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
+-		       void **l3, const __u32 l3_len, const bool pull)
++____revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
++			 void **l3, const __u32 l3_len, const bool pull,
++			 __u8 eth_hlen)
+ {
+-	const __u32 tot_len = ETH_HLEN + l3_len;
++	const __u32 tot_len = eth_hlen + l3_len;
+ 	void *data_end;
+ 	void *data;
+ 
+@@ -146,10 +156,18 @@ __revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
+ 	*data_ = data;
+ 	*data_end_ = data_end;
+ 
+-	*l3 = data + ETH_HLEN;
++	*l3 = data + eth_hlen;
+ 	return true;
+ }
+ 
++static __always_inline __maybe_unused bool
++__revalidate_data_pull(struct __ctx_buff *ctx, void **data, void **data_end,
++		       void **l3, const __u32 l3_len, const bool pull)
++{
++	return ____revalidate_data_pull(ctx, data, data_end, l3, l3_len, pull,
++					ETH_HLEN);
++}
++
+ /* revalidate_data_pull() initializes the provided pointers from the ctx and
+  * ensures that the data is pulled in for access. Should be used the first
+  * time that the ctx data is accessed, subsequent calls can be made to
+@@ -174,6 +192,10 @@ __revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
+ #define revalidate_data(ctx, data, data_end, ip)			\
+ 	__revalidate_data_pull(ctx, data, data_end, (void **)ip, sizeof(**ip), false)
+ 
++#define revalidate_data_with_eth_hlen(ctx, data, data_end, ip, eth_len)		\
++	____revalidate_data_pull(ctx, data, data_end, (void **)ip,	\
++				 sizeof(**ip), false, eth_len)
++
+ /* Macros for working with L3 cilium defined IPV6 addresses */
+ #define BPF_V6(dst, ...)	BPF_V6_1(dst, fetch_ipv6(__VA_ARGS__))
+ #define BPF_V6_1(dst, ...)	BPF_V6_4(dst, __VA_ARGS__)
+
+
+
+
+@@ -7,7 +7,7 @@
+ #include <linux/if_ether.h>
+ 
+ #ifndef ETH_HLEN
+-#define ETH_HLEN 14
++#define ETH_HLEN __ETH_HLEN
+ #endif
+ 
+ #ifndef ETH_ALEN
+@@ -109,4 +109,11 @@ static __always_inline int eth_store_daddr(struct __ctx_buff *ctx,
+ #endif
+ }
+ 
++static __always_inline int eth_store_proto(struct __ctx_buff *ctx,
++					   const __u16 proto, int off)
++{
++	return ctx_store_bytes(ctx, off + ETH_ALEN + ETH_ALEN,
++			       &proto, sizeof(proto), 0);
++}
++
+ #endif /* __LIB_ETH__ */
+
+
+
+
+@@ -161,6 +161,32 @@ stat

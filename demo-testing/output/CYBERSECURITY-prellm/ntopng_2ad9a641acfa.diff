@@ -1,0 +1,151 @@
+@@ -27,21 +27,23 @@
+ class Ping {
+  private:
+   int pid;
+-  int sd;
++  int sd, sd6;
+   u_int8_t cnt;
+   bool running;
+   pthread_t resultPoller;
+   Mutex m;
+-  std::map<u_int32_t /* IP */, float /* RTT */> results;
++  std::map<std::string /* IP */, float /* RTT */> results;
+   
+   u_int16_t checksum(void *b, int len);
+   float ms_timeval_diff(struct timeval *begin, struct timeval *end);
++  void setOpts(int fd);
++  void handleICMPResponse(unsigned char *buf, socklen_t buf_len, bool is_v6);
+   
+  public:
+   Ping();
+   ~Ping();
+   
+-  int  ping(char *_addr);
++  int  ping(char *_addr, bool use_v6);
+   void pollResults();
+   void collectResponses(lua_State* vm);    
+ };
+
+
+
+
+@@ -5052,12 +5052,15 @@ static int ntop_get_prefs(lua_State* vm) {
+ 
+ static int ntop_ping_host(lua_State* vm) {
+   char *host;
+-  
++  bool is_v6;
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK) return(CONST_LUA_PARAM_ERROR);
+   if((host = (char*)lua_tostring(vm, 1)) == NULL) return(CONST_LUA_PARAM_ERROR);
+ 
++  if(ntop_lua_check(vm, __FUNCTION__, 2, LUA_TBOOLEAN) != CONST_LUA_OK) return(CONST_LUA_PARAM_ERROR);
++  is_v6 = (bool)lua_toboolean(vm, 2);
++
+   if(getLuaVMUservalue(vm, ping) == NULL) {
+     Ping *ping;
+ 
+@@ -5084,7 +5087,7 @@ static int ntop_ping_host(lua_State* vm) {
+       getLuaVMUservalue(vm, ping) = ping;
+   }
+ 
+-  getLuaVMUservalue(vm, ping)->ping(host);
++  getLuaVMUservalue(vm, ping)->ping(host, is_v6);
+   
+   return(CONST_LUA_OK);
+ }
+
+
+
+
+@@ -43,25 +43,41 @@ static void* resultPollerFctn(void* ptr) {
+ 
+ /* ****************************************** */
+ 
+-Ping::Ping() {
++void Ping::setOpts(int fd) {
+   const int val = 255;
+ 
++  setsockopt(fd, SOL_IP, IP_TTL, &val, sizeof(val));
++  fcntl(fd, F_SETFL, O_NONBLOCK);
++}
++
++/* ****************************************** */
++
++Ping::Ping() {
+   pid = getpid(), cnt = 0;
+   running = true;
+ 
+ #if defined(__APPLE__)
+-  sd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
++  sd  = socket(AF_INET,  SOCK_DGRAM, IPPROTO_ICMP);
++  sd6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+ #else
+-  sd = socket(PF_INET, SOCK_RAW, IPPROTO_ICMP);
++  sd  = socket(PF_INET, SOCK_RAW, IPPROTO_ICMP);
++  sd6 = socket(PF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+ #endif
+ 
+-  if(sd == -1) {
+-    ntop->getTrace()->traceEvent(TRACE_ERROR, "Ping socket creation error: %s", strerror(errno));
+-    throw("Unable to create socket");
+-  }
++  if(sd == -1)
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Ping IPv4 socket creation error: %s",
++				 strerror(errno));
++  else
++    setOpts(sd);
+ 
+-  setsockopt(sd, SOL_IP, IP_TTL, &val, sizeof(val));
+-  fcntl(sd, F_SETFL, O_NONBLOCK);
++  if(sd6 == -1)
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Ping IPv6 socket creation error: %s",
++				 strerror(errno));
++  else
++    setOpts(sd6);
++
++  if((sd == -1) && (sd6 == -1))
++    throw "Socket creation error";
+ 
+   pthread_create(&resultPoller, NULL, resultPollerFctn, (void*)this);
+ }
+@@ -85,19 +101,22 @@ u_int16_t Ping::checksum(void *b, int len) {
+   sum = (sum >> 16) + (sum & 0xFFFF);
+   sum += (sum >> 16);
+   result = ~sum;
+-  
++
+   return(result);
+ }
+ 
+ /* ****************************************** */
+ 
+-int Ping::ping(char *_addr) {
+-  struct hostent *hname = gethostbyname(_addr);
++int Ping::ping(char *_addr, bool use_v6) {
++  struct hostent *hname = gethostbyname2(_addr, use_v6 ? AF_INET6 : AF_INET);
+   struct sockaddr_in addr;
+   struct ping_packet pckt;
+   u_int i;
+   struct timeval *tv;
+ 
++  if(hname == NULL)
++    return(-1);
++
+   bzero(&addr, sizeof(addr));
+   addr.sin_family = hname->h_addrtype;
+   addr.sin_port = 0;
+@@ -124,67 +143,85 @@ int Ping::ping(char *_addr) {
+ void Ping::pollResults() {
+   while(running) {
+     struct sockaddr_in addr;
+-    int bytes;
++    int bytes, fd_max = max(sd, sd6);
+     fd_set mask;
+     struct timeval wait_time = { 1, 0 };
+ 
+     FD_ZERO(&mask);
+-    FD_SET(sd, &mask);
++    if(sd != -1)  FD_SET(sd, &mask);
++    if(sd6 

@@ -1,0 +1,171 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,493 @@
++/* radare - LGPL - Copyright 2009-2019 - nibble, pancake */
++
++#include <r_types.h>
++#include <r_util.h>
++#include <r_lib.h>
++#include <r_bin.h>
++
++#define R_BIN_MACH064 1
++#include "../format/mach0/mach0.h"
++#include "../format/mach0/mach0_defines.h"
++
++/* at offset 0x10f8 (pointer to it stored right after "legion2") */
++typedef struct _RSepHdr64 {
++	ut8 kernel_uuid[16];
++	ut64 unknown0;
++	ut64 kernel_base_paddr;
++	ut64 kernel_max_paddr;
++	ut64 app_images_base_paddr;
++	ut64 app_images_max_paddr;
++	ut64 paddr_max; /* size of SEP firmware image */
++	ut64 unknown1;
++	ut64 unknown2;
++	ut64 unknown3;
++	ut64 init_base_paddr;
++	ut64 unknown4;
++	ut64 unknown5;
++	ut64 unknown6;
++	ut64 unknown7;
++	ut64 unknown8;
++	ut64 unknown9;
++	char init_name[16];
++	ut8 init_uuid[16];
++	ut64 unknown10;
++	ut64 unknown11;
++	ut64 n_apps;
++} RSepHdr64;
++
++/* right after the above, from offset 0x11c0 */
++typedef struct _RSepApp64 {
++	ut64 phys_text;
++	ut64 size_text;
++	ut64 phys_data;
++	ut64 size_data;
++	ut64 virt;
++	ut64 entry;
++	ut64 unknown4;
++	ut64 unknown5;
++	ut64 unknown6;
++	ut32 minus_one;
++	ut32 unknown7;
++	char app_name[16];
++	ut8 app_uuid[16];
++	ut64 unknown8;
++} RSepApp64;
++
++typedef struct _RSepMachoInfo {
++	struct MACH0_(mach_header) * hdr;
++	ut64 total_size;
++	ut64 text_size;
++	ut64 data_offset;
++	ut64 data_size;
++	ut64 text_offset_in_whole;
++	ut64 data_offset_in_whole;
++} RSepMachoInfo;
++
++typedef struct _RSepSlice64 {
++	RBuffer * buf;
++	RBinXtrMetadata * meta;
++	ut64 nominal_offset;
++	ut64 total_size;
++} RSepSlice64;
++
++typedef struct _RSepXtr64Ctx {
++	RSepHdr64 * hdr;
++	RSepApp64 * apps;
++} RSepXtr64Ctx;
++
++static RSepXtr64Ctx * sep64_xtr_ctx_new(RBuffer * buf);
++static void sep64_xtr_ctx_free(void * p);
++static RSepSlice64 * sep64_xtr_ctx_get_slice(RSepXtr64Ctx * ctx, RBuffer * whole, int idx);
++
++static RSepMachoInfo * mach0_info_new(RBuffer * buf, ut64 at, ut64 max_size);
++static void mach0_info_free(RSepMachoInfo * info);
++
++static ut32 read_arm64_ins(RBuffer *b, int idx);
++static char * get_proper_name (const char * app_name);
++static RBuffer * extract_slice(RBuffer * whole, RSepMachoInfo * info);
++static inline void fill_metadata_info_from_hdr(RBinXtrMetadata *meta, struct MACH0_(mach_header) *hdr);
++
++#define BTW(val, min, max) ((val) > min && (val) < max)
++
++static bool check_buffer(RBuffer *b) {
++	r_return_val_if_fail (b, false);
++
++	const ut64 sz = r_buf_size (b);
++	if (sz < 0x11c0) {
++		return false;
++	}
++
++	ut32 msr_vbar_el1 = read_arm64_ins (b, 2);
++	if (msr_vbar_el1 != 0xd518c002) {
++		return false;
++	}
++	ut32 adr = read_arm64_ins (b, 1);
++	if (adr != 0x10003fe2) {
++		return false;
++	}
++
++	/* check exception vector */
++	if (read_arm64_ins (b, 512) != 0x14000000) {
++		return false;
++	}
++	if (read_arm64_ins (b, 1023) != 0x14000000) {
++		return false;
++	}
++
++	/* legion2 */
++	if (read_arm64_ins (b, 1028) !=  0x326e6f69) {
++		return false;
++	}
++
++	/* data header start */
++	ut64 hdr_offset = read_arm64_ins (b, 1029);
++	if (hdr_offset >= sz) {
++		return false;
++	}
++
++	/* check size */
++	if (r_buf_read_le64_at (b, hdr_offset + 56) != sz) {
++		return false;
++	}
++
++	return true;
++}
++
++static bool load(RBin *bin) {
++	return ((bin->cur->xtr_obj = sep64_xtr_ctx_new (bin->cur->buf)) != NULL);
++}
++
++static void destroy(RBin *bin) {
++	sep64_xtr_ctx_free (bin->cur->xtr_obj);
++}
++
++static int size(RBin *bin) {
++	// TODO
++	return 0;
++}
++
++static RBinXtrData *oneshot_buffer(RBin *bin, RBuffer *b, int idx) {
++	r_return_val_if_fail (bin && bin->cur, NULL);
++
++	if (!bin->cur->xtr_obj) {
++		bin->cur->xtr_obj = sep64_xtr_ctx_new (b);
++	}
++	RSepXtr64Ctx * ctx = bin->cur->xtr_obj;
++
++	RSepSlice64 * slice = sep64_xtr_ctx_get_slice (ctx, b, idx);
++	RBinXtrData * res = r_bin_xtrdata_new (slice->buf, slice->nominal_offset, slice->total_size, 3 + ctx->hdr->n_apps, slice->meta);
++
++	r_buf_free (slice->buf);
++	free (slice);
++	return res;
++}
++
++static RList * oneshotall_buffer(RBin *bin, RBuffer *b) {
++	RBinXtrData 

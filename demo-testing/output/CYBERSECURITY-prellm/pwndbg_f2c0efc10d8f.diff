@@ -1,0 +1,114 @@
+@@ -10,6 +10,7 @@ import ast
+ import codecs
+ import ctypes
+ import sys
++from collections import defaultdict
+ from io import open
+ 
+ import gdb
+@@ -49,6 +50,10 @@ config_context_sections = pwndbg.config.Parameter('context-sections',
+                                                   'regs disasm code stack backtrace',
+                                                   'which context sections are displayed (controls order)')
+ 
++# Storing output configuration per section
++outputs = {}
++output_settings = {}
++
+ 
+ @pwndbg.config.Trigger([config_context_sections])
+ def validate_context_sections():
+@@ -70,17 +75,80 @@ def validate_context_sections():
+ 
+ class StdOutput(object):
+     """A context manager wrapper to give stdout"""
+-    def __enter__(*args,**kwargs):
++    def __enter__(self):
+         return sys.stdout
+-    def __exit__(*args, **kwargs):
++    def __exit__(self, *args, **kwargs):
++        pass
++    def __hash__(self):
++        return hash(sys.stdout)
++    def __eq__(self, other):
++        return type(other) is StdOutput
++
++class FileOutput(object):
++    """A context manager wrapper to reopen files on enter"""
++    def __init__(self, *args):
++        self.args = args
++        self.handle = None
++    def __enter__(self):
++        self.handle = open(*self.args)
++        return self.handle
++    def __exit__(self, *args, **kwargs):
++        self.handle.close()
++    def __hash__(self):
++        return hash(self.args)
++    def __eq__(self, other):
++        return self.args == other.args
++
++class CallOutput(object):
++    """A context manager which calls a function on write"""
++    def __init__(self, func):
++        self.func = func
++    def __enter__(self):
++        return self
++    def __exit__(self, *args, **kwargs):
+         pass
++    def __hash__(self):
++        return hash(self.func)
++    def __eq__(self, other):
++        return self.func == other.func
++    def write(self, data):
++        self.func(data)
++    def flush(self):
++        try:
++            return self.func.flush()
++        except AttributeError:
++            pass
++    def isatty(self):
++        try:
++            return self.func.isatty()
++        except AttributeError:
++            return False
+ 
+-def output():
++
++def output(section):
+     """Creates a context manager corresponding to configured context ouput"""
+-    if not config_output or config_output == "stdout":
++    target = outputs.get(section, str(config_output))
++    if not target or target == "stdout":
+         return StdOutput()
++    elif callable(target):
++        return CallOutput(target)
+     else:
+-        return open(str( config_output ), "w")
++        return FileOutput(target, "w")
++
++parser = argparse.ArgumentParser()
++parser.description = "Sets the output of a context section."
++parser.add_argument("section", type=str, help="The section which is to be configured. ('regs', 'disasm', 'code', 'stack', 'backtrace', and/or 'args')")
++parser.add_argument("path", type=str, help="The path to which the output is written")
++parser.add_argument("clearing", type=bool, help="Indicates weather to clear the output")
++parser.add_argument("banner", type=str, default="both", help="Where a banner should be placed: both, top , bottom, none")
++parser.add_argument("width", type=int, default=None, help="Sets a fixed width (used for banner). Set to None for auto")
++@pwndbg.commands.ArgparsedCommand(parser, aliases=['ctx-out'])
++def contextoutput(section, path, clearing, banner="both", width=None):
++    outputs[section] = path
++    output_settings[section] = dict(clearing=clearing,
++                                    width=width,
++                                    banner_top= banner in ["both", "top"],
++                                    banner_bottom= banner in ["both", "bottom"])
+ 
+ # @pwndbg.events.stop
+ 
+@@ -98,33 +166,46 @@ def context(subcontext=None):
+     if subcontext is None:
+         subcontext = []
+     args = subcontext
+-    
++
+     if len(args) == 0:
+         args = config_context_sections.split()
+ 

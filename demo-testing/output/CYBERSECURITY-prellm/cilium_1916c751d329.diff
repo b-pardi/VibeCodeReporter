@@ -1,0 +1,140 @@
+@@ -346,9 +346,11 @@ to_host:
+ 		if (ret != TC_ACT_OK)
+ 			return ret;
+ 
+-#ifndef POLICY_EGRESS
+ 		send_trace_notify(skb, TRACE_TO_HOST, SECLABEL, HOST_ID, 0, HOST_IFINDEX,
+ 				  forwarding_reason);
++
++#ifndef POLICY_EGRESS
++		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, HOST_IFINDEX);
+ 		return redirect(HOST_IFINDEX, 0);
+ #else
+ 		skb->cb[CB_SRC_LABEL] = SECLABEL;
+@@ -373,10 +375,12 @@ pass_to_stack:
+ 	if (ipv6_store_flowlabel(skb, l3_off, SECLABEL_NB) < 0)
+ 		return DROP_WRITE_ERROR;
+ 
+-#ifndef POLICY_EGRESS
+-	/* No policy, pass directly down to stack */
+ 	send_trace_notify(skb, TRACE_TO_STACK, SECLABEL, dstID, 0, 0,
+ 			  forwarding_reason);
++
++#ifndef POLICY_EGRESS
++	/* No policy, pass directly down to stack */
++	cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, 0);
+ 	return TC_ACT_OK;
+ #else
+ 	skb->cb[CB_SRC_LABEL] = SECLABEL;
+@@ -636,9 +640,11 @@ to_host:
+ 		if (ret != TC_ACT_OK)
+ 			return ret;
+ 
+-#ifndef POLICY_EGRESS
+ 		send_trace_notify(skb, TRACE_TO_HOST, SECLABEL, HOST_ID, 0, HOST_IFINDEX,
+ 				  forwarding_reason);
++
++#ifndef POLICY_EGRESS
++		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, HOST_IFINDEX);
+ 		return redirect(HOST_IFINDEX, 0);
+ #else
+ 		skb->cb[CB_SRC_LABEL] = SECLABEL;
+@@ -665,10 +671,12 @@ pass_to_stack:
+ 	 * network.
+ 	 */
+ 
+-#ifndef POLICY_EGRESS
+-	/* No policy, pass directly down to stack */
+ 	send_trace_notify(skb, TRACE_TO_STACK, SECLABEL, dstID, 0, 0,
+ 			  forwarding_reason);
++
++#ifndef POLICY_EGRESS
++	/* No policy, pass directly down to stack */
++	cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, 0);
+ 	return TC_ACT_OK;
+ #else
+ 	skb->cb[CB_SRC_LABEL] = SECLABEL;
+@@ -708,7 +716,7 @@ int handle_ingress(struct __sk_buff *skb)
+ 
+ 	bpf_clear_cb(skb);
+ 
+-	cilium_dbg_capture2(skb, DBG_CAPTURE_FROM_LXC, skb->ingress_ifindex, SECLABEL);
++	send_trace_notify(skb, TRACE_FROM_LXC, SECLABEL, 0, 0, 0, 0);
+ 
+ #ifdef DROP_ALL
+ 	if (skb->protocol == bpf_htons(ETH_P_ARP)) {
+
+
+
+
+@@ -40,6 +40,7 @@
+ #include "lib/icmp6.h"
+ #include "lib/eth.h"
+ #include "lib/dbg.h"
++#include "lib/trace.h"
+ #include "lib/l3.h"
+ #include "lib/l4.h"
+ #include "lib/policy.h"
+@@ -159,7 +160,7 @@ static inline int rewrite_dmac_to_host(struct __sk_buff *skb)
+ }
+ #endif
+ 
+-static inline int handle_ipv6(struct __sk_buff *skb)
++static inline int handle_ipv6(struct __sk_buff *skb, __u32 proxy_identity)
+ {
+ 	union v6addr node_ip = { };
+ 	void *data, *data_end;
+@@ -191,7 +192,8 @@ static inline int handle_ipv6(struct __sk_buff *skb)
+ 	if (1) {
+ 		int ret;
+ 
+-		handle_identity_from_proxy(skb, &flowlabel);
++		if (proxy_identity)
++			flowlabel = proxy_identity;
+ 
+ 		ret = reverse_proxy6(skb, l4_off, ip6, ip6->nexthdr);
+ 		/* DIRECT PACKET READ INVALID */
+@@ -324,7 +326,7 @@ reverse_proxy(struct __sk_buff *skb, int l4_off, struct iphdr *ip4,
+ }
+ #endif
+ 
+-static inline int handle_ipv4(struct __sk_buff *skb)
++static inline int handle_ipv4(struct __sk_buff *skb, __u32 proxy_identity)
+ {
+ 	struct ipv4_ct_tuple tuple = {};
+ 	struct endpoint_info *ep;
+@@ -344,7 +346,8 @@ static inline int handle_ipv4(struct __sk_buff *skb)
+ 	if (1) {
+ 		int ret;
+ 
+-		handle_identity_from_proxy(skb, &secctx);
++		if (proxy_identity)
++			secctx = proxy_identity;
+ 
+ 		ret = reverse_proxy(skb, l4_off, ip4, &tuple);
+ 		/* DIRECT PACKET READ INVALID */
+@@ -393,9 +396,12 @@ static inline int handle_ipv4(struct __sk_buff *skb)
+ 	return TC_ACT_OK;
+ }
+ 
++#define CB_SRC_IDENTITY 0
++
+ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4) int tail_handle_ipv4(struct __sk_buff *skb)
+ {
+-	int ret = handle_ipv4(skb);
++	__u32 proxy_identity = skb->cb[CB_SRC_IDENTITY];
++	int ret = handle_ipv4(skb, proxy_identity);
+ 
+ 	if (IS_ERR(ret))
+ 		return send_drop_notify_error(skb, ret, TC_ACT_SHOT);
+@@ -408,16 +414,33 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4) int tail_handle_ipv4(struct _
+ __section("from-netdev")
+ int from_netdev(struct __sk_buff *skb)
+ {
++	__u32 proxy_identity = 0;
+ 	int ret;
+ 
+ 	bpf_clear_cb(skb);
+ 
+-	cilium_dbg_capture(skb, DBG_CAPTURE_FROM_NETDEV, skb->ingress_ifindex);
++

@@ -1,0 +1,85 @@
+@@ -93,10 +93,9 @@ public class DHTHandler implements HttpHandler {
+                     break;
+                 }
+                 case AUTH_READS: {
+-                    List<Multihash> blockHashes = Arrays.stream(last.apply("hashes").split(","))
+-                            .map(Cid::decode)
+-                            .collect(Collectors.toList());
+-                    dht.authReads(blockHashes).thenAccept(res -> {
++                    CborObject cbor = CborObject.fromByteArray(Serialize.readFully(httpExchange.getRequestBody()));
++                    List<MirrorCap> blockCaps = ((CborObject.CborList) cbor).map(MirrorCap::fromCbor);
++                    dht.authReads(blockCaps).thenAccept(res -> {
+                         replyBytes(httpExchange, new CborObject.CborList(res).serialize(), Optional.empty());
+                     }).exceptionally(Futures::logAndThrow).get();
+                     break;
+
+
+
+
+@@ -100,16 +100,24 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+     }
+ 
+     @Override
+-    public CompletableFuture<List<PresignedUrl>> authReads(List<Multihash> blocks) {
++    public CompletableFuture<List<PresignedUrl>> authReads(List<MirrorCap> blocks) {
+         if (blocks.size() > 50)
+             throw new IllegalStateException("Too many reads to auth!");
+         List<PresignedUrl> res = new ArrayList<>();
+ 
+-        for (Multihash block : blocks) {
+-            String s3Key = hashToKey(block);
++        // retrieve all blocks and verify BATs in aprallel
++        List<CompletableFuture<Optional<byte[]>>> data = blocks.stream()
++                .parallel()
++                .map(b -> getRaw(b.hash, b.bat, id, hasher))
++                .collect(Collectors.toList());
+ 
++        for (MirrorCap block : blocks) {
++            String s3Key = hashToKey(block.hash);
+             res.add(S3Request.preSignGet(s3Key, Optional.of(600), S3AdminRequests.asAwsDate(ZonedDateTime.now()), host, region, accessKeyId, secretKey, hasher).join());
+         }
++        for (CompletableFuture<Optional<byte[]>> fut : data) {
++            fut.join(); // Any invalids BATs will cause this to throw
++        }
+         return Futures.of(res);
+     }
+ 
+
+
+
+
+@@ -38,7 +38,7 @@ public interface ContentAddressedStorage {
+      */
+     ContentAddressedStorage directToOrigin();
+ 
+-    default CompletableFuture<List<PresignedUrl>> authReads(List<Multihash> blocks) {
++    default CompletableFuture<List<PresignedUrl>> authReads(List<MirrorCap> blocks) {
+         return Futures.errored(new IllegalStateException("Unimplemented call!"));
+     }
+ 
+@@ -52,29 +52,29 @@ public interface ContentAddressedStorage {
+     }
+ 
+     default CompletableFuture<Cid> put(PublicKeyHash owner,
+-                                             SigningPrivateKeyAndPublicHash writer,
+-                                             byte[] block,
+-                                             Hasher hasher,
+-                                             TransactionId tid) {
++                                       SigningPrivateKeyAndPublicHash writer,
++                                       byte[] block,
++                                       Hasher hasher,
++                                       TransactionId tid) {
+         return hasher.sha256(block)
+                 .thenCompose(hash -> put(owner, writer.publicKeyHash, writer.secret.signMessage(hash), block, tid));
+     }
+ 
+     default CompletableFuture<Cid> put(PublicKeyHash owner,
+-                                             PublicKeyHash writer,
+-                                             byte[] signature,
+-                                             byte[] block,
+-                                             TransactionId tid) {
++                                       PublicKeyHash writer,
++                                       byte[] signature,
++                                       byte[] block,
++                                       TransactionId tid) {
+         return put(owner, writer, Col

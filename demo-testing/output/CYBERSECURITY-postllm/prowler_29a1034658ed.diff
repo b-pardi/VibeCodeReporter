@@ -1,0 +1,120 @@
+@@ -1,10 +1,14 @@
+ import uuid
+ from functools import wraps
+ 
+-from django.db import connection, transaction
++from django.core.exceptions import ObjectDoesNotExist
++from django.db import IntegrityError, connection, transaction
+ from rest_framework_json_api.serializers import ValidationError
+ 
+-from api.db_utils import POSTGRES_TENANT_VAR, SET_CONFIG_QUERY
++from api.db_router import READ_REPLICA_ALIAS
++from api.db_utils import POSTGRES_TENANT_VAR, SET_CONFIG_QUERY, rls_transaction
++from api.exceptions import ProviderDeletedException
++from api.models import Provider, Scan
+ 
+ 
+ def set_tenant(func=None, *, keep_tenant=False):
+@@ -66,3 +70,49 @@ def set_tenant(func=None, *, keep_tenant=False):
+         return decorator
+     else:
+         return decorator(func)
++
++
++def handle_provider_deletion(func):
++    """
++    Decorator that raises ProviderDeletedException if provider was deleted during execution.
++
++    Catches ObjectDoesNotExist and IntegrityError, checks if provider still exists,
++    and raises ProviderDeletedException if not. Otherwise, re-raises original exception.
++
++    Requires tenant_id and provider_id in kwargs.
++
++    Example:
++        @shared_task
++        @handle_provider_deletion
++        def scan_task(scan_id, tenant_id, provider_id):
++            ...
++    """
++
++    @wraps(func)
++    def wrapper(*args, **kwargs):
++        try:
++            return func(*args, **kwargs)
++        except (ObjectDoesNotExist, IntegrityError):
++            tenant_id = kwargs.get("tenant_id")
++            provider_id = kwargs.get("provider_id")
++
++            with rls_transaction(tenant_id, using=READ_REPLICA_ALIAS):
++                if provider_id is None:
++                    scan_id = kwargs.get("scan_id")
++                    if scan_id is None:
++                        raise AssertionError(
++                            "This task does not have provider or scan in the kwargs"
++                        )
++                    scan = Scan.objects.filter(pk=scan_id).first()
++                    if scan is None:
++                        raise ProviderDeletedException(
++                            f"Provider for scan '{scan_id}' was deleted during the scan"
++                        ) from None
++                    provider_id = str(scan.provider_id)
++                if not Provider.objects.filter(pk=provider_id).exists():
++                    raise ProviderDeletedException(
++                        f"Provider '{provider_id}' was deleted during the scan"
++                    ) from None
++            raise
++
++    return wrapper
+
+
+
+
+@@ -66,6 +66,10 @@ class ProviderConnectionError(Exception):
+     """Base exception for provider connection errors."""
+ 
+ 
++class ProviderDeletedException(Exception):
++    """Raised when a provider has been deleted during scan/task execution."""
++
++
+ def custom_exception_handler(exc, context):
+     if isinstance(exc, django_validation_error):
+         if hasattr(exc, "error_dict"):
+
+
+
+
+@@ -2,9 +2,12 @@ import uuid
+ from unittest.mock import call, patch
+ 
+ import pytest
++from django.core.exceptions import ObjectDoesNotExist
++from django.db import IntegrityError
+ 
+ from api.db_utils import POSTGRES_TENANT_VAR, SET_CONFIG_QUERY
+-from api.decorators import set_tenant
++from api.decorators import handle_provider_deletion, set_tenant
++from api.exceptions import ProviderDeletedException
+ 
+ 
+ @pytest.mark.django_db
+@@ -34,3 +37,142 @@ class TestSetTenantDecorator:
+ 
+         with pytest.raises(KeyError):
+             random_func("test_arg")
++
++
++@pytest.mark.django_db
++class TestHandleProviderDeletionDecorator:
++    def test_success_no_exception(self, tenants_fixture, providers_fixture):
++        """Decorated function runs normally when no exception is raised."""
++        tenant = tenants_fixture[0]
++        provider = providers_fixture[0]
++
++        @handle_provider_deletion
++        def task_func(**kwargs):
++            return "success"
++
++        result = task_func(
++            tenant_id=str(tenant.id),
++          

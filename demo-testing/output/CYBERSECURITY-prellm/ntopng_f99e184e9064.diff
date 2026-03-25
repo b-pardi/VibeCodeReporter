@@ -1,0 +1,101 @@
+@@ -95,7 +95,17 @@ class Flow : public GenericHashEntry {
+   bool pending_lua_call_protocol_detected; /* Whether the protocol detected lua script has been called on this flow */
+   time_t next_lua_call_periodic_update; /* The time at which the periodic lua script on this flow shall be called */
+   u_int32_t periodic_update_ctr;
+- 
++
++  /* 
++     The structure below is used to store the packet payload of
++     nDPI protocol match (one packet only). In case of protocol
++     guess, no payload is saved (i.e. length will be zero)
++  */
++  struct {
++    u_int16_t payload_len;
++    u_int8_t *payload;
++  } packet_payload_match;
++    
+   union {
+     struct {
+       char *last_url, *last_method;
+@@ -352,7 +362,9 @@ class Flow : public GenericHashEntry {
+ 
+   void updateSeqNum(time_t when, u_int32_t sN, u_int32_t aN);
+   void setDetectedProtocol(ndpi_protocol proto_id);
+-  void processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time);
++  void processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time,
++		     u_int8_t *payload, u_int16_t payload_len);
++  void setMatchedPacketPayload(u_int8_t *payload, u_int16_t payload_len);
+   void processDNSPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time);
+   void endProtocolDissection();
+   inline void setCustomApp(custom_app_t ca) {
+
+
+
+
+@@ -77,7 +77,7 @@ Flow::Flow(NetworkInterface *_iface,
+   bytes_thpt_srv2cli  = 0, goodput_bytes_thpt_srv2cli = 0;
+   pkts_thpt = 0, pkts_thpt_cli2srv = 0, pkts_thpt_srv2cli = 0;
+   top_bytes_thpt = 0, top_goodput_bytes_thpt = 0, applLatencyMsec = 0;
+-
++  packet_payload_match.payload = NULL, packet_payload_match.payload_len = 0;
+   external_alert = NULL;
+   trigger_immediate_periodic_update = false;
+   pending_lua_call_protocol_detected = false;
+@@ -297,9 +297,13 @@ Flow::~Flow() {
+       if(status_infos[i].script_key)
+ 	free(status_infos[i].script_key);
+     }
++    
+     free(status_infos);
+   }
+ 
++  if(packet_payload_match.payload)
++    free(packet_payload_match.payload);
++  
+   freeDPIMemory();
+   if(icmp_info) delete(icmp_info);
+   if(external_alert) free(external_alert);
+@@ -512,7 +516,8 @@ bool Flow::needsExtraDissection() {
+ /* *************************************** */
+ 
+ /* Process a packet and advance the flow detection state. */
+-void Flow::processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time) {
++void Flow::processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time,
++			 u_int8_t *payload, u_int16_t payload_len) {
+   bool detected;
+   ndpi_protocol proto_id;
+ 
+@@ -521,8 +526,9 @@ void Flow::processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t pa
+    * be able to guess the protocol. */
+ 
+   proto_id = ndpi_detection_process_packet(iface->get_ndpi_struct(), ndpiFlow,
+-    ip_packet, ip_len, packet_time,
+-    (struct ndpi_id_struct*) cli_id, (struct ndpi_id_struct*) srv_id);
++					   ip_packet, ip_len, packet_time,
++					   (struct ndpi_id_struct*) cli_id,
++					   (struct ndpi_id_struct*) srv_id);
+ 
+   detected = ndpi_is_protocol_detected(iface->get_ndpi_struct(), proto_id);
+ 
+@@ -549,6 +555,7 @@ void Flow::processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t pa
+   if(detected) {
+     updateProtocol(proto_id);
+     setProtocolDetectionCompleted();
++    setMatchedPacketPayload(payload, payload_len);
+   }
+ 
+   if(detection_completed && !needsExtraDissection())
+@@ -557,6 +564,17 @@ void Flow::processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t pa
+ 
+ /* *************************************** */
+ 
++void Flow::setMatchedPacketPayload(u_int8_t *payload, u_int16_t payload_len) {
++  if((payload_len > 0) && (packet_payload_match.payload_len == 0)) {
++    if((packet_payload_match.payload = (u_int8_t*)malloc(payload_len*sizeof(u_int8_t))) != NULL) {
++      memcpy(packet_payload_match.payload, payload, payload_len);
++      packet_payload_match.payload_len = payload_len;
++    }
++  }
++}
++
++/* *************************

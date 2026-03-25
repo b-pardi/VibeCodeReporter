@@ -1,0 +1,130 @@
+@@ -23,6 +23,7 @@ class DataBuffer {
+   DataBuffer(const DataBuffer& other) : data_(nullptr), len_(0) {
+     Assign(other);
+   }
++  explicit DataBuffer(size_t l) : data_(nullptr), len_(0) { Allocate(l); }
+   ~DataBuffer() { delete[] data_; }
+ 
+   DataBuffer& operator=(const DataBuffer& other) {
+
+
+
+
+@@ -12,6 +12,7 @@
+ 
+ struct ScopedDeleteSSL {
+   void operator()(SSLAeadContext* ctx) { SSL_DestroyAead(ctx); }
++  void operator()(SSLMaskingContext* ctx) { SSL_DestroyMaskingContext(ctx); }
+   void operator()(SSLAntiReplayContext* ctx) {
+     SSL_ReleaseAntiReplayContext(ctx);
+   }
+@@ -34,6 +35,7 @@ struct ScopedMaybeDeleteSSL {
+ 
+ SCOPED(SSLAeadContext);
+ SCOPED(SSLAntiReplayContext);
++SCOPED(SSLMaskingContext);
+ SCOPED(SSLResumptionTokenInfo);
+ 
+ #undef SCOPED
+
+
+
+
+@@ -74,6 +74,11 @@ const uint8_t kTlsFakeChangeCipherSpec[] = {
+     0x01   // Value
+ };
+ 
++const uint8_t kCtDtlsCiphertext = 0x20;
++const uint8_t kCtDtlsCiphertextMask = 0xE0;
++const uint8_t kCtDtlsCiphertext16bSeqno = 0x08;
++const uint8_t kCtDtlsCiphertextLengthPresent = 0x04;
++
+ static const uint8_t kTls13PskKe = 0;
+ static const uint8_t kTls13PskDhKe = 1;
+ static const uint8_t kTls13PskAuth = 0;
+
+similarity index 98%
+rename from gtests/ssl_gtest/ssl_primitive_unittest.cc
+rename to gtests/ssl_gtest/ssl_aead_unittest.cc
+
+
+
+@@ -54,7 +54,7 @@ class AeadTest : public ::testing::Test {
+     ASSERT_GE(kMaxSize, ciphertext_len);
+     ASSERT_LT(0U, ciphertext_len);
+ 
+-    uint8_t output[kMaxSize];
++    uint8_t output[kMaxSize] = {0};
+     unsigned int output_len = 0;
+     EXPECT_EQ(SECSuccess, SSL_AeadEncrypt(ctx.get(), 0, kAad, sizeof(kAad),
+                                           kPlaintext, sizeof(kPlaintext),
+@@ -181,7 +181,7 @@ TEST_F(AeadTest, AeadNoPointer) {
+ }
+ 
+ TEST_F(AeadTest, AeadAes128Gcm) {
+-  SSLAeadContext *ctxInit;
++  SSLAeadContext *ctxInit = nullptr;
+   ASSERT_EQ(SECSuccess,
+             SSL_MakeAead(SSL_LIBRARY_VERSION_TLS_1_3, TLS_AES_128_GCM_SHA256,
+                          secret_.get(), kLabel, strlen(kLabel), &ctxInit));
+@@ -203,7 +203,7 @@ TEST_F(AeadTest, AeadAes256Gcm) {
+ }
+ 
+ TEST_F(AeadTest, AeadChaCha20Poly1305) {
+-  SSLAeadContext *ctxInit;
++  SSLAeadContext *ctxInit = nullptr;
+   ASSERT_EQ(
+       SECSuccess,
+       SSL_MakeAead(SSL_LIBRARY_VERSION_TLS_1_3, TLS_CHACHA20_POLY1305_SHA256,
+
+
+
+
+@@ -263,6 +263,7 @@ TEST_P(TlsCipherSuiteTest, ResumeCipherSuite) {
+ TEST_P(TlsCipherSuiteTest, ReadLimit) {
+   SetupCertificate();
+   EnableSingleCipher();
++  TlsSendCipherSpecCapturer capturer(client_);
+   ConnectAndCheckCipherSuite();
+   if (version_ < SSL_LIBRARY_VERSION_TLS_1_3) {
+     uint64_t last = last_safe_write();
+@@ -295,9 +296,31 @@ TEST_P(TlsCipherSuiteTest, ReadLimit) {
+   } else {
+     epoch = 0;
+   }
+-  TlsAgentTestBase::MakeRecord(variant_, ssl_ct_application_data, version_,
+-                               payload, sizeof(payload), &record,
+-                               (epoch << 48) | record_limit());
++
++  uint64_t seqno = (epoch << 48) | record_limit();
++
++  // DTLS 1.3 masks the sequence number
++  if (variant_ == ssl_variant_datagram &&
++      version_ >= SSL_LIBRARY_VERSION_TLS_1_3) {
++    auto spec = capturer.spec(1);
++    ASSERT_NE(nullptr, spec.get());
++    ASSERT_EQ(3, spec->epoch());
++
++    DataBuffer pt, ct;
++    uint8_t dtls13_ctype = kCtDtlsCiphertext | kCtDtlsCiphertext16bSeqno |
++                           kCtDtlsCiphertextLengthPresent;
++    TlsRecordHeader hdr(variant_, version_, dtls13_ctype, seqno);
++    pt.Assign(payload, sizeof(payload));
++    TlsRecordHeader out_hdr;
++    spec->Protect(hdr, pt, &ct, &out_hdr);
++
++    auto rv = out_hdr.Write(&record, 0, ct);
++    EXPECT_EQ(out_hdr.header_length() + ct.len(), rv);
++  } else {
++    TlsAgentTestBase::MakeRecord(variant_, ssl_ct_application_data, version_,
++                                 payload, sizeof(payload), &record, seqno);
++  }
++
+   client_->SendDirect(record);
+   server_->ExpectReadWriteError();
+   server_->ReadBytes();
+
+
+
+
+@@ -619,55 +619,6 @@ TEST_P(TlsD

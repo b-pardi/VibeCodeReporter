@@ -1,0 +1,103 @@
+@@ -176,6 +176,321 @@ TEST_P(TlsConnectGeneric, ClientAuth) {
+   CheckKeys();
+ }
+ 
++class TlsCertificateRequestContextRecorder : public TlsHandshakeFilter {
++ public:
++  TlsCertificateRequestContextRecorder(const std::shared_ptr<TlsAgent>& a,
++                                       uint8_t handshake_type)
++      : TlsHandshakeFilter(a, {handshake_type}), buffer_(), filtered_(false) {
++    EnableDecryption();
++  }
++
++  bool filtered() const { return filtered_; }
++  const DataBuffer& buffer() const { return buffer_; }
++
++ protected:
++  virtual PacketFilter::Action FilterHandshake(const HandshakeHeader& header,
++                                               const DataBuffer& input,
++                                               DataBuffer* output) {
++    assert(1 < input.len());
++    size_t len = input.data()[0];
++    assert(len + 1 < input.len());
++    buffer_.Assign(input.data() + 1, len);
++    filtered_ = true;
++    return KEEP;
++  }
++
++ private:
++  DataBuffer buffer_;
++  bool filtered_;
++};
++
++// All stream only tests; DTLS isn't supported yet.
++
++TEST_F(TlsConnectStreamTls13, PostHandshakeAuth) {
++  EnsureTlsSetup();
++  auto capture_cert_req = MakeTlsFilter<TlsCertificateRequestContextRecorder>(
++      server_, kTlsHandshakeCertificateRequest);
++  auto capture_certificate =
++      MakeTlsFilter<TlsCertificateRequestContextRecorder>(
++          client_, kTlsHandshakeCertificate);
++  client_->SetupClientAuth();
++  EXPECT_EQ(SECSuccess, SSL_OptionSet(client_->ssl_fd(),
++                                      SSL_ENABLE_POST_HANDSHAKE_AUTH, PR_TRUE));
++  size_t called = 0;
++  server_->SetAuthCertificateCallback(
++      [&called](TlsAgent*, PRBool, PRBool) -> SECStatus {
++        called++;
++        return SECSuccess;
++      });
++  Connect();
++  EXPECT_EQ(0U, called);
++  EXPECT_FALSE(capture_cert_req->filtered());
++  EXPECT_FALSE(capture_certificate->filtered());
++  // Send CertificateRequest.
++  EXPECT_EQ(SECSuccess, SSL_SendCertificateRequest(server_->ssl_fd()))
++      << "Unexpected error: " << PORT_ErrorToName(PORT_GetError());
++  // Need to do a round-trip so that the post-handshake message is
++  // handled on both client and server.
++  server_->SendData(50);
++  client_->ReadBytes(50);
++  client_->SendData(50);
++  server_->ReadBytes(50);
++  EXPECT_EQ(1U, called);
++  EXPECT_TRUE(capture_cert_req->filtered());
++  EXPECT_TRUE(capture_certificate->filtered());
++  // Check if a non-empty request context is generated and it is
++  // properly sent back.
++  EXPECT_LT(0U, capture_cert_req->buffer().len());
++  EXPECT_EQ(capture_cert_req->buffer().len(),
++            capture_certificate->buffer().len());
++  EXPECT_EQ(0, memcmp(capture_cert_req->buffer().data(),
++                      capture_certificate->buffer().data(),
++                      capture_cert_req->buffer().len()));
++  ScopedCERTCertificate cert1(SSL_PeerCertificate(server_->ssl_fd()));
++  ScopedCERTCertificate cert2(SSL_LocalCertificate(client_->ssl_fd()));
++  EXPECT_TRUE(SECITEM_ItemsAreEqual(&cert1->derCert, &cert2->derCert));
++}
++
++static SECStatus GetClientAuthDataHook(void* self, PRFileDesc* fd,
++                                       CERTDistNames* caNames,
++                                       CERTCertificate** clientCert,
++                                       SECKEYPrivateKey** clientKey) {
++  ScopedCERTCertificate cert;
++  ScopedSECKEYPrivateKey priv;
++  // use a different certificate than TlsAgent::kClient
++  if (!TlsAgent::LoadCertificate(TlsAgent::kRsa2048, &cert, &priv)) {
++    return SECFailure;
++  }
++
++  *clientCert = cert.release();
++  *clientKey = priv.release();
++  return SECSuccess;
++}
++
++TEST_F(TlsConnectStreamTls13, PostHandshakeAuthMultiple) {
++  client_->SetupClientAuth();
++  EXPECT_EQ(SECSuccess, SSL_OptionSet(client_->ssl_fd(),
++                                      SSL_ENABLE_POST_HANDSHAKE_AUTH, PR_TRUE));
++  size_t called = 0;
++  server_->SetAuthCertificateCallback(
++      [&called](TlsAgent*, PRBool, PRBool) -> SECStatus {
++        called+

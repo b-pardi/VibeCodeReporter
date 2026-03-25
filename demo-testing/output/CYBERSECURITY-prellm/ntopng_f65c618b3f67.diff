@@ -1,0 +1,102 @@
+@@ -78,7 +78,7 @@ class LuaEngine {
+    */
+   int handle_script_request(struct mg_connection *conn,
+ 			    const struct mg_request_info *request_info, 
+-			    char *script_path, bool *attack_attempt, const char *user);
++			    char *script_path, bool *attack_attempt, const char *user, const char *group, bool localuser);
+ 
+   bool setParamsTable(lua_State* vm,
+ 		      const struct mg_request_info *request_info,
+
+
+
+
+@@ -381,13 +381,13 @@ class Ntop {
+ #endif
+ 
+   void getUsers(lua_State* vm);
+-  void getUserGroup(lua_State* vm);
++  bool isUserAdministrator(lua_State* vm);
+   void getAllowedNetworks(lua_State* vm);
+   bool getInterfaceAllowed(lua_State* vm, char *ifname)         const;
+   bool isInterfaceAllowed(lua_State* vm, const char *ifname)    const;
+   bool isInterfaceAllowed(lua_State* vm, int ifid)              const;
+-  bool isNonLocalUser(lua_State* vm);
+-  bool checkUserPassword(const char * const user, const char * const password) const;
++  bool isLocalUser(lua_State* vm);
++  bool checkUserPassword(const char * const user, const char * const password, char *group, bool *localuser) const;
+   bool checkUserInterfaces(const char * const user)             const;
+   bool resetUserPassword(char *username, char *old_password, char *new_password);
+   bool mustChangePassword(const char *user);
+
+
+
+
+@@ -66,7 +66,6 @@ class Utils {
+   static int ifname2id(const char *name);
+   static char* sanitizeHostName(char *str);
+   static char* urlDecode(const char *src, char *dst, u_int dst_len);
+-  static bool isUserAdministrator(lua_State* vm);
+   static bool purifyHTTPparam(char * const param, bool strict, bool allowURL, bool allowDots);
+   static char* stripHTML(const char * const str);
+   static bool postHTTPJsonData(char *username, char *password, char *url, char *json, HTTPTranferStats *stats);
+
+
+
+
+@@ -807,7 +807,10 @@
+ #define HOST_LOW_GOODPUT_THRESHOLD  25 /* No more than X low goodput flows per host */
+ #define FLOW_GOODPUT_THRESHOLD      40 /* 40% */
+ 
+-#define CUSTOM_GROUP_OF_USER          NTOPNG_PREFS_PREFIX".auth.%s.custom_group_of_user"
++#define NTOP_USERNAME_MAXLEN        33 /* NOTE: do not change, is this bound to mg_md5 ? */
++#define NTOP_GROUP_MAXLEN           33
++#define NTOP_SESSION_ID_LENGTH      33
++#define NTOP_UNKNOWN_GROUP "unknown"
+ #define PREF_NTOP_LDAP_AUTH           NTOPNG_PREFS_PREFIX".ldap.auth_enabled"
+ #define PREF_LDAP_ACCOUNT_TYPE        NTOPNG_PREFS_PREFIX".ldap.account_type"
+ #define PREF_LDAP_SERVER              NTOPNG_PREFS_PREFIX".ldap.ldap_server_address"
+@@ -832,7 +835,6 @@
+ #define PREF_HTTP_AUTHENTICATOR_URL   NTOPNG_PREFS_PREFIX".http_authenticator.http_auth_url"
+ #define MAX_HTTP_AUTHENTICATOR_LEN    256
+ #define MAX_HTTP_AUTHENTICATOR_RETURN_DATA_LEN      4096
+-#define PREF_USER_TYPE_LOG            NTOPNG_PREFS_PREFIX".user.%s.type_log"
+ #define PREF_NTOP_LOCAL_AUTH          NTOPNG_PREFS_PREFIX".local.auth_enabled"
+ 
+ /* Elastic Search */
+
+
+
+
+@@ -495,12 +495,13 @@ typedef struct {
+ class SNMP; /* Forward */
+ 
+ struct ntopngLuaContext {
+-  char *allowed_ifname, *user;
++  char *allowed_ifname, *user, *group;
+   void *zmq_context, *zmq_subscriber;
+   struct mg_connection *conn;
+   AddressTree *allowedNets;
+   NetworkInterface *iface;
+   SNMP *snmp;
++  bool localuser;
+   int (*luaL_pcall)(lua_State *);
+ 
+   /* Packet capture */
+
+
+
+
+@@ -104,8 +104,8 @@ static void redirect_to_ssl(struct mg_connection *conn,
+ // Generate session ID. buf must be 33 bytes in size.
+ // Note that it is easy to steal session cookies by sniffing traffic.
+ // This is why all communication must be SSL-ed.
+-static void generate_session_id(char *buf, const char *random, const char *user) {
+-  mg_md5(buf, random, user, NULL);
++static void generate_session_id(char *buf, const char *random, const char *user, const char *group) {
++  mg_md5(buf, random, user, group, NULL);
+ }
+ 
+ /* ****************************************** */
+@@ -155,8 +155,9 @@ static void traceLogin(const char *user, bool authorized) {
+ /* ***************

@@ -1,0 +1,116 @@
+@@ -7,7 +7,7 @@ import subprocess
+ import sys
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Iterator, List
++from typing import Iterator, List, Union
+ 
+ import nox
+ from nox import Session
+@@ -45,7 +45,7 @@ nox.options.error_on_missing_interpreters = True
+ @dataclass
+ class Plugin:
+     name: str
+-    path: str
++    abspath: str
+     module: str
+     source_dir: str
+     dir_name: str
+@@ -103,6 +103,25 @@ def install_hydra(session: Session, cmd: List[str]) -> None:
+         session.run("pipdeptree", "-p", "hydra-core")
+ 
+ 
++def install_selected_plugins(
++    session: Session,
++    install_cmd: List[str],
++    selected_plugins: List[Plugin],
++) -> None:
++    for plugin in selected_plugins:
++        cmd = install_cmd + [plugin.abspath]
++        session.run(*cmd, silent=SILENT)
++        if not SILENT:
++            session.run("pipdeptree", "-p", plugin.name)
++
++    # Test that we can import Hydra
++    session.run("python", "-c", "from hydra import main", silent=SILENT)
++
++    # Test that we can import all installed plugins
++    for plugin in selected_plugins:
++        session.run("python", "-c", f"import {plugin.module}")
++
++
+ def pytest_args(*args: str) -> List[str]:
+     ret = ["pytest"]
+     ret.extend(args)
+@@ -142,18 +161,22 @@ def list_plugins(directory: str) -> List[Plugin]:
+         if x not in blacklist
+     ]
+ 
++    # Install read-version in base python environment, needed to run setup.py
++    subprocess.check_output(
++        [sys.executable, "-m", "pip", "install", "read-version"],
++    )
++
+     plugins: List[Plugin] = []
+     for plugin in _plugins:
+ 
+-        setup_py = os.path.join(BASE, directory, plugin["path"], "setup.py")
+-        plugin_name = subprocess.run(
++        abspath = os.path.join(BASE, directory, plugin["path"])
++        setup_py = os.path.join(abspath, "setup.py")
++        plugin_name = subprocess.check_output(
+             [sys.executable, setup_py, "--name"],
+-            capture_output=True,
+-            text=True,
+-            check=True,
+-        ).stdout.strip()
++            universal_newlines=True,
++        ).strip()
+ 
+-        if "hydra_plugins" in os.listdir(os.path.join(BASE, directory, plugin["path"])):
++        if "hydra_plugins" in os.listdir(abspath):
+             module = "hydra_plugins." + plugin["dir_name"]
+             source_dir = "hydra_plugins"
+         else:
+@@ -163,7 +186,7 @@ def list_plugins(directory: str) -> List[Plugin]:
+         plugins.append(
+             Plugin(
+                 name=plugin_name,
+-                path=plugin["path"],
++                abspath=abspath,
+                 source_dir=source_dir,
+                 module=module,
+                 dir_name=plugin["dir_name"],
+@@ -178,60 +201,57 @@ def select_plugins_under_directory(session: Session, directory: str) -> List[Plu
+     Select all plugins under the current directory that should be tested in this session.
+     """
+     plugins_under_directory: List[Plugin] = list_plugins(directory)
+-    return filter_incompatible_plugins(session, plugins_under_directory)
++    selected_plugins = [
++        plugin
++        for plugin in plugins_under_directory
++        if is_plugin_compatible(session, plugin)
++    ]
+ 
++    if len(selected_plugins) == 0:
++        logger.warn("No plugins selected")
++
++    return selected_plugins
+ 
+-def filter_incompatible_plugins(
+-    session: Session, plugins: List[Plugin]
+-) -> List[Plugin]:
++
++def is_plugin_compatible(session: Session, plugin: Plugin) -> bool:
+     """
+     Considers the current Python version and operating systems against the supported ones,
+-    as well as the user plugins selection (via the PLUGINS environment variable).
++    as well as the user plugins selection (via the PLUGINS and SKIP_PLUGINS environment variables).
+     """
+     assert session.python is not None, "Session python version is not specified"
+ 
+-    ret = []
+-    skipped = []
+-    for plugin in plugins:
+-        if (
+-            not (plugin.dir_name in PLUGINS o

@@ -1,0 +1,100 @@
+@@ -36,6 +36,7 @@ import datetime
+ import ipaddress
+ from typing import TYPE_CHECKING, cast
+ import math
++import struct
+ 
+ from pcapkit.const.ipv4.classification_level import ClassificationLevel as Enum_ClassificationLevel
+ from pcapkit.const.ipv4.option_class import OptionClass as Enum_OptionClass
+@@ -110,7 +111,8 @@ if TYPE_CHECKING:
+     from pcapkit.protocols.protocol import Protocol
+ 
+     Option = OrderedMultiDict[Enum_OptionNumber, Data_Option]
+-    OptionParser = Callable[['IPv4', Enum_OptionNumber, NamedArg(Option, 'options')], Data_Option]
++    OptionParser = Callable[['IPv4', Enum_OptionNumber, NamedArg(bytes, 'data'), NamedArg(int, 'length'),
++                             NamedArg(Option, 'options')], Data_Option]
+     OptionConstructor = Callable[['IPv4', Enum_OptionNumber, DefaultArg(Optional[Data_Option]),
+                                   KwArg(Any)], Schema_Option]
+ 
+@@ -467,11 +469,9 @@ class IPv4(IP[Data_IPv4, Schema_IPv4]):
+             flag), option class, and option number.
+ 
+         """
+-        bin_ = bin(code)[2:].zfill(8)
+-
+-        oflg = bool(int(bin_[0], base=2))
+-        ocls = Enum_OptionClass.get(int(bin_[1:3], base=2))
+-        onum = int(bin_[3:], base=2)
++        oflg = bool(code >> 7)
++        ocls = Enum_OptionClass.get((code >> 5) & 0b11)
++        onum = code & 0b11111
+ 
+         return Data_OptionType.from_dict({
+             'change': oflg,
+@@ -492,23 +492,35 @@ class IPv4(IP[Data_IPv4, Schema_IPv4]):
+             ProtocolError: If the threshold is **NOT** matching.
+ 
+         """
++        payload = cast('bytes', self.__header__.options)
++        self.__header__.options = []
++
+         counter = 0                   # length of read option list
+         options = OrderedMultiDict()  # type: Option
+ 
+         while counter < length:
+             # break when eol triggerred
+-            code = self._read_unpack(1)
+-            if not code:
++            cbuf = payload[counter:counter + 1]
++            if not cbuf:
+                 break
+ 
+-            # get options type
++            # get option type
++            code = int(cbuf, base=2)
+             kind = Enum_OptionNumber.get(code)
+ 
++            # get option length
++            if code in (Enum_OptionNumber.NOP, Enum_OptionNumber.EOOL):
++                clen = 1
++            else:
++                cbuf = payload[counter + 1:counter + 2]
++                clen = struct.unpack('!B', cbuf)[0]
++
+             # extract option data
+             meth_name = f'_read_opt_{kind.name.lower()}'
+             meth = cast('OptionParser',
+                         getattr(self, meth_name, self._read_opt_unassigned))
+-            data = meth(self, kind, options=options)
++            data = meth(self, kind, data=payload[counter:counter + clen],
++                        length=clen, options=options)
+ 
+             # record option data
+             counter += data.length
+@@ -524,7 +536,8 @@ class IPv4(IP[Data_IPv4, Schema_IPv4]):
+ 
+         return options
+ 
+-    def _read_opt_unassigned(self, kind: 'Enum_OptionNumber', *, options: 'Option') -> 'Data_UnassignedOption':  # pylint: disable=unused-argument
++    def _read_opt_unassigned(self, kind: 'Enum_OptionNumber', *, data: 'bytes',
++                             length: 'int', options: 'Option') -> 'Data_UnassignedOption':  # pylint: disable=unused-argument
+         """Read IPv4 unassigned options.
+ 
+         Structure of IPv4 unassigned options [:rfc:`791`]:
+@@ -539,6 +552,8 @@ class IPv4(IP[Data_IPv4, Schema_IPv4]):
+ 
+         Arguments:
+             kind: option type code
++            data: option payload
++            length: option payload length
+             options: extracted IPv4 options
+ 
+         Returns:
+@@ -548,20 +563,22 @@ class IPv4(IP[Data_IPv4, Schema_IPv4]):
+             ProtocolError: If ``size`` is **LESS THAN** ``3``.
+ 
+         """
+-        size = self._read_unpack(1)
+-        if size < 3:
++        if length < 3:
+             raise ProtocolError(f'{self.alias}: [OptNo {kind}] invalid for

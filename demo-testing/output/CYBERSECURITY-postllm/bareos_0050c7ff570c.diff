@@ -1,0 +1,85 @@
+@@ -211,10 +211,10 @@ struct RestoreContext {
+   POOLMEM* fname = nullptr; /**< Filename only */
+   POOLMEM* path = nullptr;  /**< Path only */
+   POOLMEM* query = nullptr;
+-  int fnl = 0; /**< Filename length */
+-  int pnl = 0; /**< Path length */
+-  bool found = false;
+-  bool all = false; /**< Mark all as default */
++  int fnl = 0;        /**< Filename length */
++  int pnl = 0;        /**< Path length */
++  bool found = false; /**< the last handler found at least one result */
++  bool all = false;   /**< Mark all as default */
+ 
+   RestoreContext() = default;
+   ~RestoreContext() = default;
+
+
+
+
+@@ -1232,6 +1232,7 @@ static bool BuildDirectoryTree(UaContext* ua, RestoreContext* rx)
+     // Use first JobId as estimate of the number of files to restore
+     ua->db->FillQuery(rx->query, BareosDb::SQL_QUERY::uar_count_files,
+                       edit_int64(JobId, ed1));
++    rx->found = false;
+     if (!ua->db->SqlQuery(rx->query, RestoreCountHandler, (void*)rx)) {
+       ua->ErrorMsg("%s\n", ua->db->strerror());
+     }
+@@ -1266,6 +1267,7 @@ static bool BuildDirectoryTree(UaContext* ua, RestoreContext* rx)
+     // Find out if any Job is purged
+     Mmsg(rx->query, "SELECT SUM(PurgedFiles) FROM Job WHERE JobId IN (%s)",
+          rx->JobIds);
++    rx->found = false;
+     if (!ua->db->SqlQuery(rx->query, RestoreCountHandler, (void*)rx)) {
+       ua->ErrorMsg("%s\n", ua->db->strerror());
+     }
+
+
+
+
+@@ -541,12 +541,14 @@ void NativeVbackupCleanup(JobControlRecord* jcr, int TermCode, int JobLevel)
+  */
+ static int InsertBootstrapHandler(void* ctx, int, char** row)
+ {
+-  JobId_t JobId;
+-  int FileIndex;
+-  RestoreBootstrapRecord* bsr = (RestoreBootstrapRecord*)ctx;
++  auto* rx = static_cast<RestoreContext*>(ctx);
++  RestoreBootstrapRecord* bsr = rx->bsr.get();
+ 
+-  JobId = str_to_int64(row[3]);
+-  FileIndex = str_to_int64(row[2]);
++  // at least one file is found
++  rx->found = true;
++
++  JobId_t JobId = str_to_int64(row[3]);
++  int FileIndex = str_to_int64(row[2]);
+   AddFindex(bsr, JobId, FileIndex);
+   return 0;
+ }
+@@ -560,16 +562,23 @@ static bool CreateBootstrapFile(JobControlRecord& jcr,
+   }
+ 
+   PoolMem jobids_pm{jobids};
+-  RestoreContext rx;
++  RestoreContext rx = {};
+   rx.bsr = std::make_unique<RestoreBootstrapRecord>();
+   rx.JobIds = jobids_pm.addr();
+ 
++  rx.found = false;
++
+   if (DbLocker _{jcr.db_batch}; !jcr.db_batch->GetFileList(
+           &jcr, rx.JobIds, false /* don't use md5 */, true /* use delta */,
+-          InsertBootstrapHandler, (void*)rx.bsr.get())) {
++          InsertBootstrapHandler, &rx)) {
+     Jmsg(&jcr, M_ERROR, 0, "%s\n", jcr.db_batch->strerror());
+   }
+ 
++  if (!rx.found) {
++    Jmsg(&jcr, M_ERROR, 0, "No files were found in the jobids %s\n", rx.JobIds);
++    return false;
++  }
++
+   UaContext* ua = new_ua_context(&jcr);
+   AddVolumeInformationToBsr(ua, rx.bsr.get());
+   jcr.dir_impl->ExpectedFiles = WriteBsrFile(ua, rx);

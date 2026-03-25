@@ -1,0 +1,120 @@
+@@ -562,11 +562,15 @@ char *executable_path(const char *argv0);
+ /* addrset management functions and definitions */
+ /* A set of addresses. Used to match against allow/deny lists. */
+ struct addrset_elem;
++/* A radix tree (trie) used to match quickly against allow/deny lists. */
++struct trie_node;
+ 
+ /* A set of addresses. Used to match against allow/deny lists. */
+ struct addrset {
+     /* Linked list of struct addset_elem. */
+     struct addrset_elem *head;
++    /* Radix tree for faster matching of certain cases */
++    struct trie_node *trie;
+ };
+ 
+ void nbase_set_log(void (*log_user_func)(const char *, ...),void (*log_debug_func)(const char *, ...));
+
+
+
+
+@@ -156,19 +156,334 @@ void nbase_set_log(void (*log_user_func)(const char *, ...),void (*log_debug_fun
+         log_debug = log_debug_func;
+ }
+ 
++/* Node for a radix tree (trie) used to match certain addresses.
++ * Currently, only individual numeric IP and IPv6 addresses are matched using
++ * the trie. */
++struct trie_node {
++  /* The address prefix that this node represents. */
++  u32 addr[4];
++  /* The prefix mask. Bits in addr that are not within this mask are ignored. */
++  u32 mask[4];
++  /* Addresses with the next bit after the mask equal to 1 are on this branch. */
++  struct trie_node *next_bit_one;
++  /* Addresses with the next bit after the mask equal to 0 are on this branch. */
++  struct trie_node *next_bit_zero;
++};
++
++/* Special node pointer to represent "all possible addresses"
++ * This will be used to represent netmask specifications. */
++static struct trie_node *TRIE_NODE_TRUE = NULL;
++
+ void addrset_init(struct addrset *set)
+ {
+     set->head = NULL;
++    /* We could simply allocate one byte to get a unique address, but this
++     * feels safer and is not too large. */
++    if (TRIE_NODE_TRUE == NULL) {
++      TRIE_NODE_TRUE = (struct trie_node *) safe_zalloc(sizeof(struct trie_node));
++    }
++
++    /* Allocate the first node of the IPv4 trie */
++    set->trie = (struct trie_node *) safe_zalloc(sizeof(struct trie_node));
+ }
+ 
+ void addrset_free(struct addrset *set)
+ {
+     struct addrset_elem *elem, *next;
++    /* Since we descend only down one side, we at most accumulate one tree's-depth, or 128.
++     * Add 4 for safety to account for special root node and special empty stack position 0.
++     */
++    struct trie_node *stack[128+4];
++    struct trie_node *curr;
++    int i = 1;
+ 
+     for (elem = set->head; elem != NULL; elem = next) {
+         next = elem->next;
+         free(elem);
+     }
++
++    curr = set->trie;
++    while (i > 0) {
++      /* stash next_bit_one */
++      if (curr->next_bit_one != NULL && curr->next_bit_one != TRIE_NODE_TRUE) {
++        stack[i++] = curr->next_bit_one;
++      }
++      /* if next_bit_zero is valid, descend */
++      if (curr->next_bit_zero != NULL && curr->next_bit_zero != TRIE_NODE_TRUE) {
++        curr = curr->next_bit_zero;
++      }
++      else {
++        /* next_bit_one was stashed, next_bit_zero is invalid. Free it and move back up the stack. */
++        free(curr);
++        curr = stack[--i];
++      }
++    }
++}
++
++
++/* Public domain log2 function. https://graphics.stanford.edu/~seander/bithacks.html#IntegerLogLookup */
++static const char LogTable256[256] = {
++#define LT(n) n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n
++  -1, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
++  LT(4), LT(5), LT(5), LT(6), LT(6), LT(6), LT(6),
++  LT(7), LT(7), LT(7), LT(7), LT(7), LT(7), LT(7), LT(7)
++};
++
++/* Returns a mask representing the common prefix between 2 values. */
++u32 common_mask(u32 a, u32 b)
++{
++  u8 r;     // r will be lg(v)
++  u32 t, tt; // temporaries
++  u32 v = a ^ b;
++
++  if ((tt = v >> 16))
++  {
++    r = (t = tt >> 8) ? 24 + LogTable256[t] : 16 + LogTable256[tt];
++  }
++  else
++  {
++    r = (t = v >> 8) ? 8 + LogTable256[t] : LogTable256[v];
++  }
++  if (r + 1 >= 32) {
++    /* shifting this many bits would overflow. Just return max mask */
++    return 0xffffffff;
++  }
++  else {
++    return ~((1 << (r + 1)) - 1);
++  }
++

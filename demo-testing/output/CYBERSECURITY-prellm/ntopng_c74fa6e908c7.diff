@@ -1,0 +1,153 @@
+@@ -76,7 +76,7 @@ class LuaEngine {
+    *
+    * @return 0 if the script has been executed successfully.
+    */
+-  int run_script(char *script_path, NetworkInterface *iface, bool load_only = false, time_t deadline = 0);
++  int run_script(char *script_path, NetworkInterface *iface, bool load_only = false, time_t deadline = 0, bool no_pcall = false);
+ 
+   /**
+    * @brief Handling of request info of script.
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,45 @@
++/*
++ *
++ * (C) 2019 - ntop.org
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++ *
++ */
++
++#ifndef _LUA_REUSABLE_ENGINE_H_
++#define _LUA_REUSABLE_ENGINE_H_
++
++#include "ntop_includes.h"
++
++class LuaReusableEngine {
++ private:
++  LuaEngine *vm;
++  NetworkInterface *iface;
++  char *script_path;
++  int reload_interval;
++  time_t next_reload;
++
++  void reloadVm(time_t now);
++
++ public:
++  LuaReusableEngine(const char *_script_path, NetworkInterface *_iface, int _reload_interval);
++  ~LuaReusableEngine();
++
++  bool pcall(time_t deadline);
++  inline void setNextVmReload(time_t t) { next_reload = t; }
++};
++
++#endif
+
+
+
+
+@@ -80,6 +80,10 @@ class Ntop {
+   std::set<std::string> *new_malicious_ja3, *malicious_ja3, *malicious_ja3_shadow;
+   FifoStringsQueue *sqlite_alerts_queue, *alerts_notifications_queue, *internal_alerts_queue;
+ 
++#ifdef __linux__
++  int inotify_fd;
++#endif
++
+ #ifdef NTOPNG_PRO
+ #ifndef WIN32
+   NagiosManager *nagios_manager;
+
+
+
+
+@@ -38,6 +38,7 @@ class PeriodicActivities {
+   void sendShutdownSignal();
+ 
+   void lua(NetworkInterface *iface, lua_State *vm);
++  void reloadVMs();
+ };
+ 
+ #endif /* _PERIODIC_ACTIVITIES_H_ */
+
+
+
+
+@@ -37,10 +37,15 @@ class ThreadedActivity {
+   bool exclude_pcap_dump_interfaces;
+   bool thread_started;
+   bool systemTaskRunning;
++  bool reuse_vm;
+   bool *interfaceTasksRunning;
+   Mutex m;
+   ThreadPool *pool;
+   ThreadedActivityStats **threaded_activity_stats;
++  Mutex vms_mutex;
++
++  /* iface -> engine */
++  std::map<std::string, LuaReusableEngine*> vms;
+ 
+   void periodicActivityBody();
+   void aperiodicActivityBody();
+@@ -49,13 +54,15 @@ class ThreadedActivity {
+   void setInterfaceTaskRunning(NetworkInterface *iface, bool running);
+   bool isInterfaceTaskRunning(NetworkInterface *iface);
+   void updateThreadedActivityStats(NetworkInterface *iface, u_long latest_duration);
+-  
++  void reloadVm(const char *ifname);
++
+  public:
+   ThreadedActivity(const char* _path,		   
+ 		   u_int32_t _periodicity_seconds = 0,
+ 		   bool _align_to_localtime = false,
+ 		   bool _exclude_viewed_interfaces = false,
+ 		   bool _exclude_pcap_dump_interfaces = false,
++       bool _reuse_vm = false,
+ 		   ThreadPool* _pool = NULL);
+   ~ThreadedActivity();
+ 
+@@ -67,6 +74,7 @@ class ThreadedActivity {
+   inline void shutdown()      { terminating = true; };
+   void terminateEnqueueLoop();
+   bool isTerminating();
++  void setNextVmReload(time_t when);
+ 
+   void run();
+ 
+
+
+
+
+@@ -286,6 +286,7 @@ using namespace std;
+ #include "AlertsQueue.h"
+ #include "NetworkInterfaceTsPoint.h"
+ #include "LuaEngine.h"
++#include "LuaReusableEngine.h"
+ #include "AlertCheckLuaEngine.h"
+ #include "FlowAlertCheckLuaEngine.h"
+ #include "SyslogLuaEngine.h"
+
+
+
+
+@@ -11626,7 +11626,7 @@ static int post_iterator(void *cls,
+ /*
+   Run a Lua script from within ntopng (no HTTP GUI)
+ */
+-int LuaEngine::run_script(char *script_path,

@@ -1,0 +1,91 @@
+@@ -845,10 +845,7 @@ public class CumulusFrrConfigurationBuilder extends CumulusFrrParserBaseListener
+ 
+   @Override
+   public void enterS_router_ospf(S_router_ospfContext ctx) {
+-    if (_frr.getOspfProcess() == null) {
+-      _frr.setOspfProcess(new OspfProcess());
+-    }
+-    _currentOspfVrf = _frr.getOspfProcess().getDefaultVrf();
++    _currentOspfVrf = _frr.getOrCreateOspfProcess().getDefaultVrf();
+   }
+ 
+   @Override
+
+
+
+
+@@ -5,7 +5,6 @@ import static com.google.common.base.Preconditions.checkState;
+ import static java.util.Collections.singletonList;
+ import static java.util.stream.Collectors.groupingBy;
+ import static java.util.stream.Collectors.mapping;
+-import static org.batfish.common.util.CollectionUtil.toImmutableSortedMap;
+ import static org.batfish.datamodel.Configuration.DEFAULT_VRF_NAME;
+ import static org.batfish.datamodel.MultipathEquivalentAsPathMatchMode.EXACT_PATH;
+ import static org.batfish.datamodel.MultipathEquivalentAsPathMatchMode.PATH_LENGTH;
+@@ -24,6 +23,7 @@ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.ImmutableSortedMap;
+ import com.google.common.collect.ImmutableSortedSet;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Sets;
+@@ -82,6 +82,7 @@ import org.batfish.datamodel.bgp.RouteDistinguisher;
+ import org.batfish.datamodel.bgp.community.Community;
+ import org.batfish.datamodel.bgp.community.ExtendedCommunity;
+ import org.batfish.datamodel.ospf.OspfArea;
++import org.batfish.datamodel.ospf.OspfAreaSummary;
+ import org.batfish.datamodel.ospf.OspfInterfaceSettings;
+ import org.batfish.datamodel.ospf.OspfMetricType;
+ import org.batfish.datamodel.routing_policy.Common;
+@@ -202,6 +203,10 @@ public final class CumulusConversions {
+     return String.format("~OSPF_EXPORT_POLICY:%s~", vrfName);
+   }
+ 
++  public static String computeOspfAreaRangeFilterName(String vrfName, long area) {
++    return String.format("~OSPF_AREA_RANGE:%s:%s~", vrfName, area);
++  }
++
+   /**
+    * Infers the peer Ip for the interface. This is doable only if the interface has exactly one
+    * (primary) address that is a /30 or /31. For a /30, the address must NOT be the first or last
+@@ -1282,7 +1287,7 @@ public final class CumulusConversions {
+     }
+ 
+     addOspfInterfaces(vsConfig, vrfInterfaces, proc.getProcessId(), w);
+-    proc.setAreas(computeOspfAreas(vsConfig, vrfInterfaces.keySet()));
++    proc.setAreas(computeOspfAreas(c, vsConfig, ospfVrf, vrfInterfaces.keySet()));
+ 
+     // Handle Max Metric Router LSA
+     if (firstNonNull(vsConfig.getOspfProcess().getMaxMetricRouterLsa(), Boolean.FALSE)) {
+@@ -1425,7 +1430,10 @@ public final class CumulusConversions {
+ 
+   @VisibleForTesting
+   static SortedMap<Long, OspfArea> computeOspfAreas(
+-      CumulusConcatenatedConfiguration vsConfig, Collection<String> vrfIfaceNames) {
++      Configuration c,
++      CumulusConcatenatedConfiguration vsConfig,
++      OspfVrf ospfVrf,
++      Collection<String> vrfIfaceNames) {
+     Map<Long, List<String>> areaInterfaces =
+         vrfIfaceNames.stream()
+             .filter(
+@@ -1438,10 +1446,60 @@ public final class CumulusConversions {
+                     iface -> vsConfig.getOspfInterface(iface).get().getOspfArea(),
+                     mapping(Function.identity(), Collectors.toList())));
+ 
+-    return toImmutableSortedMap(
+-        areaInterfaces,
+-        Entry::getKey,
+-        e -> OspfArea.builder().setNumber(e.getKey()).addInterfaces(e.getValue()).build());
++    // Ensure that the VRF-level OSPF config has each area used.
++    areaInterfaces.keySet().forEach(ospfVrf::getOrCreateArea);
++
++    // Now convert each area
++    ImmutableSortedMap.Builder<Long, OspfArea> areas = ImmutableSortedMap.naturalOrder();
++    ospfVrf
++        .getAreas()
++        .values()
++        .forEach(
++            vrfArea -> {
++             

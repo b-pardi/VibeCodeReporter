@@ -1,0 +1,134 @@
+@@ -793,6 +793,7 @@ class Ntop {
+   inline BlacklistStats* getBlacklistStats() { return(&blStats); }
+   inline void resetBlacklistStats()          { blStats.reset();  }
+   inline JobQueue* getJobsQueue()            { return(&jobsQueue); }
++  inline PeriodicActivities* getPeriodicActivities() { return(pa); }
+ };
+ 
+ extern Ntop *ntop;
+
+
+
+
+@@ -26,7 +26,7 @@
+ 
+ class PeriodicActivities {
+  private:
+-  ThreadedActivity *activities[CONST_MAX_NUM_THREADED_ACTIVITIES];
++  ThreadedActivity *activities[CONST_MAX_NUM_THREADED_ACTIVITIES], *daily;
+   u_int16_t num_activities;
+   ThreadPool *th_pool;
+   pthread_t pthreadLoop;
+@@ -45,6 +45,7 @@ class PeriodicActivities {
+   void run();
+ 
+   inline bool isRunning() { return (thread_running); }
++  void forceStartDailyActivity();
+ };
+ 
+ #endif /* _PERIODIC_ACTIVITIES_H_ */
+
+
+
+
+@@ -30,6 +30,7 @@ class PeriodicScript;
+ class ThreadedActivity {
+  private:
+   u_int32_t deadline_approaching_secs;
++  bool force_run;
+   Mutex m;
+   bool randomDelaySchedule;
+   u_int32_t next_schedule;
+@@ -87,6 +88,7 @@ class ThreadedActivity {
+ 
+   void lua(NetworkInterface *iface, lua_State *vm);
+   void schedule(u_int32_t now);
++  inline void force() { force_run = true; /* Force activity schedule */}
+ };
+ 
+ #endif /* _THREADED_ACTIVITY_H_ */
+
+
+
+
+@@ -7363,6 +7363,14 @@ static int ntop_pools_unlock(lua_State *vm) {
+ 
+ /* **************************************************************** */
+ 
++static int ntop_force_run_daily_activities(lua_State *vm) {
++  ntop->getPeriodicActivities()->forceStartDailyActivity();
++  lua_pushboolean(vm, true);
++  return (ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_OK));  
++}
++
++/* **************************************************************** */
++
+ static luaL_Reg _ntop_reg[] = {
+     {"getDirs", ntop_get_dirs},
+     {"getInfo", ntop_get_info},
+@@ -7791,6 +7799,9 @@ static luaL_Reg _ntop_reg[] = {
+     {"sendKafkaMessage", ntop_send_kafka_message},
+ #endif
+ 
++    /* Debug */
++    {"forceRunDailyActivities", ntop_force_run_daily_activities },
++    
+     {NULL, NULL}
+ };
+ 
+
+
+
+
+@@ -49,6 +49,7 @@ PeriodicActivities::PeriodicActivities() {
+ 
+   th_pool = new ThreadPool();
+   thread_running = false;
++  daily = NULL;
+ }
+ 
+ /* ******************************************* */
+@@ -68,7 +69,8 @@ PeriodicActivities::~PeriodicActivities() {
+ /* ******************************************* */
+ 
+ void PeriodicActivities::lua(NetworkInterface *iface, lua_State *vm) {
+-  for (int i = 0; i < num_activities; i++) activities[i]->lua(iface, vm);
++  for (int i = 0; i < num_activities; i++)
++    activities[i]->lua(iface, vm);
+ }
+ 
+ /* **************************************************** */
+@@ -85,11 +87,12 @@ static void *startActivity(void *ptr) {
+ 
+ /* This is the main infinite loop */
+ void PeriodicActivities::run() {
+-  while (!(ntop->getGlobals()->isShutdownRequested() ||
+-           ntop->getGlobals()->isShutdown())) {
++  while (!(ntop->getGlobals()->isShutdownRequested()
++	   || ntop->getGlobals()->isShutdown())) {
+     u_int32_t now = (u_int32_t)time(NULL);
+ 
+-    for (u_int16_t i = 0; i < num_activities; i++) activities[i]->schedule(now);
++    for (u_int16_t i = 0; i < num_activities; i++)
++      activities[i]->schedule(now);
+ 
+     sleep(1);
+   }
+@@ -115,9 +118,8 @@ void PeriodicActivities::startPeriodicActivitiesLoop() {
+     ntop->getTrace()->traceEvent(TRACE_ERROR,
+                                  "The current user cannot access %s.",
+                                  ntop->get_callbacks_dir());
+-    ntop->getTrace()->traceEvent(
+-        TRACE_ERROR,
+-        "Please fix the directory right or add --dont-change-user to");
++    ntop->getTrace()->traceEvent(TRACE_ERROR,
++				 "Please fix the directory right or add --dont-change-user to");
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "the ntopng command line.");
+     exit(0);
+   }
+@@ -142,12 +144,16 @@ void PeriodicActivities::startPeriodicActivitiesLoop() {
+       continue;
+     }
+ 
+-    ta = new (std::nothrow) ThreadedActivity(
+-        ad[

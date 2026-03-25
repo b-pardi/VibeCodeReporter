@@ -1,0 +1,96 @@
+@@ -226,7 +226,7 @@ public class NetworkAccess {
+                 .exceptionally(t -> false));
+         return buildViaPeergosInstance(relative, relative, localDht, 7_000, hasher, true)
+                 .thenApply(net -> net.withStorage(s ->
+-                        new UnauthedCachingStorage(s, new JSBlockCache(cacheSizeKiB/1024)))
++                        new UnauthedCachingStorage(s, new JSBlockCache(cacheSizeKiB/1024), hasher))
+                         .withMutablePointerOfflineCache(m -> new OfflinePointerCache(m,
+                                 new JSPointerCache(2000, net.dhtClient),
+                                 onlineState)))
+
+
+
+
+@@ -5,6 +5,7 @@ import peergos.shared.cbor.*;
+ import peergos.shared.corenode.*;
+ import peergos.shared.crypto.*;
+ import peergos.shared.crypto.hash.*;
++import peergos.shared.hamt.*;
+ import peergos.shared.io.ipfs.cid.*;
+ import peergos.shared.io.ipfs.multihash.*;
+ import peergos.shared.mutable.*;
+@@ -54,8 +55,24 @@ public class BufferedStorage extends DelegatingStorage {
+ 
+     @Override
+     public CompletableFuture<List<byte[]>> getChampLookup(PublicKeyHash owner, Cid root, byte[] champKey, Optional<BatWithId> bat) {
+-        // We must do a local champ look up because of the unwritten blocks
+-        return getChampLookup(root, champKey, bat, hasher);
++        // Try to perform a local champ lookup from the buffer, falling back to a direct champ get
++        return Futures.asyncExceptionally(
++                () -> getChampLookup(root, champKey, bat, hasher),
++                t -> target.getChampLookup(owner, root, champKey, bat)
++        );
++    }
++
++    @Override
++    public CompletableFuture<List<byte[]>> getChampLookup(Cid root, byte[] champKey, Optional<BatWithId> bat, Hasher hasher) {
++        CachingStorage cache = new CachingStorage(new LocalOnlyStorage(storage), 100, 100 * 1024);
++        return ChampWrapper.create((Cid)root, x -> Futures.of(x.data), cache, hasher, c -> (CborObject.CborMerkleLink) c)
++                        .thenCompose(tree -> tree.get(champKey))
++                        .thenApply(c -> c.map(x -> x.target).map(MaybeMultihash::of).orElse(MaybeMultihash.empty()))
++                        .thenApply(btreeValue -> {
++                            if (btreeValue.isPresent())
++                                return cache.get((Cid) btreeValue.get(), bat);
++                            return Optional.empty();
++                        }).thenApply(x -> new ArrayList<>(cache.getCached()));
+     }
+ 
+     @Override
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,75 @@
++package peergos.shared.storage;
++
++import peergos.shared.cbor.*;
++import peergos.shared.corenode.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.cid.*;
++import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.storage.auth.*;
++import peergos.shared.util.*;
++
++import java.util.*;
++import java.util.concurrent.*;
++
++public class LocalOnlyStorage implements ContentAddressedStorage {
++    private static final IllegalStateException BLOCK_ABSENT = new IllegalStateException("Block not present locally!");
++
++    private final Map<Cid, OpLog.BlockWrite> storage;
++
++    public LocalOnlyStorage(Map<Cid, OpLog.BlockWrite> storage) {
++        this.storage = storage;
++    }
++
++    @Override
++    public CompletableFuture<Optional<CborObject>> get(Cid hash, Optional<BatWithId> bat) {
++        return getRaw(hash, bat).thenApply(res -> res.map(CborObject::fromByteArray));
++    }
++
++    @Override
++    public CompletableFuture<Optional<byte[]>> getRaw(Cid hash, Optional<BatWithId> bat) {
++        OpLog.BlockWrite res = storage.get(hash);
++        if (res != null)
++            return Futures.of(Optional.of(res.block));
++        return Futures.errored(BLOCK_ABSENT);
++    }
++
++    @Override
++    public CompletableFuture<List<byte[]>> getChampLookup(PublicKeyHash owner, Cid root, byte[] champKey, Optional<BatWithId> bat) {
++        throw new IllegalStateException("Unimplemented!");
++    }
++
++    @Override
++  

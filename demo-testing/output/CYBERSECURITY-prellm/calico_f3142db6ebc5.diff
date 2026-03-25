@@ -1,0 +1,106 @@
+@@ -8,7 +8,6 @@
+ __attribute__((section("calico_connect_v4_noop")))
+ int cali_noop_v4(struct bpf_sock_addr *ctx)
+ {
+-	enum calico_tc_flags flags = CALI_CGROUP;
+ 	CALI_INFO("Noop program executing\n");
+ 	return 1;
+ }
+@@ -16,7 +15,6 @@ int cali_noop_v4(struct bpf_sock_addr *ctx)
+ __attribute__((section("calico_connect_v4")))
+ int cali_ctlb_v4(struct bpf_sock_addr *ctx)
+ {
+-	enum calico_tc_flags flags = CALI_CGROUP;
+ 	int verdict = 1;
+ 
+ 	/* do not process anything non-TCP or non-UDP, but do not block it, will be
+@@ -43,7 +41,7 @@ int cali_ctlb_v4(struct bpf_sock_addr *ctx)
+ 	}
+ 
+ 	uint16_t dport = (uint16_t)(be32_to_host(ctx->user_port)>>16);
+-	struct calico_nat_dest *nat_dest = calico_v4_nat_lookup(ip_proto, ctx->user_ip4, dport, flags);
++	struct calico_nat_dest *nat_dest = calico_v4_nat_lookup(ip_proto, ctx->user_ip4, dport);
+ 	if (!nat_dest) {
+ 		goto out;
+ 	}
+
+
+
+
+@@ -132,25 +132,27 @@ enum calico_tc_flags {
+ 	CALI_CGROUP     = 1<<3,
+ };
+ 
+-#define CALI_TC_FLAGS_INGRESS(flags) (flags & CALI_TC_INGRESS)
+-#define CALI_TC_FLAGS_EGRESS(flags) (!(flags & CALI_TC_INGRESS))
+-#define CALI_TC_FLAGS_HOST_ENDPOINT(flags) (flags & CALI_TC_HOST_EP)
+-
+-#define CALI_TC_FLAGS_FROM_HOST_ENDPOINT(flags) ((flags & CALI_TC_HOST_EP) && (flags & CALI_TC_INGRESS))
+-
+-#define CALI_TC_FLAGS_FROM_WORKLOAD(flags) (!(flags & CALI_TC_HOST_EP) && !(flags & CALI_TC_INGRESS))
++#ifndef CALI_COMPILE_FLAGS
++#define CALI_COMPILE_FLAGS 0
++#endif
+ 
+-#define CALI_TC_FLAGS_TO_WORKLOAD(flags) (!(flags & CALI_TC_HOST_EP) && (flags & CALI_TC_INGRESS))
++#define CALI_F_INGRESS ((CALI_COMPILE_FLAGS) & CALI_TC_INGRESS)
++#define CALI_F_EGRESS  (!CALI_F_INGRESS)
+ 
+-#define CALI_TC_FLAGS_TO_HOST(flags) \
+-	(CALI_TC_FLAGS_FROM_HOST_ENDPOINT(flags) || CALI_TC_FLAGS_FROM_WORKLOAD(flags))
++#define CALI_F_HEP     ((CALI_COMPILE_FLAGS) & CALI_TC_HOST_EP)
++#define CALI_F_WEP     (!CALI_F_HEP)
++#define CALI_F_TUNNEL  ((CALI_COMPILE_FLAGS) & CALI_TC_TUNNEL)
+ 
+-#define CALI_TC_FLAGS_TO_HOST_ENDPOINT(flags) \
+-	((flags & CALI_TC_HOST_EP) && !(flags & CALI_TC_INGRESS))
++#define CALI_F_FROM_HEP (CALI_F_HEP && CALI_F_INGRESS)
++#define CALI_F_TO_HEP   (CALI_F_HEP && !CALI_F_INGRESS)
+ 
+-#define CALI_TC_FLAGS_L3(flags) ((flags & CALI_TC_HOST_EP) && !(flags & CALI_TC_INGRESS) && (flags & CALI_TC_TUNNEL))
++#define CALI_F_FROM_WEP (CALI_F_WEP && CALI_F_EGRESS)
++#define CALI_F_TO_WEP   (CALI_F_WEP && CALI_F_INGRESS)
+ 
+-#define CALI_TC_FLAGS_IPIP_ENCAPPED(flags) ((flags & CALI_TC_INGRESS) && (flags & CALI_TC_TUNNEL))
++#define CALI_F_TO_HOST       (CALI_F_FROM_HEP || CALI_F_FROM_WEP)
++#define CALI_F_FROM_HOST     (!CALI_F_TO_HOST)
++#define CALI_F_L3            (CALI_F_TO_HEP && CALI_F_TUNNEL)
++#define CALI_F_IPIP_ENCAPPED (CALI_F_INGRESS && CALI_F_TUNNEL)
+ 
+ enum calico_skb_mark {
+ 	// TODO allocate marks from the mark pool.
+
+
+
+
+@@ -65,7 +65,6 @@ struct calico_ct_value {
+ 
+ struct ct_ctx {
+ 	struct __sk_buff *skb;
+-	enum calico_tc_flags flags;
+ 	__u8 proto;
+ 	__be32 src;
+ 	__be32 orig_dst;
+@@ -88,7 +87,7 @@ struct bpf_map_def_extended __attribute__((section("maps"))) cali_v4_ct = {
+ #endif
+ };
+ 
+-static CALI_BPF_INLINE void dump_ct_key(struct calico_ct_key *k, enum calico_tc_flags flags)
++static CALI_BPF_INLINE void dump_ct_key(struct calico_ct_key *k)
+ {
+ 	CALI_VERB("CT-TCP   key A=%x:%d proto=%d\n", be32_to_host(k->addr_a), k->port_a, (int)k->protocol);
+ 	CALI_VERB("CT-TCP   key B=%x:%d size=%d\n", be32_to_host(k->addr_b), k->port_b, (int)sizeof(struct calico_ct_key));
+@@ -114,8 +113,6 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 		syn = ctx->tcp->syn;
+ 	}
+ 
+-	enum calico_tc_flags flags = ctx->flags;
+-
+ 	if ((ctx->skb->mark & CALI_SKB_MARK_SEEN_MASK) == CALI_SKB_MARK_SEEN) {
+ 		// Packet already marked as being from another workload, which will
+ 		// have created a conntrack entry.  Look that one up instead of
+@@ -136,7 +133,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 				.addr_b = ip_src, .port_b = sport,
+ 			};
+ 		}
+-		du

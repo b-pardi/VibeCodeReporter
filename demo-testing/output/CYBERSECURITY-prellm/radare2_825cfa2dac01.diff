@@ -1,0 +1,147 @@
+@@ -629,8 +629,8 @@ R_IPI int wasm_dis(WasmOp *op, const unsigned char *buf, int buf_len) {
+ 				if (!(n > 0 && n < buf_len)) {
+ 					goto err;
+ 				}
+-				switch (0x80 - val) {
+-				case R_BIN_WASM_VALUETYPE_EMPTY:
++				switch (val) {
++				case R_BIN_WASM_VALUETYPE_VOID:
+ 					r_strbuf_set (sb, opdef->txt);
+ 					break;
+ 				case R_BIN_WASM_VALUETYPE_i32:
+
+
+
+
+@@ -242,7 +242,6 @@ static RList *r_bin_wasm_get_sections_by_id(RList *sections, ut8 id) {
+ 	return ret;
+ }
+ 
+-#if 0
+ const char *r_bin_wasm_valuetype_to_string (r_bin_wasm_value_type_t type) {
+ 	switch (type) {
+ 	case R_BIN_WASM_VALUETYPE_i32:
+@@ -253,7 +252,7 @@ const char *r_bin_wasm_valuetype_to_string (r_bin_wasm_value_type_t type) {
+ 		return "f32";
+ 	case R_BIN_WASM_VALUETYPE_f64:
+ 		return "f64";
+-	case R_BIN_WASM_VALUETYPE_ANYFUNC:
++	case R_BIN_WASM_VALUETYPE_REFTYPE:
+ 		return "ANYFUNC";
+ 	case R_BIN_WASM_VALUETYPE_FUNC:
+ 		return "FUNC";
+@@ -262,33 +261,75 @@ const char *r_bin_wasm_valuetype_to_string (r_bin_wasm_value_type_t type) {
+ 	}
+ }
+ 
+-static char *r_bin_wasm_type_entry_to_string(RBinWasmTypeEntry *ptr) {
+-	if (!ptr) {
+-		return NULL;
++static inline bool strbuf_append_type_vec(RStrBuf *sb, RBinWasmTypeVec *vec) {
++	if (!r_strbuf_append (sb, "(")) {
++		return false;
+ 	}
+-	char *buf = (char*)calloc (ptr->param_count, 5);
+-	if (!buf) {
++	ut32 i;
++	for (i = 0; i < vec->count; i++) {
++		if (i > 0 && !r_strbuf_append (sb, ", ")) {
++			return false;
++		}
++		const char *s = r_bin_wasm_valuetype_to_string (vec->types[i]);
++		if (!s || !r_strbuf_append (sb, s)) {
++			return false;
++		}
++	}
++
++	if (!r_strbuf_append (sb, ")")) {
++		return false;
++	}
++	return true;
++}
++
++static bool append_rets(RStrBuf *sb, RBinWasmTypeVec *rets) {
++	bool ret = true;
++	if (!rets->count) {
++		ret &= r_strbuf_append (sb, "nil");
++	} else if (rets->count == 1) {
++		ret &= r_strbuf_append (sb, r_bin_wasm_valuetype_to_string (rets->types[0]));
++	} else {
++		ret &= strbuf_append_type_vec (sb, rets);
++	}
++	return ret;
++}
++
++static const char *r_bin_wasm_type_entry_to_string(RBinWasmTypeEntry *type) {
++	r_return_val_if_fail (type, NULL);
++	if (type->to_str) {
++		return type->to_str;
++	}
++
++	RStrBuf *sb = r_strbuf_new ("");
++	if (!sb) {
+ 		return NULL;
+ 	}
+-	int p;
+-	for (p = 0; p < ptr->param_count; p++) {
+-		strcat (buf, r_bin_wasm_valuetype_to_string (ptr->param_types[p]));
+-		if (p < ptr->param_count - 1) {
+-			strcat (buf, ", ");
+-		}
++	r_strbuf_reserve (sb, (type->args->count + type->rets->count) * 8);
++
++	bool appended = strbuf_append_type_vec (sb, type->args);
++	appended &= r_strbuf_append (sb, " -> ");
++	appended &= append_rets (sb, type->rets);
++	if (appended) {
++		type->to_str = r_strbuf_drain (sb);
++	} else {
++		r_strbuf_free (sb);
+ 	}
+-	snprintf (ptr->to_str, R_BIN_WASM_STRING_LENGTH, "(%s) -> (%s)",
+-		(ptr->param_count > 0? buf: ""),
+-		(ptr->return_count == 1? r_bin_wasm_valuetype_to_string (ptr->return_type): ""));
+-	free (buf);
+-	return ptr->to_str;
++	return type->to_str;
+ }
+-#endif
+ 
+ // Free
+-static void r_bin_wasm_free_types(RBinWasmTypeEntry *ptr) {
++static void free_type_vec(RBinWasmTypeVec *vec) {
++	if (vec) {
++		free (vec->types);
++		free (vec);
++	}
++}
++
++static void free_type_entry(RBinWasmTypeEntry *ptr) {
+ 	if (ptr) {
+-		free (ptr->param_types);
++		free_type_vec (ptr->args);
++		free_type_vec (ptr->rets);
++		free (ptr->to_str);
+ 		free (ptr);
+ 	}
+ }
+@@ -395,48 +436,55 @@ beach:
+ 	return ret;
+ }
+ 
+-static void *parse_type_entry(RBuffer *b, ut64 bound) {
+-	RBinWasmTypeEntry *ptr = R_NEW0 (RBinWasmTypeEntry);
+-	if (!ptr) {
++static inline ut8 *buf_read_new(RBuffer *b, ut64 len) {
++	ut8 *buf = malloc (len);
++	if (buf && r_buf_read (b, buf, len) < len) {
++		free (buf);
++		buf = NULL;
++	}
++	return buf;
++}
++
++static inline RBinWasmTypeVec *parse_type_vector(RBuffer *b, ut64 bound) {
++	RBinWasmTypeVec *vec = R_NEW0 (RBinWasmTypeVec);
++	// types are all ut8, so leb128 shouldn't be needed, we can reuse consume_str_new
++	if (vec && !consume_str_new (b, bound, &vec->count, (ch

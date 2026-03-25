@@ -1,0 +1,159 @@
+@@ -52,7 +52,6 @@ const char* stmt_name(StmtTag t)
+ 		"check-any-length",
+ 		"compiled-C++",
+ 		"ZAM",
+-		"ZAM-resumption",
+ 		"null",
+ 		"assert",
+ 	};
+
+
+
+
+@@ -31,7 +31,6 @@ enum StmtTag
+ 	STMT_CHECK_ANY_LEN, // internal reduced statement
+ 	STMT_CPP, // compiled C++
+ 	STMT_ZAM, // a ZAM function body
+-	STMT_ZAM_RESUMPTION, // resumes ZAM execution for "when" statements
+ 	STMT_NULL,
+ 	STMT_ASSERT,
+ #define NUM_STMTS (int(STMT_ASSERT) + 1)
+
+
+
+
+@@ -138,7 +138,6 @@ public:
+ 	std::shared_ptr<ProfileFunc> ProfilePtr() const { return pf; }
+ 
+ 	void SetBody(StmtPtr new_body) { body = std::move(new_body); }
+-	// void SetProfile(std::shared_ptr<ProfileFunc> _pf);
+ 	void SetProfile(std::shared_ptr<ProfileFunc> _pf) { pf = std::move(_pf); }
+ 
+ 	// The following provide a way of marking FuncInfo's as
+
+
+
+
+@@ -927,47 +927,6 @@ const ZInstI* ZAMCompiler::EndOfLoop(const ZInstI* inst, int depth) const
+ 	return insts1[i];
+ 	}
+ 
+-bool ZAMCompiler::VarIsAssigned(int slot) const
+-	{
+-	for ( auto& inst : insts1 )
+-		if ( inst->live && VarIsAssigned(slot, inst) )
+-			return true;
+-
+-	return false;
+-	}
+-
+-bool ZAMCompiler::VarIsAssigned(int slot, const ZInstI* i) const
+-	{
+-	// Special-case for table iterators, which assign to a bunch
+-	// of variables but they're not immediately visible in the
+-	// instruction layout.
+-	if ( i->op == OP_NEXT_TABLE_ITER_VAL_VAR_VVV || i->op == OP_NEXT_TABLE_ITER_VV )
+-		{
+-		auto& iter_vars = i->aux->loop_vars;
+-		for ( auto v : iter_vars )
+-			if ( v == slot )
+-				return true;
+-
+-		if ( i->op != OP_NEXT_TABLE_ITER_VAL_VAR_VVV )
+-			return false;
+-
+-		// Otherwise fall through, since that flavor of iterate
+-		// *does* also assign to slot 1.
+-		}
+-
+-	if ( i->op == OP_NEXT_VECTOR_ITER_VAL_VAR_VVVV && i->v2 == slot )
+-		return true;
+-
+-	if ( i->op_type == OP_VV_FRAME )
+-		// We don't want to consider these as assigning to the
+-		// variable, since the point of this method is to figure
+-		// out which variables don't need storing to the frame
+-		// because their internal value is never modified.
+-		return false;
+-
+-	return i->AssignsToSlot1() && i->v1 == slot;
+-	}
+-
+ bool ZAMCompiler::VarIsUsed(int slot) const
+ 	{
+ 	for ( auto& inst : insts1 )
+
+
+
+
+@@ -459,14 +459,6 @@ private:
+ 	const ZInstI* BeginningOfLoop(const ZInstI* inst, int depth) const;
+ 	const ZInstI* EndOfLoop(const ZInstI* inst, int depth) const;
+ 
+-	// True if any statement other than a frame sync assigns to the
+-	// given slot.
+-	bool VarIsAssigned(int slot) const;
+-
+-	// True if the given statement assigns to the given slot, and
+-	// it's not a frame sync.
+-	bool VarIsAssigned(int slot, const ZInstI* i) const;
+-
+ 	// True if any statement other than a frame sync uses the given slot.
+ 	bool VarIsUsed(int slot) const;
+ 
+
+
+
+
+@@ -33,20 +33,9 @@ void ZAMCompiler::Init()
+ 	{
+ 	InitGlobals();
+ 	InitArgs();
++	InitCaptures();
+ 	InitLocals();
+ 
+-#if 0
+-	// Complain about unused aggregates ... but not if we're inlining,
+-	// as that can lead to optimizations where they wind up being unused
+-	// but the original logic for using them was sound.
+-	if ( ! analysis_options.inliner )
+-		for ( auto a : pf->Inits() )
+-			{
+-			if ( pf->Locals().find(a) == pf->Locals().end() )
+-				reporter->Warning("%s unused", a->Name());
+-			}
+-#endif
+-
+ 	TrackMemoryManagement();
+ 
+ 	non_recursive = non_recursive_funcs.count(func) > 0;
+@@ -216,11 +205,6 @@ StmtPtr ZAMCompiler::CompileBody()
+ 	// Could erase insts1 here to recover memory, but it's handy
+ 	// for debugging.
+ 
+-#if 0
+-	if ( non_recursive )
+-		func->UseStaticFrame();
+-#endif
+-
+ 	auto zb = make_intrusive<ZBody>(func->Name(), this);
+ 	zb->SetInsts(insts2);
+ 
+
+
+
+
+@@ -1109,19 +1109,6 @@ const ZAMStmt ZAMCompiler::DoCall(const CallExpr* c, const NameExpr* n)
+ 			z.func = func_id->GetVal()->AsFunc();
+ 		}
+ 
+-	if ( n )
+-		{
+-		auto id = n->Id();
+-		if ( id->IsGlobal() )
+-			{
+-			AddInst(z);
+-			auto global_slot = global_id_to_info[id];
+-			z = ZInstI(OP_STORE_GLOBAL_V, global_slot);
+-			z.op_type = OP_V_I1;
+-			z.t = globalsI[glo

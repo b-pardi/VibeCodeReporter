@@ -1,0 +1,136 @@
+@@ -340,6 +340,12 @@ pass_to_stack:
+ 			  forwarding_reason, monitor);
+ 
+ 	cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, 0);
++#ifdef ENABLE_IPSEC
++	if (*dstID > UNMANAGED_ID && encrypt_key) {
++		set_encrypt_key(skb, encrypt_key);
++		set_identity(skb, SECLABEL);
++	}
++#endif
+ 	return TC_ACT_OK;
+ }
+ 
+@@ -658,7 +664,12 @@ pass_to_stack:
+ 
+ 	send_trace_notify(skb, TRACE_TO_STACK, SECLABEL, *dstID, 0, 0,
+ 			  forwarding_reason, monitor);
+-
++#ifdef ENABLE_IPSEC
++	if (*dstID > UNMANAGED_ID && encrypt_key) {
++		set_encrypt_key(skb, encrypt_key);
++		set_identity(skb, SECLABEL);
++	}
++#endif
+ 	cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, 0);
+ 	return TC_ACT_OK;
+ }
+
+
+
+
+@@ -160,7 +160,7 @@ reverse_proxy6(struct __sk_buff *skb, int l4_off, struct ipv6hdr *ip6, __u8 nh)
+ 
+ static inline int handle_ipv6(struct __sk_buff *skb, __u32 src_identity)
+ {
+-	struct remote_endpoint_info *info;
++	struct remote_endpoint_info *info = NULL;
+ 	union v6addr node_ip = { };
+ 	void *data, *data_end;
+ 	struct ipv6hdr *ip6;
+@@ -281,6 +281,14 @@ static inline int handle_ipv6(struct __sk_buff *skb, __u32 src_identity)
+ 	dst = (union v6addr *) &ip6->daddr;
+ 	if (ipv6_match_prefix_96(dst, &node_ip))
+ 		return DROP_NON_LOCAL;
++#endif
++#ifdef ENABLE_IPSEC
++	dst = (union v6addr *) &ip6->daddr;
++	info = ipcache_lookup6(&IPCACHE_MAP, dst, V6_CACHE_KEY_LEN);
++	if (secctx > UNMANAGED_ID && info && info->key) {
++		set_encrypt_key(skb, info->key);
++		set_identity(skb, secctx);
++	}
+ #endif
+ 	return TC_ACT_OK;
+ }
+@@ -363,7 +371,7 @@ reverse_proxy(struct __sk_buff *skb, int l4_off, struct iphdr *ip4, __u8 nh)
+ 
+ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ {
+-	struct remote_endpoint_info *info;
++	struct remote_endpoint_info *info = NULL;
+ 	struct ipv4_ct_tuple tuple = {};
+ 	struct endpoint_info *ep;
+ 	void *data, *data_end;
+@@ -479,6 +487,13 @@ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ 	 * will create a routing loop. Drop it. */
+ 	if ((ip4->daddr & IPV4_MASK) == (IPV4_GATEWAY & IPV4_MASK))
+ 		return DROP_NON_LOCAL;
++#endif
++#ifdef ENABLE_IPSEC
++	info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr, V4_CACHE_KEY_LEN);
++	if (secctx > UNMANAGED_ID && info && info->key) {
++		set_encrypt_key(skb, info->key);
++		set_identity(skb, secctx);
++	}
+ #endif
+ 	return TC_ACT_OK;
+ #endif
+@@ -540,7 +555,7 @@ static __always_inline int do_netdev(struct __sk_buff *skb)
+ 		/* Pass unknown traffic to the stack */
+ 		return TC_ACT_OK;
+ 
+-#if defined ENABLE_IPSEC && defined ENCAP_IFINDEX
++#ifdef ENABLE_IPSEC
+ 	if (1) {
+ 		__u32 magic = skb->mark & MARK_MAGIC_HOST_MASK;
+ 
+@@ -551,7 +566,11 @@ static __always_inline int do_netdev(struct __sk_buff *skb)
+ 			tunnel_endpoint = skb->cb[4];
+ 			skb->mark = 0;
+ 			bpf_clear_cb(skb);
++
++#ifdef ENCAP_IFINDEX
+ 			return __encap_and_redirect_with_nodeid(skb, tunnel_endpoint, seclabel, TRACE_PAYLOAD_LEN);
++#endif
++			return TC_ACT_OK;
+ 		}
+ 	}
+ #endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,142 @@
++/*
++ *  Copyright (C) 2019 Authors of Cilium
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++#include <node_config.h>
++#include <netdev_config.h>
++
++#include <bpf/api.h>
++
++#include <stdint.h>
++#include <stdio.h>
++
++#include <linux/if_packet.h>
++
++#include "lib/utils.h"
++#include "lib/common.h"
++#include "lib/maps.h"
++#include "li

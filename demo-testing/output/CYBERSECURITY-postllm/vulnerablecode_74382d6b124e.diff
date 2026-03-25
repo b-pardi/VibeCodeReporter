@@ -1,0 +1,89 @@
+@@ -332,7 +332,7 @@ class PackageV2Serializer(serializers.ModelSerializer):
+         return [vuln.vulnerability_id for vuln in obj.fixing_vulnerabilities.all()]
+ 
+ 
+-class AdvisoryPackageV2Serializer(serializers.ModelSerializer):
++class PackageV3Serializer(serializers.ModelSerializer):
+     purl = serializers.CharField(source="package_url")
+     risk_score = serializers.FloatField(read_only=True)
+     affected_by_vulnerabilities = serializers.SerializerMethodField()
+@@ -353,26 +353,38 @@ class AdvisoryPackageV2Serializer(serializers.ModelSerializer):
+ 
+     def get_affected_by_vulnerabilities(self, package):
+         """Return a dictionary with advisory as keys and their details, including fixed_by_packages."""
++        impacts = package.affected_in_impacts.select_related("advisory").prefetch_related(
++            "fixed_by_packages"
++        )
++
++        avids = {impact.advisory.avid for impact in impacts if impact.advisory_id}
++
++        latest_advisories = AdvisoryV2.objects.latest_for_avids(avids)
++        advisory_by_avid = {adv.avid: adv for adv in latest_advisories}
++
+         result = {}
+-        request = self.context.get("request")
+-        for impact in package.affected_in_impacts.all():
+-            advisory = impact.advisory
++
++        for impact in impacts:
++            avid = impact.advisory.avid
++            advisory = advisory_by_avid.get(avid)
++            if not advisory:
++                continue
+             fixed_by_packages = [pkg.purl for pkg in impact.fixed_by_packages.all()]
+-            code_fixes = CodeFixV2.objects.filter(advisory=advisory).distinct()
+-            code_fix_urls = [
+-                reverse("advisory-codefix-detail", args=[code_fix.id], request=request)
+-                for code_fix in code_fixes
+-            ]
+             result[advisory.avid] = {
+                 "advisory_id": advisory.avid,
+                 "fixed_by_packages": fixed_by_packages,
+-                "code_fixes": code_fix_urls,
+             }
+ 
+         return result
+ 
+     def get_fixing_vulnerabilities(self, package):
+-        return [impact.advisory.avid for impact in package.fixed_in_impacts.all()]
++        impacts = package.fixed_in_impacts.select_related("advisory")
++
++        avids = {impact.advisory.avid for impact in impacts if impact.advisory_id}
++
++        latest_advisories = AdvisoryV2.objects.latest_for_avids(avids)
++
++        return [adv.avid for adv in latest_advisories]
+ 
+     def get_next_non_vulnerable_version(self, package):
+         if next_non_vulnerable := package.get_non_vulnerable_versions()[0]:
+@@ -1013,9 +1025,9 @@ class PipelineScheduleV2ViewSet(CreateListRetrieveUpdateViewSet):
+         return "Pipeline Jobs"
+ 
+ 
+-class AdvisoriesPackageV2ViewSet(viewsets.ReadOnlyModelViewSet):
++class PackageV3ViewSet(viewsets.ReadOnlyModelViewSet):
+     queryset = PackageV2.objects.all()
+-    serializer_class = AdvisoryPackageV2Serializer
++    serializer_class = PackageV3Serializer
+     filter_backends = [filters.DjangoFilterBackend]
+     filterset_class = AdvisoryPackageV2FilterSet
+ 
+@@ -1039,35 +1051,42 @@ class AdvisoriesPackageV2ViewSet(viewsets.ReadOnlyModelViewSet):
+         )
+ 
+     def list(self, request, *args, **kwargs):
+-        filtered_queryset = self.filter_queryset(self.get_queryset())
+-        page = self.paginate_queryset(filtered_queryset)
++        queryset = self.filter_queryset(self.get_queryset())
++        page = self.paginate_queryset(queryset)
+ 
+-        advisories = set()
+-        if page is not None:
+-            for package in page:
+-                advisories.update({impact.advisory for impact in package.affected_in_impacts.all()})
+-                advisories.update({impact.advisory for impact in package.fixed_in_impacts.all()})
++        packages = page if page is not None else queryset
+ 
+-            # Serialize the vulnerabilities with advisory_id and advisory label as keys
+-            advisory_data = {f"{adv.avid}": AdvisoryV2Serializer(adv).data for adv in advisories}
++ 

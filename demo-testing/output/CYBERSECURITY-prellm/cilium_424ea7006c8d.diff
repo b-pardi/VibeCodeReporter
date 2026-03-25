@@ -1,0 +1,111 @@
+@@ -188,7 +188,8 @@ ct_recreate6:
+ 		 * reverse NAT.
+ 		 */
+ 		ct_state_new.src_sec_id = SECLABEL;
+-		ret = ct_create6(get_ct_map6(tuple), tuple, ctx, CT_EGRESS, &ct_state_new, verdict > 0);
++		ret = ct_create6(get_ct_map6(tuple), &CT_MAP_ANY6, tuple, ctx,
++				 CT_EGRESS, &ct_state_new, verdict > 0);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 		monitor = TRACE_PAYLOAD_LEN;
+@@ -537,8 +538,11 @@ ct_recreate4:
+ 		 * reverse NAT.
+ 		 */
+ 		ct_state_new.src_sec_id = SECLABEL;
+-		ret = ct_create4(get_ct_map4(&tuple), &tuple, ctx, CT_EGRESS,
+-				 &ct_state_new, verdict > 0);
++		/* We could avoid creating related entries for legacy ClusterIP
++		 * handling here, but turns out that verifier cannot handle it.
++		 */
++		ret = ct_create4(get_ct_map4(&tuple), &CT_MAP_ANY4, &tuple, ctx,
++				 CT_EGRESS, &ct_state_new, verdict > 0);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 		break;
+@@ -884,7 +888,8 @@ ipv6_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label, __u8 *reason,
+ 
+ 		ct_state_new.src_sec_id = src_label;
+ 		ct_state_new.node_port = ct_state.node_port;
+-		ret = ct_create6(get_ct_map6(&tuple), &tuple, ctx, CT_INGRESS, &ct_state_new, verdict > 0);
++		ret = ct_create6(get_ct_map6(&tuple), &CT_MAP_ANY6, &tuple, ctx, CT_INGRESS,
++				 &ct_state_new, verdict > 0);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 
+@@ -1091,7 +1096,8 @@ ipv4_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label, __u8 *reason,
+ 
+ 		ct_state_new.src_sec_id = src_label;
+ 		ct_state_new.node_port = ct_state.node_port;
+-		ret = ct_create4(get_ct_map4(&tuple), &tuple, ctx, CT_INGRESS, &ct_state_new, verdict > 0);
++		ret = ct_create4(get_ct_map4(&tuple), &CT_MAP_ANY4, &tuple, ctx, CT_INGRESS,
++				 &ct_state_new, verdict > 0);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 
+
+
+
+
+@@ -31,10 +31,10 @@
+ #endif
+ 
+ /* Map access/manipulation */
+-static void *BPF_FUNC(map_lookup_elem, void *map, const void *key);
+-static int BPF_FUNC(map_update_elem, void *map, const void *key,
++static void *BPF_FUNC(map_lookup_elem, const void *map, const void *key);
++static int BPF_FUNC(map_update_elem, const void *map, const void *key,
+ 		    const void *value, __u32 flags);
+-static int BPF_FUNC(map_delete_elem, void *map, const void *key);
++static int BPF_FUNC(map_delete_elem, const void *map, const void *key);
+ 
+ /* Time access */
+ static __u64 BPF_FUNC(ktime_get_ns);
+
+
+
+
+@@ -631,8 +631,9 @@ ct_update6_rev_nat_index(void *map, struct ipv6_ct_tuple *tuple,
+ }
+ 
+ /* Offset must point to IPv6 */
+-static __always_inline int ct_create6(void *map, struct ipv6_ct_tuple *tuple,
+-				      struct __ctx_buff *ctx, int dir,
++static __always_inline int ct_create6(const void *map_main, const void *map_related,
++				      struct ipv6_ct_tuple *tuple,
++				      struct __ctx_buff *ctx, const int dir,
+ 				      struct ct_state *ct_state,
+ 				      bool proxy_redirect)
+ {
+@@ -669,30 +670,26 @@ static __always_inline int ct_create6(void *map, struct ipv6_ct_tuple *tuple,
+ 	cilium_dbg3(ctx, DBG_CT_CREATED6, entry.rev_nat_index, ct_state->src_sec_id, 0);
+ 
+ 	entry.src_sec_id = ct_state->src_sec_id;
+-	if (map_update_elem(map, tuple, &entry, 0) < 0)
++	if (map_update_elem(map_main, tuple, &entry, 0) < 0)
+ 		return DROP_CT_CREATE_FAILED;
+ 
+-	/* Create an ICMPv6 entry to relate errors */
+-	struct ipv6_ct_tuple icmp_tuple = {
+-		.nexthdr = IPPROTO_ICMPV6,
+-		.sport = 0,
+-		.dport = 0,
+-		.flags = tuple->flags | TUPLE_F_RELATED,
+-	};
++	if (map_related != NULL) {
++		/* Create an ICMPv6 entry to relate errors */
++		struct ipv6_ct_tuple icmp_tuple = {
++			.nexthdr = IPPROTO_ICMPV6,
++			.sport = 0,
++			.dport = 0,
++			.flags = tuple->flags | TUPLE_F_RELATED,
++		};
+ 
+-	entry.seen_non_syn = true; /* For ICMP, there is no SYN. */
++		entry.seen_non_syn = true; /* For ICMP, there is no SYN. */
+ 
+-	ipv6_addr_copy(&icmp_tuple.daddr, &tuple->daddr);
+-	ipv6_addr_copy(&icmp_tuple.saddr, &tuple->saddr);
++		ipv6_addr_copy(&icmp_tuple.daddr, &tuple->daddr);
++		ipv6_addr_copy(&icmp_tuple.saddr, &tuple->saddr);
+ 
+-	/* FIXME: We could do a look

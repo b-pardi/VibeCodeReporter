@@ -1,0 +1,113 @@
+@@ -59,6 +59,7 @@ def main():
+           files_in(dir, 'onionshare_gui/mode') + \
+           files_in(dir, 'onionshare_gui/mode/share_mode') + \
+           files_in(dir, 'onionshare_gui/mode/receive_mode') + \
++          files_in(dir, 'onionshare_gui/mode/website_mode') + \
+           files_in(dir, 'install/scripts') + \
+           files_in(dir, 'tests')
+     pysrc = [p for p in src if p.endswith('.py')]
+
+
+
+
+@@ -51,6 +51,7 @@ def main(cwd=None):
+     parser.add_argument('--connect-timeout', metavar='<int>', dest='connect_timeout', default=120, help="Give up connecting to Tor after a given amount of seconds (default: 120)")
+     parser.add_argument('--stealth', action='store_true', dest='stealth', help="Use client authorization (advanced)")
+     parser.add_argument('--receive', action='store_true', dest='receive', help="Receive shares instead of sending them")
++    parser.add_argument('--website', action='store_true', dest='website', help=strings._("help_website"))
+     parser.add_argument('--config', metavar='config', default=False, help="Custom JSON config file location (optional)")
+     parser.add_argument('-v', '--verbose', action='store_true', dest='verbose', help="Log OnionShare errors to stdout, and web errors to disk")
+     parser.add_argument('filename', metavar='filename', nargs='*', help="List of files or folders to share")
+@@ -68,10 +69,13 @@ def main(cwd=None):
+     connect_timeout = int(args.connect_timeout)
+     stealth = bool(args.stealth)
+     receive = bool(args.receive)
++    website = bool(args.website)
+     config = args.config
+ 
+     if receive:
+         mode = 'receive'
++    elif website:
++        mode = 'website'
+     else:
+         mode = 'share'
+ 
+@@ -168,6 +172,15 @@ def main(cwd=None):
+         print(e.args[0])
+         sys.exit()
+ 
++    if mode == 'website':
++        # Prepare files to share
++        print(strings._("preparing_website"))
++        try:
++            web.website_mode.set_file_info(filenames)
++        except OSError as e:
++            print(e.strerror)
++            sys.exit(1)
++
+     if mode == 'share':
+         # Prepare files to share
+         print("Compressing files.")
+@@ -206,6 +219,8 @@ def main(cwd=None):
+         # Build the URL
+         if common.settings.get('public_mode'):
+             url = 'http://{0:s}'.format(app.onion_host)
++        elif mode == 'website':
++            url = 'http://onionshare:{0:s}@{1:s}'.format(web.slug, app.onion_host)
+         else:
+             url = 'http://{0:s}/{1:s}'.format(app.onion_host, web.slug)
+ 
+
+
+
+
+@@ -15,7 +15,7 @@ from .. import strings
+ 
+ from .share_mode import ShareModeWeb
+ from .receive_mode import ReceiveModeWeb, ReceiveModeWSGIMiddleware, ReceiveModeRequest
+-
++from .website_mode import WebsiteModeWeb
+ 
+ # Stub out flask's show_server_banner function, to avoiding showing warnings that
+ # are not applicable to OnionShare
+@@ -111,13 +111,15 @@ class Web(object):
+         self.receive_mode = None
+         if self.mode == 'receive':
+             self.receive_mode = ReceiveModeWeb(self.common, self)
++        elif self.mode == 'website':
++            self.website_mode = WebsiteModeWeb(self.common, self)
+         elif self.mode == 'share':
+             self.share_mode = ShareModeWeb(self.common, self)
+ 
+ 
+     def define_common_routes(self):
+         """
+-        Common web app routes between sending and receiving
++        Common web app routes between sending, receiving and website modes.
+         """
+         @self.app.errorhandler(404)
+         def page_not_found(e):
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,154 @@
++import os
++import sys
++import tempfile
++import mimetypes
++from flask import Response, request, render_template, make_response, send_from_directory
++from flask_httpauth import HTTPBasicAuth
++
++from .. import strings
++
++
++class WebsiteModeWeb(object):
++    """
++    All of the web logic for share mode
++    """
++    def __init__(self, common, web):
++        self.common = common
++        self.common.log('WebsiteModeWeb', '__init__')
++

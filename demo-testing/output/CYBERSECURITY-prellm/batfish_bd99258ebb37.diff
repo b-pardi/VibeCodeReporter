@@ -1,0 +1,101 @@
+@@ -222,6 +222,470 @@ public class TracerouteEngineImplContext {
+           _currentFlow,
+           _flowTraces);
+     }
++
++    private void processOutgoingInterfaceEdges(
++        String outgoingInterface, Ip nextHopIp, SortedSet<Edge> edges) {
++      checkArgument(!edges.isEmpty(), "No edges.");
++      Ip arpIp =
++          Route.UNSET_ROUTE_NEXT_HOP_IP.equals(nextHopIp) ? _currentFlow.getDstIp() : nextHopIp;
++
++      if (!processArpFailure(outgoingInterface, arpIp)) {
++        return;
++      }
++
++      _steps.add(buildExitOutputIfaceStep(outgoingInterface, TRANSMITTED));
++      Hop hop = new Hop(_currentNode, _steps);
++      _hops.add(hop);
++
++      for (Edge edge : edges) {
++        if (!edge.getNode1().equals(_currentNode.getName())) {
++          continue;
++        }
++        checkState(edge.getInt1().equals(outgoingInterface), "Edge is not for outgoingInterface");
++        String toNode = edge.getNode2();
++        String toIface = edge.getInt2();
++        if (isArpSuccessful(arpIp, _forwardingAnalysis, _configurations.get(toNode), toIface)) {
++          followEdge(edge).processHop();
++        }
++      }
++    }
++
++    @Nonnull
++    private ExitOutputIfaceStep buildExitOutputIfaceStep(String outputIface, StepAction action) {
++      return ExitOutputIfaceStep.builder()
++          .setDetail(
++              ExitOutputIfaceStepDetail.builder()
++                  .setOutputInterface(new NodeInterfacePair(_currentNode.getName(), outputIface))
++                  .setTransformedFlow(hopFlow(_originalFlow, _currentFlow))
++                  .build())
++          .setAction(action)
++          .build();
++    }
++
++    /**
++     * Checks ARP reply for {@param arpIp}. Returns whether someone replies. If not, also constructs
++     * the trace.
++     */
++    private boolean processArpFailure(String outgoingInterfaceName, Ip arpIp) {
++      String currentNodeName = _currentNode.getName();
++      String vrf = _currentConfig.getAllInterfaces().get(outgoingInterfaceName).getVrfName();
++      // halt processing and add neighbor-unreachable trace if no one would respond
++      if (_forwardingAnalysis
++          .getNeighborUnreachableOrExitsNetwork()
++          .get(currentNodeName)
++          .get(vrf)
++          .get(outgoingInterfaceName)
++          .containsIp(arpIp, _currentConfig.getIpSpaces())) {
++        FlowDisposition disposition =
++            computeDisposition(currentNodeName, outgoingInterfaceName, _currentFlow.getDstIp());
++        buildArpFailureTrace(outgoingInterfaceName, disposition);
++        return false;
++      }
++      return true;
++    }
++
++    private void processHop() {
++      checkState(_steps.isEmpty(), "Steps must be empty when processHop is called");
++
++      String currentNodeName = _currentNode.getName();
++      String inputIfaceName = _ingressInterface;
++      Configuration currentConfiguration = _configurations.get(currentNodeName);
++      if (currentConfiguration == null) {
++        throw new BatfishException(
++            String.format(
++                "Node %s is not in the network, cannot perform traceroute", currentNodeName));
++      }
++      if (processSessions()) {
++        // flow was processed by a session.
++        return;
++      }
++
++      Map<String, IpAccessList> aclDefinitions = currentConfiguration.getIpAccessLists();
++      NavigableMap<String, IpSpace> namedIpSpaces = currentConfiguration.getIpSpaces();
++
++      // trace was received on a source interface of this hop
++      if (inputIfaceName != null) {
++        _steps.add(createEnterSrcIfaceStep(currentConfiguration, inputIfaceName));
++
++        // apply ingress filter
++        IpAccessList inputFilter =
++            currentConfiguration.getAllInterfaces().get(inputIfaceName).getIncomingFilter();
++        if (inputFilter != null) {
++          if (applyFilter(inputFilter, INGRESS_FILTER) == DENIED) {
++            return;
++          }
++        }
++
++        TransformationResult transformationResult =
++            TransformationEvaluator.eval(
++ 

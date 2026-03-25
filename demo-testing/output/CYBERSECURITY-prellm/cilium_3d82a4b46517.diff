@@ -1,0 +1,166 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,566 @@
++/*
++ *  Copyright (C) 2017 Authors of Cilium
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ *  Parts from iproute2 bpf.c loader code:
++ *
++ *  This program is free software; you can distribute it and/or
++ *  modify it under the terms of the GNU General Public License
++ *  as published by the Free Software Foundation; either version
++ *  2 of the License, or (at your option) any later version.
++ *
++ *  Authors:
++ *
++ *    Daniel Borkmann <daniel@iogearbox.net>
++ *    Jiri Pirko <jiri@resnulli.us>
++ *    Alexei Starovoitov <ast@kernel.org>
++ */
++
++#include <stdio.h>
++#include <syslog.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <limits.h>
++
++#include <sys/syscall.h>
++#include <sys/stat.h>
++
++#include <arpa/inet.h>
++
++#include <linux/bpf.h>
++
++#include "elf/libelf.h"
++#include "elf/gelf.h"
++
++#include "iproute2/bpf_elf.h"
++
++#ifndef EM_BPF
++# define EM_BPF		247
++#endif
++
++#define ELF_MAX_MAPS	64
++
++#define STATE_PENDING	"pending"
++
++struct bpf_elf_sec_data {
++	GElf_Shdr	sec_hdr;
++	Elf_Data	*sec_data;
++	const char	*sec_name;
++};
++
++struct bpf_elf_ctx {
++	GElf_Ehdr	elf_hdr;
++	Elf		*elf_fd;
++	Elf_Data	*sym_tab;
++	Elf_Data	*str_tab;
++	Elf_Data	*map_tab;
++	int		map_len;
++	int		map_num;
++	int		map_sec;
++	int		sym_num;
++	int		obj_fd;
++};
++
++static int bpf(int cmd, union bpf_attr *attr, unsigned int size)
++{
++#ifndef __NR_bpf
++# if defined(__i386__)
++#  define __NR_bpf 357
++# elif defined(__x86_64__)
++#  define __NR_bpf 321
++# elif defined(__aarch64__)
++#  define __NR_bpf 280
++# else
++#  error __NR_bpf not defined.
++# endif
++#endif
++	return syscall(__NR_bpf, cmd, attr, size);
++}
++
++static int renameat2(int dfd1, const char *path1,
++		     int dfd2, const char *path2,
++		     unsigned int flags)
++{
++#ifndef __NR_renameat2
++# if defined(__i386__)
++#  define __NR_renameat2 353
++# elif defined(__x86_64__)
++#  define __NR_renameat2 316
++# elif defined(__aarch64__)
++#  define __NR_renameat2 276
++# else
++#  error __NR_renameat2 not defined.
++# endif
++#endif
++	return syscall(__NR_renameat2, dfd1, path1, dfd2, path2, flags);
++}
++
++static inline __u64 bpf_ptr_to_u64(const void *ptr)
++{
++	return (__u64)(unsigned long)ptr;
++}
++
++static int bpf_elf_check_ehdr(const struct bpf_elf_ctx *ctx)
++{
++	if (ctx->elf_hdr.e_type != ET_REL ||
++	    (ctx->elf_hdr.e_machine != EM_NONE &&
++	     ctx->elf_hdr.e_machine != EM_BPF) ||
++	    ctx->elf_hdr.e_version != EV_CURRENT) {
++		fprintf(stderr, "ELF format error, ELF file not for eBPF?\n");
++		return -EINVAL;
++	}
++
++	switch (ctx->elf_hdr.e_ident[EI_DATA]) {
++	default:
++		fprintf(stderr, "ELF format error, wrong endianness info?\n");
++		return -EINVAL;
++	case ELFDATA2LSB:
++		if (htons(1) == 1) {
++			fprintf(stderr,
++				"We are big endian, eBPF object is little endian!\n");
++			return -EIO;
++		}
++		break;
++	case ELFDATA2MSB:
++		if (htons(1) != 1) {
++			fprintf(stderr,
++				"We are little endian, eBPF object is big endian!\n");
++			return -EIO;
++		}
++		break;
++	}
++
++	return 0;
++}
++
++static int bpf_elf_init(struct bpf_elf_ctx *ctx, const char *pathname)
++{
++	int ret;
++
++	if (elf_version(EV_CURRENT) == EV_NONE)
++		return -EIO;
++	ctx->obj_fd = open(pathname, O_RDONLY);
++	if (ctx->obj_fd < 0)
++		ret

@@ -1,0 +1,135 @@
+@@ -586,8 +586,12 @@ R_API bool r_core_bin_load(RCore *r, const char *filenameuri, ut64 baddr) {
+ 	}
+ 
+ 	if (plugin && plugin->name) {
+-		if (!strncmp (plugin->name, "any", 3)) {
+-			r_io_map_new (r->io, desc->fd, desc->perm, 0, laddr, r_io_desc_size (desc));
++		if (!strcmp (plugin->name, "any")) {
++			if (r_str_startswith (desc->name, "rap") && strstr (desc->name, "://")) {
++				r_io_map_new (r->io, desc->fd, desc->perm, 0, laddr, UT64_MAX);
++			} else {
++				r_io_map_new (r->io, desc->fd, desc->perm, 0, laddr, r_io_desc_size (desc));
++			}
+ 			// set use of raw strings
+ 			//r_config_set (r->config, "bin.rawstr", "true");
+ 			// r_config_set_i (r->config, "io.va", false);
+
+
+
+
+@@ -2041,6 +2041,9 @@ static int r_core_cmd_subst(RCore *core, char *cmd) {
+ 				*http = 0;
+ 			}
+ 		}
++		r_cons_printf ("HTTP/1.0 %d %s\r\n%s"
++				"Connection: close\r\nContent-Length: %d\r\n\r\n",
++				200, "OK", "", -1);
+ 		return r_core_cmd0 (core, cmd);
+ 	}
+ 
+
+
+
+
+@@ -174,7 +174,7 @@ R_API char *r_core_get_theme () {
+ R_API RList *r_core_list_themes(RCore *core) {
+ 	RList *list = r_list_newf (free);
+ 	getNext = false;
+-	const char *tmp = strdup ("default");
++	char *tmp = strdup ("default");
+ 	r_list_append (list, tmp);
+ 	char *path = r_str_home (R2_HOME_THEMES R_SYS_DIR);
+ 	if (path) {
+
+
+
+
+@@ -2915,7 +2915,7 @@ R_API RAnalOp *r_core_op_anal(RCore *core, ut64 addr) {
+ static void rap_break (void *u) {
+ 	RIORap *rior = (RIORap*) u;
+ 	if (u) {
+-		r_socket_free (rior->fd);
++		r_socket_close (rior->fd);
+ 		rior->fd = NULL;
+ 	}
+ }
+@@ -3047,7 +3047,10 @@ reaccept:
+ 						cmd[i] = '\0';
+ 						eprintf ("len: %d cmd:'%s'\n", i, cmd);
+ 						fflush (stdout);
++						int scr_interactive = r_config_get_i (core->config, "scr.interactive");
++						r_config_set_i (core->config, "scr.interactive", 0);
+ 						cmd_output = r_core_cmd_str (core, cmd);
++						r_config_set_i (core->config, "scr.interactive", scr_interactive);
+ 						free (cmd);
+ 					} else {
+ 						eprintf ("rap: cannot malloc\n");
+@@ -3148,9 +3151,38 @@ reaccept:
+ 				}
+ 				break;
+ 			default:
+-				eprintf ("unknown command 0x%02x\n", cmd);
+-				r_socket_close (c);
+-				R_FREE (ptr);
++				if (cmd == 'G') {
++					// silly http emulation over rap://
++					char line[256] = {0};
++					char *cmd = line;
++					r_socket_read (c, (ut8*)line, sizeof (line));
++					if (!strncmp (line, "ET /cmd/", 8)) {
++						cmd = line + 8;
++						char *http = strstr (cmd, "HTTP");
++						if (http) {
++							*http = 0;
++							http--;
++							if (*http == ' ') {
++								*http = 0;
++							}
++						}
++						r_str_uri_decode (cmd);
++						char *res = r_core_cmd_str (core, cmd);
++						if (res) {
++							r_socket_printf (c, "HTTP/1.0 %d %s\r\n%s"
++									"Connection: close\r\nContent-Length: %d\r\n\r\n",
++									200, "OK", "", -1); // strlen (res));
++							r_socket_write (c, res, strlen (res));
++							free (res);
++						}
++						r_socket_flush (c);
++						r_socket_close (c);
++					}
++				} else {
++					eprintf ("[r2p] unknown command 0x%02x\n", cmd);
++					r_socket_close (c);
++					R_FREE (ptr);
++				}
+ 				if (r_config_get_i (core->config, "rap.loop")) {
+ 					eprintf ("rap: waiting for new connection\n");
+ 					r_socket_free (c);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - Copyright 2009-2018 - pancake, nibble */
++/* radare - Copyright 2009-2019 - pancake, nibble */
+ 
+ #include "r_core.h"
+ #include "r_socket.h"
+@@ -1796,9 +1796,11 @@ static bool r_core_rtr_rap_run(RCore *core, const char *input) {
+ 	if (fd) {
+ 		if (r_io_is_listener (core->io)) {
+ 			if (!r_core_serve (core, fd)) {
+-				r_cons_singleton () ->context->breaked = true;
++				r_cons_singleton ()->context->breaked = true;
+ 			}
+-			r_io_desc_free (fd);
++			r_io_desc_close (fd);
++			// avoid doble free, we are not the owners of this fd so we cant destroy it
++			//r_io_desc_free (fd);
+ 		}
+ 	} else {
+ 		r_cons_singleton ()->context->breaked = true;
+@@ -1873,7 +1875,6 @@ R_API void r_core_rtr_cmd(RCore *core, const char *input) {
+ 
+ 	if (rtr_host[rtr_n].proto == RTR_PROTOC

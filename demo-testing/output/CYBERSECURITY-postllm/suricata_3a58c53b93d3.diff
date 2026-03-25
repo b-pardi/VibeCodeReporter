@@ -1,0 +1,115 @@
+@@ -740,11 +740,18 @@ static int StatsOutput(ThreadVars *tv)
+         memset(&thread_table_from_private, 0x00, max_id * sizeof(StatsLocalCounter));
+ 
+         /* copy private table to a local variable to loop it w/o lock */
++        bool skip = false;
+         SCSpinLock(&sts->ctx->lock);
+         uint16_t table_size = sts->ctx->curr_id + 1;
+-        memcpy(&thread_table_from_private, sts->ctx->copy_of_private,
+-                table_size * sizeof(StatsLocalCounter));
++        if (sts->ctx->copy_of_private == NULL) {
++            skip = true;
++        } else {
++            memcpy(&thread_table_from_private, sts->ctx->copy_of_private,
++                    table_size * sizeof(StatsLocalCounter));
++        }
+         SCSpinUnlock(&sts->ctx->lock);
++        if (skip)
++            goto next;
+ 
+         /* loop counters and handle them. This includes the global counters, which
+          * access the StatsCounters but don't modify them. */
+@@ -829,6 +836,7 @@ static int StatsOutput(ThreadVars *tv)
+             }
+         }
+ 
++    next:
+         sts = sts->next;
+         thread--;
+     }
+@@ -1148,8 +1156,7 @@ static int StatsThreadSetupPublic(StatsPublicThreadContext *pctx)
+ static int StatsThreadRegister(const char *thread_name, StatsPublicThreadContext *pctx)
+ {
+     if (stats_ctx == NULL) {
+-        SCLogDebug("Counter module has been disabled");
+-        return 0;
++        return 1;
+     }
+ 
+     if (thread_name == NULL || pctx == NULL) {
+@@ -1184,6 +1191,7 @@ static int StatsThreadRegister(const char *thread_name, StatsPublicThreadContext
+     }
+ 
+     if (StatsThreadSetupPublic(pctx) != 0) {
++        SCLogDebug("failed to setup StatsThreadSetupPublic");
+         SCMutexUnlock(&stats_ctx->sts_lock);
+         return 0;
+     }
+@@ -1234,10 +1242,16 @@ static int StatsGetAllCountersArray(
+ 
+ int StatsSetupPrivate(ThreadVars *tv)
+ {
+-    StatsGetAllCountersArray(&(tv)->perf_public_ctx, &(tv)->perf_private_ctx);
++    int r = StatsGetAllCountersArray(&(tv)->perf_public_ctx, &(tv)->perf_private_ctx);
++    if (r < 0) {
++        return -1;
++    }
+ 
+-    StatsThreadRegister(tv->printable_name ? tv->printable_name : tv->name,
+-        &(tv)->perf_public_ctx);
++    r = StatsThreadRegister(
++            tv->printable_name ? tv->printable_name : tv->name, &(tv)->perf_public_ctx);
++    if (r != 1) {
++        return -2;
++    }
+     return 0;
+ }
+ 
+@@ -1269,7 +1283,7 @@ static int StatsUpdateCounterArray(StatsPrivateThreadContext *pca, StatsPublicTh
+         return -1;
+     }
+ 
+-    if (pca->size > 0) {
++    if (pca->size > 0 && pctx->copy_of_private != NULL) {
+         /* copy the whole table under lock to the public section
+          * and release the lock. The stats thread will copy it from
+          * there. */
+
+
+
+
+@@ -1149,12 +1149,14 @@ static TmEcode UnixManagerThreadDeinit(ThreadVars *t, void *data)
+ 
+ static TmEcode UnixManager(ThreadVars *th_v, void *thread_data)
+ {
+-    int ret;
+-
+     /* set the thread name */
+     SCLogDebug("%s started...", th_v->name);
+ 
+-    StatsSetupPrivate(th_v);
++    int r = StatsSetupPrivate(th_v);
++    if (r != 0) {
++        SCLogError("stats setup failed with code %d", r);
++        return TM_ECODE_FAILED;
++    }
+ 
+     /* Set the threads capability */
+     th_v->cap_flags = 0;
+@@ -1163,7 +1165,7 @@ static TmEcode UnixManager(ThreadVars *th_v, void *thread_data)
+     TmThreadsSetFlag(th_v, THV_INIT_DONE | THV_RUNNING);
+ 
+     while (1) {
+-        ret = UnixMain(&command);
++        int ret = UnixMain(&command);
+         if (ret == 0) {
+             SCLogError("Fatal error on unix socket");
+         }
+@@ -1184,7 +1186,6 @@ static TmEcode UnixManager(ThreadVars *th_v, void *thread_data)
+     return TM_ECODE_OK;
+ }
+ 
+-
+ /** \brief Spawn the unix socket manager thread
+  *
+  * \param mode if set to 1, init failure cause suricata exit

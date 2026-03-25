@@ -1,0 +1,123 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,597 @@
++/* radare2 - LGPL - Copyright 2025 - pancake */
++
++#define R_LOG_ORIGIN "bin.som"
++
++#include "som.h"
++#include <string.h>
++
++// XXX this is a hack because we should be able to find out the interpreter from the dynamicloaderheader instead of this crap
++static char *som_find_interpreter_path(RBuffer *b) {
++	const char *pattern = "dld.sl";
++	const ut64 size = r_buf_size (b);
++	if (!size || size > (1ULL << 26)) {
++		return NULL;
++	}
++	ut8 *tmp = malloc (size);
++	if (!tmp) {
++		return NULL;
++	}
++	if (r_buf_read_at (b, 0, tmp, size) != size) {
++		free (tmp);
++		return NULL;
++	}
++	char *res = NULL;
++	const size_t pat_len = strlen (pattern);
++	const ut8 *match = r_mem_mem (tmp, size, (const ut8 *)pattern, pat_len);
++	if (match) {
++		// scan backward to find the start of the string
++		const ut8 *start = match;
++		while (start > tmp && *(start - 1) != '\0') {
++			start--;
++		}
++		size_t offset = start - tmp;
++		size_t len = r_str_nlen ((const char *)start, size - offset);
++		if (len > 0) {
++			res = r_str_ndup ((const char *)start, len);
++		}
++	}
++	free (tmp);
++	return res;
++}
++
++static bool is_valid_magic(const uint8_t *buf) {
++	uint16_t magic = r_read_be16 (buf + 2);
++	switch (magic) {
++	case SOM_MAGIC_RELOC:
++	case SOM_MAGIC_EXEC:
++	case SOM_MAGIC_SHARE:
++	case SOM_MAGIC_SHMEM:
++	case SOM_MAGIC_DEMAND:
++	case SOM_MAGIC_DL:
++	case SOM_MAGIC_SHL:
++		return true; /* match found */
++	default:
++		return false; /* no match */
++	}
++}
++
++R_IPI bool r_bin_som_check_buffer(RBuffer *b) {
++	if (!b || r_buf_size (b) < 4) {
++		return false;
++	}
++	ut8 buf[4];
++	if (r_buf_read_at (b, 0, buf, sizeof (buf)) != sizeof (buf)) {
++		return false;
++	}
++	return is_valid_magic (buf);
++}
++
++static void read_string_table(RBuffer *b, ut64 location, ut32 size, char **strings) {
++	if (location > 0 && size > 0) {
++		char *data = malloc (size);
++		if (data) {
++			if (r_buf_read_at (b, location, (ut8 *)data, size) == size) {
++				*strings = data;
++			} else {
++				free (data);
++			}
++		}
++	}
++}
++
++static void parse_som_header(RSomFile *obj, RBuffer *b, const ut8 *header) {
++	obj->hdr.system_id = r_read_be16 (header + 0);
++	obj->hdr.magic = r_read_be16 (header + 2);
++	obj->hdr.version_id = r_read_be32 (header + 4);
++	obj->hdr.file_time.secs = r_read_be32 (header + 8);
++	obj->hdr.file_time.nanosecs = r_read_be32 (header + 12);
++	obj->hdr.entry_space = r_read_be32 (header + 16);
++	obj->hdr.entry_subspace = r_read_be32 (header + 20);
++	obj->hdr.entry_offset = r_read_be32 (header + 24);
++	obj->hdr.aux_header_location = r_read_be32 (header + 28);
++	obj->hdr.aux_header_size = r_read_be32 (header + 32);
++	obj->hdr.som_length = r_read_be32 (header + 36);
++	obj->hdr.presumed_dp = r_read_be32 (header + 40);
++	obj->hdr.space_location = r_read_be32 (header + 44);
++	obj->hdr.space_total = r_read_be32 (header + 48);
++	obj->hdr.subspace_location = r_read_be32 (header + 52);
++	obj->hdr.subspace_total = r_read_be32 (header + 56);
++	obj->hdr.loader_fixup_location = r_read_be32 (header + 60);
++	obj->hdr.loader_fixup_total = r_read_be32 (header + 64);
++	obj->hdr.space_strings_location = r_read_be32 (header + 68);
++	obj->hdr.space_strings_size = r_read_be32 (header + 72);
++	obj->hdr.init_array_location = r_read_be32 (header + 76);
++	obj->hdr.init_array_total = r_read_be32 (header + 80);
++	obj->hdr.compiler_location = r_read_be32 (header + 84);
++	obj->hdr.compiler_total = r_read_be32 (header + 88);
++	obj->hdr.symbol_location = r_read_be32 (header + 92);
++	obj->hdr.symbol_total = r_read_be32 (header + 96);
++	obj->hdr.fixup_request_location = r_read_be32 (header + 100);
++	obj->hdr.fixup_request_total = r_read_be32 (header + 104);
++	obj->hdr.symbol_strings_location = r_read_be32 (header + 108);
++	obj->hdr.symbol_strings_size = r_read_be32 (header + 112);
++	obj->hdr.unloadable_sp_location = r_read_be32 (header + 116);
++	obj->hdr.unloadable_sp_size = r_read_be32 (header + 120);
++	obj->hdr.checksum = r_read_be32 (header + 124);
++}
++
++static RSomDlHead

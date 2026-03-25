@@ -1,0 +1,92 @@
+@@ -4,13 +4,12 @@
+ 
+ import logging
+ import struct
+-from typing import Callable, Tuple, List, Dict
++from typing import List, Set
+ 
+-from volatility3.framework import interfaces, exceptions, constants, objects
++from volatility3.framework import exceptions, constants
+ from volatility3.framework.renderers import TreeGrid, NotAvailableValue, format_hints
+ from volatility3.framework.configuration import requirements
+ from volatility3.framework.interfaces import plugins
+-from volatility3.framework.objects import utility
+ from volatility3.framework.symbols import linux
+ from volatility3.plugins.linux import sockstat
+ from volatility3.framework import symbols
+@@ -41,6 +40,62 @@ class Sockscan(plugins.PluginInterface):
+             ),
+         ]
+ 
++    def _canonicalize_symbol_addrs(
++        self, symbol_table_name: List[str], symbol_names: str
++    ) -> Set[bytes]:
++        """Takes a list of symbol names and converts the address of each to the bytes
++        as they would appear in memory so that they can be scanned for.
++
++        Symbols that cannot be found are ignored and not included in the results.
++
++        Args:
++            symbol_table_name: The name of the kernel module on which to operate
++            symbol_names: A list of symbol names to be looked up
++
++        Returns:
++            A set of bytes which are the packed addresses.
++        """
++        # get vmlinux module from context in order to build objects and read symbols
++        vmlinux = self.context.modules[symbol_table_name]
++
++        # get kernel layer from context so that it's dependencies can be found, and therefore scanned.
++        # kernel layer will be virtual and built ontop of a physical layer.
++        kernel_layer = self.context.layers[vmlinux.layer_name]
++
++        # detmine if kernel is 64bit or not. The plugin scans for pointers and these need to formated
++        # to the correct size so that they can be accurately located in the physical layer.
++        if symbols.symbol_table_is_64bit(self.context, vmlinux.symbol_table_name):
++            pack_format = "Q"  # 64 bit
++        else:
++            pack_format = "I"  # 32 bit
++
++        packed_needles = set()
++        for symbol_name in symbol_names:
++            try:
++                needle_addr = vmlinux.object_from_symbol(symbol_name).vol.offset
++            except exceptions.SymbolError:
++                vollog.log(
++                    constants.LOGLEVEL_VVVV,
++                    f"Unable to find symbol {symbol_name} this will not be scanned for.",
++                )
++                continue
++            # use canonicalize to set the appropriate sign extension for the addr
++            addr = kernel_layer.canonicalize(needle_addr)
++            packed_addr = struct.pack(pack_format, addr)
++            packed_needles.add(packed_addr)
++            vollog.log(
++                constants.LOGLEVEL_VVVV,
++                f"Will scan for {symbol_name} using the bytes: {packed_addr.hex()}",
++            )
++
++        # make a warning if no symbols at all could be resolved.
++        if len(packed_needles) == 0:
++            vollog.warning(
++                f"_canonicalize_symbol_addrs was unable to resolve any symbols, use -vvvv for more information."
++            )
++
++        return packed_needles
++
+     def _generator(self, symbol_table_name: str):
+         """Scans for sockets. Each row represents a kernel socket.
+ 
+@@ -48,6 +103,7 @@ class Sockscan(plugins.PluginInterface):
+             symbol_table_name: The name of the kernel module on which to operate
+ 
+         Yields:
++            addr: Physical offset
+             family: Socket family string (AF_UNIX, AF_INET, etc)
+             sock_type: Socket type string (STREAM, DGRAM, etc)
+             protocol: Protocol string (UDP, TCP, etc)
+@@ -65,15 +121,9 @@ class Sockscan(plugins.PluginInterface):
+         # kernel layer will be virtual and built ontop of a physical layer.
+         kernel_layer = self.context.layers[vmlinux.layer_name]
+ 
+-     

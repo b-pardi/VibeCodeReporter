@@ -1,0 +1,103 @@
+@@ -22,6 +22,7 @@ enum calico_reason {
+ 	CALI_REASON_DECAP_FAIL,
+ 	CALI_REASON_UNAUTH_SOURCE,
+ 	CALI_REASON_RT_UNKNOWN,
++	CALI_REASON_BLACK_HOLE,
+ 	CALI_REASON_ACCEPTED_BY_XDP, // Not used by counters map
+ 	CALI_REASON_WEP_NOT_READY,
+ 	CALI_REASON_NATIFACE,
+
+
+
+
+@@ -30,6 +30,8 @@ enum cali_rt_flags {
+ 	CALI_RT_SAME_SUBNET = 0x20,
+ 	CALI_RT_TUNNELED    = 0x40,
+ 	CALI_RT_NO_DSR      = 0x80,
++	CALI_RT_BLACKHOLE_DROP  = 0x100,
++	CALI_RT_BLACKHOLE_REJECT  = 0x200,
+ };
+ 
+ struct cali_rt {
+@@ -76,6 +78,8 @@ static CALI_BPF_INLINE enum cali_rt_flags cali_rt_lookup_flags(ipv46_addr_t *add
+ #define cali_rt_is_host(rt)	((rt)->flags & CALI_RT_HOST)
+ #define cali_rt_is_workload(rt)	((rt)->flags & CALI_RT_WORKLOAD)
+ #define cali_rt_is_tunneled(rt)	((rt)->flags & CALI_RT_TUNNELED)
++#define cali_rt_is_blackhole_drop(rt) ((rt)->flags & CALI_RT_BLACKHOLE_DROP)
++#define cali_rt_is_blackhole_reject(rt) ((rt)->flags & CALI_RT_BLACKHOLE_REJECT)
+ 
+ #define cali_rt_flags_host(t) (((t) & CALI_RT_HOST) == CALI_RT_HOST)
+ #define cali_rt_flags_local_host(t) (((t) & (CALI_RT_LOCAL | CALI_RT_HOST)) == (CALI_RT_LOCAL | CALI_RT_HOST))
+
+
+
+
+@@ -428,6 +428,7 @@ static CALI_BPF_INLINE void calico_tc_process_ct_lookup(struct cali_tc_ctx *ctx)
+ 			 * usecase of this is node-local-dns.
+ 			 */
+ 			ctx->state->flags |= CALI_ST_SKIP_FIB;
++			ctx->state->flags |= CALI_ST_NAT_EXCLUDE;
+ 		}
+ 	}
+ 
+@@ -542,8 +543,12 @@ syn_force_policy:
+ 		ctx->state->flags |= CALI_ST_SRC_IS_HOST;
+ 	}
+ 
+-	struct cali_rt *dest_rt = cali_rt_lookup(&ctx->state->post_nat_ip_dst);
+-
++	struct cali_rt *dest_rt = NULL;
++	// Route lookup is not done for those packets which are nat excluded, where there
++	// is a nat hit, but we don't resolve (such as node local DNS cache).
++	if (!(ctx->state->flags & CALI_ST_NAT_EXCLUDE)) {
++		dest_rt = cali_rt_lookup(&ctx->state->post_nat_ip_dst);
++	}
+ 	if (!dest_rt) {
+ 		CALI_DEBUG("No route for post DNAT dest %x\n", debug_ip(ctx->state->post_nat_ip_dst));
+ 		if (CALI_F_FROM_HEP) {
+@@ -559,6 +564,32 @@ syn_force_policy:
+ 		goto do_policy;
+ 	}
+ 
++	/* If the dest route is a blackhole route, drop/reject the packet.
++	 * This is based on the service loop prevention configuration.
++	 * If ServiceLoopPrevention = Drop, route is a blackhole drop route.
++	 * If ServiceLoopPrevention = Reject, route is a blackhole reject route.
++	 * If ServiceLoopPrevention = Disabled, these routes are not programmed.
++	 */
++	if (CALI_F_TO_HOST) {
++		if (cali_rt_is_blackhole_drop(dest_rt)) {
++			CALI_DEBUG("Packet hit a black hole route: DROP\n");
++			deny_reason(ctx, CALI_REASON_BLACK_HOLE);
++			goto deny;
++		}
++		if (cali_rt_is_blackhole_reject(dest_rt)) {
++			CALI_DEBUG("Packet hit a black hole route: REJECT\n");
++			deny_reason(ctx, CALI_REASON_BLACK_HOLE);
++#ifdef IPVER6
++			ctx->state->icmp_type = ICMPV6_DEST_UNREACH;
++			ctx->state->icmp_code = ICMPV6_PORT_UNREACH;
++#else
++			ctx->state->icmp_type = ICMP_DEST_UNREACH;
++			ctx->state->icmp_code = ICMP_PORT_UNREACH;
++#endif
++			goto icmp_send_reply;
++		}
++	}
++
+ 	if (cali_rt_flags_local_host(dest_rt->flags)) {
+ 		CALI_DEBUG("Post-NAT dest IP is local host.\n");
+ 		if (CALI_F_FROM_HEP && is_failsafe_in(ctx->state->ip_proto, ctx->state->post_nat_dport, ctx->state->ip_src)) {
+
+
+
+
+@@ -147,6 +147,8 @@ enum cali_state_flags {
+ 	CALI_ST_CT_NP_LOOP	  = 0x80,
+ 	/* CALI_ST_CT_NP_REMOTE is set when host is accessing a remote nodeport. */
+ 	CALI_ST_CT_NP_REMOTE	  = 0x100,
++	/* CALI_ST_NAT_EXCLUDE is set when there is a NAT hit, but we don't want to resolve (such as node local DNS). */
++	CALI_ST_NAT_EXCLUDE       = 0x200,
+ };
+ 
+ struct fwd {

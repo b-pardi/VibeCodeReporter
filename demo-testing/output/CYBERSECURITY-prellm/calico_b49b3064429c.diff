@@ -1,0 +1,90 @@
+@@ -111,8 +111,8 @@ struct bpf_map_def_extended __attribute__((section("maps"))) cali_v4_ct = {
+ 
+ static CALI_BPF_INLINE void dump_ct_key(struct calico_ct_key *k)
+ {
+-	CALI_VERB("CT-TCP   key A=%x:%d proto=%d\n", be32_to_host(k->addr_a), k->port_a, (int)k->protocol);
+-	CALI_VERB("CT-TCP   key B=%x:%d size=%d\n", be32_to_host(k->addr_b), k->port_b, (int)sizeof(struct calico_ct_key));
++	CALI_VERB("CT-ALL   key A=%x:%d proto=%d\n", be32_to_host(k->addr_a), k->port_a, (int)k->protocol);
++	CALI_VERB("CT-ALL   key B=%x:%d size=%d\n", be32_to_host(k->addr_b), k->port_b, (int)sizeof(struct calico_ct_key));
+ }
+ 
+ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+@@ -163,6 +163,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 		}
+ 		CALI_VERB("CT Found expected entry, updating...\n");
+ 		if (srcLTDest) {
++			CALI_VERB("CT-ALL update src_to_dst A->B\n");
+ 			ct_value->a_to_b.seqno = seq;
+ 			ct_value->a_to_b.syn_seen = syn;
+ 			if (CALI_F_TO_HOST) {
+@@ -171,6 +172,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 				ct_value->b_to_a.whitelisted = 1;
+ 			}
+ 		} else  {
++			CALI_VERB("CT-ALL update src_to_dst B->A\n");
+ 			ct_value->b_to_a.seqno = seq;
+ 			ct_value->b_to_a.syn_seen = syn;
+ 			if (CALI_F_TO_HOST) {
+@@ -186,7 +188,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 	__u64 now;
+ 	create:
+ 	now = bpf_ktime_get_ns();
+-	CALI_DEBUG("CT-ALL Creating entry at %llu.\n", now);
++	CALI_DEBUG("CT-ALL Creating tracking entry type %d at %llu.\n", type, now);
+ 	struct calico_ct_value ct_value = {};
+ 	ct_value.created=now;
+ 	ct_value.last_seen=now;
+@@ -209,6 +211,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 			.addr_a = ip_src, .port_a = sport,
+ 			.addr_b = ip_dst, .port_b = dport,
+ 		};
++		CALI_VERB("CT-ALL src_to_dst A->B\n");
+ 		src_to_dst = &ct_value.a_to_b;
+ 		dst_to_src = &ct_value.b_to_a;
+ 	} else  {
+@@ -217,6 +220,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_tracking(struct ct_ctx *ctx,
+ 			.addr_a = ip_dst, .port_a = dport,
+ 			.addr_b = ip_src, .port_b = sport,
+ 		};
++		CALI_VERB("CT-ALL src_to_dst B->A\n");
+ 		src_to_dst = &ct_value.b_to_a;
+ 		dst_to_src = &ct_value.a_to_b;
+ 	}
+@@ -257,7 +261,7 @@ static CALI_BPF_INLINE int calico_ct_v4_create_nat_fwd(struct ct_ctx *ctx,
+ 
+ 	__u64 now = bpf_ktime_get_ns();
+ 
+-	CALI_DEBUG("CT-%d Creating entry at %llu.\n", ip_proto, now);
++	CALI_DEBUG("CT-%d Creating FWD entry at %llu.\n", ip_proto, now);
+ 	struct calico_ct_value ct_value = {
+ 		.type = CALI_CT_TYPE_NAT_FWD,
+ 		.last_seen = now,
+@@ -356,6 +360,8 @@ static CALI_BPF_INLINE void calico_ct_v4_tcp_delete(
+ #define CALI_CT_VERB(fmt, ...) \
+ 	CALI_CT_LOG(CALI_LOG_LEVEL_VERB, fmt, ## __VA_ARGS__)
+ 
++#define seqno_add(seq, add) (host_to_be32((be32_to_host(seq) + add)))
++
+ static CALI_BPF_INLINE void ct_tcp_entry_update(struct tcphdr *tcp_header,
+ 						struct calico_ct_leg *src_to_dst,
+ 						struct calico_ct_leg *dst_to_src)
+@@ -375,7 +381,7 @@ static CALI_BPF_INLINE void ct_tcp_entry_update(struct tcphdr *tcp_header,
+ 	}
+ 
+ 	if (tcp_header->syn && tcp_header->ack) {
+-		if (dst_to_src->syn_seen && (dst_to_src->seqno + 1) == tcp_header->ack_seq) {
++		if (dst_to_src->syn_seen && seqno_add(dst_to_src->seqno, 1) == tcp_header->ack_seq) {
+ 			CALI_CT_VERB("SYN+ACK seen, marking CT entry.\n");
+ 			src_to_dst->syn_seen = 1;
+ 			src_to_dst->ack_seen = 1;
+@@ -383,17 +389,19 @@ static CALI_BPF_INLINE void ct_tcp_entry_update(struct tcphdr *tcp_header,
+ 		} else {
+ 			CALI_CT_VERB("SYN+ACK seen but packet's ACK (%u) "
+ 					"doesn't match other side's SYN (%u).\n",
+-					tcp_header->ack_seq, dst_to_src->seqno);
++					be32_to_host(tcp_header->ack_seq),
++					be32_to_host(dst_to_src->seqno));
+ 			// Have to let this through so source can reset?
+ 		}
+ 	} else if (tcp_header->ack && !src_to_dst->ack_seen && src_to_dst->syn_seen) {
+-		if (dst_to_src->syn_seen && (dst_to_src->seqno + 1) == 

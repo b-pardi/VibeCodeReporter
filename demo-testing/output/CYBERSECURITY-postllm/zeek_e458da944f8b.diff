@@ -1,0 +1,91 @@
+@@ -245,8 +245,11 @@ struct Manager::WriterInfo {
+     string instantiating_filter;
+ 
+     std::shared_ptr<telemetry::Counter> total_writes;
++    std::shared_ptr<telemetry::Counter> total_discarded_writes;
+ 
+-    WriterInfo(std::shared_ptr<telemetry::Counter> total_writes) : total_writes(std::move(total_writes)) {}
++    WriterInfo(std::shared_ptr<telemetry::Counter> total_writes,
++               std::shared_ptr<telemetry::Counter> total_discarded_writes)
++        : total_writes(std::move(total_writes)), total_discarded_writes(std::move(total_discarded_writes)) {}
+ };
+ 
+ struct Manager::Stream {
+@@ -484,7 +487,11 @@ Manager::Manager()
+           telemetry_mgr
+               ->CounterFamily("zeek", "log-writer-writes", {"writer", "module", "stream", "filter-name", "path"},
+                               "Total number of log writes passed to a concrete log writer not vetoed by stream or "
+-                              "filter policies.")) {
++                              "filter policies.")),
++      total_log_writer_discarded_writes_family(
++          telemetry_mgr->CounterFamily("zeek", "log-writer-discarded-writes",
++                                       {"writer", "module", "stream", "filter-name", "path"},
++                                       "Total number of log writes discarded due to size limitations.")) {
+     rotations_pending = 0;
+ }
+ 
+@@ -496,6 +503,7 @@ Manager::~Manager() {
+ void Manager::InitPostScript() {
+     rotation_format_func = id::find_func("Log::rotation_format_func");
+     log_stream_policy_hook = id::find_func("Log::log_stream_policy");
++    max_log_record_size = id::find_val("Log::max_log_record_size")->AsCount();
+ }
+ 
+ WriterBackend* Manager::CreateBackend(WriterFrontend* frontend, EnumVal* tag) {
+@@ -1140,7 +1148,14 @@ bool Manager::WriteToFilters(const Manager::Stream* stream, zeek::RecordValPtr c
+         assert(info);
+ 
+         // Alright, can do the write now.
+-        auto rec = RecordToLogRecord(stream, filter, columns.get());
++        size_t total_size = 0;
++        auto rec = RecordToLogRecord(stream, filter, columns.get(), total_size);
++
++        if ( total_size > max_log_record_size ) {
++            reporter->Weird("log_record_too_large", util::fmt("%s", stream->name.c_str()));
++            w->second->total_discarded_writes->Inc();
++            continue;
++        }
+ 
+         if ( zeek::plugin_mgr->HavePluginForHook(zeek::plugin::HOOK_LOG_WRITE) ) {
+             // The current HookLogWrite API takes a threading::Value**.
+@@ -1373,7 +1388,7 @@ bool Manager::SetMaxDelayQueueSize(const EnumValPtr& id, zeek_uint_t queue_size)
+     return true;
+ }
+ 
+-threading::Value Manager::ValToLogVal(std::optional<ZVal>& val, Type* ty) {
++threading::Value Manager::ValToLogVal(std::optional<ZVal>& val, Type* ty, size_t& total_size) {
+     if ( ! val )
+         return {ty->Tag(), false};
+ 
+@@ -1381,7 +1396,10 @@ threading::Value Manager::ValToLogVal(std::optional<ZVal>& val, Type* ty) {
+ 
+     switch ( lval.type ) {
+         case TYPE_BOOL:
+-        case TYPE_INT: lval.val.int_val = val->AsInt(); break;
++        case TYPE_INT:
++            lval.val.int_val = val->AsInt();
++            total_size += sizeof(lval.val.int_val);
++            break;
+ 
+         case TYPE_ENUM: {
+             const char* s = ty->AsEnumType()->Lookup(val->AsInt());
+@@ -1398,13 +1416,16 @@ threading::Value Manager::ValToLogVal(std::optional<ZVal>& val, Type* ty) {
+                 lval.val.string_val.data = util::copy_string("", 0);
+                 lval.val.string_val.length = 0;
+             }
++
++            total_size += lval.val.string_val.length;
++
+             break;
+         }
+ 
+-        case TYPE_COUNT: {
++        case TYPE_COUNT:
+             lval.val.uint_val = val->AsCount();
++            total_size += sizeof(lval.val.uint_val);
+             break;
+-        }
+ 
+         case TYPE_PORT: {
+             auto p = val->AsCount();
+@@ -1420,16 +1441,26 @@ threading::Value Manager::ValToLogVal(std::optional<ZVal>& val, Type* ty) {

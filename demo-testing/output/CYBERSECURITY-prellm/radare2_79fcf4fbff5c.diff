@@ -1,0 +1,166 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,619 @@
++/* radare - LGPL - Copyright 2020 - thestr4ng3r */
++
++#include "r2r.h"
++
++#include <assert.h>
++
++#define LINEFMT "%s, line %"PFMT64u": "
++
++R_API R2RCmdTest *r2r_cmd_test_new() {
++	return R_NEW0 (R2RCmdTest);
++}
++
++R_API void r2r_cmd_test_free(R2RCmdTest *test) {
++	if (!test) {
++		return;
++	}
++#define DO_KEY_STR(key, field) free (test->field.value);
++	R2R_CMD_TEST_FOREACH_RECORD(DO_KEY_STR, R2R_CMD_TEST_FOREACH_RECORD_NOP)
++#undef DO_KEY_STR
++	free (test);
++}
++
++static char *readline(char *buf, size_t *linesz) {
++	char *end = strchr (buf, '\n');
++	if (end) {
++		*end = '\0';
++		*linesz = end - buf;
++		return end + 1;
++	} else {
++		*linesz = strlen (buf);
++		return NULL;
++	}
++}
++
++// read the (possibly multiline) string value of some key in the file
++// e.g. for
++//
++// 0    CMDS=<<EOF
++// 1    Hello
++// 2    World
++// 3    EOF
++// 4    ...
++//
++// if nextline is at the beginning of line 1,
++// read_string_val(&nextline, "<<EOF\0")
++// will return "Hello\nWorld\n" with nextline being at the beginning of line 4 afterwards.
++static char *read_string_val(char **nextline, const char *val, ut64 *linenum) {
++	if (val[0] == '\'') {
++		size_t len = strlen (val);
++		if (len > 1 && val[len - 1] == '\'') {
++			eprintf ("Error: Invalid string syntax, use <<EOF instead of '...'\n");
++			return NULL;
++		}
++	}
++	if (val[0] == '<' && val[1] == '<') {
++		// <<EOF syntax
++		const char *endtoken = val + 2;
++		if (!*endtoken) {
++			eprintf ("Error: Missing opening end token after <<\n");
++			return NULL;
++		}
++		if (strcmp (endtoken, "EOF") != 0) {
++			// In case there will be strings containing "EOF" inside of them, this requirement
++			// can be weakened to only apply for strings which do not contain "EOF".
++			eprintf ("Error: End token must be \"EOF\", got \"%s\" instead.", endtoken);
++			return NULL;
++		}
++		RStrBuf *buf = r_strbuf_new ("");
++		char *line = *nextline;
++		size_t linesz = 0;
++		do {
++			*nextline = readline (line, &linesz);
++			(*linenum)++;
++			char *end = strstr (line, endtoken);
++			if (end != line) {
++				// Require the EOF to be at the beginning of the line.
++				// This means makes it impossible to write multiline tests without a trailing newline.
++				// This requirement could be lifted later if necessary.
++				end = NULL;
++			}
++			if (end) {
++				*end = '\0';
++			}
++			r_strbuf_append (buf, line);
++			if (end) {
++				return r_strbuf_drain (buf);
++			} else {
++				r_strbuf_append (buf, "\n");
++			}
++		} while ((line = *nextline));
++		eprintf ("Error: Missing closing end token %s\n", endtoken);
++		r_strbuf_free (buf);
++		return NULL;
++	}
++	return strdup (val);
++}
++
++R_API RPVector *r2r_load_cmd_test_file(const char *file) {
++	char *contents = r_file_slurp (file, NULL);
++	if (!contents) {
++		eprintf ("Failed to open file \"%s\"\n", file);
++		return NULL;
++	}
++
++	RPVector *ret = r_pvector_new (NULL);
++	if (!ret) {
++		return NULL;
++	}
++	R2RCmdTest *test = r2r_cmd_test_new ();
++	if (!test) {
++		r_pvector_free (ret);
++		return NULL;
++	}
++
++	ut64 linenum = 0;
++	char *line = contents;
++	size_t linesz;
++	char *nextline;
++	do {
++		nextline = readline (line, &linesz);
++		linenum++;
++		if (!linesz) {
++			continue;
++		}
++		if (*line == '#') {
++			continue;
++		}
++		char *val = strchr (line, '=');
++		if (val) {
++			*val = '\0';
++			val++;
++			// Strip comment
++			char *cmt = strchr (val, '#');
++			if (cmt) {
++				*cmt = '\0';
++				cmt--;
++				while (cmt > val && *cmt == ' ') {
++					*cmt = '\0';
++					cmt--;
++				}
++			}
++		}
++
++		// RUN is the only cmd without value
++		if (strcmp (line, "RUN") == 0) {
++			r_pvector_push (ret, test);
++			test = r2r_cmd_test_new ();
++			if (!test) {
++				goto beach;
++			}
++			continue;
++		}
++
++#define DO_KEY_STR(key, field) \
++		if (strcmp (line, key) == 0) { \
++			if (test->field.value) { \
++				free (test->field.value); \
++				eprintf (LINEFMT "Warning: Duplicate key \"%s\"\n", file, linenum, key); \
++			} \
++			test->field.line_begin = linenum; \
++			test->f

@@ -1,0 +1,91 @@
+@@ -92,7 +92,7 @@ static inline __u32 __inline__ __ct_update_timeout(struct ct_entry *entry,
+ 	__u32 last_report;
+ 
+ #ifdef NEEDS_TIMEOUT
+-	entry->lifetime = now + lifetime;
++	WRITE_ONCE(entry->lifetime, now + lifetime);
+ #endif
+ 	if (dir == CT_INGRESS) {
+ 		accumulated_flags = READ_ONCE(entry->rx_flags_seen);
+@@ -189,6 +189,29 @@ static inline bool __inline__ ct_entry_alive(const struct ct_entry *entry)
+ 	return !entry->rx_closing || !entry->tx_closing;
+ }
+ 
++/* Helper for holding 2nd service entry alive in nodeport case. */
++static inline bool __ct_entry_keep_alive(void *map, void *tuple)
++{
++	struct ct_entry *entry;
++
++	/* Lookup indicates to LRU that key/value is in use. */
++	if ((entry = map_lookup_elem(map, tuple))) {
++		if (entry->node_port) {
++#ifdef NEEDS_TIMEOUT
++			__u32 lifetime = (entry->seen_non_syn ?
++					  CT_SERVICE_LIFETIME_TCP :
++					  CT_SERVICE_LIFETIME_NONTCP) +
++					 bpf_ktime_get_sec();
++			WRITE_ONCE(entry->lifetime, lifetime);
++#endif
++			if (!ct_entry_alive(entry))
++				ct_reset_closing(entry);
++		}
++		return true;
++	}
++	return false;
++}
++
+ static inline __u8 __inline__ __ct_lookup(void *map, struct __sk_buff *skb,
+ 					  void *tuple, int action, int dir,
+ 					  struct ct_state *ct_state,
+
+
+
+
+@@ -318,6 +318,7 @@ static inline int nodeport_lb6(struct __sk_buff *skb, __u32 src_identity)
+ 			return ret;
+ 		if (backend_local) {
+ 			ct_flip_tuple_dir6(&tuple);
++redo:
+ 			ct_state_new.rev_nat_index = 0;
+ 			ret = ct_create6(get_ct_map6(&tuple), &tuple, skb,
+ 					 CT_INGRESS, &ct_state_new, false);
+@@ -328,6 +329,15 @@ static inline int nodeport_lb6(struct __sk_buff *skb, __u32 src_identity)
+ 
+ 	case CT_ESTABLISHED:
+ 	case CT_REPLY:
++		if (backend_local) {
++			ct_flip_tuple_dir6(&tuple);
++			if (!__ct_entry_keep_alive(get_ct_map6(&tuple),
++						   &tuple)) {
++				ct_state_new.src_sec_id = SECLABEL;
++				ct_state_new.node_port = 1;
++				goto redo;
++			}
++		}
+ 		break;
+ 
+ 	default:
+@@ -709,6 +719,7 @@ static inline int nodeport_lb4(struct __sk_buff *skb, __u32 src_identity)
+ 			return ret;
+ 		if (backend_local) {
+ 			ct_flip_tuple_dir4(&tuple);
++redo:
+ 			ct_state_new.rev_nat_index = 0;
+ 			ret = ct_create4(get_ct_map4(&tuple), &tuple, skb,
+ 					 CT_INGRESS, &ct_state_new, false);
+@@ -719,6 +730,15 @@ static inline int nodeport_lb4(struct __sk_buff *skb, __u32 src_identity)
+ 
+ 	case CT_ESTABLISHED:
+ 	case CT_REPLY:
++		if (backend_local) {
++			ct_flip_tuple_dir4(&tuple);
++			if (!__ct_entry_keep_alive(get_ct_map4(&tuple),
++						   &tuple)) {
++				ct_state_new.src_sec_id = SECLABEL;
++				ct_state_new.node_port = 1;
++				goto redo;
++			}
++		}
+ 		break;
+ 
+ 	default:

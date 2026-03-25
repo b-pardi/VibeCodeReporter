@@ -1,0 +1,104 @@
+@@ -126,8 +126,7 @@ def main(cwd=None):
+         print(strings._("preparing_files"))
+         try:
+             web.share_mode.set_file_info(filenames)
+-            if web.share_mode.is_zipped:
+-                app.cleanup_filenames.append(web.share_mode.download_filename)
++            app.cleanup_filenames += web.share_mode.cleanup_filenames
+         except OSError as e:
+             print(e.strerror)
+             sys.exit(1)
+
+
+
+
+@@ -3,6 +3,7 @@ import sys
+ import tempfile
+ import zipfile
+ import mimetypes
++import gzip
+ from flask import Response, request, render_template, make_response
+ 
+ from .. import strings
+@@ -23,6 +24,7 @@ class ShareModeWeb(object):
+         self.is_zipped = False
+         self.download_filename = None
+         self.download_filesize = None
++        self.gzip_filename = None
+         self.zip_writer = None
+ 
+         self.download_count = 0
+@@ -118,12 +120,20 @@ class ShareModeWeb(object):
+             shutdown_func = request.environ.get('werkzeug.server.shutdown')
+             path = request.path
+ 
++            # If this is a zipped file, then serve as-is. If it's not zipped, then,
++            # if the http client supports gzip compression, gzip the file first
++            # and serve that
++            use_gzip = (not self.is_zipped) and ('gzip' in request.headers.get('Accept-Encoding', '').lower())
++            if use_gzip:
++                file_to_download = self.gzip_filename
++            else:
++                file_to_download = self.download_filename
++
+             # Tell GUI the download started
+             self.web.add_request(self.web.REQUEST_STARTED, path, {
+-                'id': download_id}
+-            )
++                'id': download_id
++            })
+ 
+-            dirname = os.path.dirname(self.download_filename)
+             basename = os.path.basename(self.download_filename)
+ 
+             def generate():
+@@ -136,7 +146,7 @@ class ShareModeWeb(object):
+ 
+                 chunk_size = 102400  # 100kb
+ 
+-                fp = open(self.download_filename, 'rb')
++                fp = open(file_to_download, 'rb')
+                 self.web.done = False
+                 canceled = False
+                 while not self.web.done:
+@@ -200,7 +210,11 @@ class ShareModeWeb(object):
+                         pass
+ 
+             r = Response(generate())
+-            r.headers.set('Content-Length', self.download_filesize)
++            if use_gzip:
++                r.headers.set('Content-Encoding', 'gzip')
++                r.headers.set('Content-Length', os.path.getsize(self.gzip_filename))
++            else:
++                r.headers.set('Content-Length', self.download_filesize)
+             r.headers.set('Content-Disposition', 'attachment', filename=basename)
+             r = self.web.add_security_headers(r)
+             # guess content type
+@@ -218,6 +232,8 @@ class ShareModeWeb(object):
+         self.common.log("ShareModeWeb", "set_file_info")
+         self.web.cancel_compression = False
+ 
++        self.cleanup_filenames = []
++
+         # build file info list
+         self.file_info = {'files': [], 'dirs': []}
+         for filename in filenames:
+@@ -238,9 +254,18 @@ class ShareModeWeb(object):
+ 
+         # Check if there's only 1 file and no folders
+         if len(self.file_info['files']) == 1 and len(self.file_info['dirs']) == 0:
+-            self.is_zipped = False
+             self.download_filename = self.file_info['files'][0]['filename']
+             self.download_filesize = self.file_info['files'][0]['size']
++
++            # Compress the file with gzip now, so we don't have to do it on each request
++            self.gzip_filename = tempfile.mkstemp('wb+')[1]
++            self._gzip_compress(self.download_filename, self.gzip_filename, 6, processed_size_callback)
++
++            # Make sure the gzip file gets cleaned up when onionshare stops
++            self.cleanup_filenames.append(self.gzip_filename)
++
++            self.is_zipped = False
++
+         else:
+             # Zip up the files 

@@ -1,0 +1,120 @@
+@@ -144,10 +144,10 @@ public:
+     }
+   }
+ 
+-  char* Convert(std::string_view str [[maybe_unused]]) {
++  char* Convert(std::string_view str) {
+     std::shared_lock read_lock(rw_mut); // shared read lock
+     if (convert_fn) {
+-      return nullptr;
++      return convert_fn(str.data());
+     } else {
+       return nullptr;
+     }
+@@ -244,11 +244,13 @@ extern DWORD g_MinorVersion;
+  */
+ static inline void conv_unix_to_vss_win32_path(const char* name,
+                                                char* win32_name,
+-                                               DWORD dwSize [[maybe_unused]])
++                                               DWORD dwSize)
+ {
+   const char* fname = name;
+   char* tname = win32_name;
+ 
++  int offset = 0;
++
+   Dmsg0(debuglevel, "Enter convert_unix_to_win32_path\n");
+ 
+   if (IsPathSeparator(name[0]) && IsPathSeparator(name[1]) && name[2] == '.'
+@@ -265,6 +267,8 @@ static inline void conv_unix_to_vss_win32_path(const char* name,
+     *win32_name++ = '\\';
+     *win32_name++ = '?';
+     *win32_name++ = '\\';
++
++    offset = 4; // skip this part during vss conversion
+   }
+ 
+   while (*name) {
+@@ -291,6 +295,12 @@ static inline void conv_unix_to_vss_win32_path(const char* name,
+   } else {
+     *win32_name = 0;
+   }
++  Dmsg1(debuglevel, "path = %s\n", tname);
++  if (char* shadow_path = vss_path_converter.Convert(tname + offset);
++      shadow_path != nullptr) {
++    bstrncpy(tname, shadow_path, dwSize);
++    free(shadow_path);
++  }
+ 
+   Dmsg1(debuglevel, "Leave cvt_u_to_win32_path path=%s\n", tname);
+ }
+
+
+
+
+@@ -225,9 +225,7 @@ bool InitializeComSecurity();
+ bool CreateJunction(const char* szJunction, const char* szPath);
+ const char* errorString(void);
+ 
+-typedef bool (*t_pVSSPathConvert)(const char* szFilePath,
+-                                  char* szShadowPath,
+-                                  int nBuflen);
++typedef char* (*t_pVSSPathConvert)(const char* szFilePath);
+ typedef wchar_t* (*t_pVSSPathConvertW)(const wchar_t* szFilePath);
+ bool SetVSSPathConvert(t_pVSSPathConvert pPathConvert,
+                        t_pVSSPathConvertW pPathConvertW);
+
+
+
+
+@@ -48,18 +48,15 @@ static const GUID VSS_SWPRV_ProviderID
+        0x4925,
+        {0xaf, 0x80, 0x51, 0xab, 0xd6, 0x0b, 0x20, 0xd5}};
+ 
+-static bool VSSPathConvert(const char* szFilePath,
+-                           char* szShadowPath,
+-                           int nBuflen)
++static char* VSSPathConvert(const char* szFilePath)
+ {
+   JobControlRecord* jcr = GetJcrFromThreadSpecificData();
+ 
+   if (jcr && jcr->fd_impl->pVSSClient) {
+-    return jcr->fd_impl->pVSSClient->GetShadowPath(szFilePath, szShadowPath,
+-                                                   nBuflen);
++    return jcr->fd_impl->pVSSClient->GetShadowPath(szFilePath);
+   }
+ 
+-  return false;
++  return nullptr;
+ }
+ 
+ static wchar_t* VSSPathConvertW(const wchar_t* szFilePath)
+@@ -175,23 +172,28 @@ static std::pair<String, String> FindMountPoint(const CharT* path,
+   return {std::move(current_volume), path};
+ }
+ 
+-bool VSSClient::GetShadowPath(const char* szFilePath,
+-                              char* szShadowPath,
+-                              int nBuflen)
++char* VSSClient::GetShadowPath(const char* szFilePath)
+ {
+-  if (!bBackupIsInitialized_) return false;
++  using namespace std::literals;
++  if (!bBackupIsInitialized_) return nullptr;
+ 
+   auto [volume, path] = FindMountPoint(szFilePath, this->mount_to_vol);
+ 
+   if (auto found = vol_to_vss.find(volume);
+       found != vol_to_vss.end()) {
+-    bstrncpy(szShadowPath, found->second.c_str(), nBuflen);
+-    auto len = strlen(szShadowPath);
+-    szShadowPath[len] = '\\';
+-    szShadowPath[len+1] = '\0';
+-    nBuflen -= len + 1;
+-    bstrncat(szShadowPath, path.c_str(), nBuflen);
+-    return true;
++    constexpr std::string_view sep = "\\"sv;
++    auto len = found->second.size() + sep.size() + path.size() + 1;
++    char* shadow_path = (char*)malloc(len * sizeof(*shadow_path));
++    shadow_path[len - 1] = '\0';
++    auto head = std::copy

@@ -1,0 +1,112 @@
+@@ -68,7 +68,8 @@ class Flow : public GenericHashEntry {
+     twh_over, twh_ok, dissect_next_http_packet, passVerdict,
+     l7_protocol_guessed, flow_dropped_counts_increased,
+     good_tls_hs,
+-    quota_exceeded, has_malicious_cli_signature, has_malicious_srv_signature;
++    quota_exceeded, has_malicious_cli_signature, has_malicious_srv_signature,
++    is_cli_srv_swapped;
+ #ifdef ALERTED_FLOWS_DEBUG
+   bool iface_alert_inc, iface_alert_dec;
+ #endif
+@@ -395,6 +396,8 @@ class Flow : public GenericHashEntry {
+ 		    u_int out_pkts, u_int out_bytes, u_int out_goodput_bytes, 
+ 		    u_int in_fragments, u_int out_fragments,
+ 		    time_t first_seen, time_t last_seen);
++  void set_swapped_cli_srv(Host *cli_h, Host *srv_h);
++  
+   inline bool isThreeWayHandshakeOK()    const { return(twh_ok);                          };
+   inline bool isDetectionCompleted()     const { return(detection_completed);             };
+   inline bool isOneWay()                 const { return(get_packets() && (!get_packets_cli2srv() || !get_packets_srv2cli())); };
+
+
+
+
+@@ -55,7 +55,8 @@ Flow::Flow(NetworkInterface *_iface,
+   doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
+   periodic_update_ctr = 0, cli2srv_tos = srv2cli_tos = 0, iec104 = NULL;
+   zero_window_alert_triggered = src2dst_tcp_zero_window = dst2src_tcp_zero_window = 0;
+-
++  is_cli_srv_swapped = false;
++  
+ #ifdef HAVE_NEDGE
+   last_conntrack_update = 0;
+   marker = MARKER_NO_ACTION;
+@@ -413,13 +414,17 @@ void Flow::processDetectedProtocol() {
+ 
+   switch(l7proto) {
+   case NDPI_PROTOCOL_DHCP:
+-    if(cli_port == ntohs(67) /* client */ && cli_h)      cli_h->setDhcpServer();
+-    else if(srv_port == ntohs(67) /* server */ && srv_h) srv_h->setDhcpServer();
++    if(cli_port == ntohs(67) /* client */ && cli_h) {
++      cli_h->setDhcpServer();
++      set_swapped_cli_srv(cli_h, srv_h);
++    } else if(srv_port == ntohs(67) /* server */ && srv_h)
++      srv_h->setDhcpServer();
+     break;
+ 
+   case NDPI_PROTOCOL_NTP:
+     if(cli_h && cli_port == ntohs(123))  {
+       cli_h->setNtpServer();
++      set_swapped_cli_srv(cli_h, srv_h);
+ 
+       if(srv_h) srv_h->incNTPContactCardinality(cli_h); 
+     } else if(srv_h && srv_port == ntohs(123)) {
+@@ -439,7 +444,8 @@ void Flow::processDetectedProtocol() {
+     } else if(cli_h
+ 	      && (cli_port == ntohs(25) || cli_port == ntohs(465) || cli_port == ntohs(587))) {
+       cli_h->setSmtpServer();
+-
++      set_swapped_cli_srv(cli_h, srv_h);
++      
+       if(srv_h) srv_h->incSMTPContactCardinality(cli_h);
+     }
+     break;
+@@ -447,6 +453,7 @@ void Flow::processDetectedProtocol() {
+   case NDPI_PROTOCOL_DNS:
+     if(cli_h && cli_port == ntohs(53)) {
+       cli_h->setDnsServer();
++      set_swapped_cli_srv(cli_h, srv_h);
+ 
+       if(srv_h) srv_h->incDNSContactCardinality(cli_h);
+     } else if(srv_h && srv_port == ntohs(53))  {
+@@ -462,9 +469,11 @@ void Flow::processDetectedProtocol() {
+     if(ndpiDetectedProtocol.app_protocol == NDPI_PROTOCOL_DOH_DOT
+        && cli_h && srv_h && cli_h->isLocalHost())
+       cli_h->incDohDoTUses(srv_h);
++    set_swapped_cli_srv(cli_h, srv_h);
+     break;
+ 
+   default:
++    set_swapped_cli_srv(cli_h, srv_h);
+     break;
+   } /* switch */
+ }
+@@ -1961,7 +1970,7 @@ const char* Flow::cipher_weakness2str(ndpi_cipher_weakness w) const {
+ /* *************************************** */
+ 
+ void Flow::luaScore(lua_State* vm) {
+-  u_int32_t tot;
++  u_int32_t tot_cli, tot_srv;
+ 
+   lua_newtable(vm);
+ 
+@@ -1985,15 +1994,16 @@ void Flow::luaScore(lua_State* vm) {
+ 
+   lua_newtable(vm);
+ 
+-  tot = 0;
++  tot_cli = 0;
+   for(u_int i=0; i<MAX_NUM_SCORE_CATEGORIES; i++)
+-    tot += cli_host_score[i];
+-  lua_push_int32_table_entry(vm, "client_score", tot);
+-
+-  tot = 0;
++    tot_cli += cli_host_score[i];
++  
++  tot_srv = 0;
+   for(u_int i=0; i<MAX_NUM_SCORE_CATEGORIES; i++)
+-    tot += srv_host_score[i];
+-  lua_push_int32_table_entry(vm, "server_score", tot);
++    tot_srv += srv_host_score[i];
++
++  lua_push_int32_table_entry

@@ -1,0 +1,100 @@
+@@ -305,11 +305,14 @@ TEST_P(TlsConnectTls13, ConnectEsniHrr) {
+       server_, kTlsHandshakeHelloRetryRequest);
+   auto filter =
+       MakeTlsFilter<TlsExtensionCapture>(client_, ssl_server_name_xtn);
+-  auto cfilter =
+-      MakeTlsFilter<TlsExtensionCapture>(client_, ssl_server_name_xtn);
++  auto filter2 =
++      MakeTlsFilter<TlsExtensionCapture>(client_, ssl_server_name_xtn, true);
++  client_->SetFilter(std::make_shared<ChainedPacketFilter>(
++      ChainedPacketFilterInit({filter, filter2})));
+   server_->SetSniCallback(SniCallback);
+   Connect();
+-  CheckSniExtension(cfilter->extension());
++  CheckSniExtension(filter->extension());
++  CheckSniExtension(filter2->extension());
+   EXPECT_NE(0UL, hrr_capture->buffer().len());
+ }
+ 
+
+
+
+
+@@ -4983,9 +4983,8 @@ ssl3_SendClientHello(sslSocket *ss, sslClientHelloType type)
+         }
+     }
+ 
+-    if (ss->vrange.max >= SSL_LIBRARY_VERSION_TLS_1_3 &&
+-        type == client_hello_initial) {
+-        rv = tls13_SetupClientHello(ss);
++    if (ss->vrange.max >= SSL_LIBRARY_VERSION_TLS_1_3) {
++        rv = tls13_SetupClientHello(ss, type);
+         if (rv != SECSuccess) {
+             goto loser;
+         }
+
+
+
+
+@@ -416,7 +416,7 @@ SSL_SendAdditionalKeyShares(PRFileDesc *fd, unsigned int count)
+  * Called from ssl3_SendClientHello.
+  */
+ SECStatus
+-tls13_SetupClientHello(sslSocket *ss)
++tls13_SetupClientHello(sslSocket *ss, sslClientHelloType chType)
+ {
+     unsigned int i;
+     SSL3Statistics *ssl3stats = SSL_GetStatistics();
+@@ -427,17 +427,24 @@ tls13_SetupClientHello(sslSocket *ss)
+ 
+     PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+     PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+-    PORT_Assert(PR_CLIST_IS_EMPTY(&ss->ephemeralKeyPairs));
+ 
+-    /* Do encrypted SNI. This may create a key share as a side effect. */
++    /* Do encrypted SNI.
++     * Note: this makes a new key even though we don't need one.
++     * Maybe remove this in future for efficiency. */
+     rv = tls13_ClientSetupESNI(ss);
+     if (rv != SECSuccess) {
+         return SECFailure;
+     }
+ 
++    /* Everything below here is only run on the first CH. */
++    if (chType != client_hello_initial) {
++        return SECSuccess;
++    }
++
+     /* Select the first enabled group.
+      * TODO(ekr@rtfm.com): be smarter about offering the group
+      * that the other side negotiated if we are resuming. */
++    PORT_Assert(PR_CLIST_IS_EMPTY(&ss->ephemeralKeyPairs));
+     for (i = 0; i < SSL_NAMED_GROUP_COUNT; ++i) {
+         if (!ss->namedGroupPreferences[i]) {
+             continue;
+
+
+
+
+@@ -63,7 +63,7 @@ SECStatus tls13_DeriveSecretNullHash(sslSocket *ss, PK11SymKey *key,
+                                      PK11SymKey **dest);
+ void tls13_FatalError(sslSocket *ss, PRErrorCode prError,
+                       SSL3AlertDescription desc);
+-SECStatus tls13_SetupClientHello(sslSocket *ss);
++SECStatus tls13_SetupClientHello(sslSocket *ss, sslClientHelloType chType);
+ SECStatus tls13_MaybeDo0RTTHandshake(sslSocket *ss);
+ PRInt32 tls13_LimitEarlyData(sslSocket *ss, SSLContentType type, PRInt32 toSend);
+ PRBool tls13_AllowPskCipher(const sslSocket *ss,
+
+
+
+
+@@ -584,6 +584,8 @@ tls13_ClientSetupESNI(sslSocket *ss)
+     const sslNamedGroupDef *group = NULL;
+     PRTime now = PR_Now() / PR_USEC_PER_SEC;
+ 
++    PORT_Assert(!ss->xtnData.esniPrivateKey);
++
+     if (!ss->esniKeys) {
+         return SECSuccess;
+     }

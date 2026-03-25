@@ -1,0 +1,140 @@
+@@ -265,26 +265,34 @@ beach: {
+        }
+ }
+ 
++
+ static int utf8len_fixed(const char *s, int n) {
+-	int i = 0, j = 0;
++	int i = 0, j = 0, fullwidths = 0;
+ 	while (s[i] && n > 0) {
+ 		if ((s[i] & 0xc0) != 0x80) {
+ 			j++;
++			if (r_str_char_fullwidth (s + i, n)) {
++				fullwidths++;
++			}
+ 		}
+ 		n--;
+ 		i++;
+ 	}
+-	return j;
++	return j + fullwidths;
+ }
+ 
+ static int bytes_utf8len(const char *s, int n, int left) {
+-	int i = 0;
++	int i = 0, fullwidths = 0;
+ 	while (s[i] && n > -1 && i < left) {
++		if (r_str_char_fullwidth (s + i, left)) {
++			fullwidths++;
++		}
+ 		if ((s[i] & 0xc0) != 0x80) {
+ 			n--;
+ 		}
+ 		i++;
+ 	}
++	i -= fullwidths;
+ 	return n == -1 ? i - 1 : i;
+ }
+ 
+@@ -353,6 +361,7 @@ R_API void r_cons_canvas_write(RConsCanvas *c, const char *s) {
+ 		slen = piece_len;
+ 
+ 		if (piece_len > left) {
++			/*int utf8_piece_len = utf8len_fixed (s_part, piece_len, c->bsize[c->y] - c->x);*/
+ 			int utf8_piece_len = utf8len_fixed (s_part, piece_len);
+ 			if (utf8_piece_len >= c->w - attr_x) {
+ 				slen = left;
+@@ -380,6 +389,7 @@ R_API void r_cons_canvas_write(RConsCanvas *c, const char *s) {
+ 			c->attr = Color_RESET;
+ 			stamp_attr (c, c->y*c->w + attr_x, 0);
+ 			c->y++;
++
+ 			s++;
+ 			if (*s == '\0' || c->y  >= c->h) {
+ 				break;
+@@ -430,6 +440,9 @@ R_API char *r_cons_canvas_to_string(RConsCanvas *c) {
+ 					olen += len;
+ 				}
+ 				attr_x++;
++				if (r_str_char_fullwidth (c->b[y] + x, c->bsize[c->y] - x)) {
++					attr_x++;
++				}
+ 			}
+ 			if (!c->b[y][x] || c->b[y][x] == '\n') {
+ 				o[olen++] = ' ';
+
+
+
+
+@@ -38,6 +38,8 @@ R_API bool r_str_range_in(const char *r, ut64 addr);
+ R_API int r_str_len_utf8(const char *s);
+ R_API int r_str_len_utf8char(const char *s, int left);
+ R_API void r_str_filter_zeroline(char *str, int len);
++R_API int r_str_utf8_codepoint (char* s, int left);
++R_API bool r_str_char_fullwidth (char* s, int left);
+ R_API int r_str_write(int fd, const char *b);
+ R_API void r_str_ncpy(char *dst, const char *src, int n);
+ R_API void r_str_sanitize(char *c);
+
+
+
+
+@@ -1509,15 +1509,16 @@ R_API int r_str_ansi_filter(char *str, char **out, int **cposs, int len) {
+ 	return j;
+ }
+ 
++
+ R_API char *r_str_ansi_crop(const char *str, ut32 x, ut32 y, ut32 x2, ut32 y2) {
+ 	char *r, *r_end, *ret;
+-	const char *s;
++	const char *s, *s_start;
+ 	size_t r_len, str_len = 0, nr_of_lines = 0;
+ 	ut32 ch = 0, cw = 0;
+ 	if (x2 < 1 || y2 < 1 || !str) {
+ 		return strdup ("");
+ 	}
+-	s = str;
++	s = s_start = str;
+ 	while (*s) {
+ 		str_len++;
+ 		if (*s == '\n') {
+@@ -1560,6 +1561,14 @@ R_API char *r_str_ansi_crop(const char *str, ut32 x, ut32 y, ut32 x2, ut32 y2) {
+ 					}
+ 					continue;
+ 				}
++				if (r_str_char_fullwidth (str, str_len - (str - s_start))) {
++					cw++;
++					if (cw == x) {
++						*r++ = ' ';
++						str++;
++						continue;
++					}
++				}
+ 				if (*str == 0x1b && *(str + 1) == '[') {
+ 					const char *ptr = str;
+ 					if ((r_end - r) > 2) {
+@@ -1592,6 +1601,38 @@ R_API char *r_str_ansi_crop(const char *str, ut32 x, ut32 y, ut32 x2, ut32 y2) {
+ 	return ret;
+ }
+ 
++R_API int r_str_utf8_codepoint (char* s, int left) {
++	bool safe = left >= 0;
++	if ((*s & 0x80) != 0x80) {
++		return 0;
++	} else if ((*s & 0xe0) == 0xc0 && (safe ? left >= 1 : *(s + 1))) {
++		return ((*s & 0x1f) << 6) + (*(s + 1) & 0x3f);
++	} else if ((*s & 0xf0) == 0xe0 && (safe ? left >= 2 : (*(s + 1) && *(s + 2)))) {
++		return ((*s & 0xf) << 12) + ((*(s + 1) & 0x3f) << 6) + (*(s + 2) & 0x3f);
++	} else if ((*s & 0xf8) == 0xf0 && (safe ? left >= 3 : (*(s + 1) && *(s + 2) && *(s + 3)))) {
++		return ((*s & 0x7) << 18) + ((*(s + 1) & 0x3f) << 12) + ((*(s + 2) & 0x3f) << 6) + (*(s + 3) & 0x3f);
++	}
++	return 0;
++}
++
++R_API bool r_str_char_fullwidth (char* s, int left) {
++	int codepoint = r_str_utf8_codepoint (s, left);
++	return (codepoint >= 0x1100 &&
++		 (codepoint <= 0x115f ||                  /* Hangul Jamo init. consonants */
++			  codepoint == 0x2329 || codepoint == 0x232a ||
++		 (R_BETWEEN (0x2e80, codepoint, 0xa4cf)
++			&& codepoint != 0x303f) ||        /* CJK ... Yi 

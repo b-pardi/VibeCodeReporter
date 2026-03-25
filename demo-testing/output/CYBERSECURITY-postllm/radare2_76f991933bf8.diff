@@ -1,0 +1,136 @@
+@@ -15,14 +15,7 @@ typedef struct {
+ 	int line;
+ } LineEntry;
+ 
+-// Create a Mach-O 64-bit object with minimal DWARF v2 debug info
+-RBuffer *create_macho_with_dwarf(RList *lines, RList *symbols) {
+-	RBuffer *buf = r_buf_new ();
+-	if (!buf) {
+-		return NULL;
+-	}
+-
+-	// Macros for writing to RBuffer (little-endian)
++// Macros for writing to RBuffer (little-endian)
+ #define B(x,y)    r_buf_append_bytes (buf, (const ut8*)(x), (y))
+ #define U8(x)     do { ut8 _v = (ut8)(x); r_buf_append_bytes (buf, &_v, 1); } while (0)
+ #define U16(x)    r_buf_append_ut16 (buf, (ut16)(x))
+@@ -31,6 +24,14 @@ RBuffer *create_macho_with_dwarf(RList *lines, RList *symbols) {
+ #define Z(n)      r_buf_append_nbytes (buf, (n))
+ #define W(off, data, len)  r_buf_write_at (buf, (off), (const ut8*)(data), (len))
+ 
++
++// Create a Mach-O 64-bit object with minimal DWARF v2 debug info
++RBuffer *create_macho_with_dwarf(RList *lines, RList *symbols) {
++	RBuffer *buf = r_buf_new ();
++	if (!buf) {
++		return NULL;
++	}
++
+ 	// Mach-O 64-bit Header (mach_header_64)
+ 	U32(0xFEEDFACF);                // magic MH_MAGIC_64 [oai_citation:0‡mikeash.com](https://www.mikeash.com/pyblog/friday-qa-2012-11-30-lets-build-a-mach-o-executable.html#:~:text=%2F,NXSwapInt%28MH_MAGIC_64%29)
+ 	U32(0x01000007);                // cputype (CPU_TYPE_X86_64 | CPU_ARCH_ABI64)
+@@ -420,6 +421,217 @@ RBuffer *create_macho_with_dwarf(RList *lines, RList *symbols) {
+ 	return buf;
+ }
+ 
++RBuffer *create_elf_with_dwarf(RList *lines, RList *symbols) {
++	RBuffer *buf = r_buf_new ();
++	if (!buf) {
++		return NULL;
++	}
++	// ELF header
++	B("\x7f""ELF", 4);
++	U8(2); U8(1); U8(1); U8(0); U8(0); Z(7);
++	U16(1); U16(0x3E); U32(1);
++	U64(0); U64(0);
++	ut64 shoff_off = r_buf_size(buf);
++	U64(0);
++	U32(0); U16(64); U16(0); U16(0); U16(64); U16(8); U16(7);
++	// .text
++	ut64 text_off = r_buf_size(buf); U8(0xC3);
++	ut64 text_sz = r_buf_size(buf) - text_off;
++	// .debug_info
++	ut64 debug_info_start = r_buf_size(buf);
++	ut64 cu_len_off = r_buf_size(buf);
++	U32(0); U16(2); U32(0); U8(8);
++	U8(0x01); U8(0x0c); B("main.c",6); U8(0); B(".",1); U8(0);
++	U64(0); U64(1); U32(0);
++	{
++		RListIter *sym_it; SymEntry *sym;
++		r_list_foreach (symbols, sym_it, sym) {
++			U8(0x02);
++			B(sym->symbol, strlen (sym->symbol));
++			U8(0);
++			U64(sym->addr);
++			U64(sym->addr + 1);
++		}
++	}
++	U8(0);
++	ut64 cu_end = r_buf_size (buf);
++	ut32 cu_len = (ut32)(cu_end - (cu_len_off + 4));
++	W(cu_len_off, &cu_len, 4);
++	// .debug_abbrev
++	ut64 debug_abbrev_start = r_buf_size (buf);
++	U8(0x01); U8(0x11); U8(0x01);
++	U8(0x13); U8(0x0b);
++	U8(0x03); U8(0x08);
++	U8(0x1b); U8(0x08);
++	U8(0x11); U8(0x01);
++	U8(0x12); U8(0x01);
++	U8(0x10); U8(0x06);
++	U8(0x00); U8(0x00);
++	U8(0x02); U8(0x2e); U8(0x00);
++	U8(0x03); U8(0x08);
++	U8(0x11); U8(0x01);
++	U8(0x12); U8(0x01);
++	U8(0x00); U8(0x00);
++	U8(0x00);
++	// .debug_line
++	ut64 debug_line_start = r_buf_size (buf);
++	ut64 line_len_off = r_buf_size(buf); U32(0); U16(2);
++	ut64 hdr_len_off = r_buf_size(buf); U32(0);
++	U8(1); U8(1); U8((ut8)0xFB); U8(14); U8(13);
++	ut8 std_op_len[12] = {0,1,1,1,1,0,0,0,1,0,0,1};
++	{
++		int i;
++		for (i = 0; i < 12; i++) {
++			U8(std_op_len[i]);
++		}
++	}
++	RList *dirs = r_list_newf (free);
++	RListIter *dir_it; char *dir;
++	r_list_foreach (dirs, dir_it, dir) {
++		B(dir, strlen(dir)); U8(0);
++	}
++	U8(0);
++	RList *files = r_list_newf(free);
++	{
++		RListIter *lit;
++		LineEntry *le;
++		r_list_foreach (lines, lit, le) {
++			RListIter *fit;
++			char *fn;
++			bool found = false;
++			r_list_foreach (files, fit, fn) {
++				if (!strcmp (fn, le->file)) {
++					found = true;
++					break;
++				}
++			}
++			if (!found) {
++				r_list_append (files, strdup (le->file));
++			}
++		}
++	}
++	RListIter *file_it;
++	char *filename;
++	r_list_foreach (files, file_it, filename) {
++		B(filename, strlen (filename));
++		U8(0); U8(0); U8(0); U8(0);
++	}
++	U8(0);
++	{
++		ut64 prev_line = 1; int prev_file_idx = 1;
++		RListIter *lit; LineEntry *le;
++		r_list_foreach (lines, lit, le) {
++			U8(0x00); U8(1 + sizeof (ut

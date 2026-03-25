@@ -1,0 +1,108 @@
+@@ -1,7 +1,7 @@
+ from enum import Enum
+-from typing import Optional
++from typing import Dict, List, Optional
+ 
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
+ 
+ from prowler.lib.logger import logger
+ from prowler.lib.scan_filters.scan_filters import is_resource_filtered
+@@ -49,6 +49,7 @@ class Kinesis(AWSService):
+             stream.encrypted_at_rest = EncryptionType(
+                 stream_description.get("EncryptionType", "NONE")
+             )
++            stream.retention_period = stream_description.get("RetentionPeriodHours", 24)
+         except Exception as error:
+             logger.error(
+                 f"{stream.region} -- {error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
+@@ -91,5 +92,6 @@ class Stream(BaseModel):
+     region: str
+     name: str
+     status: StreamStatus
+-    tags: Optional[list]
++    tags: Optional[List[Dict[str, str]]] = Field(default_factory=list)
+     encrypted_at_rest: EncryptionType = EncryptionType.NONE
++    retention_period: int = 24  # 1 day
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,37 @@
++from prowler.lib.check.models import Check, Check_Report_AWS
++from prowler.providers.aws.services.kinesis.kinesis_client import kinesis_client
++
++
++class kinesis_stream_data_retention_period(Check):
++    """Ensure Kinesis Stream has an adequate data retention period
++
++    The retention period for Kinesis Streams should be set to a value that meets the organization's data retention policy.
++    """
++
++    def execute(self):
++        """Execute Check Kinesis Stream data retention period
++
++        Iterate over all Kinesis Streams and check if the retention period is adequate.
++
++        Returns:
++            findings (list): List of findings
++        """
++        findings = []
++        for stream in kinesis_client.streams.values():
++            report = Check_Report_AWS(self.metadata())
++            report.region = stream.region
++            report.resource_id = stream.name
++            report.resource_arn = stream.arn
++            report.resource_tags = stream.tags
++            report.status = "FAIL"
++            report.status_extended = f"Kinesis Stream {stream.name} does not have an adequate data retention period ({stream.retention_period}hrs)."
++
++            if stream.retention_period >= kinesis_client.audit_config.get(
++                "min_kinesis_stream_retention_hours", 168
++            ):
++                report.status = "PASS"
++                report.status_extended = f"Kinesis Stream {stream.name} does have an adequate data retention period ({stream.retention_period}hrs)."
++
++            findings.append(report)
++
++        return findings
+
+
+
+
+@@ -3,7 +3,11 @@ from unittest.mock import patch
+ import botocore
+ from moto import mock_aws
+ 
+-from prowler.providers.aws.services.kinesis.kinesis_service import Kinesis, StreamStatus
++from prowler.providers.aws.services.kinesis.kinesis_service import (
++    EncryptionType,
++    Kinesis,
++    StreamStatus,
++)
+ from tests.providers.aws.utils import AWS_REGION_US_EAST_1, set_mocked_aws_provider
+ 
+ make_api_call = botocore.client.BaseClient._make_api_call
+@@ -28,6 +32,8 @@ def mock_make_api_call(self, operation_name, kwarg):
+                 "StreamARN": "arn:aws:kinesis:us-east-1:123456789012:stream/test-stream",
+                 "StreamStatus": "ACTIVE",
+                 "Tags": [{"Key": "test_tag", "Value": "test_value"}],
++                "EncryptionType": "KMS",
++                "RetentionPeriodHours": 24,
+             }
+         }
+     if operation_name == "ListTagsForStream":
+@@ -72,3 +78,17 @@ class Test_Kinesis_Service:
+         assert kinesis.streams[arn].tags == [{"Key": "test_tag", "Value": "test_value"}]
+         assert kinesis.streams[arn].region == AWS_REGION_US_EAST_1
+         assert kinesis.streams[arn].arn == arn
++
++    @mock_aws
++    def test_describe_stream(self):
++        aws_provider = set_mocked_aws_provider([AWS_REGION_US_EAST_1])
++        kinesis = Kinesis(aws_provider)
++

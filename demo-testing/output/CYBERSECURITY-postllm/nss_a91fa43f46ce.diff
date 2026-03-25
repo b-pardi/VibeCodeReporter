@@ -1,0 +1,104 @@
+@@ -173,6 +173,16 @@ extern PK11SymKey *
+ NSS_CMSUtil_DecryptSymKey_ESDH(SECKEYPrivateKey *privkey, SECItem *encKey,
+                                SECAlgorithmID *keyEncAlg, SECOidTag bulkalgtag, void *pwfn_arg);
+ 
++extern SECStatus
++NSS_CMSUtil_EncryptSymKey_ESECDH(PLArenaPool *poolp, CERTCertificate *cert, PK11SymKey *key,
++                                 SECItem *encKey, SECItem *ukm, SECAlgorithmID *keyEncAlg,
++                                 SECItem *originatorPubKey);
++
++PK11SymKey *
++NSS_CMSUtil_DecryptSymKey_ECDH(SECKEYPrivateKey *privkey, SECItem *encKey,
++                               SECAlgorithmID *keyEncAlg, SECOidTag bulkalgtag,
++                               SECItem *ukm, NSSCMSOriginatorIdentifierOrKey *oiok);
++
+ /************************************************************************
+  * cmsreclist.c - recipient list stuff
+  ************************************************************************/
+
+
+
+
+@@ -15,6 +15,7 @@
+ #include "secoid.h"
+ #include "pk11func.h"
+ #include "secerr.h"
++#include "secder.h"
+ 
+ /* ====== RSA ======================================================================= */
+ 
+@@ -106,6 +107,354 @@ NSS_CMSUtil_DecryptSymKey_RSA(SECKEYPrivateKey *privkey, SECItem *encKey, SECOid
+     return PK11_PubUnwrapSymKey(privkey, encKey, target, CKA_DECRYPT, 0);
+ }
+ 
++/* ====== ESECDH (Ephemeral-Static Elliptic Curve Diffie-Hellman) =========== */
++
++typedef struct ECC_CMS_SharedInfoStr ECC_CMS_SharedInfo;
++struct ECC_CMS_SharedInfoStr {
++    SECAlgorithmID *keyInfo; /* key-encryption algorithm */
++    SECItem entityUInfo;     /* ukm */
++    SECItem suppPubInfo;     /* length of KEK in bits as 32-bit number */
++};
++
++SEC_ASN1_MKSUB(SECOID_AlgorithmIDTemplate)
++SEC_ASN1_MKSUB(SEC_OctetStringTemplate)
++
++static const SEC_ASN1Template ECC_CMS_SharedInfoTemplate[] = {
++    { SEC_ASN1_SEQUENCE,
++      0, NULL, sizeof(ECC_CMS_SharedInfo) },
++    { SEC_ASN1_INLINE | SEC_ASN1_POINTER,
++      offsetof(ECC_CMS_SharedInfo, keyInfo),
++      SEC_ASN1_SUB(SECOID_AlgorithmIDTemplate) },
++    { SEC_ASN1_OPTIONAL | SEC_ASN1_EXPLICIT | SEC_ASN1_CONSTRUCTED |
++          SEC_ASN1_CONTEXT_SPECIFIC | SEC_ASN1_XTRN | 0,
++      offsetof(ECC_CMS_SharedInfo, entityUInfo),
++      SEC_ASN1_SUB(SEC_OctetStringTemplate) },
++    { SEC_ASN1_EXPLICIT | SEC_ASN1_CONSTRUCTED |
++          SEC_ASN1_CONTEXT_SPECIFIC | SEC_ASN1_XTRN | 2,
++      offsetof(ECC_CMS_SharedInfo, suppPubInfo),
++      SEC_ASN1_SUB(SEC_OctetStringTemplate) },
++    { 0 }
++};
++
++/* Inputs:
++ *       keyInfo: key-encryption algorithm
++ *       ukm: ukm field of KeyAgreeRecipientInfo
++ *       KEKsize: length of KEK in bytes
++ *
++ * Output: DER encoded ECC-CMS-SharedInfo
++ */
++static SECItem *
++Create_ECC_CMS_SharedInfo(PLArenaPool *poolp,
++                          SECAlgorithmID *keyInfo, SECItem *ukm, unsigned int KEKsize)
++{
++    ECC_CMS_SharedInfo SI;
++    unsigned char suppPubInfo[4];
++
++    SI.keyInfo = keyInfo;
++    SI.entityUInfo.type = ukm->type;
++    SI.entityUInfo.data = ukm->data;
++    SI.entityUInfo.len = ukm->len;
++
++    KEKsize = KEKsize * 8;
++    suppPubInfo[0] = (KEKsize & 0xFF000000) >> 24;
++    suppPubInfo[1] = (KEKsize & 0xFF0000) >> 16;
++    suppPubInfo[2] = (KEKsize & 0xFF00) >> 8;
++    suppPubInfo[3] = KEKsize & 0xFF;
++
++    SI.suppPubInfo.type = siBuffer;
++    SI.suppPubInfo.data = suppPubInfo;
++    SI.suppPubInfo.len = 4;
++
++    return SEC_ASN1EncodeItem(poolp, NULL, &SI, ECC_CMS_SharedInfoTemplate);
++}
++
++/* this will generate a key pair, compute the shared secret, */
++/* derive a key and ukm for the keyEncAlg out of it, encrypt the bulk key with */
++/* the keyEncAlg, set encKey, keyEncAlg, publicKey etc. */
++SECStatus
++NSS_CMSUtil_EncryptSymKey_ESECDH(PLArenaPool *poolp, CERTCertificate *cert,
++                                 PK11SymKey *bulkkey, SECItem *encKey, SECItem *ukm,
++                                 SECAlgorithmID *keyEncAlg, SECItem *pubKey)
++{
++    SECOidTag certalgtag; /* the certificate's encryption algorithm */
++    SE

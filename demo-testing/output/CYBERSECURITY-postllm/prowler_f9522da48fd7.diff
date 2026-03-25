@@ -1,0 +1,123 @@
+@@ -6,7 +6,10 @@ from os import environ
+ 
+ from colorama import Fore, Style
+ 
+-from prowler.config.config import get_available_compliance_frameworks
++from prowler.config.config import (
++    get_available_compliance_frameworks,
++    threat_detection_checks,
++)
+ from prowler.lib.banner import print_banner
+ from prowler.lib.check.check import (
+     bulk_load_checks_metadata,
+@@ -170,6 +173,12 @@ def prowler():
+     if checks_from_resources:
+         checks_to_execute = checks_to_execute.intersection(checks_from_resources)
+ 
++    # Only execute threat detection checks if threat-detection category is set
++    if "threat-detection" not in categories:
++        checks_to_execute = [
++            check for check in checks_to_execute if check not in threat_detection_checks
++        ]
++
+     # Sort final check list
+     checks_to_execute = sorted(checks_to_execute)
+ 
+
+
+
+
+@@ -27,6 +27,12 @@ valid_severities = ["critical", "high", "medium", "low", "informational"]
+ # Compliance
+ actual_directory = pathlib.Path(os.path.dirname(os.path.realpath(__file__)))
+ 
++# AWS CloudTrail Threat Detection checks
++threat_detection_checks = [
++    "cloudtrail_threat_detection_privilege_escalation",
++    "cloudtrail_threat_detection_enumeration",
++]
++
+ 
+ def get_available_compliance_frameworks(provider=None):
+     available_compliance_frameworks = []
+
+
+
+
+@@ -496,7 +496,8 @@ class AwsProvider(Provider):
+             f"{Style.BRIGHT}AWS Regions: {Style.RESET_ALL}{Fore.YELLOW}{regions}{Style.RESET_ALL}",
+             f"{Style.BRIGHT}AWS Account: {Style.RESET_ALL}{Fore.YELLOW}{self._identity.account}{Style.RESET_ALL}",
+             f"{Style.BRIGHT}User Id: {Style.RESET_ALL}{Fore.YELLOW}{self._identity.user_id}{Style.RESET_ALL}",
+-            f"{Style.BRIGHT}Caller Identity ARN: {Style.RESET_ALL}{Fore.YELLOW}{self._identity.identity_arn}{Style.RESET_ALL}",
++            f"{Style.BRIGHT}Caller Identity ARN: {Style.RESET_ALL}",
++            f"{Fore.YELLOW}{self._identity.identity_arn}{Style.RESET_ALL}",
+         ]
+         # If -A is set, print Assumed Role ARN
+         if (
+
+
+
+
+@@ -1,4 +1,4 @@
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from typing import Optional
+ 
+ from botocore.client import ClientError
+@@ -173,6 +173,22 @@ class Cloudtrail(AWSService):
+                 f"{error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
+             )
+ 
++    def __lookup_events__(self, trail, event_name, minutes):
++        logger.info("CloudTrail - Lookup Events...")
++        try:
++            regional_client = self.regional_clients[trail.region]
++            response = regional_client.lookup_events(
++                LookupAttributes=[
++                    {"AttributeKey": "EventName", "AttributeValue": event_name}
++                ],
++                StartTime=datetime.now() - timedelta(minutes=minutes),
++            )
++            return response.get("Events")
++        except Exception as error:
++            logger.error(
++                f"{error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
++            )
++
+     def __list_tags_for_resource__(self):
+         logger.info("CloudTrail - List Tags...")
+         try:
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,69 @@
++import json
++
++from prowler.lib.check.models import Check, Check_Report_AWS
++from prowler.providers.aws.services.cloudtrail.cloudtrail_client import (
++    cloudtrail_client,
++)
++
++ENTROPY_THRESHOLD = cloudtrail_client.audit_config.get(
++    "threat_detection_enumeration_entropy", 0.7
++)
++THREAT_DETECTION_MINUTES = cloudtrail_client.audit_config.get(
++    "threat_detection_enumeration_minutes", 1440
++)
++ENUMERATION_ACTIONS = cloudtrail_client.audit_config.get(
++    "threat_detection_enumeration_actions", []
++)
++
++
++class cloudtrail_threat_detection_enumeration(Check):
++    def execute(self):
++        findings = []
++        potential_enumeration = {}
++        found_potential_enumeration = False
++        multiregion_trail = None
++    

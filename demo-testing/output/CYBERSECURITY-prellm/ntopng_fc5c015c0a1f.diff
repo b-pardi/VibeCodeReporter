@@ -1,0 +1,106 @@
+@@ -278,7 +278,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   bool has_seen_pods, has_seen_containers, has_external_alerts;
+   time_t last_pkt_rcvd, last_pkt_rcvd_remote, /* Meaningful only for ZMQ interfaces */
+     next_idle_flow_purge, next_idle_host_purge, next_idle_other_purge;
+-  bool running, is_idle;
++  bool running, shutting_down, is_idle;
+   NetworkStats **networkStats;
+   InterfaceStatsHash *interfaceStats;
+   dhcp_range* dhcp_ranges, *dhcp_ranges_shadow;
+@@ -575,6 +575,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   inline void set_datalink(int l)  { pcap_datalink_type = l;     };
+   bool isStartingUp() const;
+   bool isRunning() const;
++  bool isShuttingDown() const;
+   inline bool isTrafficMirrored()           const { return is_traffic_mirrored;            };
+   inline bool showDynamicInterfaceTraffic() const { return show_dynamic_interface_traffic; };
+   inline bool discardProbingTraffic()       const { return discard_probing_traffic;        };
+
+
+
+
+@@ -2015,8 +2015,9 @@ void Host::releaseAllEngagedAlerts() {
+   for (u_int i = 0; i < NUM_DEFINED_HOST_CHECKS; i++) {
+     HostCheckID t = (HostCheckID) i;
+     HostAlert *alert = getCheckEngagedAlert(t);
+-    if(alert)
++    if(alert) {
+       releaseAlert(alert);
++    }
+   }
+ }
+ 
+
+
+
+
+@@ -243,7 +243,7 @@ void NetworkInterface::init(const char *interface_name) {
+     has_external_alerts = false,
+     last_pkt_rcvd = last_pkt_rcvd_remote = 0,
+     next_idle_flow_purge = next_idle_host_purge = 0,
+-    running = false, customIftype = NULL,
++    running = false, shutting_down = false, customIftype = NULL,
+     is_loopback = is_traffic_mirrored = false, lbd_serialize_by_mac = false,
+     discard_probing_traffic = false;
+     flows_only_interface = false;
+@@ -662,6 +662,14 @@ bool NetworkInterface::isRunning() const {
+ 
+ /* **************************************************** */
+ 
++/* Whether the interface is running and shutting down (flows/hosts purge already completed) */
++bool NetworkInterface::isShuttingDown() const {
++  return !running
++    && shutting_down;
++}
++
++/* **************************************************** */
++
+ bool NetworkInterface::getInterfaceBooleanPref(const char *pref_key, bool default_pref_value) const {
+   char pref_buf[CONST_MAX_LEN_REDIS_KEY], rsp[2] = { 0 };
+   bool interface_pref = default_pref_value;
+@@ -3046,7 +3054,7 @@ void NetworkInterface::flowAlertsDequeueLoop() {
+   }
+ 
+   /* Now operational */
+-  while(isRunning()) {
++  while(!isShuttingDown()) {
+     /*
+       Dequeue flows for dump.
+      */
+@@ -3102,7 +3110,7 @@ void NetworkInterface::hostAlertsDequeueLoop() {
+   }
+ 
+   /* Now operational */
+-  while(isRunning()) {
++  while(!isShuttingDown()) {
+     /*
+       Dequeue hosts for dump.
+      */
+@@ -3159,7 +3167,7 @@ void NetworkInterface::dumpFlowLoop() {
+   }
+ 
+   /* Now operational */
+-  while(isRunning()) {
++  while(!isShuttingDown()) {
+     /*
+       Dequeue flows for dump. Use an unlimited budget for idle flows as they're high-priority and
+       thus we want to keep processing them if they're in the queue.
+@@ -3270,13 +3278,19 @@ void NetworkInterface::shutdown() {
+     running = false;
+ 
+     if(pollLoopCreated)          pthread_join(pollLoop, &res);
+-    if(flowDumpLoopCreated)      pthread_join(flowDumpLoop, &res);
+-    if(flowAlertsDequeueLoopCreated) pthread_join(flowChecksLoop, &res);
+-    if(hostAlertsDequeueLoopCreated) pthread_join(hostChecksLoop, &res);
+ 
+     /* purgeIdle one last time to make sure all entries will be marked as idle */
+     purgeIdle(time(NULL), true, true);
+ 
++    /* stop host/flow alerts dump threads */
++    shutting_down = true;
++
++    /* Shut down dump threads (after purging flows/hosts to flush engaged
++     * alerts to the database) */
++    if(flowDumpLoopCreated)          pthread_join(flowDumpLoop, &res);
++    if(flowAlertsDequeueLoopCreated) pthread_join(flowChecksLoop, &res);
++    if(hostAlertsDequeueLoopCreated) pthread_join(hostChecksLoop

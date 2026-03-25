@@ -1,0 +1,104 @@
+@@ -59,7 +59,7 @@ class Flow : public GenericHashEntry {
+ 
+   u_int hash_entry_id; /* Uniquely identify this Flow inside the flows_hash hash table */
+ 
+-  bool detection_completed, protocol_processed, fully_processed,
++  bool detection_completed, extra_dissection_completed,
+     twh_over, twh_ok, dissect_next_http_packet, passVerdict,
+     l7_protocol_guessed, flow_dropped_counts_increased,
+     good_tls_hs, update_flow_port_stats,
+@@ -231,6 +231,11 @@ class Flow : public GenericHashEntry {
+   void updateCliJA3();
+   void updateSrvJA3();
+   void updateHASSH(bool as_client);
++  void processExtraDissectedInformation();
++  void processDetectedProtocol();
++  void setExtraDissectionCompleted();
++  void setProtocolDetectionCompleted();
++  void updateProtocol(ndpi_protocol proto_id);
+   const char* cipher_weakness2str(ndpi_cipher_weakness w) const;
+   bool get_partial_traffic_stats(PartializableFlowTrafficStats **dst, PartializableFlowTrafficStats *delta, bool *first_partial) const;
+   /**
+@@ -345,9 +350,9 @@ class Flow : public GenericHashEntry {
+ 		       u_int16_t payload_len, bool src2dst_direction);
+ 
+   void updateSeqNum(time_t when, u_int32_t sN, u_int32_t aN);
+-  void processDetectedProtocol();
+-  void processFullyDissectedProtocol();
+-  void setDetectedProtocol(ndpi_protocol proto_id, bool forceDetection);
++  void setDetectedProtocol(ndpi_protocol proto_id);
++  void processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time);
++  void endProtocolDissection();
+   inline void setCustomApp(custom_app_t ca) {
+     memcpy(&custom_app, &ca, sizeof(custom_app));
+   };
+
+
+
+
+@@ -53,7 +53,7 @@ public:
+ 
+   void discover(lua_State* vm, u_int timeout);
+   void arpScan(lua_State* vm);
+-  void queueMDNSRespomse(u_int32_t src_ip_nw_byte_order, u_char *buf, u_int buf_len);
++  void queueMDNSResponse(u_int32_t src_ip_nw_byte_order, u_char *buf, u_int buf_len);
+ };
+ 
+ #endif /* _NETWORK_DISCOVERY_H_ */
+
+
+
+
+@@ -51,7 +51,7 @@ Flow::Flow(NetworkInterface *_iface,
+   status_infos = NULL;
+ 
+   detection_completed = update_flow_port_stats = false;
+-  fully_processed = false;
++  extra_dissection_completed = false;
+   ndpiDetectedProtocol = ndpiUnknownProtocol;
+   doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
+   periodic_update_ctr = 0;
+@@ -138,7 +138,6 @@ Flow::Flow(NetworkInterface *_iface,
+   first_seen = _first_seen, last_seen = _last_seen;
+   bytes_thpt_trend = trend_unknown, pkts_thpt_trend = trend_unknown;
+   //bytes_rate = new TimeSeries<float>(4096);
+-  protocol_processed = false;
+ 
+   synTime.tv_sec = synTime.tv_usec = 0,
+     ackTime.tv_sec = ackTime.tv_usec = 0,
+@@ -177,7 +176,7 @@ Flow::Flow(NetworkInterface *_iface,
+   switch(protocol) {
+   case IPPROTO_TCP:
+   case IPPROTO_UDP:
+-    if(iface->is_ndpi_enabled() && (!iface->isSampledTraffic()))
++    if(iface->is_ndpi_enabled())
+       allocDPIMemory();
+ 
+     if(protocol == IPPROTO_UDP)
+@@ -187,19 +186,17 @@ Flow::Flow(NetworkInterface *_iface,
+   case IPPROTO_ICMP:
+     ndpiDetectedProtocol.app_protocol = NDPI_PROTOCOL_IP_ICMP,
+       ndpiDetectedProtocol.master_protocol = NDPI_PROTOCOL_UNKNOWN;
+-    setDetectedProtocol(ndpiDetectedProtocol, true);
++    setDetectedProtocol(ndpiDetectedProtocol);
+     break;
+ 
+   case IPPROTO_ICMPV6:
+     ndpiDetectedProtocol.app_protocol = NDPI_PROTOCOL_IP_ICMPV6,
+       ndpiDetectedProtocol.master_protocol = NDPI_PROTOCOL_UNKNOWN;
+-    setDetectedProtocol(ndpiDetectedProtocol, true);
++    setDetectedProtocol(ndpiDetectedProtocol);
+     break;
+ 
+   default:
+-    ndpiDetectedProtocol = ndpi_guess_undetected_protocol(iface->get_ndpi_struct(),
+-							  NULL, protocol, 0, 0, 0, 0);
+-    setDetectedProtocol(ndpiDetectedProtocol, true);
++    setDetectedProtocol(ndpi_guess_undetected_protocol(iface->get_ndpi_struct(), NULL, protocol, 0, 0, 0, 0));
+     break;
+   }
+ }
+@@ -327,12 +324,12 @@ u_int16_t Flow::getStatsProtocol() const {
+ /* *************************************** */
+ 
+ /* This function is called as s

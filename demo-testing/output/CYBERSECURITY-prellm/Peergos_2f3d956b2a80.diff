@@ -1,0 +1,117 @@
+@@ -465,7 +465,7 @@ public class Main {
+                 boolean enableGC = a.getBoolean("enable-gc", false);
+                 ContentAddressedStorage.HTTP ipfs = new ContentAddressedStorage.HTTP(ipfsApi, false);
+                 if (enableGC) {
+-                    GarbageCollector gced = new GarbageCollector(ipfs, a.getInt("gc.period.millis", 60 * 60 * 1000));
++                    IpfsGarbageCollector gced = new IpfsGarbageCollector(ipfs, a.getInt("gc.period.millis", 60 * 60 * 1000));
+                     gced.start();
+                     localDht = new CachingStorage(gced, dhtCacheEntries, maxValueSizeToCache);
+                 } else
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,13 @@
++package peergos.server.storage;
++
++import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.storage.*;
++
++import java.util.stream.*;
++
++public interface DeletableContentAddressedStorage extends ContentAddressedStorage {
++
++    Stream<Multihash> getAllFiles();
++
++    void delete(Multihash hash);
++}
+
+
+
+
+@@ -18,10 +18,10 @@ import java.util.function.*;
+ import java.util.logging.*;
+ import java.util.stream.*;
+ 
+-/** A local directory implementation of ContentAddressedStorage.
++/** A local directory implementation of ContentAddressedStorage. Only used for testing.
+  *
+  */
+-public class FileContentAddressedStorage implements ContentAddressedStorage {
++public class FileContentAddressedStorage implements DeletableContentAddressedStorage {
+     private static final Logger LOG = Logging.LOG();
+     private static final int CID_V1 = 1;
+     private static final int DIRECTORY_DEPTH = 5;
+@@ -216,10 +216,17 @@ public class FileContentAddressedStorage implements ContentAddressedStorage {
+         return CompletableFuture.completedFuture(file.exists() ? Optional.of((int) file.length()) : Optional.empty());
+     }
+ 
+-    protected boolean delete(Multihash h) {
++    @Override
++    public Stream<Multihash> getAllFiles() {
++        return getFiles().stream();
++    }
++
++    @Override
++    public void delete(Multihash h) {
+         Path path = getFilePath(h);
+         File file = root.resolve(path).toFile();
+-        return file.exists() && file.delete();
++        if (file.exists())
++            file.delete();
+     }
+ 
+     public Optional<Long> getLastAccessTimeMillis(Multihash h) {
+
+
+
+
+@@ -1,159 +1,92 @@
+ package peergos.server.storage;
+ 
+-import peergos.server.AggregatedMetrics;
+-import peergos.server.util.*;
++import peergos.server.corenode.*;
++import peergos.shared.*;
+ import peergos.shared.cbor.*;
++import peergos.shared.crypto.asymmetric.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.mutable.*;
+ import peergos.shared.storage.*;
+-import peergos.shared.util.*;
+ 
+ import java.util.*;
+ import java.util.concurrent.*;
+-import java.util.concurrent.atomic.*;
+-import java.util.logging.*;
++import java.util.function.*;
++import java.util.stream.*;
+ 
+-public class GarbageCollector implements ContentAddressedStorage {
++public class GarbageCollector {
+ 
+-    private static final long MAX_WAIT_FOR_TRANSACTION_MILLIS = 10_000;
+-
+-    private final ContentAddressedStorage target;
+-    private final long gcPeriodMillis;
+-    // This lock is used to make new transactions block until a pending GC completes
+-    private final Object gcLock = new Object();
+-    private final ConcurrentHashMap<PublicKeyHash, AtomicInteger> openTransactions = new ConcurrentHashMap<>();
+-
+-    public GarbageCollector(ContentAddressedStorage target, long gcPeriodMillis) {
+-        this.target = target;
+-        this.gcPeriodMillis = gcPeriodMillis;
+-    }
+-
+-    public void start() {
+-        new Thread(this::run).start();
+-    }
+-
+-    private int openTransactions() {
+-        int res = 0;
+-        for (AtomicInteger open : openTransactions.values()) {
+-            res += Math.max(0, open.get());
++    /** The result of this method is a snapshot of the mutable pointers that is consistent with the blocks store
++     * after GC has completed 

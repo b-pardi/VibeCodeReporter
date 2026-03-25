@@ -1,0 +1,112 @@
+@@ -98,7 +98,7 @@ public abstract class AbstractRib<R extends AbstractRoute> implements GenericRib
+   }
+ 
+   @Override
+-  public final Set<R> getRoutes() {
++  public Set<R> getRoutes() {
+     if (_allRoutes == null) {
+       _allRoutes = ImmutableSet.copyOf(_tree.getRoutes());
+     }
+@@ -230,6 +230,15 @@ public abstract class AbstractRib<R extends AbstractRoute> implements GenericRib
+     return d;
+   }
+ 
++  /**
++   * Extract routes stored for this exact prefix, if any.
++   *
++   * <p>Does not collect routes for any other prefixes. Does not alter memoized routes.
++   */
++  protected Set<R> extractRoutes(Prefix prefix) {
++    return _tree.getRoutes(prefix);
++  }
++
+   /**
+    * Check if two RIBs have exactly same sets of routes.
+    *
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,271 @@
++package org.batfish.dataplane.rib;
++
++import static com.google.common.base.Preconditions.checkArgument;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.ImmutableSortedSet;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.SortedSet;
++import java.util.function.Function;
++import javax.annotation.Nonnull;
++import javax.annotation.Nullable;
++import javax.annotation.ParametersAreNonnullByDefault;
++import org.batfish.datamodel.AbstractRoute;
++import org.batfish.datamodel.AsPath;
++import org.batfish.datamodel.AsSet;
++import org.batfish.datamodel.BgpRoute;
++import org.batfish.datamodel.BgpTieBreaker;
++import org.batfish.datamodel.MultipathEquivalentAsPathMatchMode;
++import org.batfish.datamodel.Prefix;
++import org.batfish.datamodel.RoutingProtocol;
++import org.batfish.dataplane.rib.RouteAdvertisement.Reason;
++
++/** BGP-specific RIB implementation */
++@ParametersAreNonnullByDefault
++public class BgpRib extends AbstractRib<BgpRoute> {
++
++  private static final long serialVersionUID = 1L;
++
++  /** Main RIB to use for IGP cost estimation */
++  @Nullable private final Rib _mainRib;
++
++  /** Tie breaker to use if all route attributes appear to be equal */
++  @Nonnull private final BgpTieBreaker _tieBreaker;
++
++  /** Maximum number of paths to install. Unconstrained (infinite) if {@code null} */
++  @Nullable private final Integer _maxPaths;
++
++  /**
++   * For multipath: how strict should the comparison of AS Path be for paths to be considered equal
++   */
++  @Nullable private final MultipathEquivalentAsPathMatchMode _multipathEquivalentAsPathMatchMode;
++
++  // Best BGP paths. Invariant: must be re-evaluated (per prefix) each time a route is added or
++  // evicted
++  @Nonnull private final Map<Prefix, BgpRoute> _bestPaths;
++
++  public BgpRib(
++      @Nullable Map<Prefix, SortedSet<BgpRoute>> backupRoutes,
++      @Nullable Rib mainRib,
++      BgpTieBreaker tieBreaker,
++      @Nullable Integer maxPaths,
++      @Nullable MultipathEquivalentAsPathMatchMode multipathEquivalentAsPathMatchMode) {
++    super(backupRoutes);
++    _mainRib = mainRib;
++    _tieBreaker = tieBreaker;
++    checkArgument(maxPaths == null || maxPaths > 0, "Invalid max-paths value %s", maxPaths);
++    if (maxPaths != null && maxPaths > 1) {
++      /*
++       * Essentially make this infinite. This is a design choice to enable more comprehensive path
++       * analysis up the stack (e.g., reachability, multipath consistency, etc.)
++       */
++      _maxPaths = null;
++    } else {
++      _maxPaths = maxPaths;
++    }
++    checkArgument(
++        Integer.valueOf(1).equals(maxPaths) || multipathEquivalentAsPathMatchMode != null,
++        "Multipath AS-Path-Match-mode must be specified for a multipath BGP RIB");
++    _multipathEquivalentAsPathMatchMode = multipathEquivalentAsPathMatchMode;
++    _bestPaths = new HashMap<>();
++  }
++
++  /*
++   * Resources for understanding this logic and the missing features:
++   *
++   * - https://www.cisco.com/c/en/us/support/docs/ip/border-gateway-protocol-bgp/13753-25.html
++   * - https://www.juniper.net/documentation

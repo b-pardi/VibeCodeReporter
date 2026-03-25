@@ -1,0 +1,139 @@
+@@ -85,18 +85,10 @@ class NetworkInterface : public Checkpointable {
+   MDNS *mdns;
+ 
+   /* Live Capture */
+-  /*
+-    LocklessList *registering_captures, *active_captures;
+-
+-    registerCapture(LiveCaptureRing *lcr);
+-    sendLiveTraffic(cosnt pcap_hdr * cosnt h, const char * const pkt) {
+-    // move registering to active
+-    for (each lcr in active captires) { 
+-        if(lcr->done) { dequeue lcr from active_captures; delete lcr; continue; };
+-        lcr->send(h, pkt);
+-     }
+-    };
+-   */
++  LocklessList *live_captures;
++  static bool matchLiveCapture(struct ntopngLuaContext * const luactx, Flow * const f);
++  int deliverLiveCapture(const struct pcap_pkthdr * const h, const u_char * const packet, Flow * const f);
++
+   string ip_addresses;
+   int id;
+   bool bridge_interface, is_dynamic_interface;
+@@ -520,7 +512,7 @@ class NetworkInterface : public Checkpointable {
+ 
+   PacketDumper *getPacketDumper(void)                  { return pkt_dumper;     }
+   PacketDumperTuntap *getPacketDumperTap(void)         { return pkt_dumper_tap; }
+-
++  int registerLiveCapture(struct ntopngLuaContext * const luactx);
+ #ifdef NTOPNG_PRO
+   void updateHostsL7Policy(u_int16_t host_pool_id);
+   void updateFlowsL7Policy();
+
+
+
+
+@@ -139,6 +139,9 @@ class Utils {
+   /* Data Format */
+   static char* formatTraffic(float numBits, bool bits, char *buf);
+   static char* formatPackets(float numPkts, char *buf);
++
++  /* Pcap files utiles */
++  static void init_pcap_header(struct pcap_file_header * const h, NetworkInterface * const iface);
+ };
+ 
+ #endif /* _UTILS_H_ */
+
+
+
+
+@@ -121,6 +121,7 @@
+ #define CONST_HTTPS_CERT_NAME     "ntopng-cert.pem"
+ #define CONST_NTOP_INTERFACE      "ntop_interface"
+ 
++#define PCAP_MAGIC                0xa1b2c3d4
+ #define NO_NDPI_PROTOCOL          ((u_int)-1)
+ #define NDPI_MIN_NUM_PACKETS      10
+ #define GTP_U_V1_PORT             2152
+
+
+
+
+@@ -455,6 +455,18 @@ struct ntopngLuaContext {
+     pcap_dumper_t *dumper;
+     u_int32_t end_capture;
+   } pkt_capture;
++
++  /* Live capture written to mongoose socket */
++  struct {
++    /* Filters */
++    struct {
++      IpAddress ip;
++      u_int16_t vlan_id;
++    } filters;
++    /* Status */
++    bool pcaphdr_sent;
++    bool done;
++  } live_capture;
+ };
+ 
+ typedef enum {
+@@ -502,4 +514,15 @@ typedef struct {
+   double namelookup, connect, appconnect, pretransfer, redirect, start, total;
+ } HTTPTranferStats;
+ 
++struct pcap_disk_timeval {
++  u_int32_t tv_sec;
++  u_int32_t tv_usec;
++};
++
++struct pcap_disk_pkthdr {
++  struct pcap_disk_timeval ts; /* time stamp                    */
++  u_int32_t caplen;            /* length of portion present     */
++  u_int32_t len;               /* length this packet (off wire) */
++};
++
+ #endif /* _NTOP_TYPEDEFS_H_ */
+
+
+
+
+@@ -3561,22 +3561,45 @@ static int ntop_interface_set_idle(lua_State* vm) {
+ /* ****************************************** */
+ 
+ // ***API***
+-// static int ntop_interface_live_capture(lua_State* vm) {
+-//   NetworkInterface *ntop_interface = NULL; // read interface from vm
+-//   // Parse params (including mongoose connection conn, filter)
++static int ntop_interface_live_capture(lua_State* vm) {
++  NetworkInterface *ntop_interface = getCurrentInterface(vm);
++  struct ntopngLuaContext *c;
+ 
+-//     if(lcr = new LiveCaptureRing()) {
+-//       ntop_interface->registerCapture(lcr);
+-//     }
++  char *key, buf[64];
++  u_int16_t vlan_id = 0;
+ 
+-//     mg_write(pcap_file_hdr);
+-//     while(lrc->receive(&pcap_h, &pkt)) {
+-//       mg_write(pcap_h);
+-//       mg_write(pkt);
+-//     }
++  ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+-//     lcr->done();
+-// }
++
++  if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK) {
++    lua_pushnil(vm);
++    return(CONST_LUA_ERROR);
++  }
++  get_host_vlan_info((char*)lua_tostring(vm, 1), &key, &vlan_id, buf, sizeof(buf));
++
++#ifdef DONT_USE_LUAJIT
++  lua_getglobal(vm, "userdata");
++  c = (struct ntopngLuaContext*)lua_touserdata(vm, lua_gettop(vm));
++#else
++  c = (

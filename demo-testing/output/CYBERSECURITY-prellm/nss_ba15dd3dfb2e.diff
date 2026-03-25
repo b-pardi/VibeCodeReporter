@@ -1,0 +1,110 @@
+@@ -15,6 +15,7 @@ class GatherV2ClientHelloTest : public TlsConnectTestBase {
+ 
+   void ConnectExpectMalformedClientHello(const DataBuffer &data) {
+     EnsureTlsSetup();
++    server_->SetOption(SSL_ENABLE_V2_COMPATIBLE_HELLO, PR_TRUE);
+     server_->ExpectSendAlert(kTlsAlertIllegalParameter);
+     client_->SendDirect(data);
+     server_->StartConnect();
+
+
+
+
+@@ -151,6 +151,7 @@ class SSLv2ClientHelloTestF : public TlsConnectTestBase {
+   void SetUp() override {
+     TlsConnectTestBase::SetUp();
+     filter_ = MakeTlsFilter<SSLv2ClientHelloFilter>(client_, version_);
++    server_->SetOption(SSL_ENABLE_V2_COMPATIBLE_HELLO, PR_TRUE);
+   }
+ 
+   void SetExpectedVersion(uint16_t version) {
+@@ -197,6 +198,27 @@ TEST_P(SSLv2ClientHelloTest, Connect) {
+   Connect();
+ }
+ 
++TEST_P(SSLv2ClientHelloTest, ConnectDisabled) {
++  server_->SetOption(SSL_ENABLE_V2_COMPATIBLE_HELLO, PR_FALSE);
++  SetAvailableCipherSuite(TLS_DHE_RSA_WITH_AES_128_CBC_SHA);
++
++  StartConnect();
++  client_->Handshake();  // Send the modified ClientHello.
++  server_->Handshake();  // Read some.
++  // The problem here is that the v2 ClientHello puts the version where the v3
++  // ClientHello puts a version number.  So the version number (0x0301+) appears
++  // to be a length and server blocks waiting for that much data.
++  EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
++
++  // This is usually what happens with v2-compatible: the server hangs.
++  // But to be certain, feed in more data to see if an error comes out.
++  uint8_t zeros[SSL_LIBRARY_VERSION_TLS_1_2] = {0};
++  client_->SendDirect(DataBuffer(zeros, sizeof(zeros)));
++  ExpectAlert(server_, kTlsAlertIllegalParameter);
++  server_->Handshake();
++  client_->Handshake();
++}
++
+ // Sending a v2 ClientHello after a no-op v3 record must fail.
+ TEST_P(SSLv2ClientHelloTest, ConnectAfterEmptyV3Record) {
+   DataBuffer buffer;
+
+
+
+
+@@ -291,6 +291,14 @@ SSL_IMPORT PRFileDesc *DTLS_ImportFD(PRFileDesc *model, PRFileDesc *fd);
+  */
+ #define SSL_ENABLE_HELLO_DOWNGRADE_CHECK 37
+ 
++/* Enables the SSLv2-compatible ClientHello for servers. NSS does not support
++ * SSLv2 and will never send an SSLv2-compatible ClientHello as a client.  An
++ * NSS server with this option enabled will accept a ClientHello that is
++ * v2-compatible as defined in Appendix E.1 of RFC 6101.
++ *
++ * This is disabled by default and will be removed in a future version. */
++#define SSL_ENABLE_V2_COMPATIBLE_HELLO 38
++
+ #ifdef SSL_DEPRECATED_FUNCTION
+ /* Old deprecated function names */
+ SSL_IMPORT SECStatus SSL_Enable(PRFileDesc *fd, int option, PRIntn on);
+
+
+
+
+@@ -470,8 +470,8 @@ ssl3_GatherCompleteHandshake(sslSocket *ss, int flags)
+             ssl2Gather ssl2gs = { PR_FALSE, 0 };
+             ssl2Gather *ssl2gs_ptr = NULL;
+ 
+-            /* If we're a server and waiting for a client hello, accept v2. */
+-            if (ss->sec.isServer && ss->ssl3.hs.ws == wait_client_hello) {
++            if (ss->sec.isServer && ss->opt.enableV2CompatibleHello &&
++                ss->ssl3.hs.ws == wait_client_hello) {
+                 ssl2gs_ptr = &ssl2gs;
+             }
+ 
+@@ -484,8 +484,8 @@ ssl3_GatherCompleteHandshake(sslSocket *ss, int flags)
+             }
+ 
+             if (!IS_DTLS(ss)) {
+-                /* If we're a server waiting for a ClientHello then pass
+-                 * ssl2gs to support SSLv2 ClientHello messages. */
++                /* Passing a non-NULL ssl2gs here enables detection of
++                 * SSLv2-compatible ClientHello messages. */
+                 rv = ssl3_GatherData(ss, &ss->gs, flags, ssl2gs_ptr);
+             } else {
+                 rv = dtls_GatherData(ss, &ss->gs, flags);
+
+
+
+
+@@ -267,6 +267,7 @@ typedef struct sslOptionsStr {
+     unsigned int enableTls13CompatMode : 1;
+     unsigned int enableDtlsShortHeader : 1;
+     unsigned int enableHelloDowngradeCheck : 1;
++    unsigned int enableV2CompatibleHello : 1;
+ } sslOptions;
+ 
+ typedef enum { sslHandshakingUndetermined = 0,
+
+
+
+
+@@ -83,7 +83,8 @@ static sslOptions ssl_defaults = 

@@ -1,0 +1,113 @@
+@@ -2974,7 +2974,10 @@ int SuricataMain(int argc, char **argv)
+         goto out;
+     }
+ 
+-    SystemHugepageSnapshot *prerun_snap = SystemHugepageSnapshotCreate();
++    SystemHugepageSnapshot *prerun_snap = NULL;
++    if (run_mode == RUNMODE_DPDK)
++        prerun_snap = SystemHugepageSnapshotCreate();
++
+     SCSetStartTime(&suricata);
+     RunModeDispatch(suricata.run_mode, suricata.runmode_custom_mode,
+             suricata.capture_plugin_name, suricata.capture_plugin_args);
+@@ -3032,13 +3035,12 @@ int SuricataMain(int argc, char **argv)
+     OnNotifyRunning();
+ 
+     PostRunStartedDetectSetup(&suricata);
+-
+-    SystemHugepageSnapshot *postrun_snap = SystemHugepageSnapshotCreate();
+-    if (run_mode == RUNMODE_DPDK) // only DPDK uses hpages at the moment
++    if (run_mode == RUNMODE_DPDK) { // only DPDK uses hpages at the moment
++        SystemHugepageSnapshot *postrun_snap = SystemHugepageSnapshotCreate();
+         SystemHugepageEvaluateHugepages(prerun_snap, postrun_snap);
+-    SystemHugepageSnapshotDestroy(prerun_snap);
+-    SystemHugepageSnapshotDestroy(postrun_snap);
+-
++        SystemHugepageSnapshotDestroy(prerun_snap);
++        SystemHugepageSnapshotDestroy(postrun_snap);
++    }
+     SCPledge();
+     SuricataMainLoop(&suricata);
+ 
+
+
+
+
+@@ -24,6 +24,7 @@
+ #include "suricata.h"
+ #include "util-debug.h"
+ #include "util-hugepages.h"
++#include "util-path.h"
+ 
+ static uint16_t SystemHugepageSizesCntPerNodeGet(uint16_t node_index);
+ static uint16_t SystemNodeCountGet(void);
+@@ -36,18 +37,28 @@ static void SystemHugepageNodeInfoDestroy(NodeInfo *n);
+ static void SystemHugepageNodeInfoDump(NodeInfo *n);
+ static void SystemHugepageSnapshotDump(SystemHugepageSnapshot *s);
+ 
++typedef enum OSHugepageAction_ {
++    OS_UNKNOWN, // unknown/unsupported OS
++    OS_LINUX_SYS_DEVICES,
++} OSHugepageAction;
++
++static OSHugepageAction SystemHugepageDetermineOS(void)
++{
++    // try Linux
++    if (SCPathExists("/sys/devices/system/node/")) {
++        return OS_LINUX_SYS_DEVICES;
++    }
++
++    return OS_UNKNOWN;
++}
++
+ static bool SystemHugepageSupported(void)
+ {
+-#if !defined __CYGWIN__ && !defined OS_WIN32 && !defined __OpenBSD__ && !defined sun
+-    return true;
+-#else
++    if (SystemHugepageDetermineOS() != OS_UNKNOWN)
++        return true;
+     return false;
+-#endif /* !defined __CYGWIN__ && !defined OS_WIN32 && !defined __OpenBSD__ && !defined sun */
+ }
+ 
+-// block of all hugepage-specific internal functions
+-#if !defined __CYGWIN__ && !defined OS_WIN32 && !defined __OpenBSD__ && !defined sun
+-
+ /**
+  * \brief Linux-specific function to detect number of NUMA nodes on the system
+  * \returns number of NUMA nodes, 0 on error
+@@ -56,16 +67,14 @@ static uint16_t SystemNodeCountGetLinux(void)
+ {
+     char dir_path[] = "/sys/devices/system/node/";
+     DIR *dir = opendir(dir_path);
+-    if (dir == NULL) {
+-        SCLogError("unable to open %s", dir_path);
+-        return 0;
+-    }
++    if (dir == NULL)
++        FatalError("unable to open %s", dir_path);
+ 
+     uint16_t count = 0;
+     struct dirent *entry;
+     while ((entry = readdir(dir)) != NULL) {
+         char d_name[] = "node";
+-        if (entry->d_type == DT_DIR && strncmp(entry->d_name, d_name, strlen(d_name)) == 0)
++        if (SCIsRegularDirectory(entry) && strncmp(entry->d_name, d_name, strlen(d_name)) == 0)
+             count++;
+     }
+     closedir(dir);
+@@ -83,7 +92,7 @@ static uint16_t SystemHugepageSizesCntPerNodeGetLinux(uint16_t node_index)
+     snprintf(dir_path, sizeof(dir_path), "/sys/devices/system/node/node%d/hugepages/", node_index);
+     DIR *dir = opendir(dir_path);
+     if (dir == NULL) {
+-        SCLogError("unable to open %s", dir_path);
++        SCLogInfo("unable to open %s", dir_path);
+         return 0;
+     }
+ 
+@@ -91,7 +100,7 @@ static uint16_t SystemHugepageSizesCntPerNodeGetLinux(uint16_t node_index)
+     struct dirent *entry;
+     while ((entry = readdir(dir)) != NULL) {
+         char d_name[] = "hugepages-";
+-        if (entry->d_type == DT_DIR && strncmp

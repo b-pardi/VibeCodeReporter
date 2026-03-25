@@ -1,0 +1,125 @@
+@@ -2342,7 +2342,9 @@ TEST_F(TlsConnectStreamTls13, EchBadCiphersuite) {
+   ConnectExpectFail();
+ }
+ 
+-// Connect to a 1.2 server, it should ignore ECH.
++/* ECH (configured) client connects to a 1.2 server, this MUST lead to an
++ * 'ech_required' alert being sent by the client when handling the handshake
++ * finished messages [draft-ietf-tls-esni-14, Section 6.1.6]. */
+ TEST_F(TlsConnectStreamTls13, EchToTls12Server) {
+   EnsureTlsSetup();
+   SetupEch(client_, server_);
+@@ -2353,7 +2355,14 @@ TEST_F(TlsConnectStreamTls13, EchToTls12Server) {
+ 
+   client_->ExpectEch(false);
+   server_->ExpectEch(false);
+-  Connect();
++
++  client_->ExpectSendAlert(kTlsAlertEchRequired, kTlsAlertFatal);
++  server_->ExpectReceiveAlert(kTlsAlertEchRequired, kTlsAlertFatal);
++  ConnectExpectFailOneSide(TlsAgent::CLIENT);
++  client_->CheckErrorCode(SSL_ERROR_ECH_RETRY_WITHOUT_ECH);
++
++  /* Reset expectations for the TlsAgent deconstructor. */
++  server_->ExpectReceiveAlert(kTlsAlertCloseNotify, kTlsAlertWarning);
+ }
+ 
+ TEST_F(TlsConnectStreamTls13, NoEchFromTls12Client) {
+
+
+
+
+@@ -12372,9 +12372,7 @@ ssl3_FinishHandshake(sslSocket *ss)
+     ss->ssl3.hs.canFalseStart = PR_FALSE; /* False Start phase is complete */
+     ss->ssl3.hs.ws = idle_handshake;
+ 
+-    ssl_FinishHandshake(ss);
+-
+-    return SECSuccess;
++    return ssl_FinishHandshake(ss);
+ }
+ 
+ SECStatus
+
+
+
+
+@@ -1268,7 +1268,7 @@ extern void ssl3_SetAlwaysBlock(sslSocket *ss);
+ 
+ extern SECStatus ssl_EnableNagleDelay(sslSocket *ss, PRBool enabled);
+ 
+-extern void ssl_FinishHandshake(sslSocket *ss);
++extern SECStatus ssl_FinishHandshake(sslSocket *ss);
+ 
+ extern SECStatus ssl_CipherPolicySet(PRInt32 which, PRInt32 policy);
+ 
+
+
+
+
+@@ -15,6 +15,7 @@
+ #include "pk11func.h" /* for PK11_GenerateRandom */
+ #include "nss.h"      /* for NSS_RegisterShutdown */
+ #include "prinit.h"   /* for PR_CallOnceWithArg */
++#include "tls13ech.h"
+ #include "tls13psk.h"
+ 
+ /* Step through the handshake functions.
+@@ -49,11 +50,34 @@ ssl_Do1stHandshake(sslSocket *ss)
+     return rv;
+ }
+ 
+-void
++SECStatus
+ ssl_FinishHandshake(sslSocket *ss)
+ {
+     PORT_Assert(ss->opt.noLocks || ssl_Have1stHandshakeLock(ss));
+     PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
++    PORT_Assert(ss->ssl3.hs.echAccepted ||
++                (ss->opt.enableTls13BackendEch &&
++                 ss->xtnData.ech &&
++                 ss->xtnData.ech->receivedInnerXtn) ==
++                    ssl3_ExtensionNegotiated(ss, ssl_tls13_encrypted_client_hello_xtn));
++
++    /* If ECH was OFFERED to (echHpkeCtx is set on the client) DISABLED by the
++     * server through negotiation of a TLS version < 1.3, an 'ech_required'
++     * alert MUST be sent to inform the server about the intention / possible
++     * misconfiguration. */
++    if (!ss->sec.isServer && ss->ssl3.hs.echHpkeCtx && !ss->ssl3.hs.echAccepted) {
++        SSL3_SendAlert(ss, alert_fatal, ech_required);
++        /* "If [one, none] of the retry_configs contains a supported version,
++         * the client can regard ECH as securely [replaced, disabled] by the
++         * server." */
++        if (ss->xtnData.ech && ss->xtnData.ech->retryConfigs.len) {
++            PORT_SetError(SSL_ERROR_ECH_RETRY_WITH_ECH);
++            ss->xtnData.ech->retryConfigsValid = PR_TRUE;
++        } else {
++            PORT_SetError(SSL_ERROR_ECH_RETRY_WITHOUT_ECH);
++        }
++        return SECFailure;
++    }
+ 
+     SSL_TRC(3, ("%d: SSL[%d]: handshake is completed", SSL_GETPID(), ss->fd));
+ 
+@@ -69,6 +93,8 @@ ssl_FinishHandshake(sslSocket *ss)
+     }
+ 
+     ssl_FreeEphemeralKeyPairs(ss);
++
++    return SECSuccess;
+ }
+ 
+ /*
+
+
+
+
+@@ -5063,8 +5063,6 @@ loser:
+ static SECStatus
+ tls13_FinishHandshake(sslSocket *ss)
+ {
+-    /* If |!echHpkeCtx|, any advertised ECH was GREASE ECH. */
+-    PRBool offeredEch = !ss->sec.isServer && ss->ssl3.hs.echHpkeCtx;
+     PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+     PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+     PORT_Assert(ss->ssl3.hs.restart

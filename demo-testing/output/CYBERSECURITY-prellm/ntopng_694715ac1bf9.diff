@@ -1,0 +1,149 @@
+@@ -43,9 +43,13 @@ class ContinuousPingStats {
+   inline void heartbeat()                    { stats.last_refresh = time(NULL);               }
+   inline void incSent()                      { stats.num_ping_sent++;                         }
+   inline void update(float rtt) {
+-    stats.num_ping_rcvd++, stats.last_rtt = rtt;
+-    stats.min_rtt = (stats.num_ping_rcvd == 1) ? rtt : min(stats.min_rtt, rtt);
+-    stats.max_rtt = max(stats.max_rtt, rtt);
++    stats.num_ping_rcvd++;
++    
++    if(rtt > 0) {
++      stats.last_rtt = rtt;
++      stats.min_rtt = (stats.num_ping_rcvd == 1) ? rtt : min(stats.min_rtt, rtt);
++      stats.max_rtt = max(stats.max_rtt, rtt);
++    }
+   }  
+ 
+   inline float getSuccessRate(float *min_rtt, float *max_rtt) {
+
+
+
+
+@@ -35,7 +35,6 @@ class Ping {
+   std::map<std::string /* IP */, float /* RTT */> results;
+   
+   u_int16_t checksum(void *b, int len);
+-  float ms_timeval_diff(struct timeval *begin, struct timeval *end);
+   void setOpts(int fd);
+   void handleICMPResponse(unsigned char *buf, u_int buf_len, struct in_addr *ip, struct in6_addr *ip6);
+   
+@@ -44,7 +43,7 @@ class Ping {
+   ~Ping();
+ 
+   int  ping(char *_addr, bool use_v6);
+-  void pollResults(bool wait_forever);
++  void pollResults(u_int8_t max_wait_time_sec = 1);
+   void collectResponses(lua_State* vm);
+   float getRTT(std::string who);
+   void cleanup();
+
+
+
+
+@@ -23,6 +23,8 @@
+ 
+ #include "ntop_includes.h"
+ 
++/* #define TRACE_PING */
++
+ /*
+   Usage example (minute.lua):
+   
+@@ -199,8 +201,7 @@ void ContinuousPing::runPingCampaign() {
+ 
+     pinger->cleanup();
+     pingAll();
+-    sleep(1);
+-    pinger->pollResults(false);
++    pinger->pollResults(2);
+     readPingResults();
+   }
+ 
+
+
+
+
+@@ -29,6 +29,10 @@
+ 
+ #define PACKETSIZE	64
+ 
++/* #define PING_DEBUG */
++
++/* ****************************************** */
++
+ struct ping_packet {
+   struct ndpi_icmphdr hdr;
+   char msg[PACKETSIZE-sizeof(struct ndpi_icmphdr)];
+@@ -41,7 +45,7 @@ struct ping_packet {
+ static void* resultPollerFctn(void* ptr) {
+   Utils::setThreadName("PingLoop");
+ 
+-  ((Ping*)ptr)->pollResults(false);
++  ((Ping*)ptr)->pollResults(2 /* sec */);
+   return(NULL);
+ }
+ 
+@@ -194,19 +198,22 @@ int Ping::ping(char *_addr, bool use_v6) {
+ 
+ /* ****************************************** */
+ 
+-void Ping::pollResults(bool wait_forever) {
+-  while(running) {
+-    int bytes, fd_max = max(sd, sd6);
+-    fd_set mask;
+-    struct timeval wait_time = { 1, 0 };
++void Ping::pollResults(u_int8_t max_wait_time_sec) {
++  int bytes, fd_max = max(sd, sd6);
++  fd_set mask;
++  struct timeval wait_time = { 1, 0 };
++  time_t now = time(NULL), max_time;
+ 
++  max_time = now + max_wait_time_sec;
++  
++  while(now < max_time) {
+     FD_ZERO(&mask);
+     if(sd != -1)  FD_SET(sd, &mask);
+     if(sd6 != -1) FD_SET(sd6, &mask);
+-
++    
+     if(select(fd_max+1, &mask, 0, 0, &wait_time) > 0) {
+       unsigned char buf[1024];
+-
++      
+       if(FD_ISSET(sd, &mask)) {
+ 	struct sockaddr_in addr;
+ 	socklen_t len = sizeof(addr);
+@@ -214,7 +221,7 @@ void Ping::pollResults(bool wait_forever) {
+ 	bytes = recvfrom(sd, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
+ 	handleICMPResponse(buf, bytes, &addr.sin_addr, NULL);
+       }
+-
++      
+       if(FD_ISSET(sd6, &mask)) {
+ 	struct sockaddr_in6 addr;
+ 	socklen_t len = sizeof(addr);
+@@ -222,10 +229,9 @@ void Ping::pollResults(bool wait_forever) {
+ 	bytes = recvfrom(sd6, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
+ 	handleICMPResponse(buf, bytes, NULL, &addr.sin6_addr);
+       }
+-    } else {
+-      if(!wait_forever)
+-	break;
+     }
++
++    now = time(NULL);
+   }
+ }
+ 
+@@ -263,8 +269,7 @@ void Ping::handleICMPResponse(unsigned char *buf, u_int buf_len,
+     char *h, buf[64];
+     
+     gettimeofday(&end, NULL);
+-
+-    rtt = ms_timeval_diff(begin, &end);
++    rtt = ((float)Utils::usecTimevalDiff(&end,begin))/1000.0;
+ 
+     m.lock(__FILE__, __LINE__);
+ 
+@@ -274,6 +279,10 @@ void Ping::handleICMPResponse(unsigned char *buf, u_int buf_len,
+       h = Utils::intoaV6(*((s

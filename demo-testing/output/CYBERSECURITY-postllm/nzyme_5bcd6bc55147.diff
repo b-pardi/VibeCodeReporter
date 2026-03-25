@@ -1,0 +1,129 @@
+@@ -19,6 +19,7 @@ package app.nzyme.core;
+ 
+ import app.nzyme.core.distributed.ClusterManager;
+ import app.nzyme.core.distributed.NodeManager;
++import app.nzyme.core.distributed.messaging.MessageBus;
+ import app.nzyme.core.monitoring.health.HealthMonitor;
+ import app.nzyme.core.registry.RegistryImpl;
+ import app.nzyme.plugin.Database;
+@@ -210,6 +211,11 @@ public class MockNzyme implements NzymeNode {
+         return null;
+     }
+ 
++    @Override
++    public MessageBus getMessageBus() {
++        return null;
++    }
++
+     @Override
+     public HealthMonitor getHealthMonitor() {
+         return null;
+
+
+
+
+@@ -19,6 +19,7 @@ package app.nzyme.core;
+ 
+ import app.nzyme.core.distributed.ClusterManager;
+ import app.nzyme.core.distributed.NodeManager;
++import app.nzyme.core.distributed.messaging.MessageBus;
+ import app.nzyme.core.monitoring.health.HealthMonitor;
+ import app.nzyme.plugin.*;
+ import app.nzyme.plugin.retro.RetroService;
+@@ -58,6 +59,7 @@ public interface NzymeNode extends RemoteConnector, PluginEntryPoint, DatabasePr
+ 
+     NodeManager getNodeManager();
+     ClusterManager getClusterManager();
++    MessageBus getMessageBus();
+ 
+     HealthMonitor getHealthMonitor();
+ 
+
+
+
+
+@@ -20,6 +20,8 @@ package app.nzyme.core;
+ import app.nzyme.core.crypto.tls.KeyStoreBootstrapResult;
+ import app.nzyme.core.distributed.ClusterManager;
+ import app.nzyme.core.distributed.NodeManager;
++import app.nzyme.core.distributed.messaging.MessageBus;
++import app.nzyme.core.distributed.messaging.postgres.PostgresMessageBusImpl;
+ import app.nzyme.core.monitoring.health.HealthMonitor;
+ import app.nzyme.core.periodicals.distributed.NodeUpdater;
+ import app.nzyme.core.rest.resources.system.cluster.NodesResource;
+@@ -160,6 +162,7 @@ public class NzymeNodeImpl implements NzymeNode {
+     private final List<Uplink> uplinks;
+     private final List<Forwarder> forwarders;
+     private final TapManager tapManager;
++    private final MessageBus messageBus;
+ 
+     private final Ethernet ethernet;
+ 
+@@ -217,6 +220,7 @@ public class NzymeNodeImpl implements NzymeNode {
+         }
+ 
+         this.clusterManager = new ClusterManager(this);
++        this.messageBus = new PostgresMessageBusImpl(this);
+ 
+         this.signingKey = Keys.secretKeyFor(SignatureAlgorithm.HS512);
+ 
+@@ -459,6 +463,11 @@ public class NzymeNodeImpl implements NzymeNode {
+         return clusterManager;
+     }
+ 
++    @Override
++    public MessageBus getMessageBus() {
++        return messageBus;
++    }
++
+     @Override
+     public HealthMonitor getHealthMonitor() {
+         return healthMonitor;
+
+
+
+
+@@ -3,5 +3,6 @@ package app.nzyme.core.distributed.messaging;
+ public interface MessageHandler {
+ 
+     MessageProcessingResult handle(Message message);
++    String getName();
+ 
+ }
+
+
+
+
+@@ -2,13 +2,21 @@ package app.nzyme.core.distributed.messaging.postgres;
+ 
+ import app.nzyme.core.NzymeNode;
+ import app.nzyme.core.distributed.messaging.*;
++import com.beust.jcommander.internal.Lists;
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.DeserializationFeature;
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import com.google.common.collect.Maps;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.joda.time.DateTime;
+ 
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++
+ public class PostgresMessageBusImpl implements MessageBus {
+ 
+     private static final Logger LOG = LogManager.getLogger(PostgresMessageBusImpl.class);
+@@ -16,22 +24,50 @@ public class PostgresMessageBusImpl implements MessageBus {
+     private final NzymeNode nzyme;
+     private final ObjectMapper om;
+ 
++    private final Map<MessageType, List<MessageHandler>> messageHandlers;
++
++    private boolean initialized;
++
+     public PostgresMessageBusImpl(NzymeNode nzyme) {
+         this.nzyme = nzyme;
++  

@@ -1,0 +1,132 @@
+@@ -71,6 +71,7 @@ class MySQLDB : public DB {
+   void shutdown();
+   void updateStats(const struct timeval *tv);
+   void lua(lua_State* vm, bool since_last_checkpoint) const;
++  static int exec_single_query(lua_State *vm, char *sql);
+ #ifdef NTOPNG_PRO
+   bool dumpAggregatedFlow(time_t when, AggregatedFlow *f) { return(false); };
+ #endif
+
+
+
+
+@@ -5844,6 +5844,24 @@ static int ntop_interface_exec_sql_query(lua_State *vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_interface_exec_single_sql_query(lua_State *vm) {
++  char *sql;
++
++  ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
++
++  if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK) return(CONST_LUA_PARAM_ERROR);
++  if((sql = (char*)lua_tostring(vm, 1)) == NULL)  return(CONST_LUA_PARAM_ERROR);
++
++#ifdef HAVE_MYSQL
++  MySQLDB::exec_single_query(vm, sql);
++  return(CONST_LUA_OK);
++#else
++  return(CONST_LUA_ERROR);
++#endif
++}
++
++/* ****************************************** */
++
+ // ***API***
+ static int ntop_get_dirs(lua_State* vm) {
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+@@ -8170,6 +8188,7 @@ static const luaL_Reg ntop_reg[] = {
+   { "md5",              ntop_md5 },
+   { "hasRadiusSupport", ntop_has_radius_support },
+   { "hasLdapSupport",   ntop_has_ldap_support },
++  { "execSingleSQLQuery", ntop_interface_exec_single_sql_query },
+ 
+   /* Redis */
+   { "getCache",          ntop_get_redis },
+
+
+
+
+@@ -707,23 +707,9 @@ void MySQLDB::disconnectFromDB(MYSQL *conn) {
+ 
+ /* ******************************************* */
+ 
+-bool MySQLDB::connectToDB(MYSQL *conn, bool select_db) {
++static MYSQL *mysql_try_connect(MYSQL *conn, const char *dbname) {
+   MYSQL *rc;
+   unsigned long flags = CLIENT_COMPRESS;
+-  char *dbname = select_db ? ntop->getPrefs()->get_mysql_dbname() : NULL;
+-
+-  db_operational = false;
+-
+-  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Attempting to connect to MySQL for interface %s...",
+-			       iface->get_name());
+-
+-  if(m) m->lock(__FILE__, __LINE__);
+-
+-  if(mysql_init(conn) == NULL) {
+-    ntop->getTrace()->traceEvent(TRACE_ERROR, "Failed to initialize MySQL connection");
+-    if(m) m->unlock(__FILE__, __LINE__);
+-    return(false);
+-  }
+ 
+   if(ntop->getPrefs()->get_mysql_host()[0] == '/') /* Use socketD */
+     rc = mysql_real_connect(conn,
+@@ -742,6 +728,69 @@ bool MySQLDB::connectToDB(MYSQL *conn, bool select_db) {
+ 			    ntop->getPrefs()->get_mysql_port(),
+ 			    NULL /* socket */, flags);
+ 
++  return(rc);
++}
++
++/* ******************************************* */
++
++void mysql_result_to_lua(lua_State *vm, MYSQL_RES *result, bool limitRows) {
++  MYSQL_ROW row;
++  char *fields[MYSQL_MAX_NUM_FIELDS] = { NULL };
++  int num_fields = min_val(mysql_num_fields(result), MYSQL_MAX_NUM_FIELDS);
++  int num = 0;
++  lua_newtable(vm);
++
++  while((row = mysql_fetch_row(result))) {
++    lua_newtable(vm);
++
++    if(num == 0) {
++      for(int i = 0; i < num_fields; i++) {
++	MYSQL_FIELD *field = mysql_fetch_field(result);
++
++	fields[i] = field->name;
++      }
++    }
++
++    for(int i = 0; i < num_fields; i++)
++      lua_push_str_table_entry(vm, (const char*)fields[i], row[i] ? row[i] : (char*)"");
++
++    lua_pushinteger(vm, ++num);
++    lua_insert(vm, -2);
++    lua_settable(vm, -3);
++
++    if(num > MYSQL_MAX_NUM_ROWS) {
++      static bool warning_shown = false;
++      if(!warning_shown) {
++	ntop->getTrace()->traceEvent(TRACE_WARNING, "Too many results returned from MySQL, reduce query result set");
++	warning_shown = true;
++      }
++    }
++
++    if(limitRows && num >= MYSQL_MAX_NUM_ROWS) break;
++  }
++}
++
++/* ******************************************* */
++
++bool MySQLDB::connectToDB(MYSQL *conn, bool select_db) {
++  MYSQL *rc;
++  char *dbname = select_db ? ntop->getPrefs()->get_mysql_dbname() : NULL;
++
++  db_operational = false;
++
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Attempting to connect to MySQL for interface %s...",
++			       iface->get_name());
++
++  if(m) m->loc

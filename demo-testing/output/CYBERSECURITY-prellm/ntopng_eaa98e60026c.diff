@@ -1,0 +1,108 @@
+@@ -39,7 +39,7 @@ class ParserInterface : public NetworkInterface {
+ 
+   virtual bool is_ndpi_enabled() const    { return(false);      };
+   virtual u_int getPacketOverhead() { return 0; /* Can't determine this for non-packet interfaces */ }
+-  void processFlow(ParsedFlow *zflow);
++  bool processFlow(ParsedFlow *zflow);
+ 
+   void deliverFlowToCompanions(ParsedFlow * const flow);
+   inline bool companionsEnabled() { return num_companion_interfaces > 0; };
+
+
+
+
+@@ -36,11 +36,6 @@ typedef struct {
+ class ZMQCollectorInterface : public ZMQParserInterface {
+  private:
+   void *context;
+-  struct {
+-    u_int32_t num_flows, num_events, num_counters,
+-      num_templates, num_options, num_network_events,
+-      zmq_msg_rcvd, zmq_msg_drops;
+-  } recvStats, recvStatsCheckpoint;
+   std::map<u_int8_t, u_int32_t>source_id_last_msg_id;
+   bool is_collector;
+   u_int8_t num_subscribers;
+
+
+
+
+@@ -40,7 +40,8 @@ class ZMQParserInterface : public ParserInterface {
+ #ifdef NTOPNG_PRO
+   CustomAppMaps *custom_app_maps;
+ #endif
+-  void preprocessFlow(ParsedFlow *flow);
++
++  bool preprocessFlow(ParsedFlow *flow);
+   bool getKeyId(char *sym, u_int32_t sym_len, u_int32_t * const pen, u_int32_t * const field) const;
+   void addMapping(const char *sym, u_int32_t num, u_int32_t pen = 0);
+   bool parsePENZeroField(ParsedFlow * const flow, u_int32_t field, ParsedValue *value) const;
+@@ -49,7 +50,7 @@ class ZMQParserInterface : public ParserInterface {
+   bool matchPENNtopField(ParsedFlow * const flow, u_int32_t field, ParsedValue *value) const;
+   static bool parseContainerInfo(json_object *jo, ContainerInfo * const container_info);
+   bool parseNProbeAgentField(ParsedFlow * const flow, const char * const key, ParsedValue *value, json_object * const jvalue) const;
+-  void parseSingleJSONFlow(json_object *o, u_int8_t source_id);
++  int parseSingleJSONFlow(json_object *o, u_int8_t source_id);
+   int parseSingleTLVFlow(ndpi_deserializer *deserializer, u_int8_t source_id);
+   void setFieldMap(const ZMQ_FieldMap * const field_map) const;
+   void setFieldValueMap(const ZMQ_FieldValueMap * const field_value_map) const;
+@@ -57,7 +58,16 @@ class ZMQParserInterface : public ParserInterface {
+   u_int8_t parseOptionFieldMap(json_object * const jo) const;
+   u_int8_t parseOptionFieldValueMap(json_object * const jo) const;
+ 
+- public:
++protected:
++  struct {
++    u_int32_t num_flows, /* flows processed */
++      num_dropped_flows, /* flows unhandles (received but no room in the flow hash) */
++      num_events, num_counters,
++      num_templates, num_options, num_network_events,
++      zmq_msg_rcvd, zmq_msg_drops;
++  } recvStats, recvStatsCheckpoint;
++
++public:
+   ZMQParserInterface(const char *endpoint, const char *custom_interface_type = NULL);
+   ~ZMQParserInterface();
+ 
+
+
+
+
+@@ -39,7 +39,7 @@ ParserInterface::~ParserInterface() {
+ 
+ /* **************************************************** */
+ 
+-void ParserInterface::processFlow(ParsedFlow *zflow) {
++bool ParserInterface::processFlow(ParsedFlow *zflow) {
+   bool src2dst_direction, new_flow;
+   Flow *flow;
+   ndpi_protocol p = Flow::ndpiUnknownProtocol;
+@@ -65,7 +65,7 @@ void ParserInterface::processFlow(ParsedFlow *zflow) {
+     if(isProbingFlow(zflow)) {
+       discardedProbingStats.inc(zflow->pkt_sampling_rate * (zflow->in_pkts + zflow->out_pkts),
+ 				zflow->pkt_sampling_rate * (zflow->in_bytes + zflow->out_bytes));
+-      return;
++      return false;
+     }
+   }
+ 
+@@ -139,7 +139,7 @@ void ParserInterface::processFlow(ParsedFlow *zflow) {
+     }
+ 
+     if (processed && !showDynamicInterfaceTraffic()) {
+-      return;
++      return false;
+     }
+   }
+ 
+@@ -168,21 +168,7 @@ void ParserInterface::processFlow(ParsedFlow *zflow) {
+   PROFILING_SECTION_EXIT(0);
+ 
+   if(flow == NULL) {
+-
+-#ifdef NTOPNG_PRO
+-    /* Update drop stats in case of direct flow dump */
+-    if(ntop->getPrefs()->do_dump_flows_direct() && (
+-       ntop->getPrefs()->is_flows_dump_enabled()
+-#ifndef HAVE_NEDGE
+-       || ntop->get_export_interface()

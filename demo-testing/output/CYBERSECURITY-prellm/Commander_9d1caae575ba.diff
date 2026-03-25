@@ -1,0 +1,111 @@
+@@ -22,6 +22,7 @@ import abc
+ 
+ from tabulate import tabulate
+ from collections import OrderedDict
++from typing import Optional
+ 
+ from ..params import KeeperParams
+ 
+@@ -233,7 +234,7 @@ class Command(CliCommand):
+         except ParseError as e:
+             logging.error(e)
+ 
+-    def get_parser(self):   # type: () -> argparse.ArgumentParser | None
++    def get_parser(self):   # type: () -> Optional[argparse.ArgumentParser]
+         return None
+ 
+     def _ensure_parser(func):
+
+
+
+
+@@ -5,7 +5,7 @@
+ #              |_|
+ #
+ # Keeper Commander
+-# Copyright 2019 Keeper Security Inc.
++# Copyright 2021 Keeper Security Inc.
+ # Contact: ops@keepersecurity.com
+ #
+ 
+@@ -13,17 +13,27 @@
+ import argparse
+ import logging
+ import requests
++import json
++import os
++import getpass
+ 
++from typing import Optional, List
+ from contextlib import contextmanager
+ from .. import api
+ from . import imp_exp
++from ..params import KeeperParams
+ from ..commands.base import raise_parse_exception, suppress_exit, user_choice, Command
+-from .importer import Attachment as ImportAttachment
++from .importer import Attachment as ImportAttachment, SharedFolder, Permission
++from .lastpass import fetcher
++from .lastpass.vault import Vault
++from .json.json import KeeperJsonImporter, KeeperJsonExporter
+ 
+ 
+ def register_commands(commands):
+     commands['import'] = RecordImportCommand()
+     commands['export'] = RecordExportCommand()
++    commands['unload-membership'] = UnloadMembershipCommand()
++    commands['load-membership'] = LoadMembershipCommand()
+ 
+ 
+ def register_command_info(aliases, command_info):
+@@ -56,6 +66,18 @@ export_parser.error = raise_parse_exception
+ export_parser.exit = suppress_exit
+ 
+ 
++unload_membership_parser = argparse.ArgumentParser(prog='unload-membership', description='Unload shared folder membership to JSON file.')
++unload_membership_parser.add_argument('--source', dest='source', choices=['keeper', 'lastpass'], required=True, help='Shared folder membership source')
++unload_membership_parser.add_argument('name', type=str, nargs='?', help='Output file name. "shared_folder_membership.json" if omitted.')
++unload_membership_parser.error = raise_parse_exception
++unload_membership_parser.exit = suppress_exit
++
++
++load_membership_parser = argparse.ArgumentParser(prog='unload-membership', description='Unload shared folder membership to JSON file.')
++load_membership_parser.add_argument('name', type=str, nargs='?', help='Output file name. "shared_folder_membership.json" if omitted.')
++load_membership_parser.error = raise_parse_exception
++load_membership_parser.exit = suppress_exit
++
+ csv_instructions = '''CSV Import Instructions
+ 
+ File Format:
+@@ -220,3 +242,141 @@ def is_export_restricted(params):
+             is_export_restricted = restrict_export_boolean['value']
+ 
+     return is_export_restricted
++
++
++class UnloadMembershipCommand(Command):
++    def get_parser(self):  # type: () -> Optional[argparse.ArgumentParser]
++        return unload_membership_parser
++
++    def execute(self, params, **kwargs):  # type: (KeeperParams, **any) -> any
++        source = kwargs.get('source') or 'keeper'
++        file_name = kwargs.get('name') or 'shared_folder_membership.json'
++
++        shared_folders = []  # type: List[SharedFolder]
++
++        json_importer = KeeperJsonImporter()
++
++        if os.path.exists(file_name):
++            for sf in json_importer.do_import(file_name, users_only=True):
++                if isinstance(sf, SharedFolder):
++                    shared_folders.append(sf)
++
++        json_shared_folders = set((x.uid for x in shared_folders))
++
++        added_members = []  # type: List[SharedFolder]
++        if source == 'keeper':
++            if params.shared_folder_cache:
++                for shared_folder_uid in params.shared_folder_cache:
++                    if shared_folder_uid in json_shared_folders:
++                        continue
++                    shared_folder = api.get_shared_folder(params, shared_folder_uid)
++                    

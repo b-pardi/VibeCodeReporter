@@ -1,0 +1,138 @@
+@@ -554,6 +554,24 @@ ct_recreate4:
+ 			ep_tail_call(skb, CILIUM_CALL_IPV4_NODEPORT_REVNAT);
+ 			return DROP_MISSED_TAIL_CALL;
+ 		}
++# ifdef ENABLE_DSR
++		if (ct_state.dsr) {
++			struct ipv4_ct_tuple nat_tup = tuple;
++			struct ipv4_nat_entry *entry;
++
++			nat_tup.flags = NAT_DIR_EGRESS;
++			nat_tup.sport = tuple.dport;
++			nat_tup.dport = tuple.sport;
++			entry = snat_v4_lookup(&nat_tup);
++			if (entry) {
++				ret = snat_v4_rewrite_egress(skb, &nat_tup,
++								  entry, l4_off);
++				if (ret != 0) {
++					return ret;
++				}
++			}
++		}
++# endif /* ENABLE_DSR */
+ #endif /* ENABLE_NODEPORT */
+ 
+ 		if (ct_state.rev_nat_index) {
+@@ -982,6 +1000,7 @@ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, __u8 *reason, _
+ 	__be32 orig_dip, orig_sip;
+ 	bool is_fragment = false;
+ 	__u32 monitor = 0;
++	bool dsr = false;
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip4))
+ 		return DROP_INVALID;
+@@ -1048,9 +1067,41 @@ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, __u8 *reason, _
+ 		verdict = 0;
+ 
+ 	if (ret == CT_NEW) {
++#ifdef ENABLE_DSR
++		// Check whether IPv4 header contains a 64-bit option (IPv4 header
++		// w/o option (5 x 32-bit words) + the DSR option (2 x 32-bit words))
++		if (ip4->ihl == 0x7) {
++			uint32_t opt1 = 0;
++			uint32_t opt2 = 0;
++
++			if (skb_load_bytes(skb, ETH_HLEN + sizeof(struct iphdr),
++					   &opt1, sizeof(opt1)) < 0)
++				return DROP_INVALID;
++			opt1 = bpf_ntohl(opt1);
++
++			if ((opt1 & DSR_IPV4_OPT_MASK) == DSR_IPV4_OPT_32) {
++				if (skb_load_bytes(skb, ETH_HLEN +
++						   sizeof(struct iphdr) +
++						   sizeof(opt1),
++						   &opt2, sizeof(opt2)) < 0)
++					return DROP_INVALID;
++				opt2 = bpf_ntohl(opt2);
++
++				__be32 dport = opt1 & DSR_IPV4_DPORT_MASK;
++				__be32 address = opt2;
++				dsr = true;
++
++				if (snat_v4_create_dsr(skb, address, dport) < 0) {
++					return DROP_INVALID;
++				}
++			}
++		}
++#endif /* ENABLE_DSR */
++
+ 		ct_state_new.orig_dport = tuple.dport;
+ 		ct_state_new.src_sec_id = src_label;
+ 		ct_state_new.node_port = ct_state.node_port;
++		ct_state_new.dsr = dsr;
+ 		ret = ct_create4(get_ct_map4(&tuple), &tuple, skb, CT_INGRESS, &ct_state_new, verdict > 0);
+ 		if (IS_ERR(ret))
+ 			return ret;
+
+
+
+
+@@ -714,14 +714,14 @@ int to_netdev(struct __sk_buff *skb)
+ 	 * workaround.
+ 	 */
+ 	int ret = TC_ACT_OK;
+-#if defined(ENABLE_NODEPORT) || defined(ENABLE_MASQUERADE)
+-#ifdef ENABLE_NODEPORT
++#if (defined(ENABLE_NODEPORT) && !defined(ENABLE_DSR)) || defined(ENABLE_MASQUERADE)
++# if defined(ENABLE_NODEPORT) && !defined(ENABLE_DSR)
+ 	if ((skb->mark & MARK_MAGIC_SNAT_DONE) == MARK_MAGIC_SNAT_DONE)
+ 		return TC_ACT_OK;
+ 	ret = nodeport_nat_fwd(skb, false);
+ 	if (IS_ERR(ret))
+ 		return send_drop_notify_error(skb, 0, ret, TC_ACT_SHOT, METRIC_EGRESS);
+-#else
++# else
+ 	__u16 proto;
+ 	if (!validate_ethertype(skb, &proto))
+ 		/* Pass unknown traffic to the stack */
+@@ -730,8 +730,8 @@ int to_netdev(struct __sk_buff *skb)
+ 	ret = snat_process(skb, BPF_PKT_DIR);
+ 	if (!ret)
+ 		cilium_dbg_capture(skb, DBG_CAPTURE_SNAT_POST, skb->ifindex);
+-#endif /* ENABLE_NODEPORT */
+-#endif /* ENABLE_NODEPORT || ENABLE_MASQUERADE */
++# endif
++#endif
+ 	return ret;
+ }
+ 
+
+
+
+
+@@ -162,6 +162,8 @@ static int BPF_FUNC(skb_load_bytes, struct __sk_buff *skb, uint32_t off,
+ 		    void *to, uint32_t len);
+ static int BPF_FUNC(skb_store_bytes, struct __sk_buff *skb, uint32_t off,
+ 		    const void *from, uint32_t len, uint32_t flags);
++static int BPF_FUNC(skb_adjust_room, struct __sk_buff *skb, int32_t len_diff,
++		    uint32_t mode, uint64_t flags);
+ 
+ static int BPF_FUNC(l3_csum_replace, struct __sk_buff *skb, uint32_t off,
+ 		    uint32_t from, uint32_t to, uint32_t flags);
+
+
+
+
+@@ -89,7 +89,8 @@
+ #define CILIUM_CALL_IPV4_NODEPORT_REVNAT	17
+ #define CILIUM_CALL_IPV6_NODEPORT_REVNAT	18
+ #define CILIUM_CALL_ENCAP_NODEPORT_NAT		19
+-#define CILIUM_CALL_SIZE			20
++#define CILIUM_CALL_IPV4_NODEPORT_DSR		20
++#define CILIUM_CALL_SIZE			21
+ 
+ typedef __u64 mac_t;
+ 
+@@ -382,6 +383,20 @@ enum {
+ 
+ #define MARK_M

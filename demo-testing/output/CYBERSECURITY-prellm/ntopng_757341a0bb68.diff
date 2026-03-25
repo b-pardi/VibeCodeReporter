@@ -1,0 +1,124 @@
+@@ -701,9 +701,10 @@ class NetworkInterface : public Checkpointable {
+   virtual bool read_from_pcap_dump()         { return(false); };
+   void makeTsPoint(NetworkInterfaceTsPoint *pt);
+   void tsLua(lua_State* vm);
+-#ifdef HAVE_EBFF
++#ifdef HAVE_EBPF
+   inline void enqueueeBPFEvent(void *event)  { if(ebpfEvents) ebpfEvents->enqueue(event, false);        }
+   inline bool dequeueeBPFEvent(void **event) { return(ebpfEvents ? ebpfEvents->dequeue(event) : false); }
++  void delivereBPFEvent(eBPFevent *event);
+ #endif
+ };
+ 
+
+
+
+
+@@ -75,7 +75,6 @@ class Ntop {
+ #endif
+ 
+   void loadLocalInterfaceAddress();
+-
+   void initAllowedProtocolPresets();
+ 
+  public:
+@@ -444,6 +443,9 @@ class Ntop {
+   bool addToNotifiedInformativeCaptivePortal(u_int32_t client_ip);
+   bool addIPToLRUMatches(u_int32_t client_ip, u_int16_t user_pool_id,
+ 			 char *label, int32_t lifetime_secs, char *ifname);
++#ifdef HAVE_EBPF
++  void deliverEventToInterfaces(eBPFevent *event);
++#endif
+ #endif /* NTOPNG_PRO */
+   
+   DeviceProtocolBitmask* getDeviceAllowedProtocols(DeviceType t) { return(&deviceProtocolPresets[t]); }
+
+
+
+
+@@ -164,9 +164,11 @@ typedef struct ether80211q {
+ typedef struct {
+   u_int32_t pid, father_pid;
+   char name[48], father_name[48], user_name[48];
++#if 0
+   u_int32_t actual_memory, peak_memory;
+   float average_cpu_load, percentage_iowait_time;
+   u_int32_t num_vm_page_faults;
++#endif
+ } ProcessInfo;
+ 
+ typedef struct zmq_flow_core {
+
+
+
+
+@@ -1435,6 +1435,7 @@ void Flow::processJson(bool is_src,
+   json_object_object_add(my_object, Utils::jsonLabel(num_id, str_id, jsonbuf, sizeof(jsonbuf)),
+ 			 json_object_new_string(proc->user_name));
+ 
++#if 0
+   num_id = is_src ? SRC_PROC_ACTUAL_MEMORY : DST_PROC_ACTUAL_MEMORY;
+   str_id = is_src ? "SRC_PROC_ACTUAL_MEMORY" : "DST_PROC_ACTUAL_MEMORY";
+   json_object_object_add(my_object, Utils::jsonLabel(num_id, str_id, jsonbuf, sizeof(jsonbuf)),
+@@ -1456,6 +1457,7 @@ void Flow::processJson(bool is_src,
+   json_object_object_add(my_object,
+ 			 Utils::jsonLabel(num_id, str_id, jsonbuf, sizeof(jsonbuf)),
+ 			 json_object_new_int(proc->num_vm_page_faults));
++#endif
+ }
+ 
+ /* *************************************** */
+@@ -1472,12 +1474,13 @@ void Flow::processLua(lua_State* vm, ProcessInfo *proc, bool client) {
+   lua_push_str_table_entry(vm, "name", proc->name);
+   lua_push_str_table_entry(vm, "father_name", proc->father_name);
+   lua_push_str_table_entry(vm, "user_name", proc->user_name);
++#if 0
+   lua_push_int_table_entry(vm, "actual_memory", proc->actual_memory);
+   lua_push_int_table_entry(vm, "peak_memory", proc->peak_memory);
+   lua_push_float_table_entry(vm, "average_cpu_load", proc->average_cpu_load);
+   lua_push_float_table_entry(vm, "percentage_iowait_time", proc->percentage_iowait_time);
+   lua_push_int_table_entry(vm, "num_vm_page_faults", proc->num_vm_page_faults);
+-
++#endif
+   lua_pushstring(vm, client ? "client_process" : "server_process");
+   lua_insert(vm, -2);
+   lua_settable(vm, -3);
+
+
+
+
+@@ -344,7 +344,13 @@ void NetworkInterface::init() {
+     }
+ 
+ #ifdef HAVE_EBPF
+-    ebpfEvents = new SPSCQueue();
++    if(bridge_interface
++       || is_dynamic_interface
++       || is_traffic_mirrored
++       || isView())
++      ;
++    else
++      ebpfEvents = new SPSCQueue();
+ #endif
+ }
+ 
+@@ -2378,7 +2384,8 @@ decode_packet_eth:
+       if(vlan_id && ntop->getPrefs()->do_ignore_vlans())
+ 	vlan_id = 0;
+       if((vlan_id == 0) && ntop->getPrefs()->do_simulate_vlans())
+-	vlan_id = (ip6 ? ip6->ip6_src.u6_addr.u6_addr8[15] + ip6->ip6_dst.u6_addr.u6_addr8[15] : iph->saddr + iph->daddr) % 0xFF;
++	vlan_id = (ip6 ? ip6->ip6_src.u6_addr.u6_addr8[15] +
++		   ip6->ip6_dst.u6_addr.u6_addr8[15] : iph->saddr + iph->daddr) % 0xFF;
+ 
+       try {
+ 	pass_verdict = processPacket(bridge_iface_idx,
+@@ -2571,6 +2578,17 @@ decode_packet_eth:
+     break;
+   }
+ 
++#ifdef HAVE_EBPF
++  if(ebpfEvents) {
++    eBPFevent *event;
++
++    if(dequeueeBPFEvent((void**)&event)) {
++      /* ntop->getTrace()->traceEvent(TRACE_WARNING, "*** Event c

@@ -1,0 +1,89 @@
+@@ -23,6 +23,7 @@ import pymisp
+ from pymisp import ExpandedPyMISP
+ import signal
+ from ipaddress import IPv4Address, AddressValueError
++from event_count_logger import EventCountLogger, EventGroup, DummyEventGroup
+ 
+ # Add to path the "one directory above the current file location"
+ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+@@ -62,6 +63,22 @@ config_tags = common.config.read_config(tags_cfg_file)
+ bl_cfg_file = os.path.join(cfg_dir, config.get('bl_config'))
+ config_bl = common.config.read_config(bl_cfg_file)
+ 
++# Read EventCountLogger config (to separate dict) and initialize loggers
++ecl_cfg_filename = config.get('event_logging_config', None)
++if ecl_cfg_filename:
++    # Load config
++    config_ecl = common.config.read_config(os.path.join(cfg_dir, ecl_cfg_filename))
++    # Initialize EventCountLogger
++    ecl = EventCountLogger(config_ecl.get('groups'), config_ecl.get('redis', {}))
++    # Get instances of EventGroups (if specified in configuration, otherwise, DummyEventGroup is used, so logging is no-op)
++    # (it's recommended to enable local counters for both groups for better performance)
++    log_ep = ecl.get_group('web_endpoints') or DummyEventGroup() # log access to individual endpoints
++    log_err = ecl.get_group('web_errors') or DummyEventGroup() # log error replies
++else:
++    print("WARNING: nerd_main: Path to event logging config ('event_logging_config' key) not specified, EventCountLogger disabled.")
++    log_ep = DummyEventGroup()
++    log_err = DummyEventGroup()
++
+ # Read Task queue config
+ rabbit_config = config.get('rabbitmq')
+ num_processes = config.get('worker_processes')
+@@ -406,6 +423,7 @@ def store_user_info():
+         # API authentication using token
+         auth = request.headers.get("Authorization")
+         if not auth:
++            log_err.log('403_no_auth_header')
+             return API_RESPONSE_403_NOAUTH
+ 
+         # Extract token from Authorization header. Two formats may be used:
+@@ -417,10 +435,12 @@ def store_user_info():
+         elif len(vals) == 2 and vals[0] == "token":
+             token = vals[1]
+         else:
++            log_err.log('403_invalid_token')
+             return API_RESPONSE_403_TOKEN
+ 
+         g.user, g.ac = authenticate_with_token(token)
+         if not g.user:
++            log_err.log('403_invalid_token')
+             return API_RESPONSE_403_TOKEN
+ 
+     else:
+@@ -435,6 +455,7 @@ def exceeded_rate_limit(user_id):
+             'err_n': 429,
+             'error': "Too many requests",
+         }
++        log_err.log('429_rate_limit_api')
+         return Response(json.dumps(err), 429, mimetype='application/json')
+     else:
+         # Web -> return HTML with more information
+@@ -443,6 +464,7 @@ def exceeded_rate_limit(user_id):
+             message = "You are only allowed to make {} requests per second.".format(tps)
+         else:
+             message = "We only allow {} requests per second per IP address for not logged in users.".format(tps)
++        log_err.log('429_rate_limit_web')
+         return make_response(render_template('429.html', message=message), 429)
+ 
+ 
+@@ -502,6 +524,7 @@ def render_template(template, **kwargs):
+ # TODO: rewrite as before_request (to check for this situation at any URL)
+ @app.route('/')
+ def main():
++    log_ep.log('/')
+     # User is authenticated but has no account
+     if g.user and g.ac('notregistered'):
+         return redirect(BASE_URL+'/noaccount')
+@@ -517,6 +540,7 @@ class AccountRequestForm(FlaskForm):
+ 
+ @app.route('/noaccount', methods=['GET','POST'])
+ def noaccount():
++    log_ep.log('/noaccount')
+     if not g.user:
+         return make_response("ERROR: no user is authenticated")
+     if not g.ac('notregistered'):
+@@ -562,6 +586,7 @@ class PasswordChangeForm(FlaskForm):
+ @app.route('/account/gen_token', endpoint='gen_token', methods=['POST'])
+ @app.route('/account/set_password', endpoint='set_password', methods=['POST'])
+ def account_info():
++    log_ep.log('/account'

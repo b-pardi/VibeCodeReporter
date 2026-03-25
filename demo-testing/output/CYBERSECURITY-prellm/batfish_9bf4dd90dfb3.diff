@@ -1,0 +1,86 @@
+@@ -73,6 +73,10 @@ public final class IpAccessListLine implements Serializable {
+     return new Builder().setAction(LineAction.PERMIT);
+   }
+ 
++  public static IpAccessListLine accepting(AclLineMatchExpr expr) {
++    return new Builder().setAction(LineAction.PERMIT).setMatchCondition(expr).build();
++  }
++
+   public static IpAccessListLine acceptingHeaderSpace(HeaderSpace headerSpace) {
+     return accepting().setMatchCondition(new MatchHeaderSpace(headerSpace)).build();
+   }
+@@ -85,6 +89,10 @@ public final class IpAccessListLine implements Serializable {
+     return new Builder().setAction(LineAction.DENY);
+   }
+ 
++  public static IpAccessListLine rejecting(AclLineMatchExpr expr) {
++    return new Builder().setAction(LineAction.DENY).setMatchCondition(expr).build();
++  }
++
+   public static IpAccessListLine rejectingHeaderSpace(HeaderSpace headerSpace) {
+     return rejecting().setMatchCondition(new MatchHeaderSpace(headerSpace)).build();
+   }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,198 @@
++package org.batfish.datamodel.acl.normalize;
++
++import static org.batfish.datamodel.acl.AclLineMatchExprs.and;
++import static org.batfish.datamodel.acl.AclLineMatchExprs.not;
++import static org.batfish.datamodel.acl.AclLineMatchExprs.or;
++
++import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.ImmutableSortedSet;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++import java.util.function.Supplier;
++import javax.annotation.Nonnull;
++import net.sf.javabdd.BDD;
++import org.batfish.common.util.NonRecursiveSupplier;
++import org.batfish.datamodel.IpAccessList;
++import org.batfish.datamodel.IpAccessListLine;
++import org.batfish.datamodel.LineAction;
++import org.batfish.datamodel.acl.AclLineMatchExpr;
++import org.batfish.datamodel.acl.AndMatchExpr;
++import org.batfish.datamodel.acl.FalseExpr;
++import org.batfish.datamodel.acl.GenericAclLineMatchExprVisitor;
++import org.batfish.datamodel.acl.MatchHeaderSpace;
++import org.batfish.datamodel.acl.MatchSrcInterface;
++import org.batfish.datamodel.acl.NotMatchExpr;
++import org.batfish.datamodel.acl.OrMatchExpr;
++import org.batfish.datamodel.acl.OriginatingFromDevice;
++import org.batfish.datamodel.acl.PermittedByAcl;
++import org.batfish.datamodel.acl.TrueExpr;
++import org.batfish.datamodel.acl.explanation.ConjunctsBuilder;
++import org.batfish.datamodel.acl.explanation.DisjunctsBuilder;
++import org.batfish.symbolic.bdd.AclLineMatchExprToBDD;
++
++/**
++ * Reduce an {@link org.batfish.datamodel.IpAccessList} to a single {@link AclLineMatchExpr}.
++ *
++ * <p>All references to other {@link org.batfish.datamodel.IpAccessList ACLs} are inlined. For each
++ * {@link LineAction#PERMIT} line, we generate an expression of the form "matches that line AND does
++ * not match any earlier {@link LineAction#DENY} line". We then combine all those expressions into a
++ * single {@link OrMatchExpr}. Note that the line expressions may overlap. This is OK because we are
++ * only trying to express the space of the entire ACL as an {@link AclLineMatchExpr}. If you're
++ * interested in an {@link AclLineMatchExpr} that describes exactly what is matched by a particular
++ * line, you want something of the form "matches that line AND does not match ANY early line ({@link
++ * LineAction#PERMIT} or {@link LineAction#DENY})". This class does not do that.
++ *
++ * <p>We use {@link BDD BDDs} to keep the expressions small. This refines the generated line
++ * expressions to the form "matches that line AND does not match any early OVERLAPPING {@link
++ * LineAction#DENY} line".
++ */
++public final class AclToAclLineMatchExpr
++    implements GenericAclLineMatchExprVisitor<AclLineMatchExpr> {
++
++  /** Reduce an entire {@link IpAccessList} to a single {@link AclLineMatchExpr}. */
++  public static AclLineMatchExpr toAclLineMatchExpr(
++      @Nonnull AclLineMatchExprToBDD a

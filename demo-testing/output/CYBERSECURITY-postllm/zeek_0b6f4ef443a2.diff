@@ -1,0 +1,91 @@
+@@ -2,15 +2,15 @@
+ // Copyright (c) 2023 by the Zeek Project. See COPYING for details.
+ 
+ /*
+-WARNING: THIS CODE IS NOT SAFE IN MULTI-THREADED
++WARNING: THIS CODE IS NOT SAFE IN MULTI-THREADED ENVIRONMENTS:
+ 
+ * Initializations of static OpenSSL contexts without locking
+-* Use of contexts is not protected by locks.
++* Use of SSL contexts is not protected by locks
+ 
+-The involved contexts are EVP_CIPHER_CTX and EVP_PKEY_CTX and are allocated
+-lazily just once and re-used for performance reasons. Previously, every
+-decrypt operation allocated, initialized and freed each of the used context
+-resulting in a significant performance hit.
++The involved contexts are EVP_CIPHER_CTX and EVP_PKEY_CTX. These are allocated
++lazily and re-used for performance reasons. Previously, every decrypt operation
++allocated, initialized and freed these individually, resulting in a significant
++performance hit. Given Zeek's single threaded nature, this is fine.
+ */
+ 
+ /*
+@@ -25,6 +25,7 @@ refactors as C++ development is not our main profession.
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -51,31 +52,6 @@ struct DecryptionInformation {
+ // This should be alright: https://stackoverflow.com/a/15172304
+ inline const uint8_t* data_as_uint8(const hilti::rt::Bytes& b) { return reinterpret_cast<const uint8_t*>(b.data()); }
+ 
+-/*
+-Constants used in the HKDF functions. HKDF-Expand-Label uses labels
+-such as 'quic key' and 'quic hp'. These labels can obviously be
+-calculated dynamically, but are incluced statically for now, as the
+-goal of this analyser is only to analyze the INITIAL packets.
+-*/
+-
+-std::vector<uint8_t> INITIAL_SALT_V1 = {0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+-                                        0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a};
+-
+-std::vector<uint8_t> CLIENT_INITIAL_INFO = {0x00, 0x20, 0x0f, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x20, 0x63,
+-                                            0x6c, 0x69, 0x65, 0x6e, 0x74, 0x20, 0x69, 0x6e, 0x00};
+-
+-std::vector<uint8_t> SERVER_INITIAL_INFO = {0x00, 0x20, 0x0f, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x20, 0x73,
+-                                            0x65, 0x72, 0x76, 0x65, 0x72, 0x20, 0x69, 0x6e, 0x00};
+-
+-std::vector<uint8_t> KEY_INFO = {0x00, 0x10, 0x0e, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x20,
+-                                 0x71, 0x75, 0x69, 0x63, 0x20, 0x6b, 0x65, 0x79, 0x00};
+-
+-std::vector<uint8_t> IV_INFO = {0x00, 0x0c, 0x0d, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x20,
+-                                0x71, 0x75, 0x69, 0x63, 0x20, 0x69, 0x76, 0x00};
+-
+-std::vector<uint8_t> HP_INFO = {0x00, 0x10, 0x0d, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x20,
+-                                0x71, 0x75, 0x69, 0x63, 0x20, 0x68, 0x70, 0x00};
+-
+ /*
+ Constants used by the different functions
+ */
+@@ -107,100 +83,6 @@ EVP_CIPHER_CTX* get_aes_128_gcm() {
+ 
+     return ctx;
+ }
+-/*
+-HKDF-Extract as described in https://www.rfc-editor.org/rfc/rfc8446.html#section-7.1
+-*/
+-std::vector<uint8_t> hkdf_extract(const hilti::rt::Bytes& connection_id) {
+-    std::vector<uint8_t> out_temp(INITIAL_SECRET_LEN);
+-    size_t initial_secret_len = out_temp.size();
+-    static EVP_PKEY_CTX* ctx = nullptr;
+-    if ( ! ctx ) {
+-        ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+-        EVP_PKEY_derive_init(ctx);
+-        EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256());
+-        EVP_PKEY_CTX_hkdf_mode(ctx, EVP_PKEY_HKDEF_MODE_EXTRACT_ONLY);
+-    }
+-
+-    EVP_PKEY_CTX_set1_hkdf_key(ctx, data_as_uint8(connection_id), connection_id.size());
+-    EVP_PKEY_CTX_set1_hkdf_salt(ctx, INITIAL_SALT_V1.data(), INITIAL_SALT_V1.size());
+-    EVP_PKEY_derive(ctx, out_temp.data(), &initial_secret_len);
+-    return out_temp;
+-}
+-
+-/*
+-HKDF-Expand-Label as described in https://www.rfc-editor.org/rfc/rfc8446.html#section-7.1
+-*/
+-std::vector<uint8_t> hkdf_expand(EVP_PKEY_CTX* ctx, size_t out_len, const std::vector<uint8_t>& key) {
+-    std::vector<uint8_t> 

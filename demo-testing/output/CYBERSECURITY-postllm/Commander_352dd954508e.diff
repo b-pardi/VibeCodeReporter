@@ -1,0 +1,120 @@
+@@ -88,6 +88,7 @@ def display_command_help(show_enterprise=False, show_shell=False, show_legacy=Fa
+         'Reporting Commands': '\033[96m',             # Cyan - analytics
+         'MSP Management Commands': bcolors.HIGHINTENSITYRED, # Bright Red - MSP admin
+         'Enterprise Management Commands': '\033[94m',  # Blue - enterprise admin
++        'Automation Commands': '\033[32m',            # Dark Green - automation workflows
+         'Secrets Manager Commands': '\033[95m',       # Magenta - KSM
+         'BreachWatch Commands': bcolors.FAIL,         # Red - security alerts
+         'Device Management Commands': '\033[93m',     # Bright Yellow - devices
+
+
+
+
+@@ -54,7 +54,12 @@ COMMAND_CATEGORIES = {
+         'create-user', 'transfer-user', 'automator', 'scim', 'enterprise-down',
+         'public-api-key'
+     },
+-    
++
++    # Automation Commands
++    'Automation Commands': {
++        'credential-provision'
++    },
++
+     # Secrets Manager Commands
+     'Secrets Manager Commands': {
+         'secrets-manager'
+@@ -119,6 +124,7 @@ def get_category_order():
+         'Reporting Commands',
+         'MSP Management Commands',
+         'Enterprise Management Commands',
++        'Automation Commands',
+         'Secrets Manager Commands',
+         'BreachWatch Commands',
+         'Device Management Commands',
+
+
+
+
+@@ -132,6 +132,10 @@ def register_commands(commands, aliases, command_info):
+     commands['email-config'] = EmailConfigCommand()
+     command_info['email-config'] = 'Email provider configuration management'
+ 
++    from . import credential_provision
++    credential_provision.register_commands(commands)
++    credential_provision.register_command_info(aliases, command_info)
++
+     from . import device_management
+     device_management.register_commands(commands)
+     device_management.register_command_info(aliases, command_info)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1704 @@
++#  _  __
++# | |/ /___ ___ _ __  ___ _ _ ®
++# | ' </ -_) -_) '_ \/ -_) '_|
++# |_|\_\___\___| .__/\___|_|
++#              |_|
++#
++# Keeper Commander
++# Contact: ops@keepersecurity.com
++#
++
++"""
++Automated Credential Provisioning Command (KC-1007)
++
++Automates employee credential provisioning by creating PAM User records with
++password rotation, generating share URLs, and delivering credentials via email.
++
++This command integrates with external HR systems (Aquera, Workday, etc.) to
++streamline onboarding workflows.
++
++Usage:
++    keeper credential-provision --config employee.yaml
++    keeper credential-provision --config employee.yaml --dry-run
++    keeper credential-provision --config employee.yaml --output json
++"""
++
++import argparse
++import json
++import logging
++import os
++import re
++from contextlib import redirect_stdout, redirect_stderr
++from io import StringIO
++from typing import Dict, List, Optional, Any, Tuple
++from urllib.parse import urlunparse, urlparse
++
++try:
++    import yaml
++except ImportError:
++    yaml = None
++
++from keepercommander.commands.base import Command, suppress_exit, raise_parse_exception
++from .. import api, vault, vault_extensions, crypto, utils, generator
++from ..error import CommandError
++from ..params import KeeperParams
++from ..subfolder import try_resolve_path, get_folder_path
++from ..record_management import add_record_to_folder
++from ..record_facades import LoginRecordFacade
++from ..proto import APIRequest_pb2
++from ..commands.folder import FolderMakeCommand
++
++# RecordLink and discoveryrotation require pydantic (Python 3.8+)
++try:
++    from ..discovery_common.record_link import RecordLink
++    from ..commands.discoveryrotation import (
++        PAMCreateRecordRotationCommand,
++        PAMGatewayActionRotateCommand,
++        validate_cron_expression
++    )
++except ImportError:
++    RecordLink = None  # Will be None on Python 3.7
++    PAMCreateRecordRotationCommand = None
++    PAMGatewayActionRotateCommand = None
++    validate_cron_expression = None
++from ..commands.helpers.timeout import parse_timeout, format_timeout
++from .

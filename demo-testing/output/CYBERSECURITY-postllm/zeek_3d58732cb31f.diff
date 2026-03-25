@@ -1,0 +1,114 @@
+@@ -44,7 +44,16 @@ void CPPCompile::Compile(bool report_uncompilable) {
+             reporter->FatalError("aborting standalone compilation to C++ due to having to skip some functions");
+ 
+         for ( auto& g : global_scope()->OrderedVars() ) {
+-            if ( ! obj_matches_opt_files(g) )
++            bool compiled_global = obj_matches_opt_files(g);
++
++            if ( ! compiled_global )
++                for ( const auto& i_e : g->GetOptInfo()->GetInitExprs() )
++                    if ( obj_matches_opt_files(i_e) ) {
++                        compiled_global = true;
++                        break;
++                    }
++
++            if ( ! compiled_global )
+                 continue;
+ 
+             // We will need to generate this global's definition, including
+@@ -63,6 +72,10 @@ void CPPCompile::Compile(bool report_uncompilable) {
+                     (void)pfs->HashType(t);
+                     rep_types.insert(TypeRep(t));
+                 }
++                for ( auto& g : pf->Globals() )
++                    accessed_globals.insert(g);
++                for ( auto& ag : pf->AllGlobals() )
++                    all_accessed_globals.insert(ag);
+             }
+         }
+ 
+
+
+
+
+@@ -355,14 +355,16 @@ AttrsInfo::AttrsInfo(CPPCompile* _c, const AttributesPtr& _attrs) : CompoundItem
+     }
+ }
+ 
+-GlobalLookupInitInfo::GlobalLookupInitInfo(CPPCompile* c, const ID* g, string _CPP_name)
++GlobalLookupInitInfo::GlobalLookupInitInfo(CPPCompile* c, const ID* g, string _CPP_name, bool do_init)
+     : CPP_InitInfo(g), CPP_name(std::move(_CPP_name)) {
+     Zeek_name = g->Name();
++    val = ValElem(c, do_init ? g->GetVal() : nullptr);
+ }
+ 
+ void GlobalLookupInitInfo::InitializerVals(std::vector<std::string>& ivs) const {
+     ivs.push_back(CPP_name);
+     ivs.push_back(string("\"") + Zeek_name + "\"");
++    ivs.push_back(val);
+ }
+ 
+ GlobalInitInfo::GlobalInitInfo(CPPCompile* c, const ID* g, string _CPP_name)
+@@ -380,7 +382,8 @@ GlobalInitInfo::GlobalInitInfo(CPPCompile* c, const ID* g, string _CPP_name)
+     else
+         attrs = -1;
+ 
+-    exported = g->IsExport();
++    is_exported = g->IsExport();
++    is_option = g->IsOption();
+     val = ValElem(c, nullptr); // empty because we initialize dynamically
+ 
+     if ( gt->Tag() == TYPE_FUNC && (! g->GetVal() || g->GetVal()->AsFunc()->GetKind() == Func::BUILTIN_FUNC) )
+@@ -396,7 +399,8 @@ void GlobalInitInfo::InitializerVals(std::vector<std::string>& ivs) const {
+     ivs.push_back(Fmt(type));
+     ivs.push_back(Fmt(attrs));
+     ivs.push_back(val);
+-    ivs.push_back(Fmt(exported));
++    ivs.push_back(Fmt(is_exported));
++    ivs.push_back(Fmt(is_option));
+     ivs.push_back(Fmt(func_with_no_val));
+ }
+ 
+
+
+
+
+@@ -479,10 +479,11 @@ public:
+ };
+ 
+ // A lightweight initializer for a Zeek global that will look it up at
+-// initialization time but not create it if missing.
++// initialization time but not create it if missing. If do_init is true,
++// then the global will be (re-)initialized to its value during compilation.
+ class GlobalLookupInitInfo : public CPP_InitInfo {
+ public:
+-    GlobalLookupInitInfo(CPPCompile* c, const ID* g, std::string CPP_name);
++    GlobalLookupInitInfo(CPPCompile* c, const ID* g, std::string CPP_name, bool do_init = false);
+ 
+     std::string InitializerType() const override { return "CPP_GlobalLookupInit"; }
+     void InitializerVals(std::vector<std::string>& ivs) const override;
+@@ -490,6 +491,7 @@ public:
+ protected:
+     std::string Zeek_name;
+     std::string CPP_name;
++    std::string val;
+ };
+ 
+ // Information for initializing a Zeek global.
+@@ -504,7 +506,8 @@ protected:
+     int type;
+     int attrs;
+     std::string val;
+-    bool exported;
++    bool is_exported;
++    bool is_option;
+     bool func_with_no_val = false; // needed to handle some error situations
+ };
+ 
+
+
+
+
+@@ -457,11 +457,17 @@ int CPP_EnumMapping::ComputeOffset(InitsManager* im) const {
+ 
+ void CPP_GlobalLookupInit::Generate(InitsManager* im, std::vector<void*>& /* inits_vec */, int /* offset

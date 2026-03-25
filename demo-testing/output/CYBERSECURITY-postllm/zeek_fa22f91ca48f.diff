@@ -1,0 +1,95 @@
+@@ -22,6 +22,7 @@
+ #include "zeek/cluster/Serializer.h"
+ #include "zeek/cluster/backend/zeromq/Plugin.h"
+ #include "zeek/cluster/backend/zeromq/ZeroMQ-Proxy.h"
++#include "zeek/util.h"
+ 
+ namespace zeek {
+ 
+@@ -36,6 +37,7 @@ namespace cluster::zeromq {
+ enum class DebugFlag : zeek_uint_t {
+     NONE = 0,
+     POLL = 1,
++    THREAD = 2,
+ };
+ 
+ constexpr DebugFlag operator&(zeek_uint_t x, DebugFlag y) {
+@@ -68,13 +70,8 @@ void self_thread_fun(void* arg) {
+ ZeroMQBackend::ZeroMQBackend(std::unique_ptr<EventSerializer> es, std::unique_ptr<LogSerializer> ls,
+                              std::unique_ptr<detail::EventHandlingStrategy> ehs)
+     : ThreadedBackend(std::move(es), std::move(ls), std::move(ehs)) {
+-    xsub = zmq::socket_t(ctx, zmq::socket_type::xsub);
+-    xpub = zmq::socket_t(ctx, zmq::socket_type::xpub);
+     log_push = zmq::socket_t(ctx, zmq::socket_type::push);
+-    log_pull = zmq::socket_t(ctx, zmq::socket_type::pull);
+-
+     main_inproc = zmq::socket_t(ctx, zmq::socket_type::pair);
+-    child_inproc = zmq::socket_t(ctx, zmq::socket_type::pair);
+ }
+ 
+ void ZeroMQBackend::DoInitPostScript() {
+@@ -97,9 +94,6 @@ void ZeroMQBackend::DoInitPostScript() {
+ 
+     event_unsubscription = zeek::event_registry->Register("Cluster::Backend::ZeroMQ::unsubscription");
+     event_subscription = zeek::event_registry->Register("Cluster::Backend::ZeroMQ::subscription");
+-
+-    main_inproc.bind("inproc://publish-bridge");
+-    child_inproc.connect("inproc://publish-bridge");
+ }
+ 
+ 
+@@ -109,13 +103,12 @@ void ZeroMQBackend::DoTerminate() {
+     ZEROMQ_DEBUG("Joining self_thread");
+     if ( self_thread.joinable() )
+         self_thread.join();
++    ZEROMQ_DEBUG("Joined self_thread");
+ 
++    // Close the sockets that are used from the main thread,
++    // the remaining sockets are closed by self_thread.
+     log_push.close();
+-    log_pull.close();
+-    xsub.close();
+-    xpub.close();
+     main_inproc.close();
+-    child_inproc.close();
+ 
+     ZEROMQ_DEBUG("Closing ctx");
+     ctx.close();
+@@ -130,6 +123,11 @@ void ZeroMQBackend::DoTerminate() {
+ }
+ 
+ bool ZeroMQBackend::DoInit() {
++    xsub = zmq::socket_t(ctx, zmq::socket_type::xsub);
++    xpub = zmq::socket_t(ctx, zmq::socket_type::xpub);
++    log_pull = zmq::socket_t(ctx, zmq::socket_type::pull);
++    child_inproc = zmq::socket_t(ctx, zmq::socket_type::pair);
++
+     auto linger_ms = static_cast<int>(zeek::id::find_val<zeek::IntVal>("Cluster::Backend::ZeroMQ::linger_ms")->AsInt());
+     int xpub_nodrop = zeek::id::find_val<zeek::BoolVal>("Cluster::Backend::ZeroMQ::xpub_nodrop")->AsBool() ? 1 : 0;
+ 
+@@ -218,6 +216,10 @@ bool ZeroMQBackend::DoInit() {
+     // following post might be useful:
+     //
+     // https://funcptr.net/2012/09/10/zeromq---edge-triggered-notification/
++
++    // Setup connectivity between main and child thread.
++    main_inproc.bind("inproc://inproc-bridge");
++    child_inproc.connect("inproc://inproc-bridge");
+     self_thread = std::thread(self_thread_fun, this);
+ 
+     // After connecting, call ThreadedBackend::DoInit() to register
+@@ -267,7 +269,7 @@ bool ZeroMQBackend::DoSubscribe(const std::string& topic_prefix) {
+         // Prepend 0x01 byte to indicate subscription to XSUB socket
+         // This is the XSUB API instead of setsockopt(ZMQ_SUBSCRIBE).
+         std::string msg = "\x01" + topic_prefix;
+-        xsub.send(zmq::const_buffer(msg.data(), msg.size()));
++        main_inproc.send(zmq::const_buffer(msg.data(), msg.size()));
+     } catch ( zmq::error_t& err ) {
+         zeek::reporter->Error("Failed to subscribe to topic %s: %s", topic_prefix.c_str(), err.what());
+         return false;
+@@ -282,7 +284,7 @@ bool ZeroMQBackend::DoUnsubscribe(const std::string& topic_prefix) {
+         // Prepend 0x00 byte to indicate subscription to XSUB socket.
+         // This is the XSUB API instead of setsockopt(ZMQ_SUBSCRIBE).
+         std::string msg = "\x00" + topic_prefix;
+-        xsub.send(zmq::const_buffer(msg.data(), msg.size()));
++        main_inproc.send(z

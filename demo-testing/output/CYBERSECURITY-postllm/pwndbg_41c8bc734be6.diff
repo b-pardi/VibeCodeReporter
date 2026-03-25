@@ -1,0 +1,128 @@
+@@ -648,18 +648,24 @@ def num_numa_nodes() -> int:
+ 
+ 
+ def node_data() -> pwndbg.dbg_mod.Value:
+-    if arch_symbols() is not None:
+-        return arch_symbols().node_data()
++    if (syms := arch_symbols()) is not None:
++        return syms.node_data()
+     return None
+ 
+ 
+ def slab_caches() -> pwndbg.dbg_mod.Value:
+-    if arch_symbols() is not None:
+-        return arch_symbols().slab_caches()
++    if (syms := arch_symbols()) is not None:
++        return syms.slab_caches()
+     return None
+ 
+ 
+ def per_cpu_offset() -> pwndbg.dbg_mod.Value:
+-    if arch_symbols() is not None:
+-        return arch_symbols().per_cpu_offset()
++    if (syms := arch_symbols()) is not None:
++        return syms.per_cpu_offset()
++    return None
++
++
++def modules() -> pwndbg.dbg_mod.Value:
++    if (syms := arch_symbols()) is not None:
++        return syms.modules()
+     return None
+
+
+
+
+@@ -12,6 +12,7 @@ from pwnlib.util.packing import u64
+ 
+ import pwndbg.aglib
+ import pwndbg.aglib.kernel
++import pwndbg.aglib.kernel.kmod
+ import pwndbg.aglib.memory
+ import pwndbg.color.message as M
+ import pwndbg.commands
+@@ -80,6 +81,8 @@ class Kallsyms:
+         self.names = self.find_names()
+         self.kernel_addresses = self.get_kernel_addresses()
+         self.parse_symbol_table()
++        for sym_name, sym_addr, sym_type in pwndbg.aglib.kernel.kmod.all_modules_kallsyms():
++            self.kallsyms[sym_name] = (sym_addr, sym_type)
+         print(M.info(f"Found {len(self.kallsyms)} ksymbols"))
+ 
+     def find_token_table(self) -> int:
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,221 @@
++from __future__ import annotations
++
++from enum import Enum
++from typing import List
++from typing import Tuple
++
++import pwndbg
++import pwndbg.color.message as M
++import pwndbg.commands
++from pwndbg.aglib.kernel.macros import for_each_entry
++
++
++class mod_mem_type(Enum):
++    # Calculate runtime memory footprint by summing sizes of MOD_TEXT, MOD_DATA, MOD_RODATA, MOD_RO_AFTER_INIT,
++    # which excludes initialization sections that are freed after the module load. See `enum mod_mem_type` in kernel source.
++    MOD_TEXT = 0
++    MOD_DATA = 1
++    MOD_RODATA = 2
++    MOD_RO_AFTER_INIT = 3  # might be empty
++    # MOD_INIT_TEXT,
++    # MOD_INIT_DATA,
++    # MOD_INIT_RODATA,
++    MOD_MEM_NUM_TYPES = 4
++
++
++# TODO: handle potential negative offsets when CONFIG_RANDSTRUCT=y
++@pwndbg.lib.cache.cache_until("stop")
++def module_name_offset():
++    modules = pwndbg.aglib.kernel.modules()
++    if modules is None:
++        print(M.warn("Could not find modules"))
++        return None
++    module = pwndbg.aglib.memory.read_pointer_width(int(modules))
++    for i in range(0x100):
++        offset = i * pwndbg.aglib.arch.ptrsize
++        try:
++            bs = pwndbg.aglib.memory.string(module + offset).decode("ascii")
++            if len(bs) < 2:
++                continue
++            return offset
++        except Exception:
++            pass
++    print(M.warn("Could not find module->name"))
++    return None
++
++
++@pwndbg.lib.cache.cache_until("stop")
++def module_mem_offset() -> Tuple[int | None, int | None, int | None]:
++    modules = pwndbg.aglib.kernel.modules()
++    if modules is None:
++        print(M.warn("Could not find modules"))
++        return None, None, None
++    module = pwndbg.aglib.memory.read_pointer_width(int(modules))
++    for i in range(0x100):
++        offset = i * pwndbg.aglib.arch.ptrsize
++        min_size = 0x10
++        if pwndbg.aglib.kernel.krelease() >= (6, 13):
++            min_size += 0x8
++        for module_memory_size in (
++            min_size,
++            min_size + 0x38,
++        ):
++            found = True
++            for mem_type in range(mod_mem_type.MOD_RO_AFTER_INIT.value):
++                mem_ptr = module + offset + mem_type * module_memory_size
++                if pwndbg.aglib.memory.peek(mem_ptr) is None:
++                    found = False
++                    break
++                base = pwndbg.aglib.memory.read_pointer_width(mem_ptr)
++                if 

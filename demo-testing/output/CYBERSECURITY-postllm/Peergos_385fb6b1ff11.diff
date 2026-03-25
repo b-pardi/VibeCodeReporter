@@ -1,0 +1,84 @@
+@@ -206,6 +206,10 @@ public class PeergosNetworkUtils {
+                 sharerUser.network, crypto, l -> {}).join();
+         Optional<Bat> originalBat = uploaded.writableFilePointer().bat;
+ 
++        // create a secret link to the file
++        String userLinkPassword = "forbob";
++        SecretLink link = sharerUser.createSecretLink(Paths.get(sharerUser.username, filename), false, Optional.empty(), Optional.empty(), userLinkPassword).join();
++
+         // share the file from sharer to each of the sharees
+         Set<String> shareeNames = shareeUsers.stream()
+                 .map(u -> u.username)
+@@ -220,6 +224,9 @@ public class PeergosNetworkUtils {
+             checkFileContents(originalFileContents, sharedFile.get(), userContext);
+         }
+ 
++        // check secret link works
++        UserContext.fromSecretLinkV2(link.toLink(), () -> Futures.of(userLinkPassword), shareeNode, crypto).join();
++
+         // check other users can browse to the friend's root
+         for (UserContext userContext : shareeUsers) {
+             Optional<FileWrapper> friendRoot = userContext.getByPath(sharerUser.username).join();
+@@ -246,6 +253,9 @@ public class PeergosNetworkUtils {
+                     }
+                 }).collect(Collectors.toList());
+ 
++        // check secret link works
++        UserContext.fromSecretLinkV2(link.toLink(), () -> Futures.of(userLinkPassword), shareeNode, crypto).join();
++
+         //test that the other user cannot access it from scratch
+         Optional<FileWrapper> otherUserView = updatedShareeUsers.get(0).getByPath(sharerUser.username + "/" + filename).join();
+         Assert.assertTrue(!otherUserView.isPresent());
+
+
+
+
+@@ -40,6 +40,14 @@ public class SharedWithState implements Cborable {
+         return readShares;
+     }
+ 
++    public Map<String, Set<LinkProperties>> readLinks() {
++        return readLinks;
++    }
++
++    public Map<String, Set<LinkProperties>> writeLinks() {
++        return writeLinks;
++    }
++
+     public Map<String, Set<String>> writeShares() {
+         return writeShares;
+     }
+@@ -96,9 +104,11 @@ public class SharedWithState implements Cborable {
+ 
+         if (access == SharedWithCache.Access.READ) {
+             newReadLinks.putIfAbsent(filename, new HashSet<>());
++            newReadLinks.get(filename).removeIf(p -> p.label == link.label); // make sure we replace any old version
+             newReadLinks.get(filename).add(link);
+         } else if (access == SharedWithCache.Access.WRITE) {
+             newWriteLinks.putIfAbsent(filename, new HashSet<>());
++            newWriteLinks.get(filename).removeIf(p -> p.label == link.label); // make sure we replace any old version
+             newWriteLinks.get(filename).add(link);
+         }
+         return new SharedWithState(readShares, writeShares, newReadLinks, newWriteLinks);
+
+
+
+
+@@ -661,22 +661,30 @@ public class UserContext {
+     public CompletableFuture<SecretLink> updateSecretLink(Path toFile,
+                                                           boolean isWritable,
+                                                           LinkProperties props) {
++        SecretLink res = new SecretLink(signer.publicKeyHash, props.label, props.linkPassword);
++        return writeSynchronizer.applyComplexUpdate(signer.publicKeyHash, signer, (v, c) -> updateSecretLink(toFile, isWritable, props, v, c))
++                .thenApply(s -> res);
++    }
++
++    private CompletableFuture<Snapshot> updateSecretLink(Path toFile,
++                                                         boolean isWritable,
++                                                         LinkProperties props,
++                                                         Snapshot v1,
++                                                         Committer c) {
+         // put encrypted secret link in champ on identity, champ root must have mirror bat to make it private
+         PublicKeyHash id = signer.publicKeyHash;
+-        FileWrapper file = getByPath(toFile).join().get();
++     

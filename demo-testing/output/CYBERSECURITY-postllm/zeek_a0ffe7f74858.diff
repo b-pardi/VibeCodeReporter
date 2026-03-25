@@ -1,0 +1,90 @@
+@@ -8,9 +8,30 @@
+ #include "zeek/storage/Manager.h"
+ #include "zeek/storage/ReturnCode.h"
+ #include "zeek/storage/storage-events.bif.h"
++#include "zeek/telemetry/Counter.h"
++#include "zeek/telemetry/Histogram.h"
++#include "zeek/telemetry/Manager.h"
+ 
+ namespace zeek::storage {
+ 
++namespace detail {
++
++OperationMetrics::OperationMetrics(const telemetry::CounterFamilyPtr& results_family,
++                                   const telemetry::HistogramFamilyPtr& latency_family, std::string_view operation_type,
++                                   std::string_view backend_type, std::string_view backend_config)
++    : success(results_family->GetOrAdd(
++          {{"operation", operation_type}, {"type", backend_type}, {"config", backend_config}, {"result", "success"}})),
++      fail(results_family->GetOrAdd(
++          {{"operation", operation_type}, {"type", backend_type}, {"config", backend_config}, {"result", "fail"}})),
++      error(results_family->GetOrAdd(
++          {{"operation", operation_type}, {"type", backend_type}, {"config", backend_config}, {"result", "error"}})),
++      timeouts(results_family->GetOrAdd(
++          {{"operation", operation_type}, {"type", backend_type}, {"config", backend_config}, {"result", "timeout"}})),
++      latency(latency_family->GetOrAdd(
++          {{"operation", operation_type}, {"type", backend_type}, {"config", backend_config}})) {}
++
++} // namespace detail
++
+ RecordValPtr OperationResult::BuildVal() { return MakeVal(code, err_str, value); }
+ 
+ RecordValPtr OperationResult::MakeVal(EnumValPtr code, std::string_view err_str, ValPtr value) {
+@@ -32,9 +53,14 @@ ResultCallback::ResultCallback(zeek::detail::trigger::TriggerPtr trigger, const
+ void ResultCallback::Timeout() {
+     if ( ! IsSyncCallback() )
+         trigger->Cache(assoc, OperationResult::MakeVal(ReturnCode::TIMEOUT).get());
++
++    if ( operation_metrics )
++        operation_metrics->timeouts->Inc();
+ }
+ 
+ void ResultCallback::Complete(OperationResult res) {
++    UpdateOperationMetrics(res.code);
++
+     // If this is a sync callback, there isn't a trigger to process. Store the result and bail.
+     if ( IsSyncCallback() ) {
+         result = std::move(res);
+@@ -46,6 +72,25 @@ void ResultCallback::Complete(OperationResult res) {
+     trigger->Release();
+ }
+ 
++void ResultCallback::Init(detail::OperationMetrics* m) {
++    operation_metrics = m;
++    start_time = util::current_time(true);
++}
++
++void ResultCallback::UpdateOperationMetrics(EnumValPtr c) {
++    if ( operation_metrics ) {
++        if ( c == ReturnCode::SUCCESS )
++            operation_metrics->success->Inc();
++        else if ( c == ReturnCode::KEY_EXISTS || c == ReturnCode::KEY_NOT_FOUND )
++            operation_metrics->fail->Inc();
++        else if ( c != ReturnCode::IN_PROGRESS )
++            operation_metrics->error->Inc();
++
++        // Store the latency between start and completion in milliseconds.
++        operation_metrics->latency->Observe(util::current_time(true) - start_time);
++    }
++}
++
+ OpenResultCallback::OpenResultCallback(IntrusivePtr<detail::BackendHandleVal> backend)
+     : ResultCallback(), backend(std::move(backend)) {}
+ 
+@@ -55,6 +100,7 @@ OpenResultCallback::OpenResultCallback(zeek::detail::trigger::TriggerPtr trigger
+ 
+ void OpenResultCallback::Complete(OperationResult res) {
+     if ( res.code == ReturnCode::SUCCESS ) {
++        backend->backend->InitMetrics();
+         backend->backend->EnqueueBackendOpened();
+     }
+ 
+@@ -68,6 +114,12 @@ void OpenResultCallback::Complete(OperationResult res) {
+ Backend::Backend(uint8_t modes, std::string_view tag_name) : modes(modes) {
+     tag = storage_mgr->BackendMgr().GetComponentTag(std::string{tag_name});
+     tag_str = zeek::obj_desc_short(tag.AsVal().get());
++
++    // The rest of the metrics are initialized after the backend opens, but this one has
++    // to be here because it's possible it gets used by the open callback before Open()
++    // fully returns.
++    backends_opened_metric =
++        telemetr

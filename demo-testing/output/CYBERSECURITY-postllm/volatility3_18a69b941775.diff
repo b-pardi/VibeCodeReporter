@@ -1,0 +1,107 @@
+@@ -87,6 +87,8 @@ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+         # Only found in 6.1+ kernels
+         self.optional_set_type_class("maple_tree", extensions.maple_tree)
+ 
++        self.optional_set_type_class("latch_tree_root", extensions.latch_tree_root)
++
+ 
+ class LinuxUtilities(interfaces.configuration.VersionableInterface):
+     """Class with multiple useful linux functions."""
+
+
+
+
+@@ -10,7 +10,17 @@ import binascii
+ import stat
+ import datetime
+ import socket as socket_module
+-from typing import Generator, Iterable, Iterator, Optional, Tuple, List, Union, Dict
++from typing import (
++    Generator,
++    Iterable,
++    Iterator,
++    Optional,
++    Tuple,
++    List,
++    Union,
++    Dict,
++    Callable,
++)
+ 
+ from volatility3.framework import constants, exceptions, objects, interfaces, symbols
+ from volatility3.framework.renderers import conversion
+@@ -2979,3 +2989,78 @@ class scatterlist(objects.StructType):
+         physical_layer = self._context.layers[physical_layer_name]
+         for sg in self.for_each_sg():
+             yield from physical_layer.read(sg.dma_address, sg._sg_dma_len())
++
++
++class latch_tree_root(objects.StructType):
++    """Latched RB-trees implementation"""
++
++    @functools.cached_property
++    def _vmlinux(self):
++        return linux.LinuxUtilities.get_module_from_volobj_type(self._context, self)
++
++    @functools.lru_cache
++    def _get_type_cached(self, name):
++        return self._vmlinux.get_type(name)
++
++    def _get_lt_node_from_rb_node(
++        self, rb_node, index
++    ) -> Optional[interfaces.objects.ObjectInterface]:
++        """Gets the latch tree node from the RBTree node.
++        Based on __lt_from_rb()
++        """
++        # Unfortunately, we cannot use our LinuxUtilities.container_of() here, since the
++        # member is indexed by the 'index' variable:
++        #   ltn = container_of(node, struct latch_tree_node, node[idx])
++        pointer_size = self._get_type_cached("pointer").size
++        type_dec = self._get_type_cached("latch_tree_node")
++        member_offset = type_dec.relative_child_offset("node") + index * pointer_size
++        container_addr = rb_node.vol.offset - member_offset
++
++        return self._vmlinux.object(
++            object_type="latch_tree_node", offset=container_addr, absolute=True
++        )
++
++    def find(
++        self, key: int, comp_function: Callable
++    ) -> Optional[interfaces.objects.ObjectInterface]:
++        """Returns a pointer to the node matching key or None.
++
++        Based on latch_tree_find() and __lt_find()
++
++        Args:
++            key (int): Typically an address
++            comp_function: Callback comparison function to provide the order between the
++                search key and an element. It's works like the kernel's latch_tree_ops::comp
++                i.e.: comp_function(key, latch_tree_node)
++
++        Returns:
++            latch_tree_node: A pointer to the node matching key or None.
++        """
++        # latch_tree_root >= 4.2 ade3f510f93a5613b672febe88eff8ea7f1c63b7
++
++        # Use the lowest sequence bit as an index for picking which data copy to read
++        if self.seq.has_member("seqcount"):
++            # kernels >= 5.10 0c9794c8b6781eb7dad8e19b78c5d4557790597a
++            sequence = self.seq.seqcount.sequence
++        elif self.seq.has_member("sequence"):
++            # 4.2 <= kernel < 5.10
++            sequence = self.seq.sequence
++        else:
++            raise AttributeError("Unsupported sequence type implementation")
++
++        idx = sequence & 1
++
++        rb_node_ptr = self.tree[idx].rb_node
++        while rb_node_ptr and rb_node_ptr.is_readable():
++            rb_node = rb_node_ptr.dereference()
++            lt_node = self._get_lt_node_from_rb_node(rb_node, idx)
++            c = comp_function(key, lt_node)
++            if c < 0:
++                rb_node_ptr = rb_node.rb_left
++            elif c > 0:
++                rb_node_ptr = rb_node.rb_right
++            else:

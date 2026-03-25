@@ -1,0 +1,119 @@
+@@ -16,7 +16,6 @@ import traceback
+ import operator
+ 
+ from datetime import datetime, timedelta, timezone
+-from json import dumps
+ from typing import Callable, Dict, Optional, Union
+ from enum import Enum, auto
+ 
+@@ -41,8 +40,6 @@ try:
+ except ImportError:
+     metamodel_from_file = None
+ 
+-CondMap = Dict[str, Callable[["SieveExpertBot", object, Event], bool]]
+-
+ 
+ class Procedure(Enum):
+     CONTINUE = auto()  # continue processing subsequent statements (default)
+@@ -60,6 +57,80 @@ class SieveExpertBot(ExpertBot):
+         "/opt/intelmq/var/lib/bots/sieve/filter.sieve"  # TODO: should be pathlib.Path
+     )
+ 
++    def init(self) -> None:
++        if parse is None:
++            raise MissingDependencyError("pendulum")
++
++        if not SieveExpertBot._harmonization:
++            harmonization_config = utils.load_configuration(HARMONIZATION_CONF_FILE)
++            SieveExpertBot._harmonization = harmonization_config["event"]
++
++        self.sieve = SieveModel(self.file, self.logger)
++
++    @staticmethod
++    def check(parameters):
++        try:
++            harmonization_config = utils.load_configuration(HARMONIZATION_CONF_FILE)
++            SieveExpertBot._harmonization = harmonization_config["event"]
++
++            grammarfile = os.path.join(os.path.dirname(__file__), "sieve.tx")
++            if not os.path.exists(grammarfile):
++                raise FileExistsError(f"Sieve grammar file not found: {grammarfile!r}.")
++
++            metamodel = None
++
++            try:
++                metamodel = metamodel_from_file(grammarfile)
++            except TextXError as e:
++                raise ValueError(
++                    f"Could not process sieve grammar file. Error in ({e.line}, {e.col})."
++                )
++
++            if not os.path.exists(parameters["file"]):
++                raise ValueError(f'File does not exist: {parameters["file"]!r}')
++
++            try:
++                metamodel.model_from_file(parameters["file"])
++            except TextXError as e:
++                raise ValueError(
++                    f'Could not process sieve file {parameters["file"]!r}. Error in ({e.line}, {e.col}).'
++                )
++        except Exception:
++            return [
++                [
++                    "error",
++                    f"Validation of Sieve file failed with the following traceback: {traceback.format_exc()!r}",
++                ]
++            ]
++
++    def process(self) -> None:
++        event = self.receive_message()
++        procedure = self.sieve.process(event)
++
++        # forwarding decision
++        if procedure == Procedure.DROP:
++            self.acknowledge_message()
++            return
++
++        paths = getattr(event, "path", ("_default",))
++        if hasattr(paths, "values"):  # PathValueList
++            paths = tuple(path.value for path in paths.values)
++        elif hasattr(paths, "value"):  # SinglePathValue
++            paths = (paths.value,)
++
++        for path in paths:
++            self.send_message(event, path=path)
++
++        self.acknowledge_message()
++
++
++class SieveModel:
++    def __init__(self, file_path: str, logger) -> None:
++        self.metamodel = self.init_metamodel()
++        self.sieve = self.read_sieve_file(file_path, self.metamodel)
++        self.logger = logger
++        self.variables = {}
++
+     _string_op_map = {
+         "==": operator.eq,
+         "!=": operator.ne,
+@@ -76,7 +147,7 @@ class SieveExpertBot(ExpertBot):
+ 
+     _list_op_map = {
+         ":setequals": operator.eq,
+-        ":overlaps": lambda l, r: not l.isdisjoint(r),
++        ":overlaps": lambda lhs, rhs: not lhs.isdisjoint(rhs),
+         ":subsetof": set.issubset,
+         ":supersetof": set.issuperset,
+     }
+@@ -106,48 +177,62 @@ class SieveExpertBot(ExpertBot):
+ 
+     _date_op_map = {":before": operator.lt, ":after": operator.gt}
+ 
+-    _cond_map: CondMap = {
++    _cond_map: Dict[
++        str,
++        Callable[
++            [
++                "SieveModel",
++                object,
++                E

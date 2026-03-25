@@ -1,0 +1,89 @@
+@@ -96,12 +96,22 @@ import org.batfish.datamodel.TcpFlagsMatchConditions;
+ import org.batfish.datamodel.VniSettings;
+ import org.batfish.datamodel.acl.AclLineMatchExpr;
+ import org.batfish.datamodel.acl.AclLineMatchExprs;
++import org.batfish.datamodel.acl.PermittedByAcl;
+ import org.batfish.datamodel.bgp.community.StandardCommunity;
+ import org.batfish.datamodel.isis.IsisMetricType;
+ import org.batfish.datamodel.ospf.NssaSettings;
+ import org.batfish.datamodel.ospf.OspfAreaSummary;
+ import org.batfish.datamodel.ospf.OspfMetricType;
+ import org.batfish.datamodel.ospf.StubSettings;
++import org.batfish.datamodel.packet_policy.BoolExpr;
++import org.batfish.datamodel.packet_policy.FalseExpr;
++import org.batfish.datamodel.packet_policy.FibLookup;
++import org.batfish.datamodel.packet_policy.FibLookupOverrideLookupIp;
++import org.batfish.datamodel.packet_policy.IngressInterfaceVrf;
++import org.batfish.datamodel.packet_policy.PacketMatchExpr;
++import org.batfish.datamodel.packet_policy.PacketPolicy;
++import org.batfish.datamodel.packet_policy.Return;
++import org.batfish.datamodel.packet_policy.TrueExpr;
+ import org.batfish.datamodel.routing_policy.RoutingPolicy;
+ import org.batfish.datamodel.routing_policy.expr.AutoAs;
+ import org.batfish.datamodel.routing_policy.expr.BooleanExpr;
+@@ -779,6 +789,18 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+   private void convertRouteMaps() {
+     _routeMaps.forEach(
+         (name, routeMap) -> _c.getRoutingPolicies().put(name, toRoutingPolicy(routeMap)));
++
++    // Find which route maps are used for PBR
++    _c.getAllInterfaces().values().stream()
++        .map(org.batfish.datamodel.Interface::getRoutingPolicyName)
++        .filter(Objects::nonNull)
++        .distinct()
++        // Extract route map objects
++        .map(_routeMaps::get)
++        .filter(Objects::nonNull)
++        // Convert PBR route maps to packet policies
++        .map(this::toPacketPolicy)
++        .forEach(packetPolicy -> _c.getPacketPolicies().put(packetPolicy.getName(), packetPolicy));
+   }
+ 
+   private void convertStaticRoutes() {
+@@ -1230,6 +1252,13 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+       convertHsrp(iface.getHsrp(), newIfaceBuilder);
+     }
+ 
++    // PBR policy
++    String pbrPolicy = iface.getPbrPolicy();
++    // Do not convert undefined references
++    if (pbrPolicy != null && _routeMaps.get(pbrPolicy) != null) {
++      newIfaceBuilder.setRoutingPolicy(pbrPolicy);
++    }
++
+     // OSPF properties
+     OspfInterface ospf = iface.getOspf();
+     if (ospf != null) {
+@@ -1871,6 +1900,17 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+         .build();
+   }
+ 
++  @Nonnull
++  private PacketPolicy toPacketPolicy(RouteMap routeMap) {
++    return new PacketPolicy(
++        routeMap.getName(),
++        routeMap.getEntries().values().stream()
++            .map(this::toPacketPolicyStatement)
++            .collect(ImmutableList.toImmutableList()),
++        // Default action is to fall through to the destination-based forwarding pipeline
++        new Return(new FibLookup(IngressInterfaceVrf.instance())));
++  }
++
+   private @Nonnull Statement toStatement(RouteMapEntry entry) {
+     ImmutableList.Builder<Statement> trueStatements = ImmutableList.builder();
+     ImmutableList.Builder<BooleanExpr> conjuncts = ImmutableList.builder();
+@@ -1892,6 +1932,171 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+     return new If(new Conjunction(conjuncts.build()), trueStatements.build(), ImmutableList.of());
+   }
+ 
++  @Nonnull
++  private org.batfish.datamodel.packet_policy.Statement toPacketPolicyStatement(
++      RouteMapEntry entry) {
++    RouteMapMatchVisitor<BoolExpr> matchToBoolExpr =
++        new RouteMapMatchVisitor<BoolExpr>() {
++
++          @Override
++          public BoolExpr visitRouteMapMatchAsPath(RouteMapMatchAsPath routeMapMatchAsPath) {
++            // Not applicable to PBR
++            return null;
++     

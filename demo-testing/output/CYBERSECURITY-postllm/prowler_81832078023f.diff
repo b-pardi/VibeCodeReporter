@@ -1,0 +1,137 @@
+@@ -29,6 +29,10 @@ class BaseViewSet(ModelViewSet):
+ 
+ 
+ class BaseRLSViewSet(BaseViewSet):
++    def dispatch(self, request, *args, **kwargs):
++        with transaction.atomic():
++            return super().dispatch(request, *args, **kwargs)
++
+     def initial(self, request, *args, **kwargs):
+         # Ideally, this logic would be in the `.setup()` method but DRF view sets don't call it
+         # https://docs.djangoproject.com/en/5.1/ref/class-based-views/base/#django.views.generic.base.View.setup
+@@ -44,9 +48,8 @@ class BaseRLSViewSet(BaseViewSet):
+         except ValueError:
+             raise ValidationError("X-Tenant-ID header must be a valid UUID")
+ 
+-        with transaction.atomic():
+-            with connection.cursor() as cursor:
+-                cursor.execute("SET api.tenant_id = %s", [tenant_id])
++        with connection.cursor() as cursor:
++            cursor.execute(f"SELECT set_config('api.tenant_id', '{tenant_id}', TRUE);")
+             return super().initial(request, *args, **kwargs)
+ 
+     def get_serializer_context(self):
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,52 @@
++from functools import wraps
++
++from django.db import connection, transaction
++
++
++def set_tenant(func):
++    """
++    Decorator to set the tenant context for a Celery task based on the provided tenant_id.
++
++    This decorator extracts the `tenant_id` from the task's keyword arguments,
++    and uses it to set the tenant context for the current database session.
++    The `tenant_id` is then removed from the kwargs before the task function
++    is executed. If `tenant_id` is not provided, a KeyError is raised.
++
++    Args:
++        func (function): The Celery task function to be decorated.
++
++    Raises:
++        KeyError: If `tenant_id` is not found in the task's keyword arguments.
++
++    Returns:
++        function: The wrapped function with tenant context set.
++
++    Example:
++        # This decorator MUST be defined the last in the decorator chain
++
++        @shared_task
++        @set_tenant
++        def some_task(arg1, **kwargs):
++            # Task logic here
++            pass
++
++        # When calling the task
++        some_task.delay(arg1, tenant_id="1234-abcd-5678")
++
++        # The tenant context will be set before the task logic executes.
++    """
++
++    @wraps(func)
++    @transaction.atomic
++    def wrapper(*args, **kwargs):
++        try:
++            tenant_id = kwargs.pop("tenant_id")
++        except KeyError:
++            raise KeyError("This task requires the tenant_id")
++
++        with connection.cursor() as cursor:
++            cursor.execute(f"SELECT set_config('api.tenant_id', '{tenant_id}', TRUE);")
++
++        return func(*args, **kwargs)
++
++    return wrapper
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,34 @@
++from unittest.mock import patch, call
++
++import pytest
++
++from api.decorators import set_tenant
++
++
++@pytest.mark.django_db
++class TestSetTenantDecorator:
++    @patch("api.decorators.connection.cursor")
++    def test_set_tenant(self, mock_cursor):
++        mock_cursor.return_value.__enter__.return_value = mock_cursor
++
++        @set_tenant
++        def random_func(arg):
++            return arg
++
++        tenant_id = "1234-abcd-5678"
++
++        result = random_func("test_arg", tenant_id=tenant_id)
++
++        assert (
++            call(f"SELECT set_config('api.tenant_id', '{tenant_id}', TRUE);")
++            in mock_cursor.execute.mock_calls
++        )
++        assert result == "test_arg"
++
++    def test_set_tenant_exception(self):
++        @set_tenant
++        def random_func(arg):
++            return arg
++
++        with pytest.raises(KeyError):
++            random_func("test_arg")
+
+
+
+
+@@ -1,4 +1,4 @@
+-from datetime import datetime
++from unittest.mock import Mock, patch
+ 
+ import pytest
+ from django.urls import reverse
+@@ -433,7 +433,15 @@ class TestProviderViewSet:
+         )
+         assert response.status_code == status.HTTP_404_NOT_FOUND
+ 
+-    def test_providers_connection(self, client, providers, tenant_header):
++    @patch("

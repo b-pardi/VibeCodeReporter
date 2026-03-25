@@ -1,0 +1,82 @@
+@@ -18,17 +18,20 @@ public class ChatController {
+     private final Chat state;
+     private final MessageStore store;
+     private final PrivateChatState privateChatState;
++    private final LRUCache<MessageRef, MessageEnvelope> cache;
+     private final Hasher hasher;
+ 
+     public ChatController(String chatUuid,
+                           Chat state,
+                           MessageStore store,
+                           PrivateChatState privateChatState,
++                          LRUCache<MessageRef, MessageEnvelope> cache,
+                           Hasher hasher) {
+         this.chatUuid = chatUuid;
+         this.state = state;
+         this.store = store;
+         this.privateChatState = privateChatState;
++        this.cache = cache;
+         this.hasher = hasher;
+     }
+ 
+@@ -52,15 +55,27 @@ public class ChatController {
+ 
+     @JsMethod
+     public CompletableFuture<MessageEnvelope> getMessage(MessageRef ref) {
++        MessageEnvelope cached = cache.get(ref);
++        if (cached != null)
++            return Futures.of(cached);
+         long msgCount = state.host().messagesMergedUpto;
+         // Todo try most recent 100 first, then try previous chunks
+-        // Todo cache hashes in LRU
+         return store.getMessagesFrom(0)
+-                .thenCompose(allSigned -> Futures.findFirst(allSigned, s -> hasher.bareHash(s.msg.serialize())
+-                        .thenApply(h -> h.equals(ref.envelopeHash) ? Optional.of(s.msg) : Optional.empty())))
++                .thenCompose(allSigned -> Futures.findFirst(allSigned, s -> hashMessage(s.msg)
++                        .thenApply(h -> h.equals(ref) ? Optional.of(s.msg) : Optional.empty())))
+                 .thenApply(Optional::get);
+     }
+ 
++    private CompletableFuture<MessageRef> hashMessage(MessageEnvelope m) {
++        byte[] raw = m.serialize();
++        return hasher.bareHash(raw)
++                .thenApply(MessageRef::new)
++                .thenApply(r -> {
++                    cache.put(r, m);
++                    return r;
++                });
++    }
++
+     @JsMethod
+     public CompletableFuture<List<MessageEnvelope>> getMessages(int from, int to) {
+         return store.getMessages(from, to)
+
+
+
+
+@@ -37,6 +37,7 @@ public class Messenger {
+     private final NetworkAccess network;
+     private final Crypto crypto;
+     private final Hasher hasher;
++    private final LRUCache<MessageRef, MessageEnvelope> cache = new LRUCache<>(1_000);
+ 
+     @JsConstructor
+     public Messenger(UserContext context) {
+@@ -77,7 +78,7 @@ public class Messenger {
+                         .thenCompose(updatedChatRoot -> updatedChatRoot.uploadOrReplaceFile(PRIVATE_CHAT_STATE,
+                                 AsyncReader.build(rawPrivateChatState), rawPrivateChatState.length, network, crypto, x -> {}, crypto.random.randomBytes(32))))
+                 .thenCompose(this::getChatMessageStore)
+-                .thenApply(messageStore -> new ChatController(chatId, chat, messageStore, privateChatState, hasher))
++                .thenApply(messageStore -> new ChatController(chatId, chat, messageStore, privateChatState, cache, hasher))
+                 .thenCompose(controller -> controller.join(context.signer, c -> overwriteState(c, chatId)));
+     }
+ 
+@@ -203,7 +204,7 @@ public class Messenger {
+                 .thenCompose(sharedDir -> getChatState(sharedDir.get()))
+                 .thenCompose(chat -> getPrivateChatState(chatRoot)
+                         .thenCompose(priv -> getChatMessageStore(chatRoot)
+-                                .thenApply(msgStore -> new ChatController(chatRoot.getName(), chat, msgStore, priv, hasher))));
++                                .thenApply(msgStore -> new ChatController(chatRoot.getName(), chat, msgStore, priv, cache, hasher))));
+     }
+ 
+     private CompletableFuture<Chat> getChatState(FileWrapper chatRoot) {

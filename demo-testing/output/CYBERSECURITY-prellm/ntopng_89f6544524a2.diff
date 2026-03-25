@@ -1,0 +1,101 @@
+@@ -134,6 +134,7 @@ class NetworkInterface : public Checkpointable {
+   int cpu_affinity; /**< Index of physical core where the network interface works. */
+   nDPIStats ndpiStats;
+   PacketStats pktStats;
++  L4Stats l4Stats;
+   FlowHash *flows_hash; /**< Hash used to store flows information. */
+   u_int32_t last_remote_pps, last_remote_bps;
+   u_int8_t packet_drops_alert_perc;
+@@ -366,24 +367,27 @@ class NetworkInterface : public Checkpointable {
+   virtual u_int32_t getCheckPointNumPacketDrops();
+ 
+   inline void _incStats(bool ingressPacket, time_t when,
+-			u_int16_t eth_proto, u_int16_t ndpi_proto,
++			u_int16_t eth_proto, u_int16_t ndpi_proto, u_int8_t l4proto,
+ 		       u_int pkt_len, u_int num_pkts, u_int pkt_overhead) {
+     ethStats.incStats(ingressPacket, eth_proto, num_pkts, pkt_len, pkt_overhead);
+     ndpiStats.incStats(when, ndpi_proto, 0, 0, num_pkts, pkt_len);
+     // Note: here we are not currently interested in packet direction, so we tell it is receive
+     ndpiStats.incCategoryStats(when, get_ndpi_proto_category(ndpi_proto), 0 /* see above comment */, pkt_len);
+     pktStats.incStats(pkt_len);
++    l4Stats.incStats(when, l4proto,
++      ingressPacket ? num_pkts : 0, ingressPacket ? pkt_len : 0,
++      !ingressPacket ? num_pkts : 0, !ingressPacket ? pkt_len : 0);
+   };
+ 
+   inline void incFlagsStats(u_int8_t flags) { pktStats.incFlagStats(flags); };
+   inline void incStats(bool ingressPacket, time_t when, u_int16_t eth_proto, u_int16_t ndpi_proto,
+-		       u_int pkt_len, u_int num_pkts, u_int pkt_overhead) {
++		       u_int8_t l4proto, u_int pkt_len, u_int num_pkts, u_int pkt_overhead) {
+ #ifdef HAVE_NEDGE
+     /* In nedge, we only update the stats periodically with conntrack */
+     return;
+ #endif
+ 
+-    _incStats(ingressPacket, when, eth_proto, ndpi_proto, pkt_len, num_pkts, pkt_overhead);
++    _incStats(ingressPacket, when, eth_proto, ndpi_proto, l4proto, pkt_len, num_pkts, pkt_overhead);
+   };
+ 
+   inline void incLocalStats(u_int num_pkts, u_int pkt_len, bool localsender, bool localreceiver) {
+
+
+
+
+@@ -32,6 +32,7 @@ class NetworkInterfaceTsPoint: public TimeseriesPoint {
+   u_int devices, flows, http_hosts;
+   TcpPacketStats tcpPacketStats;
+   PacketStats packetStats;
++  L4Stats l4Stats;
+ 
+   virtual void lua(lua_State* vm, NetworkInterface *iface);
+ };
+
+
+
+
+@@ -268,6 +268,7 @@ using namespace std;
+ #include "TimeseriesRing.h"
+ #include "HostTimeseriesPoint.h"
+ #include "SPSCQueue.h"
++#include "L4Stats.h"
+ #include "NetworkInterfaceTsPoint.h"
+ #include "NetworkInterface.h"
+ #ifndef HAVE_NEDGE
+@@ -328,7 +329,6 @@ using namespace std;
+ #include "Country.h"
+ #include "MacStats.h"
+ #include "Mac.h"
+-#include "L4Stats.h"
+ #include "TimeseriesStats.h"
+ #include "HostStats.h"
+ #include "LocalHostStats.h"
+
+
+
+
+@@ -3695,12 +3695,12 @@ void Flow::setPacketsBytes(time_t now, u_int32_t s2d_pkts, u_int32_t d2s_pkts,
+   */
+   last_conntrack_update = now;
+ 
+-  iface->_incStats(isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol,
++  iface->_incStats(isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol, protocol,
+ 		   nf_existing_flow ? s2d_bytes - cli2srv_bytes : s2d_bytes,
+ 		   nf_existing_flow ? s2d_pkts - cli2srv_packets : s2d_pkts,
+ 		   overhead);
+ 
+-  iface->_incStats(!isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol,
++  iface->_incStats(!isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol, protocol,
+ 		  nf_existing_flow ? d2s_bytes - srv2cli_bytes : d2s_bytes,
+ 		  nf_existing_flow ? d2s_pkts - srv2cli_packets : d2s_pkts,
+ 		  overhead);
+
+
+
+
+@@ -1364,7 +1364,7 @@ void NetworkInterface::processFlow(ParsedFlow *zflow, bool zmq_flow) {
+   /* Do not put incStats before guessing the flow protocol */
+   incStats(true /* ingressPacket */,
+ 	   now, srcIP.isIPv4() ? ETHERTYPE_IP : ETHERTYPE_IPV6,
+-	   flow->get_detected_protocol().app_protocol,
++	   flow->get_detected_protocol().app_protocol, zflow->l4_proto,
+ 

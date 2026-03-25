@@ -1,0 +1,146 @@
+@@ -24,7 +24,7 @@ struct name {				\
+ 	__u32 natout_idx;		\
+ 	__u8 iface_name[16];		\
+ 	__u32 log_filter_jmp;		\
+-	__u32 jumps[32];		\
++	__u32 jumps[40];		\
+ 	/* Needs to be 32bit aligned as it is followed by scratch area for 				\
+ 	 * building headers. We reuse the same slot in state map to save 				\
+ 	 * ourselves a lookup. 										\
+
+
+
+
+@@ -71,6 +71,7 @@ enum cali_jump_index {
+ 	PROG_INDEX_DROP,
+ 	PROG_INDEX_HOST_CT_CONFLICT,
+ 	PROG_INDEX_ICMP_INNER_NAT,
++	PROG_INDEX_NEW_FLOW,
+ 
+ 	PROG_INDEX_MAIN_DEBUG,
+ 	PROG_INDEX_POLICY_DEBUG,
+@@ -79,6 +80,7 @@ enum cali_jump_index {
+ 	PROG_INDEX_DROP_DEBUG,
+ 	PROG_INDEX_HOST_CT_CONFLICT_DEBUG,
+ 	PROG_INDEX_ICMP_INNER_NAT_DEBUG,
++	PROG_INDEX_NEW_FLOW_DEBUG,
+ 
+ 	PROG_INDEX_MAIN_V6,
+ 	PROG_INDEX_POLICY_V6,
+@@ -87,6 +89,7 @@ enum cali_jump_index {
+ 	PROG_INDEX_DROP_V6,
+ 	PROG_INDEX_HOST_CT_CONFLICT_V6,
+ 	PROG_INDEX_ICMP_INNER_NAT_V6,
++	PROG_INDEX_NEW_FLOW_V6,
+ 
+ 	PROG_INDEX_MAIN_V6_DEBUG,
+ 	PROG_INDEX_POLICY_V6_DEBUG,
+@@ -95,6 +98,7 @@ enum cali_jump_index {
+ 	PROG_INDEX_DROP_V6_DEBUG,
+ 	PROG_INDEX_HOST_CT_CONFLICT_V6_DEBUG,
+ 	PROG_INDEX_ICMP_INNER_NAT_V6_DEBUG,
++	PROG_INDEX_NEW_FLOW_V6_DEBUG,
+ };
+ 
+ #if CALI_F_XDP
+
+
+
+
+@@ -631,7 +631,7 @@ static CALI_BPF_INLINE enum do_nat_res do_nat(struct cali_tc_ctx *ctx,
+ 		 * if we need encap or not. Must do before MTU check and before
+ 		 * we jump to do the encap.
+ 		 */
+-		if (ct_rc == CALI_CT_NEW) {
++		if (ct_ctx_nat /* iff CALI_CT_NEW */) {
+ 			struct cali_rt * rt;
+ 
+ 			if (encap_needed) {
+@@ -1112,34 +1112,231 @@ int calico_tc_skb_accepted_entrypoint(struct __sk_buff *skb)
+ 	}
+ 
+ 	update_rule_counters(ctx);
+-	struct calico_nat_dest *nat_dest = NULL;
+-	struct calico_nat_dest nat_dest_2 = {
+-		.addr = ctx->state->nat_dest.addr,
+-		.port = ctx->state->nat_dest.port,
+-	};
+-	if (!ip_void(ctx->state->nat_dest.addr)) {
+-		nat_dest = &nat_dest_2;
+-	}
+ 
+-	ctx->fwd = calico_tc_skb_accepted(ctx, nat_dest);
++	ctx->fwd = calico_tc_skb_accepted(ctx);
+ 	return forward_or_drop(ctx);
+ 
+ deny:
+ 	return TC_ACT_SHOT;
+ }
+ 
+-static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx,
+-							 struct calico_nat_dest *nat_dest)
++static CALI_BPF_INLINE void update_fib_mark(struct cali_tc_state *state, bool* fib, __u32 *seen_mark)
+ {
+-	CALI_DEBUG("Entering calico_tc_skb_accepted\n");
++	if (CALI_F_FROM_WEP && (state->flags & CALI_ST_NAT_OUTGOING)) {
++		// We are going to SNAT this traffic, using iptables SNAT so set the mark
++		// to trigger that and leave the fib lookup disabled.
++		*fib = false;
++		*seen_mark = CALI_SKB_MARK_NAT_OUT;
++	} else {
++		if (state->flags & CALI_ST_SKIP_FIB) {
++			*fib = false;
++			*seen_mark = CALI_SKB_MARK_SKIP_FIB;
++		}
++	}
++}
++
++SEC("tc")
++int calico_tc_skb_new_flow_entrypoint(struct __sk_buff *skb)
++{
++	DECLARE_TC_CTX(_ctx,
++		.skb = skb,
++		.fwd = {
++			.res = TC_ACT_UNSPEC,
++			.reason = CALI_REASON_UNKNOWN,
++			.mark = CALI_SKB_MARK_SEEN,
++		},
++	);
++	struct cali_tc_ctx *ctx = &_ctx;
+ 	struct cali_tc_state *state = ctx->state;
++	enum do_nat_res nat_res = NAT_ALLOW;
++	bool is_dnat = false;
++	int ct_rc = ct_result_rc(state->ct_result.rc);
++	__u32 seen_mark = ctx->fwd.mark;
+ 	bool fib = true;
++
++	CALI_DEBUG("Entering calico_tc_skb_new_flow\n");
++
++	switch (state->pol_rc) {
++	case CALI_POL_NO_MATCH:
++		CALI_DEBUG("Implicitly denied by policy: DROP\n");
++		goto deny;
++	case CALI_POL_DENY:
++		CALI_DEBUG("Denied by policy: DROP\n");
++		goto deny;
++	case CALI_POL_ALLOW:
++		CALI_DEBUG("Allowed by policy: ACCEPT\n");
++	}
++
++	if (CALI_F_FROM_WEP &&
++			CALI_DROP_WORKLOAD_TO_HOST &&
++			cali_rt_flags_local_host(
++				cali_rt_lookup_flags(&state->post_nat_ip_dst))) {
++		CALI_DEBUG("Workload to host traffic blocked by "
++			   "DefaultEndpointToHostAction: DROP\n");
++		goto deny;
++	}
++
++	update_fib_mark(state, &fib, &seen_mark);
++
+ 	struct ct_create_ctx *ct_ctx_nat = &ctx->scratch->ct_ctx_nat;
++	__builtin_memset(ct_ctx_nat, 0, sizeof(*ct_ctx_nat));
++
++	ct_ctx_nat->proto = state->ip_proto;
++	ct_ctx_nat->src = state->ip_src;
++

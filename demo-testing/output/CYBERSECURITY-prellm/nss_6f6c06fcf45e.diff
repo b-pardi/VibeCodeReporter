@@ -1,0 +1,109 @@
+@@ -320,6 +320,53 @@ TEST_F(TlsConnectStreamTls13, DropRecordClient) {
+   SendReceive();
+ }
+ 
++// Check that a server can use 0.5 RTT if client authentication isn't enabled.
++TEST_P(TlsConnectTls13, WriteBeforeClientFinished) {
++  EnsureTlsSetup();
++  StartConnect();
++  client_->Handshake();  // ClientHello
++  server_->Handshake();  // ServerHello
++
++  server_->SendData(10);
++  client_->ReadBytes(10);  // Client should emit the Finished as a side-effect.
++  server_->Handshake();    // Server consumes the Finished.
++  CheckConnected();
++}
++
++// We don't allow 0.5 RTT if client authentication is requested.
++TEST_P(TlsConnectTls13, WriteBeforeClientFinishedClientAuth) {
++  client_->SetupClientAuth();
++  server_->RequestClientAuth(false);
++  StartConnect();
++  client_->Handshake();  // ClientHello
++  server_->Handshake();  // ServerHello
++
++  static const uint8_t data[] = {1, 2, 3};
++  EXPECT_GT(0, PR_Write(server_->ssl_fd(), data, sizeof(data)));
++  EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
++
++  Handshake();
++  CheckConnected();
++  SendReceive();
++}
++
++// 0.5 RTT should fail with client authentication required.
++TEST_P(TlsConnectTls13, WriteBeforeClientFinishedClientAuthRequired) {
++  client_->SetupClientAuth();
++  server_->RequestClientAuth(true);
++  StartConnect();
++  client_->Handshake();  // ClientHello
++  server_->Handshake();  // ServerHello
++
++  static const uint8_t data[] = {1, 2, 3};
++  EXPECT_GT(0, PR_Write(server_->ssl_fd(), data, sizeof(data)));
++  EXPECT_EQ(PR_WOULD_BLOCK_ERROR, PORT_GetError());
++
++  Handshake();
++  CheckConnected();
++  SendReceive();
++}
++
+ // The next two tests takes advantage of the fact that we
+ // automatically read the first 1024 bytes, so if
+ // we provide 1200 bytes, they overrun the read buffer
+
+
+
+
+@@ -548,6 +548,37 @@ TEST_P(TlsConnectTls13, TestTls13ResumeNoCertificateRequest) {
+   EXPECT_TRUE(SECITEM_ItemsAreEqual(&cert1->derCert, &cert2->derCert));
+ }
+ 
++// Here we test that 0.5 RTT is available at the server when resuming, even if
++// configured to request a client certificate.  The resumed handshake relies on
++// the authentication from the original handshake, so no certificate is
++// requested this time around.  The server can write before the handshake
++// completes because the PSK binder is sufficient authentication for the client.
++TEST_P(TlsConnectTls13, WriteBeforeHandshakeCompleteOnResumption) {
++  ConfigureSessionCache(RESUME_BOTH, RESUME_TICKET);
++  client_->SetupClientAuth();
++  server_->RequestClientAuth(true);
++  Connect();
++  SendReceive();  // Absorb the session ticket.
++  ScopedCERTCertificate cert1(SSL_LocalCertificate(client_->ssl_fd()));
++
++  Reset();
++  ConfigureSessionCache(RESUME_BOTH, RESUME_TICKET);
++  ExpectResumption(RESUME_TICKET);
++  server_->RequestClientAuth(false);
++  StartConnect();
++  client_->Handshake();  // ClientHello
++  server_->Handshake();  // ServerHello
++
++  server_->SendData(10);
++  client_->ReadBytes(10);  // Client should emit the Finished as a side-effect.
++  server_->Handshake();    // Server consumes the Finished.
++  CheckConnected();
++
++  // Check whether the client certificate matches the one from the ticket.
++  ScopedCERTCertificate cert2(SSL_PeerCertificate(server_->ssl_fd()));
++  EXPECT_TRUE(SECITEM_ItemsAreEqual(&cert1->derCert, &cert2->derCert));
++}
++
+ // We need to enable different cipher suites at different times in the following
+ // tests.  Those cipher suites need to be suited to the version.
+ static uint16_t ChooseOneCipher(uint16_t version) {
+
+
+
+
+@@ -936,6 +936,25 @@ ssl_SecureSend(sslSocket *ss, const unsigned char *buf, int len, int flags)
+             firstClientWrite = ss->ssl3.hs.ws == idle_handshake;
+             ssl_ReleaseSSL3HandshakeLock(ss);
+         }
++        /* Allow the server to send 0.5 RTT data in TLS 1.3. Requesting a
++         * certificate implies that the server might condition its sending on
++         * client authentication, so force servers that do that to wait.
++         *
++         * What mig

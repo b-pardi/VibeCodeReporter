@@ -1,0 +1,144 @@
+new file mode 100755
+
+
+
+@@ -0,0 +1,446 @@
++#!/usr/bin/python
++# -*- coding: utf-8 -*-
++#
++# This program is Free Software; you can redistribute it and/or
++# modify it under the terms of version three of the GNU Affero General Public
++# License as published by the Free Software Foundation, which is
++# listed in the file LICENSE.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++# Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++# 02110-1301, USA.
++#
++# Author: Alexandre Bruyelles <git@jack.fr.eu.org>
++#
++
++import BareosFdPluginBaseclass
++import bareosfd
++import bareos_fd_consts
++import datetime
++import dateutil.parser
++import io
++import itertools
++import libcloud
++import multiprocessing
++import os
++import syslog
++import time
++import traceback
++
++from libcloud.storage.types import Provider
++from libcloud.storage.providers import get_driver
++from bareos_fd_consts import bRCs, bIOPS
++
++syslog.openlog(__name__, facility=syslog.LOG_LOCAL7)
++
++debug = False
++
++
++def log(message):
++	if debug is True:
++		message = '[%s] %s' % (os.getpid(), message)
++		syslog.syslog(message)
++
++
++def error(message):
++	message = '[%s] %s' % (os.getpid(), message)
++	syslog.syslog(message)
++
++
++# Print the traceback to syslog
++def log_exc():
++	for line in traceback.format_exc().split('\n'):
++		error(line)
++
++
++class IterStringIO(io.BufferedIOBase):
++	def __init__(self, iterable):
++		self.iter = itertools.chain.from_iterable(iterable)
++
++	def read(self, n=None):
++		return bytearray(itertools.islice(self.iter, None, n))
++
++
++def str2bool(data):
++	if data == 'false' or data == 'False':
++		return False
++	if data == 'true' or data == 'True':
++		return True
++	raise Exception('%s: not a boolean' % (data,))
++
++
++def connect(options):
++	driver_opt = dict(options)
++
++	# Some drivers does not support unknown options
++	# Here, we remove those used by libcloud and let the rest pass through
++	for opt in ('buckets_exclude', 'accurate', 'nb_prefetcher', 'prefetch_size', 'queue_size', 'provider', 'buckets_include', 'debug'):
++		if opt in options:
++			del driver_opt[opt]
++
++	provider = getattr(Provider, options['provider'])
++	driver = get_driver(provider)(**driver_opt)
++	return driver
++
++
++def get_object(driver, bucket, key):
++	try:
++		return driver.get_object(bucket, key)
++	except libcloud.common.types.InvalidCredsError:
++		# Something is buggy here, this bug is triggered by tilde-ending objects
++		# Our tokens are good, we used then before
++		error('BUGGY filename found, see the libcloud bug somewhere : %s/%s' % (bucket, key))
++		return None
++
++
++class Prefetcher(object):
++	def __init__(self, options, plugin_todo_queue, pref_todo_queue):
++		self.options = options
++		self.plugin_todo_queue = plugin_todo_queue
++		self.pref_todo_queue = pref_todo_queue
++
++	def __call__(self):
++		try:
++			self.driver = connect(self.options)
++			self.__work()
++		except:
++			log('FATAL ERROR: I am a prefetcher, and I am dying !')
++			log_exc()
++
++	def __work(self):
++		while True:
++			job = self.pref_todo_queue.get()
++			if job is None:
++				log('prefetcher[%s] : job completed, I will now die' % (os.getpid(),))
++				return
++
++			obj = get_object(self.driver, job['bucket'], job['name'])
++			if obj is None:
++				# Object cannot be fetched, an error is already logged
++				continue
++
++			stream = obj.as_stream()
++			content = b''.join(list(stream))
++
++			prefetched = len(content)
++			if prefetched != job['size']:
++				error('FATAL ERROR: prefetched file %s: got %s bytes, not the real size (%s bytes)' % (job['name'], prefetched, job['size']))
++				return
++
++			data = io.BytesIO(content)
++
++			job['data'] = data
++			self.plugin_todo_queue.put(job

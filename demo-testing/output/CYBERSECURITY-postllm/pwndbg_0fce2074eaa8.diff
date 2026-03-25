@@ -1,0 +1,134 @@
+@@ -660,6 +660,7 @@ def load_commands() -> None:
+     import pwndbg.commands.asm
+     import pwndbg.commands.attachp
+     import pwndbg.commands.auxv
++    import pwndbg.commands.binder
+     import pwndbg.commands.branch
+     import pwndbg.commands.canary
+     import pwndbg.commands.checksec
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,377 @@
++from __future__ import annotations
++
++import argparse
++import logging
++from typing import Any
++from typing import Optional
++
++import gdb
++
++import pwndbg.color as C
++import pwndbg.commands
++import pwndbg.gdblib.symbol
++from pwndbg.commands import CommandCategory
++from pwndbg.gdblib.kernel.macros import container_of
++from pwndbg.gdblib.kernel.macros import for_each_entry
++from pwndbg.gdblib.kernel.rbtree import for_each_rb_entry
++
++log = logging.getLogger(__name__)
++
++addrc = C.green
++fieldnamec = C.blue
++fieldvaluec = C.yellow
++typenamec = C.red
++
++
++def for_each_transaction(addr, field):
++    typename = "struct binder_transaction"
++
++    while addr != 0:
++        transaction = gdb.Value(addr).cast(gdb.lookup_type(typename).pointer())
++        yield transaction
++
++        addr = transaction[field]
++
++
++# TODO: pull this out from the slab command so we can reuse it
++class IndentContextManager:
++    def __init__(self):
++        self.indent = 0
++
++    def __enter__(self):
++        self.indent += 1
++
++    def __exit__(self, exc_type, exc_value, exc_tb):
++        self.indent -= 1
++        assert self.indent >= 0
++
++
++node_types = {
++    "waiting_threads": "struct binder_thread",
++    "todo": "struct binder_work",
++    "refs": "struct binder_ref",
++    "threads": "struct binder_thread",
++    "nodes": "struct binder_node",
++    "refs_by_node": "struct binder_ref",
++}
++
++entry_field_names = {
++    "waiting_threads": "waiting_thread_node",
++    "todo": "entry",
++    "refs": "node_entry",
++}
++
++rb_node_field_names = {
++    "threads": "rb_node",
++    "nodes": "rb_node",
++    "refs_by_node": "rb_node_node",
++}
++
++codenames = [x for x in dir(gdb) if "TYPE_CODE_" in x]
++code_to_name = {getattr(gdb, name): name for name in codenames}
++name_to_code = {v: k for k, v in code_to_name.items()}
++
++
++# TODO: merge with for_each_entry?
++def for_each_hlist_entry(head, typename, field):
++    addr = head["first"]
++    while addr != 0:
++        yield container_of(addr, typename, field)
++        addr = addr.dereference()["next"]
++
++
++class BinderVisitor:
++    def __init__(self, procs_addr):
++        self.indent = IndentContextManager()
++        self.addr = pwndbg.gdblib.memory.get_typed_pointer_value(
++            gdb.lookup_type("struct hlist_head"), procs_addr
++        )
++
++    def _format_indent(self, text: str) -> str:
++        return "    " * self.indent.indent + text
++
++    def _format_heading(self, typename: str, fields, addr: int):
++        hex_addr = hex(int(addr))
++        return self._format_indent(
++            f"{fieldnamec(typename)} {fieldvaluec(fields)} ({addrc(hex_addr)})"
++        )
++
++    # TODO: do this in a cleaner, object-oriented way
++    def _format_field(self, field: Optional[str] = None, value: Any = "", only_heading=True):
++        if isinstance(value, gdb.Value):
++            t = value.type
++            if t.code == name_to_code["TYPE_CODE_TYPEDEF"]:
++                real_type = t.strip_typedefs()
++
++                # We only want to replace the typedef with the real type if the
++                # real type is not an anonymous struct
++                if real_type.name is not None:
++                    t = real_type
++
++            if t.code == name_to_code["TYPE_CODE_INT"]:
++                value = int(value)
++            elif t.code == name_to_code["TYPE_CODE_BOOL"]:
++                value = True if value else False
++            elif t.code == name_to_code["TYPE_CODE_PTR"]:
++                typename = t.target().name
++                if int(value) == 0:
++                    value = "NULL"
++                elif typename == "binder_proc":
++                    value = self.format_proc(value, only_hea

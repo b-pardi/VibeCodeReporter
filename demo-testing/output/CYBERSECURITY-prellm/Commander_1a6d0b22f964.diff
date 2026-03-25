@@ -1,0 +1,89 @@
+@@ -10,10 +10,14 @@
+ #
+ 
+ import argparse
++import datetime
+ import logging
++import fnmatch
++import re
++from typing import Dict, Any
+ 
+-from .base import dump_report_data, Command
+-from .. import api, display, vault, vault_extensions
++from .base import dump_report_data, user_choice, Command, GroupCommand
++from .. import api, display, crypto, utils, vault, vault_extensions
+ from ..team import Team
+ 
+ from ..params import KeeperParams
+@@ -22,6 +26,7 @@ from ..subfolder import try_resolve_path
+ 
+ def register_commands(commands):
+     commands['search'] = SearchCommand()
++    commands['trash'] = TrashCommand()
+     commands['list'] = RecordListCommand()
+     commands['list-sf'] = RecordListSfCommand()
+     commands['list-team'] = RecordListTeamCommand()
+@@ -35,6 +40,7 @@ def register_command_info(aliases, command_info):
+ 
+     for p in [search_parser, list_parser, list_sf_parser, list_team_parser]:
+         command_info[p.prog] = p.description
++    command_info['trash'] = 'Manage deleted items'
+ 
+ 
+ search_parser = argparse.ArgumentParser(prog='search', description='Search the vault. Can use a regular expression.')
+@@ -202,3 +208,180 @@ class RecordListTeamCommand(Command):
+                                     row_number=True)
+         else:
+             logging.info('No teams are found')
++
++
++trash_list_parser = argparse.ArgumentParser(prog='trash list', description='.')
++trash_list_parser.add_argument('--format', dest='format', action='store', choices=['csv', 'json', 'table'],
++                               default='table', help='output format')
++trash_list_parser.add_argument('--output', dest='output', action='store',
++                               help='output file name. (ignored for table format)')
++trash_list_parser.add_argument('--reload', dest='reload', action='store_true', help='reload deleted records')
++trash_list_parser.add_argument('pattern', nargs='?', type=str, action='store', help='search pattern')
++
++
++trash_restore_parser = argparse.ArgumentParser(prog='trash restore', description='.')
++trash_restore_parser.add_argument('-f', '--force', dest='force', action='store_true',
++                                  help='do not prompt for confirmation')
++trash_restore_parser.add_argument('records', nargs='+', type=str, action='store',
++                                  help='Record UID or search pattern')
++
++
++class TrashMixin:
++    last_revision = 0
++    deleted_record_cache = {}
++
++    @staticmethod
++    def get_deleted_records(params, reload=False):    # type: (KeeperParams, bool) -> Dict[str, Any]
++        if params.revision != TrashMixin.last_revision or reload:
++            deleted_uids = set()
++            rq = {
++                'command': 'get_deleted_records',
++                'client_time': utils.current_milli_time()
++            }
++            rs = api.communicate(params, rq)
++            if 'records' in rs:
++                for record in rs['records']:
++                    record_uid = record['record_uid']
++                    deleted_uids.add(record_uid)
++                    if record_uid in TrashMixin.deleted_record_cache:
++                        continue
++                    try:
++                        key_type = record['record_key_type']
++                        record_key = utils.base64_url_decode(record['record_key'])
++                        if key_type == 1:
++                            record_key = crypto.decrypt_aes_v1(record_key, params.data_key)
++                        elif key_type == 2:
++                            record_key = api.decrypt_rsa(record_key, params.rsa_key)
++                        elif key_type == 3:
++                            record_key = crypto.decrypt_aes_v2(record_key, params.data_key)
++                        elif key_type == 4:
++                            record_key = crypto.decrypt_ec(record_key, params.ecc_key)
++                        else:
++                            logging.debug('Cannot decrypt record key %s', record_uid)
++                            continue
++ 

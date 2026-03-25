@@ -1,0 +1,109 @@
+@@ -41,6 +41,7 @@ class Flow : public GenericHashEntry {
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   u_int16_t cli_score, srv_score;
++  bool peers_score_accounted;
+   struct ndpi_flow_struct *ndpiFlow;
+ 
+   Bitmap status_map;              /* The bitmap of the possible problems on the flow */
+@@ -603,9 +604,10 @@ class Flow : public GenericHashEntry {
+   inline u_int16_t getFlowDeviceOutIndex() { return flow_device.out_index; };
+ 
+   void incScore(u_int16_t cli_inc, u_int16_t srv_inc);
+-  inline u_int16_t getCliScore()           { return(cli_score); };
+-  inline u_int16_t getSrvScore()           { return(srv_score); };
+-  inline u_int16_t getScore()              { return(max(cli_score, srv_score)); };
++  inline u_int16_t getCliScore() const     { return(cli_score); };
++  inline u_int16_t getSrvScore() const     { return(srv_score); };
++  inline u_int16_t getScore() const        { return(max(cli_score, srv_score)); };
++  inline void setPeersScoreAccounted()     { peers_score_accounted = true; };
+ 
+ #ifdef HAVE_NEDGE
+   inline void setLastConntrackUpdate(u_int32_t when) { last_conntrack_update = when; }
+
+
+
+
+@@ -39,6 +39,7 @@ class Host : public GenericHashEntry, public AlertableEntity {
+   OperatingSystem os;
+   time_t last_stats_reset;
+   u_int32_t old_score, new_score;
++  u_int32_t old_idle_flow_score, new_idle_flow_score; /* Necessary to handle short idle flows */
+   u_int32_t active_alerted_flows;
+   Bitmap misbehaving_flows_as_client_status, misbehaving_flows_as_server_status;
+  
+@@ -362,7 +363,11 @@ class Host : public GenericHashEntry, public AlertableEntity {
+ 
+   inline void incScore(u_int16_t score)    { new_score += score; };
+   inline u_int16_t getScore() const        { return(old_score); };
+-  inline void refreshScore()               { old_score = new_score; new_score = 0; };
++  void refreshScore();
++
++  /* This call is not performed into the same thread as the incScore, so
++   * it needs a separate counter to avoid contention. */
++  inline void incIdleFlowScore(u_int16_t score) { new_idle_flow_score += score; };
+ 
+   inline void setOS(OperatingSystem _os) {
+     Mac *mac = getMac();
+
+
+
+
+@@ -48,6 +48,7 @@ Flow::Flow(NetworkInterface *_iface,
+   alert_level = alert_level_none;
+   alerted_status = status_normal;
+   predominant_status = status_normal;
++  peers_score_accounted = false;
+ 
+   detection_completed = update_flow_port_stats = false;
+   fully_processed = false;
+@@ -1104,6 +1105,13 @@ if(cli_host && srv_host) {
+ 				     cli_host->get_ip()->isBroadcastAddress());
+       }
+     }
++
++    if(!peers_score_accounted && idle()) {
++      /* The flow went idle to quickly as the run_min_flows_tasks was not
++       * called. Account the score using a separate counter. */
++      cli_host->incIdleFlowScore(getCliScore());
++      srv_host->incIdleFlowScore(getSrvScore());
++    }
+   }
+ 
+   switch(get_protocol()) {
+
+
+
+
+@@ -176,6 +176,7 @@ void Host::initialize(Mac *_mac, u_int16_t _vlanId, bool init_all) {
+   num_resolve_attempts = 0, ssdpLocation = NULL;
+   num_active_flows_as_client.reset(), num_active_flows_as_server.reset();
+   old_score = new_score = 0;
++  old_idle_flow_score = new_idle_flow_score = 0;
+   active_alerted_flows = 0;
+ 
+   flow_alert_counter = NULL;
+@@ -1382,3 +1383,15 @@ char* Host::get_tskey(char *buf, size_t bufsize) {
+ 
+   return(k);
+ }
++
++/* *************************************** */
++
++void Host::refreshScore() {
++  /* Add the score calculated on the idle flows */
++  new_score += (new_idle_flow_score - old_idle_flow_score);
++  old_idle_flow_score = new_idle_flow_score;
++
++  /* Account the new_score and prepare the counter for the next run */
++  old_score = new_score;
++  new_score = 0;
++}
+
+
+
+
+@@ -7759,6 +7759,7 @@ static bool run_min_flows_tasks(GenericHashEntry *f, void *user_data, bool *matc
+   /* Update the peers score */
+   if(flow->unsafeGetClient()) flow->unsafeGetClient()->incScore(flow->getCliScore());
+   if(flow->unsafeGetServer()) flow->unsafeGetServer()->

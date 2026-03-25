@@ -1,0 +1,124 @@
+@@ -50,6 +50,7 @@ class AddressTree {
+ 
+   inline patricia_tree_t * getTree(bool isV4) const { return(isV4 ? ptree_v4 : ptree_v6); }
+   bool addAddress(const char * const _net, const int16_t user_data = -1);
++  bool addAddressAndData(const char * const _what, void *user_data);
+   patricia_node_t* addAddress(const IpAddress * const ipa);
+   patricia_node_t* addAddress(const IpAddress * const ipa, int network_bits, bool compact_after_add);
+   bool addAddresses(const char *net, const int16_t user_data = -1);
+
+
+
+
+@@ -54,6 +54,7 @@ public:
+   void discover(lua_State* vm, u_int timeout);
+   void arpScan(lua_State* vm);
+   void queueMDNSResponse(u_int32_t src_ip_nw_byte_order, u_char *buf, u_int buf_len);
++  void sendArpNetwork(void *data, u_int32_t netp, u_int32_t maskp, u_int32_t sender_ip);
+ };
+ 
+ #endif /* _NETWORK_DISCOVERY_H_ */
+
+
+
+
+@@ -295,6 +295,7 @@ class NetworkInterface : public AlertableEntity {
+   void checkDisaggregationMode();
+   inline void setCPUAffinity(int core_id)      { cpu_affinity = core_id; };
+   inline void getIPv4Address(bpf_u_int32 *a, bpf_u_int32 *m) { *a = ipv4_network, *m = ipv4_network_mask; };
++  inline AddressTree* getInterfaceNetworks()   { return(&interface_networks); };
+   virtual void startPacketPolling();
+   virtual void shutdown();
+   virtual void cleanup();
+@@ -637,7 +638,7 @@ class NetworkInterface : public AlertableEntity {
+   inline bool is_bridge_interface()                { return(bridge_interface);        }
+   inline const char* getLocalIPAddresses()         { return(ip_addresses.c_str());    }
+   void addInterfaceAddress(char * const addr);
+-  void addInterfaceNetwork(char * const net);
++  void addInterfaceNetwork(char * const net, char * addr);
+   bool isInterfaceNetwork(const IpAddress * const ipa, int network_bits) const;
+   inline int exec_sql_query(lua_State *vm, char *sql, bool limit_rows, bool wait_for_db_created = true) {
+ #ifdef HAVE_MYSQL
+
+
+
+
+@@ -168,6 +168,21 @@ patricia_node_t *AddressTree::addAddress(const IpAddress * const ipa,
+ 
+ /* ******************************************* */
+ 
++bool AddressTree::addAddressAndData(const char * const _what, void *user_data) {
++  patricia_node_t *node = Utils::ptree_add_rule(strchr(_what, '.') ? ptree_v4 : ptree_v6, _what);
++
++  if(node)
++    node->data = user_data;
++  else
++    return(false);
++
++  numAddresses++;
++
++  return(true);
++}
++
++/* ******************************************* */
++
+ bool AddressTree::addAddress(const char * const _what, const int16_t user_data) {
+   u_int32_t _mac[6];
+   int16_t id = (user_data == -1) ? numAddresses : user_data;
+
+
+
+
+@@ -21,6 +21,8 @@
+ 
+ #include "ntop_includes.h"
+ 
++//#define DEBUG_DISCOVERY
++
+ /* ******************************* */
+ 
+ NetworkDiscovery::NetworkDiscovery(NetworkInterface *_iface) {
+@@ -139,16 +141,155 @@ void NetworkDiscovery::queueMDNSResponse(u_int32_t src_ip_nw_byte_order,
+ }
+ 
+ /* ******************************* */
++
++typedef struct {
++  NetworkDiscovery *discover;
++  int fd;
++  int mdns_sock;
++  lua_State* vm;
++  struct sockaddr_in *mdns_dest;
++  ndpi_dns_packet_header *dns_h;
++  char *mdnsbuf;
++  struct arp_packet *arp;
++  u_int dns_query_len;
++  char *ifname;
++} arp_data;
++
++static void arp_scan_hosts(patricia_node_t *node, void *data, void *user_data) {
++  u_int32_t netp, maskp;
++  arp_data *arp_d = (arp_data*) user_data;
++
++  if(node->prefix->family == AF_INET) {
++    struct in_addr sender_ip;
++    netp = ntohl(node->prefix->add.sin.s_addr);
++    maskp = (0xFFFFFFFF << (32 - node->prefix->bitlen)) & 0xFFFFFFFF;
++
++    if(node->data)
++      inet_aton((char*)node->data, &sender_ip);
++    else
++      sender_ip.s_addr = 0;
++
++    arp_d->discover->sendArpNetwork(arp_d, netp, maskp, sender_ip.s_addr);
++  }
++}
++
++/* ******************************* */
++
+ /*
+   Code portions courtesy of Andrea Zerbinati <zeran23@gmail.com>
+   and Luca Peretti <lucaperetti.lp@gmail.com>
+ */
++void NetworkDiscovery::sendArpNetwork(void *data, u_int32_t netp, u_int32_t maskp, u_int32_t sender_ip) {
++  u

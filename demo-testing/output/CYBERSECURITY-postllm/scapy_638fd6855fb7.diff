@@ -1,0 +1,125 @@
+@@ -823,9 +823,24 @@ class HTTP_Client(object):
+             )
+         return resp
+ 
+-    def request(self, url, data=b"", timeout=5, follow_redirects=True, **headers):
++    def request(self,
++                url,
++                data=b"",
++                timeout=5,
++                follow_redirects=True,
++                http_headers={},
++                **headers):
+         """
+         Perform a HTTP(s) request.
++
++        :param url: the full URL to connect to.
++            e.g. https://google.com/test
++        :param data: the data to send as payload
++        :param follow_redirects: if True, request() will follow 302 return codes
++        :param http_headers: if specified, overwrites the HTTP headers
++            (except Host and Path).
++        :param headers: any additional HTTPRequest parameter to add.
++            e.g. Method="POST"
+         """
+         # Parse request url
+         m = re.match(r"(https?)://([^/:]+)(?:\:(\d+))?(/.*)?", url)
+@@ -844,14 +859,20 @@ class HTTP_Client(object):
+         self._connect_or_reuse(host, port=port, tls=tls, timeout=timeout)
+ 
+         # Build request
+-        http_headers = {
+-            "Accept_Encoding": b'gzip, deflate',
+-            "Cache_Control": b'no-cache',
+-            "Pragma": b'no-cache',
+-            "Connection": b'keep-alive',
+-            "Host": host,
+-            "Path": path,
+-        }
++        headers.setdefault("Host", host)
++        headers.setdefault("Path", path)
++
++        if not http_headers:
++            http_headers = {
++                "Accept_Encoding": b'gzip, deflate',
++                "Cache_Control": b'no-cache',
++                "Pragma": b'no-cache',
++                "Connection": b'keep-alive',
++            }
++        else:
++            http_headers = {
++                k.replace("-", "_"): v for k, v in http_headers.items()
++            }
+         http_headers.update(headers)
+         req = HTTP() / HTTPRequest(**http_headers)
+         if data:
+
+
+
+
+@@ -46,7 +46,7 @@ Example decryption::
+     >>> enc.decrypt(k)
+ """
+ 
+-from collections import namedtuple
++from collections import namedtuple, deque
+ from datetime import datetime, timedelta, timezone
+ from enum import IntEnum
+ 
+@@ -117,7 +117,7 @@ from scapy.fields import (
+     XStrField,
+ )
+ from scapy.packet import Packet, bind_bottom_up, bind_top_down, bind_layers
+-from scapy.supersocket import StreamSocket
++from scapy.supersocket import StreamSocket, SuperSocket
+ from scapy.utils import strrot, strxor
+ from scapy.volatile import GeneralizedTime, RandNum, RandBin
+ 
+@@ -2523,7 +2523,7 @@ class KDC_PROXY_MESSAGE(ASN1_Packet):
+         ASN1F_optional(
+             ASN1F_FLAGS(
+                 "dclocatorHint",
+-                "",
++                None,
+                 FlagsField("", 0, -32, _NV_VERSION).names,
+                 explicit_tag=0xA2,
+             )
+@@ -2531,6 +2531,69 @@ class KDC_PROXY_MESSAGE(ASN1_Packet):
+     )
+ 
+ 
++class KdcProxySocket(SuperSocket):
++    """
++    This is a wrapper of a HTTP_Client that does KKDCP proxying,
++    disguised as a SuperSocket to be compatible with the rest of the KerberosClient.
++    """
++
++    def __init__(
++        self,
++        url,
++        targetDomain,
++        dclocatorHint=None,
++        no_check_certificate=False,
++        **kwargs,
++    ):
++        self.url = url
++        self.targetDomain = targetDomain
++        self.dclocatorHint = dclocatorHint
++        self.no_check_certificate = no_check_certificate
++        self.queue = deque()
++        super(KdcProxySocket, self).__init__(**kwargs)
++
++    def recv(self, x=None):
++        return self.queue.popleft()
++
++    def send(self, x, **kwargs):
++        from scapy.layers.http import HTTP_Client
++
++        cli = HTTP_Client(no_check_certificate=self.no_check_certificate)
++        try:
++            # sr it via the web client
++            resp = cli.request(
++                self.url,
++                Method="POST",
++                data=bytes(
++                    # Wrap request in KDC_

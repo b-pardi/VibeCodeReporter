@@ -1,0 +1,117 @@
+@@ -73,7 +73,7 @@ class Flow : public GenericHashEntry {
+     cli2srv_direction, twh_over, twh_ok, dissect_next_http_packet, passVerdict,
+     check_tor, l7_protocol_guessed, flow_alerted, flow_dropped_counts_increased,
+     good_low_flow_detected, good_ssl_hs, update_flow_port_stats,
+-    quota_exceeded;
++    quota_exceeded, has_malicious_signature;
+   u_int16_t diff_num_http_requests;
+ #ifdef NTOPNG_PRO
+   bool counted_in_aggregated_flow, status_counted_in_aggregated_flow;
+
+
+
+
+@@ -73,6 +73,7 @@ class Ntop {
+   cpu_load_stats cpu_stats;
+   float cpu_load;
+   bool is_started;
++  std::set<std::string> *new_malicious_ja3, *malicious_ja3, *malicious_ja3_shadow;
+   
+ #ifdef NTOPNG_PRO
+ #ifndef WIN32
+@@ -435,6 +436,10 @@ class Ntop {
+   void sendNetworkInterfacesTermination();
+   inline time_t getLastStatsReset() { return(last_stats_reset); }
+   void resetStats();
++
++  inline void loadMaliciousJA3Hash(std::string md5_hash)     { new_malicious_ja3->insert(md5_hash); }
++  bool isMaliciousJA3Hash(std::string md5_hash);
++  void reloadJA3Hashes();
+ };
+ 
+ extern Ntop *ntop;
+
+
+
+
+@@ -140,6 +140,7 @@ typedef enum {
+   slow_periodic_activity = 40,
+   login_failed = 42,
+   alert_potentially_dangerous_protocol = 43,
++  alert_malicious_signature = 48,
+   /* 
+      IMPORTANT IMPORTANT IMPORTANT
+      If # status >= 64 then extend Utils.h and Lua bitmap functions to handle it
+@@ -365,6 +366,7 @@ typedef enum {
+   status_data_exfiltration /* 24 */,
+   status_ssl_old_protocol_version /* 25 */,
+   status_potentially_dangerous /* 26 */,
++  status_malicious_signature /* 27 */,
+   num_flow_status,
+   /* 
+      IMPORTANT IMPORTANT IMPORTANT
+
+
+
+
+@@ -131,6 +131,7 @@ Flow::Flow(NetworkInterface *_iface,
+ #endif
+ 
+   passVerdict = true, quota_exceeded = false;
++  has_malicious_signature = false;
+   if(_first_seen > _last_seen) _first_seen = _last_seen;
+   first_seen = _first_seen, last_seen = _last_seen;
+   bytes_thpt_trend = trend_unknown, pkts_thpt_trend = trend_unknown;
+@@ -303,6 +304,7 @@ void Flow::dumpFlowAlert() {
+       do_dump = ntop->getPrefs()->are_mining_alerts_enabled();
+       break;
+ 
++    case status_malicious_signature:
+     case status_blacklisted:
+       do_dump = ntop->getPrefs()->are_malware_alerts_enabled();
+       break;
+@@ -2210,6 +2212,10 @@ json_object* Flow::flow2statusinfojson() {
+   else if(fs == status_elephant_remote_to_local)
+     json_object_object_add(obj, "elephant.r2l_threshold",
+ 			   json_object_new_int64(ntop->getPrefs()->get_elephant_flow_remote_to_local_bytes()));
++  else if(fs == status_malicious_signature) {
++    if(isSSL() && protos.ssl.ja3.client_hash)
++      json_object_object_add(obj, "ja3_signature", json_object_new_string(protos.ssl.ja3.client_hash));
++  }
+ 
+   if(isICMP()) {
+     json_object_object_add(obj, "icmp.icmp_type", json_object_new_int(protos.icmp.icmp_type)),
+@@ -3753,6 +3759,9 @@ FlowStatus Flow::getFlowStatus() {
+   if(!isDeviceAllowedProtocol())
+     return status_device_protocol_not_allowed;
+ 
++  if(has_malicious_signature)
++    return status_malicious_signature;
++
+   //if(get_protocol_category() == CUSTOM_CATEGORY_MINING)
+   if(ndpiDetectedProtocol.category == CUSTOM_CATEGORY_MINING)
+     return status_web_mining_detected;
+@@ -4023,9 +4032,12 @@ void Flow::setParsedeBPFInfo(const ParsedeBPF * const ebpf, bool src2dst_directi
+ /* ***************************************************** */
+ 
+ void Flow::updateJA3() {
+-  if(cli_host && isSSL() && protos.ssl.ja3.client_hash)
++  if(cli_host && isSSL() && protos.ssl.ja3.client_hash) {
+     cli_host->getJA3Fingerprint()->update(protos.ssl.ja3.client_hash,
+ 					  cli_ebpf ? cli_ebpf->process_info.process_name : NULL);
++
++    has_malicious_signature |= ntop->isMaliciousJA3Hash(protos.ssl.ja3.client_hash);
++  }
+ }
+ 
+ /* ***************************************************** */
+
+
+
+
+@@ -1497,6 +1497,31 @@ static int ntop_ip_cmp(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_load_malicious_ja3_hash(lua_State* vm) {
++ 

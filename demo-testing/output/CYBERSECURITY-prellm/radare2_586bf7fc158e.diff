@@ -1,0 +1,119 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2011-2017 - pancake */
++/* radare - LGPL - Copyright 2011-2018 - pancake */
+ 
+ #include <r_egg.h>
+ #include <r_bin.h>
+
+
+
+
+@@ -64,7 +64,14 @@ static inline int r_asm_pseudo_org(RAsm *a, char *input) {
+ 
+ static inline int r_asm_pseudo_hex(RAsmOp *op, char *input) {
+ 	int len = r_hex_str2bin (input, op->buf);
+-	strncpy (op->buf_hex, r_str_trim_head_tail (input), R_ASM_BUFSIZE-1);
++	// non null terminated string
++	strncpy (op->buf_hex, r_str_trim_head_tail (input), R_ASM_BUFSIZE - 1);
++	op->buf_hex[sizeof (op->buf_hex)] = 0;
++	if (len < 0) {
++		len = -len;
++		len--;
++		eprintf ("Buffer truncated at %d because of the RAsmOp abuse.\nInput: %s\n", len, input);
++	}
+ 	return len;
+ }
+ 
+@@ -891,9 +898,9 @@ R_API RAsmCode* r_asm_massemble(RAsm *a, const char *buf) {
+ 					r_asm_set_cpu (a, ptr + 5);
+ 				else if (!strncmp (ptr, ".os ", 4))
+ 					r_syscall_setup (a->syscall, a->cur->arch, a->bits, asmcpu, ptr + 4);
+-				else if (!strncmp (ptr, ".hex ", 5))
+-					ret = r_asm_pseudo_hex (&op, ptr+5);
+-				else if ((!strncmp (ptr, ".int16 ", 7)) || !strncmp (ptr, ".short ", 7))
++				else if (!strncmp (ptr, ".hex ", 5)) {
++					ret = r_asm_pseudo_hex (&op, ptr + 5);
++				} else if ((!strncmp (ptr, ".int16 ", 7)) || !strncmp (ptr, ".short ", 7))
+ 					ret = r_asm_pseudo_int16 (a, &op, ptr+7);
+ 				else if (!strncmp (ptr, ".int32 ", 7))
+ 					ret = r_asm_pseudo_int32 (a, &op, ptr+7);
+@@ -943,8 +950,8 @@ R_API RAsmCode* r_asm_massemble(RAsm *a, const char *buf) {
+ 					continue;
+ 				}
+ 				if (ret < 0) {
+-					eprintf ("!!! Oops\n");
+-					free(lbuf);
++					eprintf ("!!! Oops (%s)\n", ptr);
++					free (lbuf);
+ 					return r_asm_code_free (acode);
+ 				}
+ 			} else { /* Instruction */
+
+
+
+
+@@ -97,22 +97,23 @@ static struct cEnv_t* r_egg_Cfile_set_cEnv(const char *arch, const char *os, int
+ 
+ 	cEnv->JMP = r_egg_Cfile_armOrMips (arch) ? "b" : "jmp";
+ 
+-	if (isXNU(os)) {
++	// TODO: Missing -Os .. caused some rip-relative LEA to be MOVQ on PIE in CLANG.. so sad
++	if (isXNU (os)) {
+ 		cEnv->OBJCOPY = "gobjcopy";
+ 		cEnv->FMT = "mach0";
+ 		if (!strcmp (arch, "x86")) {
+ 			if (bits == 32) {
+-				cEnv->CFLAGS = strdup ("-arch i386");
+-				cEnv->LDFLAGS = strdup ("-arch i386 -shared -c");
++				cEnv->CFLAGS = strdup ("-arch i386 -fPIC -fPIE");
++				cEnv->LDFLAGS = strdup ("-arch i386 -shared -c -fPIC -fPIE -pie");
+ 			} else {
+-				cEnv->CFLAGS = strdup ("-arch x86_64");
+-				cEnv->LDFLAGS = strdup ("-arch x86_64 -shared -c");
++				cEnv->CFLAGS = strdup ("-arch x86_64 -fPIC -fPIE");
++				cEnv->LDFLAGS = strdup ("-arch x86_64 -shared -c -fPIC -fPIE -pie");
+ 			}
+ 		} else {
+-			cEnv->LDFLAGS = strdup ("-shared -c");
++			cEnv->CFLAGS = strdup ("-shared -c -fPIC -pie -fPIE");
++			cEnv->LDFLAGS = strdup ("-shared -c -fPIC -pie -fPIE");
+ 		}
+ 		cEnv->SHDR = r_str_newf ("\n.text\n%s _main\n", cEnv->JMP);
+-
+ 	} else {
+ 		cEnv->OBJCOPY = "objcopy";
+ 		cEnv->FMT = "elf";
+@@ -249,17 +250,14 @@ R_API char* r_egg_Cfile_parser(const char *file, const char *arch, const char *o
+ 
+ 	r_str_sanitize (cEnv->CC);
+ 
+-	//printf ("==> Compile\n");
+-	printf ("'%s' %s -o '%s.tmp' -S -Os '%s'\n", cEnv->CC, cEnv->CFLAGS, file, file);
+-
+-	output = r_sys_cmd_strf ("('%s' %s -o '%s.tmp' -S -Os '%s') 2>&1",
+-	  			cEnv->CC, cEnv->CFLAGS, file, file);
+-	if (output == NULL) {
+-		eprintf ("Compilation failed!\n");
++	// Compile
++	char *cmd = r_str_newf ("'%s' %s -o '%s.tmp' -S '%s'\n", cEnv->CC, cEnv->CFLAGS, file, file);
++	eprintf ("%s\n", cmd);
++	int rc = r_sys_cmd (cmd);
++	free (cmd);
++	if (rc != 0) {
+ 		goto fail;
+ 	}
+-	printf ("%s", output);
+-
+ 	if (!(fileExt = r_str_newf ("%s.s", file))) {
+ 		goto fail;
+ 	}
+@@ -273,22 +271,19 @@ R_API char* r_egg_Cfile_parser(const char *file, const char *arch, const char *o
+ 		goto fail;
+ 	}
+ 
+-	//printf ("==> Assemble\n");
+-	printf ("'%s' %s -Os -o '%s.o' '%s.s'\n", cEnv->CC, cEnv->LDFLAGS, file, file);
+-
+ 	free (output);
+-	output = r_sys_cmd_strf ("'%s' %s -Os -o '%s.o' '%s.s'",
+-		   		cEnv->CC, cEnv->

@@ -1,0 +1,99 @@
+@@ -33,12 +33,12 @@ class PcapInterface : public NetworkInterface {
+   int iface_datalink[MAX_NUM_PCAP_INTERFACES];
+   char *pcap_path;
+   bool read_pkts_from_pcap_dump, read_pkts_from_pcap_dump_done,
+-    emulate_traffic_directions, read_from_stdin_pipe,
++    read_pkts_from_directory, emulate_traffic_directions, read_from_stdin_pipe,
+     delete_pcap_when_done;
+   ProtoStats prev_stats_in, prev_stats_out;
+   FILE *pcap_list;
+   struct timeval startTS, firstPktTS;
+-  
++  std::vector<std::string> pcap_files_queue;
+   pcap_stat last_pcap_stat;
+   u_int32_t getNumDroppedPackets();
+   void cleanupPcapDumpDir();
+@@ -74,7 +74,7 @@ class PcapInterface : public NetworkInterface {
+     return (emulate_traffic_directions);
+   };
+   inline void set_pcap_handle(pcap_t *p, u_int8_t id) { if(id < num_ifaces) pcap_handle[id] = p; };
+-  inline FILE *get_pcap_list() { return (pcap_list); };
++  inline std::vector<std::string>* get_pcap_files_queue() { return (&pcap_files_queue); };
+   void startPacketPolling();
+   bool set_packet_filter(char *filter);
+   bool read_from_stdin() const { return (read_from_stdin_pipe); };
+@@ -92,6 +92,9 @@ class PcapInterface : public NetworkInterface {
+   unsigned int get_ifindex(int i) { return(ifname_indexes[i]); }
+   int get_ifdatalink(int i)       { return(iface_datalink[i]); }
+   char* getPcapIfaceName(int i)   { return(pcap_ifaces[i]);    }
++  inline bool readFromPcapDump()  { return(read_pkts_from_pcap_dump); }
++  inline bool readFromPcapDir()   { return(read_pkts_from_directory); }
++  bool loadPcapFilesFromDir();
+ };
+ 
+ #endif /* _PCAP_INTERFACE_H_ */
+
+
+
+
+@@ -46,19 +46,19 @@ PcapInterface::PcapInterface(const char *name, u_int8_t ifIdx,
+   memset(&last_pcap_stat, 0, sizeof(last_pcap_stat));
+   emulate_traffic_directions = false;
+   read_pkts_from_pcap_dump = read_pkts_from_pcap_dump_done = false,
+-    read_from_stdin_pipe = false;
++    read_pkts_from_directory = false, read_from_stdin_pipe = false;
+ 
+   firstPktTS.tv_sec = 0;
+   pcap_path = NULL;
+   iface_datalink[0] = DLT_EN10MB; /* default */
+ 
+-  if ((stat(name, &buf) == 0) || (name[0] == '-') ||
+-      !strncmp(name, "stdin", 5)) {
+-    /*
+-      The file exists so we need to check if it's a
+-      text file or a pcap file
+-    */
++  if ((stat(name, &buf) == 0)
++      || (name[0] == '-')
++      || (!strncmp(name, "stdin", 5))) {
++    /* The file exists so we need to check if it's a text file or a pcap file */
+ 
++    num_ifaces = 1;
++    
+     if (strcmp(name, "-") == 0 || !strncmp(name, "stdin", 5)) {
+       /* stdin */
+       ntop->getTrace()->traceEvent(TRACE_NORMAL, "Reading packets from stdin...");
+@@ -69,7 +69,6 @@ PcapInterface::PcapInterface(const char *name, u_int8_t ifIdx,
+       is_traffic_mirrored = true;
+       emulate_traffic_directions = true;
+       read_from_stdin_pipe = true;
+-      num_ifaces = 1;
+     } else if ((pcap_handle[0] = pcap_open_offline(ifname, pcap_error_buffer)) != NULL) {
+       char *slash = strrchr(ifname, '/');
+ 
+@@ -84,17 +83,51 @@ PcapInterface::PcapInterface(const char *name, u_int8_t ifIdx,
+       read_pkts_from_pcap_dump = true,
+ 	purge_idle_flows_hosts = ntop->getPrefs()->purgeHostsFlowsOnPcapFiles();
+       iface_datalink[0] = pcap_datalink(pcap_handle[0]);
+-      num_ifaces = 1;
+     } else {
+-      /* Trying to open a playlist */
+-      if ((pcap_list = fopen(name, "r")) != NULL) {
+-        read_pkts_from_pcap_dump = true;
++      bool is_dir = ((stat(ifname, &buf) == 0) && (S_ISDIR(buf.st_mode))) ? true : false;
++
++      if(is_dir) {
++	read_pkts_from_pcap_dump = true, read_pkts_from_directory = true;
++	loadPcapFilesFromDir();
+       } else {
+-        ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to open file %s", name);
+-        exit(0);
++	/* Trying to open a playlist */
++	if ((pcap_list = fopen(ifname, "r")) != NULL) {
++	  if (pcap_list != NULL) {
++	    char path[256], *fname;
++
++	    while ((fname = fgets(path, sizeof(path), pcap_list)) != NULL) {
++	      int l = (int)strlen(path) - 1;
++
++	      if ((l

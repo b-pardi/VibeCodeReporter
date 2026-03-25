@@ -1,0 +1,84 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,268 @@
++package peergos.server;
++
++import peergos.server.crypto.hash.Blake3;
++import peergos.shared.util.ArrayOps;
++import peergos.shared.util.Pair;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.nio.channels.FileChannel;
++import java.util.*;
++
++public class DirectorySync {
++
++    public static void main(String[] args) throws Exception {
++        File local = new File("sync/local");
++        File remote = new File("sync/remote");
++        TreeState syncedState = new TreeState();
++        while (true) {
++            syncedState = syncDirs(local, remote, syncedState);
++            Thread.sleep(30_000);
++        }
++    }
++
++    public static TreeState syncDirs(File localDir, File remoteDir, TreeState syncedVersions) throws IOException {
++        TreeState localState = new TreeState();
++        buildDirState("", localDir, localState, syncedVersions);
++
++        TreeState remoteState = new TreeState();
++        buildDirState("", remoteDir, remoteState, syncedVersions);
++
++        TreeState finalSyncedState = new TreeState();
++        for (FileState local : localState.filesByPath.values()) {
++
++            FileState synced = syncedVersions.filesByPath.get(local.relPath);
++            FileState remote = remoteState.filesByPath.get(local.relPath);
++            List<FileState> syncedResults = syncFile(localDir, remoteDir, synced, local, remote);
++            syncedResults.forEach(finalSyncedState::add);
++        }
++        for (FileState remote : remoteState.filesByPath.values()) {
++            if (! finalSyncedState.filesByPath.containsKey(remote.relPath)) {
++
++                FileState synced = syncedVersions.filesByPath.get(remote.relPath);
++                List<FileState> syncedResults = syncFile(localDir, remoteDir, synced, null, remote);
++                syncedResults.forEach(finalSyncedState::add);
++            }
++        }
++        return finalSyncedState;
++    }
++
++    public static List<FileState> syncFile(File localDir, File remoteDir, FileState synced, FileState local, FileState remote) throws IOException {
++        if (synced == null) {
++            if (local == null) { // remotely added
++                copyFileDiffAndTruncate(remoteDir.toPath().resolve(remote.relPath).toFile(), remote, localDir.toPath().resolve(remote.relPath).toFile(), null);
++                return List.of(remote);
++            } else if (remote == null) { // locally added
++                copyFileDiffAndTruncate(localDir.toPath().resolve(local.relPath).toFile(), local, remoteDir.toPath().resolve(local.relPath).toFile(), null);
++                return List.of(local);
++            } else {
++                // concurrent addition, rename 1 if contents are different
++                if (remote.hash.equals(local.hash)) {
++                    if (local.modificationTime >= remote.modificationTime) {
++                        setModificationTime(remoteDir.toPath().resolve(local.relPath).toFile(), local.modificationTime);
++                        return List.of(local);
++                    } else {
++                        setModificationTime(localDir.toPath().resolve(local.relPath).toFile(), remote.modificationTime);
++                        return List.of(remote);
++                    }
++                } else {
++                    FileState renamed = renameOnConflict(localDir.toPath().resolve(local.relPath).toFile(), local);
++                    copyFileDiffAndTruncate(remoteDir.toPath().resolve(remote.relPath).toFile(), remote, localDir.toPath().resolve(remote.relPath).toFile(), null);
++                    copyFileDiffAndTruncate(localDir.toPath().resolve(renamed.relPath).toFile(), renamed, remoteDir.toPath().resolve(renamed.relPath).toFile(), null);
++                    return List.of(renamed, remote);
++                }
++            }
++        } else {
++            if (synced.equals(local)) { // remote change only
++                if (

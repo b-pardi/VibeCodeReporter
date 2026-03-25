@@ -1,0 +1,97 @@
+@@ -4,9 +4,11 @@ import argparse
+ import ast
+ import functools
+ import logging
++import math
+ import os
+ import sys
+ from collections import defaultdict
++from enum import Enum
+ from typing import Any
+ from typing import Callable
+ from typing import DefaultDict
+@@ -35,6 +37,7 @@ import pwndbg.color.syntax_highlight as H
+ import pwndbg.commands
+ import pwndbg.commands.telescope
+ import pwndbg.integration
++import pwndbg.lib.config
+ import pwndbg.ui
+ from pwndbg.aglib.arch_mod import get_thumb_mode_string
+ from pwndbg.color import ColorConfig
+@@ -807,8 +810,29 @@ def context(subcontext=None, enabled=None) -> None:
+     reserve_lines_maybe(cmd_lines)
+ 
+ 
++class CompactRegsOptions(Enum):
++    NO = "off"
++    YES = "on"
++    VERY = "very"
++    HARDCUT = "hardcut"
++
++
+ pwndbg.config.add_param(
+-    "show-compact-regs", False, "whether to show a compact register view with columns"
++    "show-compact-regs",
++    CompactRegsOptions.NO.value,
++    "whether to show a compact register view with columns",
++    param_class=pwndbg.lib.config.PARAM_ENUM,
++    enum_sequence=[x.value for x in CompactRegsOptions],
++    help_docstring=f"""
++Values explained:
++
+++ `{CompactRegsOptions.NO.value}` - Disable compact registers (default). Every other option tries to make the register context use less rows by putting the registers into multiple columns.
+++ `{CompactRegsOptions.YES.value}` - If a register printout doesn't fit it will be added to the end of the register context.
+++ `{CompactRegsOptions.VERY.value}` - Try to very hard to compress. May save more lines than `{CompactRegsOptions.YES.value}` but logical register grouping may suffer.
+++ `{CompactRegsOptions.HARDCUT.value}` - If a register printout doesn't fit its slot, it will simply be truncated.
++
++See also show-compact-regs-columns, show-compact-regs-min-width and show-compact-regs-separation.
++""",
+ )
+ pwndbg.config.add_param(
+     "show-compact-regs-columns", 2, "the number of columns (0 for dynamic number of columns)"
+@@ -819,20 +843,259 @@ pwndbg.config.add_param(
+ )
+ 
+ 
+-def calculate_padding_to_align(length, align):
++def calculate_padding_to_align(length: int, align: int) -> int:
+     """Calculates the number of spaces to append to reach the next alignment.
+     The next alignment point is given by "x * align >= length".
+     """
+     return 0 if length % align == 0 else (align - (length % align))
+ 
+ 
++def compact_regs_hardcut(
++    regs: List[str], terminal_width: int, column_width: int, columns: int, separation: int
++) -> List[str]:
++    """
++    If the string of any register overflows its column_width, it will be hard cut to the column_width.
++
++    Example:
++     RAX  0xfffffffffffffdfe              R8   0                               R14  0
++     RBX  0                               R9   0x7fffffffcbd0 —▸ 0x7fff...     R15  0x7ffff7f83e60 (_rl_orig...
++     RCX  0x7ffff7c90efa (__intern...     R10  0                               RBP  1
++     RDX  0                               R11  0x202                           RSP  0x7fffffffcb70 ◂— 0
++     RDI  1                               R12  0x7fffffffccb0 ◂— 1             RIP  0x7ffff7c90efa (__intern...
++     RSI  0x7fffffffccb0 ◂— 1             R13  0                               EFLAGS 0x202 [ cf pf af zf sf...
++    """
++    result: List[str] = []
++
++    cut_marker = pwndbg.color.white("...")
++
++    def hardcut(reg: str) -> tuple[str, int]:
++        # Returns the cut string and the new size
++        # I don't know of a better way to do this while retaining the coloring.
++        reglen = len(reg)
++        for i in range(reglen, 0, -1):
++            candidate = reg[0:i] + cut_marker
++            candidate_len = len(pwndbg.color.strip(candidate))
++            if candidate_len <= column_width:
++                return candidate, candidate_len
++        # Shouldn't happen anyway, but we return non-zero so padding alignment
++        # can proceed.
++        return " ", 1
++
++    line: str = ""
++    line_length: int = 0
++    nregs: int = len(

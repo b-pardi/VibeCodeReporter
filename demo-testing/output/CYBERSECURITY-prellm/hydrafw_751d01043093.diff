@@ -1,0 +1,162 @@
+@@ -166,6 +166,10 @@ typedef struct {
+ 	uint8_t dev_function;
+ } hydranfc_config_t;
+ 
++typedef struct {
++	uint8_t bus_width;
++} mmc_config_t;
++
+ #define MODE_CONFIG_PROTO_BUFFER_SIZE (256)
+ typedef struct {
+ 	uint8_t dev_num;
+@@ -182,6 +186,7 @@ typedef struct {
+ 		wiegand_config_t wiegand;
+ 		sump_config_t sump;
+ 		hydranfc_config_t hydranfc;
++		mmc_config_t mmc;
+ 	} config;
+ 
+ 	uint8_t aux_config;
+
+
+
+
+@@ -172,6 +172,31 @@ uint32_t *bsp_mmc_get_csd(bsp_dev_mmc_t dev_num)
+ 	return hmmc->CSD;
+ }
+ 
++bsp_status_t bsp_mmc_change_bus_width(bsp_dev_mmc_t dev_num, uint8_t bus_size)
++{
++	MMC_HandleTypeDef* hmmc;
++	bsp_status_t status;
++
++	hmmc = &mmc_handle[dev_num];
++
++	switch(bus_size) {
++	case 1:
++		status = (bsp_status_t) HAL_MMC_ConfigWideBusOperation(hmmc, SDIO_BUS_WIDE_1B);
++		break;
++	case 4:
++		status = (bsp_status_t) HAL_MMC_ConfigWideBusOperation(hmmc, SDIO_BUS_WIDE_4B);
++		break;
++	/* Unused, pins are not present on Hydrabus v1
++	case 8:
++		status = (bsp_status_t) HAL_MMC_ConfigWideBusOperation(hmmc, SDIO_BUS_WIDE_8B);
++		break;
++	*/
++	default:
++		status = BSP_ERROR;
++	}
++	return status;
++}
++
+ bsp_status_t bsp_mmc_get_info(bsp_dev_mmc_t dev_num, bsp_mmc_info_t * mmc_info)
+ {
+ 	MMC_HandleTypeDef* hmmc;
+
+
+
+
+@@ -44,5 +44,6 @@ bsp_status_t bsp_mmc_read_block(bsp_dev_mmc_t dev_num, uint8_t* rx_data, uint32_
+ uint32_t *bsp_mmc_get_cid(bsp_dev_mmc_t dev_num);
+ uint32_t *bsp_mmc_get_csd(bsp_dev_mmc_t dev_num);
+ bsp_status_t bsp_mmc_get_info(bsp_dev_mmc_t dev_num, bsp_mmc_info_t * mmc_info);
++bsp_status_t bsp_mmc_change_bus_width(bsp_dev_mmc_t dev_num, uint8_t bus_size);
+ 
+ #endif /* _BSP_MMC_H_ */
+
+
+
+
+@@ -1685,6 +1685,11 @@ t_token tokens_mode_mmc[] = {
+ 		.help = "Show mmc parameters"
+ 	},
+ 	/* mmc-specific commands */
++	{
++		T_PINS,
++		.arg_type = T_ARG_UINT,
++		.help = "Number of data pins (1 or 4)"
++	},
+ 	{
+ 		T_ID,
+ 		.help = "Displays the CID and CSD registers"
+
+
+
+
+@@ -200,5 +200,6 @@
+ #define BBIO_MMC_CSD		0b00000011
+ #define BBIO_MMC_READ_PAGE	0b00000100
+ #define BBIO_MMC_WRITE_PAGE	0b00000101
++#define BBIO_MMC_CONFIG		0b10000000
+ 
+ int cmd_bbio(t_hydra_console *con);
+
+
+
+
+@@ -108,7 +108,15 @@ void bbio_mode_mmc(t_hydra_console *con)
+ 				}
+ 				break;
+ 			default:
+-				cprint(con, "\x00", 1);
++				if ((bbio_subcommand & BBIO_MMC_CONFIG) == BBIO_MMC_CONFIG) {
++					proto->config.mmc.bus_width = (bbio_subcommand & 0b1)?4:1;
++					status = bsp_mmc_change_bus_width(proto->dev_num, proto->config.mmc.bus_width);
++					if(status == BSP_OK) {
++						cprint(con, "\x01", 1);
++					} else {
++						cprint(con, "\x00", 1);
++					}
++				}
+ 			}
+ 		}
+ 	}
+
+
+
+
+@@ -40,6 +40,7 @@ static void init_proto_default(t_hydra_console *con)
+ 
+ 	/* Defaults */
+ 	proto->dev_num = 0;
++	proto->config.mmc.bus_width = 1;
+ }
+ 
+ static void show_params(t_hydra_console *con)
+@@ -48,6 +49,8 @@ static void show_params(t_hydra_console *con)
+ 
+ 	cprintf(con, "Device: MMC%d\r\n",
+ 		proto->dev_num + 1);
++	cprintf(con, "Bus width: %d bits\r\n",
++		proto->config.mmc.bus_width);
+ }
+ 
+ static int init(t_hydra_console *con, t_tokenline_parsed *p)
+@@ -81,13 +84,25 @@ static int exec(t_hydra_console *con, t_tokenline_parsed *p, int token_pos)
+ 	mode_config_proto_t* proto = &con->mode->proto;
+ 	bsp_mmc_info_t mmc_info;
+ 	uint32_t * mmc_reg;
+-	int t;
++	bsp_status_t status;
++	int t, arg_int;
+ 
+ 	for (t = token_pos; p->tokens[t]; t++) {
+ 		switch (p->tokens[t]) {
+ 		case T_SHOW:
+ 			t += show(con, p);
+ 			break;
++		case T_PINS:
++			t += 2;
++			memcpy(&arg_int, p->buf + p->tokens[t], sizeof(int));
++			if((arg_int == 1) || (arg_int == 4)) {
++				proto->config.mmc.bus_width = arg_int;
++				status = bsp_mmc_change_bus_width(proto->dev_num, proto->config.mmc.bus_width);
++			}
++			if(status != BSP_OK) {
++				cprintf(con, str_bsp_init_err, status);
++			}
++			break;
+ 		case T_ID:
+ 			mmc_reg = bsp_mmc_get_cid(proto->dev_num);
+ 			cprintf(con, "CID : 0x%08x ", mmc_reg[0]);

@@ -1,0 +1,111 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2008-2022 - nibble, pancake, alvaro_fe */
++/* radare - LGPL - Copyright 2008-2023 - nibble, pancake, alvaro_fe */
+ 
+ #define R_LOG_ORIGIN "elf"
+ #include <r_types.h>
+@@ -3694,18 +3694,36 @@ static RBinElfSymbol* parse_gnu_debugdata(ELFOBJ *bin, size_t *ret_size) {
+ 	return NULL;
+ }
+ 
++static bool section_matters(ELFOBJ *bin, int i, int type, ut32 shdr_size) {
++	bool is_symtab = ((type & R_BIN_ELF_SYMTAB_SYMBOLS) && (bin->shdr[i].sh_type == SHT_SYMTAB));
++	bool is_dyntab = ((type & R_BIN_ELF_DYNSYM_SYMBOLS) && (bin->shdr[i].sh_type == SHT_DYNSYM));
++	if (is_symtab || is_dyntab) {
++		if (bin->shdr[i].sh_link < 1) {
++			/* oops. fix out of range pointers */
++			return false;
++		}
++		if ((bin->shdr[i].sh_link * sizeof (Elf_(Shdr))) >= shdr_size) {
++			/* oops. fix out of range pointers */
++			return false;
++		}
++		return true;
++	}
++	return false;
++}
++
+ // TODO: return RList<RBinSymbol*> .. or run a callback with that symbol constructed, so we don't have to do it twice
+ static RBinElfSymbol* Elf_(_r_bin_elf_get_symbols_imports)(ELFOBJ *bin, int type) {
+-	ut32 shdr_size;
+-	int tsize, nsym, ret_ctr = 0, i, j, r, k, newsize;
+-	ut64 toffset;
+-	ut32 size = 0;
+-	RBinElfSymbol *ret = NULL, *import_ret = NULL;
++	r_return_val_if_fail (bin, NULL);
++	int tsize, nsym, ret_ctr = 0, i, j, k, newsize;
++	RBinElfSymbol *ret = NULL;
++	RBinElfSymbol *import_ret = NULL;
+ 	RBinSymbol *import_sym_ptr = NULL;
+-	size_t ret_size = 0, prev_ret_size = 0, import_ret_ctr = 0;
+-	Elf_(Shdr) *strtab_section = NULL;
++	size_t ret_size = 0, import_ret_ctr = 0;
+ 	Elf_(Sym) *sym = NULL;
+ 	ut8 s[sizeof (Elf_(Sym))] = {0};
++	ut32 shdr_size = 0;
++	ut64 toffset;
++	ut32 size = 0;
+ 	char *strtab = NULL;
+ 	HtPP *symbol_map = NULL;
+ 	HtPPOptions symbol_map_options = {
+@@ -3718,15 +3736,19 @@ static RBinElfSymbol* Elf_(_r_bin_elf_get_symbols_imports)(ELFOBJ *bin, int type
+ 		.elem_size = sizeof (HtPPKv),
+ 	};
+ 
+-	if (!bin || !bin->shdr || !bin->ehdr.e_shnum || bin->ehdr.e_shnum == 0xffff) {
++	if (!bin->shdr || !bin->ehdr.e_shnum || bin->ehdr.e_shnum == 0xffff) {
++		R_LOG_DEBUG ("invalid section header value");
+ 		return Elf_(get_phdr_symbols) (bin, type);
+ 	}
+ 	if (!UT32_MUL (&shdr_size, bin->ehdr.e_shnum, sizeof (Elf_(Shdr)))) {
++		R_LOG_DEBUG ("shnum mul overflow");
+ 		return NULL;
+ 	}
+ 	if (shdr_size + 8 > bin->size) {
++		R_LOG_DEBUG ("skipping section headers after file size");
+ 		return NULL;
+ 	}
++	// ret_size = amount of dbgsymbols in the array (not size of the array)
+ 	RBinElfSymbol *dbgsyms = parse_gnu_debugdata (bin, &ret_size);
+ 	if (dbgsyms) {
+ 		ret = dbgsyms;
+@@ -3736,186 +3758,183 @@ static RBinElfSymbol* Elf_(_r_bin_elf_get_symbols_imports)(ELFOBJ *bin, int type
+ 		ret_size = 0;
+ 	}
+ 	for (i = 0; i < bin->ehdr.e_shnum; i++) {
+-		if (((type & R_BIN_ELF_SYMTAB_SYMBOLS) && bin->shdr[i].sh_type == SHT_SYMTAB) ||
+-			((type & R_BIN_ELF_DYNSYM_SYMBOLS) && bin->shdr[i].sh_type == SHT_DYNSYM)) {
+-			if (bin->shdr[i].sh_link < 1) {
+-				/* oops. fix out of range pointers */
+-				continue;
+-			}
+-			// hack to avoid asan cry
+-			if ((bin->shdr[i].sh_link * sizeof (Elf_(Shdr))) >= shdr_size) {
+-				/* oops. fix out of range pointers */
+-				continue;
+-			}
+-			strtab_section = &bin->shdr[bin->shdr[i].sh_link];
+-			if (strtab_section->sh_size > ST32_MAX || strtab_section->sh_size+8 > bin->size) {
+-				R_LOG_ERROR ("size (syms strtab)");
+-				free (ret);
+-				free (strtab);
+-				return NULL;
+-			}
+-			if (!strtab) {
+-				if (!(strtab = (char *)calloc (1, 8 + strtab_section->sh_size))) {
+-					R_LOG_ERROR ("malloc (syms strtab)");
+-					goto beach;
+-				}
+-				if (strtab_section->sh_offset > bin->size ||
+-						strtab_section->sh_offset + strtab_section->sh_size > bin->size) {
+-					goto beach;
+-				}
+-				if (r_buf_read_at (bin->b, strtab_section->sh_offset,
+-							(ut8*)strtab, strtab_section->sh_size) == -1) {
+-					R_LOG_ERROR ("read (syms strtab)");
+-					goto beach;
+-				}
+-			}
+-
+-			newsize = 1 + bin->shdr[i].sh_size;
+-		

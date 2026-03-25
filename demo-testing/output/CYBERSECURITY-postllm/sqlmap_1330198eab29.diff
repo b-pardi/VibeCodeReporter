@@ -1,0 +1,91 @@
+@@ -19,7 +19,7 @@ from lib.core.enums import OS
+ from thirdparty import six
+ 
+ # sqlmap version (<major>.<minor>.<month>.<monthly commit>)
+-VERSION = "1.9.12.32"
++VERSION = "1.9.12.33"
+ TYPE = "dev" if VERSION.count('.') > 2 and VERSION.split('.')[-1] != '0' else "stable"
+ TYPE_COLORS = {"dev": 33, "stable": 90, "pip": 34}
+ VERSION_STRING = "sqlmap/%s#%s" % ('.'.join(VERSION.split('.')[:-1]) if VERSION.count('.') > 2 and VERSION.split('.')[-1] == '0' else VERSION, TYPE)
+@@ -703,8 +703,11 @@ FORCE_COOKIE_EXPIRATION_TIME = "9999999999"
+ # Github OAuth token used for creating an automatic Issue for unhandled exceptions
+ GITHUB_REPORT_OAUTH_TOKEN = "wxqc7vTeW8ohIcX+1wK55Mnql2Ex9cP+2s1dqTr/mjlZJVfLnq24fMAi08v5vRvOmuhVZQdOT/lhIRovWvIJrdECD1ud8VMPWpxY+NmjHoEx+VLK1/vCAUBwJe"
+ 
+-# Skip unforced HashDB flush requests below the threshold number of cached items
+-HASHDB_FLUSH_THRESHOLD = 32
++# Flush HashDB threshold number of cached items
++HASHDB_FLUSH_THRESHOLD_ITEMS = 200
++
++# Flush HashDB threshold "dirty" time
++HASHDB_FLUSH_THRESHOLD_TIME = 5
+ 
+ # Number of retries for unsuccessful HashDB flush attempts
+ HASHDB_FLUSH_RETRIES = 3
+
+
+
+
+@@ -255,7 +255,7 @@ def runThreads(numThreads, threadFunction, cleanupFunction=None, forwardExceptio
+                     pass
+ 
+         if conf.get("hashDB"):
+-            conf.hashDB.flush(True)
++            conf.hashDB.flush()
+ 
+         if cleanupFunction:
+             cleanupFunction()
+
+
+
+
+@@ -22,7 +22,8 @@ from lib.core.data import logger
+ from lib.core.exception import SqlmapConnectionException
+ from lib.core.settings import HASHDB_END_TRANSACTION_RETRIES
+ from lib.core.settings import HASHDB_FLUSH_RETRIES
+-from lib.core.settings import HASHDB_FLUSH_THRESHOLD
++from lib.core.settings import HASHDB_FLUSH_THRESHOLD_ITEMS
++from lib.core.settings import HASHDB_FLUSH_THRESHOLD_TIME
+ from lib.core.settings import HASHDB_RETRIEVE_RETRIES
+ from lib.core.threads import getCurrentThreadData
+ from lib.core.threads import getCurrentThreadName
+@@ -34,15 +35,17 @@ class HashDB(object):
+         self._write_cache = {}
+         self._cache_lock = threading.Lock()
+         self._connections = []
++        self._last_flush_time = time.time()
+ 
+     def _get_cursor(self):
+         threadData = getCurrentThreadData()
+ 
+         if threadData.hashDBCursor is None:
+             try:
+-                connection = sqlite3.connect(self.filepath, timeout=3, isolation_level=None)
++                connection = sqlite3.connect(self.filepath, timeout=3, isolation_level=None, check_same_thread=False)
+                 self._connections.append(connection)
+                 threadData.hashDBCursor = connection.cursor()
++                threadData.hashDBCursor.execute("PRAGMA journal_mode=WAL")
+                 threadData.hashDBCursor.execute("CREATE TABLE IF NOT EXISTS storage (id INTEGER PRIMARY KEY, value TEXT)")
+                 connection.commit()
+             except Exception as ex:
+@@ -86,7 +89,7 @@ class HashDB(object):
+     def retrieve(self, key, unserialize=False):
+         retVal = None
+ 
+-        if key and (self._write_cache or os.path.isfile(self.filepath)):
++        if key and (self._write_cache or self._connections or os.path.isfile(self.filepath)):
+             hash_ = HashDB.hashKey(key)
+             retVal = self._write_cache.get(hash_)
+             if not retVal:
+@@ -123,28 +126,26 @@ class HashDB(object):
+     def write(self, key, value, serialize=False):
+         if key:
+             hash_ = HashDB.hashKey(key)
+-            self._cache_lock.acquire()
+-            self._write_cache[hash_] = getUnicode(value) if not serialize else serializeObject(value)
+-            self._cache_lock.release()
++            with self._cache_lock:
++                self._write_cache[hash_] = getUnicode(value) if not serialize else serializeObject(value)
++                cache_size = len(self._write_cache)
++                time_since_flush = time.time() - self._last_flush_time
+ 
+-        if getCurrentThreadName() in ('0', "MainThread"):

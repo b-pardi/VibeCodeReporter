@@ -1,0 +1,114 @@
+@@ -26,7 +26,8 @@ import time
+ 
+ from threading import Lock
+ 
+-from .datetemplate import re, DateTemplate, DatePatternRegex, DateTai64n, DateEpoch
++from .datetemplate import re, DateTemplate, DatePatternRegex, DateTai64n, DateEpoch, \
++	RE_EPOCH_PATTERN
+ from .strptime import validateTimeZone
+ from .utils import Utils
+ from ..helpers import getLogger
+@@ -36,7 +37,7 @@ logSys = getLogger(__name__)
+ 
+ logLevel = 6
+ 
+-RE_DATE_PREMATCH = re.compile("\{DATE\}", re.IGNORECASE)
++RE_DATE_PREMATCH = re.compile(r"(?<!\\)\{DATE\}", re.IGNORECASE)
+ DD_patternCache = Utils.Cache(maxCount=1000, maxTime=60*60)
+ 
+ 
+@@ -48,12 +49,18 @@ def _getPatternTemplate(pattern, key=None):
+ 	template = DD_patternCache.get(key)
+ 
+ 	if not template:
+-		if key in ("EPOCH", "{^LN-BEG}EPOCH", "^EPOCH"):
+-			template = DateEpoch(lineBeginOnly=(key != "EPOCH"))
+-		elif key in ("TAI64N", "{^LN-BEG}TAI64N", "^TAI64N"):
+-			template = DateTai64n(wordBegin=('start' if key != "TAI64N" else False))
+-		else:
+-			template = DatePatternRegex(pattern)
++		if "EPOCH" in key:
++			if RE_EPOCH_PATTERN.search(pattern):
++				template = DateEpoch(pattern=pattern, longFrm="LEPOCH" in key)
++			elif key in ("EPOCH", "{^LN-BEG}EPOCH", "^EPOCH"):
++				template = DateEpoch(lineBeginOnly=(key != "EPOCH"))
++			elif key in ("LEPOCH", "{^LN-BEG}LEPOCH", "^LEPOCH"):
++				template = DateEpoch(lineBeginOnly=(key != "LEPOCH"), longFrm=True)
++		if template is None:
++			if key in ("TAI64N", "{^LN-BEG}TAI64N", "^TAI64N"):
++				template = DateTai64n(wordBegin=('start' if key != "TAI64N" else False))
++			else:
++				template = DatePatternRegex(pattern)
+ 
+ 	DD_patternCache.set(key, template)
+ 	return template
+
+
+
+
+@@ -47,6 +47,9 @@ RE_LINE_BOUND_END = re.compile(r'(?<![\\\|])(?:\$\)?)$')
+ 
+ RE_ALPHA_PATTERN = re.compile(r'(?<!\%)\%[aAbBpc]')
+ 
++RE_EPOCH_PATTERN = re.compile(r"(?<!\\)\{L?EPOCH\}", re.IGNORECASE)
++
++
+ class DateTemplate(object):
+ 	"""A template which searches for and returns a date from a log line.
+ 
+@@ -192,14 +195,22 @@ class DateEpoch(DateTemplate):
+ 	regex
+ 	"""
+ 
+-	def __init__(self, lineBeginOnly=False):
++	def __init__(self, lineBeginOnly=False, pattern=None, longFrm=False):
+ 		DateTemplate.__init__(self)
+ 		self.name = "Epoch"
+-		if not lineBeginOnly:
+-			regex = r"((?:^|(?P<square>(?<=^\[))|(?P<selinux>(?<=\baudit\()))\d{10,11}\b(?:\.\d{3,6})?)(?:(?(selinux)(?=:\d+\)))|(?(square)(?=\])))"
++		self._longFrm = longFrm;
++		epochRE = r"\d{10,11}\b(?:\.\d{3,6})?"
++		if longFrm:
++			self.name = "LongEpoch";
++			epochRE = r"\d{10,11}(?:\d{3}(?:\d{3})?)?"
++		if pattern:
++			regex = RE_EPOCH_PATTERN.sub("(%s)" % epochRE, pattern)
++			self.setRegex(regex)
++		elif not lineBeginOnly:
++			regex = r"((?:^|(?P<square>(?<=^\[))|(?P<selinux>(?<=\baudit\()))%s)(?:(?(selinux)(?=:\d+\)))|(?(square)(?=\])))" % epochRE
+ 			self.setRegex(regex, wordBegin=False) ;# already line begin resp. word begin anchored
+ 		else:
+-			regex = r"((?P<square>(?<=^\[))?\d{10,11}\b(?:\.\d{3,6})?)(?(square)(?=\]))"
++			regex = r"((?P<square>(?<=^\[))?%s)(?(square)(?=\]))" % epochRE
+ 			self.setRegex(regex, wordBegin='start', wordEnd=True)
+ 
+ 	def getDate(self, line, dateMatch=None, default_tz=None):
+@@ -220,8 +231,14 @@ class DateEpoch(DateTemplate):
+ 		if not dateMatch:
+ 			dateMatch = self.matchDate(line)
+ 		if dateMatch:
++			v = dateMatch.group(1)
+ 			# extract part of format which represents seconds since epoch
+-			return (float(dateMatch.group(1)), dateMatch)
++			if self._longFrm and len(v) >= 13:
++				if len(v) >= 16:
++					v = float(v) / 1000000
++				else:
++					v = float(v) / 1000
++			return (float(v), dateMatch)
+ 
+ 
+ class DatePatternRegex(DateTemplate):
+
+
+
+
+@@ -77,6 +77,48 @@ class DateDetectorTest(LogCaptureTestCase):
+ 				log = date + " [sshd] error: PAM: Authentication failure"
+ 				datelog = self.datedetector.getTime(log)
+ 				self.assertFalse(datelog)
++
++	def testGetEpochMsTime(self):
++		self.__datedetector = DateDetector()
++		self.__datedetector.appendTemplate('LEPOCH')
++		# correct short/long epoch time

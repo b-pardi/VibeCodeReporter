@@ -1,0 +1,102 @@
+@@ -4529,7 +4529,11 @@ class MongoDBFlow(MongoDB, DBFlow):
+ 
+     needunwind = [
+         'src_ports',
+-        'meta.*',
++        'codes',
++        'meta.dns',
++        'meta.dns.answers',
++        'meta.http',
++        'meta.ssh'
+     ]
+ 
+     def __init__(self, host, dbname, colname_flows="flows",
+@@ -4631,7 +4635,7 @@ class MongoDBFlow(MongoDB, DBFlow):
+             '$min': {'firstseen': rec['start_time']},
+             '$max': {'lastseen': rec['end_time']},
+             # TODO : should be optionnal
+-            '$addToSet': {'meta.%s' % name:  meta_dict},
++            '$addToSet': {'meta.%s' % name: meta_dict},
+             '$inc': {'count': 1}
+         }
+ 
+@@ -4954,6 +4958,186 @@ class MongoDBFlow(MongoDB, DBFlow):
+                 query.add_clause_from_filter(flt, mode=flt_type)
+         return query
+ 
++    def top(self, query, fields, collect_fields=[], sum_fields=[],
++            limit=10, skip=None, least=False):
++        """
++        Return the top values honoring the given `query` for the given
++        fields list `fields`, counting and sorting the aggregated records
++        by `sum_fields` sum and storing the `collect_fields` fields of
++        each original entry in aggregated records as a list.
++        By default, the aggregated records are sorted by their number of
++        occurences.
++        Return format:
++            {
++                fields: {
++                    field1: value,
++                    field2: value
++                },
++                count: count,
++                collected: [
++                    {'collect1': value, 'collect2': value},
++                    ...
++                ]
++            }
++        """
++        pipeline = []
++
++        # Translation dictionnary for special fields
++        special_fields = {'src.addr': ['src_addr_0', 'src_addr_1'],
++                          'dst.addr': ['dst_addr_0', 'dst_addr_1'],
++                          'dport': ['dst_port'],
++                          'sport': ['src_ports']}
++        # special fields that are not addresses will be translated again at
++        # the end
++        reverse_special_fields = {'dst_port': 'dport', 'src_ports': 'sport'}
++
++        # Compute the internal fields
++        # internal_fields = [aggr fields, collect_fields, sum_fields]
++        internal_fields = [[], [], []]
++        external_fields = [fields, collect_fields, sum_fields]
++        for i in range(len(external_fields)):
++            for field in external_fields[i]:
++                if field in special_fields:
++                    internal_fields[i].extend(special_fields[field])
++                else:
++                    internal_fields[i].append(field)
++
++        internal_fields_set = set(internal_fields[0])
++
++        # Remove non existing agggr field
++        match = {}
++        for field in internal_fields_set:
++            match[field] = {"$exists": True}
++        pipeline.append({"$match": match})
++
++        # Unwind aggregate array fields
++        for field in internal_fields_set:
++            for i in range(field.count('.'), -1, -1):
++                subfield = field.rsplit('.', i)[0]
++                if subfield in self.needunwind:
++                    pipeline += [{"$unwind": "$" + subfield}]
++
++        # Match the given query
++        # It is important to match the query after the unwind stages
++        # because the query could target one of the aggregated fields
++        flt = self.flt_from_query(query)
++        if flt:
++            pipeline.append({'$match': flt})
++
++        # Create a projection for every fields retrieved
++        # In the same time, prepare a group objects for the group stage
++        project_fields = {}  # represents the projection {new_field: old_field}
++        reverse_project_fields = {}
++        group_fields = [{}, {}]
++        index = 0  # each new field will be indexed
++        for i in range(len(group_fields)):
++            for field in internal_fields[i]:
++                cur_field = "$%s" % field
++                fi

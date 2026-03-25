@@ -1,0 +1,133 @@
+@@ -5,6 +5,7 @@
+ #include "zeek/Trigger.h"
+ #include "zeek/broker/Data.h"
+ #include "zeek/storage/ReturnCode.h"
++#include "zeek/storage/storage.bif.h"
+ 
+ namespace zeek::storage {
+ 
+@@ -68,6 +69,10 @@ OpenResultCallback::OpenResultCallback(zeek::detail::trigger::TriggerPtr trigger
+     : ResultCallback(std::move(trigger), assoc), backend(std::move(backend)) {}
+ 
+ void OpenResultCallback::Complete(OperationResult res) {
++    if ( res.code == ReturnCode::SUCCESS ) {
++        backend->backend->EnqueueBackendOpened();
++    }
++
+     // If this is a sync callback, there isn't a trigger to process. Store the result and bail. Always
+     // set result's value to the backend pointer so that it comes across in the result. This ensures
+     // the handle is always available in the result even on failures.
+@@ -94,6 +99,7 @@ void OpenResultCallback::Complete(OperationResult res) {
+ OperationResult Backend::Open(RecordValPtr options, TypePtr kt, TypePtr vt, OpenResultCallback* cb) {
+     key_type = std::move(kt);
+     val_type = std::move(vt);
++    backend_options = options;
+ 
+     auto ret = DoOpen(std::move(options), cb);
+     if ( ! ret.value )
+@@ -153,6 +159,15 @@ void Backend::CompleteCallback(ResultCallback* cb, const OperationResult& data)
+     }
+ }
+ 
++void Backend::EnqueueBackendOpened() {
++    event_mgr.Enqueue(Storage::backend_opened, make_intrusive<StringVal>(Tag()), backend_options);
++}
++
++void Backend::EnqueueBackendLost(std::string_view reason) {
++    event_mgr.Enqueue(Storage::backend_lost, make_intrusive<StringVal>(Tag()), backend_options,
++                      make_intrusive<StringVal>(reason));
++}
++
+ zeek::OpaqueTypePtr detail::backend_opaque;
+ IMPLEMENT_OPAQUE_VALUE(detail::BackendHandleVal)
+ 
+
+
+
+
+@@ -114,10 +114,15 @@ public:
+      */
+     virtual void Poll() {}
+ 
++    const RecordValPtr& Options() const { return backend_options; }
++
+ protected:
+     // Allow the manager to call Open/Close.
+     friend class storage::Manager;
+ 
++    // Allow OpenResultCallback to call EnqueueConnectionEstablished.
++    friend class storage::OpenResultCallback;
++
+     /**
+      * Constructor
+      *
+@@ -183,10 +188,24 @@ protected:
+      */
+     virtual void Expire() {}
+ 
++    /**
++     * Enqueues the Storage::backend_opened event. This is called automatically
++     * when an OpenResultCallback is completed successfully.
++     */
++    void EnqueueBackendOpened();
++
++    /**
++     * Enqueues the Storage::backend_lost event with an optional reason
++     * string. This should be called by the backends whenever they lose their
++     * connection.
++     */
++    void EnqueueBackendLost(std::string_view reason);
++
+     void CompleteCallback(ResultCallback* cb, const OperationResult& data) const;
+ 
+     TypePtr key_type;
+     TypePtr val_type;
++    RecordValPtr backend_options;
+ 
+     std::string tag;
+ 
+
+
+
+
+@@ -8,6 +8,7 @@
+ #include "zeek/Val.h"
+ #include "zeek/iosource/Manager.h"
+ #include "zeek/storage/ReturnCode.h"
++#include "zeek/storage/storage.bif.h"
+ 
+ #include "hiredis/adapters/poll.h"
+ #include "hiredis/async.h"
+@@ -481,7 +482,7 @@ void Redis::OnConnect(int status) {
+     if ( status == REDIS_OK ) {
+         connected = true;
+         CompleteCallback(open_cb, {ReturnCode::SUCCESS});
+-        // TODO: post connect event
++        // The connection_established event is sent via the open callback handler.
+         return;
+     }
+ 
+@@ -493,17 +494,14 @@ void Redis::OnConnect(int status) {
+ 
+ void Redis::OnDisconnect(int status) {
+     DBG_LOG(DBG_STORAGE, "Redis backend: disconnection event");
+-    --active_ops;
+-
+-    if ( status == REDIS_OK ) {
+-        // TODO: this was an intentional disconnect, nothing to do?
+-    }
+-    else {
+-        // TODO: this was unintentional, should we reconnect?
+-        // TODO: post disconnect event
+-    }
+ 
++    --active_ops;
+     connected = false;
++
++    if ( status == REDIS_ERR )
++        EnqueueBackendLost(async_ctx->errstr);
++    else
++        EnqueueBackendLost("Client disconnected");
+ }
+ 
+ void Red

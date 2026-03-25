@@ -1,0 +1,125 @@
+@@ -423,6 +423,7 @@ struct uc_struct {
+     uint64_t nested; // the nested level of all exposed API
+     bool thread_executable_entry;
+     bool current_executable;
++    bool skip_sync_pc_on_exit;
+ };
+ 
+ // Metadata stub for the variable-size cpu context used with uc_context_*()
+
+
+
+
+@@ -4,6 +4,7 @@
+ #ifndef UNICORN_ARCH_POSTFIX
+ #define UNICORN_ARCH_POSTFIX _aarch64
+ #endif
++#define gen_helper_check_exit_request gen_helper_check_exit_request_aarch64
+ #define unicorn_fill_tlb unicorn_fill_tlb_aarch64
+ #define reg_read reg_read_aarch64
+ #define reg_write reg_write_aarch64
+
+
+
+
+@@ -1575,7 +1575,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                     //                because qemu might generate tcg code like:
+                     //                       qemu_ld_i64 x0,x1,leq,8  sync: 0  dead: 0 1
+                     //                where we don't have a change to recover x0 value
+-                    cpu_loop_exit(uc->cpu);
++                    cpu_loop_exit_restore(uc->cpu, retaddr);
+                 }
+                 return 0;
+             }
+@@ -1586,7 +1586,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+             if (uc->nested_level > 0 && !uc->cpu->stopped) {
+                 cpu_exit(uc->cpu);
+                 // See comments above
+-                cpu_loop_exit(uc->cpu);
++                cpu_loop_exit_restore(uc->cpu, retaddr);
+             }
+             return 0;
+         }
+@@ -1660,7 +1660,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                 if (uc->nested_level > 0 && !uc->cpu->stopped) {
+                     cpu_exit(uc->cpu);
+                     // See comments above
+-                    cpu_loop_exit(uc->cpu);
++                    cpu_loop_exit_restore(uc->cpu, retaddr);
+                 }
+                 return 0;
+             }
+@@ -1694,7 +1694,7 @@ load_helper(CPUArchState *env, target_ulong addr, TCGMemOpIdx oi,
+                 if (uc->nested_level > 0 && !uc->cpu->stopped) {
+                     cpu_exit(uc->cpu);
+                     // See comments above
+-                    cpu_loop_exit(uc->cpu);
++                    cpu_loop_exit_restore(uc->cpu, retaddr);
+                 }
+                 return 0;
+             }
+
+
+
+
+@@ -164,3 +164,25 @@ void HELPER(exit_atomic)(CPUArchState *env)
+ {
+     cpu_loop_exit_atomic(env_cpu(env), GETPC());
+ }
++
++void HELPER(check_exit_request)(void *p, uint32_t in_delay_slot) {
++    uc_engine *uc = p;
++
++    if (cpu_loop_exit_requested(uc->cpu) && !in_delay_slot) {
++        // There are stil something we have to before exiting to be compatible with previous behaviors
++
++        // from cpu_tb_exec
++        if (uc->nested_level == 1) {
++            // Only unlock (allow writing to JIT area) if we are the outmost uc_emu_start
++            tb_exec_unlock(uc);
++        }
++        uc->cpu->tcg_exit_req = 0;
++
++        if (uc->skip_sync_pc_on_exit) {
++            cpu_loop_exit(uc->cpu);
++        } else {
++            uc->skip_sync_pc_on_exit = false;
++            cpu_loop_exit_restore(uc->cpu, GETPC());
++        }
++    }
++}
+\ No newline at end of file
+
+
+
+
+@@ -259,3 +259,5 @@ DEF_HELPER_FLAGS_4(gvec_leu32, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+ DEF_HELPER_FLAGS_4(gvec_leu64, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, i32)
+ 
+ DEF_HELPER_FLAGS_5(gvec_bitsel, TCG_CALL_NO_RWG, void, ptr, ptr, ptr, ptr, i32)
++
++DEF_HELPER_2(check_exit_request, void, ptr, i32)
+\ No newline at end of file
+
+
+
+
+@@ -4,6 +4,7 @@
+ #ifndef UNICORN_ARCH_POSTFIX
+ #define UNICORN_ARCH_POSTFIX _arm
+ #endif
++#define gen_helper_check_exit_request gen_helper_check_exit_request_arm
+ #define unicorn_fill_tlb unicorn_fill_tlb_arm
+ #define reg_read reg_read_arm
+ #define reg_write reg_write_arm
+
+
+
+
+@@ -32,28 +32,17 @@ static inline void gen_io_end(TCGContext *tcg_ctx)
+ 
+ static inline void gen_tb_start(TCGContext *tcg_ctx, TranslationBlock *tb)
+ {
+-    TCGv_i32 count;
+-
+-    tcg_ctx->exitreq_label = gen_new_label(tcg_ctx)

@@ -1,0 +1,98 @@
+@@ -63,7 +63,8 @@ static DetectParseRegex parse_regex;
+ 
+ static int DetectBytejumpMatch(DetectEngineThreadCtx *det_ctx,
+                         Packet *p, const Signature *s, const SigMatchCtx *ctx);
+-static DetectBytejumpData *DetectBytejumpParse(DetectEngineCtx *de_ctx, const char *optstr, char **offset);
++static DetectBytejumpData *DetectBytejumpParse(
++        DetectEngineCtx *de_ctx, const char *optstr, char **nbytes, char **offset);
+ static int DetectBytejumpSetup(DetectEngineCtx *de_ctx, Signature *s, const char *optstr);
+ static void DetectBytejumpFree(DetectEngineCtx*, void *ptr);
+ #ifdef UNITTESTS
+@@ -84,6 +85,47 @@ void DetectBytejumpRegister (void)
+     DetectSetupParseRegexes(PARSE_REGEX, &parse_regex);
+ }
+ 
++/* 23 - This is the largest string (octal, with a zero prefix) that
++ *      will not overflow uint64_t.  The only way this length
++ *      could be over 23 and still not overflow is if it were zero
++ *      prefixed and we only support 1 byte of zero prefix for octal.
++ *
++ * "01777777777777777777777" = 0xffffffffffffffff
++ *
++ * 8 - Without string, the maximum byte extract count is 8.
++ */
++static inline bool DetectBytejumpValidateNbytesOnly(const DetectBytejumpData *data, int32_t nbytes)
++{
++    return (data->flags & DETECT_BYTEJUMP_STRING && nbytes <= 23) || (nbytes <= 8);
++}
++
++static bool DetectBytejumpValidateNbytes(const DetectBytejumpData *data, int32_t nbytes)
++{
++    if (!DetectBytejumpValidateNbytesOnly(data, nbytes)) {
++        if (data->flags & DETECT_BYTEJUMP_STRING) {
++            /* 23 - This is the largest string (octal, with a zero prefix) that
++             *      will not overflow uint64_t.  The only way this length
++             *      could be over 23 and still not overflow is if it were zero
++             *      prefixed and we only support 1 byte of zero prefix for octal.
++             *
++             * "01777777777777777777777" = 0xffffffffffffffff
++             */
++            if (nbytes > 23) {
++                SCLogError("Cannot test more than 23 bytes "
++                           "with \"string\"");
++            }
++        } else {
++            if (nbytes > 8) {
++                SCLogError("Cannot test more than 8 bytes "
++                           "without \"string\"");
++            }
++        }
++        return false;
++    }
++
++    return true;
++}
++
+ /** \brief Byte jump match function
+  *  \param det_ctx thread detect engine ctx
+  *  \param s signature
+@@ -94,8 +136,8 @@ void DetectBytejumpRegister (void)
+  *  \retval 0 no match
+  */
+ int DetectBytejumpDoMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+-                          const SigMatchCtx *ctx, const uint8_t *payload, uint32_t payload_len,
+-                          uint16_t flags, int32_t offset)
++        const SigMatchCtx *ctx, const uint8_t *payload, uint32_t payload_len, uint16_t flags,
++        int32_t nbytes, int32_t offset)
+ {
+     SCEnter();
+ 
+@@ -109,6 +151,20 @@ int DetectBytejumpDoMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+         SCReturnInt(0);
+     }
+ 
++    /* Validate the number of bytes we are testing
++     * If the validation is successful, we know that
++     * it contains a value <= 23. Thus, we can
++     * safely cast it when extracting bytes
++     */
++    if (data->flags & DETECT_BYTEJUMP_NBYTES_VAR) {
++        if (!DetectBytejumpValidateNbytesOnly(data, nbytes)) {
++            SCLogDebug("Invalid byte_jump nbytes "
++                       "seen in byte_jump - %d",
++                    nbytes);
++            SCReturnInt(0);
++        }
++    }
++
+     /* Calculate the ptr value for the bytejump and length remaining in
+      * the packet from that point.
+      */
+@@ -130,29 +186,26 @@ int DetectBytejumpDoMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+     }
+ 
+     /* Verify the to-be-extracted data is within the packet */
+-    if (ptr < payload || data->nbytes > len) {
++    if (ptr < payload || nbytes > len) {
+         SCLogDebug("Data not within payload "
+-        

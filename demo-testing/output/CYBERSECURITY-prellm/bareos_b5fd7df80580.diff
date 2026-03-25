@@ -1,0 +1,115 @@
+@@ -427,8 +427,8 @@ bool DoNativeBackup(JobControlRecord* jcr)
+     return false;
+   }
+ 
+-  if (!StartStorageDaemonJob(jcr, nullptr,
+-                             jcr->dir_impl->res.write_storage_list)) {
++  if (!StartStorageDaemonJob(jcr)) { return false; }
++  if (!ReserveWriteDevice(jcr, jcr->dir_impl->res.write_storage_list)) {
+     return false;
+   }
+ 
+
+
+
+
+@@ -696,9 +696,7 @@ static bool regex_find_jobids(JobControlRecord* jcr,
+ 
+ bail_out:
+   Dmsg2(dbglevel, "Count=%d Jobids=%s\n", ids->count, ids->list);
+-  foreach_dlist (item, item_chain) {
+-    free(item->item);
+-  }
++  foreach_dlist (item, item_chain) { free(item->item); }
+   delete item_chain;
+   return ok;
+ }
+@@ -1338,18 +1336,17 @@ static inline bool DoActualMigration(JobControlRecord* jcr)
+     }
+ 
+     // Now start a job with the Reading Storage daemon
+-    if (!StartStorageDaemonJob(jcr, jcr->dir_impl->res.read_storage_list, NULL,
+-                               /* send_bsr */ true)) {
++    if (!StartStorageDaemonJob(jcr, true)) { goto bail_out; }
++    if (!ReserveReadDevice(jcr, jcr->dir_impl->res.read_storage_list)) {
+       goto bail_out;
+     }
+ 
+     Dmsg0(150, "Reading Storage daemon connection OK\n");
+ 
+     // Now start a job with the Writing Storage daemon
+-
+-    if (!StartStorageDaemonJob(mig_jcr, NULL,
+-                               mig_jcr->dir_impl->res.write_storage_list,
+-                               /* send_bsr */ false)) {
++    if (!StartStorageDaemonJob(mig_jcr, false)) { goto bail_out; }
++    if (!ReserveWriteDevice(mig_jcr,
++                            mig_jcr->dir_impl->res.write_storage_list)) {
+       goto bail_out;
+     }
+ 
+@@ -1369,9 +1366,10 @@ static inline bool DoActualMigration(JobControlRecord* jcr)
+     }
+ 
+     // Now start a job with the Storage daemon
+-    if (!StartStorageDaemonJob(jcr, jcr->dir_impl->res.read_storage_list,
+-                               jcr->dir_impl->res.write_storage_list,
+-                               /* send_bsr */ true)) {
++    if (!StartStorageDaemonJob(jcr, true)
++        || !ReserveReadAndWriteDevices(jcr,
++                                       jcr->dir_impl->res.read_storage_list,
++                                       jcr->dir_impl->res.write_storage_list)) {
+       FreePairedStorage(jcr);
+       return false;
+     }
+
+
+
+
+@@ -117,12 +117,183 @@ static inline bool SendBootstrapFileToSd(JobControlRecord* jcr,
+   return true;
+ }
+ 
++bool ReserveReadDevice(JobControlRecord* jcr,
++                       alist<StorageResource*>* read_storage)
++{
++  BareosSocket* sd_socket = jcr->store_bsock;
++  StorageResource* storage = nullptr;
++  PoolMem device_name;
++  std::string StoreName{};
++  std::string pool_name{};
++  std::string pool_type{};
++  std::string media_type{};
++  bool ok = true;
++  int copy = 0;
++  int stripe = 0;
++  /*
++   * We have two loops here. The first comes from the
++   *  Storage = associated with the Job, and we need
++   *  to attach to each one.
++   * The inner loop loops over all the alternative devices
++   *  associated with each Storage. It selects the first
++   *  available one.
++   *
++   */
++  // Do read side of storage daemon
++  if (read_storage) {
++    // For the moment, only migrate, copy and vbackup have rpool
++    if (jcr->is_JobType(JT_MIGRATE) || jcr->is_JobType(JT_COPY)
++        || (jcr->is_JobType(JT_BACKUP) && jcr->is_JobLevel(L_VIRTUAL_FULL))) {
++      pool_type = jcr->dir_impl->res.rpool->pool_type;
++      pool_name = jcr->dir_impl->res.rpool->resource_name_;
++    } else {
++      pool_type = jcr->dir_impl->res.pool->pool_type;
++      pool_name = jcr->dir_impl->res.pool->resource_name_;
++    }
++    BashSpaces(pool_type);
++    BashSpaces(pool_name);
++    foreach_alist (storage, read_storage) {
++      Dmsg1(100, "Rstore=%s\n", storage->resource_name_);
++      StoreName = storage->resource_name_;
++      BashSpaces(StoreName);
++      media_type = storage->media_type;
++      BashSpaces(media_type);
++      sd_socket->fsend(use_storage, StoreName.c_str(), media_type.c_str(),
++

@@ -1,0 +1,130 @@
+@@ -422,6 +422,24 @@ SECStatus SSLInt_AdvanceWriteSeqByAWindow(PRFileDesc *fd, PRInt32 extra) {
+   return SSLInt_AdvanceWriteSeqNum(fd, to);
+ }
+ 
++SECStatus SSLInt_AdvanceDtls13DecryptFailures(PRFileDesc *fd, PRUint64 to) {
++  sslSocket *ss = ssl_FindSocket(fd);
++  if (!ss) {
++    return SECFailure;
++  }
++
++  ssl_GetSpecWriteLock(ss);
++  ssl3CipherSpec *spec = ss->ssl3.crSpec;
++  if (spec->cipherDef->type != type_aead) {
++    ssl_ReleaseSpecWriteLock(ss);
++    return SECFailure;
++  }
++
++  spec->deprotectionFailures = to;
++  ssl_ReleaseSpecWriteLock(ss);
++  return SECSuccess;
++}
++
+ SSLKEAType SSLInt_GetKEAType(SSLNamedGroup group) {
+   const sslNamedGroupDef *groupDef = ssl_LookupNamedGroup(group);
+   if (!groupDef) return ssl_kea_null;
+
+
+
+
+@@ -36,6 +36,7 @@ PRBool SSLInt_DamageEarlyTrafficSecret(PRFileDesc *fd);
+ SECStatus SSLInt_Set0RttAlpn(PRFileDesc *fd, PRUint8 *data, unsigned int len);
+ PRBool SSLInt_HasCertWithAuthType(PRFileDesc *fd, SSLAuthType authType);
+ PRBool SSLInt_SendAlert(PRFileDesc *fd, uint8_t level, uint8_t type);
++SECStatus SSLInt_AdvanceDtls13DecryptFailures(PRFileDesc *fd, PRUint64 to);
+ SECStatus SSLInt_AdvanceWriteSeqNum(PRFileDesc *fd, PRUint64 to);
+ SECStatus SSLInt_AdvanceReadSeqNum(PRFileDesc *fd, PRUint64 to);
+ SECStatus SSLInt_AdvanceWriteSeqByAWindow(PRFileDesc *fd, PRInt32 extra);
+
+
+
+
+@@ -191,6 +191,36 @@ class ShortHeaderChecker : public PacketFilter {
+   }
+ };
+ 
++TEST_F(TlsConnectDatagram13, AeadLimit) {
++  Connect();
++  EXPECT_EQ(SECSuccess, SSLInt_AdvanceDtls13DecryptFailures(server_->ssl_fd(),
++                                                            (1ULL << 36) - 2));
++  SendReceive(50);
++
++  // Expect this to increment the counter. We should still be able to talk.
++  client_->SetFilter(std::make_shared<TlsRecordLastByteDamager>(client_));
++  client_->SendData(10);
++  server_->ReadBytes(10);
++  client_->ClearFilter();
++  client_->ResetSentBytes(50);
++  SendReceive(60);
++
++  // Expect alert when the limit is hit.
++  client_->SetFilter(std::make_shared<TlsRecordLastByteDamager>(client_));
++  client_->SendData(10);
++  ExpectAlert(server_, kTlsAlertBadRecordMac);
++
++  // Check the error on both endpoints.
++  uint8_t buf[10];
++  PRInt32 rv = PR_Read(server_->ssl_fd(), buf, sizeof(buf));
++  EXPECT_EQ(-1, rv);
++  EXPECT_EQ(SSL_ERROR_BAD_MAC_READ, PORT_GetError());
++
++  rv = PR_Read(client_->ssl_fd(), buf, sizeof(buf));
++  EXPECT_EQ(-1, rv);
++  EXPECT_EQ(SSL_ERROR_BAD_MAC_ALERT, PORT_GetError());
++}
++
+ TEST_F(TlsConnectDatagram13, ShortHeadersClient) {
+   Connect();
+   client_->SetOption(SSL_ENABLE_DTLS_SHORT_HEADER, PR_TRUE);
+
+
+
+
+@@ -1154,7 +1154,7 @@ void TlsAgent::ReadBytes(size_t amount) {
+   }
+ }
+ 
+-void TlsAgent::ResetSentBytes() { send_ctr_ = 0; }
++void TlsAgent::ResetSentBytes(size_t bytes) { send_ctr_ = bytes; }
+ 
+ void TlsAgent::SetOption(int32_t option, int value) {
+   ASSERT_TRUE(EnsureTlsSetup());
+
+
+
+
+@@ -182,7 +182,7 @@ class TlsAgent : public PollTarget {
+               uint16_t zeroRttSuite = TLS_NULL_WITH_NULL_NULL);
+   void RemovePsk(std::string label);
+   void ReadBytes(size_t max = 16384U);
+-  void ResetSentBytes();  // Hack to test drops.
++  void ResetSentBytes(size_t bytes = 0);  // Hack to test drops.
+   void EnableExtendedMasterSecret();
+   void CheckExtendedMasterSecret(bool expected);
+   void CheckEarlyDataAccepted(bool expected);
+
+
+
+
+@@ -185,6 +185,27 @@ dtls13_SendAckCb(sslSocket *ss)
+     (void)dtls13_SendAck(ss);
+ }
+ 
++/* Limits from draft-ietf-tls-dtls13-38; section 4.5.3. */
++PRBool
++dtls13_AeadLimitReached(ssl3CipherSpec *spec)
++{
++    if (spec->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
++        switch (spec->cipherDef->calg) {
++            case ssl_calg_chacha20:
++            case ssl_calg_aes_gcm:
++                return spec->deprotectionFailures >= (1ULL << 36);
++#ifdef UNSAFE_FUZZER_MODE
++            case ssl_calg_null:
++                return PR_FALSE;
++#endif
++            default:
++                PORT_Assert(0);
++                break;
++        }
++    }

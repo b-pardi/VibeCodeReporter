@@ -1,0 +1,134 @@
+@@ -23,7 +23,7 @@ R_LIB_VERSION_HEADER (r_lib);
+ // double-indirection required because cpp is crap
+ #define STRINGIFY2(x) #x
+ #define STRINGIFY(x) STRINGIFY2(x)
+-#define R2_ABIVERSION 40
++#define R2_ABIVERSION 41
+ #define R2_ABIVERSION_STRING STRINGIFY(R2_ABIVERSION)
+ 
+ #define R_LIB_ENV "R2_LIBR_PLUGINS"
+
+
+
+
+@@ -31,6 +31,7 @@ typedef struct r_list_range_t {
+ 
+ // RListComparator should return -1, 0, 1 to indicate "a<b", "a==b", "a>b".
+ typedef int (*RListComparator)(const void *a, const void *b);
++typedef int (*RListComparatorWithUser)(const void *a, const void *b, void *user);
+ typedef ut64 (*RListComparatorItem)(const void *a);
+ 
+ #endif
+@@ -82,8 +83,11 @@ R_API void *r_list_first(const RList *list);
+ R_API void *r_list_last(const RList *list);
+ R_API RListIter *r_list_add_sorted(RList *list, void *data, RListComparator cmp);
+ R_API void r_list_sort(RList *list, RListComparator cmp);
++R_API void r_list_sort_with_user(RList *list, RListComparatorWithUser cmp, void *user);
+ R_API void r_list_merge_sort(RList *list, RListComparator cmp);
++R_API void r_list_merge_sort_with_user(RList *list, RListComparatorWithUser cmp, void *user);
+ R_API void r_list_insertion_sort(RList *list, RListComparator cmp);
++R_API void r_list_insertion_sort_with_user(RList *list, RListComparatorWithUser cmp, void *user);
+ R_API RList *r_list_uniq(const RList *list, RListComparatorItem cmp);
+ R_API int r_list_uniq_inplace(RList *list, RListComparatorItem cmp);
+ R_API void r_list_init(RList *list);
+
+
+
+
+@@ -64,6 +64,7 @@ typedef struct {
+ 	bool adjustedCols;
+ 	int maxColumnWidth;
+ 	bool wrapColumns;
++	bool widthsDirty;
+ } RTable;
+ 
+ typedef void (*RTableSelector)(RTableRow *acc, RTableRow *new_row, int nth);
+
+
+
+
+@@ -516,6 +516,41 @@ static RListIter *_merge(RListIter *first, RListIter *second, RListComparator cm
+ 	return head;
+ }
+ 
++static RListIter *_merge_with_user(RListIter *first, RListIter *second, RListComparatorWithUser cmp, void *user) {
++	RListIter *next = NULL, *result = NULL, *head = NULL;
++	while (first || second) {
++		if (!second) {
++			next = first;
++			first = first->n;
++		} else if (!first) {
++			next = second;
++			second = second->n;
++		} else if (cmp (first->data, second->data, user) <= 0) {
++			next = first;
++			first = first->n;
++		} else {
++			next = second;
++			second = second->n;
++		}
++		if (!head) {
++			result = next;
++			head = result;
++			head->p = NULL;
++		} else {
++			result->n = next;
++			next->p = result;
++			result = result->n;
++		}
++	}
++	if (head) {
++		head->p = NULL;
++	}
++	if (next) {
++		next->n = NULL;
++	}
++	return head;
++}
++
+ static RListIter *_r_list_half_split(RListIter *head) {
+ 	RListIter *tmp;
+ 	RListIter *fast;
+@@ -552,6 +587,19 @@ static void list_insertion_sort_iter(RListIter *iter, RListComparator cmp) {
+ 	}
+ }
+ 
++static void list_insertion_sort_iter_with_user(RListIter *iter, RListComparatorWithUser cmp, void *user) {
++	RListIter *it, *it2;
++	for (it = iter; it && it->data; it = it->n) {
++		for (it2 = it->n; it2 && it2->data; it2 = it2->n) {
++			if (cmp (it->data, it2->data, user) > 0) {
++				void *t = it->data;
++				it->data = it2->data;
++				it2->data = t;
++			}
++		}
++	}
++}
++
+ static RListIter *_merge_sort(RListIter *head, RListComparator cmp) {
+ 	RListIter *second;
+ 	if (!head || !head->n) {
+@@ -567,6 +615,21 @@ static RListIter *_merge_sort(RListIter *head, RListComparator cmp) {
+ 	return head;
+ }
+ 
++static RListIter *_merge_sort_with_user(RListIter *head, RListComparatorWithUser cmp, void *user) {
++	RListIter *second;
++	if (!head || !head->n) {
++		return head;
++	}
++	second = _r_list_half_split (head);
++	if (second) {
++		head = _merge_sort_with_user (head, cmp, user);
++		second = _merge_sort_with_user (second, cmp, user);
++		return _merge_with_user (head, second, cmp, user);
++	}
++	list_insertion_sort_iter_with_user (head, cmp, user);
++	return head;
++}
++
+ R_API void r_list_merge_sort(RList *list, RListComparator cmp) {
+ 	R_RETURN_IF_FAIL (list);
+ 
+@@ -583,16 +646,51 @@ R_API void r_list_merge_sort(RList *li

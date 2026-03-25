@@ -1,0 +1,122 @@
+@@ -13,20 +13,29 @@ typedef struct type_trace_change_reg_t {
+ 	ut64 odata;
+ } TypeTraceRegChange;
+ 
+-static void type_trace_reg_change_fini(void *data, void *user) {
++static void type_trace_reg_change_fini(void *data) {
+ 	if (data) {
+ 		TypeTraceRegChange *change = data;
+ 		free (change->name);
+ 	}
+ }
+ 
+-typedef struct type_trace_change_mem_t {
++typedef struct type_trace_mem_range_t {
+ 	int idx;
+ 	ut32 cc;
+ 	ut64 addr;
+-	ut8 data;
+-	ut8 odata;
+-} TypeTraceMemChange;
++	ut32 len;
++	ut8 *data;
++	ut8 *odata;
++} TypeTraceMemRange;
++
++static void type_trace_mem_range_fini(void *data) {
++	TypeTraceMemRange *range = data;
++	if (range) {
++		free (range->data);
++		free (range->odata);
++	}
++}
+ 
+ typedef struct {
+ 	char *name;
+@@ -65,6 +74,8 @@ static inline void tt_fini_access(TypeTraceAccess *access) {
+ 
+ R_VEC_TYPE(VecTraceOp, TypeTraceOp);
+ R_VEC_TYPE_WITH_FINI(VecAccess, TypeTraceAccess, tt_fini_access);
++R_VEC_TYPE_WITH_FINI(VecRegChange, TypeTraceRegChange, type_trace_reg_change_fini);
++R_VEC_TYPE_WITH_FINI(VecMemRange, TypeTraceMemRange, type_trace_mem_range_fini);
+ 
+ typedef struct {
+ 	VecTraceOp ops;
+@@ -80,7 +91,7 @@ typedef struct type_trace_t {
+ 	int cur_idx;
+ 	RReg *reg;
+ 	HtUP *registers;
+-	HtUP *memory;
++	VecMemRange memory;
+ 	ut32 voy[4];
+ 	RStrBuf rollback;  // ESIL string to rollback state (inspired by PR #24428)
+ 	bool enable_rollback;
+@@ -88,7 +99,6 @@ typedef struct type_trace_t {
+ } TypeTrace;
+ 
+ #define CMP_REG_CHANGE(x, y) ((x) - ((TypeTraceRegChange *)y)->idx)
+-#define CMP_MEM_CHANGE(x, y) ((x) - ((TypeTraceMemChange *)y)->idx)
+ 
+ static void update_trace_db_op(TypeTraceDB *db) {
+ 	const ut32 trace_op_len = VecTraceOp_length (&db->ops);
+@@ -131,19 +141,20 @@ static void type_trace_voyeur_reg_read(void *user, const char *name, ut64 val) {
+ static void add_reg_change(TypeTrace *trace, RRegItem *ri, ut64 data, ut64 odata) {
+ 	R_RETURN_IF_FAIL (trace && ri);
+ 	ut64 addr = ri->offset | (ri->arena << 16);
+-	RVector *vreg = ht_up_find (trace->registers, addr, NULL);
++	VecRegChange *vreg = ht_up_find (trace->registers, addr, NULL);
+ 	if (R_UNLIKELY (!vreg)) {
+-		// TODO: Do not use RVector!
+-		vreg = r_vector_new (sizeof (TypeTraceRegChange), type_trace_reg_change_fini, NULL);
++		vreg = R_NEW0 (VecRegChange);
+ 		if (R_UNLIKELY (!vreg)) {
+ 			R_LOG_ERROR ("creating a register vector");
+ 			return;
+ 		}
++		VecRegChange_init (vreg);
+ 		ht_up_insert (trace->registers, addr, vreg);
+ 	}
+-	char *name = strdup (ri->name);
+-	TypeTraceRegChange reg = { trace->cur_idx, trace->cc++, name, data, odata };
+-	r_vector_push (vreg, &reg);
++	TypeTraceRegChange *reg = VecRegChange_emplace_back (vreg);
++	if (reg) {
++		*reg = (TypeTraceRegChange){ trace->cur_idx, trace->cc++, strdup (ri->name), data, odata };
++	}
+ }
+ 
+ static void type_trace_voyeur_reg_write(void *user, const char *name, ut64 old, ut64 val) {
+@@ -154,21 +165,11 @@ static void type_trace_voyeur_reg_write(void *user, const char *name, ut64 old,
+ 		return;
+ 	}
+ 	char *name_dup = strdup (name);
+-	if (!name_dup) {
+-		R_LOG_ERROR ("Failed to allocate(strdup) memory for storing access");
+-		return;
+-	}
+ 	TypeTraceAccess *access = VecAccess_emplace_back (&trace->db.accesses);
+-	if (!access) {
+-		free (name_dup);
+-		R_LOG_ERROR ("Failed to allocate memory for storing access");
+-		return;
+-	}
+ 	access->is_reg = true;
+ 	access->reg.name = name_dup;
+ 	access->reg.value = val;
+ 	access->is_write = true;
+-
+ 	if (trace->enable_rollback) {
+ 		r_strbuf_prependf (&trace->rollback, "0x%" PFMT64x ",%s,:=,", old, name);
+ 	}
+@@ -181,16 +182,11 @@ static void type_trace_voyeur_mem_read(void *user, ut64 addr, const ut8 *buf, in
+ 	R_RETURN_IF_FAIL (user && buf && (len > 0));
+ 	char *hexbuf = r_hex_bin2strdup (buf, len); // why?
+ 	if (!hexbuf) {
+-		R_LOG_ERROR ("Failed to allocate(r_hex_bin2strdup) memory for storing access");
++		R_LOG_ERROR ("r_hex_bin2strdup fail");
+ 		return;
+ 	}
+ 	TypeTraceDB *db = user;
+ 	TypeTraceAccess *access = VecAccess_emplace_back (&db->accesses);
+-	if (!access) {
+-		free (

@@ -1,0 +1,112 @@
+@@ -494,6 +494,27 @@ SECStatus SSLInt_SetRawEchConfigForRetry(PRFileDesc *fd, const uint8_t *buf,
+   sslEchConfig *cfg = (sslEchConfig *)PR_LIST_HEAD(&ss->echConfigs);
+   SECITEM_FreeItem(&cfg->raw, PR_FALSE);
+   SECITEM_AllocItem(NULL, &cfg->raw, len);
+-  memcpy(cfg->raw.data, buf, len);
++  PORT_Memcpy(cfg->raw.data, buf, len);
++  return SECSuccess;
++}
++
++// Zero the echConfig.config_id for all configured echConfigs.
++// This mimics a collision on the 8B config ID so that we can
++// test trial decryption.
++SECStatus SSLInt_ZeroEchConfigIds(PRFileDesc *fd) {
++  if (!fd) {
++    return SECFailure;
++  }
++  sslSocket *ss = ssl_FindSocket(fd);
++  if (!ss) {
++    return SECFailure;
++  }
++
++  for (PRCList *cur_p = PR_LIST_HEAD(&ss->echConfigs); cur_p != &ss->echConfigs;
++       cur_p = PR_NEXT_LINK(cur_p)) {
++    PORT_Memset(((sslEchConfig *)cur_p)->configId, 0,
++                sizeof(((sslEchConfig *)cur_p)->configId));
++  }
++
+   return SECSuccess;
+ }
+
+
+
+
+@@ -51,5 +51,5 @@ SECStatus SSLInt_SetDCAdvertisedSigSchemes(PRFileDesc *fd,
+ SECStatus SSLInt_RemoveServerCertificates(PRFileDesc *fd);
+ SECStatus SSLInt_SetRawEchConfigForRetry(PRFileDesc *fd, const uint8_t *buf,
+                                          size_t len);
+-
+-#endif  // ndef libssl_internals_h_
++SECStatus SSLInt_ZeroEchConfigIds(PRFileDesc *fd);
++#endif  // ifndef libssl_internals_h_
+
+
+
+
+@@ -1098,22 +1098,6 @@ TEST_P(TlsExtensionTest13, HrrThenRemoveSupportedGroups) {
+                               SSL_ERROR_MISSING_SUPPORTED_GROUPS_EXTENSION);
+ }
+ 
+-#ifdef NSS_ENABLE_DRAFT_HPKE
+-TEST_P(TlsExtensionTest13, HrrThenRemoveEch) {
+-  if (variant_ == ssl_variant_datagram) {
+-    // ECH not supported in DTLS.
+-    GTEST_SKIP();
+-  }
+-
+-  EnsureTlsSetup();
+-  SetupEch(client_, server_);
+-  ExpectAlert(server_, kTlsAlertIllegalParameter);
+-  HrrThenRemoveExtensionsTest(ssl_tls13_encrypted_client_hello_xtn,
+-                              SSL_ERROR_ILLEGAL_PARAMETER_ALERT,
+-                              SSL_ERROR_BAD_2ND_CLIENT_HELLO);
+-}
+-#endif
+-
+ TEST_P(TlsExtensionTest13, EmptyVersionList) {
+   static const uint8_t ext[] = {0x00, 0x00};
+   ConnectWithBogusVersionList(ext, sizeof(ext));
+
+
+
+
+@@ -19,9 +19,9 @@ namespace nss_test {
+ 
+ class TlsAgentEchTest : public TlsAgentTestClient13 {
+  protected:
+-  void InstallEchConfig(const DataBuffer& record, PRErrorCode err = 0) {
+-    SECStatus rv =
+-        SSL_SetClientEchConfigs(agent_->ssl_fd(), record.data(), record.len());
++  void InstallEchConfig(const DataBuffer& echconfig, PRErrorCode err = 0) {
++    SECStatus rv = SSL_SetClientEchConfigs(agent_->ssl_fd(), echconfig.data(),
++                                           echconfig.len());
+     if (err == 0) {
+       ASSERT_EQ(SECSuccess, rv);
+     } else {
+@@ -143,18 +143,6 @@ class TlsConnectStreamTls13Ech : public TlsConnectTestBase {
+     Connect();
+   }
+ 
+- private:
+-  // Testing certan invalid CHInner configurations is tricky, particularly
+-  // since the CHOuter forms AAD and isn't available in filters. Instead of
+-  // generating these inputs on the fly, use a fixed server keypair so that
+-  // the input can be generated once (e.g. via a debugger) and replayed in
+-  // each invocation of the test.
+-  std::string kFixedServerPubkey =
+-      "3067020100301406072a8648ce3d020106092b06010401da470f01044c304a"
+-      "02010104205a8aa0d2476b28521588e0c704b14db82cdd4970d340d293a957"
+-      "6deaee9ec1c7a1230321008756e2580c07c1d2ffcb662f5fadc6d6ff13da85"
+-      "abd7adfecf984aaa102c1269";
+-
+   void ImportFixedEchKeypair(ScopedSECKEYPublicKey& pub,
+                              ScopedSECKEYPrivateKey& priv) {
+     ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
+@@ -176,16 +164,30 @@ class TlsConnectStreamTls13Ech : public TlsConnectTestBase {
+     ASSERT_NE(nullptr, tmp_pub);
+   }
+ 
++ private:
++  // Testing certan invalid CHInner configurations is tricky, particularly
++  // since the CHOuter forms AAD and isn't available in filters. Instead of
++  // generating these inputs on the fly

@@ -1,0 +1,117 @@
+@@ -21,6 +21,8 @@ def dummy_training(cfg: DictConfig) -> float:
+     log.info(
+         f"dummy_training(dropout={do:.3f}, lr={cfg.lr:.3f}, db={cfg.db}, batch_size={bs}) = {out:.3f}",
+     )
++    if cfg.error:
++        raise RuntimeError("cfg.error is True")
+     return out
+ 
+ 
+
+
+
+
+@@ -1,5 +1,6 @@
+ # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+ import logging
++import math
+ from typing import (
+     Any,
+     Dict,
+@@ -12,6 +13,7 @@ from typing import (
+ )
+ 
+ import nevergrad as ng
++from hydra.core import utils
+ from hydra.core.override_parser.overrides_parser import OverridesParser
+ from hydra.core.override_parser.types import (
+     ChoiceSweep,
+@@ -158,14 +160,32 @@ class NevergradSweeperImpl(Sweeper):
+             )
+             self.validate_batch_is_legal(overrides)
+             returns = self.launcher.launch(overrides, initial_job_idx=self.job_idx)
+-            self.job_idx += len(returns)
+             # would have been nice to avoid waiting for all jobs to finish
+             # aka batch size Vs steady state (launching a new job whenever one is done)
++            self.job_idx += len(returns)
++            # check job status and prepare losses
++            failures = 0
+             for cand, ret in zip(candidates, returns):
+-                loss = direction * ret.return_value
+-                optimizer.tell(cand, loss)
+-                if loss < best[0]:
+-                    best = (loss, cand)
++                if ret.status == utils.JobStatus.COMPLETED:
++                    rectified_loss = direction * ret.return_value
++                else:
++                    rectified_loss = math.inf
++                    failures += 1
++                    try:
++                        ret.return_value
++                    except Exception as e:
++                        log.warning(f"Returning infinity for failed experiment: {e}")
++                optimizer.tell(cand, rectified_loss)
++                if rectified_loss < best[0]:
++                    best = (rectified_loss, cand)
++            # raise if too many failures
++            if failures / len(returns) > self.opt_config.max_failure_rate:
++                log.error(
++                    f"Failed {failures} times out of {len(returns)} "
++                    f"with max_failure_rate={self.opt_config.max_failure_rate}"
++                )
++                for ret in returns:
++                    ret.return_value  # delegate raising to JobReturn, with actual traceback
+             all_returns.extend(returns)
+         recom = optimizer.provide_recommendation()
+         results_to_serialize = {
+
+
+
+
+@@ -63,6 +63,9 @@ class OptimConf:
+     # optimization seed, for reproducibility
+     seed: Optional[int] = None
+ 
++    # maximum authorized failure rate for a batch of parameters
++    max_failure_rate: float = 0.0
++
+ 
+ @dataclass
+ class NevergradSweeperConf:
+
+
+
+
+@@ -1,4 +1,5 @@
+ # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
++import sys
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -9,6 +10,7 @@ from hydra.plugins.sweeper import Sweeper
+ from hydra.test_utils.test_utils import (
+     TSweepRunner,
+     chdir_plugin_root,
++    run_process,
+     run_python_script,
+ )
+ from omegaconf import DictConfig, OmegaConf
+@@ -155,3 +157,24 @@ def test_nevergrad_example(with_commandline: bool, tmpdir: Path) -> None:
+     # check that all job folders are created
+     last_job = max(int(fp.name) for fp in Path(tmpdir).iterdir() if fp.name.isdigit())
+     assert last_job == budget - 1
++
++
++@mark.parametrize("max_failure_rate", (0.5, 1.0))
++def test_failure_rate(max_failure_rate: float, tmpdir: Path) -> None:
++    cmd = [
++        sys.executable,
++        "example/my_app.py",
++        "-m",
++        f"hydra.sweep.dir={tmpdir}",
++        "hydra.sweeper.optim.budget=2",  # small budget to test fast
++        "hydra.sweeper.optim.num_workers=2",
++        f"hydra.sweeper.optim.max_failure_rate={max_failure_rate}",
++        "error=true",
++    ]
++    out, err

@@ -1,0 +1,119 @@
+@@ -185,7 +185,8 @@ static inline void InterruptsTurnOnOff(uint16_t port_id, uint16_t queue_id, bool
+     rte_spinlock_unlock(&(intr_lock[port_id]));
+ }
+ 
+-static void DPDKFreeMbufArray(struct rte_mbuf **mbuf_array, uint16_t mbuf_cnt, uint16_t offset)
++static inline void DPDKFreeMbufArray(
++        struct rte_mbuf **mbuf_array, uint16_t mbuf_cnt, uint16_t offset)
+ {
+     for (int i = offset; i < mbuf_cnt; i++) {
+         rte_pktmbuf_free(mbuf_array[i]);
+@@ -394,151 +395,204 @@ static void DPDKReleasePacket(Packet *p)
+     PacketFreeOrRelease(p);
+ }
+ 
+-/**
+- *  \brief Main DPDK reading Loop function
+- */
+-static TmEcode ReceiveDPDKLoop(ThreadVars *tv, void *data, void *slot)
++static TmEcode ReceiveDPDKLoopInit(ThreadVars *tv, DPDKThreadVars *ptv)
+ {
+     SCEnter();
+-    Packet *p;
+-    uint16_t nb_rx;
+-    time_t last_dump = 0;
+-    time_t current_time;
+-    bool segmented_mbufs_warned = 0;
+-    SCTime_t t = DPDKSetTimevalReal(&machine_start_time);
+-    uint64_t last_timeout_msec = SCTIME_MSECS(t);
+-
+-    DPDKThreadVars *ptv = (DPDKThreadVars *)data;
+-    TmSlot *s = (TmSlot *)slot;
+-
+-    ptv->slot = s->slot_next;
+-
+-    // Indicate that the thread is actually running its application level code (i.e., it can poll
+-    // packets)
++    // Indicate that the thread is actually running its application level
++    // code (i.e., it can poll packets)
+     TmThreadsSetFlag(tv, THV_RUNNING);
+     PacketPoolWait();
+ 
+     rte_eth_stats_reset(ptv->port_id);
+     rte_eth_xstats_reset(ptv->port_id);
+ 
+-    uint32_t pwd_zero_rx_packet_polls_count = 0;
+     if (ptv->intr_enabled && !InterruptsRXEnable(ptv->port_id, ptv->queue_id))
+         SCReturnInt(TM_ECODE_FAILED);
+ 
+-    while (1) {
+-        if (unlikely(suricata_ctl_flags != 0)) {
+-            SCLogDebug("Stopping Suricata!");
+-            SC_ATOMIC_ADD(ptv->workers_sync->worker_checked_in, 1);
+-            while (SC_ATOMIC_GET(ptv->workers_sync->worker_checked_in) <
+-                    ptv->workers_sync->worker_cnt) {
+-                rte_delay_us(10);
++    SCReturnInt(TM_ECODE_OK);
++}
++
++static inline void LoopHandleTimeoutOnIdle(ThreadVars *tv)
++{
++    static uint64_t last_timeout_msec = 0;
++    SCTime_t t = DPDKSetTimevalReal(&machine_start_time);
++    uint64_t msecs = SCTIME_MSECS(t);
++    if (msecs > last_timeout_msec + 100) {
++        TmThreadsCaptureHandleTimeout(tv, NULL);
++        last_timeout_msec = msecs;
++    }
++}
++
++/**
++ * \brief Decides if it should retry the packet poll or continue with the packet processing
++ * \return true if the poll should be retried, false otherwise
++ */
++static inline bool RXPacketCountHeuristic(ThreadVars *tv, DPDKThreadVars *ptv, uint16_t nb_rx)
++{
++    static uint32_t zero_pkt_polls_cnt = 0;
++
++    if (nb_rx > 0) {
++        zero_pkt_polls_cnt = 0;
++        return false;
++    }
++
++    LoopHandleTimeoutOnIdle(tv);
++    if (!ptv->intr_enabled)
++        return true;
++
++    zero_pkt_polls_cnt++;
++    if (zero_pkt_polls_cnt <= MIN_ZERO_POLL_COUNT)
++        return true;
++
++    uint32_t pwd_idle_hint = InterruptsSleepHeuristic(zero_pkt_polls_cnt);
++    if (pwd_idle_hint < STANDARD_SLEEP_TIME_US) {
++        rte_delay_us(pwd_idle_hint);
++    } else {
++        InterruptsTurnOnOff(ptv->port_id, ptv->queue_id, true);
++        struct rte_epoll_event event;
++        rte_epoll_wait(RTE_EPOLL_PER_THREAD, &event, 1, MAX_EPOLL_TIMEOUT_MS);
++        InterruptsTurnOnOff(ptv->port_id, ptv->queue_id, false);
++        return true;
++    }
++
++    return false;
++}
++
++/**
++ * \brief Initializes a packet from an mbuf
++ * \return true if the packet was initialized successfully, false otherwise
++ */
++static inline Packet *PacketInitFromMbuf(DPDKThreadVars *ptv, struct rte_mbuf *mbuf)
++{
++    Packet *p = PacketGetFromQueueOrAlloc();
++    if (unlikely(p == NULL)) {
++        return NULL;
++    }
++    PKT_SET_SRC(p, PKT_SRC_WIRE);
++    p->datalink = LINKTYPE_ETHERNET;
++    if (ptv->checksum_mode == CHECKSUM_VALIDATION_DISABLE) {
++        p->flags |= PKT_IGNORE_CHECKSUM;
++    }

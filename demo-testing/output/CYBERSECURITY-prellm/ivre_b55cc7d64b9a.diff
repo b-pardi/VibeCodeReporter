@@ -1,0 +1,149 @@
+@@ -125,7 +125,9 @@ FLOW_TIME = True
+ FLOW_TIME_PRECISION = 3600
+ # When recording flow times, record the whole range from start_time to end_time
+ # This option is experimental and possibly useless in practice
+-FLOW_TIME_FULL_RANGE = False
++FLOW_TIME_FULL_RANGE = True
++# Store high level protocols metadata in flows. It may take much more space.
++FLOW_STORE_METADATA = True
+ 
+ IPDATA_URLS = {
+     'GeoLite2-City.tar.gz':
+
+
+
+
+@@ -51,8 +51,8 @@ except ImportError:
+     USE_CLUSTER = False
+ 
+ 
+-from ivre import config, geoiputils, nmapout, utils, xmlnmap
+-from datetime import datetime
++from ivre import config, geoiputils, nmapout, utils, xmlnmap, flow
++from datetime import datetime, timedelta
+ 
+ 
+ class DB(object):
+@@ -2443,8 +2443,35 @@ class DBFlow(DB):
+         ts = ts - (ts % config.FLOW_TIME_PRECISION)
+         if isinstance(date, datetime):
+             return datetime.fromtimestamp(ts)
+-        else:
+-            return ts
++        return ts
++
++    @classmethod
++    def from_filters(cls, filters, limit=None, skip=0, orderby="", mode=None,
++                     timeline=False):
++        """
++        Returns a flow.Query object representing the given filters
++        Note: limit, skip, orderby, mode and timeline are IGNORED. They are
++        present only for compatibility reasons with neo4j backend.
++        This should be inherited by backend specific classes
++        """
++        query = flow.Query()
++        for flt_type in ["node", "edge"]:
++            for flt in filters.get("%ss" % flt_type, []):
++                query.add_clause_from_filter(flt, mode=flt_type)
++        return query
++
++    @classmethod
++    def _get_timeslots(cls, start_time, end_time):
++        """
++        Returns an array of timeslots included between start_time and end_time
++        """
++        times = []
++        time = cls.date_round(start_time)
++        end_timeslot = cls.date_round(end_time)
++        while time <= end_timeslot:
++            times.append(time)
++            time += timedelta(seconds=config.FLOW_TIME_PRECISION)
++        return times
+ 
+ 
+ class MetaDB(object):
+
+
+
+
+@@ -23,7 +23,6 @@ databases.
+ """
+ 
+ 
+-import bson
+ try:
+     from collections import OrderedDict
+ except ImportError:
+@@ -34,7 +33,6 @@ import datetime
+ import hashlib
+ import json
+ import os
+-import pymongo
+ import random
+ import re
+ import socket
+@@ -46,14 +44,16 @@ except ImportError:
+     from urllib import unquote
+ import uuid
+ 
++import bson
+ from future.builtins import bytes, range
+ from future.utils import viewitems
+ from past.builtins import basestring
++from pymongo.errors import BulkWriteError
++import pymongo
+ 
+ from ivre.db import DB, DBActive, DBNmap, DBPassive, DBAgent, DBView, DBFlow, \
+     LockError
+ from ivre import config, passive, utils, xmlnmap, flow
+-from pymongo.errors import BulkWriteError
+ 
+ 
+ class Nmap2Mongo(xmlnmap.Nmap2DB):
+@@ -4540,18 +4540,10 @@ scan object on success, and raises a LockError on failure.
+ 
+ class MongoDBFlow(MongoDB, DBFlow):
+     column_flow = 0
+-    column_passive = 1
+-
+-    count_flow = 0
+-    count_passive = 0
+ 
+     needunwind = [
+         'sports',
+         'codes',
+-        'meta.dns',
+-        'meta.dns.answers',
+-        'meta.http',
+-        'meta.ssh'
+     ]
+ 
+     datefields = [
+@@ -4559,6 +4551,21 @@ class MongoDBFlow(MongoDB, DBFlow):
+         'lastseen'
+     ]
+ 
++    # This represents the kinds of metadata that are defined in flow.META_DESC
++    # Each kind is associated with an aggregation operator used for
++    # insertion in db.
++    meta_kinds = {
++        'keys': '$addToSet',
++        'counters': '$inc'
++    }
++
++    # meta_desc is a "usable" version of flow.META_DESC. It is computed only
++    # once at class initialization.
++    meta_desc = {}
++
++    # initialized ensures class attributes get initialized only once.
++    initialized = False
++
+     indexes = [
+         # flows
+         [
+@@ -4582,27 +4589,47 @@ class MongoDBFlow(MongoDB, DBFlow):
+         ],
+     ]
+ 
++    @classmethod
++    def compute_meta_d

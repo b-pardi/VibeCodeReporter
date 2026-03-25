@@ -1,0 +1,155 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#pragma once
++
++#include "lib/common.h"
++
++typedef __u8 cls_flags_t;
++
++/* Classification flags used to enrich trace/drop notifications events. */
++enum {
++	/* Packet uses IPv6. This flag is only needed/set in trace event:
++	 * - carrying the orig_ip IPv6 info from send_trace_notify6, or
++	 * - with L3 IPv6 packets, to instruct Hubble to use the right decoder.
++	 */
++	CLS_FLAG_IPV6	   = (1 << 0),
++	/* Packet originates from a L3 device (no ethernet header). */
++	CLS_FLAG_L3_DEV    = (1 << 1),
++};
++
++/* Wrapper for specifying empty flags during the trace/drop event. */
++#define CLS_FLAG_NONE ((cls_flags_t)0)
++
++/**
++ * ctx_classify
++ * @ctx: socket buffer
++ *
++ * Compute classifiers (CLS_FLAG_*) for the given packet to be used during
++ * trace/drop notification events.
++ */
++static __always_inline cls_flags_t
++ctx_classify(const struct __ctx_buff *ctx __maybe_unused)
++{
++#if defined(IS_BPF_WIREGUARD)
++	if (ctx_get_protocol(ctx) == bpf_htons(ETH_P_IPV6))
++		return CLS_FLAG_L3_DEV | CLS_FLAG_IPV6;
++
++	return CLS_FLAG_L3_DEV;
++#else
++	return CLS_FLAG_NONE;
++#endif
++}
+
+
+
+
+@@ -20,6 +20,7 @@
+ #include "metrics.h"
+ #include "ratelimit.h"
+ #include "tailcall.h"
++#include "classifiers.h"
+ 
+ #define NOTIFY_DROP_VER 2
+ 
+@@ -32,9 +33,10 @@ struct drop_notify {
+ 	__u8		file;
+ 	__s8		ext_error;
+ 	__u32		ifindex;
+-	__u8		ipv6:1;
+-	__u8		l3_dev:1;
+-	__u8		pad1:6;
++	__u8		flags; /* __u8 instead of cls_flags_t so that it will error
++				* when cls_flags_t grows (either borrow bits from pad2 or
++				* move to flags_lower/flags_upper).
++				*/
+ 	__u8		pad2[3];
+ };
+ 
+@@ -59,7 +61,6 @@ struct drop_notify {
+ __declare_tail(CILIUM_CALL_DROP_NOTIFY)
+ int __send_drop_notify(struct __ctx_buff *ctx)
+ {
+-	bool l3_dev = false, ipv6 = false;
+ 	/* Mask needed to calm verifier. */
+ 	__u32 error = ctx_load_meta(ctx, 2) & 0xFFFFFFFF;
+ 	__u64 ctx_len = ctx_full_len(ctx);
+@@ -68,6 +69,7 @@ int __send_drop_notify(struct __ctx_buff *ctx)
+ 	__u16 line = (__u16)(meta4 >> 16);
+ 	__u8 file = (__u8)(meta4 >> 8);
+ 	__u8 exitcode = (__u8)meta4;
++	cls_flags_t flags = CLS_FLAG_NONE;
+ 	struct ratelimit_key rkey = {
+ 		.usage = RATELIMIT_USAGE_EVENTS_MAP,
+ 	};
+@@ -83,10 +85,7 @@ int __send_drop_notify(struct __ctx_buff *ctx)
+ 			return exitcode;
+ 	}
+ 
+-#ifdef IS_BPF_WIREGUARD
+-	l3_dev = true;
+-	ipv6 = ctx->protocol == bpf_htons(ETH_P_IPV6);
+-#endif
++	flags = ctx_classify(ctx);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_DROP, (__u8)error),
+@@ -98,8 +97,7 @@ int __send_drop_notify(struct __ctx_buff *ctx)
+ 		.file           = file,
+ 		.ext_error      = (__s8)(__u8)(error >> 8),
+ 		.ifindex        = ctx_get_ifindex(ctx),
+-		.ipv6           = ipv6,
+-		.l3_dev         = l3_dev,
++		.flags          = flags,
+ 	};
+ 
+ 	ctx_event_output(ctx, &cilium_events,
+
+
+
+
+@@ -58,6 +58,7 @@ __id_for_file(const char *const header_name)
+ 	_strcase_(114, "host_firewall.h");
+ 	_strcase_(115, "nodeport_egress.h");
+ 	_strcase_(116, "ipv6.h");
++	_strcase_(117, "classifiers.h");
+ 
+ 	/* @@ source files list end */
+ 
+
+
+
+
+@@ -28,6 +28,7 @@
+ #include "utils.h"
+ #include "metrics.h"
+ #include "ratelimit.h"
++#include "classifiers.h"
+ 
+ /* Available observation points. */
+ enum trace_point {
+@@ -166,9 +167,9 @@ struct trace_notify {
+ 	__u32		dst_label;
+ 	__u16		dst_id;
+ 	__u8		reason;
+-	__u8		ipv6:1;
+-	__u8		l3_dev:1;
+-	__u8		pad:6;
++	__u8		flags; /* __u8 instead of cls_flags_t so that it will error
++				* when cls_flags_t grows (move to flags_lower/flags_upper).
++				*/
+ 	__u32		ifindex;
+ 	union {
+ 		struct {
+@@ -221,7 +222,6 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 		   __u32 src, __u32 dst, __u16 dst_id, __u32 ifindex,
+ 		   enum trace_reason reason, __u32 monitor, __u16 line, __u8 file)
+ {
+-	bool l3_dev = false, ipv6 = false;
+ 	__u64 ctx_len = ctx_full_len(ctx);
+ 	__u64 cap_len = min_t(__u64, monitor ? : TRACE_PAYLOAD_

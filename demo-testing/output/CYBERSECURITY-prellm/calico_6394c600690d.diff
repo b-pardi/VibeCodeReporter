@@ -1,0 +1,132 @@
+@@ -22,6 +22,59 @@
+ #define PARSING_ERROR -1
+ #define PARSING_ALLOW_WITHOUT_ENFORCING_POLICY -2
+ 
++/* A struct to share information between TC and XDP programs.
++ * The struct must be 4 byte aligned, based on
++ * samples/bpf/xdp2skb_meta_kern.c code in the Kernel source. */
++struct parsing_meta_info {
++	__u32  flags;
++}__attribute__((aligned(4)));
++
++// Set metadata to be received by TC programs.
++static CALI_BPF_INLINE int xdp2tc_set_metadata(struct xdp_md *xdp, __u32 flags) {
++	if (CALI_F_XDP) {
++		struct parsing_meta_info *metadata;
++		// Reserve space in-front of xdp_md.meta for metadata.
++		// Drivers not supporting data_meta will fail here.
++		int ret = bpf_xdp_adjust_meta(xdp, -(int)sizeof(*metadata));
++		if (ret < 0) {
++			CALI_DEBUG("Failed to add space for metadata: %d\n", ret);
++			return PARSING_ERROR;
++		}
++
++		if (xdp->data_meta + sizeof(struct parsing_meta_info) > xdp->data) {
++			CALI_DEBUG("No enough space for metadata\n");
++			return PARSING_ERROR;
++		}
++
++		metadata = (void *)(unsigned long)xdp->data_meta;
++
++		CALI_DEBUG("Set metadata for TC: %d\n", flags);
++		metadata->flags = flags;
++		return PARSING_OK;
++	} else {
++		CALI_DEBUG("Setting metadata in TC no supported\n");
++		return PARSING_ERROR;
++	}
++}
++
++// Fetch metadata set by XDP program. If not set or on error return 0.
++static CALI_BPF_INLINE __u32 xdp2tc_get_metadata(struct __sk_buff *skb) {
++	if (CALI_F_FROM_HEP && !CALI_F_XDP) {
++		struct parsing_meta_info *metadata = (void *)(unsigned long)skb->data_meta;
++
++		if (skb->data_meta + sizeof(struct parsing_meta_info) > skb->data) {
++			CALI_DEBUG("No metadata is shared by XDP\n");
++			return 0;
++		}
++
++		CALI_DEBUG("Received metadata from XDP: %d\n", metadata->flags);
++		return metadata->flags;
++	} else {
++		CALI_DEBUG("Fetching metadata from XDP not supported in this hook\n");
++		return 0;
++	}
++}
++
+ static CALI_BPF_INLINE int parse_packet_ip(struct cali_tc_ctx *ctx) {
+ 	__u16 protocol = 0;
+ 
+
+
+
+
+@@ -38,6 +38,7 @@ enum calico_reason {
+ 	CALI_REASON_IP_MALFORMED = 0xec,
+ 	CALI_REASON_UNAUTH_SOURCE = 0xed,
+ 	CALI_REASON_RT_UNKNOWN = 0xdead,
++	CALI_REASON_ACCEPTED_BY_XDP = 0xd9,
+ };
+ 
+ #endif /* __CALI_REASONS_H__ */
+
+
+
+
+@@ -69,6 +69,15 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 		return TC_ACT_UNSPEC;
+ 	}
+ 
++	/* Optimisation: if XDP program has already accepted the packet,
++	 * skip all processing. */
++	if (CALI_F_FROM_HEP) {
++		if (xdp2tc_get_metadata(skb) & CALI_ST_ACCEPTED_BY_XDP) {
++			CALI_INFO("Final result=ALLOW (%d). Accepted by XDP.\n", CALI_REASON_ACCEPTED_BY_XDP);
++			return TC_ACT_UNSPEC;
++		}
++	}
++
+ 	/* Initialise the context, which is stored on the stack, and the state, which
+ 	 * we use to pass data from one program to the next via tail calls. */
+ 	struct cali_tc_ctx ctx = {
+
+
+
+
+@@ -101,6 +101,8 @@ enum cali_state_flags {
+ 	/* CALI_ST_SRC_IS_HOST is set if the packet is heading away from the host namespace and the source
+ 	 * belongs to the host. */
+ 	CALI_ST_SRC_IS_HOST	  = 0x08,
++	/* CALI_ST_ACCEPTED_BY_XDP is set if the packet is already accepted by XDP */
++	CALI_ST_ACCEPTED_BY_XDP 	= 0x10,
+ };
+ 
+ struct fwd {
+
+
+
+
+@@ -42,13 +42,13 @@
+ #include "jump.h"
+ 
+ /* calico_xdp is the main function used in all of the xdp programs */
+-static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
++static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp)
+ {
+ 	/* Initialise the context, which is stored on the stack, and the state, which
+ 	 * we use to pass data from one program to the next via tail calls. */
+ 	struct cali_tc_ctx ctx = {
+ 		.state = state_get(),
+-		.xdp = xdp_ctx,
++		.xdp = xdp,
+ 		.fwd = {
+ 			.res = XDP_PASS, // TODO: Adjust based on the design
+ 			.reason = CALI_REASON_UNKNOWN,
+@@ -69,10 +69,8 @@ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ 	// Parse packets and drop malformed and unsupported ones
+ 	switch (parse_packet_ip(&ctx)) {
+ 	case PARSING_ERROR:
+-		ctx.fwd.res = XDP_DROP;
+ 		goto deny;
+ 	case PARSING_ALLOW_WITHOUT_ENFORCING_POLICY:

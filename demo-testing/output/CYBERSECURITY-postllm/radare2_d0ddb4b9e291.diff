@@ -1,0 +1,195 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,404 @@
++/* radare2 - MIT - Copyright 2023 - keegan */
++
++#include "dis.h"
++
++// From "Dis Virtual Machine Specification":
++// > OP encoded integer operand, encoding selected by the two most significant
++// > bits as follows:
++// >     00: signed 7 bits, 1 byte
++// >     10: signed 14 bits, 2 bytes
++// >     11: signed 30 bits, 4 bytes
++// Based off of `operand' in Inferno's load.c
++static bool dis_read_operand(RBuffer *buf, st32 *n) {
++	ut8 b;
++	if (r_buf_read (buf, &b, sizeof (b)) != sizeof (b)) {
++		return false;
++	}
++	st32 c = b;
++
++	switch (c & 0xc0) {
++	case 0x00:
++		*n = c;
++		return true;
++	case 0x40:
++		*n = c | ~0x7f;
++		return true;
++	case 0x80: {
++		if (r_buf_read (buf, &b, sizeof (b)) != sizeof (b)) {
++			return false;
++		}
++
++		if (c & 0x20) {
++			c |= ~0x3f;
++		} else {
++			c &= 0x3f;
++		}
++
++		*n = (c << 8) | (st32)b;
++		return true;
++	}
++	case 0xc0: {
++		ut8 k[3] = {0};
++		if (r_buf_read (buf, k, sizeof (k)) != sizeof (k)) {
++			return false;
++		}
++
++		if (c & 0x20) {
++			c |= ~0x3f;
++		} else {
++			c &= 0x3f;
++		}
++
++		*n = (c << 24) | (k[0] << 16) | (k[1] << 8) | k[2];
++		return true;
++	}
++	}
++
++	return false;
++}
++
++static bool dis_read_instr(RBuffer *buf, struct dis_instr *instr) {
++	ut8 opcode;
++	if (r_buf_read (buf, &opcode, sizeof (opcode)) != sizeof (opcode)) {
++		return false;
++	}
++	if (opcode >= DIS_OP_INVALID) {
++		return false;
++	}
++	instr->opcode = opcode;
++	ut8 address_mode;
++	if (r_buf_read (buf, &address_mode, sizeof (address_mode)) != sizeof (address_mode)) {
++		return false;
++	}
++
++	// address mode is packed as follows:
++	//      7  6  5  4  3  2  1  0
++	//     m1 m0 s2 s1 s0 d2 d1 d0
++	ut8 mmode = (address_mode >> 6) & 3;
++	ut8 smode = (address_mode >> 3) & 7;
++	ut8 dmode = address_mode & 7;
++
++	switch (mmode) {
++	// small immediate
++	case 1:
++		instr->mop = DIS_OPERAND_IMM;
++		break;
++	// small offset indirect from fp
++	case 2:
++		instr->mop = DIS_OPERAND_IND_FP;
++		break;
++	// small offset indirect from mp
++	case 3:
++		instr->mop = DIS_OPERAND_IND_MP;
++		break;
++	// no operand
++	default:
++		instr->mop = DIS_OPERAND_NONE;
++		break;
++	}
++	if (instr->mop) {
++		if (!dis_read_operand (buf, &instr->mop_imm)) {
++			return false;
++		}
++	}
++
++	switch (smode) {
++	// offset indirect from mp
++	case 0:
++		instr->sop = DIS_OPERAND_IND_MP;
++		break;
++	// offset indirect from fp
++	case 1:
++		instr->sop = DIS_OPERAND_IND_FP;
++		break;
++	case 2:
++		instr->sop = DIS_OPERAND_IMM;
++		break;
++	// double-indirect from mp
++	case 4:
++		instr->sop = DIS_OPERAND_DIND_MP;
++		break;
++	// double-indirect from fp
++	case 5:
++		instr->sop = DIS_OPERAND_DIND_FP;
++		break;
++	// no operand
++	default:
++		instr->sop = DIS_OPERAND_NONE;
++		break;
++	}
++	if (instr->sop) {
++		if (!dis_read_operand (buf, &instr->sop_imm1)) {
++			return false;
++		}
++	}
++	if (instr->sop == DIS_OPERAND_DIND_MP || instr->sop == DIS_OPERAND_DIND_FP) {
++		if (!dis_read_operand (buf, &instr->sop_imm2)) {
++			return false;
++		}
++	}
++
++	switch (dmode) {
++	case 0:
++		instr->dop = DIS_OPERAND_IND_MP;
++		break;
++	case 1:
++		instr->dop = DIS_OPERAND_IND_FP;
++		break;
++	case 2:
++		instr->dop = DIS_OPERAND_IMM;
++		break;
++	case 4:
++		instr->dop = DIS_OPERAND_DIND_MP;
++		break;
++	case 5:
++		instr->dop = DIS_OPERAND_DIND_FP;
++		break;
++	default:
++		instr->dop = DIS_OPERAND_NONE;
++		break;
++	}
++	if (instr->dop) {
++		if (!dis_read_operand (buf, &instr->dop_imm1)) {
++			return false;
++		}
++	}
++	if (instr->dop == DIS_OPERAND_DIND_MP || instr->dop == DIS_OPERAND_DIND_FP) {
++		if (!dis_read_operand (buf, &instr->dop_imm2)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++FUNC_ATTR_USED static bool dis_read_type(RBuffer *buf, struct dis_type *typ) {
++	if (!dis_read_operand (buf, &typ->desc_number)) {
++		return false;
++	}
++
++	if (!dis_read_operand (buf, &typ->size)) {
++		return false;
++	}
++
++	if (!dis_read_operand (buf, &typ->number_ptrs)) {
++		return false;
++	}
++
++	// TODO: ignored for now (unused)
++	typ->array = NULL;
++	// skip
++	r_buf_s

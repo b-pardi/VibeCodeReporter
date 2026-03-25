@@ -1,0 +1,125 @@
+@@ -466,6 +466,73 @@ beach:
+ 	return !breaked;
+ }
+ 
++typedef struct {
++	RAnalBlock *bb;
++	RListIter *switch_it;
++} RecurseDepthFirstCtx;
++
++R_API bool r_anal_block_recurse_depth_first(RAnalBlock *block, RAnalBlockCb cb, R_NULLABLE RAnalBlockCb on_exit, void *user) {
++	bool breaked = false;
++	HtUP *visited = ht_up_new0 ();
++	if (!visited) {
++		goto beach;
++	}
++	RAnal *anal = block->anal;
++	RVector path;
++	r_vector_init (&path, sizeof (RecurseDepthFirstCtx), NULL, NULL);
++	RAnalBlock *cur_bb = block;
++	RecurseDepthFirstCtx ctx = { cur_bb, NULL };
++	r_vector_push (&path, &ctx);
++	ht_up_insert (visited, cur_bb->addr, NULL);
++	breaked = !cb (cur_bb, user);
++	if (breaked) {
++		goto beach;
++	}
++	do {
++		RecurseDepthFirstCtx *cur_ctx = r_vector_index_ptr (&path, path.len - 1);
++		cur_bb = cur_ctx->bb;
++		if (cur_bb->jump != UT64_MAX && !ht_up_find_kv (visited, cur_bb->jump, NULL)) {
++			cur_bb = r_anal_get_block_at (anal, cur_bb->jump);
++		} else if (cur_bb->fail != UT64_MAX && !ht_up_find_kv (visited, cur_bb->fail, NULL)) {
++			cur_bb = r_anal_get_block_at (anal, cur_bb->fail);
++		} else {
++			RAnalCaseOp *cop = NULL;
++			if (cur_bb->switch_op && !cur_ctx->switch_it) {
++				cur_ctx->switch_it = cur_bb->switch_op->cases->head;
++				cop = r_list_first (cur_bb->switch_op->cases);
++			} else if (cur_ctx->switch_it) {
++				while ((cur_ctx->switch_it = r_list_iter_get_next (cur_ctx->switch_it))) {
++					cop = r_list_iter_get_data (cur_ctx->switch_it);
++					if (!ht_up_find_kv (visited, cop->jump, NULL)) {
++						break;
++					}
++					cop = NULL;
++				}
++			}
++			cur_bb = cop ? r_anal_get_block_at (anal, cop->jump) : NULL;
++		}
++		if (cur_bb) {
++			RecurseDepthFirstCtx ctx = { cur_bb, NULL };
++			r_vector_push (&path, &ctx);
++			ht_up_insert (visited, cur_bb->addr, NULL);
++			bool breaked = !cb (cur_bb, user);
++			if (breaked) {
++				break;
++			}
++		} else {
++			if (on_exit) {
++				on_exit (cur_ctx->bb, user);
++			}
++			r_vector_pop (&path, NULL);
++		}
++	} while (!r_vector_empty (&path));
++
++beach:
++	ht_up_free (visited);
++	r_vector_clear (&path);
++	return !breaked;
++}
++
+ static bool recurse_list_cb(RAnalBlock *block, void *user) {
+ 	RList *list = user;
+ 	r_anal_block_ref (block);
+
+
+
+
+@@ -267,6 +267,11 @@ static ut64 try_get_cmpval_from_parents(RAnal * anal, RAnalFunction *fcn, RAnalB
+ 	r_list_foreach (fcn->bbs, iter, tmp_bb) {
+ 		if (tmp_bb->jump == my_bb->addr || tmp_bb->fail == my_bb->addr) {
+ 			if (tmp_bb->cmpreg == cmp_reg) {
++				if (tmp_bb->cond) {
++					if (tmp_bb->cond->type == R_ANAL_COND_HI || tmp_bb->cond->type == R_ANAL_COND_GT) {
++						return tmp_bb->cmpval + 1;
++					}
++				}
+ 				return tmp_bb->cmpval;
+ 			}
+ 		}
+@@ -459,6 +464,10 @@ static inline bool op_is_set_bp(RAnalOp *op, const char *bp_reg, const char *sp_
+ 	return false;
+ }
+ 
++static inline does_arch_destroys_dst(const char *arch) {
++	return arch && (!strncmp (arch, "arm", 3) || !strcmp (arch, "riscv") || !strcmp (arch, "ppc"));
++}
++
+ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth) {
+ 	const int continue_after_jump = anal->opt.afterjmp;
+ 	const int addrbytes = anal->iob.io ? anal->iob.io->addrbytes : 1;
+@@ -481,8 +490,8 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int
+ 	} delay = {
+ 		0
+ 	};
++	bool arch_destroys_dst = does_arch_destroys_dst (anal->cur->arch);
+ 	bool is_arm = anal->cur->arch && !strncmp (anal->cur->arch, "arm", 3);
+-	bool is_riscv = anal->cur->arch && !strcmp (anal->cur->arch, "riscv");
+ 	char tmp_buf[MAX_FLG_NAME_SIZE + 5] = "skip";
+ 	bool is_x86 = is_arm ? false: anal->cur->arch && !strncmp (anal->cur->arch, "x86", 3);
+ 	bool is_amd64 = is_x86 ? fcn->cc && !strcmp (fcn->cc, "amd64") : false;
+@@ -990,6 +999,7 @@ repeat:
+ 				cmpval = val;
+ 				bb->cmpval = cmpval;
+ 				bb->cmpreg = op.reg;
++				bb->cond = r_anal_cond_new_from_op (&op);
+ 			}
+ 		}
+ 			break;
+@@ -1004,6 +1014,9 @@ repeat:
+ 				bb->jump = op.jump;
+ 				bb->fail = op.fail;
+ 			}
++			if (bb->cond) {
++				bb->cond-

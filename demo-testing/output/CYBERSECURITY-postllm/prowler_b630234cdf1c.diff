@@ -1,0 +1,105 @@
+@@ -10,6 +10,7 @@ from rest_framework.exceptions import AuthenticationFailed
+ from rest_framework.request import Request
+ from rest_framework_simplejwt.authentication import JWTAuthentication
+ 
++from api.db_router import MainRouter
+ from api.models import TenantAPIKey, TenantAPIKeyManager
+ 
+ 
+@@ -19,6 +20,22 @@ class TenantAPIKeyAuthentication(BaseAPIKeyAuth):
+     def __init__(self):
+         self.key_crypto = get_crypto()
+ 
++    def _authenticate_credentials(self, request, key):
++        """
++        Override to use admin connection, bypassing RLS during authentication.
++        Delegates to parent after temporarily routing model queries to admin DB.
++        """
++        # Temporarily point the model's manager to admin database
++        original_objects = self.model.objects
++        self.model.objects = self.model.objects.using(MainRouter.admin_db)
++
++        try:
++            # Call parent method which will now use admin database
++            return super()._authenticate_credentials(request, key)
++        finally:
++            # Restore original manager
++            self.model.objects = original_objects
++
+     def authenticate(self, request: Request):
+         prefixed_key = self.get_key(request)
+ 
+@@ -43,13 +60,15 @@ class TenantAPIKeyAuthentication(BaseAPIKeyAuth):
+             api_key_pk = UUID(api_key_pk)
+ 
+         try:
+-            api_key_instance = TenantAPIKey.objects.get(id=api_key_pk, prefix=prefix)
++            api_key_instance = TenantAPIKey.objects.using(MainRouter.admin_db).get(
++                id=api_key_pk, prefix=prefix
++            )
+         except TenantAPIKey.DoesNotExist:
+             raise AuthenticationFailed("Invalid API Key.")
+ 
+         # Update last_used_at
+         api_key_instance.last_used_at = timezone.now()
+-        api_key_instance.save(update_fields=["last_used_at"])
++        api_key_instance.save(update_fields=["last_used_at"], using=MainRouter.admin_db)
+ 
+         return entity, {
+             "tenant_id": str(api_key_instance.tenant_id),
+
+
+
+
+@@ -1003,6 +1003,504 @@ class TestCombinedAuthentication:
+         assert api_key.last_used_at is not None
+ 
+ 
++@pytest.mark.django_db
++class TestAPIKeyRLSBypass:
++    """Test RLS bypass fix for API key authentication.
++
++    These tests verify that API key authentication works correctly even when
++    RLS context is not set, which is critical since we don't know the tenant_id
++    until we look up the API key (which itself is protected by RLS).
++
++    The fix ensures all database operations during authentication use the admin
++    database, bypassing RLS constraints.
++    """
++
++    def test_api_key_authentication_without_rls_context(
++        self, create_test_user, tenants_fixture, api_keys_fixture
++    ):
++        """Verify API key authentication works without pre-existing RLS context.
++
++        This is the core fix: authentication must succeed even when prowler.tenant_id
++        is not set, since we need to look up the API key to discover the tenant.
++        """
++        client = APIClient()
++        api_key = api_keys_fixture[0]
++
++        api_key_headers = get_api_key_header(api_key._raw_key)
++        response = client.get(reverse("provider-list"), headers=api_key_headers)
++
++        assert response.status_code == 200
++        assert "data" in response.json()
++
++    def test_api_key_lookup_uses_admin_database(
++        self, create_test_user, tenants_fixture
++    ):
++        """Verify API key lookup uses admin database during authentication.
++
++        The TenantAPIKey model is RLS-protected, so queries against it would
++        normally fail without prowler.tenant_id set. The fix routes lookups
++        to the admin database which bypasses RLS.
++        """
++        client = APIClient()
++        tenant = tenants_fixture[0]
++
++        role = Role.objects.create(
++            tenant_id=tenant.id,
++            name="Admin DB Test Role",
++            unlimited_visibility=True,
++            manage_account=True,
++        )
++        UserRoleR

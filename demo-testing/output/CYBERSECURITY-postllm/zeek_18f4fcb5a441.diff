@@ -1,0 +1,134 @@
+@@ -345,11 +345,6 @@ private:
+ 	// Maps functions (not hooks or events) to upstream compiled names.
+ 	std::unordered_map<std::string, std::string> hashed_funcs;
+ 
+-	// Tracks all of the module names used in activate_bodies__CPP()
+-	// calls, to ensure all of the global names of compiled-to-standalone
+-	// functions are available to subsequent scripts.
+-	std::unordered_set<std::string> module_names;
+-
+ 	// If non-zero, provides a tag used for auxiliary/additional
+ 	// compilation units.
+ 	int addl_tag = 0;
+
+
+
+
+@@ -495,17 +495,14 @@ void CPPCompile::GenFinishInit()
+ 
+ 	NL();
+ 
++	Emit("load_BiFs__CPP();");
++
+ 	if ( standalone )
+-		// BiFs need to be loaded later, because the main
+-		// initialization finishes upon loading of the activation
++		// Note, BiFs will also be loaded again later, because the
++		// main initialization finishes upon loading of the activation
+ 		// script, rather than after all scripts have been parsed
+-		// and BiFs have been loaded.
++		// and plugins (with BiFs) have been loaded.
+ 		Emit("init_globals__CPP();");
+-	else
+-		// For non-standalone, we're only initializing after all
+-		// scripts have been parsed and BiFs loaded, so it's fine
+-		// to go ahead and do so now.
+-		Emit("load_BiFs__CPP();");
+ 
+ 	EndBlock();
+ 	}
+
+
+
+
+@@ -313,7 +313,6 @@ void CPPCompile::GenStandaloneActivation()
+ 
+ 		auto var = extract_var_name(fn);
+ 		auto mod = extract_module_name(fn);
+-		module_names.insert(mod);
+ 
+ 		auto fid = lookup_ID(var.c_str(), mod.c_str(), false, true, false);
+ 		if ( ! fid )
+
+
+
+
+@@ -350,6 +350,11 @@ GlobalInitInfo::GlobalInitInfo(CPPCompile* c, const ID* g, string _CPP_name)
+ 
+ 	exported = g->IsExport();
+ 	val = ValElem(c, nullptr); // empty because we initialize dynamically
++
++	if ( gt->Tag() == TYPE_FUNC && ! g->GetVal() )
++		// Remember this peculiarity so we can recreate it for
++		// error-behavior-compatibility.
++		func_with_no_val = true;
+ 	}
+ 
+ void GlobalInitInfo::InitializerVals(std::vector<std::string>& ivs) const
+@@ -360,6 +365,7 @@ void GlobalInitInfo::InitializerVals(std::vector<std::string>& ivs) const
+ 	ivs.push_back(Fmt(attrs));
+ 	ivs.push_back(val);
+ 	ivs.push_back(Fmt(exported));
++	ivs.push_back(Fmt(func_with_no_val));
+ 	}
+ 
+ CallExprInitInfo::CallExprInitInfo(CPPCompile* c, ExprPtr _e, string _e_name, string _wrapper_class)
+
+
+
+
+@@ -492,6 +492,7 @@ protected:
+ 	int attrs;
+ 	std::string val;
+ 	bool exported;
++	bool func_with_no_val = false; // needed to handle some error situations
+ 	};
+ 
+ // Information for initializing an item corresponding to a Zeek function
+
+
+
+
+@@ -169,7 +169,7 @@ IDPtr lookup_global__CPP(const char* g, const TypePtr& t, bool exported)
+ Func* lookup_bif__CPP(const char* bif)
+ 	{
+ 	auto b = lookup_ID(bif, GLOBAL_MODULE_NAME, false, false, false);
+-	return b ? b->GetVal()->AsFunc() : nullptr;
++	return (b && b->GetVal()) ? b->GetVal()->AsFunc() : nullptr;
+ 	}
+ 
+ FuncValPtr lookup_func__CPP(string name, int num_bodies, vector<p_hash_type> hashes,
+
+
+
+
+@@ -488,10 +488,32 @@ int CPP_EnumMapping::ComputeOffset(InitsManager* im) const
+ void CPP_GlobalInit::Generate(InitsManager* im, std::vector<void*>& /* inits_vec */,
+                               int /* offset */) const
+ 	{
+-	global = lookup_global__CPP(name, im->Types(type), exported);
++	auto& t = im->Types(type);
++	global = lookup_global__CPP(name, t, exported);
+ 
+-	if ( ! global->HasVal() && val >= 0 )
+-		global->SetVal(im->ConstVals(val));
++	if ( ! global->HasVal() )
++		{
++		if ( val >= 0 )
++			// Have explicit initialization value.
++			global->SetVal(im->ConstVals(val));
++
++		else if ( t->Tag() == TYPE_FUNC && ! func_with_no_val )
++			{
++			// Create a matching value so that this global can
++			// be used in other initializations.  The code here
++			// mirrors that in activate_bodies__CPP().
++			auto fn = global->Name();
++			auto ft = cast_intrusive<FuncType>(t);
++
++			vector<StmtPtr> no_bodies;
++			vector<int> no_priorities;
++
++			auto sf = make_intrusive<ScriptFunc>(fn, ft, no_bodies, no_priorities);
++
++			auto v = 

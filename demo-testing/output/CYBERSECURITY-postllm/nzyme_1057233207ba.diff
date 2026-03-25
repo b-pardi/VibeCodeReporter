@@ -1,0 +1,115 @@
+@@ -33,4 +33,11 @@ public class ConnectRegistryKeys {
+             false
+     );
+ 
++    public static final RegistryKey PROVIDED_SERVICES = RegistryKey.create(
++            "connect_provided_services",
++            Optional.empty(),
++            Optional.empty(),
++            false
++    );
++
+ }
+
+
+
+
+@@ -2,30 +2,47 @@ package app.nzyme.core.integrations.geoip;
+ 
+ import app.nzyme.core.NzymeNode;
+ import app.nzyme.core.connect.ConnectRegistryKeys;
+-import app.nzyme.core.integrations.geoip.ipinfo.IpInfoFreeGeoIpAdapter;
+-import app.nzyme.core.integrations.geoip.noop.NoOpGeoIpAdapter;
++import app.nzyme.core.integrations.geoip.ipinfo.IpInfoFreeCountryAsnLookupResult;
+ import app.nzyme.core.util.MetricNames;
+-import app.nzyme.plugin.RegistryCryptoException;
+ import com.codahale.metrics.Gauge;
+ import com.google.common.cache.CacheBuilder;
+ import com.google.common.cache.CacheLoader;
+ import com.google.common.cache.LoadingCache;
++import com.google.common.net.HttpHeaders;
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++import com.maxmind.db.Reader;
++import okhttp3.HttpUrl;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.Response;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.jetbrains.annotations.NotNull;
+ 
++import java.io.ByteArrayInputStream;
++import java.io.IOException;
+ import java.net.InetAddress;
+ import java.util.Optional;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ public class GeoIpService {
+ 
+-    private static final Logger LOG = LogManager.getLogger(IpInfoFreeGeoIpAdapter.class);
++    private static final Logger LOG = LogManager.getLogger(GeoIpService.class);
+ 
+     private final NzymeNode nzyme;
+ 
+     private final LoadingCache<InetAddress, Optional<GeoIpLookupResult>> cache;
+-    private boolean useCaching = true;
++
++    private final ReentrantLock lock = new ReentrantLock();
++    private Reader mmdb = null;
++
++    private final ScheduledExecutorService refresher;
++
++    // Can be disabled if Connect is not set up or GeoIp data source is not enabled in Connect.
++    private boolean isEnabled = false;
+ 
+     public GeoIpService(NzymeNode nzyme) {
+         this.nzyme = nzyme;
+@@ -36,7 +53,7 @@ public class GeoIpService {
+                 .build(new CacheLoader<>() {
+                     @Override
+                     public Optional<GeoIpLookupResult> load(@NotNull InetAddress address) {
+-                        return lookup(address);
++                        return mmdbLookup(address);
+                     }
+                 });
+ 
+@@ -50,69 +67,170 @@ public class GeoIpService {
+         // Reload on configuration change.
+         nzyme.getRegistryChangeMonitor()
+                 .onChange("core", ConnectRegistryKeys.CONNECT_API_KEY.key(), this::reload);
++        nzyme.getRegistryChangeMonitor()
++                .onChange("core", ConnectRegistryKeys.CONNECT_ENABLED.key(), this::reload);
++
++        // Reload if provided services by Connect change.
++        nzyme.getRegistryChangeMonitor()
++                .onChange("core", ConnectRegistryKeys.PROVIDED_SERVICES.key(), this::reload);
++
++        refresher = Executors.newSingleThreadScheduledExecutor(
++                new ThreadFactoryBuilder()
++                        .setDaemon(true)
++                        .setNameFormat("geoip-refresher-%d")
++                        .build()
++        );
++
++        refresher.scheduleAtFixedRate(this::reload, 1, 1, TimeUnit.HOURS);
+     }
+ 
+     private void reload() {
+-        GeoIpAdapter currentAdapter = adapter;
+-
+         // Reload with new registry settings.
+         initialize();
+ 
+         // Clear cache.
+         cache.invalidateAll();
+-
+-        // Shut down previous adapter.
+-        if (currentAdapter != null) {
+-            currentAdapter.shutdown();
+-        }
+     }
+ 
+     public void initialize

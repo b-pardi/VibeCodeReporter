@@ -1,0 +1,111 @@
+@@ -291,5 +291,37 @@ IFA_HOST = IPV6_ADDR_LOOPBACK
+ IFA_LINK = IPV6_ADDR_LINKLOCAL
+ IFA_SITE = IPV6_ADDR_SITELOCAL
+ 
+-# Promiscous mode
+-IFF_PROMISC = 0x100
++# Only for kernels < 3.15 when the net_device_flags enum didn't exist
++# ref include/uapi/linux/if.h
++NET_DEVICE_FLAGS = {
++    "IFF_UP": 0x1,
++    "IFF_BROADCAST": 0x2,
++    "IFF_DEBUG": 0x4,
++    "IFF_LOOPBACK": 0x8,
++    "IFF_POINTOPOINT": 0x10,
++    "IFF_NOTRAILERS": 0x20,
++    "IFF_RUNNING": 0x40,
++    "IFF_NOARP": 0x80,
++    "IFF_PROMISC": 0x100,
++    "IFF_ALLMULTI": 0x200,
++    "IFF_MASTER": 0x400,
++    "IFF_SLAVE": 0x800,
++    "IFF_MULTICAST": 0x1000,
++    "IFF_PORTSEL": 0x2000,
++    "IFF_AUTOMEDIA": 0x4000,
++    "IFF_DYNAMIC": 0x8000,
++    "IFF_LOWER_UP": 0x10000,
++    "IFF_DORMANT": 0x20000,
++    "IFF_ECHO": 0x40000,
++}
++
++# RFC 2863 operational status. Kernels >= 2.6.17. See IF_OPER_* in include/uapi/linux/if.h
++IF_OPER_STATES = (
++    "UNKNOWN",
++    "NOTPRESENT",
++    "DOWN",
++    "LOWERLAYERDOWN",
++    "TESTING",
++    "DORMANT",
++    "UP",
++)
+
+similarity index 88%
+rename from volatility3/framework/plugins/linux/ifconfig.py
+rename to volatility3/framework/plugins/linux/ip.py
+
+
+
+@@ -9,7 +9,7 @@ from volatility3.framework.interfaces import plugins
+ from volatility3.framework.objects import utility
+ 
+ 
+-class Ifconfig(plugins.PluginInterface):
++class Addr(plugins.PluginInterface):
+     """Lists network interface information for all devices"""
+ 
+     _required_framework_version = (2, 0, 0)
+@@ -29,6 +29,7 @@ class Ifconfig(plugins.PluginInterface):
+     def _gather_net_dev_info(self, net_dev):
+         mac_addr = net_dev.get_mac_address()
+         promisc = net_dev.promisc
++        operational_state = net_dev.get_operational_state()
+         iface_name = utility.array_to_string(net_dev.name)
+         iface_ifindex = net_dev.ifindex
+         try:
+@@ -42,15 +43,15 @@ class Ifconfig(plugins.PluginInterface):
+             prefix_len = in_ifaddr.get_prefix_len()
+             scope_type = in_ifaddr.get_scope_type()
+             ip_addr = in_ifaddr.get_address()
+-            yield net_ns_id, iface_ifindex, iface_name, mac_addr, promisc, ip_addr, prefix_len, scope_type
++            yield net_ns_id, iface_ifindex, iface_name, mac_addr, promisc, ip_addr, prefix_len, scope_type, operational_state
+ 
+         # Interface IPv6 Addresses
+-        ip6_ptr = net_dev.ip6_ptr.dereference().cast("inet6_dev")
+-        for inet6_ifaddr in ip6_ptr.get_addresses():
++        inet6_dev = net_dev.ip6_ptr.dereference().cast("inet6_dev")
++        for inet6_ifaddr in inet6_dev.get_addresses():
+             prefix_len = inet6_ifaddr.get_prefix_len()
+             scope_type = inet6_ifaddr.get_scope_type()
+             ip6_addr = inet6_ifaddr.get_address()
+-            yield net_ns_id, iface_ifindex, iface_name, mac_addr, promisc, ip6_addr, prefix_len, scope_type
++            yield net_ns_id, iface_ifindex, iface_name, mac_addr, promisc, ip6_addr, prefix_len, scope_type, operational_state
+ 
+     def _generator(self):
+         vmlinux = self.context.modules[self.config["kernel"]]
+@@ -75,6 +76,7 @@ class Ifconfig(plugins.PluginInterface):
+             ("IP", str),
+             ("Prefix", int),
+             ("Scope Type", str),
++            ("State", str),
+         ]
+ 
+         return renderers.TreeGrid(headers, self._generator())
+
+
+
+
+@@ -4,9 +4,8 @@
+ 
+ import collections.abc
+ import logging
+-import struct
+ import socket as socket_module
+-from typing import Generator, Iterable, Iterator, Optional, Tuple, List
++from typing import Generator, Iterable, Iterator, Optional, Tuple, List, Dict
+ 
+ from volatility3.framework import constants
+ from volatility3.framework.constants.linux import SOCK_TYPES, SOCK_FAMILY
+@@ -14,8 +13,10 @@ from volatility3.framework.constants.linux import IP_PROTOCOLS, IPV6_PROTOCOLS
+ from volatility3.framework.constants.linux import TCP_STATES, NETLINK_PROTOCOLS
+ from volatility3.framework.constants.linux import ETH_PROTOCOLS, BLUETOOTH_STATES
+ from volatility3.framework.constant

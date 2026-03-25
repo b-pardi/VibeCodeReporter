@@ -1,0 +1,119 @@
+@@ -725,27 +725,28 @@ beach:
+ 
+ static RList *kexts_from_load_commands(RKernelCacheObj *obj, RBinFile *bf) {
+ 	RList *kexts = r_list_newf ((RListFree) &r_kext_free);
+-	RBuffer *cache_buf = r_buf_ref (obj->cache_buf);
++	RBuffer *cache_buf = obj->cache_buf;
+ 	ut32 i, ncmds = r_buf_read_le32_at (cache_buf, 16);
+ 	ut64 length = r_buf_size (cache_buf);
+ 
+-	ut32 cursor = sizeof (struct MACH0_(mach_header));
++	ut64 cursor = sizeof (struct MACH0_(mach_header));
+ 	for (i = 0; i < ncmds && cursor < length; i++) {
+ 		ut32 cmdtype = r_buf_read_le32_at (cache_buf, cursor);
+ 		ut32 cmdsize = r_buf_read_le32_at (cache_buf, cursor + 4);
+-		if (!cmdsize || cmdsize + cursor < cursor) {
++		ut64 cmd_end = cursor + (ut64)cmdsize;
++		if (!cmdsize || cmd_end < cursor || cmd_end > length) {
+ 			break;
+ 		}
+ 		if (cmdtype != LC_KEXT) {
+-			cursor += cmdsize;
++			cursor = cmd_end;
+ 			continue;
+ 		}
+ 
+ 		ut64 vaddr = r_buf_read_le64_at (cache_buf, cursor + 8);
+ 		ut64 paddr = r_buf_read_le64_at (cache_buf, cursor + 16);
+ 		st32 padded_name_length = (st32)cmdsize - 32;
+-		if (padded_name_length <= 0 || cmdsize - 32 + cursor >= length || padded_name_length > 0x1000) {
+-			cursor += cmdsize;
++		if (padded_name_length <= 0 || padded_name_length > 0x1000) {
++			cursor = cmd_end;
+ 			continue;
+ 		}
+ 
+@@ -767,7 +768,7 @@ static RList *kexts_from_load_commands(RKernelCacheObj *obj, RBinFile *bf) {
+ 		if (!kext->mach0) {
+ 			free (padded_name);
+ 			r_kext_free (kext);
+-			cursor += cmdsize;
++			cursor = cmd_end;
+ 			continue;
+ 		}
+ 
+@@ -779,13 +780,11 @@ static RList *kexts_from_load_commands(RKernelCacheObj *obj, RBinFile *bf) {
+ 		free (padded_name);
+ 		r_list_push (kexts, kext);
+ 
+-		cursor += cmdsize;
++		cursor = cmd_end;
+ 	}
+ early:
+-	r_buf_free (cache_buf);
+ 	return kexts;
+ beach:
+-	r_buf_free (cache_buf);
+ 	r_list_free (kexts);
+ 	return NULL;
+ }
+@@ -1820,7 +1819,7 @@ static void symbols_from_stubs_vec(RVecRBinSymbol *symbols, RBinFile *bf, HtPP *
+ 	if (!stubs_info) {
+ 		return;
+ 	}
+-	RBuffer *cache_buf = r_buf_ref (obj->cache_buf);
++	RBuffer *cache_buf = obj->cache_buf;
+ 	ut64 stubs_cursor = stubs_info->stubs.offset;
+ 	ut64 stubs_end = stubs_cursor + stubs_info->stubs.size;
+ 
+@@ -1905,7 +1904,6 @@ static void symbols_from_stubs_vec(RVecRBinSymbol *symbols, RBinFile *bf, HtPP *
+ 		RVecRBinSymbol_push_back (symbols, local_sym);
+ 	}
+ 
+-	r_buf_free (cache_buf);
+ 	R_FREE (stubs_info);
+ }
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,137 @@
++#include <r_util.h>
++#include <r_bin.h>
++#include "minunit.h"
++#include "../../libr/bin/format/mach0/mach0_defines.h"
++
++static void write_le32(RBuffer *buf, ut64 off, ut32 value) {
++	ut8 tmp[4];
++	r_write_le32 (tmp, value);
++	r_buf_write_at (buf, off, tmp, sizeof (tmp));
++}
++
++static void write_le64(RBuffer *buf, ut64 off, ut64 value) {
++	ut8 tmp[8];
++	r_write_le64 (tmp, value);
++	r_buf_write_at (buf, off, tmp, sizeof (tmp));
++}
++
++static void write_padded(RBuffer *buf, ut64 off, const char *str, size_t len) {
++	ut8 tmp[16];
++	memset (tmp, 0, sizeof (tmp));
++	r_str_ncpy ((char *)tmp, str, len);
++	r_buf_write_at (buf, off, tmp, len);
++}
++
++static void write_mach0_header(RBuffer *buf, ut64 off, ut32 filetype, ut32 ncmds, ut32 sizeofcmds) {
++	write_le32 (buf, off + offsetof (struct mach_header_64, magic), MH_MAGIC_64);
++	write_le32 (buf, off + offsetof (struct mach_header_64, cputype), CPU_TYPE_ARM64);
++	write_le32 (buf, off + offsetof (struct mach_header_64, cpusubtype), 0);
++	write_le32 (buf, off + offsetof (struct mach_header_64, filetype), filetype);
++	write_le32 (buf, off + offsetof (struct mach_header_64, ncmds), ncmds);
++	write_le32 (buf, off + offsetof (struct mach_header_64, sizeofcmds), sizeofcmds);
++	write_le32 (buf, off + offsetof (struct mach_header_64, flags), MH_PIE);
++	write_le32 (buf, off + offsetof (struct mach_header_64, reserved), 0);
++}
++
++static void write_segsect64(RBuffer *buf, ut64 off, const char *segname, const char *sectname, ut64 vaddr, ut64 paddr) {
++	const ut32 cmdsize = sizeof (struct segment_command_

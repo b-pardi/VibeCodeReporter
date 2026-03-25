@@ -1,0 +1,154 @@
+@@ -60,6 +60,8 @@ int generate_llvm = 0;
+ int execute_llvm = 0;
+ extern bool panda_tb_chaining;
+ 
++extern bool panda_exit_loop;
++
+ /* -icount align implementation. */
+ 
+ typedef struct SyncClocks {
+@@ -742,6 +744,9 @@ int cpu_exec(CPUState *cpu)
+     init_delay_params(&sc, cpu);
+ 
+     for(;;) {
++
++        if (panda_exit_loop) break;       
++
+         /* prepare setjmp context for exception handling */
+         if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+             TranslationBlock *tb, *last_tb = NULL;
+@@ -753,15 +758,20 @@ int cpu_exec(CPUState *cpu)
+             }
+ 
+             for(;;) {
++
++                if (panda_exit_loop) break;
++
+                 bool panda_invalidate_tb = false;
+                 debug_checkpoint(cpu);
+                 detect_infinite_loops();
+                 rr_maybe_progress();
++
+                 //bdg Replay skipped calls from the I/O thread here
+                 if (rr_in_replay()) {
+                     rr_skipped_callsite_location = RR_CALLSITE_MAIN_LOOP_WAIT;
+                     rr_replay_skipped_calls();
+                 }
++
+                 cpu_handle_interrupt(cpu, &last_tb);
+                 panda_before_find_fast();
+                 tb = tb_find(cpu, last_tb, tb_exit);
+@@ -786,6 +796,7 @@ int cpu_exec(CPUState *cpu)
+                 if (rr_mode == RR_REPLAY && rr_replay_finished()) {
+                     rr_do_end_replay(0);
+                     qemu_cpu_kick(cpu);
++                    panda_exit_loop = true;
+                     break;
+                 }
+                 if (!rr_in_replay() || until_interrupt > 0) {
+@@ -821,5 +832,6 @@ int cpu_exec(CPUState *cpu)
+ 
+     /* Does not need atomic_mb_set because a spurious wakeup is okay.  */
+     atomic_set(&tcg_current_cpu, NULL);
++
+     return ret;
+ }
+
+
+
+
+@@ -84,6 +84,11 @@ static unsigned int throttle_percentage;
+ #define CPU_THROTTLE_PCT_MAX 99
+ #define CPU_THROTTLE_TIMESLICE_NS 10000000
+ 
++extern void panda_callbacks_top_loop(void);
++
++extern bool rr_replay_complete;
++extern bool panda_exit_loop;
++
+ bool cpu_is_stopped(CPUState *cpu)
+ {
+     return cpu->stopped || !runstate_is_running();
+@@ -1188,6 +1193,11 @@ static void *qemu_tcg_cpu_thread_fn(void *arg)
+     cpu = first_cpu;
+ 
+     while (1) {
++
++        if (!rr_replay_complete) {
++            panda_callbacks_top_loop();
++        }
++
+         /* Account partial waits to QEMU_CLOCK_VIRTUAL.  */
+         qemu_account_warp_timer();
+ 
+@@ -1214,6 +1224,13 @@ static void *qemu_tcg_cpu_thread_fn(void *arg)
+                 break;
+             }
+ 
++            if (panda_exit_loop) {
++                printf ("exiting loop in cpus.c. \n");
++                panda_exit_loop = false;
++                break;
++            }
++
++
+         } /* for cpu.. */
+ 
+         /* Pairs with smp_wmb in qemu_cpu_kick.  */
+@@ -1223,6 +1240,7 @@ static void *qemu_tcg_cpu_thread_fn(void *arg)
+ 
+         qemu_tcg_wait_io_event(QTAILQ_FIRST(&cpus));
+         deal_with_unplugged_cpus();
++
+     }
+ 
+     return NULL;
+
+
+
+
+@@ -31,4 +31,6 @@ void panda_callbacks_asid_changed(CPUState *env, target_ulong old_asid, target_u
+ // vl.c
+ void panda_callbacks_after_machine_init(void);
+ 
++void panda_callbacks_top_loop(void);
++
+ #endif
+
+
+
+
+@@ -76,6 +76,8 @@ typedef enum panda_cb_type {
+     PANDA_CB_REPLAY_HANDLE_PACKET,   // in replay, packet in / out
+     PANDA_CB_AFTER_MACHINE_INIT,     // Right after the machine is initialized, before any code runs
+ 
++    PANDA_CB_TOP_LOOP,               // at top of loop that manages emulation.  good place to take a snapshot
++
+     PANDA_CB_LAST
+ } panda_cb_type;
+ 
+@@ -589,6 +591,8 @@ typedef union panda_cb {
+ 
+   void (*after_machine_init)(CPUState *env);
+ 
++  void (*top_loop)(CPUState *env);
++
+ } panda_cb;
+ 
+ // Doubly linked list that stores a callback, along with its owner
+
+
+
+
+@@ -196,4 +196,6 @@ static inline uint64_t rr_num_instr_before_next_interrupt(void) {
+ uint32_t rr_checksum_memory(void);
+ uint32_t rr_checksum_regs(void);
+ 
++bool rr_queue_empty(void);
++
+ #endif
+
+
+
+
+@@ -21,6 +21,11 @

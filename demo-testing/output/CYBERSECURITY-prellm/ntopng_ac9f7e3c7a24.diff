@@ -1,0 +1,111 @@
+@@ -167,7 +167,7 @@ typedef struct ether80211q {
+ 
+ typedef struct {
+   u_int32_t pid, father_pid;
+-  char process_name[16], father_process_name[16];
++  char *process_name, *father_process_name;
+   u_int32_t uid /* User Id */, gid; /* Group Id */
+   u_int32_t father_uid /* User Id */, father_gid; /* Group Id */
+ #if 0
+
+
+
+
+@@ -176,10 +176,18 @@ Flow::~Flow() {
+   if(srv_host) srv_host->decNumFlows(false, cli_host), srv_host->decUses();
+ 
+   if(json_info)        free(json_info);
+-  if(client_proc)      free(client_proc);
+-  if(server_proc)      free(server_proc);
+   if(host_server_name) free(host_server_name);
+ 
++  if(client_proc) {
++    if(client_proc->process_name) free(client_proc->process_name);
++    if(client_proc->father_process_name) free(client_proc->father_process_name);
++    free(client_proc);
++  }
++  
++  if(server_proc) {
++    free(server_proc);
++  }
++
+   if(isHTTP()) {
+     if(protos.http.last_method) free(protos.http.last_method);
+     if(protos.http.last_url)    free(protos.http.last_url);
+@@ -1488,7 +1496,7 @@ void Flow::processLua(lua_State* vm, ProcessInfo *proc, bool client) {
+   Host *src = get_cli_host(), *dst = get_srv_host();
+   struct passwd *pwd;
+   
+-  if((src == NULL) || (dst == NULL)) return;
++  if((src == NULL) || (dst == NULL) || (proc->pid == 0)) return;
+ 
+   lua_newtable(vm);
+ 
+@@ -1546,7 +1554,7 @@ void Flow::lua(lua_State* vm, AddressTree * ptree,
+     lua_push_str_table_entry(vm, "cli.ip",
+ 			     src->get_ip()->printMask(buf, sizeof(buf),
+ 						      src->isLocalHost()));
+-    if(src->get_vlan_id())
++   if(src->get_vlan_id())
+       lua_push_uint64_table_entry(vm, "cli.vlan", src->get_vlan_id());
+ 
+     lua_push_uint64_table_entry(vm, "cli.key", mask_cli_host ? 0 : src->key());
+@@ -3609,11 +3617,14 @@ void Flow::setProcessInfo(eBPFevent *event, bool client_process) {
+ 
+     c->pid = proc->tid ? proc->tid : proc->pid,
+       c->father_pid = father->tid ? father->tid : father->pid,
+-      snprintf(c->process_name, sizeof(c->process_name), "%s", proc->task),
+-      snprintf(c->father_process_name, sizeof(c->father_process_name), "%s", father->task),
+       c->uid = proc->uid, c->gid = proc->gid,
+       c->father_uid = father->uid, c->father_gid = father->gid;
+ 
++    if(c->process_name) free(c->process_name);
++    c->process_name = strdup(proc->full_task_path ? proc->full_task_path : proc->task);
++    if(c->father_process_name) free(c->father_process_name);
++    c->father_process_name = strdup(father->full_task_path ? father->full_task_path : father->task);
++
+     /* TODO: handle latency_usec */
+   }
+ }
+
+
+
+
+@@ -8642,7 +8642,9 @@ bool LuaEngine::setParamsTable(lua_State* vm,
+ 	  /* Now make sure that decoded_buf is not a file path */
+ 	  if(strchr(decoded_buf, CONST_PATH_SEP)
+ 	     && Utils::file_exists(decoded_buf)
+-	     && !Utils::dir_exists(decoded_buf))
++	     && !Utils::dir_exists(decoded_buf)
++	     && strcmp(tok, "pid_name") /* This is the only exception */
++	     )
+ 	    ntop->getTrace()->traceEvent(TRACE_WARNING, "Discarded '%s'='%s' as argument is a valid file path",
+ 					 tok, decoded_buf);
+ 	  else
+
+
+
+
+@@ -1906,39 +1906,19 @@ void NetworkInterface::purgeIdle(time_t when) {
+ 
+ #ifdef EBPF_DEBUG
+ 
+-static void IPV4Handler(Flow *f, struct ipv4_kernel_data *event) {  
++static void IPV4Handler(Flow *f, eBPFevent *e) {
++  struct ipv4_kernel_data *event = &e->event.v4;
+   char buf1[32], buf2[32];
+-
+-#ifdef USER_READLINK
+-  char what[256], sym[256] = { '\0' };
+-  char fwhat[256], fsym[256] = { '\0' };
+-
+-  snprintf(what, sizeof(what), "/proc/%u/exe", event->proc.pid);
+-  readlink(what, sym, sizeof(sym));
+-  
+-  snprintf(fwhat, sizeof(fwhat), "/proc/%u/exe", event->father.pid);
+-  readlink(fwhat, fsym, sizeof(fsym));
+-#endif
+   
+   ntop->getTrace()->traceEvent(TRACE_NORMAL,
+-			       "[%s][IPv4/%s][%s][pid/tid: %u/%u (%s), uid/gid: %u/%u][father pid/tid: %u/%u (%s), uid/gid: %u/%u][addr: %s:%u <-> %s:%u][latency: %.2f msec]\n",
+-			       f ? "** MATCH **" : "NOT MATCH", event->net.is_tcp ?

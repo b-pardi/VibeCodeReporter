@@ -1,0 +1,136 @@
+@@ -601,7 +601,12 @@ skip_service_lookup:
+ 			return ret;
+ 
+ 		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, HOST_IFINDEX);
++
++#ifdef HOST_REDIRECT_TO_INGRESS
++		return redirect(HOST_IFINDEX, BPF_F_INGRESS);
++#else
+ 		return redirect(HOST_IFINDEX, 0);
++#endif
+ 	}
+ 
+ 	/* After L4 write in port mapping: revalidate for direct packet access */
+@@ -670,7 +675,11 @@ to_host:
+ 				  forwarding_reason, monitor);
+ 
+ 		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, HOST_IFINDEX);
++#ifdef HOST_REDIRECT_TO_INGRESS
++		return redirect(HOST_IFINDEX, BPF_F_INGRESS);
++#else
+ 		return redirect(HOST_IFINDEX, 0);
++#endif
+ 	}
+ 
+ pass_to_stack:
+@@ -712,7 +721,7 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV4_FROM_LXC) int tail_handle_ipv4
+ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_ARP) int tail_handle_arp(struct __sk_buff *skb)
+ {
+ 	union macaddr mac = NODE_MAC;
+-	return arp_respond(skb, &mac);
++	return arp_respond(skb, &mac, 0);
+ }
+ #endif /* ENABLE_ARP_RESPONDER */
+ #endif /* ENABLE_IPV4 */
+@@ -1024,6 +1033,12 @@ ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 			return DROP_WRITE_ERROR;
+ 
+ 		skb->cb[CB_IFINDEX] = HOST_IFINDEX;
++
++#ifdef HOST_REDIRECT_TO_INGRESS
++		return redirect(HOST_IFINDEX, BPF_F_INGRESS);
++#else
++		return redirect(HOST_IFINDEX, 0);
++#endif
+ 	} else { // Not redirected to host / proxy.
+ 		send_trace_notify(skb, TRACE_TO_LXC, src_label, SECLABEL,
+ 				  LXC_ID, ifindex, *forwarding_reason, monitor);
+
+
+
+
+@@ -34,6 +34,7 @@
+ 
+ #include "lib/utils.h"
+ #include "lib/common.h"
++#include "lib/arp.h"
+ #include "lib/maps.h"
+ #include "lib/ipv6.h"
+ #include "lib/ipv4.h"
+@@ -399,7 +400,12 @@ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ 		/* Let through packets to the node-ip so they are
+ 		 * processed by the local ip stack */
+ 		if (ep->flags & ENDPOINT_F_HOST)
++#ifdef HOST_REDIRECT_TO_INGRESS
++			/* This is required for L7 proxy to send packets to the host. */
++			return redirect(HOST_IFINDEX, BPF_F_INGRESS);
++#else
+ 			return TC_ACT_OK;
++#endif
+ 
+ 		return ipv4_local_delivery(skb, ETH_HLEN, l4_off, secctx, ip4, ep, METRIC_INGRESS);
+ 	}
+@@ -424,6 +430,10 @@ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ 	}
+ #endif
+ 
++#ifdef HOST_REDIRECT_TO_INGRESS
++    return redirect(HOST_IFINDEX, BPF_F_INGRESS);
++#else
++
+ #ifdef FROM_HOST
+ 	/* The destination IP address could not be associated with a local
+ 	 * endpoint or a tunnel destination. If it is destined to an IP in
+@@ -433,6 +443,7 @@ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ 		return DROP_NON_LOCAL;
+ #endif
+ 	return TC_ACT_OK;
++#endif
+ }
+ 
+ #define CB_SRC_IDENTITY 0
+@@ -489,6 +500,14 @@ int from_netdev(struct __sk_buff *skb)
+ 
+ #ifdef FROM_HOST
+ 	if (1) {
++
++#ifdef HOST_REDIRECT_TO_INGRESS
++	if (skb->protocol == bpf_htons(ETH_P_ARP)) {
++		union macaddr mac = HOST_IFINDEX_MAC;
++		return arp_respond(skb, &mac, BPF_F_INGRESS);
++	}
++#endif
++
+ 		int trace = TRACE_FROM_HOST;
+ 		bool from_proxy;
+ 
+@@ -527,6 +546,7 @@ int from_netdev(struct __sk_buff *skb)
+ 		 * this notification is unlikely to succeed. */
+ 		return send_drop_notify_error(skb, DROP_MISSED_TAIL_CALL,
+ 		                              TC_ACT_OK, METRIC_INGRESS);
++
+ #endif
+ 
+ 	default:
+
+
+
+
+@@ -62,7 +62,7 @@ static inline int arp_prepare_response(struct __sk_buff *skb, struct ethhdr *eth
+ 	return 0;
+ }
+ 
+-static inline int arp_respond(struct __sk_buff *skb, union macaddr *mac)
++static inline int arp_respond(struct __sk_buff *skb, union macaddr *mac, int direction)
+ {
+ 	void *data_end = (void *) (long) skb->data_end;
+ 	void *data = (void *) (long) skb->data;
+@@ -83,7 +83,7 @@ static inline int arp_respond(struct __sk_buff *skb, union macaddr *mac)
+ 			goto error;
+ 
+ 		cilium_dbg_capture(skb, DBG_CAPTURE_DELIVERY, skb->ifindex);
+-		return redirect(skb->ifindex, 0);
++		return redirect(skb->ifindex, direction);
+ 	}
+ 
+ 	/* Pass any unknown ARP requests to the Linux stack */

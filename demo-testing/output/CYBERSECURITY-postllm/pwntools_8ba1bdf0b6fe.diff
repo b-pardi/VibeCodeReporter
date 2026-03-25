@@ -1,0 +1,148 @@
+@@ -36,6 +36,7 @@ __all__ = [
+     'util',
+     'update',
+     'version',
++    'windbg',
+ ]
+ 
+ from . import args
+
+
+
+
+@@ -802,15 +802,6 @@ class process(tube):
+         # First check if we are already dead
+         self.poll()
+ 
+-        # close file descriptors
+-        for fd in [self.proc.stdin, self.proc.stdout, self.proc.stderr]:
+-            if fd is not None:
+-                try:
+-                    fd.close()
+-                except IOError as e:
+-                    if e.errno != errno.EPIPE and e.errno != errno.EINVAL:
+-                        raise
+-
+         if not self._stop_noticed:
+             try:
+                 self.proc.kill()
+@@ -820,6 +811,15 @@ class process(tube):
+             except OSError:
+                 pass
+ 
++        # close file descriptors
++        for fd in [self.proc.stdin, self.proc.stdout, self.proc.stderr]:
++            if fd is not None:
++                try:
++                    fd.close()
++                except IOError as e:
++                    if e.errno != errno.EPIPE and e.errno != errno.EINVAL:
++                        raise
++
+ 
+     def fileno(self):
+         if not self.connected():
+
+
+
+
+@@ -3,6 +3,7 @@ from __future__ import division
+ 
+ import errno
+ import socket
++import sys
+ import time
+ 
+ import psutil
+@@ -315,6 +316,42 @@ def status(pid):
+             raise
+     return out
+ 
++def _tracer_windows(pid):
++    import ctypes
++    from ctypes import wintypes
++
++    def _check_bool(result, func, args):
++        if not result:
++            raise ctypes.WinError(ctypes.get_last_error())
++        return args
++
++    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++    OpenProcess = kernel32.OpenProcess 
++    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
++    OpenProcess.restype = wintypes.HANDLE
++    OpenProcess.errcheck = _check_bool
++
++    CheckRemoteDebuggerPresent = kernel32.CheckRemoteDebuggerPresent
++    CheckRemoteDebuggerPresent.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
++    CheckRemoteDebuggerPresent.restype = wintypes.BOOL
++    CheckRemoteDebuggerPresent.errcheck = _check_bool
++
++    CloseHandle = kernel32.CloseHandle
++    CloseHandle.argtypes = [wintypes.HANDLE]
++    CloseHandle.restype = wintypes.BOOL
++    CloseHandle.errcheck = _check_bool
++
++    PROCESS_QUERY_INFORMATION = 0x0400
++    proc_handle = OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
++    present = wintypes.BOOL()
++    CheckRemoteDebuggerPresent(proc_handle, ctypes.byref(present))
++    ret = 0
++    if present.value:
++        ret = pid
++    CloseHandle(proc_handle)
++
++    return ret
++
+ def tracer(pid):
+     """tracer(pid) -> int
+ 
+@@ -329,7 +366,10 @@ def tracer(pid):
+         >>> tracer(os.getpid()) is None
+         True
+     """
+-    tpid = int(status(pid)['TracerPid'])
++    if sys.platform == 'win32':
++        tpid = _tracer_windows(pid)
++    else:
++        tpid = int(status(pid)['TracerPid'])
+     return tpid if tpid > 0 else None
+ 
+ def state(pid):
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,239 @@
++"""
++During exploit development, it is frequently useful to debug the
++target binary under WinDbg. This module provides a simple interface
++to do so under Windows.
++
++Useful Functions
++----------------
++
++- :func:`attach` - Attach to an existing process
++
++Debugging Tips
++--------------
++
++The :func:`attach` and :func:`debug` functions will likely be your bread and
++butter for debugging.
++
++Both allow you to provide a script to pass to WinDbg when it is started, so that
++it can automatically set your breakpoints.
++
++Attaching to Processes
++~~~~~~~~~~~~~~~~~~~~~~
++
++To attach to an existing process, just use :func:`attach`.  You can pass a PID,
++a process name (including file extension), or a :class:`.process`.
++
++Spawning New Processes
++~~~~~~~~~~~~~~~~~~~~~~
++
++Attaching to processes with :func:`attach` is useful, but the state the process
++is in may vary.  If you need to attach to a process very early, and debug it from
++the very first instruction (or even t

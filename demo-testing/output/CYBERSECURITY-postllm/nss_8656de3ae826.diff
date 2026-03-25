@@ -1,0 +1,95 @@
+@@ -78,8 +78,9 @@ class TLSCertificateCompressionExtensionModifier : public TlsExtensionFilter {
+   uint8_t value_;
+ };
+ 
+-/* The function returns a reference to ssl_hs_compressed_certificate. */
+-uint64_t findPointerToCompressedCertificate(DataBuffer plaintext) {
++/* The function returns a reference to a message of the following Handshake
++ * Type. */
++uint64_t findPointerToHandshakeType(DataBuffer plaintext, SSLHandshakeType t) {
+   uint64_t skip = 0;
+   /* struct {
+   **     HandshakeType msg_type;
+@@ -89,8 +90,7 @@ uint64_t findPointerToCompressedCertificate(DataBuffer plaintext) {
+   **     };
+   ** } Handshake;
+   */
+-  while (skip < plaintext.len() &&
+-         plaintext.data()[skip] != ssl_hs_compressed_certificate) {
++  while (skip < plaintext.len() && plaintext.data()[skip] != t) {
+     skip = skip + 1 /* HandshakeType */ + 3 /* length */
+            + (plaintext.data()[skip + 1 /* Handshake.msg_type */] << 16) +
+            (plaintext.data()[skip + 2] << 8) + (plaintext.data()[skip + 3]);
+@@ -111,6 +111,9 @@ class TLSCertificateCompressionCertificateCatcher : public TlsRecordFilter {
+ 
+   bool sawCompressedCertificate() { return received_compressed_certificate_; }
+   uint16_t getCertCompressionAlg() { return used_compression_algorithm_; }
++  void unsetSawCompressedCertificate() {
++    received_compressed_certificate_ = false;
++  }
+ 
+  protected:
+   PacketFilter::Action FilterRecord(const TlsRecordHeader& header,
+@@ -126,7 +129,8 @@ class TLSCertificateCompressionCertificateCatcher : public TlsRecordFilter {
+       return KEEP;
+     }
+ 
+-    uint64_t skip = findPointerToCompressedCertificate(plaintext);
++    uint64_t skip =
++        findPointerToHandshakeType(plaintext, ssl_hs_compressed_certificate);
+     if (skip >= plaintext.len() ||
+         plaintext.data()[skip] != ssl_hs_compressed_certificate) {
+       return KEEP;
+@@ -147,6 +151,72 @@ class TLSCertificateCompressionCertificateCatcher : public TlsRecordFilter {
+   uint16_t used_compression_algorithm_;
+ };
+ 
++class TLSCertificateToEncodedCertificateChanger : public TlsRecordFilter {
++ public:
++  TLSCertificateToEncodedCertificateChanger(const std::shared_ptr<TlsAgent>& a)
++      : TlsRecordFilter(a) {
++    EnableDecryption();
++  }
++
++ protected:
++  PacketFilter::Action FilterRecord(const TlsRecordHeader& header,
++                                    const DataBuffer& record, size_t* offset,
++                                    DataBuffer* output) override {
++    uint8_t inner_content_type;
++    DataBuffer plaintext;
++    uint16_t protection_epoch = 0;
++    TlsRecordHeader out_header(header);
++
++    if (!Unprotect(header, record, &protection_epoch, &inner_content_type,
++                   &plaintext, &out_header)) {
++      return KEEP;
++    }
++
++    uint64_t skip = findPointerToHandshakeType(plaintext, ssl_hs_certificate);
++    if (skip >= plaintext.len() ||
++        plaintext.data()[skip] != ssl_hs_certificate) {
++      return KEEP;
++    }
++
++    DataBuffer plaintextEncodedCert(plaintext);
++    /* ssl_hs_certificate -> ssl_hs_compressed_certificate */
++    plaintextEncodedCert.data()[skip] = ssl_hs_compressed_certificate;
++    /* Next 3 bytes are length*/
++    uint32_t certificateLen = (plaintext.data()[skip + 1] << 16) +
++                              (plaintext.data()[skip + 2] << 8) +
++                              plaintext.data()[skip + 3];
++
++    /* Random Encoding*/
++    const uint8_t encodingId[2] = {0xff, 0x01};
++    /* struct {
++            CertificateCompressionAlgorithm algorithm;
++            uint24 uncompressed_length;
++            opaque compressed_certificate_message<1..2^24-1>;
++       } CompressedCertificate; */
++
++    plaintextEncodedCert.Write(skip + 1, certificateLen + 5,
++                               3);  // 2 bytes for algorithm + 3 bytes for len
++    plaintextEncodedCert.Write(skip + 4, (const uint8_t*)&encodingId, 2);
++    /* the uncompressed_length (the same as we did not change the length of the
++     * cert) */
++    plaintextEncode

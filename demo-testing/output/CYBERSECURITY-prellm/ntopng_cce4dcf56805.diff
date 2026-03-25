@@ -1,0 +1,148 @@
+@@ -41,7 +41,8 @@ class InfluxDBTimeseriesExporter : public TimeseriesExporter {
+   InfluxDBTimeseriesExporter(NetworkInterface *_if);
+   ~InfluxDBTimeseriesExporter();
+ 
+-  bool exportData(lua_State* vm, bool do_lock = true);
++  bool enqueueData(lua_State* vm, bool do_lock = true);
++  char *dequeueData();
+   void flush();
+ };
+ 
+
+
+
+
+@@ -26,11 +26,14 @@
+ 
+ class RRDTimeseriesExporter : public TimeseriesExporter {
+  private:
++  FifoStringsQueue *ts_queue;
++
+  public:
+   RRDTimeseriesExporter(NetworkInterface *_if);
+   ~RRDTimeseriesExporter();
+ 
+-  bool exportData(lua_State* vm, bool do_lock = true);
++  bool enqueueData(lua_State* vm, bool do_lock = true);
++  char *dequeueData();
+   void flush();
+ };
+ 
+
+
+
+
+@@ -41,7 +41,8 @@ class TimeseriesExporter {
+   static int line_protocol_write_line(lua_State* vm, char *dst_line, int dst_line_len,
+ 				      int (*escape_fn)(char *outbuf, int outlen, const char *orig));
+ 
+-  virtual bool exportData(lua_State* vm, bool do_lock = true) = 0;
++  virtual bool  enqueueData(lua_State* vm, bool do_lock = true) = 0;
++  virtual char* dequeueData() = 0;
+   virtual void flush() = 0;
+ };
+ 
+
+
+
+
+@@ -169,6 +169,7 @@
+ #define MAX_FLOW_IDLE            60 /* sec */
+ #define MAX_LOCAL_HOST_IDLE     300 /* sec */
+ #define MAX_REMOTE_HOST_IDLE     60 /* sec */
++#define MAX_RRD_QUEUE_LEN        200000 /* timeseries in the queue */
+ #define INTF_RRD_RAW_DAYS        1
+ #define INTF_RRD_1MIN_DAYS       30
+ #define INTF_RRD_1H_DAYS         100
+
+
+
+
+@@ -273,19 +273,18 @@ using namespace std;
+ #include <radcli/radcli.h>
+ #endif
+ 
+-
+ #include "TimeseriesPoint.h"
+ #include "TimeseriesRingStatus.h"
+ #include "TimeseriesRing.h"
+-#include "TimeseriesExporter.h"
+-#include "InfluxDBTimeseriesExporter.h"
+-#include "RRDTimeseriesExporter.h"
+ #include "TimeseriesRing.h"
+ #include "HostTimeseriesPoint.h"
+ #include "FifoQueue.h"
+ #include "FifoStringsQueue.h"
+ #include "FifoSerializerQueue.h"
+ #include "SPSCQueue.h"
++#include "TimeseriesExporter.h"
++#include "InfluxDBTimeseriesExporter.h"
++#include "RRDTimeseriesExporter.h"
+ #include "L4Stats.h"
+ #include "AlertsQueue.h"
+ #include "NetworkInterfaceTsPoint.h"
+
+
+
+
+@@ -83,7 +83,7 @@ void InfluxDBTimeseriesExporter::createDump() {
+ 
+ /* ******************************************************* */
+ 
+-bool InfluxDBTimeseriesExporter::exportData(lua_State* vm, bool do_lock) {
++bool InfluxDBTimeseriesExporter::enqueueData(lua_State* vm, bool do_lock) {
+   char data[LINE_PROTOCOL_MAX_LINE];
+ 
+   if(line_protocol_write_line(vm, data, sizeof(data), escape_spaces) < 0)
+@@ -118,6 +118,13 @@ bool InfluxDBTimeseriesExporter::exportData(lua_State* vm, bool do_lock) {
+ 
+ /* ******************************************************* */
+ 
++char* InfluxDBTimeseriesExporter::dequeueData() {
++  /* Dequeued straigth from a Redis queue in influxdb.lua */
++  return NULL;
++}
++
++/* ******************************************************* */
++
+ void InfluxDBTimeseriesExporter::flush() {
+   m.lock(__FILE__, __LINE__);
+ 
+
+
+
+
+@@ -2932,7 +2932,7 @@ static int ntop_append_influx_db(lua_State* vm) {
+ 
+   if((ntop_interface = getCurrentInterface(vm))
+      && ntop_interface->getInfluxDBTSExporter()
+-     && ntop_interface->getInfluxDBTSExporter()->exportData(vm))
++     && ntop_interface->getInfluxDBTSExporter()->enqueueData(vm))
+     rv = true;
+ 
+   lua_pushboolean(vm, rv);
+@@ -2941,6 +2941,51 @@ static int ntop_append_influx_db(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_rrd_queue_push(lua_State* vm) {
++  bool rv = false;
++  NetworkInterface *ntop_interface;
++  TimeseriesExporter *ts_exporter;
++
++    if((ntop_interface = getCurrentInterface(vm))
++       && (ts_exporter = ntop_interface->getRRDTSExporter())) {
++      ts_exporter->enqueueData(vm);
++      rv = true;
++    }
++
++  lua_pushboolean(vm, rv);
++  return CONST_LUA_OK;
++}
++
++/* ****************************************** */
++
++static int ntop_rrd_queue_pop(lua_State* vm) {
++  int ifid;
++  NetworkInterface* iface;
++  Timeser

@@ -1,0 +1,116 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,786 @@
++# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
++# which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
++#
++
++# This module attempts to locate windows console histories.
++
++import logging
++import os
++import struct
++from typing import Tuple, Generator, Set, Dict, Any, Type
++
++from volatility3.framework import interfaces, symbols, exceptions
++from volatility3.framework import renderers
++from volatility3.framework.configuration import requirements
++from volatility3.framework.layers import scanners
++from volatility3.framework.objects import utility
++from volatility3.framework.renderers import format_hints
++from volatility3.framework.symbols import intermed
++from volatility3.framework.symbols.windows import pdbutil, versions
++from volatility3.framework.symbols.windows.extensions import pe, consoles
++from volatility3.plugins.windows import pslist, vadinfo, info, verinfo
++from volatility3.plugins.windows.registry import hivelist
++
++
++try:
++    import capstone
++
++    has_capstone = True
++except ImportError:
++    has_capstone = False
++
++vollog = logging.getLogger(__name__)
++
++
++class Consoles(interfaces.plugins.PluginInterface):
++    """Looks for Windows console buffers"""
++
++    _required_framework_version = (2, 4, 0)
++
++    @classmethod
++    def get_requirements(cls):
++        # Since we're calling the plugin, make sure we have the plugin's requirements
++        return [
++            requirements.ModuleRequirement(
++                name="kernel",
++                description="Windows kernel",
++                architectures=["Intel32", "Intel64"],
++            ),
++            requirements.VersionRequirement(
++                name="pslist", component=pslist.PsList, version=(2, 0, 0)
++            ),
++            requirements.VersionRequirement(
++                name="pdbutil", component=pdbutil.PDBUtility, version=(1, 0, 0)
++            ),
++            requirements.PluginRequirement(
++                name="hivelist", plugin=hivelist.HiveList, version=(1, 0, 0)
++            ),
++            requirements.BooleanRequirement(
++                name="no_registry",
++                description="Don't search the registry for possible values of CommandHistorySize and HistoryBufferMax",
++                optional=True,
++                default=False,
++            ),
++            requirements.ListRequirement(
++                name="max_history",
++                element_type=int,
++                description="CommandHistorySize values to search for.",
++                optional=True,
++                default=[50],
++            ),
++            requirements.ListRequirement(
++                name="max_buffers",
++                element_type=int,
++                description="HistoryBufferMax values to search for.",
++                optional=True,
++                default=[4],
++            ),
++        ]
++
++    @classmethod
++    def find_conhost_proc(
++        cls, proc_list: Generator[interfaces.objects.ObjectInterface, None, None]
++    ) -> Tuple[interfaces.context.ContextInterface, str]:
++        """
++        Walks the process list and returns the conhost instances.
++
++        Args:
++            proc_list: The process list generator
++
++        Return:
++            The process object and layer name for conhost
++        """
++
++        for proc in proc_list:
++            try:
++                proc_id = proc.UniqueProcessId
++                proc_layer_name = proc.add_process_layer()
++
++                yield proc, proc_layer_name
++
++            except exceptions.InvalidAddressException as excp:
++                vollog.debug(
++                    "Process {}: invalid address {} in layer {}".format(
++                        proc_id, excp.invalid_address, excp.layer_name
++                    )
++                )
++
++    @classmethod
++    def find_conhostexe(
++        cls, conhost_proc: interfaces.context.ContextInterface
++    ) -> Tuple[i

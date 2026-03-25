@@ -1,0 +1,142 @@
+@@ -148,6 +148,7 @@ enum pkt_layer {
+ 
+ 	/* IPv6 extension headers */
+ 	PKT_LAYER_IPV6_HOP_BY_HOP,
++	PKT_LAYER_IPV6_ROUTING,
+ 	PKT_LAYER_IPV6_AUTH,
+ 	PKT_LAYER_IPV6_DEST,
+ 
+@@ -328,6 +329,10 @@ struct ipv6_opt_hdr *pktgen__append_ipv6_extension_header(struct pktgen *builder
+ 		length = (0 + 1) << 3;
+ 		hdr = pktgen__push_rawhdr(builder, length, PKT_LAYER_IPV6_HOP_BY_HOP);
+ 		break;
++	case NEXTHDR_ROUTING:
++		hdr = pktgen__push_rawhdr(builder, length, PKT_LAYER_IPV6_ROUTING);
++		hdrlen = length;
++		break;
+ 	case NEXTHDR_AUTH:
+ 		length = (2 + 2) << 2;
+ 		hdr = pktgen__push_rawhdr(builder, length, PKT_LAYER_IPV6_AUTH);
+@@ -852,6 +857,9 @@ static __always_inline void pktgen__finish_ipv6(const struct pktgen *builder, in
+ 	case PKT_LAYER_IPV6_HOP_BY_HOP:
+ 		ipv6_layer->nexthdr = NEXTHDR_HOP;
+ 		break;
++	case PKT_LAYER_IPV6_ROUTING:
++		ipv6_layer->nexthdr = NEXTHDR_ROUTING;
++		break;
+ 	case PKT_LAYER_IPV6_AUTH:
+ 		ipv6_layer->nexthdr = NEXTHDR_AUTH;
+ 		break;
+@@ -904,6 +912,9 @@ static __always_inline void pktgen__finish_ipv6_opt(const struct pktgen *builder
+ 	case PKT_LAYER_IPV6_HOP_BY_HOP:
+ 		ipv6_opt_layer->nexthdr = NEXTHDR_HOP;
+ 		break;
++	case PKT_LAYER_IPV6_ROUTING:
++		ipv6_opt_layer->nexthdr = NEXTHDR_ROUTING;
++		break;
+ 	case PKT_LAYER_IPV6_AUTH:
+ 		ipv6_opt_layer->nexthdr = NEXTHDR_AUTH;
+ 		break;
+@@ -1040,6 +1051,7 @@ void pktgen__finish(const struct pktgen *builder)
+ 			break;
+ 
+ 		case PKT_LAYER_IPV6_HOP_BY_HOP:
++		case PKT_LAYER_IPV6_ROUTING:
+ 		case PKT_LAYER_IPV6_AUTH:
+ 		case PKT_LAYER_IPV6_DEST:
+ 			pktgen__finish_ipv6_opt(builder, i);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,613 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++#include <bpf/ctx/skb.h>
++#include <linux/in.h>
++#include "pktgen.h"
++
++/* Enable code paths under test */
++#define ENABLE_IPV4
++#define ENABLE_IPV6
++#define ENABLE_SRV6
++#ifdef TUNNEL_MODE
++#undef TUNNEL_MODE
++#endif
++#define ENABLE_HOST_ROUTING
++#define ENABLE_NODEPORT
++
++/* Test SRH encap. Reduced encap code path is a subset of SRH encap */
++#define ENABLE_SRV6_SRH_ENCAP
++
++#include "bpf_host.c"
++#include "lib/ipcache.h"
++#include "lib/endpoint.h"
++#include "lib/lb.h"
++
++#define FROM_NETDEV 0
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 1);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[FROM_NETDEV] = &cil_from_netdev,
++	},
++};
++
++#define POD_IPV4 v4_pod_one
++#define POD_IPV6 v6_pod_one
++#define EXT_IPV4 v4_ext_one
++#define EXT_IPV6 v6_pod_two
++#define OUTER_SRC v6_node_one
++#define SID v6_node_two
++#define ROUTER_MAC mac_one
++#define POD_MAC mac_two
++#define SERVICE_IPV4 v4_svc_one
++#define SERVICE_IPV6 v6_node_three
++#define CLIENT_PORT __bpf_htons(12345)
++#define SERVICE_PORT __bpf_htons(80)
++
++PKTGEN("tc", "tc_srv6_decap_to_pod_ipv4")
++int srv6_decap_to_pod_ipv4_pktgen(struct __ctx_buff *ctx)
++{
++	struct pktgen builder;
++	struct ethhdr *l2;
++	struct ipv6hdr *outer_l3;
++	struct srv6_srh *srh;
++	struct iphdr *inner_l3;
++	struct tcphdr *l4;
++	void *data;
++
++	pktgen__init(&builder, ctx);
++
++	l2 = pktgen__push_ethhdr(&builder);
++	if (!l2)
++		return TEST_FAIL;
++
++	/* We don't set mac addresses. It doesn't matter. */
++
++	outer_l3 = pktgen__push_default_ipv6hdr(&builder);
++	if (!outer_l3)
++		return TEST_FAIL;
++
++	memcpy(outer_l3->daddr.s6_addr, (const void *)SID, sizeof(SID));
++	memcpy(outer_l3->saddr.s6_addr, (const void *)OUTER_SRC, sizeof(OUTER_SRC));
++
++	srh = (struct srv6_srh *)pktgen__append_ipv6_extension_header(&builder,
++			NEXTHDR_ROUTING, sizeof(*srh) + sizeof(union v6addr));
++	if (!srh)
++		return TEST_FAIL;
++
++	srh->rthdr.nexthdr = IPPROTO_IPIP; /* Inner IP */
++	srh->rthdr.hdrlen = 2;             /* 24B (excluding first 8B) */
++	srh->rthdr.type = 4;               /* Segment Routing Header */
++	srh->rthdr.segments_left = 0;      /* Single SID */
++	srh->first_segment = 0;            /* Single SID */
++	srh->flags = 

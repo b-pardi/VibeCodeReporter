@@ -1,0 +1,101 @@
+@@ -38,6 +38,7 @@ class Analysis(MongoDict):
+         self['pending_modules'] = []
+         self['waiting_modules'] = []
+         self['canceled_modules'] = []
++        self['preloading_modules'] = []
+         self['tags'] = []
+         self['iocs'] = []
+         self['results'] = {}
+@@ -58,12 +59,28 @@ class Analysis(MongoDict):
+ 
+         if '_id' not in self:
+             self._init_threat_intelligence()
++
++            # Sort preloading and processing modules
++            if self['modules']:
++                processing = []
++
++                for module_name in self['modules']:
++                    module = dispatcher.get_module(module_name)
++
++                    if module.info['type'] == "Preloading":
++                        self['preloading_modules'].append(module_name)
++                    else:
++                        processing.append(module_name)
++
++                self['modules'] = processing
++
+             self.save()
+ 
+             if self['modules']:
+                 self.queue_modules(self['modules'])
+-            else:
+-                self._automatic()
++
++            self._automatic()
++            self.resume()
+ 
+     def magic_enabled(self):
+         return ('magic_enabled' not in self['options']) or (self['options']['magic_enabled'])
+@@ -228,6 +245,7 @@ class Analysis(MongoDict):
+ 
+     def add_preloaded_file(self, filepath, fd):
+         f = self._store_preloaded_file(filepath, fd)
++        self._file = f
+ 
+         if f['_id'] != self['file']:
+             f.append_to('analysis', self['_id'])
+@@ -237,10 +255,10 @@ class Analysis(MongoDict):
+                 f.save()
+ 
+             self['file'] = f['_id']
+-            self._file = f
+             self.save()
+ 
+-        self._automatic(preloading_done=True)
++        # Queue general purpose modules if necessary
++        self._automatic()
+ 
+     # Starts / Resumes an analysis to reach the target module
+     def resume(self):
+@@ -249,21 +267,35 @@ class Analysis(MongoDict):
+         # First, see if there is pending modules remaining
+         if self._run_pending_modules():
+             was_resumed = True
++        # If not and there is no file, look for a preloading module
++        elif self._needs_preloading():
++            try:
++                next_module = dispatcher.next_preloading_module(self['preloading_modules'], self._tried_modules())
++                self.queue_modules(next_module)
++                was_resumed = True
++            except DispatchingException:
++                self.log('warning', 'no preloading module was able to find a file for submitted hash')
++
++                for module in list(self['waiting_modules']):
++                    self._cancel_module(module)
++        # If not, look for a path to a waiting module
+         else:
+-            # If not, look for a path to a waiting module
+-            for module in self['waiting_modules']:
++            for module in list(self['waiting_modules']):
+                 try:
+                     next_module = dispatcher.next_module(self._types_available(), module, self._tried_modules())
+                     self.queue_modules(next_module)
+                     was_resumed = True
+                 except DispatchingException:
+-                    self.remove_from('waiting_modules', module)
+-                    self.append_to('canceled_modules', module)
+-                    self.log('warning', 'could not find execution path to "{}" (cancelled)'.format(module))
++                    self._cancel_module(module)
+ 
+         if not was_resumed and self['status'] != self.STATUS_ERROR:
+             self._mark_as_finished()
+ 
++    def _cancel_module(self, module):
++        self.remove_from('waiting_modules', module)
++        self.append_to('canceled_modules', module)
++        self.log('warning', 'could not find execution path to "{}" (cancelled)'.format(module))
++
+     # Queue execution of specific module(s)
+     def queue_modules(self, modules, fallback_waiting=True):
+         for module_name in iterify(modules

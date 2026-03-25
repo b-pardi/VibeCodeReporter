@@ -1,0 +1,134 @@
+@@ -33,6 +33,7 @@ class DB {
+   FILE *log_fd;
+   NetworkInterface *iface;
+   Mutex *m;
++  bool running;
+ 
+   void open_log();
+  public:
+@@ -43,6 +44,8 @@ class DB {
+   virtual int exec_sql_query(lua_State *vm, char *sql,
+ 			     bool limit_rows, bool wait_for_db_created = true);
+   virtual void startDBLoop();
++  inline int isRunning() { return running; };
++  virtual void shutdown();
+   virtual void flush() {};
+   virtual bool createDBSchema(bool set_db_created = true) {
+ 	  return false; /* override in non-schemaless subclasses */ };
+
+
+
+
+@@ -65,6 +65,7 @@ class MySQLDB : public DB {
+   virtual void flush() { ; };
+   int exec_sql_query(lua_State *vm, char *sql, bool limitRows, bool wait_for_db_created = true);
+   void startDBLoop();
++  void shutdown();
+   void updateStats(const struct timeval *tv);
+   void lua(lua_State* vm, bool since_last_checkpoint) const;
+ #ifdef NTOPNG_PRO
+
+
+
+
+@@ -501,6 +501,7 @@ class NetworkInterface : public Checkpointable {
+   inline u_int64_t  getNumPacketDropsSinceReset() { return getNumPacketDrops() - getCheckPointNumPacketDrops(); }
+ 
+   void runHousekeepingTasks();
++  void runShutdownTasks();
+   Vlan* getVlan(u_int16_t vlanId, bool createIfNotPresent);
+   AutonomousSystem *getAS(IpAddress *ipa, bool createIfNotPresent);
+   Country* getCountry(const char *country_name, bool createIfNotPresent);
+
+
+
+
+@@ -414,6 +414,7 @@ class Ntop {
+   void shutdown();
+   void shutdownAll();
+   void runHousekeepingTasks();
++  void runShutdownTasks();
+   bool isLocalInterfaceAddress(int family, void *addr)       { return(local_interface_addresses.findAddress(family, addr) == -1 ? false : true);    };
+   inline char* getLocalNetworkName(int16_t local_network_id) {
+     return(address->get_local_network((u_int8_t)local_network_id));
+
+
+
+
+@@ -100,7 +100,7 @@ class Prefs {
+   bool read_flows_from_mysql;
+   InterfaceInfo *ifNames;
+   char *local_networks;
+-  bool local_networks_set, shutdown_when_done, simulate_vlans, ignore_vlans;
++  bool local_networks_set, shutdown_when_done, simulate_vlans, ignore_vlans, flush_flows_on_shutdown;
+   char *data_dir, *install_dir, *docs_dir, *scripts_dir,
+ 	  *callbacks_dir, *prefs_dir, *pcap_dir, *export_endpoint;
+   char *categorization_key;
+@@ -268,6 +268,7 @@ class Prefs {
+   inline char* get_es_user()  { return(es_user);  };
+   inline char* get_es_pwd()   { return(es_pwd);   };
+   inline bool shutdownWhenDone() { return(shutdown_when_done); }
++  inline bool flushFlowsOnShutdown() { return(flush_flows_on_shutdown); }
+   inline void set_promiscuous_mode(bool mode)  { use_promiscuous_mode = mode; };
+   inline bool use_promiscuous()         { return(use_promiscuous_mode);  };
+   inline char* get_mysql_host()         { return(mysql_host);            };
+
+
+
+
+@@ -29,6 +29,7 @@ DB::DB(NetworkInterface *_iface) {
+ 
+   iface = _iface;
+   log_fd = NULL;
++  running = false;
+ 
+   open_log();
+ }
+@@ -89,3 +90,9 @@ bool DB::dumpAggregatedFlow(time_t when, AggregatedFlow *f) {
+ #endif
+ 
+ /* ******************************************* */
++
++void DB::shutdown() {
++  running = false;
++}
++
++/* ******************************************* */
+
+
+
+
+@@ -1871,6 +1871,11 @@ u_int32_t Flow::key(Host *_cli, u_int16_t _cli_port,
+ /* *************************************** */
+ 
+ bool Flow::isReadyToPurge() {
++
++  if (ntop->getPrefs()->flushFlowsOnShutdown()
++      && (ntop->getGlobals()->isShutdownRequested() || ntop->getGlobals()->isShutdown()))
++    return(true);
++
+   if(idle()) return(true);
+ 
+ #ifdef HAVE_NEDGE
+
+
+
+
+@@ -144,7 +144,7 @@ bool GenericHash::walk(u_int32_t *begin_slot,
+   bool found = false;
+   u_int16_t tot_matched = 0;
+ 
+-  if(ntop->getGlobals()->isShutdown())
++  if(ntop->getGlobals()->isShutdown() && !ntop->getPrefs()->flushFlowsOnShutdown())
+     return(found);
+ 
+   for(u_int hash_id = *begin_slot; hash_id < num_hashes; hash_id++) {
+
+
+
+
+@@ -44,7 +44,7 @@ void* MySQLDB::queryLoop() {
+   if(ntop->getGlobals()->isShutdown() || !connectToDB(&mysql_alt, true))
+     return(NULL);
+ 
+-  while(!ntop->getGlo

@@ -1,0 +1,141 @@
+@@ -1453,13 +1453,14 @@ R_API RBinFile *r_bin_file_at(RBin *bin, ut64 at) {
+ 	return NULL;
+ }
+ 
+-R_API RBinTrycatch *r_bin_trycatch_new(ut64 source, ut64 from, ut64 to, ut64 handler) {
++R_API RBinTrycatch *r_bin_trycatch_new(ut64 source, ut64 from, ut64 to, ut64 handler, ut64 filter) {
+ 	RBinTrycatch *tc = R_NEW0 (RBinTrycatch);
+ 	if (tc) {
+ 		tc->source = source;
+ 		tc->from = from;
+-		tc->to = to ;
++		tc->to = to;
+ 		tc->handler = handler;
++		tc->filter = filter;
+ 	}
+ 	return tc;
+ }
+
+
+
+
+@@ -690,4 +690,70 @@ typedef struct {
+ 	StringFileInfo* stringFileInfo;   //0 or 1 elements
+ } PE_VS_VERSIONINFO;
+ 
++// Specific for x64 SEH
++
++typedef enum {
++	UWOP_PUSH_NONVOL = 0, /* info == register number */
++	UWOP_ALLOC_LARGE,     /* no info, alloc size in next 2 slots */
++	UWOP_ALLOC_SMALL,     /* info == size of allocation / 8 - 1 */
++	UWOP_SET_FPREG,       /* no info, FP = RSP + UNWIND_INFO.FPRegOffset*16 */
++	UWOP_SAVE_NONVOL,     /* info == register number, offset in next slot */
++	UWOP_SAVE_NONVOL_FAR, /* info == register number, offset in next 2 slots */
++	UWOP_SAVE_XMM128 = 8, /* info == XMM reg number, offset in next slot */
++	UWOP_SAVE_XMM128_FAR, /* info == XMM reg number, offset in next 2 slots */
++	UWOP_PUSH_MACHFRAME   /* info == 0: no error-code, 1: error-code */
++} PE64_UNWIND_CODE_OPS;
++
++#define PE64_UNW_FLAG_NHANDLER 0
++#define PE64_UNW_FLAG_EHANDLER 1
++#define PE64_UNW_FLAG_UHANDLER 2
++#define PE64_UNW_FLAG_CHAININFO 4
++
++typedef struct {
++	ut32 BeginAddress; // Function start address
++	ut32 EndAddress; // Function end address
++	union {
++		ut32 UnwindInfoAddress;
++		ut32 UnwindData;
++	};
++} PE64_RUNTIME_FUNCTION;
++
++typedef union {
++	struct {
++		ut8 CodeOffset;
++		ut8 UnwindOp : 4;
++		ut8 OpInfo : 4;
++	};
++	ut16 FrameOffset;
++} PE64_UNWIND_CODE;
++
++typedef struct {
++	ut8 Version : 3;
++	ut8 Flags : 5;
++	ut8 SizeOfProlog;
++	ut8 CountOfCodes;
++	ut8 FrameRegister : 4;
++	ut8 FrameOffset : 4;
++	PE64_UNWIND_CODE UnwindCode[];
++	/*
++	union {
++		ut32 ExceptionHandler; // if (flags & UNW_FLAG_EHANDLER)
++		PE64_RUNTIME_FUNCTION FunctionEntry;    // else if (flags & UNW_FLAG_CHAININFO)
++	};
++	ut32 ExceptionData[]; // if (flags & UNW_FLAG_EHANDLER)
++	*/
++} PE64_UNWIND_INFO;
++
++typedef struct {
++	ut32 BeginAddress;
++	ut32 EndAddress;
++	ut32 HandlerAddress;
++	ut32 JumpTarget;
++} PE64_SCOPE_RECORD;
++
++typedef struct {
++	ut32 Count;
++	PE64_SCOPE_RECORD ScopeRecord[];
++} PE64_SCOPE_TABLE;
++
+ #endif
+
+
+
+
+@@ -1315,7 +1315,7 @@ static const ut8 *parse_dex_class_method(RBinFile *bf, RBinDexClass *c, RBinClas
+ 					if (dexdump) {
+ 						cb_printf ("        0x%04x - 0x%04x\n", start_addr, (start_addr + insn_count));
+ 					}
+-					RBinTrycatch *tc = r_bin_trycatch_new (method_offset, try_from, try_to, try_catch);
++					RBinTrycatch *tc = r_bin_trycatch_new (method_offset, try_from, try_to, try_catch, 0);
+ 					r_list_append (bin->trycatch_list, tc);
+ 
+ 					//XXX tries_size is tainted and oob here
+
+
+
+
+@@ -313,6 +313,86 @@ static void header(RBinFile *bf) {
+ 
+ extern struct r_bin_write_t r_bin_write_pe64;
+ 
++static RList *trycatch(RBinFile *bf) {
++	RIO *io = bf->rbin->iob.io;
++	ut64 baseAddr = bf->o->baddr;
++	
++	struct PE_(r_bin_pe_obj_t) * bin = bf->o->bin_obj;
++	PE_(image_data_directory) *expdir = &bin->optional_header->DataDirectory[PE_IMAGE_DIRECTORY_ENTRY_EXCEPTION];
++	if (!expdir->Size) {
++		return NULL;
++	}
++
++	RList *tclist = r_list_newf (r_bin_trycatch_free);
++	if (!tclist) {
++		return NULL;
++	}
++
++	for (ut64 offset = expdir->VirtualAddress; offset < (ut64)expdir->VirtualAddress + expdir->Size; offset += sizeof (PE64_RUNTIME_FUNCTION)) {
++		PE64_RUNTIME_FUNCTION rfcn;
++		r_io_read_at_mapped (io, offset + baseAddr, (ut8 *)&rfcn, sizeof (rfcn));
++		if (!rfcn.BeginAddress) {
++			break;
++		}
++		PE64_UNWIND_INFO info;
++		r_io_read_at_mapped (io, rfcn.UnwindData + baseAddr, (ut8 *)&info, sizeof (info));
++		if (!(info.Flags & PE64_UNW_FLAG_EHANDLER) && !(info.Flags & PE64_UNW_FLAG_CHAININFO)) {
++			continue;
++		}
++
++		ut32 sizeOfCodeEntries 

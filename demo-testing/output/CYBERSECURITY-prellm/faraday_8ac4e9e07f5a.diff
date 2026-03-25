@@ -1,0 +1,124 @@
+@@ -8,6 +8,10 @@ See the file 'doc/LICENSE' for the license information
+ 
+ from model.common import factory
+ from persistence.server import models
++from persistence.server.server_io_exceptions import (
++    CantCommunicateWithServerError,
++    ConflictInDatabase
++)
+ 
+ __description__ = 'Creates a new vulnerability'
+ __prettyname__ = 'Create Vulnerability'
+@@ -31,8 +35,6 @@ def main(workspace='', args=None, parser=None):
+                         default='false')
+     parser.add_argument('--description', help='Vulnerability description', default='')
+ 
+-    parser.add_argument('--dry-run', action='store_true', help='Do not touch the database. Only print the object ID')
+-
+     parsed_args = parser.parse_args(args)
+ 
+     obj = factory.createModelObject(models.Vuln.class_signature,
+@@ -53,20 +55,28 @@ def main(workspace='', args=None, parser=None):
+         'parent': parsed_args.parent,
+     }
+ 
+-    old = models.get_vulns(
++    try:
++        models.create_vuln(workspace, obj)
++    except ConflictInDatabase as ex:
++        if ex.answer.status_code == 409:
++            try:
++                old_id = ex.answer.json()['object']['_id']
++            except KeyError:
++                print "Vulnerability already exists. Couldn't fetch ID"
++                return 2, None
++            else:
++                print "A vulnerability with ID %s already exists!" % old_id
++                return 2, None
++        else:
++            print "Unknown error while creating the vulnerability"
++            return 2, None
++    except CantCommunicateWithServerError as ex:
++        print "Error while creating vulnerability:", ex.response.text
++        return 2, None
++
++    new = models.get_vulns(
+         workspace,
+         **params
+     )
+ 
+-    if not old:
+-        if not parsed_args.dry_run:
+-            models.create_vuln(workspace, obj)
+-        old = models.get_vulns(
+-            workspace,
+-            **params
+-        )
+-    else:
+-        print "A vulnerability with ID %s already exists!" % old[0].getID()
+-        return 2, None
+-
+-    return 0, old[0].getID()
++    return 0, new[0].getID()
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,237 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++'''
++Faraday Penetration Test IDE
++Copyright (C) 2018  Infobyte LLC (http://www.infobytesec.com/)
++See the file 'doc/LICENSE' for the license information
++'''
++
++import os
++import sys
++import base64
++import shlex
++import time
++import re
++import requests
++
++
++from subprocess import Popen, PIPE, call
++from persistence.server import models, server
++from persistence.server.server import SERVER_URL
++
++__description__ = 'Script to perform a brute force attack on different services in a workspace'
++__prettyname__ = 'FBrute'
++
++SUPPORTED_SERVICES = ["asterisk", "cisco", "cisco-enable", "cvs", "firebird", "ftp", "ftps", "http",
++                      "https", "http-proxy", "icq" "imap", "imaps", "irc", "ldap2", "ldap3",
++                      "mssql", "mysql", "nntp", "oracle-listener", "oracle-sid", "pcanywhere",
++                      "pcnfs", "pop3", "pop3s", "postgres", "rdp", "redis", "rexec", "rlogin",
++                      "rsh", "rtsp", "s7-300", "sip", "smb", "smtp", "smtps", "smtp-enum", "snmp",
++                      "socks5", "ssh", "sshkey", "svn", "teamspeak", "telnet"
++                      "telnets", "vmauthd", "vnc", "xmpp"]
++
++PID = os.getpid()
++
++def check_hydra():
++    p = Popen(["which", "hydra"], stdout=PIPE)
++    p.communicate()[0]
++    return p.returncode == 0
++
++
++def add_output(output):
++    pwd = os.getcwd()
++    data = {"cmd" : base64.b64encode(output), "pid" : PID, "pwd" : base64.b64encode(pwd)}
++    requests.post("http://localhost:9977/cmd/input", json=data)
++
++
++def send_output(output):
++    output = base64.b64encode(open(output, "r").read())
++    data = {"exit_code" : 0, "pid" : PID, "output" : output}
++    requests.post("http://localhost:9977/cmd/output", json=data)
++
++
++def search_hosts_by_service(workspace, b_service):
++    output = ""
++    

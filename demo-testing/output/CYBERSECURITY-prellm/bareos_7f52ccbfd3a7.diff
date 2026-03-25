@@ -1,0 +1,126 @@
+@@ -464,15 +464,13 @@ static void RemoveJcr(JobControlRecord* jcr)
+   Dmsg0(debuglevel, "Leave RemoveJcr\n");
+ }
+ 
+-static void FreeCommonJcr(JobControlRecord* jcr, bool internal = false)
++static void FreeCommonJcr(JobControlRecord* jcr,
++                          bool is_destructor_call = false)
+ {
+   Dmsg1(100, "FreeCommonJcr: %p \n", jcr);
+ 
+   if (!jcr) { Dmsg0(100, "FreeCommonJcr: Invalid jcr\n"); }
+ 
+-  /*
+-   * Uses jcr lock/unlock
+-   */
+   RemoveJcrFromTsd(jcr);
+   jcr->SetKillable(false);
+ 
+@@ -547,21 +545,22 @@ static void FreeCommonJcr(JobControlRecord* jcr, bool internal = false)
+     jcr->comment = nullptr;
+   }
+ 
+-  if (!internal) { free(jcr); }
++  if (!is_destructor_call) { free(jcr); }
+ }
+ 
+-JobControlRecord::~JobControlRecord()
++static void JcrCleanup(JobControlRecord* jcr, bool is_destructor_call = false)
+ {
+-  Dmsg0(100, "Destruct JobControlRecord\n");
++  DequeueMessages(jcr);
++  CallJobEndCallbacks(jcr); /* call registered callbacks */
+ 
+-  DequeueMessages(this);
+-  CallJobEndCallbacks(this);
++  Dmsg1(debuglevel, "End job=%d\n", jcr->JobId);
+ 
+-  Dmsg1(debuglevel, "End job=%d\n", JobId);
++  /*
++   * Keep some statistics
++   */
++  struct s_last_job* je = nullptr;
+ 
+-  // statistics
+-  struct s_last_job* je;
+-  switch (getJobType()) {
++  switch (jcr->getJobType()) {
+     case JT_BACKUP:
+     case JT_VERIFY:
+     case JT_RESTORE:
+@@ -571,23 +570,22 @@ JobControlRecord::~JobControlRecord()
+       /*
+        * Keep list of last jobs, but not Console where JobId==0
+        */
+-      if (JobId > 0) {
++      if (jcr->JobId > 0) {
+         LockLastJobsList();
+         num_jobs_run++;
+         je = (struct s_last_job*)malloc(sizeof(struct s_last_job));
+-        memset(je, 0,
+-               sizeof(struct s_last_job)); /* zero in case unset fields */
+-        je->Errors = JobErrors;
+-        je->JobType = getJobType();
+-        je->JobId = JobId;
+-        je->VolSessionId = VolSessionId;
+-        je->VolSessionTime = VolSessionTime;
+-        bstrncpy(je->Job, Job, sizeof(je->Job));
+-        je->JobFiles = JobFiles;
+-        je->JobBytes = JobBytes;
+-        je->JobStatus = JobStatus;
+-        je->JobLevel = getJobLevel();
+-        je->start_time = start_time;
++        new (je) s_last_job();
++        je->Errors = jcr->JobErrors;
++        je->JobType = jcr->getJobType();
++        je->JobId = jcr->JobId;
++        je->VolSessionId = jcr->VolSessionId;
++        je->VolSessionTime = jcr->VolSessionTime;
++        bstrncpy(je->Job, jcr->Job, sizeof(je->Job));
++        je->JobFiles = jcr->JobFiles;
++        je->JobBytes = jcr->JobBytes;
++        je->JobStatus = jcr->JobStatus;
++        je->JobLevel = jcr->getJobLevel();
++        je->start_time = jcr->start_time;
+         je->end_time = time(nullptr);
+ 
+         if (!last_jobs) { InitLastJobsList(); }
+@@ -604,25 +602,25 @@ JobControlRecord::~JobControlRecord()
+       break;
+   }
+ 
+-  CloseMsg(this); /* close messages for this job */
++  CloseMsg(jcr); /* close messages for this job */
+ 
+-  if (daemon_free_jcr) { daemon_free_jcr(this); }
++  if (jcr->daemon_free_jcr) {
++    jcr->daemon_free_jcr(jcr); /* call daemon free routine */
++  }
+ 
+-  FreeCommonJcr(this, true);
++  FreeCommonJcr(jcr, is_destructor_call);
+   CloseMsg(nullptr); /* flush any daemon messages */
+-  Dmsg0(debuglevel, "JobControlRecord Destructor finished\n");
+ }
+ 
+-/*
+- * Global routine to free a jcr
+- */
+-void b_free_jcr(const char* file, int line, JobControlRecord* jcr)
++JobControlRecord::~JobControlRecord()
+ {
+-  struct s_last_job* je;
+-
+-  Dmsg3(debuglevel, "Enter FreeJcr jid=%u from %s:%d\n", jcr->JobId, file,
+-        line);
++  Dmsg0(100, "Destruct JobControlRecord\n");
++  JcrCleanup(this, true);
++  Dmsg0(debuglevel, "JobControlRecord Destructor finished\n");
++}
+ 
++static bool RunJcrGarbageCollector(JobControlRecord* jcr)
++{
+   lock_jcr_chain();
+   jcr->DecUseCount(); /* decrement use count */
+   if (jcr->UseCount() < 0) {
+@@ -635,7 +633,7 @@ void b_free_jcr(const char* file, int line, JobControlRecord* jcr)

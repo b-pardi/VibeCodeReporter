@@ -1,0 +1,92 @@
+@@ -2,15 +2,18 @@ package org.batfish.dataplane.ibdp;
+ 
+ import static java.util.Objects.requireNonNull;
+ import static org.batfish.common.util.CollectionUtil.toImmutableSortedMap;
++import static org.batfish.common.util.CollectionUtil.toOrderedHashCode;
+ import static org.batfish.dataplane.rib.AbstractRib.importRib;
+ import static org.batfish.dataplane.rib.RibDelta.importRibDelta;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSortedMap;
+ import com.google.common.graph.Network;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.Optional;
+ import java.util.Queue;
+ import java.util.Set;
+@@ -131,7 +134,7 @@ final class EigrpRoutingProcess implements RoutingProcess<EigrpTopology, EigrpRo
+   @Override
+   public void updateTopology(EigrpTopology topology) {
+     _topology = topology;
+-    updateQueues(topology);
++    updateQueues(_topology);
+     /*
+     TODO:
+       1. Send existing routes to new neighbors
+@@ -141,24 +144,33 @@ final class EigrpRoutingProcess implements RoutingProcess<EigrpTopology, EigrpRo
+ 
+   @Override
+   public void executeIteration(Map<String, Node> allNodes) {
++    _changeSet = RibDelta.builder();
+     if (!_initializationDelta.isEmpty()) {
+       // If we haven't sent out the first round of updates after initialization, do so now. Then
+       // clear the initialization delta
+-      sendOutInternalRoutes(_initializationDelta, allNodes, _topology);
++      sendOutInternalRoutes(_initializationDelta, allNodes);
+       _initializationDelta = RibDelta.empty();
+     }
+ 
++    // TODO: optimize, don't recreate the map each iteration
++    NetworkConfigurations nc =
++        NetworkConfigurations.of(
++            allNodes.entrySet().stream()
++                .collect(
++                    ImmutableMap.toImmutableMap(
++                        Entry::getKey, e -> e.getValue().getConfiguration())));
++
+     // Process internal routes
+-    RibDelta<EigrpInternalRoute> internalDelta = processInternalRoutes();
+-    sendOutInternalRoutes(internalDelta, allNodes, _topology);
++    RibDelta<EigrpInternalRoute> internalDelta = processInternalRoutes(nc);
++    sendOutInternalRoutes(internalDelta, allNodes);
+ 
+     // Send out anything we had queued for redistribution
+-    sendOutExternalRoutes(_queuedForRedistribution, allNodes, _topology);
+-    _queuedForRedistribution = RibDelta.<EigrpExternalRoute>builder().build();
++    sendOutExternalRoutes(_queuedForRedistribution, allNodes);
++    _queuedForRedistribution = RibDelta.empty();
+ 
+     // Process new external routes and re-advertise them as necessary
+-    RibDelta<EigrpExternalRoute> externalDelta = processExternalRoutes();
+-    sendOutExternalRoutes(externalDelta, allNodes, _topology);
++    RibDelta<EigrpExternalRoute> externalDelta = processExternalRoutes(nc);
++    sendOutExternalRoutes(externalDelta, allNodes);
+ 
+     // Keep track of what what updates will go into the main RIB
+     _changeSet.from(importRibDelta(_rib, internalDelta));
+@@ -193,7 +205,11 @@ final class EigrpRoutingProcess implements RoutingProcess<EigrpTopology, EigrpRo
+ 
+   @Override
+   public boolean isDirty() {
+-    return false;
++    return !_incomingInternalRoutes.values().stream().allMatch(Queue::isEmpty)
++        || !_incomingExternalRoutes.values().stream().allMatch(Queue::isEmpty)
++        || !_changeSet.isEmpty()
++        || !_queuedForRedistribution.isEmpty()
++        || !_initializationDelta.isEmpty();
+   }
+ 
+   /**
+@@ -231,28 +247,98 @@ final class EigrpRoutingProcess implements RoutingProcess<EigrpTopology, EigrpRo
+     return builder.build();
+   }
+ 
+-  private RibDelta<EigrpInternalRoute> processInternalRoutes() {
+-    assert _incomingInternalRoutes != null;
+-    return RibDelta.<EigrpInternalRoute>builder().build();
++  @Nonnull
++  private RibDelta<EigrpInternalRoute> processInternalRoutes(NetworkConfigurations nc) {
++    //

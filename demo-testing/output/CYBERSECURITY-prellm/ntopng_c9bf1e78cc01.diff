@@ -1,0 +1,127 @@
+@@ -31,7 +31,7 @@ class AlertCheckLuaEngine : public LuaEngine {
+   AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodicity p, NetworkInterface *iface);
+   ~AlertCheckLuaEngine() {};
+ 
+-  void setEntity(AlertableEntity *al);
++  bool pcall(int num_args, int num_results);
+ 
+   ScriptPeriodicity getPeriodicity() const;
+   const char * getGranularity() const;
+
+
+
+
+@@ -756,6 +756,7 @@ class NetworkInterface : public AlertableEntity {
+ 
+   virtual bool reproducePcapOriginalSpeed() const         { return(false); }
+   u_int32_t getNumEngagedAlerts();
++  void releaseAllEngagedAlerts();
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -506,6 +506,9 @@
+ #define CONST_AGGREGATIONS            "aggregations"
+ #define CONST_HOST_CONTACTS           "host_contacts"
+ 
++#define ALERT_ENTITY_CALLBACK_CHECK_ALERTS    "checkAlerts"
++#define ALERT_ENTITY_CALLBACK_RELEASE_ALERTS  "releaseAlerts"
++
+ #define CONST_INFLUXDB_FILE_QUEUE          "ntopng.influx_file_queue"
+ #define CONST_INFLUXDB_FLUSH_TIME          10 /* sec */
+ #define CONST_INFLUXDB_MAX_DUMP_SIZE       4194304 /* 4 MB */
+
+
+
+
+@@ -144,6 +144,7 @@ typedef enum {
+   This is field "entity_type" of JSON put on "ntopng.alerts.notifications_queue"
+  */
+ typedef enum {
++  alert_entity_none = -1,
+   alert_entity_interface = 0,
+   alert_entity_host,
+   alert_entity_network,
+
+
+
+
+@@ -55,10 +55,8 @@ AlertCheckLuaEngine::AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodi
+     lua_getglobal(L, "setup");         /* Called function   */
+     lua_pushstring(L, Utils::periodicityToScriptName(p)); /* push 1st argument */
+ 
+-    if(lua_pcall(L, 1 /* 1 argument */, 0 /* 0 results */, 0)) { /* Call the function now */
+-      ntop->getTrace()->traceEvent(TRACE_WARNING, "Script failure [%s][%s]", script_path, lua_tostring(L, -1));
++    if(!pcall(1 /* 1 argument */, 0))
+       return;
+-    }
+   } else {
+     /* Possibly handle a generic entity */
+     script_path[0] = '0';
+@@ -79,9 +77,11 @@ const char * AlertCheckLuaEngine::getGranularity() const {
+ 
+ /* ****************************************** */
+ 
+-void AlertCheckLuaEngine::setEntity(AlertableEntity *al) {
+-  if(Host *h = dynamic_cast<Host*>(al))
+-    setHost(h);
+-  else if(NetworkStats *ns = dynamic_cast<NetworkStats*>(al))
+-    setNetwork(ns);
++bool AlertCheckLuaEngine::pcall(int num_args, int num_results) {
++  if(lua_pcall(L, num_args, num_results, 0)) {
++    ntop->getTrace()->traceEvent(TRACE_WARNING, "Script failure [%s]", lua_tostring(L, -1));
++    return(false);
++  }
++
++  return(true);
+ }
+
+
+
+
+@@ -1152,12 +1152,11 @@ void Host::updateStats(update_hosts_stats_user_data_t *update_hosts_stats_user_d
+        ) {
+       AlertCheckLuaEngine *acle = update_hosts_stats_user_data->acle;
+       lua_State *L = acle->getState();
+-      acle->setEntity(this);
++      acle->setHost(this);
+ 
+-      lua_getglobal(L, "releaseHostAlerts"); /* Called function */
++      lua_getglobal(L, ALERT_ENTITY_CALLBACK_RELEASE_ALERTS); /* Called function */
+ 
+-      if(lua_pcall(L, 0 /* 0 arguments */, 0 /* 0 results */, 0)) /* Call the function now */
+-	ntop->getTrace()->traceEvent(TRACE_WARNING, "Script failure [%s]", lua_tostring(L, -1));
++      acle->pcall(0 /* 0 arguments */, 0 /* 0 results */);
+     }
+   }
+ 
+
+
+
+
+@@ -7994,6 +7994,20 @@ static int ntop_network_get_alerts(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_interface_release_engaged_alerts(lua_State* vm) {
++  NetworkInterface *iface = getCurrentInterface(vm);
++
++  ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
++  if(!iface) return(CONST_LUA_ERROR);
++
++  iface->releaseAllEngagedAlerts();
++
++  lua_pushnil(vm);
++  return(CONST_LUA_OK);
++}
++
++/* ****************************************** */
++
+ static int ntop_host_get_expired_alerts(lua_State* vm) {
+   ScriptPeriodicity periodicity;
+   struct ntopngLuaContext *c = getLuaVMContext(vm);
+@@ -9066,11 +9080,25 @@ static const luaL_Reg ntop_interface_reg[] = {
+   { "getEngagedAlertsCount",  ntop_int

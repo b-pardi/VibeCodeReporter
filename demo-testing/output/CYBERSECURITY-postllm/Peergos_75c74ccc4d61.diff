@@ -1,0 +1,62 @@
+@@ -252,6 +252,29 @@ public class DirectorySync {
+             }
+             syncedVersions.finishCopies(List.of(op));
+         }
++        if (! syncedVersions.hasCompletedSync()) {
++            // Do an incremental sync of only files to make progress quicker
++            // We don't need to prehash entire dirs here,
++            // because we are not trying to detect moves/renames
++
++            localFS.applyToSubtree(file -> {
++                Path p = PathUtil.get(file.relPath);
++                if (! remoteFS.exists(p)) {
++                    if (file.size > 1024*1024) { // avoid doing many small files in non bulk uploads
++                        try {
++                            LOG.accept("REMOTE: Uploading " + file.relPath);
++                            HashTree hashTree = localFS.hashFile(p, Optional.empty(), file.relPath, syncedVersions);
++                            LocalDateTime modified = LocalDateTime.ofInstant(Instant.ofEpochSecond(file.modifiedTime / 1000, 0), ZoneOffset.UTC);
++                            remoteFS.setBytes(p, 0, localFS.getBytes(p, 0), file.size, Optional.of(hashTree),
++                                    Optional.of(modified), localFS.getThumbnail(p));
++                            syncedVersions.add(new FileState(file.relPath, file.modifiedTime, file.size, hashTree));
++                        } catch (IOException e) {
++                            throw new RuntimeException(e);
++                        }
++                    }
++                }
++            }, dir -> {});
++        }
+ 
+         String localStateDbFile = "local-tmp-"+System.nanoTime() + ".sqlite";
+         String remoteStateDbFile = "remote-tmp-"+System.nanoTime() + ".sqlite";
+@@ -439,6 +462,7 @@ public class DirectorySync {
+             }
+ 
+             syncedVersions.setSnapshot(remoteFS.getRoot(), remoteVersion);
++            syncedVersions.setCompletedSync(true);
+         } finally {
+             File localState = peergosDir.resolve(localStateDbFile).toFile();
+             if (localState.exists())
+
+
+
+
+@@ -22,6 +22,7 @@ public class JdbcTreeState implements SyncState {
+     private static final String UPDATE_SNAPSHOT = "UPDATE snapshots SET snapshot=? WHERE path=?;";
+     private static final String INSERT = "INSERT INTO syncstate (path, roothash, modtime, size, hashtree) VALUES(?, ?, ?, ?, ?);";
+     private static final String INSERT_DIR_SUFFIX = "INTO syncdirs (path) VALUES(?);";
++    private static final String SET_DONE_SUFFIX = "INTO syncdone (key, done) VALUES(?, ?);";
+     private static final String INSERT_LOCAL_DELETE_SUFFIX = "INTO synclocaldeletes (path) VALUES(?);";
+     private static final String INSERT_REMOTE_DELETE_SUFFIX = "INTO syncremotedeletes (path) VALUES(?);";
+     private static final String UPDATE = "UPDATE syncstate SET roothash=?, hashtree=?, modtime=?, size=? WHERE path=?;";
+@@ -36,6 +37,7 @@ public class JdbcTreeState implements SyncState {
+     private static final String GET_BY_HASH = "SELECT path, modtime, size, hashtree FROM syncstate WHERE roothash = ?;";
+     private static final String GET_DIRS = "SELECT path FROM syncdirs;";
+     private static final String HAS_DIR = "SELECT path FROM syncdirs WHERE path=?;";
++    private static final String DONE_SYNC = "SELECT done FROM syncdone WHERE key=?;";
+     private static final String HAS_LOCAL_DELETE = "SELECT path FROM synclocaldeletes WHERE path=?;";
+     private static final String HAS_REMOTE_DELETE = "SELECT path FROM syncremotedeletes WHERE path=?;";
+     private static final String INSERT_COPY_OP = "INSERT INTO copyops (islocal, source, target, start, end, sourcestate, targetstate) VALUES(?, ?, ?, ?, ?, ?, ?);";
+@@ -72,6 +74,7 @@ public class JdbcTreeState implements SyncState {
+         try (Connection conn = getConnection()) {
+             cmds.createTable("CREATE TABLE IF NOT EXISTS syncstate (path text primary key not null, roothash blob, modtime bigint not null, size bigint not null, hashtree blob); " +
+                     "CREATE IN

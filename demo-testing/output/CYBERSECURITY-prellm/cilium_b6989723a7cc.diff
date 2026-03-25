@@ -1,0 +1,133 @@
+@@ -27,8 +27,8 @@
+ __section("from-netdev")
+ int from_netdev(struct __sk_buff *skb)
+ {
+-	if (skb->cb[0] == MARK_MAGIC_ENCRYPT) {
+-		skb->mark = MARK_MAGIC_ENCRYPT;
++	if ((skb->cb[0] & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_ENCRYPT) {
++		skb->mark = skb->cb[0];
+ 		set_identity(skb, skb->cb[1]);
+ 	}
+ 	return TC_ACT_OK;
+
+
+
+
+@@ -146,6 +146,7 @@ static inline int ipv6_l3_from_lxc(struct __sk_buff *skb,
+ 	void *data, *data_end;
+ 	union v6addr *daddr, orig_dip;
+ 	__u32 tunnel_endpoint = 0;
++	__u8 encrypt_key = 0;
+ 	__u32 monitor = 0;
+ 
+ 	if (unlikely(!is_valid_lxc_src_ip(ip6)))
+@@ -221,6 +222,7 @@ skip_service_lookup:
+ 		if (info != NULL && info->sec_label) {
+ 			*dstID = info->sec_label;
+ 			tunnel_endpoint = info->tunnel_endpoint;
++			encrypt_key = info->key;
+ 		} else {
+ 			*dstID = WORLD_ID;
+ 		}
+@@ -331,7 +333,7 @@ skip_service_lookup:
+ 	/* The packet goes to a peer not managed by this agent instance */
+ #ifdef ENCAP_IFINDEX
+ 	if (tunnel_endpoint) {
+-		ret = encap_and_redirect_with_nodeid_from_lxc(skb, tunnel_endpoint, SECLABEL, monitor);
++		ret = encap_and_redirect_with_nodeid_from_lxc(skb, tunnel_endpoint, encrypt_key, SECLABEL, monitor);
+ 		/* If not redirected noteable due to IPSEC then pass up to stack
+ 		 * for further processing.
+ 		 */
+@@ -475,6 +477,7 @@ static inline int handle_ipv4_from_lxc(struct __sk_buff *skb, __u32 *dstID)
+ 	struct ct_state ct_state = {};
+ 	__be32 orig_dip;
+ 	__u32 tunnel_endpoint = 0;
++	__u8 encrypt_key = 0;
+ 	__u32 monitor = 0;
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip4))
+@@ -537,6 +540,7 @@ skip_service_lookup:
+ 		if (info != NULL && info->sec_label) {
+ 			*dstID = info->sec_label;
+ 			tunnel_endpoint = info->tunnel_endpoint;
++			encrypt_key = info->key;
+ 		} else {
+ 			*dstID = WORLD_ID;
+ 		}
+@@ -649,6 +653,7 @@ skip_service_lookup:
+ #ifdef ENCAP_IFINDEX
+ 	if (tunnel_endpoint) {
+ 		int ret = encap_and_redirect_with_nodeid_from_lxc(skb, tunnel_endpoint,
++								  encrypt_key,
+ 								  SECLABEL, monitor);
+ 		/* If not redirected noteably due to IPSEC then pass up to stack
+ 		 * for further processing.
+
+
+
+
+@@ -242,6 +242,7 @@ static inline int handle_ipv6(struct __sk_buff *skb, __u32 src_identity)
+ 	info = ipcache_lookup6(&IPCACHE_MAP, dst, V6_CACHE_KEY_LEN);
+ 	if (info != NULL && info->tunnel_endpoint != 0) {
+ 		int ret = encap_and_redirect_with_nodeid(skb, info->tunnel_endpoint,
++							 info->key,
+ 							 secctx, TRACE_PAYLOAD_LEN);
+ 
+ 		/* If IPSEC is needed recirc through ingress to use xfrm stack
+@@ -443,6 +444,7 @@ static inline int handle_ipv4(struct __sk_buff *skb, __u32 src_identity)
+ 	info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr, V4_CACHE_KEY_LEN);
+ 	if (info != NULL && info->tunnel_endpoint != 0) {
+ 		int ret = encap_and_redirect_with_nodeid(skb, info->tunnel_endpoint,
++							 info->key,
+ 							 secctx, TRACE_PAYLOAD_LEN);
+ 
+ 		if (ret == IPSEC_ENDPOINT)
+
+
+
+
+@@ -64,6 +64,8 @@ static inline int handle_ipv6(struct __sk_buff *skb)
+ 		 */
+ 		if (ip6->nexthdr != IPPROTO_ESP)
+ 			goto not_esp;
++
++		/* Decrypt "key" is determined by SPI */
+ 		skb->mark = MARK_MAGIC_DECRYPT;
+ 		set_identity(skb, key.tunnel_id);
+ 		/* To IPSec stack on cilium_vxlan we are going to pass
+@@ -148,6 +150,7 @@ static inline int handle_ipv4(struct __sk_buff *skb)
+ 		 */
+ 		if (ip4->protocol != IPPROTO_ESP)
+ 			goto not_esp;
++		/* Decrypt "key" is determined by SPI */
+ 		skb->mark = MARK_MAGIC_DECRYPT;
+ 		set_identity(skb, key.tunnel_id);
+ 		/* To IPSec stack on cilium_vxlan we are going to pass
+
+
+
+
+@@ -162,7 +162,7 @@ struct endpoint_key {
+ 		union v6addr	ip6;
+ 	};
+ 	__u8 family;
+-	__u8 pad4;
++	__u8 key;
+ 	__u16 pad5;
+ } __attribute__((packed));
+ 
+@@ -182,6 +182,7 @@ struct endpoint_info {
+ struct remote_endpoint_info {
+ 	__u32		sec_label;
+ 	__u32		tunnel_endpoint;
++	__u8		key;
+ };
+ 
+ struct policy_key {
+@@ -298,17 +299,24 @@ enum {
+  * packets security identity. The lower/upper halves are swapped to recover
+  * the identity.
+  *
+- * The 4 bits at 0XF00 provide
++ * The 4 bits at 0X0F00 provide
+  *  -

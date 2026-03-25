@@ -1,0 +1,118 @@
+@@ -40,7 +40,6 @@ typedef struct {
+   u_int16_t cli2srv_window, srv2cli_window;
+   struct timeval synTime, synAckTime, ackTime; /* network Latency (3-way handshake) */
+   float clientRTT3WH, serverRTT3WH; /* Computed at 3WH (msec) */
+-
+   time_t last_network_issues; /* last time retr/ooo/lost has been observed */
+ 
+   struct {
+@@ -97,6 +96,7 @@ private:
+ #ifdef NTOPNG_PRO
+   FlowUDP *udp;
+ #endif
++  u_int32_t flow_key;
+   FlowCollectionInfo *collection;
+ 
+   /* Data collected from nProbe */
+@@ -419,7 +419,8 @@ private:
+   void updateUDPHostServices(bool src2dst_direction);
+   void updateServerName(Host *h);
+   void allocateCollection();
+-
++  void computeKey();
++  
+ public:
+   Flow(NetworkInterface *_iface, int32_t iface_idx,
+        u_int16_t _vlanId,
+@@ -967,7 +968,7 @@ public:
+   static char *printTCPflags(u_int8_t flags, char *const buf, u_int buf_len);
+   char *print(char *buf, u_int buf_len, bool full_report = true) const;
+ 
+-  u_int32_t key();
++  inline u_int32_t key() { return(flow_key); }
+   static u_int32_t key(Host *cli, u_int16_t cli_port, Host *srv,
+                        u_int16_t srv_port, u_int16_t vlan_id,
+                        u_int16_t _observation_point_id, u_int16_t protocol);
+
+
+
+
+@@ -315,6 +315,7 @@ Flow::Flow(NetworkInterface *_iface,
+     break;
+   }
+ 
++  computeKey();
+   deferredInitialization();
+ }
+ 
+@@ -2740,7 +2741,8 @@ bool Flow::equal(const Mac *_src_pkt_mac, const Mac *_dst_pkt_mac,
+                  bool *src2srv_direction) const {
+   const IpAddress *cli_ip = get_cli_ip_addr(), *srv_ip = get_srv_ip_addr();
+   const Mac *src_mac, *dst_mac;
+-
++  bool useMacAddressInFlowKey = ntop->getPrefs()->useMacAddressInFlowKey();
++  
+ #if 0
+   if(ntohs(_cli_port) == 17446) {
+     char buf1[64],buf2[64],buf3[64],buf4[64];
+@@ -2784,7 +2786,11 @@ bool Flow::equal(const Mac *_src_pkt_mac, const Mac *_dst_pkt_mac,
+     return (false);
+ 
+   /* Check if MAC address needs to be used in flow key */
+-  if(ntop->getPrefs()->useMacAddressInFlowKey()) {
++  if((cli_ip->key() == 0) && (srv_ip->key() == 0xFFFFFFFF)) {
++    useMacAddressInFlowKey = true;
++  }
++  
++  if(useMacAddressInFlowKey) {
+     if(cli_host && src_mac) {
+       Mac *cli_mac = cli_host->getMac();
+ 
+@@ -2920,7 +2926,7 @@ void Flow::lua(lua_State *vm, AddressTree *ptree,
+   u_char community_id[200];
+   char buf[64];
+   Mac *cli_mac = get_cli_host() ? get_cli_host()->getMac() : NULL;
+-  
++
+   if(ptree) {
+     if(src_ip) src_match = src_ip->match(ptree);
+     if(dst_ip) dst_match = dst_ip->match(ptree);
+@@ -3372,7 +3378,7 @@ void Flow::clearRisks() {
+ 
+ /* *************************************** */
+ 
+-u_int32_t Flow::key() {
++void Flow::computeKey() {
+   u_int32_t k = cli_port + srv_port + vlanId + protocol + privateFlowId;
+ 
+ #ifdef MAKE_OBSERVATION_POINT_KEY
+@@ -3383,7 +3389,16 @@ u_int32_t Flow::key() {
+   if(get_srv_ip_addr()) k += get_srv_ip_addr()->key();
+   if(icmp_info) k += icmp_info->key();
+ 
+-  return (k);
++  if(get_cli_ip_addr() && get_srv_ip_addr()) {
++    if((get_cli_ip_addr()->key() == 0) && (get_srv_ip_addr()->key() == 0xFFFFFFFF)) {
++      /* Add the MAC address of the source host (dst_mac is not necessary as it's FF:FF:FF:FF:FF:FF) */
++      Mac *cli_mac = get_cli_host()->getMac();
++      
++      if(cli_mac != NULL) k += cli_mac->key();
++    }
++  }
++
++  flow_key = k;
+ }
+ 
+ /* *************************************** */
+@@ -7383,8 +7398,7 @@ void Flow::lua_get_ip(lua_State *vm, bool client) const {
+                                 mask_host ? 0 : h->key());
+ 
+     if(h->isProtocolServer())
+-      lua_push_bool_table_entry(
+-				vm, client ? "cli.protocol_server" : "srv.protocol_server", true);
++      lua_push_bool_table_entry(vm, client ? "cli.protocol_server" : "srv.protocol_server", true);
+   } else if(h_ip) {
+     /* Host hasn't been instantiated but we still have the ip address (e.g, in
+      * viewed interfaces) */
+@@ -7410,11 +7424,14 @@ void Flow::lua_get_mac(lua_State *vm, bool client) const {
+   Host *h = client ? get_cli_host() : g

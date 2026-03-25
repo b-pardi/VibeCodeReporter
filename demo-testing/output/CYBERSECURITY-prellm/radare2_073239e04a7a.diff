@@ -1,0 +1,124 @@
+@@ -180,6 +180,16 @@ R_API const char *r_bin_symbol_name(RBinSymbol *s) {
+ 	return s->name;
+ }
+ 
++R_API RBinSymbol *r_bin_symbol_new(const char *name, ut64 paddr, ut64 vaddr) {
++	RBinSymbol *sym = R_NEW0 (RBinSymbol);
++	if (sym) {
++		sym->name = name? strdup (name): NULL;
++		sym->paddr = paddr;
++		sym->vaddr = vaddr;
++	}
++	return sym;
++}
++
+ R_API void r_bin_symbol_free(void *_sym) {
+ 	RBinSymbol *sym = (RBinSymbol *)_sym;
+ 	if (sym) {
+@@ -1417,6 +1427,14 @@ R_API const char *r_bin_get_meth_flag_string(ut64 flag, bool compact) {
+ 	}
+ }
+ 
++R_IPI RBinSection *r_bin_section_new(const char *name) {
++	RBinSection *s = R_NEW0 (RBinSection);
++	if (s) {
++		s->name = name? strdup (name): NULL;
++	}
++	return s;
++}
++
+ R_IPI void r_bin_section_free(RBinSection *bs) {
+ 	if (bs) {
+ 		free (bs->name);
+
+
+
+
+@@ -326,12 +326,12 @@ static bool parse_symtab(struct MACH0_(obj_t) *mo, ut64 off) {
+ 		Eprintf ("Error: read (symtab)\n");
+ 		return false;
+ 	}
+-	st.cmd = r_read_ble32 (&symt[0], be);
+-	st.cmdsize = r_read_ble32 (&symt[4], be);
+-	st.symoff = r_read_ble32 (&symt[8], be);
+-	st.nsyms = r_read_ble32 (&symt[12], be);
+-	st.stroff = r_read_ble32 (&symt[16], be);
+-	st.strsize = r_read_ble32 (&symt[20], be);
++	st.cmd = r_read_ble32 (symt, be);
++	st.cmdsize = r_read_ble32 (symt+4, be);
++	st.symoff = r_read_ble32 (symt + 8, be);
++	st.nsyms = r_read_ble32 (symt+12, be);
++	st.stroff = r_read_ble32 (symt+16, be);
++	st.strsize = r_read_ble32 (symt+20, be);
+ 
+ 	mo->symtab = NULL;
+ 	mo->nsymtab = 0;
+@@ -361,16 +361,16 @@ static bool parse_symtab(struct MACH0_(obj_t) *mo, ut64 off) {
+ 			goto error;
+ 		}
+ 		for (i = 0; i < mo->nsymtab; i++) {
+-			len = r_buf_read_at (mo->b, st.symoff + (i * sizeof (struct MACH0_(nlist))),
+-								nlst, sizeof (struct MACH0_(nlist)));
++			ut64 at = st.symoff + (i * sizeof (struct MACH0_(nlist)));
++			len = r_buf_read_at (mo->b, at, nlst, sizeof (struct MACH0_(nlist)));
+ 			if (len != sizeof (struct MACH0_(nlist))) {
+ 				Error ("read (nlist)");
+ 			}
+ 			//XXX not very safe what if is n_un.n_name instead?
+-			mo->symtab[i].n_strx = r_read_ble32 (&nlst[0], be);
+-			mo->symtab[i].n_type = r_read_ble8 (&nlst[4]);
+-			mo->symtab[i].n_sect = r_read_ble8 (&nlst[5]);
+-			mo->symtab[i].n_desc = r_read_ble16 (&nlst[6], be);
++			mo->symtab[i].n_strx = r_read_ble32 (nlst, be);
++			mo->symtab[i].n_type = r_read_ble8 (nlst + 4);
++			mo->symtab[i].n_sect = r_read_ble8 (nlst + 5);
++			mo->symtab[i].n_desc = r_read_ble16 (nlst + 6, be);
+ #if R_BIN_MACH064
+ 			mo->symtab[i].n_value = r_read_ble64 (&nlst[8], be);
+ #else
+@@ -1641,7 +1641,7 @@ static bool __isDataSection(RBinSection *sect) {
+ RList *MACH0_(get_segments)(RBinFile *bf) {
+ 	struct MACH0_(obj_t) *bin = bf->o->bin_obj;
+ 	
+-	RList *list = r_list_newf (free); // r_bin_section_free);
++	RList *list = r_list_newf ((RListFree)r_bin_section_free);
+ 
+ 	int i, j;
+ 
+@@ -1653,7 +1653,7 @@ RList *MACH0_(get_segments)(RBinFile *bf) {
+ 			if (!seg->initprot) {
+ 				continue;
+ 			}
+-			RBinSection *s = R_NEW0 (RBinSection);
++			RBinSection *s = r_bin_section_new (NULL);
+ 			if (!s) {
+ 				break;
+ 			}
+@@ -1788,11 +1788,11 @@ struct section_t *MACH0_(get_sections)(struct MACH0_(obj_t) *bin) {
+ 	return sections;
+ }
+ 
+-static int parse_import_stub(struct MACH0_(obj_t) *bin, struct symbol_t *symbol, int idx) {
++static bool parse_import_stub(struct MACH0_(obj_t) *bin, struct symbol_t *symbol, int idx) {
+ 	int i, j, nsyms, stridx;
+ 	const char *symstr;
+ 	if (idx < 0) {
+-		return 0;
++		return false;
+ 	}
+ 	symbol->offset = 0LL;
+ 	symbol->addr = 0LL;
+@@ -1889,6 +1889,174 @@ static char *get_name(struct MACH0_(obj_t) *mo, ut32 stridx, bool filter) {
+ 	return NULL;
+ }
+ 
++
++// TODO: Return RList<RBinSymbol> // 2x speedup
++const RList *MACH0_(get_symbols_list)(struct MACH0_(obj_t) *bin) {
++	static RList * cache = NULL; // XXX DONT COMMIT WITH THIS
++	struct symbol_t *symbols;
++	int j, s, stridx, symbols_size, symbols_count;
++	ut32 to, from, i;
++
++	r_return_val_if_fail (bin, NULL);
++	if (!bin->symtab || !bin->sym

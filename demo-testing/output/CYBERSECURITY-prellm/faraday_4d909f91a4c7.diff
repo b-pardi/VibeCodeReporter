@@ -1,0 +1,117 @@
+@@ -44,6 +44,7 @@ from server.schemas import (
+     SeverityField,
+     MetadataSchema,
+     SelfNestedField,
++    FaradayCustomField,
+     PrimaryKeyRelatedField,
+ )
+ 
+@@ -131,7 +132,7 @@ class VulnerabilitySchema(AutoSchema):
+     metadata = SelfNestedField(CustomMetadataSchema())
+     date = fields.DateTime(attribute='create_date',
+                            dump_only=True)  # This is only used for sorting
+-    custom_fields = FaradayCustomField(attribute='cusotm_fields')
++    custom_fields = FaradayCustomField(table_name='vulnerability', attribute='custom_fields')
+ 
+     class Meta:
+         model = Vulnerability
+@@ -144,7 +145,8 @@ class VulnerabilitySchema(AutoSchema):
+             'desc', 'impact', 'confirmed', 'name',
+             'service', 'obj_id', 'type', 'policyviolations',
+             '_attachments',
+-            'target', 'host_os', 'resolution', 'metadata')
++            'target', 'host_os', 'resolution', 'metadata',
++            'custom_fields')
+ 
+     def get_type(self, obj):
+         return obj.__class__.__name__
+@@ -261,7 +263,7 @@ class VulnerabilityWebSchema(VulnerabilitySchema):
+             'service', 'obj_id', 'type', 'policyviolations',
+             'request', '_attachments', 'params',
+             'target', 'host_os', 'resolution', 'method', 'metadata',
+-            'status_code'
++            'status_code', 'custom_fields'
+         )
+ 
+ 
+
+
+
+
+@@ -5,12 +5,17 @@ See the file 'doc/LICENSE' for the license information
+ 
+ '''
+ import time
++import json
+ import datetime
+ from marshmallow import fields, Schema
+ from marshmallow.exceptions import ValidationError
+ from dateutil.tz import tzutc
+ 
+-from server.models import VulnerabilityABC
++from server.models import (
++    db,
++    VulnerabilityABC,
++    CustomFieldsSchema,
++)
+ 
+ 
+ class JSTimestampField(fields.Integer):
+@@ -27,12 +32,41 @@ class JSTimestampField(fields.Integer):
+ 
+ 
+ class FaradayCustomField(fields.Field):
+-
+-    def _serialize(self, value, attr, obj):
+-        raise NotImplementedError
+-
+-    def _deserialize(self, value, attr, data):
+-        raise NotImplementedError
++    def __init__(self, table_name='vulnerability', *args, **kwargs):
++        self.table_name = table_name
++        super(FaradayCustomField, self).__init__(*args, **kwargs)
++
++    def _serialize(self, value, attr, obj, **kwargs):
++        res = {}
++        custom_fields = db.session.query(CustomFieldsSchema).filter_by(
++            table_name=self.table_name)
++        for custom_field in custom_fields:
++            serialized_value = value.get(custom_field.field_name)
++            res[custom_field.field_display_name] = serialized_value
++
++        return res
++
++    def _deserialize(self, value, attr, data, **kwargs):
++        serialized = {}
++        if value is not None and value:
++            for key, raw_data in value.iteritems():
++                field_schema = db.session.query(CustomFieldsSchema).filter_by(
++                    table_name=self.table_name,
++                    field_name=key,
++                ).first()
++                if not field_schema:
++                    raise ValidationError("Invalid custom field, not found in schema. Did you add it first?")
++                if field_schema.field_type == 'str':
++                    serialized[key] = str(raw_data)
++                elif field_schema.field_type == 'int':
++                    try:
++                        serialized[key] = int(raw_data)
++                    except ValueError:
++                        raise ValidationError("Can not convert custom type to int")
++                else:
++                    raise ValidationError("Custom Field datatype not supported yet")
++
++        return serialized
+ 
+ 
+ class PrimaryKeyRelatedField(fields.Field):
+
+
+
+
+@@ -1575,6 +1575,41 @@ class TestListVulnerabilityView(ReadOnlyAPITests):  # TODO migration: use read w
+         assert res.status_code == 201
+ 
+ 
++@pytest.mark.usefixtures('logged_user')
++class TestCustomFieldVulnerability(ReadOnlyAPITests):  # TODO migration:

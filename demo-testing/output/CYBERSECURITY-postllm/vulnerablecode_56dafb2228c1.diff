@@ -1,0 +1,115 @@
+@@ -10,6 +10,7 @@
+ from vulnerabilities.improvers import valid_versions
+ from vulnerabilities.improvers import vulnerability_kev
+ from vulnerabilities.improvers import vulnerability_status
++from vulnerabilities.pipelines import remove_ghost_packages
+ 
+ IMPROVERS_REGISTRY = [
+     valid_versions.GitHubBasicImprover,
+@@ -29,6 +30,7 @@ IMPROVERS_REGISTRY = [
+     valid_versions.GithubOSVImprover,
+     vulnerability_status.VulnerabilityStatusImprover,
+     vulnerability_kev.VulnerabilityKevImprover,
++    remove_ghost_packages.RemoveGhostPackagePipeline,
+ ]
+ 
+ IMPROVERS_REGISTRY = {x.qualified_name: x for x in IMPROVERS_REGISTRY}
+
+
+
+
+@@ -12,6 +12,7 @@ import traceback
+ from django.core.management.base import BaseCommand
+ from django.core.management.base import CommandError
+ 
++from pipeline import BasePipeline
+ from vulnerabilities.improve_runner import ImproveRunner
+ from vulnerabilities.improvers import IMPROVERS_REGISTRY
+ 
+@@ -56,6 +57,13 @@ class Command(BaseCommand):
+ 
+         for improver in improvers:
+             self.stdout.write(f"Improving data using {improver.qualified_name}")
++            if issubclass(improver, BasePipeline):
++                status, error = improver.make_run().execute()
++                if status != 0:
++                    self.stdout.write(error)
++                    failed_improvers.append(improver.qualified_name)
++                continue
++
+             try:
+                 ImproveRunner(improver_class=improver).run()
+                 self.stdout.write(
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,76 @@
++#
++# Copyright (c) nexB Inc. and others. All rights reserved.
++# VulnerableCode is a trademark of nexB Inc.
++# SPDX-License-Identifier: Apache-2.0
++# See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
++# See https://github.com/nexB/vulnerablecode for support or download.
++# See https://aboutcode.org for more information about nexB OSS projects.
++#
++
++from fetchcode.package_versions import SUPPORTED_ECOSYSTEMS
++from fetchcode.package_versions import versions
++from packageurl import PackageURL
++from univers.version_range import RANGE_CLASS_BY_SCHEMES
++
++from pipeline import BasePipeline
++from pipeline import LoopProgress
++from vulnerabilities.models import Package
++from vulnerabilities.utils import classproperty
++
++
++class RemoveGhostPackagePipeline(BasePipeline):
++    @classproperty
++    def qualified_name(cls):
++        """
++        Fully qualified name prefixed with the module name of the improver used in logging.
++        """
++        return f"{cls.__module__}.{cls.__qualname__}"
++
++    @classmethod
++    def steps(cls):
++        return (cls.remove_ghost_packages,)
++
++    def remove_ghost_packages(self):
++        """
++        Use fetchcode to validate the package indeed exists upstream.
++        """
++        interesting_packages_qs = (
++            Package.objects.filter(type__in=SUPPORTED_ECOSYSTEMS)
++            .exclude(qualifiers__isnull=True)
++            .exclude(subpath__isnull=True)
++        )
++
++        distinct_packages = interesting_packages_qs.values("type", "namespace", "name").distinct(
++            "type", "namespace", "name"
++        )
++
++        distinct_packages_count = distinct_packages.count()
++        package_iterator = distinct_packages.iterator(chunk_size=2000)
++        progress = LoopProgress(total_iterations=distinct_packages_count, logger=self.log)
++
++        ghost_package_count = 0
++
++        for package in progress.iter(package_iterator):
++            ghost_package_count += _remove_ghost_packages(package, interesting_packages_qs)
++
++        if self.log:
++            self.log(f"Successfully removed {ghost_package_count:,d} ghost Packages")
++
++
++def _remove_ghost_packages(package, interesting_packages_qs):
++    if not package["type"] in RANGE_CLASS_BY_SCHEMES:
++        return 0
++
++    versionless_purl = PackageURL(**package)
++    purl_type = package["type"]
++    version_class = RANGE_CLASS_BY_SCHEMES[purl_type].version_class
++    known_versions = [version_class

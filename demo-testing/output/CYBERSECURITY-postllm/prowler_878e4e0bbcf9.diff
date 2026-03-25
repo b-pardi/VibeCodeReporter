@@ -1,0 +1,127 @@
+@@ -1,7 +1,9 @@
+ import json
+ import re
++import time
+ from uuid import UUID, uuid4
+ 
++from config.env import env
+ from cryptography.fernet import Fernet
+ from django.conf import settings
+ from django.contrib.auth.models import AbstractBaseUser
+@@ -352,6 +354,42 @@ class ProviderGroupMembership(RowLevelSecurityProtectedModel):
+         resource_name = "provider_groups-provider"
+ 
+ 
++class TaskManager(models.Manager):
++    def get_with_retry(
++        self,
++        id: str,
++        max_retries: int = None,
++        delay_seconds: float = None,
++    ):
++        """
++        Retry fetching a Task by ID in case it hasn't been created yet.
++
++        Args:
++            id (str): The Celery task ID (expected to match Task model PK).
++            max_retries (int, optional): Number of retry attempts. Defaults to env TASK_RETRY_ATTEMPTS or 5.
++            delay_seconds (float, optional): Delay between retries in seconds. Defaults to env TASK_RETRY_DELAY_SECONDS or 0.1.
++
++        Returns:
++            Task: The retrieved Task instance.
++
++        Raises:
++            Task.DoesNotExist: If the task is not found after all retries.
++        """
++        max_retries = max_retries or env.int("TASK_RETRY_ATTEMPTS", default=5)
++        delay_seconds = delay_seconds or env.float(
++            "TASK_RETRY_DELAY_SECONDS", default=0.1
++        )
++
++        for _attempt in range(max_retries):
++            try:
++                return self.get(id=id)
++            except self.model.DoesNotExist:
++                time.sleep(delay_seconds)
++        raise self.model.DoesNotExist(
++            f"Task with ID {id} not found after {max_retries} retries."
++        )
++
++
+ class Task(RowLevelSecurityProtectedModel):
+     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
+     inserted_at = models.DateTimeField(auto_now_add=True, editable=False)
+@@ -364,6 +402,8 @@ class Task(RowLevelSecurityProtectedModel):
+         blank=True,
+     )
+ 
++    objects = TaskManager()
++
+     class Meta(RowLevelSecurityProtectedModel.Meta):
+         db_table = "tasks"
+ 
+
+
+
+
+@@ -1,6 +1,9 @@
++import uuid
++from unittest import mock
++
+ import pytest
+ 
+-from api.models import Resource, ResourceTag
++from api.models import Resource, ResourceTag, Task
+ 
+ 
+ @pytest.mark.django_db
+@@ -120,3 +123,35 @@ class TestResourceModel:
+ #             compliance={},
+ #         )
+ #         assert Finding.objects.filter(uid=long_uid).exists()
++
++
++@pytest.mark.django_db
++class TestTaskManager:
++    def test_get_with_retry_success(self):
++        task_id = uuid.uuid4()
++        call_counter = {"count": 0}
++
++        def side_effect(*args, **kwargs):
++            if call_counter["count"] < 2:
++                call_counter["count"] += 1
++                raise Task.DoesNotExist()
++            return Task(id=task_id)
++
++        with mock.patch.object(Task.objects, "get", side_effect=side_effect):
++            task = Task.objects.get_with_retry(
++                task_id, max_retries=5, delay_seconds=0.01
++            )
++
++        assert task.id == task_id
++        assert call_counter["count"] == 2
++
++    def test_get_with_retry_fail(self):
++        non_existent_id = uuid.uuid4()
++
++        with mock.patch.object(Task.objects, "get", side_effect=Task.DoesNotExist):
++            with pytest.raises(Task.DoesNotExist) as excinfo:
++                Task.objects.get_with_retry(
++                    non_existent_id, max_retries=3, delay_seconds=0.01
++                )
++
++        assert str(non_existent_id) in str(excinfo.value)
+
+
+
+
+@@ -1086,7 +1086,7 @@ class ProviderViewSet(BaseRLSViewSet):
+             task = check_provider_connection_task.delay(
+                 provider_id=pk, tenant_id=self.request.tenant_id
+             )
+-        prowler_task = Task.objects.get(id=task.id)
++        prowler_task = Task.objects.get_with_retry(id=task.id)
+         serializer = TaskSerializer(prowler_task)
+         return Response(
+             data=serializer.data,
+@@ -1109,7 +1109,7 @@ class ProviderView

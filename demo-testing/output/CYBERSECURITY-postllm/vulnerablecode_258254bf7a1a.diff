@@ -1,0 +1,122 @@
+@@ -294,6 +294,7 @@ class Importer:
+     spdx_license_expression = ""
+     license_url = ""
+     notice = ""
++    vcs_response = None
+ 
+     def __init__(self):
+         if not self.spdx_license_expression:
+@@ -319,6 +320,14 @@ class Importer:
+         """
+         raise NotImplementedError
+ 
++    def clone(self, repo_url):
++        try:
++            self.vcs_response = fetch_via_vcs(repo_url)
++        except Exception as e:
++            msg = f"Failed to fetch {repo_url} via vcs: {e}"
++            logger.error(msg)
++            raise ForkError(msg) from e
++
+ 
+ class ForkError(Exception):
+     pass
+
+
+
+
+@@ -14,6 +14,7 @@ from vulnerabilities.importers import debian_oval
+ from vulnerabilities.importers import github
+ from vulnerabilities.importers import gitlab
+ from vulnerabilities.importers import nginx
++from vulnerabilities.importers import npm
+ from vulnerabilities.importers import nvd
+ from vulnerabilities.importers import openssl
+ from vulnerabilities.importers import postgresql
+@@ -37,6 +38,7 @@ IMPORTERS_REGISTRY = [
+     archlinux.ArchlinuxImporter,
+     ubuntu.UbuntuImporter,
+     debian_oval.DebianOvalImporter,
++    npm.NpmImporter,
+ ]
+ 
+ IMPORTERS_REGISTRY = {x.qualified_name: x for x in IMPORTERS_REGISTRY}
+
+
+
+
+@@ -9,190 +9,134 @@
+ 
+ # Author: Navonil Das (@NavonilDas)
+ 
+-import asyncio
++from pathlib import Path
++from typing import Iterable
+ from typing import List
+-from typing import Set
+-from typing import Tuple
+-from urllib.parse import quote
+ 
+ import pytz
+ from dateutil.parser import parse
+ from packageurl import PackageURL
+-from univers.version_range import VersionRange
+-from univers.versions import SemverVersion
++from univers.version_range import NpmVersionRange
+ 
+ from vulnerabilities.importer import AdvisoryData
+-from vulnerabilities.importer import GitImporter
++from vulnerabilities.importer import AffectedPackage
++from vulnerabilities.importer import Importer
+ from vulnerabilities.importer import Reference
+-from vulnerabilities.package_managers import NpmVersionAPI
++from vulnerabilities.importer import VulnerabilitySeverity
++from vulnerabilities.severity_systems import CVSSV2
++from vulnerabilities.severity_systems import CVSSV3
++from vulnerabilities.utils import build_description
+ from vulnerabilities.utils import load_json
+-from vulnerabilities.utils import nearest_patched_package
+ 
+-NPM_URL = "https://registry.npmjs.org{}"
+ 
+-
+-class NpmImporter(GitImporter):
+-    def __enter__(self):
+-        super(NpmImporter, self).__enter__()
+-        if not getattr(self, "_added_files", None):
+-            self._added_files, self._updated_files = self.file_changes(
+-                recursive=True, file_ext="json", subdir="./vuln/npm"
++class NpmImporter(Importer):
++    spdx_license_expression = "MIT"
++    license_url = "https://github.com/nodejs/security-wg/blob/main/LICENSE.md"
++    repo_url = "git+https://github.com/nodejs/security-wg"
++
++    def advisory_data(self) -> Iterable[AdvisoryData]:
++        try:
++            self.clone(self.repo_url)
++            path = Path(self.vcs_response.dest_dir)
++
++            vuln = path / "vuln"
++            npm_vulns = vuln / "npm"
++            for file in npm_vulns.glob("*.json"):
++                yield from self.to_advisory_data(file)
++        finally:
++            if self.vcs_response:
++                self.vcs_response.delete()
++
++    def to_advisory_data(self, file: Path) -> List[AdvisoryData]:
++        data = load_json(file)
++        id = data.get("id")
++        description = data.get("overview") or ""
++        summary = data.get("title") or ""
++        date_published = parse(data.get("created_at")).replace(tzinfo=pytz.UTC)
++        references = []
++        cvss_vector = data.get("cvss_vector")
++        cvss_score = data.get("cvss_score")
++        severities = []
++        if cvss_vector and cvss_vector.startswith("CVSS:3.0/"):
++            severities.append(
++                VulnerabilitySeverity(
++                    system=CVSSV3,
++                    value=cvss_score,
++

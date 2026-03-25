@@ -1,0 +1,97 @@
+@@ -522,6 +522,21 @@ class ConfigLoaderImpl(ConfigLoader):
+                         f"In '{default.config_path}': Validation error while composing config:\n{e}"
+                     ).with_traceback(sys.exc_info()[2])
+ 
++        # # remove remaining defaults lists from all nodes.
++        def strip_defaults(cfg: Any) -> None:
++            if isinstance(cfg, DictConfig):
++                if cfg._is_missing() or cfg._is_none():
++                    return
++                with flag_override(cfg, ["readonly", "struct"], False):
++                    if getattr(cfg, "__HYDRA_REMOVE_TOP_LEVEL_DEFAULTS__", False):
++                        cfg.pop("defaults", None)
++                        cfg.pop("__HYDRA_REMOVE_TOP_LEVEL_DEFAULTS__")
++
++                for _key, value in cfg.items_ex(resolve=False):
++                    strip_defaults(value)
++
++        strip_defaults(cfg)
++
+         return cfg
+ 
+     def get_sources(self) -> List[ConfigSource]:
+
+
+
+
+@@ -278,7 +278,15 @@ class ConfigRepository(IConfigRepository):
+         assert isinstance(cfg, DictConfig)
+         with read_write(cfg):
+             with open_dict(cfg):
+-                defaults = cfg.pop("defaults", empty)
++                if not cfg._is_typed():
++                    defaults = cfg.pop("defaults", empty)
++                else:
++                    # If node is a backed by Structured Config, flag it and temporarily keep the defaults list in.
++                    # It will be removed later.
++                    # This is addressing an edge case where the defaults list re-appears once the dataclass is used
++                    # as a prototype during OmegaConf merge.
++                    cfg["__HYDRA_REMOVE_TOP_LEVEL_DEFAULTS__"] = True
++                    defaults = cfg.get("defaults", empty)
+         if not isinstance(defaults, ListConfig):
+             if isinstance(defaults, DictConfig):
+                 type_str = "mapping"
+
+
+
+
+@@ -435,7 +435,10 @@ def _has_config_content(cfg: DictConfig) -> bool:
+         return False
+ 
+     for key in cfg.keys():
+-        if not OmegaConf.is_missing(cfg, key):
++        if not OmegaConf.is_missing(cfg, key) and key not in (
++            "defaults",
++            "__HYDRA_REMOVE_TOP_LEVEL_DEFAULTS__",
++        ):
+             return True
+     return False
+ 
+
+
+
+
+@@ -7,7 +7,7 @@ from pathlib import Path
+ from textwrap import dedent
+ from typing import Any, Dict, List, Optional
+ 
+-from omegaconf import OmegaConf
++from omegaconf import MISSING, OmegaConf
+ from pytest import fixture, mark, param, raises, warns
+ 
+ from hydra import compose, initialize, initialize_config_dir, initialize_config_module
+@@ -682,3 +682,24 @@ def test_deprecated_compose_strict_flag(strict: bool) -> None:
+         cfg = compose(overrides=[], strict=strict)
+     assert cfg == {}
+     assert OmegaConf.is_struct(cfg) is strict
++
++
++@mark.usefixtures("initialize_hydra_no_path")
++def test_missing_node_with_defaults_list(hydra_restore_singletons: Any) -> None:
++    @dataclass
++    class Reducer:
++        defaults: List[Any] = field(default_factory=lambda: [])
++
++    @dataclass
++    class Trainer:
++        reducer: Reducer = MISSING
++        defaults: List[Any] = field(
++            default_factory=lambda: [{"/reducer": "base_reducer"}]
++        )
++
++    cs = ConfigStore.instance()
++    cs.store(name="base_trainer", node=Trainer(), group="trainer")
++    cs.store(name="base_reducer", node=Reducer(), group="reducer")
++
++    cfg = compose("trainer/base_trainer")
++    assert cfg == {"trainer": {"reducer": {}}}

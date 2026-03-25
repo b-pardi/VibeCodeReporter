@@ -1,0 +1,187 @@
+@@ -7,6 +7,7 @@
+ #endif
+ 
+ #include "r_types.h"
++#include "r_bind.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -43,7 +44,6 @@ R_LIB_VERSION_HEADER (r_socket);
+ #define SD_BOTH 2
+ #endif
+ typedef struct {
+-	int magic;
+ 	int child;
+ #if __WINDOWS__
+ 	HANDLE pipe;
+@@ -51,6 +51,7 @@ typedef struct {
+ 	int input[2];
+ 	int output[2];
+ #endif
++	RCoreBind coreb;
+ } R2Pipe;
+ 
+ typedef struct r_socket_t {
+@@ -235,13 +236,15 @@ R_API void r_run_reset(RRunProfile *p);
+ R_API int r_run_parsefile(RRunProfile *p, const char *b);
+ 
+ /* r2pipe */
+-R_API int r2p_close(R2Pipe *r2p);
+ R_API R2Pipe *r2p_open(const char *cmd);
+-R_API int r2p_write(R2Pipe *r2p, const char *str);
+-R_API char *r2p_read(R2Pipe *r2p);
+-R_API void r2p_free(R2Pipe *r2p);
++R_API R2Pipe *r2p_open_corebind(RCoreBind *coreb);
++R_API int r2p_close(R2Pipe *r2p);
++
+ R_API char *r2p_cmd(R2Pipe *r2p, const char *str);
+ R_API char *r2p_cmdf(R2Pipe *r2p, const char *fmt, ...);
++
++R_API int r2p_write(R2Pipe *r2p, const char *str);
++R_API char *r2p_read(R2Pipe *r2p);
+ #endif
+ 
+ #ifdef __cplusplus
+
+
+
+
+@@ -124,7 +124,7 @@ static int __close(RIODesc *fd) {
+ 	if (!fd || !fd->data) {
+ 		return -1;
+ 	}
+-	r2p_free (fd->data);
++	r2p_close (fd->data);
+ 	fd->data = NULL;
+ 	return 0;
+ }
+
+
+
+
+@@ -1,10 +1,25 @@
+ /* radare - LGPL - Copyright 2015-2016 - pancake */
++/*
++Usage Example:
++
++	#include <r_core.h>
++	int main() {
++		RCoreBind rcb;
++		RCore *core = r_core_new ();
++		r_core_bind (core, &rcb);
++		r2p_open_corebind (&rcb);
++		char *clippy = r2p_cmd ("?E hello");
++		eprintf ("%s\n", clippy);
++		free (clippy);
++		r2p_close (r2p);
++		r_core_free (core);
++	}
++*/
+ 
+ #include <r_util.h>
+ #include <r_cons.h>
+ #include <r_socket.h>
+ 
+-#define R2P_MAGIC 0x329193
+ #define R2P_PID(x) (((R2Pipe*)(x)->data)->pid)
+ #define R2P_INPUT(x) (((R2Pipe*)(x)->data)->input[0])
+ #define R2P_OUTPUT(x) (((R2Pipe*)(x)->data)->output[1])
+@@ -17,6 +32,81 @@ static void env(const char *s, int f) {
+ }
+ #endif
+ 
++R_API int r2p_write(R2Pipe *r2p, const char *str) {
++	char *cmd;
++	int ret, len;
++	if (!r2p || !str) {
++		return -1;
++	}
++	len = strlen (str) + 2; /* include \n\x00 */
++	cmd = malloc (len + 2);
++	if (!cmd) {
++		return 0;
++	}
++	memcpy (cmd, str, len - 1);
++	strcpy (cmd + len - 2, "\n");
++#if __WINDOWS__ && !defined(__CYGWIN__)
++	DWORD dwWritten = -1;
++	WriteFile (r2p->pipe, cmd, len, &dwWritten, NULL);
++	ret = (dwWritten == len);
++#else
++	ret = (write (r2p->input[1], cmd, len) == len);
++#endif
++	free (cmd);
++	return ret;
++}
++
++/* TODO: add timeout here ? */
++R_API char *r2p_read(R2Pipe *r2p) {
++	int bufsz = 0;
++	char *buf = NULL;
++	if (!r2p) {
++		return NULL;
++	}
++	bufsz = 4096;
++	buf = calloc (1, bufsz);
++	if (!buf) {
++		return NULL;
++	}
++#if __WINDOWS__ && !defined(__CYGWIN__)
++	BOOL bSuccess = FALSE;
++	DWORD dwRead = 0;
++	// TODO: handle > 4096 buffers here
++	bSuccess = ReadFile (r2p->pipe, buf, bufsz, &dwRead, NULL);
++	if (!bSuccess || !buf[0]) {
++		return NULL;
++	}
++	if (dwRead > 0) {
++		buf[dwRead] = 0;
++	}
++	buf[bufsz - 1] = 0;
++#else
++	char *newbuf;
++	int i, rv;
++	for (i = 0; i < bufsz; i++) {
++		rv = read (r2p->output[0], buf + i, 1);
++		if (i + 2 >= bufsz) {
++			bufsz += 4096;
++			newbuf = realloc (buf, bufsz);
++			if (!newbuf) {
++				free (buf);
++				buf = NULL;
++				break;
++			}
++			buf = newbuf;
++		}
++		if (rv != 1 || !buf[i]) {
++			break;
++		}
++	}
++	if (buf) {
++		int zpos = (i < bufsz)? i: i - 1;
++		buf[zpos] = 0;
++	}
++#endif
++	return buf;
++}
++
+ R_API int r2p_close(R2Pipe *r2p) {
+ 	if (!r2p) {
+ 		return 0;
+@@ -62,14 +152,15 @@ static int w32_createPipe(R2Pipe *r2p, const char *cmd) {
+ 		PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+ 		sizeof (buf), sizeof (buf), 0, NULL);
+ 	if (r_sys_create_child_proc_w32 (cmd, NULL)) {
+-		if (ConnectNamedPipe (r2p->pipe, NULL))
++		if (ConnectNamedPipe (r2p->pipe, NULL)) {
+ 			return true;
++		}
+ 	}
+ 	return false;
+ }
+ #endif
+ 
+-static R2Pipe* r2p_open_spawn(R2Pipe* r2p, const char *cmd) {
++static R2Pipe* r2p_open_spawn(R2Pipe* r2p) {
+ #if __UNIX__ || defined(__CYGWIN__)
+ 	char *out 

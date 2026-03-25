@@ -1,0 +1,119 @@
+@@ -481,7 +481,8 @@ class CreateWorkspacedMixin(CreateMixin, CommandMixin):
+             db.session.commit()
+         except sqlalchemy.exc.IntegrityError as ex:
+             db.session.rollback()
+-            conflict_obj = get_conflict_object(db.session, obj, data)
++            workspace = self._get_workspace(workspace_name)
++            conflict_obj = get_conflict_object(db.session, obj, data, workspace)
+             if conflict_obj:
+                 abort(409, ValidationError(
+                     {
+@@ -520,7 +521,10 @@ class UpdateMixin(object):
+             db.session.commit()
+         except sqlalchemy.exc.IntegrityError as ex:
+             db.session.rollback()
+-            conflict_obj = get_conflict_object(db.session, obj, data)
++            workspace = None
++            if workspace_name:
++                workspace = db.session.query(Workspace).filter_by(name=workspace_name).first()
++            conflict_obj = get_conflict_object(db.session, obj, data, workspace)
+             if conflict_obj:
+                 abort(409, ValidationError(
+                     {
+
+
+
+
+@@ -1481,11 +1481,25 @@ vulnerability_uniqueness = DDL(
+     "COALESCE(website, ''), workspace_id, COALESCE(source_code_id, -1));"
+ )
+ 
++vulnerability_uniqueness_sqlite = DDL(
++    "CREATE UNIQUE INDEX uix_vulnerability ON %(fullname)s "
++    "(name, (description), COALESCE(host_id, -1), COALESCE(service_id, -1), "
++    "COALESCE(method, ''), COALESCE(parameter_name, ''), COALESCE(path, ''), "
++    "COALESCE(website, ''), workspace_id, COALESCE(source_code_id, -1));"
++)
++
++
+ event.listen(
+     VulnerabilityGeneric.__table__,
+     'after_create',
+     vulnerability_uniqueness.execute_if(dialect='postgresql')
+ )
+ 
++event.listen(
++    VulnerabilityGeneric.__table__,
++    'after_create',
++    vulnerability_uniqueness_sqlite.execute_if(dialect='sqlite')
++)
++
+ # We have to import this after all models are defined
+ import server.events
+
+
+
+
+@@ -248,7 +248,7 @@ def get_unique_fields(session, instance):
+             yield unique_constraint['column_names']
+ 
+ 
+-def get_conflict_object(session, obj, data):
++def get_conflict_object(session, obj, data, workspace=None):
+     unique_fields_gen = get_unique_fields(session, obj)
+     for unique_fields in unique_fields_gen:
+         relations_fields = filter(
+@@ -262,7 +262,7 @@ def get_conflict_object(session, obj, data):
+ 
+         if 'workspace_id' in relations_fields:
+             relations_fields.remove('workspace_id')
+-            filter_data['workspace_id'] = obj.workspace.id
++            filter_data['workspace_id'] = workspace.id
+ 
+         for relations_field in relations_fields:
+             if relations_field not in data and relations_field.strip('_id') in data:
+
+
+
+
+@@ -1,3 +1,5 @@
++from tempfile import NamedTemporaryFile
++
+ import os
+ import sys
+ import json
+@@ -15,7 +17,7 @@ from server.models import db
+ from test_cases import factories
+ 
+ 
+-
++TEMPORATY_SQLITE = NamedTemporaryFile()
+ # Discover factories to automatically register them to pytest-factoryboy and to
+ # override its session
+ enabled_factories = []
+@@ -60,7 +62,10 @@ class CustomClient(FlaskClient):
+ 
+ 
+ def pytest_addoption(parser):
+-    parser.addoption('--connection-string', default='sqlite://',
++    # currently for tests using sqlite and memory have problem while using transactions
++    # we need to review sqlite configuraitons for persistence using PRAGMA.
++    print(TEMPORATY_SQLITE.name)
++    parser.addoption('--connection-string', default='sqlite:////{0}'.format(TEMPORATY_SQLITE.name),
+                      help="Database connection string. Defaults to in-memory "
+                      "sqlite if not specified:")
+     parser.addoption('--ignore-nplusone', action='store_true',
+@@ -78,6 +83,7 @@ def app(request):
+     ctx.push()
+ 
+     def teardown():
++        TEMPORATY_SQLITE.close()
+         ctx.pop()
+ 
+     request.addfinalizer(teardown)
+
+
+
+
+@@ -121,6 +121,7 @@ class TestHostAPI:
+                                                   test_client, 

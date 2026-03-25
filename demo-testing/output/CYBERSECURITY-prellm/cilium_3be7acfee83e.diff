@@ -1,0 +1,125 @@
+@@ -83,11 +83,12 @@ union tcp_flags {
+  */
+ static inline __u32 __inline__ __ct_update_timeout(struct ct_entry *entry,
+ 						   __u32 lifetime, int dir,
+-						   union tcp_flags flags)
++						   union tcp_flags flags,
++						   __u8 report_mask)
+ {
+ 	__u32 now = bpf_ktime_get_sec();
+ 	__u8 accumulated_flags;
+-	__u8 seen_flags = flags.lower_bits & CT_REPORT_FLAGS;
++	__u8 seen_flags = flags.lower_bits & report_mask;
+ 	__u32 last_report;
+ 
+ #ifdef NEEDS_TIMEOUT
+@@ -173,7 +174,8 @@ static inline __u32 __inline__ ct_update_timeout(struct ct_entry *entry,
+ 		}
+ 	}
+ 
+-	return __ct_update_timeout(entry, lifetime, dir, seen_flags);
++	return __ct_update_timeout(entry, lifetime, dir, seen_flags,
++				   CT_REPORT_FLAGS);
+ }
+ 
+ static inline void __inline__ ct_reset_closing(struct ct_entry *entry)
+@@ -266,7 +268,8 @@ static inline __u8 __inline__ __ct_lookup(void *map, struct __sk_buff *skb,
+ 			*monitor = TRACE_PAYLOAD_LEN;
+ 			if (ct_entry_alive(entry))
+ 				break;
+-			__ct_update_timeout(entry, CT_CLOSE_TIMEOUT, dir, seen_flags);
++			__ct_update_timeout(entry, CT_CLOSE_TIMEOUT, dir,
++					    seen_flags, CT_REPORT_FLAGS);
+ 			break;
+ 		}
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2018-2019 Authors of Cilium
++
++/* Declare before lib/conntrack.h or die! */
++static uint32_t __now = 0;
++
++#define bpf_ktime_get_sec() __now
++#include "lib/conntrack.h"
++
++#define REPORT_ALL_FLAGS 0xFF
++#define REPORT_NO_FLAGS 0x0
++
++static void test___ct_update_timeout()
++{
++	struct ct_entry entry = {};
++	union tcp_flags flags = {};
++	uint32_t then;
++	int monitor;
++
++	// No update initially; mostly just because __now is less than the
++	// default report interval.
++	monitor = __ct_update_timeout(&entry, 1000, CT_INGRESS, flags, REPORT_ALL_FLAGS);
++	assert(!monitor);
++
++	// When a full report interval has passed, report.
++	__now += 1+CT_REPORT_INTERVAL;
++	monitor = __ct_update_timeout(&entry, 1000, CT_INGRESS, flags, REPORT_ALL_FLAGS);
++	assert(monitor);
++	assert(entry.last_rx_report == __now);
++	assert(entry.last_tx_report == 0);
++	assert(entry.rx_flags_seen == 0);
++	// If <= a full report interval passes, don't report.
++	then = __now;
++	__now += CT_REPORT_INTERVAL;
++	monitor = __ct_update_timeout(&entry, 1000, CT_INGRESS, flags, REPORT_ALL_FLAGS);
++	assert(!monitor);
++	assert(entry.last_rx_report == then);
++
++	// When flags change, report.
++	flags.value |= TCP_FLAG_SYN;
++	monitor = __ct_update_timeout(&entry, 1000, CT_INGRESS, flags, REPORT_ALL_FLAGS);
++	assert(monitor);
++	assert(entry.last_rx_report == __now);
++	assert(entry.rx_flags_seen == bpf_ntohs(TCP_FLAG_SYN));
++	assert(entry.last_tx_report == 0);
++	assert(entry.tx_flags_seen == 0);
++	// Same call; no report
++	monitor = __ct_update_timeout(&entry, 1000, CT_INGRESS, flags, REPORT_ALL_FLAGS);
++	assert(!monitor);
++
++	// If flags change but flag reporting is disabled, skip it.
++	flags.value |= TCP_FLAG_FIN;
++	monitor = __ct_update_timeout(&entry, 1000, CT_INGRESS, flags, REPORT_NO_FLAGS);
++	assert(!monitor);
++	assert(entry.rx_flags_seen == bpf_ntohs(TCP_FLAG_SYN));
++	assert(entry.tx_flags_seen == 0);
++}
+
+
+
+
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-// Copyright (c) 2018 Authors of Cilium
++// Copyright (c) 2018-2019 Authors of Cilium
+ #include <assert.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -8,6 +8,7 @@
+ #include "node_config.h"
+ 
+ #include "lib/common.h"
++#include "lib/conntrack_test.h"
+ #include "lib/ipv6.h"
+ 
+ #define SKIP_UNDEF_LPM_LOOKUP_FN
+@@ -104,6 +105,7 @@ int main(int argc, char *argv[])
+ {
+ 	test_lpm_lookup();
+ 	test_ipv6_addr_clear_suffix();
++	test___ct_update_timeout();
+ 
+ 	return 0;
+ }

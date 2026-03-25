@@ -1,0 +1,143 @@
+@@ -550,7 +550,7 @@ handle_ipv4(struct __ctx_buff *ctx, __u32 secctx __maybe_unused,
+ #ifdef ENABLE_NODEPORT
+ 	if (!from_host) {
+ 		if (!ctx_skip_nodeport(ctx)) {
+-			int ret = nodeport_lb4(ctx, secctx, ext_err);
++			int ret = nodeport_lb4(ctx, ip4, ETH_HLEN, secctx, ext_err);
+ 
+ 			if (ret == NAT_46X64_RECIRC) {
+ 				ctx_store_meta(ctx, CB_SRC_LABEL, secctx);
+
+
+
+
+@@ -310,7 +310,7 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
+ 
+ #ifdef ENABLE_NODEPORT
+ 	if (!ctx_skip_nodeport(ctx)) {
+-		int ret = nodeport_lb4(ctx, *identity, ext_err);
++		int ret = nodeport_lb4(ctx, ip4, ETH_HLEN, *identity, ext_err);
+ 
+ 		if (ret < 0)
+ 			return ret;
+
+
+
+
+@@ -101,18 +101,26 @@ int tail_lb_ipv4(struct __ctx_buff *ctx)
+ 	__s8 ext_err = 0;
+ 
+ 	if (!ctx_skip_nodeport(ctx)) {
+-		ret = nodeport_lb4(ctx, 0, &ext_err);
++		void *data, *data_end;
++		struct iphdr *ip4;
++
++		if (!revalidate_data(ctx, &data, &data_end, &ip4)) {
++			ret = DROP_INVALID;
++			goto out;
++		}
++
++		ret = nodeport_lb4(ctx, ip4, ETH_HLEN, 0, &ext_err);
+ 		if (ret == NAT_46X64_RECIRC) {
+ 			ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
+-			return send_drop_notify_error(ctx, 0, DROP_MISSED_TAIL_CALL,
+-						      CTX_ACT_DROP,
+-						      METRIC_INGRESS);
+-		} else if (IS_ERR(ret)) {
+-			return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
+-							  CTX_ACT_DROP, METRIC_INGRESS);
++			ret = DROP_MISSED_TAIL_CALL;
+ 		}
+ 	}
+ 
++out:
++	if (IS_ERR(ret))
++		return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
++						  CTX_ACT_DROP, METRIC_INGRESS);
++
+ 	return bpf_xdp_exit(ctx, ret);
+ }
+ 
+
+
+
+
+@@ -150,12 +150,13 @@ union v6addr {
+ 	__u8 addr[16];
+ } __packed;
+ 
+-static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
+-					       __u16 *proto)
++static __always_inline bool validate_ethertype_l2_off(struct __ctx_buff *ctx,
++						      int l2_off, __u16 *proto)
+ {
+-	void *data = ctx_data(ctx);
++	const __u64 tot_len = l2_off + ETH_HLEN;
+ 	void *data_end = ctx_data_end(ctx);
+-	struct ethhdr *eth = data;
++	void *data = ctx_data(ctx);
++	struct ethhdr *eth;
+ 
+ 	if (ETH_HLEN == 0) {
+ 		/* The packet is received on L2-less device. Determine L3
+@@ -165,20 +166,30 @@ static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
+ 		return true;
+ 	}
+ 
+-	if (data + ETH_HLEN > data_end)
++	if (data + tot_len > data_end)
+ 		return false;
++
++	eth = data + l2_off;
++
+ 	*proto = eth->h_proto;
+ 	if (bpf_ntohs(*proto) < ETH_P_802_3_MIN)
+ 		return false; /* non-Ethernet II unsupported */
++
+ 	return true;
+ }
+ 
++static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
++					       __u16 *proto)
++{
++	return validate_ethertype_l2_off(ctx, 0, proto);
++}
++
+ static __always_inline __maybe_unused bool
+ ____revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
+ 			 void **l3, const __u32 l3_len, const bool pull,
+-			 __u32 eth_hlen)
++			 __u32 l3_off)
+ {
+-	const __u64 tot_len = eth_hlen + l3_len;
++	const __u64 tot_len = l3_off + l3_len;
+ 	void *data_end;
+ 	void *data;
+ 
+@@ -194,16 +205,17 @@ ____revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
+ 	*data_ = data;
+ 	*data_end_ = data_end;
+ 
+-	*l3 = data + eth_hlen;
++	*l3 = data + l3_off;
+ 	return true;
+ }
+ 
+ static __always_inline __maybe_unused bool
+ __revalidate_data_pull(struct __ctx_buff *ctx, void **data, void **data_end,
+-		       void **l3, const __u32 l3_len, const bool pull)
++		       void **l3, const __u32 l3_off, const __u32 l3_len,
++		       const bool pull)
+ {
+ 	return ____revalidate_data_pull(ctx, data, data_end, l3, l3_len, pull,
+-					ETH_HLEN);
++					l3_off);
+ }
+ 
+ /* revalidate_data_pull() initializes the provided pointers from the ctx and
+@@ -214,14 +226,17 @@ __revalidate_data_pull(struct __ctx_buff *ctx, void **data, void **data_end,
+  * false otherwise.
+  */
+ #define revalidate_data_pull(ctx, data, data_end, ip)			\
+-	__revalidate_data_pull(ctx, data, data_end, (void **)ip, sizeof(**ip), true)
++	__revalidate_data_pull(ctx, data, data_end, (v

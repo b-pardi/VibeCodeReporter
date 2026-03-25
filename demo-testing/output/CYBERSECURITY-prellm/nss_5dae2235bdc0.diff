@@ -1,0 +1,107 @@
+@@ -313,7 +313,7 @@ void TlsConnectTestBase::SetupEch(std::shared_ptr<TlsAgent>& client,
+                                   std::shared_ptr<TlsAgent>& server,
+                                   HpkeKemId kem_id, bool expect_ech,
+                                   bool set_client_config,
+-                                  bool set_server_config) {
++                                  bool set_server_config, int max_name_len) {
+   EXPECT_TRUE(set_server_config || set_client_config);
+   ScopedSECKEYPublicKey pub;
+   ScopedSECKEYPrivateKey priv;
+@@ -322,7 +322,7 @@ void TlsConnectTestBase::SetupEch(std::shared_ptr<TlsAgent>& client,
+       {HpkeKdfHkdfSha256, HpkeAeadChaCha20Poly1305},
+       {HpkeKdfHkdfSha256, HpkeAeadAes128Gcm}};
+ 
+-  GenerateEchConfig(kem_id, kDefaultSuites, "public.name", 100, record, pub,
++  GenerateEchConfig(kem_id, kDefaultSuites, "public.name", maxConfigSize, record,
+                     priv);
+   ASSERT_NE(0U, record.len());
+   SECStatus rv;
+
+
+
+
+@@ -156,7 +156,7 @@ class TlsConnectTestBase : public ::testing::Test {
+                 std::shared_ptr<TlsAgent>& server,
+                 HpkeKemId kem_id = HpkeDhKemX25519Sha256,
+                 bool expect_ech = true, bool set_client_config = true,
+-                bool set_server_config = true);
++                bool set_server_config = true, int maxConfigSize = 100);
+ 
+  protected:
+   SSLProtocolVariant variant_;
+
+
+
+
+@@ -4,8 +4,6 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-// TODO: Add padding/maxNameLen tests after support is added in bug 1677181.
+-
+ #include "secerr.h"
+ #include "ssl.h"
+ 
+@@ -826,6 +824,129 @@ TEST_F(TlsConnectStreamTls13, EchWithInnerExtNotSplit) {
+   server_->CheckErrorCode(SSL_ERROR_RX_UNEXPECTED_EXTENSION);
+ }
+ 
++/* Parameters
++ * Length of SNI for first connection
++ * Length of SNI for second connection
++ * Use GREASE for first connection?
++ * Use GREASE for second connection?
++ * For both connections, SNI length to pad to.
++ */
++class EchCHPaddingTest : public TlsConnectStreamTls13,
++                         public testing::WithParamInterface<
++                             std::tuple<int, int, bool, bool, int>> {};
++
++TEST_P(EchCHPaddingTest, EchChPaddingEqual) {
++  auto parameters = GetParam();
++  std::string name_str1 = std::string(std::get<0>(parameters), 'a');
++  std::string name_str2 = std::string(std::get<1>(parameters), 'a');
++  const char* name1 = name_str1.c_str();
++  const char* name2 = name_str2.c_str();
++  bool grease_mode1 = std::get<2>(parameters);
++  bool grease_mode2 = std::get<3>(parameters);
++  uint8_t max_name_len = std::get<4>(parameters);
++
++  // Connection 1
++  EnsureTlsSetup();
++  SSL_SetURL(client_->ssl_fd(), name1);
++  if (grease_mode1) {
++    EXPECT_EQ(SECSuccess, SSL_EnableTls13GreaseEch(client_->ssl_fd(), PR_TRUE));
++    client_->ExpectEch(false);
++    server_->ExpectEch(false);
++  } else {
++    SetupEch(client_, server_, HpkeDhKemX25519Sha256, true, true, true,
++             max_name_len);
++  }
++  auto filter1 = MakeTlsFilter<TlsExtensionCapture>(
++      client_, ssl_tls13_encrypted_client_hello_xtn);
++  Connect();
++  size_t echXtnLen1 = filter1->extension().len();
++
++  Reset();
++
++  // Connection 2
++  EnsureTlsSetup();
++  SSL_SetURL(client_->ssl_fd(), name2);
++  if (grease_mode2) {
++    EXPECT_EQ(SECSuccess, SSL_EnableTls13GreaseEch(client_->ssl_fd(), PR_TRUE));
++    client_->ExpectEch(false);
++    server_->ExpectEch(false);
++  } else {
++    SetupEch(client_, server_, HpkeDhKemX25519Sha256, true, true, true,
++             max_name_len);
++  }
++  auto filter2 = MakeTlsFilter<TlsExtensionCapture>(
++      client_, ssl_tls13_encrypted_client_hello_xtn);
++  Connect();
++  size_t echXtnLen2 = filter2->extension().len();
++
++  // We always expect an ECH extension.
++  ASSERT_TRUE(echXtnLen2 > 0 && echXtnLen1 > 0);
++  // We expect the ECH extension to round to the same multiple of 32.
++  // Note: It will not be 0 % 32 

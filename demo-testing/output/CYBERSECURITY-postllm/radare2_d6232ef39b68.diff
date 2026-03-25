@@ -1,0 +1,142 @@
+@@ -28,6 +28,7 @@ int gettimeofday(struct timeval *p, void *tz);
+ #endif
+ #include "r_event.h"
+ #include "r_util/r_assert.h"
++#include "r_util/r_arena.h"
+ #include "r_util/r_itv.h"
+ #include "r_util/r_signal.h"
+ #include "r_util/r_alloc.h"
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,64 @@
++#ifndef R_ARENA_H
++#define R_ARENA_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <r_types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Arena Allocator - Linked list of fixed-size blocks, backed with malloc/free
++//
++// Facts:
++// - Each arena has a list of blocks (allocated on demand)
++// - Block size is fixed at arena creation
++// - Fast bump allocation within current block
++// - When block is full, allocate new block and link it
++// - Reset frees all blocks except first (reuse)
++// - Destroy frees everything
++
++// Single memory block in the arena
++typedef struct r_arena_block_t {
++	struct r_arena_block_t *next; // Next block in list (NULL if last)
++	size_t used; // Bytes used in this block
++	size_t capacity; // Total capacity of this block
++	uint8_t data[]; // Flexible array member - actual memory
++} RArenaBlock;
++
++// Arena itself
++typedef struct r_arena_t {
++	RArenaBlock *current; // Current block we're allocating from
++	RArenaBlock *first; // First block (kept for reset)
++	size_t block_size; // Fixed size for all blocks
++	size_t total_allocated; // Total bytes allocated across all blocks
++	size_t default_alignment; // Default alignment (usually 8)
++} RArena;
++
++// 64kb ought to be enough for anybody. Or just use `arena_create_with`
++#define ARENA_DEFAULT_BLOCK_SIZE (64 * 1024)
++#define ARENA_DEFAULT_ALIGNMENT 8
++
++R_API RArena *r_arena_create(void);
++R_API RArena *r_arena_create_with(size_t block_size);
++R_API void *r_arena_alloc(RArena *arena, size_t size);
++R_API void *r_arena_calloc(RArena *arena, size_t size);
++R_API void *r_arena_alloc_aligned(RArena *arena, size_t size, size_t alignment);
++R_API void *r_arena_calloc_aligned(RArena *arena, size_t size, size_t alignment);
++R_API void r_arena_reset(RArena *arena);
++R_API void r_arena_destroy(RArena *arena);
++
++R_API char *r_arena_push_str(RArena *arena, const char *str);
++R_API char *r_arena_push_strn(RArena *arena, const char *str, size_t n);
++R_API void *r_arena_push(RArena *arena, const void *mem, size_t n);
++
++R_API size_t r_arena_used(const RArena *arena);
++R_API size_t r_arena_capacity(const RArena *arena);
++R_API size_t r_arena_block_count(const RArena *arena);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // R_ARENA_H
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,261 @@
++#include <assert.h>
++#include <r_util/r_alloc.h>
++#include <r_util/r_arena.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++_Static_assert (sizeof (size_t) >= sizeof (void *), "size_t must fit pointer");
++_Static_assert (sizeof (uintptr_t) >= sizeof (void *),
++	"uintptr_t must fit pointer");
++
++static inline uintptr_t align_address(uintptr_t address, size_t alignment) {
++	assert (alignment > 0 && (alignment &(alignment - 1)) == 0);
++	return (address + alignment - 1) & ~ (alignment - 1);
++}
++
++static RArenaBlock *arena_block_create(size_t capacity) {
++	RArenaBlock *block =
++		(RArenaBlock *)r_malloc (sizeof (RArenaBlock) + capacity);
++	if (!block) {
++		return NULL;
++	}
++
++	block->next = NULL;
++	block->used = 0;
++	block->capacity = capacity;
++
++	return block;
++}
++
++static void arena_block_free_chain(RArenaBlock *block) {
++	while (block) {
++		RArenaBlock *next = block->next;
++		r_free (block);
++		block = next;
++	}
++}
++
++// Create arena with specified block size
++R_API RArena *r_arena_create_with(size_t block_size) {
++	if (block_size == 0) {
++		block_size = ARENA_DEFAULT_BLOCK_SIZE;
++	}
++
++	RArena *arena = (RArena *)r_malloc (sizeof (RArena));
++	if (!arena) {
++		return NULL;
++	}
++
++	RArenaBlock *first_block = arena_block_create (block_size);
++	if (!first_block) {
++		r_free (arena);
++		return NULL;
++	}
++
++	arena->current = first_block;
++	arena->first = first_block;
++	arena->block_size = block_size

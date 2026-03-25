@@ -1,0 +1,105 @@
+@@ -117,12 +117,13 @@ class JailReader(ConfigReader):
+ 		"logencoding": ["string", None],
+ 		"logpath": ["string", None],
+ 		"skip_if_nologs": ["bool", False],
++		"systemd_if_nologs": ["bool", True],
+ 		"action": ["string", ""]
+ 	}
+ 	_configOpts.update(FilterReader._configOpts)
+ 
+ 	_ignoreOpts = set(
+-		['action', 'filter', 'enabled', 'backend', 'skip_if_nologs'] +
++		['action', 'filter', 'enabled', 'backend', 'skip_if_nologs', 'systemd_if_nologs'] +
+ 		list(FilterReader._configOpts.keys())
+ 	)
+ 
+@@ -239,7 +240,7 @@ class JailReader(ConfigReader):
+ 			return self.__opts
+ 		return _merge_dicts(self.__opts, self.__filter.getCombined())
+ 
+-	def convert(self, allow_no_files=False):
++	def convert(self, allow_no_files=False, systemd_if_nologs=True):
+ 		"""Convert read before __opts to the commands stream
+ 
+ 		Parameters
+@@ -277,14 +278,25 @@ class JailReader(ConfigReader):
+ 						stream2.append(
+ 							["set", self.__name, "addlogpath", p, tail])
+ 				if not found_files:
+-					msg = "Have not found any log file for %s jail" % self.__name
++					msg = "Have not found any log file for '%s' jail." % self.__name
+ 					skip_if_nologs = self.__opts.get('skip_if_nologs', False)
+-					if not allow_no_files and not skip_if_nologs:
++					# if auto and we can switch to systemd backend (only possible if jail have journalmatch):
++					if backend.startswith("auto") and systemd_if_nologs and (
++					  self.__opts.get('systemd_if_nologs', True) and
++					  self.__opts.get('journalmatch', None) is not None
++					):
++						# switch backend to systemd:
++						backend = 'systemd'
++						msg += " Jail will monitor systemd journal."
++						skip_if_nologs = False
++					elif not allow_no_files and not skip_if_nologs:
+ 						raise ValueError(msg)
+ 					logSys.warning(msg)
+ 					if skip_if_nologs:
+-						self.__opts['config-error'] = msg
+-						stream = [['config-error', "Jail '%s' skipped, because of missing log files." % (self.__name,)]]
++						self.__opts['runtime-error'] = msg
++						msg = "Jail '%s' skipped, because of missing log files." % (self.__name,)
++						logSys.warning(msg)
++						stream = [['config-error', msg]]
+ 						return stream
+ 			elif opt == "ignoreip":
+ 				stream.append(["set", self.__name, "addignoreip"] + splitwords(value))
+
+
+
+
+@@ -88,7 +88,7 @@ class JailsReader(ConfigReader):
+ 				parse_status |= 2
+ 		return ((ignoreWrong and parse_status & 1) or not (parse_status & 2))
+ 
+-	def convert(self, allow_no_files=False):
++	def convert(self, allow_no_files=False, systemd_if_nologs=True):
+ 		"""Convert read before __opts and jails to the commands stream
+ 
+ 		Parameters
+@@ -101,11 +101,14 @@ class JailsReader(ConfigReader):
+ 		stream = list()
+ 		# Convert jails
+ 		for jail in self.__jails:
+-			stream.extend(jail.convert(allow_no_files=allow_no_files))
++			stream.extend(jail.convert(allow_no_files, systemd_if_nologs))
+ 		# Start jails
+ 		for jail in self.__jails:
+-			if not jail.options.get('config-error'):
++			if not jail.options.get('config-error') and not jail.options.get('runtime-error'):
+ 				stream.append(["start", jail.getName()])
++			else:
++				# just delete rtm-errors (to check next time if cached)
++				jail.options.pop('runtime-error', None)
+ 
+ 		return stream
+ 
+
+
+
+
+@@ -719,51 +719,67 @@ class JailsReaderTest(LogCaptureTestCase):
+ 		jails = JailsReader(basedir=IMPERFECT_CONFIG, share_config=IMPERFECT_CONFIG_SHARE_CFG)
+ 		self.assertTrue(jails.read())
+ 		self.assertFalse(jails.getOptions(ignoreWrong=False))
+-		self.assertRaises(ValueError, jails.convert)
+-		comm_commands = jails.convert(allow_no_files=True)
+-		self.maxDiff = None
+-		self.assertSortedEqual(comm_commands,
+-			[['add', 'emptyaction', 'auto'],
+-			 ['add', 'test-known-interp', 'auto'],
+-			 ['multi-set', 'test-known-interp', 'addfailregex', [
+-			   'failure test 1 (filter.d/test.conf) <HOST>',
+-			   'failure test 2 (filter.d/test.local) <HOST>',
+-			   'failure test 3 (jail.local) <HOST>'
+-			 ]],
+-			 ['start', 'test-known-interp'],
+-			 ['add', 'missinglogfiles', 'au

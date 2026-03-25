@@ -1,0 +1,106 @@
+@@ -46,6 +46,16 @@ class AlertsManager : public StoreManager {
+   bool isValidNetwork(const char *cidr);
+   bool isValidInterface(NetworkInterface *n);
+ 
++  /* Methods to handle caching for alerts (to avoid putting high pressure on sqlite) */
++  static char *getAlertCacheKey(int ifid, AlertType alert_type, const char *subtype, int granularity,
++				AlertEntity alert_entity, const char *alert_entity_value, AlertLevel alert_severity);
++  static bool isCached(int ifid, AlertType alert_type, const char *subtype, int granularity,
++		       AlertEntity alert_entity, const char *alert_entity_value, AlertLevel alert_severity,
++		       u_int64_t *cached_rowid);
++  static void cache(int ifid, AlertType alert_type, const char *subtype, int granularity,
++		    AlertEntity alert_entity, const char *alert_entity_value, AlertLevel alert_severity,
++		    u_int64_t rowid);
++
+  public:
+   AlertsManager(int interface_id, const char *db_filename);
+   ~AlertsManager();
+
+
+
+
+@@ -853,7 +853,14 @@
+ #define STORE_MANAGER_MAX_KEY                20
+ #define DEFAULT_GLOBAL_DNS                   ""
+ #define DEFAULT_SAFE_SEARCH_DNS              "208.67.222.123" /* OpenDNS Family Shield */
++
+ #define ALERTS_MANAGER_MAX_AGGR_SECS         300 /* Aggregate equal alerts if generated within this interval */
++
++/* A cache key used to look for the alert before going into sqlite. The rowid of an inserted
++   alert is stored in the value of this cache key. Cache key is:
++   <prefix>.ifid_<ifid>.alerts.aggregation_cache.<alert_type>_<alert_subtype>_<granularity>_<entity>_<entity_val>_<severity> */
++#define ALERTS_MANAGER_AGGR_CACHE_KEY        NTOPNG_CACHE_PREFIX ".ifid_%d.alerts.aggregation_cache.%i_%s_%i_%i_%s_%i"
++
+ #define ALERTS_MANAGER_MAX_ENTITY_ALERTS     1024
+ #define ALERTS_MANAGER_MAX_FLOW_ALERTS       16384
+ #define ALERTS_MANAGER_FLOWS_TABLE_NAME      "flows_alerts"
+
+
+
+
+@@ -334,18 +334,101 @@ int AlertsManager::parseEntityValueIp(const char *alert_entity_value, struct in6
+ 
+ /* **************************************************** */
+ 
++/*
++  Generates a key used to cache the alert
++*/
++char *AlertsManager::getAlertCacheKey(int ifid, AlertType alert_type, const char *subtype, int granularity,
++				      AlertEntity alert_entity, const char *alert_entity_value, AlertLevel alert_severity) {
++  char * res = NULL;
++
++  if((res = (char*)malloc(CONST_MAX_LEN_REDIS_KEY))) {
++    if(snprintf(res, CONST_MAX_LEN_REDIS_KEY,
++		ALERTS_MANAGER_AGGR_CACHE_KEY,
++		ifid,
++		alert_type, subtype, granularity,
++		alert_entity, alert_entity_value, alert_severity) >= CONST_MAX_LEN_REDIS_KEY) {
++      free(res);
++      res = NULL;
++    }
++  }
++
++  return res;
++}
++
++/* **************************************************** */
++
++/*
++  Checks if an alert is cached an, in case, it returns the corresponding rowid in cached_rowid
++*/
++bool AlertsManager::isCached(int ifid, AlertType alert_type, const char *subtype, int granularity,
++			     AlertEntity alert_entity, const char *alert_entity_value, AlertLevel alert_severity,
++			     u_int64_t *cached_rowid) {
++  char *cached_k = getAlertCacheKey(ifid, alert_type, subtype, granularity, alert_entity, alert_entity_value, alert_severity);
++  bool is_cached = false;
++
++  if(cached_k) {
++    Redis *r = ntop->getRedis();
++
++    if(r) {
++      char cur_rowid_str[32];
++      u_int64_t cur_rowid;
++
++      if(r->get(cached_k, cur_rowid_str, sizeof(cur_rowid_str)) == 0) {
++	errno = 0; /* Still thread-safe, errno is per-thread */
++	cur_rowid = strtol(cur_rowid_str, NULL, 0); /* Use strtol as result is a 64 bit integer */
++
++	if(!errno)
++	  *cached_rowid = cur_rowid,
++	    is_cached = true;
++      }
++    }
++
++    free(cached_k);
++  }
++
++  return is_cached;
++}
++
++/* **************************************************** */
++
++/*
++  Adds an an alert with a give rowid to the cache of alerts
++*/
++void AlertsManager::cache(int ifid, AlertType alert_type, const char *subtype, int granularity,
++			  AlertEntity alert_entity, const char *alert_entity_value, 

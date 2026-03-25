@@ -1,0 +1,158 @@
+@@ -86,6 +86,7 @@ static const char *help_msg_pF[] = {
+ 	"pFx", "[len]", "Same with X509",
+ 	"pFX", "[len]", "print decompressed xz block",
+ 	"pFA", "[len]", "decode Android Binary XML from current block",
++	"pFB", "[j] [len]", "decode iOS Binary PLIST from current block",
+ 	NULL
+ };
+ 
+@@ -1336,6 +1337,25 @@ static void cmd_print_fromage(RCore *core, const char *input, const ut8* data, i
+ 			}
+ 		}
+ 		break;
++	case 'B': // "pFB"
++		if (input[1] == '?') {
++			eprintf ("Usage: pFB[j] - parse binary plist format, check 'b'lock size on errors, pFBj for json output\n");
++		} else {
++			PJ *pj = r_core_pj_new (core);
++			if (!r_bplist_parse (pj, data, size)) {
++				eprintf ("Parse error\n");
++			}
++			char *s = pj_drain (pj);
++			if (input[1] == 'j') {
++				r_cons_printf ("%s\n", s);
++			} else {
++				char *r = r_print_json_human (s);
++				r_cons_printf ("%s\n", r);
++				free (r);
++			}
++			free (s);
++		}
++		break;
+ 	default:
+ 	case '?': // "pF?"
+ 		r_core_cmd_help (core, help_msg_pF);
+
+
+
+
+@@ -73,6 +73,7 @@ int gettimeofday (struct timeval* p, void* tz);
+ #include "r_util/r_idpool.h"
+ #include "r_util/r_asn1.h"
+ #include "r_util/pj.h"
++#include "r_util/bplist.h"
+ #include "r_util/r_x509.h"
+ #include "r_util/r_pkcs7.h"
+ #include "r_util/r_protobuf.h"
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,19 @@
++#ifndef R2_BPLIST_H
++#define R2_BPLIST_H
++
++#include <r_util.h>
++#include <r_util/pj.h>
++
++typedef struct r_bplist_t {
++	const char* data;
++	ut64 size;
++	ut64 num_objects;
++	ut8 ref_size;
++	ut8 offset_size;
++	const char* offset_table;
++	PJ *pj;
++} RBPlist;
++
++R_API bool r_bplist_parse(PJ *pj, const ut8 *data, size_t data_len);
++
++#endif
+
+
+
+
+@@ -27,6 +27,7 @@ typedef struct pj_t {
+ 	RStrBuf sb;
+ 	bool is_first;
+ 	bool is_key;
++	const char *comma;
+ 	char braces[R_PRINT_JSON_DEPTH_LIMIT];
+ 	int level;
+ 	PJEncodingStr str_encoding;
+@@ -48,6 +49,7 @@ R_API const char *pj_string(PJ *pj);
+ /* close the current json list or array */
+ R_API PJ *pj_end(PJ *j);
+ R_API void pj_raw(PJ *j, const char *k);
++R_API void pj_kraw(PJ *j);
+ 
+ /* object, array */
+ /* open new json list { */
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,516 @@
++/* radare - LGPL - Copyright 2022 - pancake */
++/*
++ * bplist.c
++ * Binary plist implementation
++ *
++ * Copyright (c) 2011-2017 Nikias Bassen, All Rights Reserved.
++ * Copyright (c) 2008-2010 Jonathan Beck, All Rights Reserved.
++ * Copyright (c) 2022      pancake, No Rights Reserved.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++
++
++#include <r_util.h>
++#include <r_util/bplist.h>
++
++/* Magic marker and size. */
++#define BPLIST_MAGIC            ((ut8*)"bplist")
++#define BPLIST_MAGIC_SIZE       6
++
++#define BPLIST_VERSION          ((ut8*)"00")
++#define BPLIST_VERSION_SIZE     2
++
++R_PACKED (typedef struct {
++	ut8 unused[6];
++	ut8 offset_size;
++	ut8 ref_size;
++	ut64 num_objects;
++	ut64 root_object_index;
++	ut64 offset_table_offset;
++}) BPlistTrailer;
++
++enum {
++	BPLIST_NULL = 0x00,
++	BPLIST_FALSE = 0x08,
++	BPLIST_TRUE = 0x09,
++	BPLIST_FILL = 0x0F,			/* will be used for length grabbing */
++	BPLIST_UINT = 0x10,
++	BPLIST_REAL = 0x20,
++	BPLIST_DATE = 0x30,
++	BPLIST_DATA = 0x40,
++	BPLIST_STRING = 0x50,
++	BPLIST_UNICODE = 0x60,
++	BPLIST_UNK_0x70 = 0x70,
++	BPLIST_UID = 0x80,
++	BPLIST_ARRAY = 0xA0,
++	BPLIST_SET = 0xC0,
++	BPLIST_DICT = 0xD0,
++	B

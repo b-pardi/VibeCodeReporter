@@ -1,0 +1,102 @@
+@@ -93,7 +93,7 @@ void read_enter(const std::string &filename, uint64_t file_id,
+     if (!taint2_enabled()) {
+         printf("file_taint read_enter: first time match of file \"%s\", "
+                "enabling taint\n",
+-               filename.c_str());
++               target_filename.c_str());
+         taint2_enable_taint();
+     }
+ 
+@@ -187,8 +187,21 @@ void windows_read_enter(CPUState *cpu, target_ulong pc, uint32_t FileHandle,
+                         uint32_t ByteOffset, uint32_t Key)
+ {
+     char *filename = get_handle_name(cpu, get_current_proc(cpu), FileHandle);
++    std::string ob_path = filename;
++    // Check if the file handle is absolute, if not we need to make it absolute.
++    if (filename[0] != '\\') {
++        char *cwd = get_cwd(cpu);
++        ob_path = cwd;
++        // If the cwd doesn't have a slash, add it.
++        if (ob_path.back() != '\\') {
++            ob_path += "\\";
++        }
++        ob_path += filename;
++        free(cwd);
++    }
++    verbose_printf("file_taint windows object path: %s\n", ob_path.c_str());
+     int64_t pos = get_file_handle_pos(cpu, get_current_proc(cpu), FileHandle);
+-    read_enter(filename, FileHandle, pos);
++    read_enter(ob_path, FileHandle, pos);
+     g_free(filename);
+ }
+ 
+@@ -217,6 +230,7 @@ void linux_read_enter(CPUState *cpu, target_ulong pc, uint32_t fd,
+                       uint32_t buffer, uint32_t count)
+ {
+     OsiProc *proc = get_current_process(cpu);
++    // The filename in Linux should always be absolute.
+     char *filename = osi_linux_fd_to_filename(cpu, proc, fd);
+     uint64_t pos = osi_linux_fd_to_pos(cpu, proc, fd);
+     read_enter(filename, fd, pos);
+
+
+
+
+@@ -67,7 +67,8 @@ void on_free_osimodules(OsiModules *ms);
+ #define OBJNAME_OFF          0x008
+ #define FILE_OBJECT_NAME_OFF 0x030
+ #define FILE_OBJECT_POS_OFF  0x038
+-
++#define PROCESS_PARAMETERS_OFF 0x010 // PEB.ProcessParameters
++#define UNICODE_WORKDIR_OFF 0x24     // ProcessParameters.WorkingDirectory
+ 
+ // "Constants" specific to the guest operating system.
+ // These are initialized in the init_plugin function.
+@@ -76,6 +77,8 @@ static uint32_t eproc_pid_off;      // _EPROCESS.UniqueProcessId
+ static uint32_t eproc_ppid_off;     // _EPROCESS.InheritedFromUniqueProcessId
+ static uint32_t eproc_name_off;     // _EPROCESS.ImageFileName
+ static uint32_t eproc_objtable_off; // _EPROCESS.ObjectTable
++static uint32_t
++    eproc_ppeb_off; // _EPROCESS.Peb (pointer to process environment block)
+ static uint32_t eproc_size;         // Value of Size
+ static uint32_t eproc_links_off;    // _EPROCESS.ActiveProcessLinks
+ static uint32_t obj_type_file;      // FILE object type
+@@ -260,6 +263,31 @@ void get_procname(CPUState *cpu, uint32_t eproc, char **name) {
+     (*name)[16] = '\0';
+ }
+ 
++char *get_cwd(CPUState *cpu)
++{
++    PTR eproc = get_current_proc(cpu);
++
++    // Get pointer to PEB
++    target_ulong ppeb = 0x0;
++    assert(!panda_virtual_memory_read(cpu, eproc + eproc_ppeb_off,
++                                      (uint8_t *)&ppeb, sizeof(ppeb)));
++    // Get pointer to PROCESS_PARAMETERS
++    target_ulong pprocess_params = 0x0;
++    assert(!panda_virtual_memory_read(cpu, ppeb + PROCESS_PARAMETERS_OFF,
++                                      (uint8_t *)&pprocess_params,
++                                      sizeof(pprocess_params)));
++
++    // Get the work dir handle
++    uint32_t cwd_handle = 0x0;
++    assert(!panda_virtual_memory_read(cpu, pprocess_params + 0x2C,
++                                      (uint8_t *)&cwd_handle,
++                                      sizeof(cwd_handle)));
++
++    char *cwd_handle_name = get_handle_name(cpu, eproc, cwd_handle);
++
++    return cwd_handle_name;
++}
++
+ bool is_valid_process(CPUState *cpu, PTR eproc) {
+     uint8_t type;
+     uint8_t size;
+@@ -566,6 +594,7 @@ bool init_plugin(void *self) {
+         eproc_ppid_off=0x140;
+         eproc_name_off=0x16c;
+         eproc_objtable_off=0xf4;
++        eproc_ppeb_off = 0x1a8;
+         obj_type_file = 28;
+         ob

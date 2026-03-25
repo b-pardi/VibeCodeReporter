@@ -1,0 +1,119 @@
+@@ -421,77 +421,6 @@ snat_v4_rewrite_headers(struct __ctx_buff *ctx, __u8 nexthdr, int l3_off,
+ 	return 0;
+ }
+ 
+-static __always_inline int
+-snat_v4_icmp_rewrite_ingress_embedded(struct __ctx_buff *ctx,
+-				      struct ipv4_ct_tuple *tuple,
+-				      struct ipv4_nat_entry *state,
+-				      __u32 l4_off, __u32 inner_l4_off)
+-{
+-	struct csum_offset csum = {};
+-	__be32 sum;
+-
+-	if (state->to_daddr == tuple->daddr &&
+-	    state->to_dport == tuple->dport)
+-		return 0;
+-
+-	sum = csum_diff(&tuple->daddr, 4, &state->to_daddr, 4, 0);
+-	csum_l4_offset_and_flags(tuple->nexthdr, &csum);
+-	if (state->to_dport != tuple->dport) {
+-		__be32 suml4 = 0;
+-
+-		switch (tuple->nexthdr) {
+-		case IPPROTO_TCP:
+-		case IPPROTO_UDP:
+-			/* In case that the destination port has been NATed from
+-			 * target to dest. We want the embedded packet which
+-			 * should refer to endpoint dest going back to original.
+-			 */
+-			if (ctx_store_bytes(ctx, inner_l4_off +
+-					    offsetof(struct tcphdr, source),
+-					    &state->to_dport,
+-					    sizeof(state->to_dport), 0) < 0)
+-				return DROP_WRITE_ERROR;
+-			break;
+-#ifdef ENABLE_SCTP
+-		case IPPROTO_SCTP:
+-			return DROP_CSUM_L4;
+-#endif  /* ENABLE_SCTP */
+-		case IPPROTO_ICMP: {
+-			/* In case that the ID has been used as source port during
+-			 * NAT from target to dest. We want the embedded packet
+-			 * which should refer to endpoint -> dest going back to
+-			 * original.
+-			 */
+-			if (ctx_store_bytes(ctx, inner_l4_off +
+-					    offsetof(struct icmphdr, un.echo.id),
+-					    &state->to_dport,
+-					    sizeof(state->to_dport), 0) < 0)
+-				return DROP_WRITE_ERROR;
+-			csum.offset = offsetof(struct icmphdr, checksum);
+-			csum.flags = 0;
+-			break;
+-		}
+-		default:
+-			return DROP_UNKNOWN_L4;
+-		}
+-		/* By recomputing L4 checksum of inner packet we avoid having
+-		 * to recompute L4 of the ICMP Error.
+-		 */
+-		suml4 = csum_diff(&tuple->dport, 4, &state->to_dport, 4, 0);
+-		if (csum_l4_replace(ctx, inner_l4_off, &csum, 0, suml4, 0) < 0)
+-			return DROP_CSUM_L4;
+-	}
+-	/* Change IP of source address of inner packet to refer the
+-	 * endpoint and update csum accordinly.
+-	 */
+-	if (ctx_store_bytes(ctx, l4_off + sizeof(struct icmphdr) + offsetof(struct iphdr, saddr),
+-			    &state->to_daddr, 4, 0) < 0)
+-		return DROP_WRITE_ERROR;
+-	if (ipv4_csum_update_by_diff(ctx, l4_off + sizeof(struct icmphdr), sum) < 0)
+-		return DROP_CSUM_L3;
+-	return 0;
+-}
+-
+ /* NAT dest of the inner IP and L4 header of the ICMP packet.
+  * It's like SNAT (endpoint -> host) but on the dest because
+  * the inner packets are sent from remote to endpoint.
+@@ -993,22 +922,23 @@ snat_v4_nat(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple, int off,
+ }
+ 
+ static __always_inline __maybe_unused int
+-snat_v4_rev_nat_handle_icmp_frag_needed(struct __ctx_buff *ctx, __u64 off,
++snat_v4_rev_nat_handle_icmp_frag_needed(struct __ctx_buff *ctx,
++					__u64 inner_l3_off,
+ 					struct ipv4_nat_entry **state)
+ {
+ 	struct ipv4_ct_tuple tuple = {};
+ 	struct iphdr iphdr;
+ 	__be16 identifier;
++	__u16 port_off;
++	__u32 icmpoff;
+ 	__u8 type;
+-	__u32 icmpoff = off + sizeof(struct icmphdr);
+ 
+ 	/* According to the RFC 5508, any networking equipment that is
+ 	 * responding with an ICMP Error packet should embed the original
+ 	 * packet in its response.
+ 	 */
+ 
+-	if (ctx_load_bytes(ctx, icmpoff, &iphdr,
+-			   sizeof(iphdr)) < 0)
++	if (ctx_load_bytes(ctx, inner_l3_off, &iphdr, sizeof(iphdr)) < 0)
+ 		return DROP_INVALID;
+ 
+ 	/* From the embedded IP headers we should be able to determine
+@@ -1020,7 +950,7 @@ snat_v4_rev_nat_handle_icmp_frag_needed(struct __ctx_buff *ctx, __u64 off,
+ 	tuple.daddr = iphdr.saddr;
+ 	tuple.flags = NAT_DIR_INGRESS;
+ 
+-	icmpoff += ipv4_hdrlen(&iphdr);
++	icmpoff = inner_l3_off + ipv4_hdrlen(&iphdr);
+ 	switch (tuple.nexthdr) {
+ 	case IPPROTO_TCP:
+ 	case IPPROTO_UDP:
+@@ -1032,14 +962,18 @@ snat_v4_rev_nat_handle_icmp_frag_needed(struct __ctx_buff *ctx, __u64 off,
+ 		 */
+ 		if (l4_load_ports(ctx, icmpoff, &tuple.dport) < 0)
+ 		

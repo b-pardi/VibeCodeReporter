@@ -1,0 +1,92 @@
+@@ -3,6 +3,7 @@ package peergos.server;
+ import peergos.server.corenode.*;
+ import peergos.server.login.*;
+ import peergos.server.space.UsageStore;
++import peergos.server.space.UserUsage;
+ import peergos.server.storage.*;
+ import peergos.server.util.*;
+ import peergos.shared.*;
+@@ -199,7 +200,7 @@ public class Mirror {
+ 
+         usage.addUserIfAbsent(username);
+         usage.addWriter(username, writer);
+-        mirrorMerkleTree(username, owner, writer, peerIds, updated.get(), mirrorBat, storage, targetPointers, transactions, hasher);
++        mirrorMerkleTree(username, owner, writer, peerIds, updated.get(), mirrorBat, storage, targetPointers, transactions, usage, hasher);
+         return updated;
+     }
+ 
+@@ -212,6 +213,7 @@ public class Mirror {
+                                         DeletableContentAddressedStorage storage,
+                                         JdbcIpnsAndSocial targetPointers,
+                                         TransactionStore transactions,
++                                        UsageStore usagedb,
+                                         Hasher hasher) {
+         Optional<byte[]> existing = targetPointers.getPointer(writer).join();
+         // First pin the new root, then commit updated pointer
+@@ -222,6 +224,10 @@ public class Mirror {
+         // use a mirror call to distinguish from normal pin calls
+         TransactionId tid = transactions.startTransaction(owner);
+         try {
++            // zero pending usage
++            UserUsage usage = usagedb.getUsage(username);
++            if (usage.getPending(writer) != 0)
++                usagedb.resetPendingUsage(username, writer);
+             storage.mirror(username, owner, writer, peerIds,
+                     existingTarget.toOptional().map(c -> (Cid)c),
+                     updatedTarget.toOptional().map(c -> (Cid)c), mirrorBat, storage.id().join(), (x, y, z) -> {}, tid, hasher);
+
+
+
+
+@@ -653,7 +653,8 @@ public class MirrorCoreNode implements CoreNode {
+             for (Map.Entry<PublicKeyHash, byte[]> e : res.pointerState.entrySet()) {
+                 byte[] existingVal = mirrored.get(e.getKey());
+                 if (! Arrays.equals(existingVal, e.getValue())) {
+-                    Mirror.mirrorMerkleTree(username, owner, e.getKey(), storageProviders, e.getValue(), mirrorBat, ipfs, rawPointers, transactions, hasher);
++                    Mirror.mirrorMerkleTree(username, owner, e.getKey(), storageProviders, e.getValue(), mirrorBat,
++                            ipfs, rawPointers, transactions, usageStore, hasher);
+                 }
+             }
+ 
+
+
+
+
+@@ -181,6 +181,23 @@ public class JdbcUsageStore implements UsageStore {
+         }
+     }
+ 
++    @Override
++    public void resetPendingUsage(String username, PublicKeyHash writer) {
++        int writerId = getWriterId(writer);
++        try (Connection conn = getConnection(true, false);
++             PreparedStatement insert = conn.prepareStatement("UPDATE pendingusage SET pending_bytes = ? " +
++                     "WHERE writer_id = ?;")) {
++            insert.setLong(1, 0);
++            insert.setInt(2, writerId);
++            int count = insert.executeUpdate();
++            if (count != 1)
++                throw new IllegalStateException("Didn't update one record!");
++        } catch (SQLException sqe) {
++            LOG.log(Level.WARNING, sqe.getMessage() + " Username: " + username + " writerId: " + writerId, sqe);
++            throw new RuntimeException(sqe);
++        }
++    }
++
+     public Map<String, Long> getAllUsage() {
+         try (Connection conn = getConnection();
+              PreparedStatement search = conn.prepareStatement("SELECT u.name, uu.total_bytes " +
+
+
+
+
+@@ -96,6 +96,11 @@ public class RamUsageStore implements UsageStore {
+         state.usage.get(username).addPending(writer, size);
+     }
+ 
++    @Override
++    public void resetPendingUsage(String username, PublicKeyHash writer) {
++        state.usage.get(username).clearPending(writer);
++    }
++
+     @Overr

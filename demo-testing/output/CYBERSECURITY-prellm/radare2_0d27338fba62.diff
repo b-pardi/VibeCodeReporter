@@ -1,0 +1,113 @@
+@@ -3073,7 +3073,6 @@ static int bin_sections(RCore *r, PJ *pj, int mode, ut64 laddr, int va, ut64 at,
+ 		r_list_foreach_prev (io_section_info, it, ibs) {
+ 			add_section (r, ibs->sec, ibs->addr, ibs->fd);
+ 		}
+-		r_io_update (r->io);
+ 	}
+ 	r_list_free (io_section_info);
+ 	io_section_info = NULL;
+
+
+
+
+@@ -122,7 +122,6 @@ typedef struct r_io_t {
+ 	ut32 curbank;	// id of current bank
+ 	RIDStorage *maps_by_id;
+ 	RPVector maps; //from tail backwards maps with higher priority are found
+-	RSkyline map_skyline; // map parts that are not covered by others
+ 	RIDStorage *files;
+ 	RIDStorage *banks;
+ 	RCache *buffer;
+@@ -327,11 +326,8 @@ R_API bool r_io_map_exists(RIO *io, RIOMap *map);
+ R_API bool r_io_map_exists_for_id(RIO *io, ut32 id);
+ R_API RIOMap *r_io_map_get(RIO *io, ut32 id);
+ R_API RIOMap *r_io_map_add(RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut64 size);
+-// same as r_io_map_add but used when many maps need to be added. Call r_io_update when all maps have been added.
+ R_API RIOMap *r_io_map_get_at(RIO *io, ut64 addr);		//returns the map at vaddr with the highest priority
+ R_API RIOMap *r_io_map_get_by_ref(RIO *io, RIOMapRef *ref);
+-// update the internal state of RIO after a series of _batch operations
+-R_API void r_io_update(RIO *io);
+ R_API bool r_io_map_is_mapped(RIO* io, ut64 addr);
+ R_API RIOMap *r_io_map_get_paddr(RIO *io, ut64 paddr);		//returns the map at paddr with the highest priority
+ R_API void r_io_map_reset(RIO* io);
+
+
+
+
+@@ -7,98 +7,6 @@
+ 
+ R_LIB_VERSION (r_io);
+ 
+-static int fd_read_at_wrap(RIO *io, int fd, ut64 addr, ut8 *buf, int len, RIOMap *map, void *user) {
+-	return r_io_fd_read_at (io, fd, addr, buf, len);
+-}
+-
+-static int fd_write_at_wrap(RIO *io, int fd, ut64 addr, ut8 *buf, int len, RIOMap *map, void *user) {
+-	return r_io_fd_write_at (io, fd, addr, buf, len);
+-}
+-
+-typedef int (*cbOnIterMap)(RIO *io, int fd, ut64 addr, ut8 *buf, int len, RIOMap *map, void *user);
+-
+-// If prefix_mode is true, returns the number of bytes of operated prefix; returns < 0 on error.
+-// If prefix_mode is false, operates in non-stop mode and returns true iff all IO operations on overlapped maps are complete.
+-static st64 on_map_skyline(RIO *io, ut64 vaddr, ut8 *buf, int len, int match_flg, cbOnIterMap op, bool prefix_mode) {
+-	RVector *skyline = &io->map_skyline.v;
+-	ut64 addr = vaddr;
+-	size_t i;
+-	bool ret = true, wrap = !prefix_mode && vaddr + len < vaddr;
+-#define CMP(addr, part) ((addr) < r_itv_end (((RSkylineItem *)(part))->itv) - 1 ? -1 : \
+-			(addr) > r_itv_end (((RSkylineItem *)(part))->itv) - 1 ? 1 : 0)
+-	// Let i be the first skyline part whose right endpoint > addr
+-	if (!len) {
+-		i = r_vector_len (skyline);
+-	} else {
+-		r_vector_lower_bound (skyline, addr, i, CMP);
+-		if (i == r_vector_len (skyline) && wrap) {
+-			wrap = false;
+-			i = 0;
+-			addr = 0;
+-		}
+-	}
+-#undef CMP
+-	while (i < r_vector_len (skyline)) {
+-		const RSkylineItem *part = r_vector_index_ptr (skyline, i);
+-		// Right endpoint <= addr
+-		if (r_itv_end (part->itv) - 1 < addr) {
+-			i++;
+-			if (wrap && i == r_vector_len (skyline)) {
+-				wrap = false;
+-				i = 0;
+-				addr = 0;
+-			}
+-			continue;
+-		}
+-		if (addr < part->itv.addr) {
+-			// [addr, part->itv.addr) is a gap
+-			if (prefix_mode || len <= part->itv.addr - vaddr) {
+-				break;
+-			}
+-			addr = part->itv.addr;
+-		}
+-		// Now left endpoint <= addr < right endpoint
+-		ut64 len1 = R_MIN (vaddr + len - addr, r_itv_end (part->itv) - addr);
+-		if (len1 < 1) {
+-			break;
+-		}
+-		RIOMap *map = part->user;
+-		// The map satisfies the permission requirement or p_cache is enabled
+-		if (((map->perm & match_flg) == match_flg || io->p_cache)) {
+-			st64 result = op (io, map->fd, map->delta + addr - r_io_map_begin(map),
+-					buf + (addr - vaddr), len1, map, NULL);
+-			if (prefix_mode) {
+-				if (result < 0) {
+-					return result;
+-				}
+-				addr += result;
+-				if (result != len1) {
+-					break;
+-				}
+-			} else {
+-				if (result != len1) {
+-					ret = false;
+-				}
+-				addr += len1

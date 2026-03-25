@@ -1,0 +1,117 @@
+@@ -8,13 +8,14 @@ import os
+ import time
+ import six
+ import tempfile
++import struct
+ 
+ from pwnlib.context import context
+ from pwnlib.elf import ELF
+ from pwnlib.filesystem.path import Path
+ from pwnlib.log import getLogger
+ from pwnlib.tubes.process import process
+-from pwnlib.util.fiddling import enhex
++from pwnlib.util.fiddling import enhex, unhex
+ from pwnlib.util.hashes import sha1filehex, sha256filehex, md5filehex
+ from pwnlib.util.misc import read
+ from pwnlib.util.misc import which
+@@ -23,12 +24,46 @@ from pwnlib.util.web import wget
+ 
+ log = getLogger(__name__)
+ 
+-HASHES = {
+-    'build_id': lambda path: enhex(ELF(path, checksec=False).buildid or b''),
++
++def _turbofast_extract_build_id(path):
++    """
++    Elf_External_Note:
++
++    0x00 +--------+
++         | namesz | <- Size of entry's owner string
++    0x04 +--------+
++         | descsz | <- Size of the note descriptor
++    0x08 +--------+
++         |  type  | <- Interpretation of the descriptor
++    0x0c +--------+
++         |  name  | <- Start of the name+desc data
++     ... +--------
++         |  desc  |
++     ... +--------+
++    """
++    data = read(path, 0x1000)
++    # search NT_GNU_BUILD_ID and b"GNU\x00" (type+name)
++    idx = data.find(unhex("03000000474e5500"))
++    if idx == -1:
++        return enhex(ELF(path, checksec=False).buildid or b'')
++    descsz, = struct.unpack("<L", data[idx-4: idx])
++    return enhex(data[idx+8: idx+8+descsz])
++
++
++TYPES = {
++    'libs_id': None,
++    'build_id': _turbofast_extract_build_id,
+     'sha1': sha1filehex,
+     'sha256': sha256filehex,
+     'md5': md5filehex,
+ }
++
++# mapping for search result (same as libc.rip)
++MAP_TYPES = {
++    'libs_id': 'id',
++    'build_id': 'buildid'
++}
++
+ DEBUGINFOD_SERVERS = [
+     'https://debuginfod.elfutils.org/',
+ ]
+@@ -42,13 +77,16 @@ NEGATIVE_CACHE_EXPIRY = 60 * 60 * 24 * 7 # 1 week
+ 
+ # https://gitlab.com/libcdb/libcdb wasn't updated after 2019,
+ # but still is a massive database of older libc binaries.
+-def provider_libcdb(hex_encoded_id, hash_type):
++def provider_libcdb(hex_encoded_id, search_type):
++    if search_type == 'libs_id':
++        return None
++
+     # Deferred import because it's slow
+     import requests
+     from six.moves import urllib
+ 
+     # Build the URL using the requested hash type
+-    url_base = "https://gitlab.com/libcdb/libcdb/raw/master/hashes/%s/" % hash_type
++    url_base = "https://gitlab.com/libcdb/libcdb/raw/master/hashes/%s/" % search_type
+     url      = urllib.parse.urljoin(url_base, hex_encoded_id)
+ 
+     data     = b""
+@@ -58,7 +96,7 @@ def provider_libcdb(hex_encoded_id, hash_type):
+             data = wget(url, timeout=20)
+ 
+             if not data:
+-                log.warn_once("Could not fetch libc for %s %s from libcdb", hash_type, hex_encoded_id)
++                log.warn_once("Could not fetch libc for %s %s from libcdb", search_type, hex_encoded_id)
+                 break
+             
+             # GitLab serves up symlinks with
+@@ -66,7 +104,7 @@ def provider_libcdb(hex_encoded_id, hash_type):
+                 url = os.path.dirname(url) + '/'
+                 url = urllib.parse.urljoin(url.encode('utf-8'), data)
+     except requests.RequestException as e:
+-        log.warn_once("Failed to fetch libc for %s %s from libcdb: %s", hash_type, hex_encoded_id, e)
++        log.warn_once("Failed to fetch libc for %s %s from libcdb: %s", search_type, hex_encoded_id, e)
+     return data
+ 
+ def query_libc_rip(params):
+@@ -86,16 +124,17 @@ def query_libc_rip(params):
+         return None
+ 
+ # https://libc.rip/
+-def provider_libc_rip(hex_encoded_id, hash_type):
++def provider_libc_rip(search_target, search_type):
+     # Build the request for the hash type
+     # https://github.com/niklasb/libc-database/blob/master/searchengine/api.yml
+-    if hash_type == 'build_id':
+-        hash_type = 'buildid'
+-    params = {hash_type: hex_encoded_id}
++    if search_type in MAP_TYPES.keys():
++        search_type = MAP_TYPES[search_type]
++
++    params = {search_t

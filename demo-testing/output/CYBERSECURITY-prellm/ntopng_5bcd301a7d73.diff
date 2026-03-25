@@ -1,0 +1,114 @@
+@@ -353,6 +353,7 @@ class Flow : public GenericHashEntry {
+   void updateSeqNum(time_t when, u_int32_t sN, u_int32_t aN);
+   void setDetectedProtocol(ndpi_protocol proto_id);
+   void processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time);
++  void processDNSPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time);
+   void endProtocolDissection();
+   inline void setCustomApp(custom_app_t ca) {
+     memcpy(&custom_app, &ca, sizeof(custom_app));
+
+
+
+
+@@ -375,25 +375,7 @@ void Flow::processDetectedProtocol() {
+     break;
+ 
+   case NDPI_PROTOCOL_DNS:
+-    if(ndpiFlow->host_server_name[0] != '\0') {
+-      char *q = strdup((const char*)ndpiFlow->host_server_name);
+-
+-      if(q) {
+-	protos.dns.invalid_chars_in_query = false;
+-
+-	for(int i = 0; q[i] != '\0'; i++) {
+-	  if(!isprint(q[i])) {
+-	    q[i] = '?';
+-	    protos.dns.invalid_chars_in_query = true;
+-	  }
+-	}
+-
+-	setDNSQuery(q);
+-	protos.dns.last_query_type = ndpiFlow->protos.dns.query_type;
+-      }
+-    }
+-
+-    /* See Flow::processExtraDissectedInformation for reply dissection */
++    /* See Flow::processDNSPacket for dissection */
+     break;
+ 
+   case NDPI_PROTOCOL_TOR:
+@@ -431,6 +413,8 @@ void Flow::processDetectedProtocol() {
+  * including extra dissection information (e.g. the TLS certificate), is
+  * available. */
+ void Flow::processExtraDissectedInformation() {
++  bool free_ndpi_memory = true; /* Possibly set to false if the flow is DNS and all the packets need to be dissected */
++
+   if(ndpiFlow) {
+     u_int16_t l7proto;
+ 
+@@ -494,40 +478,16 @@ void Flow::processExtraDissectedInformation() {
+       break;
+ 
+     case NDPI_PROTOCOL_DNS:
+-      if(ntop->getPrefs()->decode_dns_responses()) {
+-
+-	if(ndpiFlow->host_server_name[0] != '\0') {
+-	  char delimiter = '@', *name = NULL;
+-	  char *at = (char*)strchr((const char*)ndpiFlow->host_server_name, delimiter);
+-
+-	  /* Consider only positive DNS replies */
+-	  if(at != NULL)
+-	    name = &at[1], at[0] = '\0';
+-	  else if((!strstr((const char*)ndpiFlow->host_server_name, ".in-addr.arpa"))
+-		  && (!strstr((const char*)ndpiFlow->host_server_name, ".ip6.arpa")))
+-	    name = (char*)ndpiFlow->host_server_name;
+-
+-	  if(name) {
+-	    // ntop->getTrace()->traceEvent(TRACE_NORMAL, "[DNS] %s", (char*)ndpiFlow->host_server_name);
+-	    protos.dns.last_return_code = ndpiFlow->protos.dns.reply_code;
+-
+-	    if(ndpiFlow->protos.dns.reply_code == 0) {
+-	      if(ndpiFlow->protos.dns.num_answers > 0) {
+-		if(at != NULL) {
+-		  // ntop->getTrace()->traceEvent(TRACE_NORMAL, "[DNS] %s <-> %s", name, (char*)ndpiFlow->host_server_name);
+-		  ntop->getRedis()->setResolvedAddress(name, (char*)ndpiFlow->host_server_name);
+-		}
+-	      }
+-	    }
+-	  }
+-	}
+-      }
++      /* Don't free the memory, let the nDPI dissection run for DNS. See Method Flow::processDNSPacket  */
++      if(getInterface()->isPacketInterface())
++	free_ndpi_memory = false;
+       break;
+     }
+   }
+ 
+   /* Free the nDPI memory */
+-  freeDPIMemory();
++  if(free_ndpi_memory)
++    freeDPIMemory();
+ 
+   /*
+     We need to change state here as in Lua scripts we need to know
+@@ -597,6 +557,104 @@ void Flow::processPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t pa
+ 
+ /* *************************************** */
+ 
++/* Special handling of DNS which is always performed. */
++void Flow::processDNSPacket(const u_char *ip_packet, u_int16_t ip_len, u_int64_t packet_time) {
++  ndpi_protocol proto_id;
++
++  /* Exits if the flow isn't DNS or it the interface is not a packet-interface */
++  if(!isDNS() || !getInterface()->isPacketInterface())
++    return;
++
++  /* Instruct nDPI to continue the dissection
++     See https://github.com/ntop/ntopng/commit/30f52179d9f7a1eb774534def93d55c77d6070bc#diff-20b1df29540b6de59ceb6c6d2f3afdb5R387
++  */
++  // ndpiFlow->protos.dns.num_answers = 0;
++  // ndpiFlow->host_server_name[0] = '\0';
++  ndpiFlow->check_extra_packets = 1, ndpiFlow->max_extra_packets_to_check = 10;
++
++  proto_id = ndpi_detection_proces

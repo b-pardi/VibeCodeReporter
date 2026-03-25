@@ -1,0 +1,105 @@
+@@ -517,7 +517,8 @@ ipv4_ct_tuple_reverse(struct ipv4_ct_tuple *tuple)
+ 
+ static __always_inline int ipv4_ct_extract_l4_ports(struct __ctx_buff *ctx,
+ 						    int off,
+-						    struct ipv4_ct_tuple *tuple)
++						    struct ipv4_ct_tuple *tuple,
++						    bool *has_l4_header __maybe_unused)
+ {
+ #ifdef ENABLE_IPV4_FRAGMENTS
+ 	void *data, *data_end;
+@@ -531,7 +532,8 @@ static __always_inline int ipv4_ct_extract_l4_ports(struct __ctx_buff *ctx,
+ 
+ 	if (unlikely(ipv4_is_fragment(ip4)))
+ 		return ipv4_handle_fragment(ctx, ip4, off,
+-					    (struct ipv4_frag_l4ports *)&tuple->dport);
++					    (struct ipv4_frag_l4ports *)&tuple->dport,
++					    has_l4_header);
+ #endif
+ 	/* load sport + dport into tuple */
+ 	return ctx_load_bytes(ctx, off, &tuple->dport, 4);
+@@ -553,7 +555,8 @@ static __always_inline int ct_lookup4(const void *map,
+ 				      struct ct_state *ct_state, __u32 *monitor)
+ {
+ 	int ret = CT_NEW, action = ACTION_UNSPEC;
+-	bool is_tcp = tuple->nexthdr == IPPROTO_TCP;
++	bool is_tcp = tuple->nexthdr == IPPROTO_TCP,
++	     has_l4_header = true;
+ 	union tcp_flags tcp_flags = { .value = 0 };
+ 
+ 	/* The tuple is created in reverse order initially to find a
+@@ -610,22 +613,24 @@ static __always_inline int ct_lookup4(const void *map,
+ 		break;
+ 
+ 	case IPPROTO_TCP:
+-		if (1) {
++		if (ipv4_ct_extract_l4_ports(ctx, off, tuple,
++					     &has_l4_header) < 0)
++			return DROP_CT_INVALID_HDR;
++
++		action = ACTION_CREATE;
++
++		if (has_l4_header) {
+ 			if (ctx_load_bytes(ctx, off + 12, &tcp_flags, 2) < 0)
+ 				return DROP_CT_INVALID_HDR;
+ 
+ 			if (unlikely(tcp_flags.value & (TCP_FLAG_RST|TCP_FLAG_FIN)))
+ 				action = ACTION_CLOSE;
+-			else
+-				action = ACTION_CREATE;
+ 		}
+ 
+-		if (ipv4_ct_extract_l4_ports(ctx, off, tuple) < 0)
+-			return DROP_CT_INVALID_HDR;
+ 		break;
+ 
+ 	case IPPROTO_UDP:
+-		if (ipv4_ct_extract_l4_ports(ctx, off, tuple) < 0)
++		if (ipv4_ct_extract_l4_ports(ctx, off, tuple, NULL) < 0)
+ 			return DROP_CT_INVALID_HDR;
+ 
+ 		action = ACTION_CREATE;
+
+
+
+
+@@ -127,8 +127,11 @@ ipv4_frag_register_datagram(struct __ctx_buff *ctx, int l4_off,
+ static __always_inline int
+ ipv4_handle_fragment(struct __ctx_buff *ctx,
+ 		     const struct iphdr *ip4, int l4_off,
+-		     struct ipv4_frag_l4ports *ports)
++		     struct ipv4_frag_l4ports *ports,
++		     bool *has_l4_header)
+ {
++	bool not_first_fragment;
++
+ 	struct ipv4_frag_id frag_id = {
+ 		.daddr = ip4->daddr,
+ 		.saddr = ip4->saddr,
+@@ -137,7 +140,11 @@ ipv4_handle_fragment(struct __ctx_buff *ctx,
+ 		.pad = 0,
+ 	};
+ 
+-	if (likely(ipv4_is_not_first_fragment(ip4)))
++	not_first_fragment = ipv4_is_not_first_fragment(ip4);
++	if (has_l4_header)
++		*has_l4_header = !not_first_fragment;
++
++	if (likely(not_first_fragment))
+ 		return ipv4_frag_get_l4ports(&frag_id, ports);
+ 
+ 	/* First logical fragment for this datagram (not necessarily the first
+
+
+
+
+@@ -354,7 +354,8 @@ static __always_inline int extract_l4_port(struct __ctx_buff *ctx, __u8 nexthdr,
+ 
+ 			if (unlikely(ipv4_is_fragment(ip4))) {
+ 				ret = ipv4_handle_fragment(ctx, ip4, l4_off,
+-							   &ports);
++							   &ports,
++							   NULL);
+ 				if (IS_ERR(ret))
+ 					return ret;
+ 				*port = ports.dport;

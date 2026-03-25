@@ -1,0 +1,81 @@
+@@ -3,7 +3,6 @@ package org.batfish.bddreachability;
+ import static com.google.common.base.Preconditions.checkNotNull;
+ import static org.batfish.bddreachability.BDDReachabilityAnalysisSessionFactory.computeInitializedSesssions;
+ import static org.batfish.bddreachability.OriginationStateToTerminationState.originationStateToTerminationState;
+-import static org.batfish.bddreachability.ReversePassOriginationState.reverseTraceOriginationState;
+ import static org.batfish.common.util.CollectionUtil.toImmutableMap;
+ import static org.batfish.datamodel.FlowDisposition.LOOP;
+ 
+@@ -26,6 +25,7 @@ import java.util.Set;
+ import java.util.function.Supplier;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
++import javax.annotation.Nonnull;
+ import net.sf.javabdd.BDD;
+ import org.batfish.bddreachability.transition.TransformationToTransition;
+ import org.batfish.common.bdd.BDDPacket;
+@@ -60,6 +60,7 @@ public final class BidirectionalReachabilityAnalysis {
+   private final Supplier<Map<StateExpr, BDD>> _returnPassOrigBdds;
+   private final Supplier<Map<String, List<BDDFirewallSessionTraceInfo>>> _initializedSessions;
+   private final Supplier<BDDReachabilityAnalysis> _returnPassAnalysis;
++  private final @Nonnull ReversePassOriginationState _reversePassOriginationState;
+   private final Supplier<Map<Location, BDD>> _forwardPassStartLocationToReturnPassFailureBdds;
+   private final Supplier<Map<StateExpr, StateExpr>>
+       _forwardPassTerminationStateToReturnPassOriginationState;
+@@ -88,6 +89,8 @@ public final class BidirectionalReachabilityAnalysis {
+       _factory =
+           new BDDReachabilityAnalysisFactory(bddPacket, configs, forwardingAnalysis, false, true);
+       _forbiddenTransitNodes = ImmutableSet.copyOf(forbiddenTransitNodes);
++      _reversePassOriginationState =
++          new ReversePassOriginationState(forwardPassFinalNodes::contains);
+       _requiredTransitNodes = ImmutableSet.copyOf(requiredTransitNodes);
+ 
+       _zero = bddPacket.getFactory().zero();
+@@ -189,7 +192,7 @@ public final class BidirectionalReachabilityAnalysis {
+     return _forwardPassForwardReachableBdds.get().keySet().stream()
+         .map(
+             term -> {
+-              StateExpr orig = reverseTraceOriginationState(term);
++              StateExpr orig = term.accept(_reversePassOriginationState);
+               return orig == null ? null : Maps.immutableEntry(term, orig);
+             })
+         .filter(Objects::nonNull)
+
+
+
+
+@@ -150,8 +150,7 @@ public class OriginationStateToTerminationState implements StateExprVisitor<List
+ 
+   @Override
+   public List<StateExpr> visitOriginateVrf(OriginateVrf originateVrf) {
+-    // TODO: we need a NodeVrfAccept here.
+-    return ImmutableList.of(new NodeAccept(originateVrf.getHostname()));
++    return ImmutableList.of(new VrfAccept(originateVrf.getHostname(), originateVrf.getVrf()));
+   }
+ 
+   @Override
+
+
+
+
+@@ -1,6 +1,7 @@
+ package org.batfish.bddreachability;
+ 
+-import javax.annotation.Nullable;
++import java.util.function.Predicate;
++import javax.annotation.Nonnull;
+ import org.batfish.symbolic.state.NodeAccept;
+ import org.batfish.symbolic.state.NodeDropAclIn;
+ import org.batfish.symbolic.state.NodeDropAclOut;
+@@ -30,7 +31,8 @@ import org.batfish.symbolic.state.VrfAccept;
+ /**
+  * Converts successful flow termination states from the forward pass of a bidirectional reachability
+  * query to the corresponding origination state for the return pass (if any). If the state does not
+- * have a corresponding origination state, returns {@code null}.
++ * have a corresponding origination state, or if the state should be filtered out because it does
++ * not correspond to a permitted final node, returns {@code null}.
+  *
+  * <p>{@link NodeInterfaceDeliveredToSubnet} and {@link NodeInterfaceExitsNetwork} states are mapped
+  * to corresponding {@link OriginateInterfaceLink} states.
+@@ -38,12 +40,16 @@ import org.batfish.symbolic.state.VrfAccept;
+  * <p>{@link VrfAccept} states are mapped to correspondin

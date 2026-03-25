@@ -1,0 +1,145 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,2584 @@
++/* PANDABEGINCOMMENT
++ *
++ * Authors:
++ *  Tim Leek               tleek@ll.mit.edu
++ *  Ryan Whelan            rwhelan@ll.mit.edu
++ *  Joshua Hodosh          josh.hodosh@ll.mit.edu
++ *  Michael Zhivich        mzhivich@ll.mit.edu
++ *  Brendan Dolan-Gavitt   brendandg@gatech.edu
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2.
++ * See the COPYING file in the top-level directory.
++ *
++PANDAENDCOMMENT */
++// This needs to be defined before anything is included in order to get
++// the PRIx64 macro
++#define __STDC_FORMAT_MACROS
++
++#include <iostream>
++#include <fstream>
++#include <vector>
++#include <map>
++#include <set>
++#include <memory>
++#include <string>
++#include <algorithm>
++
++#include <cstdio>
++#include <cstdarg>
++#include <cstdlib>
++#include <cstring>
++#include <cerrno>
++#include <json/json.h>
++
++extern "C" {
++
++#include "panda/rr/rr_log.h"
++#include "panda/plog.h"
++#include "panda/plugin.h"
++#include "panda/plugin_plugin.h"
++
++#include "dwarf2_util.h"
++#include "dwarf2.h"
++#include "dwarf2_types.h"
++
++#include "pri/pri_types.h"
++#include "pri/pri_ext.h"
++#include "pri/pri.h"
++
++#include "osi/osi_types.h"
++#include "osi/osi_ext.h"
++
++// this provides the fd resolution magic
++#include "osi_linux/osi_linux_ext.h"
++
++#include "syscalls2/syscalls_ext_typedefs.h"
++
++#include "loaded/loaded.h"
++
++bool init_plugin(void *);
++void uninit_plugin(void *);
++//void on_ret(CPUState *cpu, target_ulong pc);
++//void on_call(CPUState *cpu, target_ulong pc);
++void on_library_load(CPUState *cpu, target_ulong pc, char *lib_name, target_ulong base_addr, target_ulong size);
++void on_all_livevar_iter(CPUState *cpu, target_ulong pc, liveVarCB f, void *args);
++
++void on_funct_livevar_iter(CPUState *cpu, target_ulong pc, liveVarCB f, void *args);
++
++void on_global_livevar_iter(CPUState *cpu, target_ulong pc, liveVarCB f, void *args);
++
++#include <libgen.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <fcntl.h>
++
++}
++
++#include "callstack_instr/callstack_instr.h"
++#include "callstack_instr/callstack_instr_ext.h"
++
++const char *guest_debug_path = NULL;
++const char *host_debug_path = NULL;
++const char *host_mount_path = NULL;
++const char *proc_to_monitor = NULL;
++bool allow_just_plt = false;
++bool logCallSites = true;
++std::string bin_path;
++#if defined(TARGET_I386)
++// These need to be extern "C" so that the ABI is compatible with
++// QEMU/PANDA, which is written in C
++extern "C" {
++
++#include "dwarf2_int_fns.h"
++PPP_PROT_REG_CB(on_dwarf2_line_change);
++}
++PPP_CB_BOILERPLATE(on_dwarf2_line_change);
++
++#define MAX_FILENAME 256
++bool debug = false;
++unsigned long prev_line = 0, cur_line;
++target_ulong prev_function = 0, cur_function;
++target_ulong prev_line_pc = 0;
++std::string prev_file_name = "";
++std::string prev_funct_name = std::string("");
++bool inExecutableSource = false;
++
++//////// consider putting this in pri
++// current process
++OsiProc *current_proc = NULL;
++OsiModule *current_lib = NULL;
++GArray *current_libs = NULL;
++bool proc_diff(OsiProc *p_curr, OsiProc *p_new) {
++    if (p_curr == NULL) {
++        return (p_new != NULL);
++    }
++    if (p_curr->taskd != p_new->taskd
++        || p_curr->asid != p_new->asid
++        || p_curr->pid != p_new->pid
++        || p_curr->ppid != p_new->ppid)
++        return true;
++    return false;
++}
++bool proc_changed = false;
++//////// end effects plugin globals
++
++// asid changed -- start looking for valid proc info
++int asid_changed(CPUState *cpu, target_ulong old_asid, target_ulong new_asid) {
++    if (current_proc) {
++        free_osiproc(current_proc);
++        current_proc = NULL;
++        current_libs = NULL;
++        current_lib = NULL;
++    }
++    return 0;
++}
++std::map <target_ulong, OsiProc> running_procs;
++//std::map<std::string,std::pair<Dwarf_Addr,Dwarf_Addr>> functions;
++std::map<target_ulong,std::string> funcaddrs;
++//std::map<Dwarf_Addr,std::string> funcaddrs_ret;
++//std::map<Dwarf_Addr,std::string> funcparams;
++std

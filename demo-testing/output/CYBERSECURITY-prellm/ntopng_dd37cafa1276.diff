@@ -1,0 +1,102 @@
+@@ -196,6 +196,8 @@ class Host : public GenericHashEntry {
+   char* get_visual_name(char *buf, u_int buf_len);
+   inline char* get_string_key(char *buf, u_int buf_len) { return(ip.print(buf, buf_len)); };
+   char* get_hostkey(char *buf, u_int buf_len, bool force_vlan=false);
++  virtual char* getSerializationKey(char *redis_key, size_t size) { if(size) redis_key[0] = '\0'; return(redis_key); };
++  char* get_idkey(char *buf, size_t bufsize);
+   bool idle();
+   virtual void incICMP(u_int8_t icmp_type, u_int8_t icmp_code, bool sent, Host *peer) {};
+   virtual void lua(lua_State* vm, AddressTree * ptree, bool host_details,
+
+
+
+
+@@ -38,6 +38,12 @@ class LocalHost : public Host {
+   void initialize();
+   void freeLocalHostData();
+   virtual void deleteHostData();
++
++  char * getMacBasedSerializationKey(char *redis_key, size_t size);
++  char * getIpBasedSerializationKey(char *redis_key, size_t size);
++  bool deserialize();
++  bool deserializeFromRedisKey(char *key);
++
+  public:
+   LocalHost(NetworkInterface *_iface, Mac *_mac, u_int16_t _vlanId, IpAddress *_ip);
+   LocalHost(NetworkInterface *_iface, char *ipAddress, u_int16_t _vlanId);
+@@ -49,7 +55,6 @@ class LocalHost : public Host {
+   virtual bool isSystemHost() const            { return(systemHost);        };
+ 
+   virtual void  serialize2redis();
+-  bool deserialize(char *json_str, char *key);
+ 
+   virtual NetworkStats* getNetworkStats(int16_t networkId){ return(iface->getNetworkStats(networkId));   };
+   virtual u_int32_t getActiveHTTPHosts()             { return(getHTTPstats() ? getHTTPstats()->get_num_virtual_hosts() : 0); };
+@@ -59,6 +64,7 @@ class LocalHost : public Host {
+   virtual bool dropAllTraffic()  { return(drop_all_host_traffic); };
+   virtual void inlineSetOS(const char * const _os);
+   virtual void updateHostTrafficPolicy(char *key);
++  virtual char * getSerializationKey(char *redis_key, size_t size);
+ 
+   virtual void incICMP(u_int8_t icmp_type, u_int8_t icmp_code, bool sent, Host *peer) { stats->incICMP(icmp_type, icmp_code, sent, peer); };
+   virtual void incNumDNSQueriesSent(u_int16_t query_type) { stats->incNumDNSQueriesSent(query_type); };
+
+
+
+
+@@ -207,6 +207,8 @@
+ #define HOST_LABEL_NAMES        "ntopng.host_labels"
+ #define HOST_SERIALIZED_KEY     "ntopng.serialized_hosts.ifid_%u__%s@%d"
+ #define MAC_SERIALIZED_KEY      "ntopng.serialized_macs.ifid_%u__%s"
++#define HOST_V4_BY_MAC_SERIALIZED_KEY "ntopng.serialized_hostsmac.v4.ifid_%u__%s"
++#define HOST_V6_BY_MAC_SERIALIZED_KEY "ntopng.serialized_hostsmac.v6.ifid_%u__%s"
+ #define HOST_POOL_SERIALIZED_KEY "ntopng.serialized_host_pools.ifid_%u"
+ #define NTOPNG_PREFS_PREFIX     "ntopng.prefs"
+ #define NTOPNG_CACHE_PREFIX     "ntopng.cache"
+
+
+
+
+@@ -523,6 +523,7 @@ void Host::lua(lua_State* vm, AddressTree *ptree,
+ 
+   lua_push_str_table_entry(vm, "ip", (ipaddr = printMask(ip_buf, sizeof(ip_buf))));
+   lua_push_uint64_table_entry(vm, "ipkey", ip.key());
++  lua_push_str_table_entry(vm, "idkey", get_idkey(buf_id, sizeof(buf_id)));
+   lua_push_bool_table_entry(vm, "localhost", isLocalHost());
+   lua_push_uint64_table_entry(vm, "vlan", vlan_id);
+ 
+@@ -1338,3 +1339,18 @@ void Host::deleteHostData() {
+   host_label_set = false;
+   first_seen = last_seen;
+ }
++
++/* *************************************** */
++
++/* TODO merge with get_hostkey after migrating alerts and other stuff */
++char* Host::get_idkey(char *buf, size_t bufsize) {
++  char *k;
++  Mac *cur_mac = getMac(); /* Cache macs as they can be swapped/updated */
++
++  if(isBroadcastDomainHost() && cur_mac)
++    k = cur_mac->print(buf, bufsize);
++  else
++    k = get_hostkey(buf, bufsize, true /* force VLAN */);
++
++  return(k);
++}
+
+
+
+
+@@ -48,7 +48,6 @@ LocalHost::~LocalHost() {
+ /* *************************************** */
+ 
+ void LocalHost::initialize() {
+-  char key[64], redis_key[128], *k;
+   char buf[64];
+ 
+   stats = allocateStats();
+@@ -64,30 +63,8 @@ void LocalHost::initialize() {
+   systemHost = ip.isLocalInterfaceAddress();
+ 
+   PROFILING_SUB_SECTION_ENTER(if

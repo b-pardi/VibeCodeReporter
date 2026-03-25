@@ -1,0 +1,103 @@
+@@ -16,7 +16,7 @@ public abstract class AbstractIpSpaceContainsIp implements GenericIpSpaceVisitor
+   @Override
+   public final Boolean visitAclIpSpace(AclIpSpace aclIpSpace) {
+     for (AclIpSpaceLine line : aclIpSpace.getLines()) {
+-      if (line.getIpSpace().accept(this)) {
++      if (visit(line.getIpSpace())) {
+         return line.getAction() == LineAction.PERMIT;
+       }
+     }
+
+
+
+
+@@ -2,14 +2,31 @@ package org.batfish.datamodel;
+ 
+ import com.google.common.collect.ImmutableMap;
+ import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ /** Implementation of {@link AbstractIpSpaceContainsIp}. */
+ public final class IpSpaceContainsIp extends AbstractIpSpaceContainsIp {
+   private final Map<String, IpSpace> _namedIpSpaces;
++  // A cache of prior containsIp resulsts. Not size-limited, but IpSpaceContainsIp instances are
++  // expected to be short-lived.
++  private final Map<IpSpace, Boolean> _cached;
+ 
+   public IpSpaceContainsIp(Ip ip, Map<String, IpSpace> namedIpSpaces) {
+     super(ip);
+     _namedIpSpaces = ImmutableMap.copyOf(namedIpSpaces);
++    _cached = new ConcurrentHashMap<>();
++  }
++
++  @Override
++  public Boolean visit(IpSpace ipSpace) {
++    // We can't use _cached.computeIfAbsent since it does not support recursive updates.
++    Boolean cachedResult = _cached.get(ipSpace);
++    if (cachedResult != null) {
++      return cachedResult;
++    }
++    Boolean result = super.visit(ipSpace);
++    _cached.putIfAbsent(ipSpace, result);
++    return result;
+   }
+ 
+   @Override
+@@ -18,6 +35,6 @@ public final class IpSpaceContainsIp extends AbstractIpSpaceContainsIp {
+     if (ipSpace == null) {
+       return false;
+     }
+-    return ipSpace.accept(this);
++    return visit(ipSpace);
+   }
+ }
+
+
+
+
+@@ -17,6 +17,7 @@ import java.util.Optional;
+ import java.util.Set;
+ import java.util.SortedMap;
+ import java.util.SortedSet;
++import java.util.concurrent.ConcurrentHashMap;
+ import javax.annotation.Nonnull;
+ import org.batfish.common.BatfishException;
+ import org.batfish.common.traceroute.TraceDag;
+@@ -28,6 +29,7 @@ import org.batfish.datamodel.FlowDisposition;
+ import org.batfish.datamodel.ForwardingAnalysis;
+ import org.batfish.datamodel.InterfaceForwardingBehavior;
+ import org.batfish.datamodel.Ip;
++import org.batfish.datamodel.IpSpaceContainsIp;
+ import org.batfish.datamodel.Topology;
+ import org.batfish.datamodel.collections.NodeInterfacePair;
+ import org.batfish.datamodel.flow.FirewallSessionTraceInfo;
+@@ -49,6 +51,7 @@ public class TracerouteEngineImplContext {
+   private final Map<String, Map<String, Fib>> _fibs;
+   private final Set<Flow> _flows;
+   private final ForwardingAnalysis _forwardingAnalysis;
++  private final Map<Ip, IpSpaceContainsIp> _containsIp;
+   private final boolean _ignoreFilters;
+   private final Topology _topology;
+ 
+@@ -65,6 +68,7 @@ public class TracerouteEngineImplContext {
+     _fibs = fibs;
+     _ignoreFilters = ignoreFilters;
+     _forwardingAnalysis = dataPlane.getForwardingAnalysis();
++    _containsIp = new ConcurrentHashMap<>();
+     _sessionsByIngressInterface = buildSessionsByIngressInterface(sessions);
+     _sessionsByOriginatingVrf = buildSessionsByOriginatingVrf(sessions);
+     _topology = topology;
+@@ -104,6 +108,8 @@ public class TracerouteEngineImplContext {
+    *     FlowDisposition#NEIGHBOR_UNREACHABLE}
+    */
+   FlowDisposition computeDisposition(String hostname, String outgoingInterfaceName, Ip dstIp) {
++    IpSpaceContainsIp containsIp =
++        _containsIp.computeIfAbsent(dstIp, ip -> new IpSpaceContainsIp(ip, ImmutableMap.of()));
+     String vrfName =
+         _configurations.get(hostname).getAllInterfaces().get(outgoingInterfaceName).getVrfName();
+     InterfaceForwardingBehavior interfaceForwardingBehavior =
+@@ -113,17 +119,13 @@ public class TracerouteEngineImplContext {
+             .get(vrfName)
+             .getInterfaceForwardingBehavior()
+             .get(outgoingInterfaceName);
+-    if (interfaceForwardingBehavior.getDeliveredToSubnet().containsIp(dstIp

@@ -1,0 +1,147 @@
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2008-2023 - pancake, Jody Frankowski */
++/* radare2 - LGPL - Copyright 2008-2024 - pancake, Jody Frankowski */
+ 
+ #include <r_cons.h>
+ #include <r_util.h>
+@@ -15,7 +15,7 @@ static R_TH_LOCAL RCons *r_cons_instance = NULL;
+ static R_TH_LOCAL ut64 prev = 0LL; //r_time_now_mono ();
+ static R_TH_LOCAL RStrBuf *echodata = NULL; // TODO: move into RConsInstance? maybe nope
+ #define I (r_cons_instance)
+-#define C (getctx())
++#define C (getctx ())
+ 
+ static inline void cons_input_state_init(InputState *state) {
+ 	state->readbuffer = NULL;
+@@ -692,8 +692,7 @@ R_API RCons *r_cons_new(void) {
+ 	I->teefile = NULL;
+ 	I->fix_columns = 0;
+ 	I->fix_rows = 0;
+-	I->backup_fd = -1;
+-	I->backup_fdn = -1;
++	RVecFdPairs_init (&I->fds);
+ 	I->mouse_event = 0;
+ 	I->force_rows = 0;
+ 	I->force_columns = 0;
+@@ -771,12 +770,12 @@ R_API RCons *r_cons_free(void) {
+ 	R_FREE (C->lastOutput);
+ 	C->lastLength = 0;
+ 	R_FREE (I->pager);
++	RVecFdPairs_fini (&I->fds);
+ 	return NULL;
+ }
+ 
+ #define MOAR (4096 * 8)
+ static bool palloc(int moar) {
+-	void *temp;
+ 	if (moar <= 0) {
+ 		return false;
+ 	}
+@@ -785,7 +784,7 @@ static bool palloc(int moar) {
+ 			return false;
+ 		}
+ 		size_t new_sz = moar + MOAR;
+-		temp = calloc (1, new_sz);
++		void *temp = calloc (1, new_sz);
+ 		if (temp) {
+ 			C->buffer_sz = new_sz;
+ 			C->buffer = temp;
+
+
+
+
+@@ -7,68 +7,147 @@
+ #define O_BINARY 0
+ #endif
+ 
+-#define I (r_cons_singleton ())
++#define HONOR_LAST_REDIRECT 0
++#define USE_HACK 0
+ 
+-static bool __dupDescriptor(int fd, int fdn) {
++#if 0
++static bool mydup(const int fd, const int fdn) {
+ 	if (fd == fdn) {
+ 		return false;
+ 	}
+ #if __wasi__
+ 	return false;
+-#elif R2__WINDOWS__
+-	I->backup_fd = 2002 - (fd - 2); // windows xp has 2048 as limit fd
+-	return _dup2 (fdn, I->backup_fd) != -1;
+ #else
+-	I->backup_fd = sysconf (_SC_OPEN_MAX) - (fd - 2); // portable getdtablesize()
+-	if (I->backup_fd < 2) {
+-		I->backup_fd = 2002 - (fd - 2); // fallback
++#  if R2__WINDOWS__
++	int newfd = -1;
++#  else
++	int newfd = sysconf (_SC_OPEN_MAX) - (fd - 2); // portable getdtablesize()
++#  endif
++	if (newfd < 2) {
++		newfd = 2002 - (fd - 2); // fallback
+ 	}
+-	return dup2 (fdn, I->backup_fd) != -1;
++	return dup2 (fd, newfd) != -1;
+ #endif
+ }
++#endif
+ 
+-R_API int r_cons_pipe_open(const char *file, int fdn, int append) {
++R_API int r_cons_pipe_open(const char *file, int fd_src, int append) {
+ #if __wasi__
+ 	return -1;
+ #else
+-	if (fdn < 1) {
++	if (fd_src < 1) {
+ 		return -1;
+ 	}
++	RCons *ci = r_cons_singleton ();
++	RConsFdPair *pair;
++#if !HONOR_LAST_REDIRECT
++	// prevent redirecting the same fd twice in the same line
++	R_VEC_FOREACH (&ci->fds, pair) {
++		if (fd_src == pair->fd_src) {
++			R_LOG_WARN ("cannot redirect the same fd twice");
++			// do not permit redirecting output to more than one file
++			return -1;
++		}
++	}
++#endif
+ 	char *targetFile = (r_str_startswith (file, "~/") || r_str_startswith (file, "~\\"))
+ 		? r_file_home (file + 2): strdup (file);
+ 	const int fd_flags = O_BINARY | O_RDWR | O_CREAT | (append? O_APPEND: O_TRUNC);
+-	int fd = r_sandbox_open (targetFile, fd_flags, 0644);
+-	if (fd == -1) {
++	int fd_new = r_sandbox_open (targetFile, fd_flags, 0644);
++	if (fd_new < 0) {
+ 		R_LOG_ERROR ("ConsPipe cannot open file '%s'", file);
+ 		free (targetFile);
+ 		return -1;
+ 	}
+-	if (I->backup_fd != -1) {
+-		close (I->backup_fd);
+-		// already set in __dupDescriptor // backup_fd = -1;
++	R_LOG_DEBUG ("open (%s) = %d", targetFile, fd_new);
++	int fd_bak = fd_src + 32; // XXX wrong assumptions
++	bool is_dual = false;
++#if HONOR_LAST_REDIRECT
++	R_VEC_FOREACH (&ci->fds, pair) {
++		if (fd_src == pair->fd_src) {
++			// do not permit redirecting output to more than one file
++#if USE_HACK
++			int fd_new2 = pair->fd_new + 64;
++			dup2 (pair->fd_bak, fd_new2);
++#else
++			int fd_new2 = dup (pair->fd_bak);
++#endif
++			fd_bak = fd_new2;
++			break;
++		}
+ 	}
+-	I->backup_fdn = fdn;
+-	if (!__dupDescriptor (fd, fdn)) {
++#endif
++	// int res = dup2 (fdn, rfd);
++	int res;
++	if (

@@ -1,0 +1,124 @@
+@@ -1337,7 +1337,9 @@ R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int r
+ 	}
+ 	fcn->maxstack = 0;
+ 	if (fcn->cc && !strcmp (fcn->cc, "ms")) {
+-		fcn->stack = fcn->maxstack = 0x28; // Shadow store for the first 4 args + Return addr
++		// Probably should put this on the cc sdb
++		const int shadow_store = 0x28; // First 4 args + retaddr
++		fcn->stack = fcn->maxstack = fcn->reg_save_area = shadow_store;
+ 	}
+ 	int ret = r_anal_fcn_bb (anal, fcn, addr, anal->opt.depth);
+ 	if (ret < 0) {
+
+
+
+
+@@ -2628,6 +2628,9 @@ jmp $$ + 4 + ( [delta] * 2 )
+ 		op->cycles = 1;
+ 		break;
+ 	case ARM_INS_POP:
++		op->stackop = R_ANAL_STACK_INC;
++		op->stackptr = -4LL * insn->detail->arm.op_count;
++		// fallthrough
+ 	case ARM_INS_FLDMDBX:
+ 	case ARM_INS_FLDMIAX:
+ 	case ARM_INS_LDMDA:
+@@ -2788,6 +2791,9 @@ jmp $$ + 4 + ( [delta] * 2 )
+ 		op->type = R_ANAL_OP_TYPE_SAR;
+ 		break;
+ 	case ARM_INS_PUSH:
++		op->stackop = R_ANAL_STACK_INC;
++		op->stackptr = 4LL * insn->detail->arm.op_count;
++		// fallthrough
+ 	case ARM_INS_STM:
+ 	case ARM_INS_STMDA:
+ 	case ARM_INS_STMDB:
+
+
+
+
+@@ -522,6 +522,7 @@ static bool var_add_structure_fields_to_list(RAnal *a, RAnalVar *av, RList *list
+ 			RAnalVarField *field = R_NEW0 (RAnalVarField);
+ 			field->name = new_name;
+ 			field->delta = av->delta + field_offset;
++			field->field = true;
+ 			r_list_append (list, field);
+ 			free (field_type);
+ 			free (field_key);
+@@ -545,7 +546,7 @@ static const char *get_regname(RAnal *anal, RAnalValue *value) {
+ 	return name;
+ }
+ 
+-static char *get_varname(RAnalFunction *fcn, char kind, const char *pfx, int ptr) {
++R_API R_OWN char *r_anal_function_autoname_var(RAnalFunction *fcn, char kind, const char *pfx, int ptr) {
+ 	void **it;
+ 	const ut32 uptr = R_ABS (ptr);
+ 	char *varname = r_str_newf ("%s_%xh", pfx, uptr);
+@@ -712,7 +713,7 @@ static void extract_arg(RAnal *anal, RAnalFunction *fcn, RAnalOp *op, const char
+ 			if (anal->opt.varname_stack) {
+ 				varname = r_str_newf ("%s_%xh", pfx, R_ABS (frame_off));
+ 			} else {
+-				varname = get_varname (fcn, type, pfx, ptr);
++				varname = r_anal_function_autoname_var (fcn, type, pfx, ptr);
+ 			}
+ 		}
+ 		if (varname) {
+@@ -732,7 +733,7 @@ static void extract_arg(RAnal *anal, RAnalFunction *fcn, RAnalOp *op, const char
+ 		}
+ 		char *varname = anal->opt.varname_stack
+ 			? r_str_newf ("%s_%xh", VARPREFIX, R_ABS (frame_off))
+-			: get_varname (fcn, type, VARPREFIX, -ptr);
++			: r_anal_function_autoname_var (fcn, type, VARPREFIX, -ptr);
+ 		if (varname) {
+ 			RAnalVar *var = r_anal_function_set_var (fcn, frame_off, type, NULL, anal->bits / 8, false, varname);
+ 			if (var) {
+
+
+
+
+@@ -4617,8 +4617,63 @@ static bool myvalid(RIO *io, ut64 addr) {
+ 	return true;
+ }
+ 
++typedef struct {
++	RAnalOp *op;
++	RAnalFunction *fcn;
++	const char *spname;
++	ut64 initial_sp;
++} EsilBreakCtx;
++
++static const char *reg_name_for_access(RAnalOp* op, RAnalVarAccessType type) {
++	if (type == R_ANAL_VAR_ACCESS_TYPE_READ) {
++		if (op->src[0] && op->src[0]->reg) {
++			return op->src[0]->reg->name;
++		}
++	} else if (op->dst && op->dst->reg) {
++		return op->dst->reg->name;
++	}
++	return NULL;
++}
++
++static ut64 delta_for_access(RAnalOp *op, RAnalVarAccessType type) {
++	if (type == R_ANAL_VAR_ACCESS_TYPE_READ) {
++		if (op->src[0]) {
++			return op->src[0]->delta;
++		}
++	} else if (op->dst) {
++		return op->dst->delta;
++	}
++	return 0;
++}
++
++static void handle_var_stack_access(RAnalEsil *esil, ut64 addr, RAnalVarAccessType type, int len) {
++	EsilBreakCtx *ctx = esil->user;
++	const char *regname = reg_name_for_access (ctx->op, type);
++	if (ctx->fcn && regname) {
++		ut64 spaddr = r_reg_getv (esil->anal->reg, ctx->spname);
++		if (addr > spaddr && addr <= ctx->initial_sp) {
++			int stack_off = addr - ctx->initial_sp;
++			RAnalVar *var = r_anal_function_get_var (ctx->fcn, R_ANAL_VAR_KIND_SPV, stack_off);
++			if (!var) {
++				var = r_anal_function_get_var (ctx->fcn, R_ANAL_VAR_KIND_BPV, stack_off);
++			}
++			if (!var && stack_off > -ctx->fcn->maxstack) {
++				char *v

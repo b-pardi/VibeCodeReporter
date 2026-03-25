@@ -1,0 +1,79 @@
+@@ -12,6 +12,8 @@
+ #include "zeek/Val.h"
+ #include "zeek/storage/ReturnCode.h"
+ 
++#include "const.bif.netvar_h"
++
+ using namespace std::chrono_literals;
+ 
+ namespace zeek::storage::backend::sqlite {
+@@ -90,7 +92,7 @@ OperationResult SQLite::DoOpen(OpenResultCallback* cb, RecordValPtr options) {
+ 
+     if ( auto open_res =
+              CheckError(sqlite3_open_v2(full_path.c_str(), &db,
+-                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL));
++                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, NULL));
+          open_res.code != ReturnCode::SUCCESS ) {
+         sqlite3_close_v2(db);
+         db = nullptr;
+@@ -110,7 +112,7 @@ OperationResult SQLite::DoOpen(OpenResultCallback* cb, RecordValPtr options) {
+ 
+         auto ks = vl->AsListVal()->Idx(0)->AsStringVal();
+         auto ks_sv = ks->ToStdStringView();
+-        auto vs = v->GetVal()->AsStringVal();
++        auto vs = iter.value->GetVal()->AsStringVal();
+         auto vs_sv = vs->ToStdStringView();
+ 
+         auto pragma_res = RunPragma(ks_sv, vs_sv);
+@@ -120,11 +122,36 @@ OperationResult SQLite::DoOpen(OpenResultCallback* cb, RecordValPtr options) {
+         }
+     }
+ 
+-    std::string create = "create table if not exists " + table_name + " (";
+-    create.append("key_str blob primary key, value_str blob not null, expire_time real);");
++    // Open a second connection to the database. This one is used for expiration and exists to prevent
++    // simultaneous multi-threaded access to the same connection.
++    if ( auto open_res =
++             CheckError(sqlite3_open_v2(full_path.c_str(), &expire_db,
++                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, NULL));
++         open_res.code != ReturnCode::SUCCESS ) {
++        Close(nullptr);
++        return open_res;
++    }
++
++    sqlite3_busy_timeout(expire_db, busy_timeout * 1000);
++
++    std::string cmd = "create table if not exists " + table_name + " (";
++    cmd.append("key_str blob primary key, value_str blob not null, expire_time real);");
+ 
+     char* errorMsg = nullptr;
+-    if ( int res = sqlite3_exec(db, create.c_str(), NULL, NULL, &errorMsg); res != SQLITE_OK ) {
++    if ( int res = sqlite3_exec(db, cmd.c_str(), NULL, NULL, &errorMsg); res != SQLITE_OK ) {
++        std::string err = util::fmt("Error executing table creation statement: (%d) %s", res, errorMsg);
++        Error(err.c_str());
++        sqlite3_free(errorMsg);
++        Close(nullptr);
++        return {ReturnCode::INITIALIZATION_FAILED, std::move(err)};
++    }
++
++    sqlite3_free(errorMsg);
++
++    // Create a table for controlling expiration contention. The ukey column here ensures that only
++    // one row exists for this backend's table.
++    cmd = util::fmt("create table if not exists zeek_storage_expiry_runs (ukey primary key, last_run double);");
++    if ( int res = sqlite3_exec(db, cmd.c_str(), NULL, NULL, &errorMsg); res != SQLITE_OK ) {
+         std::string err = util::fmt("Error executing table creation statement: (%d) %s", res, errorMsg);
+         Error(err.c_str());
+         sqlite3_free(errorMsg);
+@@ -132,34 +159,72 @@ OperationResult SQLite::DoOpen(OpenResultCallback* cb, RecordValPtr options) {
+         return {ReturnCode::INITIALIZATION_FAILED, std::move(err)};
+     }
+ 
+-    static std::array<std::string, 5> statements =
+-        {util::fmt("insert into %s (key_str, value_str, expire_time) values(?, ?, ?)", table_name.c_str()),
+-         util::fmt("insert into %s (key_str, value_str, expire_time) values(?, ?, ?) ON CONFLICT(key_str) "
+-                   "DO UPDATE SET value_str=?",
+-                   table_name.c_str()),
+-         util::fmt("select value_str from %s where key_str=?", table_name.c_str()),
+-         util::fmt("delete from %s where key_str=?", table_name.c_str()),
+-         util::fmt("delete from %s where expire_time > 0 and expire_time != 0 and expire_time <= ?",

@@ -1,0 +1,100 @@
+@@ -198,13 +198,26 @@ typedef struct r_io_plugin_t {
+ 	bool (*check)(RIO *io, const char *, bool many);
+ } RIOPlugin;
+ 
++struct r_io_map_t;
++
++typedef struct r_io_reloc_map_t {
++	void *data;
++	int (*read)(RIO *io, struct r_io_map_t *map, ut64 addr, ut8 *buf, int len);
++	int (*write)(RIO *io, struct r_io_map_t *map, ut64 addr, const ut8 *buf, int len);
++	bool (*relocate)(RIO *io, struct r_io_map_t *map, ut64 addr);
++	void (*free)(void *data);
++} RIORelocMap;
++
+ typedef struct r_io_map_t {
+ 	int fd;
+ 	int perm;
+ 	ut32 id;
+ 	ut64 ts;
+ 	RInterval itv;
+-	ut64 delta; // paddr = vaddr - itv.addr + delta
++	union {
++		ut64 delta; // paddr = vaddr - itv.addr + delta
++		RIORelocMap *reloc_map;
++	};
+ 	char *name;
+ } RIOMap;
+ 
+@@ -327,6 +340,7 @@ R_API bool r_io_map_exists(RIO *io, RIOMap *map);
+ R_API bool r_io_map_exists_for_id(RIO *io, ut32 id);
+ R_API RIOMap *r_io_map_get(RIO *io, ut32 id);
+ R_API RIOMap *r_io_map_add(RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut64 size);
++R_API RIOMap *r_io_reloc_map_add(RIO *io, int fd, int perm, RIORelocMap *rm, ut64 addr, ut64 size);
+ R_API RIOMap *r_io_map_add_bottom(RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut64 size);
+ R_API RIOMap *r_io_map_get_at(RIO *io, ut64 vaddr); // returns the map at vaddr with the highest priority
+ R_API RIOMap *r_io_map_get_by_ref(RIO *io, RIOMapRef *ref);
+
+
+
+
+@@ -86,6 +86,7 @@
+ #define R_PERM_PRIV	16
+ #define R_PERM_ACCESS	32
+ #define R_PERM_CREAT	64
++#define R_PERM_RELOC	128
+ 
+ 
+ // HACK to fix capstone-android-mips build
+
+
+
+
+@@ -786,8 +786,12 @@ R_API bool r_io_bank_read_at(RIO *io, const ut32 bankid, ut64 addr, ut8 *buf, in
+ 		const ut64 buf_off = R_MAX (addr, r_io_submap_from (sm)) - addr;
+ 		const int read_len = R_MIN (r_io_submap_to ((&fake_sm)),
+ 					     r_io_submap_to (sm)) - (addr + buf_off) + 1;
+-		const ut64 paddr = addr + buf_off - r_io_map_from (map) + map->delta;
+-		ret &= (r_io_fd_read_at (io, map->fd, paddr, &buf[buf_off], read_len) == read_len);
++		if (map->perm & R_PERM_RELOC) {
++			ret &= map->reloc_map->read (io, map, addr + buf_off, &buf[buf_off], read_len);
++		} else {
++			const ut64 paddr = addr + buf_off - r_io_map_from (map) + map->delta;
++			ret &= (r_io_fd_read_at (io, map->fd, paddr, &buf[buf_off], read_len) == read_len);
++		}
+ 		// check return value here?
+ 		node = r_rbnode_next (node);
+ 		sm = node ? (RIOSubMap *)node->data : NULL;
+@@ -828,8 +832,12 @@ R_API bool r_io_bank_write_at(RIO *io, const ut32 bankid, ut64 addr, const ut8 *
+ 		const ut64 buf_off = R_MAX (addr, r_io_submap_from (sm)) - addr;
+ 		const int write_len = R_MIN (r_io_submap_to ((&fake_sm)),
+ 					     r_io_submap_to (sm)) - (addr + buf_off) + 1;
+-		const ut64 paddr = addr + buf_off - r_io_map_from (map) + map->delta;
+-		ret &= (r_io_fd_write_at (io, map->fd, paddr, &buf[buf_off], write_len) == write_len);
++		if (map->perm & R_PERM_RELOC) {
++			ret &= map->reloc_map->write (io, map, addr + buf_off, &buf[buf_off], write_len);
++		} else {
++			const ut64 paddr = addr + buf_off - r_io_map_from (map) + map->delta;
++			ret &= (r_io_fd_write_at (io, map->fd, paddr, &buf[buf_off], write_len) == write_len);
++		}
+ 		// check return value here?
+ 		node = r_rbnode_next (node);
+ 		sm = node ? (RIOSubMap *)node->data : NULL;
+@@ -867,6 +875,9 @@ R_API int r_io_bank_read_from_submap_at(RIO *io, const ut32 bankid, ut64 addr, u
+ 		return -1;
+ 	}
+ 	const int read_len = R_MIN (len, r_io_submap_to (sm) - addr + 1);
++	if (map->perm & R_PERM_RELOC) {
++		return map->reloc_map->read (io, map, addr, buf, read_len);
++	}
+ 	const ut64 paddr = addr - r_io_map_from (map) + map->delta;
+ 	return r_io_fd_read_at (io, map->fd, paddr, buf, read_len);
+ }
+@@ -901,6 +912,9 @@ R_API int r_io_bank_write_to_submap_at(RIO *io, const ut32 bankid, ut64 addr, co
+ 		return -1;
+ 	}
+ 	const int write_len = R_MIN (len, r_io_submap_to (sm) - addr + 1);
++	if (map->perm & R_PERM_RELOC) {
++		return map->reloc_map->write (io, map, addr, buf, write_len);
++	}
+ 	const ut64 paddr = addr - r_io_map_from (map) +

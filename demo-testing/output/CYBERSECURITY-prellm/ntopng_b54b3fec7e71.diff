@@ -1,0 +1,91 @@
+@@ -60,8 +60,7 @@ class DB {
+   inline void startDBLoop()                                 { running = true; startLoop(); };
+   inline int isRunning()                                    { return(running); };
+   virtual void shutdown();
+-  virtual void flushFlows() {};
+-  virtual void flushAggregatedFlows() {};
++  virtual void flush() {};
+   virtual void lua(lua_State* vm, bool since_last_checkpoint) const;
+ #ifdef NTOPNG_PRO
+   virtual bool dumpAggregatedFlow(time_t when, AggregatedFlow *f, bool is_top_aggregated_flow, bool is_top_cli, bool is_top_srv);
+
+
+
+
+@@ -140,8 +140,8 @@ class NetworkInterface : public AlertableEntity {
+   CustomAppStats *custom_app_stats;
+   FlowInterfacesStats *flow_interfaces_stats;
+   AggregatedFlowHash *aggregated_flows_hash; /**< Hash used to store aggregated flows information. */
+-  u_int32_t aggregated_flows_dump_updates;
+-  u_int32_t aggregated_flows_dump_max_updates;
++  struct timeval aggregated_flows_dump_last_dump;
++  bool aggregated_flows_dump_ready;
+ #endif
+   EthStats ethStats;
+   std::map<u_int32_t, u_int64_t> ip_mac; /* IP (network byte order) <-> MAC association [2 bytes are unused] */
+@@ -350,11 +350,11 @@ class NetworkInterface : public AlertableEntity {
+   int dumpFlow(time_t when, Flow *f, bool no_time_left);
+ #ifdef NTOPNG_PRO
+   void dumpAggregatedFlow(time_t when, AggregatedFlow *f, bool is_top_aggregated_flow, bool is_top_cli, bool is_top_srv);
+-  void dumpAggregatedFlows(const struct timeval *tv);
+-  void flushAggregatedFlows();
++  void dumpAggregatedFlows(const struct timeval *tv, time_t deadline, bool no_time_left);
++  void flushFlowDump();
++  void set_aggregated_flows_dump_update(const struct timeval *tv);
+   bool is_aggregated_flows_dump_ready() const;
+-  void inc_aggregated_flows_dump_updates();
+-  bool check_aggregated_flows_dump_ready(const struct timeval *tv) const;
++
+ #endif
+   void checkPointHostTalker(lua_State* vm, char *host_ip, u_int16_t vlan_id);
+   int dumpLocalHosts2redis(bool disable_purge);
+@@ -661,7 +661,8 @@ class NetworkInterface : public AlertableEntity {
+ #endif
+ 
+   void getFlowsStatus(lua_State *vm);
+-  void startDBLoop()               { if(db) db->startDBLoop();                 };
++  inline void startDBLoop()                   { if(db) db->startDBLoop();                 };
++  inline void incDBNumDroppedFlows(u_int num) { if(db) db->incNumDroppedFlows(num);       };
+ #ifdef NTOPNG_PRO
+   inline void getFlowDevices(lua_State *vm) {
+     if(flow_interfaces_stats) flow_interfaces_stats->luaDeviceList(vm); else lua_newtable(vm);
+
+
+
+
+@@ -269,7 +269,8 @@ void NetworkInterface::init() {
+   num_active_misbehaving_flows = num_idle_misbehaving_flows = 0;
+ 
+ #ifdef NTOPNG_PRO
+-  aggregated_flows_dump_updates = aggregated_flows_dump_max_updates = 0;
++  gettimeofday(&aggregated_flows_dump_last_dump, NULL);
++  aggregated_flows_dump_ready = false;
+ #endif
+ 
+   ip_addresses = "", networkStats = NULL,
+@@ -505,7 +506,7 @@ void NetworkInterface::deleteDataStructures() {
+ 
+ #ifdef NTOPNG_PRO
+   if(aggregated_flows_hash) {
+-    aggregated_flows_hash->cleanup();
++    aggregated_flows_hash->cleanup(time(NULL) + 10, false);
+     delete(aggregated_flows_hash);
+     aggregated_flows_hash = NULL;
+   }
+@@ -665,11 +666,9 @@ void NetworkInterface::dumpAggregatedFlow(time_t when, AggregatedFlow *f, bool i
+ 
+ /* **************************************************** */
+ 
+-void NetworkInterface::dumpAggregatedFlows(const struct timeval *tv) {
+-  aggregated_flows_dump_updates = 0;  /* Reset */
+-
++void NetworkInterface::dumpAggregatedFlows(const struct timeval *tv, time_t deadline, bool no_time_left) {
+   if(aggregated_flows_hash)
+-    aggregated_flows_hash->cleanup();
++    aggregated_flows_hash->cleanup(deadline, no_time_left);
+ 
+ #ifdef AGGREGATED_FLOW_DEBUG
+   ntop->getTrace()->traceEvent(TRACE_NORMAL,
+@@ -677,34 +676,28 @@ void NetworkInterface::dumpAggregatedFlows(const struct timeval *tv) {
+ 			       "Aggregated flows hash cleared. [num_items: %i]",
+ 			       aggregated_flows_hash-

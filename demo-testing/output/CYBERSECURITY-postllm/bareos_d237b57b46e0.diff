@@ -1,0 +1,142 @@
+@@ -645,6 +645,7 @@ bail_out:
+  */
+ int PluginSave(JobControlRecord* jcr, FindFilesPacket* ff_pkt, bool)
+ {
++  int ret = 1;  // everything ok
+   int len;
+   bRC retval;
+   char* cmd;
+@@ -719,6 +720,8 @@ int PluginSave(JobControlRecord* jcr, FindFilesPacket* ff_pkt, bool)
+ 
+       // Get the file save parameters. I.e. the stat pkt ...
+       if (PlugFunc(ctx->plugin)->startBackupFile(ctx, &sp) != bRC_OK) {
++        Jmsg1(jcr, M_FATAL, 0,
++              _("Command plugin \"%s\": startBackupFile failed.\n"), cmd);
+         goto bail_out;
+       }
+ 
+@@ -840,17 +843,20 @@ int PluginSave(JobControlRecord* jcr, FindFilesPacket* ff_pkt, bool)
+ 
+       if (retval == bRC_More) { continue; }
+ 
+-      goto bail_out;
++      goto fun_end;
+     } /* end while loop */
+ 
+-    goto bail_out;
++    goto fun_end;
+   } /* end loop over all plugins */
+   Jmsg1(jcr, M_FATAL, 0, "Command plugin \"%s\" not found.\n", cmd);
+ 
+ bail_out:
++  ret = 0;
++
++fun_end:
+   jcr->cmd_plugin = false;
+ 
+-  return 1;
++  return ret;
+ }
+ 
+ /**
+
+
+
+
+@@ -193,7 +193,7 @@ int FindFiles(JobControlRecord* jcr,
+         Dmsg1(debuglevel, "PluginCommand: %s\n", fname);
+         ff->top_fname = fname;
+         ff->cmd_plugin = true;
+-        PluginSave(jcr, ff, true);
++        if (!PluginSave(jcr, ff, true)) { return 0; }
+         ff->cmd_plugin = false;
+         if (jcr->IsJobCanceled()) { return 0; }
+       }
+
+
+
+
+@@ -415,21 +415,28 @@ static bRC PyStartBackupFile(PluginContext* plugin_ctx, save_pkt* sp)
+     PyObject* pRetVal;
+ 
+     pSavePkt = NativeToPySavePacket(sp);
+-    if (!pSavePkt) { goto bail_out; }
++    if (!pSavePkt) {
++      Dmsg(plugin_ctx, debuglevel,
++           LOGPREFIX "Failed to convert save packet to python.\n");
++      goto bail_out;
++    }
+ 
+     pRetVal = PyObject_CallFunctionObjArgs(pFunc, (PyObject*)pSavePkt, NULL);
+     if (!pRetVal) {
+       Py_DECREF((PyObject*)pSavePkt);
+       goto bail_out;
+     } else {
+-      retval = ConvertPythonRetvalTobRCRetval(pRetVal);
+-      Py_DECREF(pRetVal);
+-
+       if (!PySavePacketToNative(pSavePkt, sp, plugin_priv_ctx, false)) {
++        Dmsg(plugin_ctx, debuglevel,
++             LOGPREFIX "Failed to convert save packet to native.\n");
++        Py_DECREF(pRetVal);
+         Py_DECREF((PyObject*)pSavePkt);
+         goto bail_out;
+       }
+       Py_DECREF((PyObject*)pSavePkt);
++
++      retval = ConvertPythonRetvalTobRCRetval(pRetVal);
++      Py_DECREF(pRetVal);
+     }
+   } else {
+     Dmsg(plugin_ctx, debuglevel,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1015 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++# BAREOS - Backup Archiving REcovery Open Sourced
++#
++# Copyright (C) 2023-2023 Bareos GmbH & Co. KG
++#
++# This program is Free Software; you can redistribute it and/or
++# modify it under the terms of version three of the GNU Affero General Public
++# License as published by the Free Software Foundation, which is
++# listed in the file LICENSE.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++# Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++# 02110-1301, USA.
++#
++# Author: Bareos Team
++#
++"""Bareos python plugins class that performs online backups (full and incremental)
++from PostgreSQL databases. Supports point-in-time (PIT) restores.
++Support PostgreSQL server version >= 10
++"""
++import os
++import io
++import json
++import getpass
++from sys import version_info
++import time
++import datetime
++import dateutil
++import dateutil.parser
++import pg8000  # minimum required version is 1.16
++import bareosfd
++
++from BareosFdPluginLocalFilesBaseclass import BareosFdPluginLocalFilesBaseclass
++
++
++def parse_row(row):
++    """
++    This function exists to fix bug in pg8000 >=

@@ -1,0 +1,100 @@
+@@ -295,7 +295,7 @@ typedef struct TcpSession_ {
+     uint32_t reassembly_depth; /**< reassembly depth for the stream */
+     TcpStream server;
+     TcpStream client;
+-    TcpStateQueue *queue;                   /**< list of SYN/ACK candidates */
++    TcpStateQueue *queue; /**< list of SYN or SYN/ACK candidates */
+ } TcpSession;
+ 
+ #define StreamTcpSetStreamFlagAppProtoDetectionCompleted(stream) \
+
+
+
+
+@@ -1803,6 +1803,7 @@ static void TcpStateQueueInitFromSsnSyn(const TcpSession *ssn, TcpStateQueue *q)
+     DEBUG_VALIDATE_BUG_ON(ssn->state != TCP_SYN_SENT); // TODO
+     memset(q, 0, sizeof(*q));
+ 
++    q->seq = ssn->client.isn;
+     /* SYN won't use wscale yet. So window should be limited to 16 bits. */
+     DEBUG_VALIDATE_BUG_ON(ssn->server.window > UINT16_MAX);
+     q->win = (uint16_t)ssn->server.window;
+@@ -1834,6 +1835,7 @@ static void TcpStateQueueInitFromPktSyn(const Packet *p, TcpStateQueue *q)
+     memset(q, 0, sizeof(*q));
+     const TCPHdr *tcph = PacketGetTCP(p);
+ 
++    q->seq = TCP_GET_RAW_SEQ(tcph);
+     q->win = TCP_GET_RAW_WINDOW(tcph);
+     q->pkt_ts = (uint32_t)SCTIME_SECS(p->ts);
+ 
+@@ -1864,6 +1866,7 @@ static void TcpStateQueueInitFromPktSynAck(const Packet *p, TcpStateQueue *q)
+     memset(q, 0, sizeof(*q));
+ 
+     const TCPHdr *tcph = PacketGetTCP(p);
++    q->seq = TCP_GET_RAW_ACK(tcph) - 1;
+     q->win = TCP_GET_RAW_WINDOW(tcph);
+     q->pkt_ts = (uint32_t)SCTIME_SECS(p->ts);
+ 
+@@ -1888,36 +1891,62 @@ static void TcpStateQueueInitFromPktSynAck(const Packet *p, TcpStateQueue *q)
+ /** \internal
+  *  \brief Find the Queued SYN that is the same as this SYN/ACK
+  *  \retval q or NULL */
+-static const TcpStateQueue *StreamTcp3whsFindSyn(const TcpSession *ssn, TcpStateQueue *s)
++static const TcpStateQueue *StreamTcp3whsFindSyn(
++        const TcpSession *ssn, TcpStateQueue *s, TcpStateQueue **ret_tail)
+ {
+     SCLogDebug("ssn %p: search state:%p, isn:%u/win:%u/has_ts:%s/tsval:%u", ssn, s, s->seq, s->win,
+             BOOL2STR(s->flags & STREAMTCP_QUEUE_FLAG_TS), s->ts);
+ 
+-    for (const TcpStateQueue *q = ssn->queue; q != NULL; q = q->next) {
+-        SCLogDebug("ssn %p: queue state:%p, isn:%u/win:%u/has_ts:%s/tsval:%u", ssn, q, q->seq,
+-                q->win, BOOL2STR(q->flags & STREAMTCP_QUEUE_FLAG_TS), q->ts);
++    TcpStateQueue *last = NULL;
++    for (TcpStateQueue *q = ssn->queue; q != NULL; q = q->next) {
++        SCLogDebug("ssn %p: queue state:%p, isn:%u/win:%u/has_ts:%s/tsval:%u (last:%s)", ssn, q,
++                q->seq, q->win, BOOL2STR(q->flags & STREAMTCP_QUEUE_FLAG_TS), q->ts,
++                BOOL2STR(q->next == NULL));
+         if ((s->flags & STREAMTCP_QUEUE_FLAG_TS) == (q->flags & STREAMTCP_QUEUE_FLAG_TS) &&
+-                s->ts == q->ts) {
++                s->ts == q->ts && s->seq == q->seq) {
+             return q;
+         }
++        last = q;
+     }
++    if (ret_tail)
++        *ret_tail = last;
+     return NULL;
+ }
+ 
+-/** \note the SEQ values *must* be the same */
++/** \internal
++ *  \brief take oldest element in the list and replace it with the new data
++ */
++static void AddAndRotate(TcpSession *ssn, TcpStateQueue *tail, TcpStateQueue *search)
++{
++    TcpStateQueue *old_head = ssn->queue;
++    TcpStateQueue *new_head = old_head->next;
++    /* set new head */
++    ssn->queue = new_head;
++
++    /* old head node is now appended to the list tail */
++    tail->next = old_head;
++
++    *old_head = *search;
++    old_head->next = NULL;
++}
++
+ static int StreamTcp3whsStoreSyn(TcpSession *ssn, Packet *p)
+ {
+     TcpStateQueue search;
+     TcpStateQueueInitFromSsnSyn(ssn, &search);
++    TcpStateQueue *tail = NULL;
+ 
+     /* first see if this is already in our list */
+-    if (ssn->queue != NULL && StreamTcp3whsFindSyn(ssn, &search) != NULL)
++    if (ssn->queue != NULL && StreamTcp3whsFindSyn(ssn, &search, &tail) != NULL)
+         return 0;
+ 
+     if (ssn->queue_len == stream_config.max_syn_queued) {
+-        SCLogDebug("ssn %p: =~ SYN queue limit reached", ssn);
++        SCLogDebug("%" PRIu64 ": s

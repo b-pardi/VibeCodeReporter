@@ -1,0 +1,136 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,301 @@
++from __future__ import annotations
++
++import os
++import socket
++import tempfile
++import threading
++import time
++
++import gdb
++import pytest
++
++import tests
++
++REFERENCE_BINARY = tests.get_binary("reference-binary.out")
++USE_FDS_BINARY = tests.get_binary("use-fds.out")
++
++
++class TCPServerThread(threading.Thread):
++    def __init__(self, *, ip: str, port: int):
++        super().__init__(daemon=True)
++        self.sock = socket.socket(
++            socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM
++        )
++        try:
++            self.sock.bind((ip, port))
++        except OSError:
++            pytest.skip(f"Could not bind to {ip}:{port}.")
++        self.port = self.sock.getsockname()[1]
++        self.sock.listen(1)
++        self.stop_event = threading.Event()
++
++    def stop(self):
++        self.stop_event.set()
++        self.sock.close()
++
++    def run(self):
++        try:
++            # Accept one conn and wait for stop event
++            conn, addr = self.sock.accept()
++            while not self.stop_event.is_set():
++                time.sleep(0.1)
++        except OSError:
++            pass  # Socket closed
++
++
++class UDPServerThread(threading.Thread):
++    def __init__(self, *, ip: str, port: int):
++        super().__init__(daemon=True)
++        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        try:
++            self.sock.bind((ip, port))
++        except OSError:
++            pytest.skip(f"Could not bind UDP to {ip}:{port}.")
++        self.port = self.sock.getsockname()[1]
++        self.received_data = None
++
++    def stop(self):
++        self.sock.close()
++
++    def run(self):
++        try:
++            # Wait for data with timeout
++            self.sock.settimeout(1)
++            data, addr = self.sock.recvfrom(1024)
++            self.received_data = data
++        except socket.timeout:
++            pass
++        except OSError:
++            pass
++
++
++def test_hijack_fd_file_redirection(start_binary):
++    """
++    Test hijack_fd command with file redirection
++    """
++    start_binary(REFERENCE_BINARY)
++
++    # Create a temporary file for testing
++    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
++        temp_file.write("test content for hijack_fd")
++        temp_file_path = temp_file.name
++
++    try:
++        # Run until break_here
++        gdb.execute("xuntil &break_here")
++
++        # Hijack stdout (fd 1) to point to our temporary file
++        result = gdb.execute(f"hijack-fd 1 {temp_file_path}", to_string=True)
++        assert "Operation succeeded" in result
++
++        # Actually write to the hijacked file descriptor to validate it works
++        gdb.execute('call write(1, "hello\\n", 6)')
++
++        # Check the file content to verify the write went to our file
++        with open(temp_file_path, "r") as f:
++            content = f.read()
++            assert "hello" in content
++
++        # Verify the file descriptor change using procinfo
++        final_procinfo = gdb.execute("procinfo", to_string=True)
++
++        # Check that fd[1] now points to our temporary file
++        assert temp_file_path in final_procinfo
++
++    finally:
++        # Clean up temporary file
++        if os.path.exists(temp_file_path):
++            os.unlink(temp_file_path)
++
++
++@pytest.mark.parametrize("ip_connect", ["127.0.0.1", "::1"])
++def test_hijack_fd_socket_redirection(start_binary, ip_connect):
++    """
++    Test hijack_fd command with TCP socket redirection (IPv4 and IPv6)
++    """
++    # Start TCP server
++    server = TCPServerThread(ip=ip_connect, port=0)
++    server.start()
++
++    try:
++        start_binary(REFERENCE_BINARY)
++
++        gdb.execute("xuntil break_here")
++
++        # Use URI style for IPv6, plain for IPv4
++        if ":" in ip_connect:
++            uri = f"tcp://[{ip_connect}]:{server.port}"
++        else:
++            uri = f"{ip_connect}:{server.port}"
++
++        result = gdb.execute(f"hijack-fd 2 {uri}", to

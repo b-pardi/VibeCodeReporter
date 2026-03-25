@@ -1,0 +1,109 @@
+@@ -361,6 +361,13 @@ class VulnerableCodeBaseImporterPipelineV2(VulnerableCodePipeline):
+         try:
+             versions = package_versions.versions(str(package_url))
+             for version in versions or []:
++                if (
++                    version.release_date
++                    and version.release_date.tzinfo
++                    and until
++                    and until.tzinfo is None
++                ):
++                    until = until.replace(tzinfo=timezone.utc)
+                 if until and version.release_date and version.release_date > until:
+                     continue
+                 versions_before_until.append(version.value)
+
+
+
+
+@@ -39,7 +39,12 @@ class ElixirSecurityImporterPipeline(VulnerableCodeBaseImporterPipelineV2):
+ 
+     @classmethod
+     def steps(cls):
+-        return (cls.collect_and_store_advisories,)
++        return (cls.clone, cls.collect_and_store_advisories, cls.clean_downloads)
++
++    def clean_downloads(self):
++        if self.vcs_response:
++            self.log(f"Removing cloned repository")
++            self.vcs_response.delete()
+ 
+     def clone(self):
+         self.log(f"Cloning `{self.repo_url}`")
+@@ -62,6 +67,9 @@ class ElixirSecurityImporterPipeline(VulnerableCodeBaseImporterPipelineV2):
+ 
+     def process_file(self, file, base_path) -> Iterable[AdvisoryData]:
+         relative_path = str(file.relative_to(base_path)).strip("/")
++        path_segments = str(file).split("/")
++        # use the last two segments as the advisory ID
++        advisory_id = "/".join(path_segments[-2:]).replace(".yml", "")
+         advisory_url = (
+             f"https://github.com/dependabot/elixir-security-advisories/blob/master/{relative_path}"
+         )
+@@ -114,8 +122,8 @@ class ElixirSecurityImporterPipeline(VulnerableCodeBaseImporterPipelineV2):
+             date_published = dateparser.parse(yaml_file.get("disclosure_date"))
+ 
+         yield AdvisoryData(
+-            advisory_id=cve_id,
+-            aliases=[],
++            advisory_id=advisory_id,
++            aliases=[cve_id],
+             summary=summary,
+             references_v2=references,
+             affected_packages=affected_packages,
+
+
+
+
+@@ -233,6 +233,8 @@ def parse_gitlab_advisory(
+     # refer to schema here https://gitlab.com/gitlab-org/advisories-community/-/blob/main/ci/schema/schema.json
+     aliases = gitlab_advisory.get("identifiers")
+     advisory_id = gitlab_advisory.get("identifier")
++    package_slug = gitlab_advisory.get("package_slug")
++    advisory_id = f"{package_slug}/{advisory_id}" if package_slug else advisory_id
+     if advisory_id in aliases:
+         aliases.remove(advisory_id)
+     summary = build_description(gitlab_advisory.get("title"), gitlab_advisory.get("description"))
+@@ -244,8 +246,6 @@ def parse_gitlab_advisory(
+ 
+     date_published = dateparser.parse(gitlab_advisory.get("pubdate"))
+     date_published = date_published.replace(tzinfo=pytz.UTC)
+-    package_slug = gitlab_advisory.get("package_slug")
+-    advisory_id = f"{package_slug}/{advisory_id}" if package_slug else advisory_id
+     advisory_url = get_advisory_url(
+         file=file,
+         base_path=base_path,
+
+
+
+
+@@ -72,7 +72,7 @@ def test_collect_advisories(mock_fetch_via_vcs, mock_vcs_response):
+     assert len(advisories) == 1
+ 
+     advisory: AdvisoryData = advisories[0]
+-    assert advisory.advisory_id == "CVE-2022-9999"
++    assert advisory.advisory_id == "some_package/CVE-2022-9999"
+     assert advisory.summary.startswith("Cross-site scripting vulnerability")
+     assert advisory.affected_packages[0].package.name == "plug"
+     assert advisory.affected_packages[0].package.type == "hex"
+
+
+
+
+@@ -570,8 +570,8 @@ class AdvisoryPackagesDetails(DetailView):
+ 
+     model = models.AdvisoryV2
+     template_name = "advisory_package_details.html"
+-    slug_url_kwarg = "id"
+-    slug_field = "id"
++    slug_url_kwarg = "avid"
++    slug_field = "avid"
+ 
+     def get_queryset(self):
+         """
+
+
+
+
+@@ -103,6 +103,11 @@ urlpatterns = [
+   

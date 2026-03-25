@@ -1,0 +1,126 @@
+@@ -1053,18 +1053,19 @@ R_API RList *r_bin_file_set_hashes(RBin *bin, RList/*<RBinFileHash*/ *new_hashes
+ 	return prev_hashes;
+ }
+ 
+-R_API RBinClass *r_bin_class_new(const char *name, const char *super, int view) {
++R_API RBinClass *r_bin_class_new(const char *name, const char *super, int visibility) {
+ 	r_return_val_if_fail (name, NULL);
+ 	RBinClass *c = R_NEW0 (RBinClass);
+ 	if (c) {
+ 		c->name = strdup (name);
+-		if (super) {
++		if (R_STR_ISNOTEMPTY (super)) {
+ 			c->super = r_list_newf (free);
+ 			r_list_append (c->super, strdup (super));
+ 		}
++		// TODO: use vectors!
+ 		c->methods = r_list_newf (r_bin_symbol_free);
+ 		c->fields = r_list_newf (r_bin_field_free);
+-		c->visibility = view;
++		c->visibility = visibility;
+ 	}
+ 	return c;
+ }
+@@ -1084,7 +1085,7 @@ R_API RBinClass *r_bin_file_add_class(RBinFile *bf, const char *name, const char
+ 	r_return_val_if_fail (name && bf && bf->bo, NULL);
+ 	RBinClass *c = __getClass (bf, name);
+ 	if (c) {
+-		if (super) {
++		if (R_STR_ISNOTEMPTY (super)) {
+ 			r_list_free (c->super);
+ 			c->super = r_list_newf (free);
+ 			r_list_append (c->super, strdup (super));
+
+
+
+
+@@ -1,5 +1,7 @@
+ /* radare - LGPL - Copyright 2015-2023 - inisider, pancake */
+ 
++#define R_LOG_ORIGIN "bin"
++
+ #include "../../i/private.h"
+ #include "mach0_classes.h"
+ 
+@@ -18,6 +20,71 @@
+ 
+ #define RO_DATA_PTR(x) ((x) & FAST_DATA_MASK)
+ 
++typedef struct {
++	bool have;
++	ut64 addr;
++	ut64 size;
++	ut8 *data;
++} MetaSection;
++
++typedef struct {
++	// swift
++	MetaSection types;
++	MetaSection fieldmd;
++	// objc
++	MetaSection clslist;
++	MetaSection catlist;
++} MetaSections;
++
++static bool adjust_bounds(RBinFile *bf, MetaSection *ms, const char *sname) {
++	if (ms->addr >= bf->size || ms->size >= bf->size) {
++		R_LOG_DEBUG ("Dropping swift5.%s section because oob", sname);
++		return false;
++	}
++	if (ms->addr + ms->size >= bf->size) {
++		R_LOG_DEBUG ("Truncating swift5.fieldmd section", sname);
++		ms->size = bf->size - ms->addr;
++	}
++	return true;
++}
++
++static bool parse_section(RBinFile *bf, MetaSection *ms, struct section_t *section, const char *sname) {
++	if (ms->have) {
++		return true;
++	}
++	if (strstr (section->name, sname)) {
++		ms->addr = section->paddr;
++		ms->size = section->size;
++		ms->have = adjust_bounds (bf, ms, sname);
++		return true;
++	}
++	return false;
++}
++
++static void metadata_sections_fini(MetaSections *ms) {
++	R_FREE (ms->types.data);
++	R_FREE (ms->fieldmd.data);
++	R_FREE (ms->clslist.data);
++	R_FREE (ms->catlist.data);
++}
++
++#define PARSECTION(x,y) parse_section (bf, x, section, y)
++static MetaSections metadata_sections_init(RBinFile *bf) {
++	MetaSections ms = {0};
++	const RVector *sections = MACH0_(load_sections) (bf->bo->bin_obj);
++	if (!sections) {
++		return ms;
++	}
++	struct section_t *section;
++	r_vector_foreach (sections, section) {
++		PARSECTION (&ms.clslist, "__objc_classlist");
++		PARSECTION (&ms.catlist, "__objc_catlist");
++		PARSECTION (&ms.types, "swift5_types");
++		PARSECTION (&ms.fieldmd, "swift5_fieldmd");
++	}
++	return ms;
++}
++
+ struct MACH0_(SMethodList) {
+ 	ut32 entsize;
+ 	ut32 count;
+@@ -112,19 +179,15 @@ static void get_objc_property_list(mach0_ut p, RBinFile *bf, RBinClass *klass);
+ static void get_method_list_t(mach0_ut p, RBinFile *bf, char *class_name, RBinClass *klass, bool is_static, objc_cache_opt_info *oi);
+ static void get_protocol_list_t(mach0_ut p, RBinFile *bf, RBinClass *klass, objc_cache_opt_info *oi);
+ static void get_class_ro_t(mach0_ut p, RBinFile *bf, ut32 *is_meta_class, RBinClass *klass, objc_cache_opt_info *oi);
+-static RList *MACH0_(parse_categories)(RBinFile *bf, const RSkipList *relocs, objc_cache_opt_info *oi);
++static RList *MACH0_(parse_categories)(RBinFile *bf, MetaSections *ms, const RSkipList *relocs, objc_cache_opt_info *oi);
+ static bool read_ptr_pa(RBinFile *bf, ut64 paddr, mach0_ut *out);
+ static bool read_ptr_va(RBinFile *bf, ut64 vaddr, mach0_ut *out);
+ static char *read_str(RBinFile *bf, mach0_ut p, ut32 *offset, ut32 *left);
+ static char *get_class_name(mach

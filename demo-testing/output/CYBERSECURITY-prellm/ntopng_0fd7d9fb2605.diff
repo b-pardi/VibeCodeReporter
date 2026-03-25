@@ -1,0 +1,120 @@
+@@ -358,6 +358,8 @@ void LocalHost::ports2Lua(lua_State* vm, bool proto_udp, bool as_client) {
+     std::map<u_int16_t,PortContactStats>::iterator it;
+     
+     lua_newtable(vm);
++
++    m.lock(__FILE__, __LINE__);
+     
+     for(it = s->begin(); it != s->end(); ++it) {
+       char buf[8];
+@@ -372,6 +374,8 @@ void LocalHost::ports2Lua(lua_State* vm, bool proto_udp, bool as_client) {
+       lua_insert(vm, -2);
+       lua_settable(vm, -3);
+     }
++
++    m.unlock(__FILE__, __LINE__);
+     
+     lua_pushstring(vm, as_client ? "client_ports" : "server_ports");
+     lua_insert(vm, -2);
+@@ -397,6 +401,7 @@ void LocalHost::updateFlowPort(std::map<u_int16_t,PortContactStats> *c, Host *pe
+ void LocalHost::setFlowPort(bool as_server, Host *peer, u_int8_t protocol,
+ 			    u_int16_t port, u_int16_t l7_proto,
+ 			    const char *info, time_t when) {
++  m.lock(__FILE__, __LINE__);
+   if(as_server) {
+     if(protocol == IPPROTO_UDP)
+       updateFlowPort(&udp_server_ports, peer, port, l7_proto, info, when);
+@@ -408,4 +413,5 @@ void LocalHost::setFlowPort(bool as_server, Host *peer, u_int8_t protocol,
+     else
+       updateFlowPort(&tcp_client_ports, peer, port, l7_proto, info, when);
+   }
++  m.unlock(__FILE__, __LINE__);
+ }
+
+
+
+
+@@ -32,7 +32,7 @@ PortContactStats::PortContactStats(u_int16_t _l7_proto, Host *peer,
+ /* ************************************************************** */
+ 
+ void PortContactStats::update(Host *peer, const char *_info, time_t when) {
+-  char buf[64];
++  char buf[64] = { '\0' };
+   
+   last_seen = when;
+   last_peer = std::string(peer->get_ip()->print(buf, sizeof(buf)));
+
+
+
+
+@@ -76,14 +76,15 @@ json_object* SerializableElement::deserializeJson(const char *key) {
+   u_int json_len;
+   char *json = NULL;
+ 
+-  if(!key ||
+-      ((json_len = ntop->getRedis()->len(key)) <= 0) ||
+-      (++json_len > HOST_MAX_SERIALIZED_LEN))
++  if(!key
++     || ((json_len = ntop->getRedis()->len(key)) <= 0)
++     || (++json_len > HOST_MAX_SERIALIZED_LEN)
++     )
+     return(NULL);
+ 
+   ntop->getTrace()->traceEvent(TRACE_INFO, "Deserializing %s", key);
+ 
+-  if((json = (char*)malloc(json_len * sizeof(char))) == NULL) {
++  if((json = (char*)calloc(json_len, sizeof(char))) == NULL) {
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to allocate memory to deserialize %s", key);
+     return(NULL);
+   }
+
+
+
+
+@@ -150,8 +150,8 @@ ZMQCollectorInterface::~ZMQCollectorInterface() {
+ void ZMQCollectorInterface::collect_flows() {
+   struct zmq_msg_hdr_v0 h0;
+   struct zmq_msg_hdr *h = (struct zmq_msg_hdr *) &h0; /* NOTE: in network-byte-order format */
+-  char payload[32768];
+-  const u_int payload_len = sizeof(payload) - 1;
++  char *payload;
++  const u_int payload_len = 32768;
+   zmq_pollitem_t items[MAX_ZMQ_SUBSCRIBERS];
+   u_int32_t zmq_max_num_polls_before_purge = MAX_ZMQ_POLLS_BEFORE_PURGE;
+   u_int32_t now, next_purge_idle = (u_int32_t)time(NULL) + FLOW_PURGE_FREQUENCY;
+@@ -159,11 +159,19 @@ void ZMQCollectorInterface::collect_flows() {
+ 
+   ntop->getTrace()->traceEvent(TRACE_NORMAL, "Collecting flows on %s", ifname);
+ 
++  if((payload = (char*)malloc(payload_len+1 /* Leave a char for \0 */)) == NULL) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Out of memory");
++    return;
++  }
++  
+   while(isRunning()) {
+     while(idle()) {
+       purgeIdle(time(NULL));
+       sleep(1);
+-      if(ntop->getGlobals()->isShutdown()) return;
++      if(ntop->getGlobals()->isShutdown()) {
++	free(payload);
++	return;
++      }
+     }
+ 
+     for(int i=0; i<num_subscribers; i++)
+@@ -175,8 +183,11 @@ void ZMQCollectorInterface::collect_flows() {
+       now = (u_int32_t)time(NULL);
+       zmq_max_num_polls_before_purge--;
+ 
+-      if((rc < 0) || (!isRunning())) return;
+-
++      if((rc < 0) || (!isRunning())) {
++	free(payload);
++	return;
++      }
++      
+       if(rc == 0 || now >= next_purge_idle || zmq_max_num_polls_before_purge == 0) {
+ 	purgeIdle(now);
+ 	next_purge_idle = now + FLOW_PURGE_FREQUENCY;
+@@ -245,13 +256,17 @@ void ZMQCollectorInterface::collect_flow

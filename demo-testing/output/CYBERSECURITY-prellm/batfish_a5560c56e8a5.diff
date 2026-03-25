@@ -1,0 +1,101 @@
+@@ -40,6 +40,8 @@ import org.batfish.question.multipath.MultipathConsistencyParameters;
+ import org.batfish.referencelibrary.ReferenceLibrary;
+ import org.batfish.role.NodeRoleDimension;
+ import org.batfish.role.NodeRolesData;
++import org.batfish.specifier.Location;
++import org.batfish.specifier.LocationInfo;
+ import org.batfish.specifier.SpecifierContext;
+ 
+ public interface IBatfish extends IPluginConsumer {
+@@ -67,6 +69,9 @@ public interface IBatfish extends IPluginConsumer {
+ 
+   boolean debugFlagEnabled(String flag);
+ 
++  /** Return the {@link LocationInfo} of each {@link Location} in the {@link NetworkSnapshot}. */
++  Map<Location, LocationInfo> getLocationInfo(NetworkSnapshot snapshot);
++
+   ReferenceLibrary getReferenceLibraryData();
+ 
+   @Nullable
+
+
+
+
+@@ -132,6 +132,8 @@ public class AclIpSpace extends IpSpace {
+       return null;
+     } else if (ipSpace2 == null) {
+       return ipSpace1;
++    } else if (EmptyIpSpace.INSTANCE.equals(ipSpace1)) {
++      return EmptyIpSpace.INSTANCE;
+     }
+     return builder()
+         .thenRejecting(ipSpace2)
+
+
+
+
+@@ -32,6 +32,19 @@ public final class Prefix implements Comparable<Prefix>, Serializable {
+   /** Multicast IPs are in "244.0.0.0/4". */
+   public static final Prefix MULTICAST = create(Ip.parse("224.0.0.0"), 4);
+ 
++  /**
++   * /32s are loopback interfaces -- no hosts are connected.
++   *
++   * <p>/31s are point-to-point connections between nodes -- again, no hosts.
++   *
++   * <p>/30s could have hosts, but usually do not. Historically, each subnet was required to reserve
++   * two addresses: one identifying the network itself, and a broadcast address. This made /31s
++   * invalid, since there were no usable IPs left over. A /30 had 2 usable IPs, so was used for
++   * point-to-point connections. Eventually /31s were allowed, but we assume here that any /30s are
++   * hold-over point-to-point connections in the legacy model.
++   */
++  public static final int HOST_SUBNET_MAX_PREFIX_LENGTH = 29;
++
+   private static long wildcardMaskForPrefixLength(int prefixLength) {
+     assert 0 <= prefixLength && prefixLength <= Prefix.MAX_PREFIX_LENGTH;
+     return (1L << (Prefix.MAX_PREFIX_LENGTH - prefixLength)) - 1;
+
+
+
+
+@@ -1,11 +1,6 @@
+ package org.batfish.specifier;
+ 
+ import java.util.Set;
+-import java.util.stream.Collectors;
+-import javax.annotation.Nullable;
+-import org.batfish.datamodel.AclIpSpace;
+-import org.batfish.datamodel.ConcreteInterfaceAddress;
+-import org.batfish.datamodel.EmptyIpSpace;
+ import org.batfish.datamodel.IpSpace;
+ 
+ /**
+@@ -14,72 +9,14 @@ import org.batfish.datamodel.IpSpace;
+ public final class InferFromLocationIpSpaceSpecifier implements IpSpaceSpecifier {
+   public static final InferFromLocationIpSpaceSpecifier INSTANCE =
+       new InferFromLocationIpSpaceSpecifier();
+-  /**
+-   * /32s are loopback interfaces -- no hosts are connected.
+-   *
+-   * <p>/31s are point-to-point connections between nodes -- again, no hosts.
+-   *
+-   * <p>/30s could have hosts, but usually do not. Historically, each subnet was required to reserve
+-   * two addresses: one identifying the network itself, and a broadcast address. This made /31s
+-   * invalid, since there were no usable IPs left over. A /30 had 2 usable IPs, so was used for
+-   * point-to-point connections. Eventually /31s were allowed, but we assume here that any /30s are
+-   * hold-over point-to-point connections in the legacy model.
+-   */
+-  private static final int HOST_SUBNET_MAX_PREFIX_LENGTH = 29;
+-
+-  /** A {@link LocationVisitor} that returns the {@link IpSpace} owned by that {@link Location}. */
+-  class IpSpaceLocationVisitor implements LocationVisitor<IpSpace> {
+-    private final SpecifierContext _specifierContext;
+-
+-    IpSpaceLocationVisitor(SpecifierContext specifierContext) {
+-      _specifierContext = specifierContext;
+-    }
+-
+-    private Set<ConcreteInterfaceAddress> interfaceAddresses(String node, String iface) {
+-      return _specifierContext
+-          .getConfigs()
+-          .get(node

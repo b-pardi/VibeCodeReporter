@@ -1,0 +1,141 @@
+@@ -103,6 +103,246 @@ static inline void UnknownCompressionAlgorithm(JobControlRecord* jcr,
+        cmprs_algo_to_text(compression_algorithm));
+ }
+ 
++std::size_t RequiredCompressionOutputBufferSize(uint32_t algo,
++                                                std::size_t max_input_size)
++{
++  switch (algo) {
++#ifdef HAVE_LIBZ
++    case COMPRESS_GZIP: {
++      return compressBound(max_input_size) + 18 + sizeof(comp_stream_header);
++    }
++#endif
++#ifdef HAVE_LZO
++    case COMPRESS_LZO1X:
++      return max_input_size + (max_input_size / 16) + 64 + 3
++             + sizeof(comp_stream_header);
++      break;
++#endif
++    case COMPRESS_FZFZ:
++    case COMPRESS_FZ4L:
++    case COMPRESS_FZ4H:
++      return max_input_size + (max_input_size / 10 + 16 * 2)
++             + sizeof(comp_stream_header);
++      break;
++  }
++
++  return max_input_size + sizeof(comp_stream_header);
++}
++
++class z4_compressor {
++  zfast_stream pZfastStream{};
++  bool init_error{false};
++  bool error{false};
++
++ public:
++  z4_compressor(int type, zfast_stream_compressor compressor)
++  {
++    pZfastStream.zalloc = Z_NULL;
++    pZfastStream.zfree = Z_NULL;
++    pZfastStream.opaque = Z_NULL;
++    pZfastStream.state = Z_NULL;
++
++    if (auto zstat = fastlzlibCompressInit(&pZfastStream, type);
++        zstat != Z_OK) {
++      // Jmsg(jcr, M_FATAL, 0, _("Failed to initialize FASTLZ compression\n"));
++      init_error = true;
++      error = true;
++    }
++
++    if (auto zstat = fastlzlibSetCompressor(&pZfastStream, compressor);
++        zstat != Z_OK) {
++      error = true;
++    }
++  }
++
++  std::optional<std::size_t> compress(char const* input,
++                                      std::size_t size,
++                                      char* output,
++                                      std::size_t capacity)
++  {
++    if (error) { return std::nullopt; }
++
++    pZfastStream.next_in = (Bytef*)input;
++    pZfastStream.avail_in = size;
++    pZfastStream.next_out = (Bytef*)output;
++    pZfastStream.avail_out = capacity;
++
++    if (auto zstat = fastlzlibCompress(&pZfastStream, Z_FINISH);
++        zstat != Z_STREAM_END) {
++      // Jmsg(jcr, M_FATAL, 0, _("Compression fastlzlibCompress error: %d\n"),
++      // 	   zstat);
++      // jcr->setJobStatusWithPriorityCheck(JS_ErrorTerminated);
++      return std::nullopt;
++    }
++
++    std::size_t out = pZfastStream.total_out;
++    if (fastlzlibCompressReset(&pZfastStream)) { error = true; }
++
++    ASSERT(out <= capacity);
++    return out;
++  }
++
++  ~z4_compressor()
++  {
++    if (!init_error && fastlzlibCompressEnd(&pZfastStream) != Z_OK) {
++      Dmsg0(100, "Could not properly destroy compress stream.\n");
++    }
++  }
++};
++
++#ifdef HAVE_LIBZ
++class gzip_compressor {
++  z_stream zlibStream{};
++  bool init_error{false};
++  bool error{false};
++
++ public:
++  gzip_compressor()
++  {
++    zlibStream.zalloc = Z_NULL;
++    zlibStream.zfree = Z_NULL;
++    zlibStream.opaque = Z_NULL;
++    zlibStream.state = Z_NULL;
++
++    if (deflateInit(&zlibStream, Z_DEFAULT_COMPRESSION) != Z_OK) {
++      init_error = true;
++      error = true;
++    }
++  }
++
++  bool set_level(int level)
++  {
++    if (error) return false;
++
++    if (auto zstat = deflateParams(&zlibStream, level, Z_DEFAULT_STRATEGY);
++        zstat != Z_OK) {
++      error = true;
++    }
++
++    return !error;
++  }
++
++  std::optional<std::size_t> compress(char const* input,
++                                      std::size_t size,
++                                      char* output,
++                                      std::size_t capacity)
++  {
++    zlibStream.next_in = (Bytef*)input;
++    zlibStream.avail_in = size;
++    zlibStream.next_out = (Bytef*)output;
++    zlibStream.avail_out = capacity;
++
++    if (auto zstat = deflate(&zlibStream, Z_FINISH); zstat != Z_STREAM_END) {
++      // Jmsg(jcr, M_FATAL, 0, _("Compression deflate error: %d\n"), zstat);
++      // jcr->setJobStatusWithPriorityCheck(JS_ErrorTerminated);
++      error = true;
++      return std::nullopt;
++    }
++
++    std::size_t

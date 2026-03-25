@@ -1,0 +1,86 @@
+@@ -20,7 +20,7 @@ package app.nzyme.core;
+ import app.nzyme.core.crypto.tls.KeyStoreBootstrapResult;
+ import app.nzyme.core.distributed.ClusterManager;
+ import app.nzyme.core.distributed.NodeManager;
+-import app.nzyme.core.distributed.messaging.MessageBus;
++import app.nzyme.core.distributed.messaging.*;
+ import app.nzyme.core.distributed.messaging.postgres.PostgresMessageBusImpl;
+ import app.nzyme.core.monitoring.health.HealthMonitor;
+ import app.nzyme.core.periodicals.distributed.NodeUpdater;
+@@ -299,6 +299,9 @@ public class NzymeNodeImpl implements NzymeNode {
+     public void initialize() {
+         LOG.info("Initializing nzyme version: {}.", version.getVersionString());
+ 
++        LOG.info("Initializing message bus [{}].", this.messageBus.getClass().getCanonicalName());
++        this.messageBus.initialize();
++
+         try {
+             this.crypto.initialize();
+         } catch (Crypto.CryptoInitializationException e) {
+@@ -871,6 +874,23 @@ public class NzymeNodeImpl implements NzymeNode {
+             throw new RuntimeException("Could not start REST API.", e);
+         }
+ 
++        // Register message handler for requested server restarts.
++        this.messageBus.onMessageReceived(MessageType.CHECK_RESTART_HTTP_SERVER, new MessageHandler() {
++            @Override
++            public MessageProcessingResult handle(Message message) {
++                // TODO move this to a separate class file. Will have logic to determine if restart is required or not.
++                // has to work with all types. wildcard, etc. - do the whole load order bootstrap.
++                // move http server classes into own files? this is too much here.
++                LOG.info("HANDLING EVENT.");
++                return MessageProcessingResult.SUCCESS;
++            }
++
++            @Override
++            public String getName() {
++                return "Check for required HTTP server restart after TLS configuration change.";
++            }
++        });
++
+         LOG.info("Started web interface and REST API at [{}]. Access it at: [{}]",
+                 configuration.restListenUri(),
+                 configuration.httpExternalUri());
+
+
+
+
+@@ -6,6 +6,7 @@ import app.nzyme.core.crypto.database.TLSWildcardKeyAndCertificateEntryMapper;
+ import app.nzyme.core.distributed.database.NodeEntryMapper;
+ import app.nzyme.core.distributed.database.metrics.GaugeHistogramBucketMapper;
+ import app.nzyme.core.distributed.database.metrics.TimerSnapshotMapper;
++import app.nzyme.core.distributed.messaging.postgres.PostgresMessageEntryMapper;
+ import app.nzyme.core.monitoring.health.db.IndicatorStatusMapper;
+ import app.nzyme.plugin.Database;
+ import app.nzyme.core.alerts.service.AlertDatabaseEntryMapper;
+@@ -103,7 +104,8 @@ public class DatabaseImpl implements Database {
+                 .registerRowMapper(new TimerSnapshotMapper())
+                 .registerRowMapper(new IndicatorStatusMapper())
+                 .registerRowMapper(new TLSKeyAndCertificateEntryMapper())
+-                .registerRowMapper(new TLSWildcardKeyAndCertificateEntryMapper());
++                .registerRowMapper(new TLSWildcardKeyAndCertificateEntryMapper())
++                .registerRowMapper(new PostgresMessageEntryMapper());
+ 
+         // Run migrations against underlying JDBC connection.
+         JdbcConnection connection = new JdbcConnection(jdbi.open().getConnection());
+
+
+
+
+@@ -107,12 +107,7 @@ public class NodeManager {
+         );
+ 
+         // Get current cycle.
+-        localCycle = nzyme.getDatabase().withHandle(handle ->
+-                handle.createQuery("SELECT cycle FROM nodes WHERE uuid = :node_id")
+-                        .bind("node_id", localNodeId)
+-                        .mapTo(Long.class)
+-                        .findOne()
+-        ).orElse(1L);
++        localCycle = getCycleOfNode(localNodeId);
+ 
+         Executors.newSingleThreadScheduledExecutor(
+                 new ThreadFactoryBuilder()
+@@ -399,6 +394,15 @@ public class NodeManager {
+         }
+     }

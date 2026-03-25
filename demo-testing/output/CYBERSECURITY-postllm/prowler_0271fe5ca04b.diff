@@ -1,0 +1,118 @@
+@@ -74,3 +74,30 @@ class BaseTenantViewset(BaseViewSet):
+         with connection.cursor() as cursor:
+             cursor.execute(f"SELECT set_config('api.user_id', '{user_id}', TRUE);")
+             return super().initial(request, *args, **kwargs)
++
++
++class BaseUserViewset(BaseViewSet):
++    def dispatch(self, request, *args, **kwargs):
++        with transaction.atomic():
++            return super().dispatch(request, *args, **kwargs)
++
++    def initial(self, request, *args, **kwargs):
++        # TODO refactor after improving RLS on users
++        if request.stream is not None and request.stream.method == "POST":
++            return super().initial(request, *args, **kwargs)
++        if request.auth is None:
++            raise NotAuthenticated
++
++        tenant_id = request.auth.get("tenant_id")
++        if tenant_id is None:
++            raise NotAuthenticated("Tenant ID is not present in token")
++
++        try:
++            uuid.UUID(tenant_id)
++        except ValueError:
++            raise ValidationError("Tenant ID must be a valid UUID")
++
++        with connection.cursor() as cursor:
++            cursor.execute(f"SELECT set_config('api.tenant_id', '{tenant_id}', TRUE);")
++            self.request.tenant_id = tenant_id
++            return super().initial(request, *args, **kwargs)
+
+
+
+
+@@ -22,6 +22,7 @@ from api.db_utils import (
+     InvitationStateEnumField,
+ )
+ from api.models import (
++    User,
+     Membership,
+     Provider,
+     Resource,
+@@ -434,3 +435,17 @@ class InvitationFilter(FilterSet):
+                 "filter_class": CharFilter,
+             }
+         }
++
++
++class UserFilter(FilterSet):
++    date_joined = DateFilter(field_name="date_joined", lookup_expr="date")
++
++    class Meta:
++        model = User
++        fields = {
++            "name": ["exact", "icontains"],
++            "email": ["exact", "icontains"],
++            "company_name": ["exact", "icontains"],
++            "date_joined": ["date", "gte", "lte"],
++            "is_active": ["exact"],
++        }
+
+
+
+
+@@ -21,9 +21,18 @@ TODAY = str(datetime.today().date())
+ 
+ @pytest.mark.django_db
+ class TestUserViewSet:
+-    def test_users_list_not_allowed(self, authenticated_client):
++    def test_users_list(self, authenticated_client, create_test_user):
++        user = create_test_user
++        user.refresh_from_db()
+         response = authenticated_client.get(reverse("user-list"))
+-        assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
++        assert response.status_code == status.HTTP_200_OK
++        assert len(response.json()["data"]) == 1
++        assert response.json()["data"][0]["attributes"]["email"] == user.email
++        assert response.json()["data"][0]["attributes"]["name"] == user.name
++        assert (
++            response.json()["data"][0]["attributes"]["company_name"]
++            == user.company_name
++        )
+ 
+     def test_users_retrieve(self, authenticated_client, create_test_user):
+         response = authenticated_client.get(
+
+
+
+
+@@ -29,7 +29,7 @@ from rest_framework_json_api.views import Response
+ from rest_framework_simplejwt.exceptions import InvalidToken
+ from rest_framework_simplejwt.exceptions import TokenError
+ 
+-from api.base_views import BaseTenantViewset, BaseRLSViewSet, BaseViewSet
++from api.base_views import BaseTenantViewset, BaseRLSViewSet, BaseUserViewset
+ from api.db_router import MainRouter
+ from api.filters import (
+     ProviderFilter,
+@@ -41,6 +41,7 @@ from api.filters import (
+     FindingFilter,
+     ProviderSecretFilter,
+     InvitationFilter,
++    UserFilter,
+ )
+ from api.models import (
+     User,
+@@ -196,9 +197,13 @@ class SchemaView(SpectacularAPIView):
+ 
+ 
+ @extend_schema_view(
++    list=extend_schema(
++        summary="List all users",
++        description="Retrieve a list of all users with options for filtering by various criteria.",
++    ),
+     retrieve=extend_schema(
+         summary="Retrieve a user's information",
+-        description="Fetch detailed information about an authentic

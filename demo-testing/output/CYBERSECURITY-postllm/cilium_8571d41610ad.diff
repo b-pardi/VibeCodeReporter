@@ -1,0 +1,143 @@
+@@ -1011,6 +1011,48 @@ static __always_inline int do_netdev_encrypt(struct __ctx_buff *ctx,
+ #endif /* TUNNEL_MODE */
+ #endif /* ENABLE_IPSEC */
+ 
++#ifdef ENABLE_L2_ANNOUNCEMENTS
++static __always_inline int handle_l2_announcement(struct __ctx_buff *ctx)
++{
++	union macaddr mac = NODE_MAC;
++	union macaddr smac;
++	__be32 sip;
++	__be32 tip;
++	struct l2_responder_v4_key key;
++	struct l2_responder_v4_stats *stats;
++	int ret;
++	__u32 index = RUNTIME_CONFIG_AGENT_LIVENESS;
++	__u64 *time;
++
++	time = map_lookup_elem(&CONFIG_MAP, &index);
++	if (!time)
++		return CTX_ACT_OK;
++
++	/* If the agent is not active for X seconds, we can't trust the contents
++	 * of the responder map anymore. So stop responding, assuming other nodes
++	 * will take over for a node without an active agent.
++	 */
++	if (ktime_get_ns() - (*time) > L2_ANNOUNCEMENTS_MAX_LIVENESS)
++		return CTX_ACT_OK;
++
++	if (!arp_validate(ctx, &mac, &smac, &sip, &tip))
++		return CTX_ACT_OK;
++
++	key.ip4 = tip;
++	key.ifindex = ctx->ingress_ifindex;
++	stats = map_lookup_elem(&L2_RESPONDER_MAP4, &key);
++	if (!stats)
++		return CTX_ACT_OK;
++
++	ret = arp_respond(ctx, &mac, tip, &smac, sip, 0);
++
++	if (ret == CTX_ACT_REDIRECT)
++		__sync_fetch_and_add(&stats->responses_sent, 1);
++
++	return ret;
++};
++#endif
++
+ static __always_inline int
+ do_netdev(struct __ctx_buff *ctx, __u16 proto, const bool from_host)
+ {
+@@ -1074,9 +1116,14 @@ do_netdev(struct __ctx_buff *ctx, __u16 proto, const bool from_host)
+ 	bpf_clear_meta(ctx);
+ 
+ 	switch (proto) {
+-# if defined ENABLE_ARP_PASSTHROUGH || defined ENABLE_ARP_RESPONDER
++# if defined ENABLE_ARP_PASSTHROUGH || defined ENABLE_ARP_RESPONDER || \
++     defined ENABLE_L2_ANNOUNCEMENTS
+ 	case bpf_htons(ETH_P_ARP):
+-		ret = CTX_ACT_OK;
++		#ifdef ENABLE_L2_ANNOUNCEMENTS
++			ret = handle_l2_announcement(ctx);
++		#else
++			ret = CTX_ACT_OK;
++		#endif
+ 		break;
+ # endif
+ #ifdef ENABLE_IPV6
+@@ -1266,6 +1313,7 @@ handle_srv6(struct __ctx_buff *ctx)
+  * managed by Cilium (e.g., eth0). This program is only attached when:
+  * - the host firewall is enabled, or
+  * - BPF NodePort is enabled, or
++ * - L2 announcements are enabled, or
+  * - WireGuard's host-to-host encryption and BPF NodePort are enabled
+  */
+ __section("from-netdev")
+
+
+
+
+@@ -80,6 +80,10 @@ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x
+ #define HASH_INIT4_SEED 0xcafe
+ #define HASH_INIT6_SEED 0xeb9f
+ 
++#ifndef L2_ANNOUNCEMENTS_MAX_LIVENESS
++# define L2_ANNOUNCEMENTS_MAX_LIVENESS 3000000000ULL
++#endif
++
+ #ifdef ENABLE_IPV4
+ #define IPV4_MASK 0xffff
+ #define IPV4_GATEWAY 0xfffff50a
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++
++/* Enable debug output */
++#define DEBUG
++
++/* Set NODE_MAC equal to mac_two */
++#define NODE_MAC { .addr = {0x13, 0x37, 0x13, 0x37, 0x13, 0x37} }
++
++#define SECCTX_FROM_IPCACHE 1
++
++/* Set the LXC source address to be the address of pod one */
++#define LXC_IPV4 (__be32)v4_pod_one
++#include "config_replacement.h"
++
++/* Enable CT debug output */
++#undef QUIET_CT
++
++#include <bpf/ctx/skb.h>
++#include "pktgen.h"
++
++/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
++#define ETH_HLEN 14
++
++/* Enable code paths under test */
++#define ENABLE_IPV4
++#define ENABLE_L2_ANNOUNCEMENTS
++
++#include <bpf_host.c>
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 2);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[0] = &cil_from_netdev,
++	},
++};
++
++/* Setup for this test:
++ * +-------------------------+   +--------------------------------------+    +--------------------------+
++ * |L2:mac_one, L3:v4_ext_one|---| ARP Request broadcast for v4_svc_one |--->|L2:mac_two, L3:v4_node_one|
++ * +-------------------------+   +--------------------------------------+    +--------------------------+
++ *             ^   +----------------------

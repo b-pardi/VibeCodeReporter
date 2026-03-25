@@ -1,0 +1,189 @@
+@@ -39,6 +39,8 @@ static const RFSType fstypes[] = {
+ 	{ "xfs", 0, "XFSB", 4, 0, 0, 0 },
+ 	{ "udf", 0x8000, "BEA01", 5, 0, 0, 0 },
+ 	{ "affs", 0, "DOS", 3, 0, 0, 0 },
++	{ "bfs", 544, "\x31\x53\x46\x42", 4, 0, 0, 0 },
++	{ "bfs", 544, "\x31\x53\x42\x4f", 4, 0, 0, 0 }, // openbfs, handled by the same plugin
+ #if AUTOZIP
+ 	{ "tar", 0x101, "ustar", 5, 0, 0, 0 },
+ 	{ "cpio", 0, "070701", 6, 0, 0, 0 },
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,862 @@
++/* radare2: Be File System - MIT - Copyright 2025 - pancake */
++
++#include <r_fs.h>
++#include <r_lib.h>
++#include <r_util.h>
++
++// BFS Magic numbers
++#define BFS_SUPER_MAGIC1 0x42465331 // "BFS1"
++#define OBS_SUPER_MAGIC1 0x4f425331 // "OBS1" for OpenBFS
++#define BFS_SUPER_MAGIC2 0xdd121031
++#define BFS_SUPER_MAGIC3 0x00000000
++#define BFS_INODE_MAGIC1 0x3bbe0ad9
++#define BFS_BTREE_MAGIC 0x69f6c2e8
++
++#define BFS_BLOCK_SIZE 1024
++#define BFS_BYTEORDER_NATIVE 0x42494745
++#define BFS_CLEAN 0x434C454E
++
++#define B_OS_NAME_LENGTH 32
++#define BFS_SYMLINK_LEN 144
++#define BFS_NUM_DIRECT_BLOCKS 12
++#define BTREE_ALIGN 8
++
++// Inode flags
++#define BEFS_INODE_IN_USE 0x00000001
++#define BEFS_ATTR_INODE 0x00000004
++#define BEFS_INODE_LOGGED 0x00000008
++#define BEFS_INODE_DELETED 0x00000010
++#define BEFS_LONG_SYMLINK 0x00000040
++#define BEFS_PERMANENT_FLAG 0x0000ffff
++#define BEFS_INODE_NO_CREATE 0x00010000
++#define BEFS_INODE_WAS_WRITTEN 0x00020000
++#define BEFS_NO_TRANSACTION 0x00040000
++
++// File types
++#define BEFS_FT_UNKNOWN 0
++#define BEFS_FT_FILE 1
++#define BEFS_FT_DIRECTORY 2
++#define BEFS_FT_SYMLINK 3
++
++// Block run (extent)
++R_PACKED(
++	typedef struct {
++		ut32 allocation_group;
++		ut16 start;
++		ut16 len;
++	})
++BeosBlockRun;
++
++// Data stream
++R_PACKED(
++	typedef struct {
++		BeosBlockRun direct[BFS_NUM_DIRECT_BLOCKS];
++		ut64 max_direct_range;
++		BeosBlockRun indirect;
++		ut64 max_indirect_range;
++		BeosBlockRun double_indirect;
++		ut64 max_double_indirect_range;
++		ut64 size;
++	})
++BeosDataStream;
++
++// Small data entry
++R_PACKED(
++	typedef struct {
++		ut32 type;
++		ut16 name_size;
++		ut16 data_size;
++		char name[1];
++	})
++BeosSmallData;
++
++// BFS Inode
++R_PACKED(
++	typedef struct {
++		ut32 magic1;
++		BeosBlockRun inode_num;
++		ut32 uid;
++		ut32 gid;
++		ut32 mode;
++		ut32 flags;
++		ut64 create_time;
++		ut64 last_modified_time;
++		BeosBlockRun parent;
++		BeosBlockRun attributes;
++		ut32 type;
++		ut32 inode_size;
++		ut32 etc;
++		union {
++			BeosDataStream datastream;
++			char symlink[BFS_SYMLINK_LEN];
++		} data;
++		ut32 pad[4];
++		BeosSmallData small_data[1];
++	})
++BeosInode;
++
++// BFS Superblock
++R_PACKED(
++	typedef struct {
++		char name[B_OS_NAME_LENGTH];
++		ut32 magic1;
++		ut32 fs_byte_order;
++		ut32 block_size;
++		ut32 block_shift;
++		ut64 num_blocks;
++		ut64 used_blocks;
++		ut32 inode_size;
++		ut32 magic2;
++		ut32 blocks_per_ag;
++		ut32 ag_shift;
++		ut32 num_ags;
++		ut32 flags;
++		BeosBlockRun log_blocks;
++		ut64 log_start;
++		ut64 log_end;
++		ut32 magic3;
++		BeosBlockRun root_dir;
++		BeosBlockRun indices;
++	})
++BeosSuperBlock;
++
++// B+tree superblock
++R_PACKED(
++	typedef struct {
++		ut32 magic;
++		ut32 node_size;
++		ut32 max_depth;
++		ut32 data_type;
++		ut64 root_node_ptr;
++		ut64 free_node_ptr;
++		ut64 max_size;
++	})
++BeosTreeSuper;
++
++// B+tree node header
++R_PACKED(
++	typedef struct {
++		ut64 left;
++		ut64 right;
++		ut64 overflow;
++		ut16 all_key_count;
++		ut16 all_key_length;
++	})
++BeosTreeNodeHead;
++
++// Parsed inode cache entry
++typedef struct {
++	ut64 inode_num;
++	ut64 parent_inode_num;
++	char *name;
++	BeosInode *inode;
++	bool parsed;
++} BeosInodeCache;
++
++// Filesystem context
++typedef struct {
++	RIOBind *iob;
++	ut64 delta;
++	ut32 block_size;
++	ut32 block_shift;
++	ut32 inode_size;
++	ut64 blocks_per_ag;
++	ut32 ag_shift;
++	ut32 num_ags;
++	BeosBlockRun root_dir;
++	HtUP *inodes; // Hash table: inode_num -> BeosInodeCache
++	bool mounted;
++	bool is_openbfs;
++	bool is_le;
++} BeosFS;
++
++static inline bool bfs_read_at(BeosFS *ctx, ut64 offset, ut8 *buf, int len) {
++	if (!ctx || !ctx->iob 

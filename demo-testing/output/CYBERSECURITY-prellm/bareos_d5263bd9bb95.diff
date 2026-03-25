@@ -1,0 +1,127 @@
+@@ -40,7 +40,7 @@
+ #include "filed/fd_plugins.h"
+ 
+ 
+-#include "python-fd.h"
++#include "bareosfd.h"
+ #include "lib/edit.h"
+ 
+ namespace filedaemon {
+@@ -322,6 +322,721 @@ bRC unloadPlugin()
+ }
+ #endif
+ 
++/**
++ * Called here to make a new instance of the plugin -- i.e. when
++ * a new Job is started. There can be multiple instances of
++ * each plugin that are running at the same time.  Your
++ * plugin instance must be thread safe and keep its own
++ * local data.
++ */
++static bRC newPlugin(PluginContext* bareos_plugin_ctx)
++{
++  struct plugin_private_context* plugin_priv_ctx =
++      (struct plugin_private_context*)malloc(
++          sizeof(struct plugin_private_context));
++  if (!plugin_priv_ctx) { return bRC_Error; }
++  memset(plugin_priv_ctx, 0, sizeof(struct plugin_private_context));
++  bareos_plugin_ctx->plugin_private_context =
++      (void*)plugin_priv_ctx; /* set our context pointer */
++
++  plugin_priv_ctx->bareos_core_functions = bareos_core_functions;
++
++  /* For each plugin instance we instantiate a new Python interpreter. */
++  PyEval_AcquireThread(mainThreadState);
++  plugin_priv_ctx->interpreter = Py_NewInterpreter();
++  PyEval_ReleaseThread(plugin_priv_ctx->interpreter);
++
++  /* Always register some events the python plugin itself can register
++     any other events it is interested in. */
++  bareos_core_functions->registerBareosEvents(
++      bareos_plugin_ctx, 9, bEventLevel, bEventSince, bEventNewPluginOptions,
++      bEventPluginCommand, bEventJobStart, bEventRestoreCommand,
++      bEventEstimateCommand, bEventBackupCommand, bEventRestoreObject);
++
++  return bRC_OK;
++}
++
++/**
++ * Release everything concerning a particular instance of a
++ * plugin. Normally called when the Job terminates.
++ */
++static bRC freePlugin(PluginContext* bareos_plugin_ctx)
++{
++  struct plugin_private_context* plugin_priv_ctx =
++      (struct plugin_private_context*)bareos_plugin_ctx->plugin_private_context;
++
++  if (!plugin_priv_ctx) { return bRC_Error; }
++
++  if (plugin_priv_ctx->plugin_options) {
++    free(plugin_priv_ctx->plugin_options);
++  }
++
++  if (plugin_priv_ctx->module_path) { free(plugin_priv_ctx->module_path); }
++
++  if (plugin_priv_ctx->module_name) { free(plugin_priv_ctx->module_name); }
++
++  if (plugin_priv_ctx->fname) { free(plugin_priv_ctx->fname); }
++
++  if (plugin_priv_ctx->link) { free(plugin_priv_ctx->link); }
++
++  if (plugin_priv_ctx->object_name) { free(plugin_priv_ctx->object_name); }
++
++  if (plugin_priv_ctx->object) { free(plugin_priv_ctx->object); }
++
++  /*
++   * Stop any sub interpreter started per plugin instance.
++   */
++  PyEval_AcquireThread(plugin_priv_ctx->interpreter);
++
++
++  if (plugin_priv_ctx->pModule) { Py_DECREF(plugin_priv_ctx->pModule); }
++
++  Py_EndInterpreter(plugin_priv_ctx->interpreter);
++  PyEval_ReleaseLock();
++
++  free(plugin_priv_ctx);
++  bareos_plugin_ctx->plugin_private_context = NULL;
++
++  return bRC_OK;
++}
++
++
++static bRC handlePluginEvent(PluginContext* bareos_plugin_ctx,
++                             bEvent* event,
++                             void* value)
++{
++  bRC retval = bRC_Error;
++  bool event_dispatched = false;
++  PoolMem plugin_options(PM_FNAME);
++  plugin_private_context* plugin_priv_ctx =
++      (plugin_private_context*)bareos_plugin_ctx->plugin_private_context;
++
++  if (!plugin_priv_ctx) { goto bail_out; }
++
++  /*
++   * First handle some events internally before calling python if it
++   * want to do some special handling on the event triggered.
++   */
++  switch (event->eventType) {
++    case bEventLevel:
++      plugin_priv_ctx->backup_level = (int64_t)value;
++      break;
++    case bEventSince:
++      plugin_priv_ctx->since = (int64_t)value;
++      break;
++    case bEventBackupCommand:
++      /*
++       * Fall-through wanted
++       */
++    case bEventRestoreCommand:
++      /* Fall-through wanted */
++    case bEventEstimateCommand:
++      /* Fall-through wanted */
++    case bEventPluginCommand:
++      event_dispatched = true;
++      retval =
++          parse_plugin_de

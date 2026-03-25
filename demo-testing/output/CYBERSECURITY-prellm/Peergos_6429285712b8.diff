@@ -1,0 +1,90 @@
+@@ -40,19 +40,45 @@ public class InodeFilesystemTests {
+ 
+         Map<String, AbsoluteCapability> state = new HashMap<>();
+ 
+-        TransactionId tid = storage.startTransaction(user.publicKeyHash).get();
+-        InodeFileSystem current = InodeFileSystem.createEmpty(user.publicKeyHash, user, storage, crypto.hasher, tid).join();
++        PublicKeyHash owner = user.publicKeyHash;
++        TransactionId tid = storage.startTransaction(owner).get();
++        InodeFileSystem current = InodeFileSystem.createEmpty(owner, user, storage, crypto.hasher, tid).join();
+ 
+         // build a random tree and keep track of the state
+         int nKeys = 1000;
+         for (int i = 0; i < nKeys; i++) {
+             String path = randomPath(r, 3);
+-            AbsoluteCapability cap = randomCap(user.publicKeyHash, r);
+-            current = current.addCap(user.publicKeyHash, user, path, cap, tid).join();
++            AbsoluteCapability cap = randomCap(owner, r);
++            current = current.addCap(owner, user, path, cap, tid).join();
+             state.put(path, cap);
+         }
+ 
+-        // check every mapping
++        checkAllMappings(state, current);
++
++        // add and remove a mapping and check result is canonical
++        for (int i = 0; i < 100; i++) {
++            String path = randomPath(r, 3);
++            AbsoluteCapability cap = randomCap(owner, r);
++            InodeFileSystem added = current.addCap(owner, user, path, cap, tid).join();
++            InodeFileSystem removed = added.removeCap(owner, user, path, tid).join();
++            checkAllMappings(state, removed);
++            if (! removed.getRoot().equals(current.getRoot()))
++                throw new IllegalStateException("Non canonical after delete!");
++            if (removed.inodeCount != current.inodeCount + 1)
++                throw new IllegalStateException("Incorrect inode count!");
++        }
++
++        // add a huge directory
++        for (int i = 0; i < 1000; i++) {
++            String path = "user/dir/" + randomPathElement(r);
++            AbsoluteCapability cap = randomCap(owner, r);
++            current = current.addCap(owner, user, path, cap, tid).join();
++            state.put(path, cap);
++        }
++        checkAllMappings(state, current);
++    }
++
++    private static void checkAllMappings(Map<String, AbsoluteCapability> state, InodeFileSystem current) {
+         for (Map.Entry<String, AbsoluteCapability> e : state.entrySet()) {
+             AbsoluteCapability res = current.getByPath(e.getKey()).join().get().left.cap.get();
+             if (! res.equals(e.getValue()))
+
+
+
+
+@@ -178,6 +178,10 @@ public class Champ<V extends Cborable> implements Cborable {
+         return Futures.reduceAll(indices, keys, (t, index) -> childCounts.get(index).thenApply(c -> c + t), (a, b) -> a + b);
+     }
+ 
++    public boolean hasMultipleMappings() {
++        return keyCount() > 1 || nodeCount() > 0;
++    }
++
+     /**
+      *
+      * @param key The key to get the value for
+
+
+
+
+@@ -57,6 +57,12 @@ public class DirectoryInode implements Cborable {
+         return keyHasher.apply(key).thenCompose(keyHash -> children.b().get(key, keyHash, 0, bitWidth, storage));
+     }
+ 
++    public CompletableFuture<Boolean> hasMoreThanOneChild() {
++        if (children.isA())
++            return Futures.of(children.a().size() > 1);
++        return Futures.of(children.b().hasMultipleMappings());
++    }
++
+     public CompletableFuture<List<InodeCap>> getChildren() {
+         if (children.isA())
+             return Futures.of(children.a());
+@@ -73,10 +79,35 @@ public class DirectoryInode implements Cborable {
+         if (children.isA() && children.a().size() < MAX_CHILDREN_INLINED)
+             return Futures.of(new DirectoryInode(Stream.concat(children.a().stream(), Stream.of(child))
+                     .collect(Collectors.toList()), writeHasher, bitWidth, keyHasher, storage));
+-        ByteArrayWrapper key = new ByteArrayWrapper(child.inode.name.name.getBytes());
++
++        ByteArrayWrapper k

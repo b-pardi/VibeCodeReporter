@@ -1,0 +1,79 @@
+@@ -428,7 +428,7 @@ public class NetworkAccess {
+             byte[] metaBlob = metadata.serialize();
+             return dhtClient.put(owner, writer.publicKeyHash, writer.secret.signatureOnly(metaBlob), metaBlob, tid)
+                     .thenCompose(blobHash -> tree.put(current.props, owner, writer, mapKey, metadata.committedHash(), blobHash, tid)
+-                            .thenCompose(wd -> committer.commit(wd, current.hash, tid)));
++                            .thenCompose(wd -> committer.commit(writer, wd, current.hash, tid)));
+         } catch (Exception e) {
+             LOG.severe(e.getMessage());
+             throw new RuntimeException(e);
+
+
+
+
+@@ -83,11 +83,11 @@ public class WriteSynchronizer {
+                                                                      ComplexMutation transformer) {
+         return pending.computeIfAbsent(new Pair<>(owner, writer.publicKeyHash), p -> new AsyncLock<>(getWriterData(owner, p.right)))
+                 .runWithLock(current -> transformer.apply(current,
+-                        (wd, existing, tid) -> wd.commit(owner, writer, existing, mutable, dht, tid)),
++                        (signer, wd, existing, tid) -> wd.commit(owner, signer, existing, mutable, dht, tid)),
+                         () -> getWriterData(owner, writer.publicKeyHash));
+     }
+ 
+     public interface Committer {
+-        CompletableFuture<CommittedWriterData> commit(WriterData wd, MaybeMultihash existing, TransactionId tid);
++        CompletableFuture<CommittedWriterData> commit(SigningPrivateKeyAndPublicHash signer, WriterData wd, MaybeMultihash existing, TransactionId tid);
+     }
+ }
+
+
+
+
+@@ -146,7 +146,8 @@ public class FileUploader implements AutoCloseable {
+         LOG.info(StringUtils.format("Uploading chunk with %d fragments\n", fragments.size()));
+         return IpfsTransaction.call(chunk.location.owner,
+                 tid -> network.uploadFragments(fragments, chunk.location.owner, writer, monitor, tid)
+-                        .thenCompose(hashes -> network.uploadChunk(current, committer, metadata, chunk.location.owner, chunk.chunk.mapKey(), writer, tid)),
++                        .thenCompose(hashes -> network.uploadChunk(current, committer, metadata, chunk.location.owner,
++                                chunk.chunk.mapKey(), writer, tid)),
+                 network.dhtClient);
+     }
+ 
+
+
+
+
+@@ -843,6 +843,21 @@ public class FileWrapper {
+                         hasher, monitor, generateChildLocationsFromSize(fileData.length, random)));
+     }
+ 
++    /**
++     *
++     * @param current
++     * @param committer
++     * @param parent
++     * @param existingChild
++     * @param fileData
++     * @param inputStartIndex
++     * @param endIndex
++     * @param network
++     * @param random
++     * @param hasher
++     * @param monitor
++     * @return The committed root for the parent (this) directory
++     */
+     private CompletableFuture<CommittedWriterData> updateExistingChild(CommittedWriterData current,
+                                                                        WriteSynchronizer.Committer committer,
+                                                                        FileWrapper parent,
+@@ -861,11 +876,14 @@ public class FileWrapper {
+ 
+         Supplier<Location> locationSupplier = () -> new Location(getLocation().owner, getLocation().writer, random.randomBytes(32));
+ 
+-        return (existingChild.isDirty() ?
+-                existingChild.clean(current, committer, network, random, parent, hasher)
++        WritableAbsoluteCapability childCap = existingChild.writableFilePointer();
++        AbsoluteCapability ourCap = getPointer().capability;
++        return getCorrectReadBase(current, childCap, ourCap, network)
++                .thenCompose(baseForChild -> (existingChild.isDirty() ?
++                        existingChild.clean(baseForChild, committer, network, random, parent, hasher)
+                         .thenCompose(pair -> pair.left.getChild(pair.right.props, filename, netw

@@ -1,0 +1,82 @@
+@@ -126,6 +126,13 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+   @Nonnull @VisibleForTesting
+   SortedMap<EdgeId, Queue<RouteAdvertisement<EvpnType3Route>>> _evpnType3IncomingRoutes;
+ 
++  /**
++   * External BGP announcements to be processed upon the first iteration of BGP on this node.
++   *
++   * <p>Always null after that first iteration.
++   */
++  @Nullable Set<BgpAdvertisement> _externalAdvertisements;
++
+   // RIBs and RIB delta builders
+   /** Helper RIB containing all paths obtained with external BGP, for IPv4 unicast */
+   @Nonnull final Bgpv4Rib _ebgpv4Rib;
+@@ -140,6 +147,12 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+   // currently used for VRF-leaking only.
+   @Nonnull private RibDelta<Bgpv4Route> _localDeltaPrev = RibDelta.empty();
+ 
++  // copy of RIBs from prev round, for new links in the current round.
++  // Nullable so they crash on improper use.
++  private @Nullable Set<Bgpv4Route> _ebgpv4Prev;
++  private @Nullable Set<Bgpv4Route> _bgpv4Prev;
++  private @Nullable Set<AnnotatedRoute<AbstractRoute>> _mainRibPrev;
++
+   /** Combined BGP (both iBGP and eBGP) RIB, for IPv4 unicast */
+   @Nonnull Bgpv4Rib _bgpv4Rib;
+   /** Builder for constructing {@link RibDelta} which represent changes to {@link #_bgpv4Rib} */
+@@ -195,7 +208,11 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+   @Nonnull private Map<String, RibDelta<? extends AnnotatedRoute<AbstractRoute>>> _toRedistribute;
+ 
+   /** Set of edges (sessions) that came up since previous topology update */
+-  private Set<EdgeId> _edgesWentUp = ImmutableSet.of();
++  private Set<EdgeId> _evpnEdgesWentUp = ImmutableSet.of();
++
++  /** Set of edges (sessions) that came up since previous topology update */
++  private Set<EdgeId> _unicastEdgesWentUp = ImmutableSet.of();
++
+   /**
+    * Type 3 routes that were created locally (across all VRFs). Save them so that if new sessions
+    * come up, we can easily send out the updates
+@@ -390,12 +407,41 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+     _topology = topology;
+     initBgpQueues(_topology);
+     // New sessions got established
+-    _edgesWentUp =
++    _unicastEdgesWentUp =
++        Sets.difference(
++            getEdgeIdStream(
++                    topology.getGraph(),
++                    BgpPeerConfig::getIpv4UnicastAddressFamily,
++                    Type.IPV4_UNICAST)
++                .collect(ImmutableSet.toImmutableSet()),
++            getEdgeIdStream(
++                    oldTopology.getGraph(),
++                    BgpPeerConfig::getIpv4UnicastAddressFamily,
++                    Type.IPV4_UNICAST)
++                .collect(ImmutableSet.toImmutableSet()));
++    _evpnEdgesWentUp =
+         Sets.difference(
+             getEdgeIdStream(topology.getGraph(), BgpPeerConfig::getEvpnAddressFamily, Type.EVPN)
+                 .collect(ImmutableSet.toImmutableSet()),
+             getEdgeIdStream(oldTopology.getGraph(), BgpPeerConfig::getEvpnAddressFamily, Type.EVPN)
+                 .collect(ImmutableSet.toImmutableSet()));
++    if (!_unicastEdgesWentUp.isEmpty()) {
++      // We copy these three RIBs here instead of at the end of the previous round to avoid
++      // unnecessary space/time use. However, this process is only correct if the RIBs have not
++      // changed since the end of the previous round. That means deltas must (still) be empty.
++      // Main RIB invariant is checked at the VirtualRouter caller, since this class does not
++      // have access to the main RIB delta.
++      assert _bgpv4DeltaBuilder.isEmpty();
++      assert _ebgpv4DeltaBuilder.isEmpty();
++
++      _mainRibPrev = _mainRib.getTypedRoutes();
++      _bgpv4Prev = _bgpv4Rib.getTypedRoutes();
++      _ebgpv4Prev = _ebgpv4Rib.getTypedRoutes();
++    } else {
++      assert _mainRibPrev == null;
++      assert _bgpv4Prev == null;
++      assert _ebgpv4Prev == null;
++    }
+     _topology = topology;
+     //

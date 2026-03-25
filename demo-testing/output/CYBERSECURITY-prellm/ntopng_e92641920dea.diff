@@ -1,0 +1,109 @@
+@@ -47,7 +47,7 @@ class AlertCounter {
+ 
+  public:
+   AlertCounter();
+-  void inc(time_t when, Host *h);
++  void inc(time_t when, AlertableEntity *alertable);
+   u_int16_t hits() const;
+   void reset_hits();
+ };
+
+
+
+
+@@ -32,6 +32,8 @@ class NetworkStats : public AlertableEntity, public GenericTrafficElement {
+   TrafficStats egress, egress_broadcast;   /* network -> outside */
+   TrafficStats inner, inner_broadcast;     /* network -> network (local traffic) */
+   TcpPacketStats tcp_packet_stats_ingress, tcp_packet_stats_egress, tcp_packet_stats_inner;
++  AlertCounter syn_flood_victim_alert;
++  AlertCounter flow_flood_victim_alert;
+ 
+   static inline void incTcp(TcpPacketStats *tps, u_int32_t ooo_pkts, u_int32_t retr_pkts, u_int32_t lost_pkts, u_int32_t keep_alive_pkts) {
+     if(ooo_pkts)        tps->incOOO(ooo_pkts);
+@@ -86,6 +88,10 @@ class NetworkStats : public AlertableEntity, public GenericTrafficElement {
+   void lua(lua_State* vm);
+   bool serialize(json_object *my_object);
+   void deserialize(json_object *obj);
++  void housekeepAlerts(ScriptPeriodicity p);
++
++  void updateSynAlertsCounter(time_t when, bool syn_sent);
++  void incNumFlows(time_t t, bool as_client);
+ };
+ 
+ #endif /* _NETWORK_STATS_H_ */
+
+
+
+
+@@ -198,6 +198,7 @@ using namespace std;
+ #include "CustomAppStats.h"
+ #endif
+ #include "GenericTrafficElement.h"
++#include "AlertCounter.h"
+ #include "NetworkStats.h"
+ #include "ContainerStats.h"
+ #include "ParsedFlowCore.h"
+@@ -283,7 +284,6 @@ using namespace std;
+ #ifdef HAVE_PF_RING
+ #include "PF_RINGInterface.h"
+ #endif
+-#include "AlertCounter.h"
+ #include "FlowAlertCounter.h"
+ #include "GenericHash.h"
+ #include "VirtualHost.h"
+
+
+
+
+@@ -42,7 +42,7 @@ void AlertCounter::reset_window(time_t when) {
+ 
+ /* *************************************** */
+ 
+-void AlertCounter::inc(time_t when, Host *h) {
++void AlertCounter::inc(time_t when, AlertableEntity *alertable) {
+   if(hits_reset_req) { /* Reset the maximum as requested and start over */
+     trailing_window_max_since_hits_reset = 0;
+     hits_reset_req = false;
+@@ -80,6 +80,7 @@ void AlertCounter::inc(time_t when, Host *h) {
+ 			       "stats [host: %s][when: %u][time_last_hit: %u][trailing_window_max_since_hits_reset: %u][trailing_window_min: %u]"
+ 			       "[trailing_window[cur]: %u][trailing_window[cur-1]: %u][trailing_window[cur-2]: %u]",
+ 			       h->get_ip()->print(buf, sizeof(buf)),
++             alertable->getEntityValue()->c_str(),
+ 			       when,
+ 			       time_last_hit,
+ 			       trailing_window_max_since_hits_reset,
+
+
+
+
+@@ -87,15 +87,19 @@ Flow::Flow(NetworkInterface *_iface,
+   PROFILING_SUB_SECTION_EXIT(iface, 7);
+ 
+   if(cli_host) {
++    NetworkStats *network_stats = cli_host->getNetworkStats(cli_host->get_local_network_id());
+     cli_host->incUses();
+     cli_host->incNumFlows(last_seen, true, srv_host);
++    if(network_stats) network_stats->incNumFlows(last_seen, true);
+     cli_ip_addr = cli_host->get_ip();
+   } else /* Client host has not been allocated, let's keep the info in an IpAddress */
+     cli_ip_addr = new (std::nothrow) IpAddress(*_cli_ip);
+ 
+   if(srv_host) {
++    NetworkStats *network_stats = srv_host->getNetworkStats(srv_host->get_local_network_id());
+     srv_host->incUses();
+     srv_host->incNumFlows(last_seen, false, cli_host);
++    if(network_stats) network_stats->incNumFlows(last_seen, false);
+     srv_ip_addr = srv_host->get_ip();
+   } else /* Server host has not been allocated, let's keep the info in an IpAddress */
+     srv_ip_addr = new (std::nothrow) IpAddress(*_srv_ip);
+@@ -2705,16 +2709,27 @@ void Flow::setTcpFlags(u_int8_t flags, bool src2dst_direction) {
+ 
+ void Flow::updateTcpFlags(const struct bpf_timeval *when,
+ 			  u_int8_t flags, bool src2dst_direction) {
++  NetworkStats *cli_network_stats = NULL, *srv_network_stats = NULL;
++
+   if(!iface->isPacketInterface())
+     return; /* Use setTcpFlags for non-packet interfaces */
+ 
+   iface->incFlagsStats(flags);
+-  if(cli_host) cli_host->incFlagStats(src2dst_direction, 

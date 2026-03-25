@@ -1,0 +1,145 @@
+@@ -265,12 +265,24 @@ skip_host_firewall:
+ 	/* Lookup IPv6 address in list of local endpoints */
+ 	ep = lookup_ip6_endpoint(ip6);
+ 	if (ep) {
++		bool l2_hdr_required __maybe_unused = true;
++
+ 		/* Let through packets to the node-ip so they are
+ 		 * processed by the local ip stack.
+ 		 */
+ 		if (ep->flags & ENDPOINT_F_HOST)
+ 			return CTX_ACT_OK;
+ 
++#ifdef ENABLE_HOST_ROUTING
++		/* add L2 header for L2-less interface, such as cilium_wg0 */
++		ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
++		if (ret != 0)
++			return ret;
++		if (l2_hdr_required && ETH_HLEN == 0) {
++			/* l2 header is added */
++			l3_off += __ETH_HLEN;
++		}
++#endif
+ 		return ipv6_local_delivery(ctx, l3_off, secctx, ep,
+ 					   METRIC_INGRESS, from_host, false);
+ 	}
+@@ -538,13 +550,31 @@ handle_ipv4(struct __ctx_buff *ctx, __u32 secctx,
+ 	/* Lookup IPv4 address in list of local endpoints and host IPs */
+ 	ep = lookup_ip4_endpoint(ip4);
+ 	if (ep) {
++		bool l2_hdr_required __maybe_unused = true;
++		int l3_off __maybe_unused = ETH_HLEN;
++
+ 		/* Let through packets to the node-ip so they are processed by
+ 		 * the local ip stack.
+ 		 */
+ 		if (ep->flags & ENDPOINT_F_HOST)
+ 			return CTX_ACT_OK;
+ 
+-		return ipv4_local_delivery(ctx, ETH_HLEN, secctx, ip4, ep,
++#ifdef ENABLE_HOST_ROUTING
++		/* add L2 header for L2-less interface, such as cilium_wg0 */
++		ret = maybe_add_l2_hdr(ctx, ep->ifindex, &l2_hdr_required);
++		if (ret != 0)
++			return ret;
++		if (l2_hdr_required && ETH_HLEN == 0) {
++			/* l2 header is added */
++			l3_off += __ETH_HLEN;
++			if (!____revalidate_data_pull(ctx, &data, &data_end,
++						      (void **)&ip4, sizeof(*ip4),
++						      false, l3_off))
++				return DROP_INVALID;
++		}
++#endif
++
++		return ipv4_local_delivery(ctx, l3_off, secctx, ip4, ep,
+ 					   METRIC_INGRESS, from_host, false);
+ 	}
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,374 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++
++#include <bpf/ctx/skb.h>
++#include <bpf/helpers_skb.h>
++#include "pktgen.h"
++
++#define ETH_HLEN		0
++#define SECCTX_FROM_IPCACHE	1
++#define ENABLE_HOST_ROUTING
++#define ENABLE_IPV4
++#define ENABLE_IPV6
++#define SKIP_ICMPV6_NS_HANDLING
++
++#define TEST_IP_LOCAL		v4_pod_one
++#define TEST_IP_REMOTE		v4_pod_two
++#define TEST_IPV6_LOCAL		v6_pod_one
++#define TEST_IPV6_REMOTE	v6_pod_two
++#define TEST_LXC_ID_LOCAL	233
++
++/* We wanted to tail call handle_policy from bpf_lxc, but at present it's
++ * impossible to #include both bpf_host.c and bpf_lxc.c at the same time.
++ * Therefore, we created a stud, mock_hanle_policy, to simply check if the
++ * our skb reaches there.
++ */
++__section("mock-handle-policy")
++int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
++{
++	return TC_ACT_REDIRECT;
++}
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 256);
++	__array(values, int());
++} mock_policy_call_map __section(".maps") = {
++	.values = {
++		[TEST_LXC_ID_LOCAL] = &mock_handle_policy,
++	},
++};
++
++#define tail_call_dynamic mock_tail_call_dynamic
++static __always_inline __maybe_unused void
++mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
++		       const void *map __maybe_unused, __u32 slot __maybe_unused)
++{
++	tail_call(ctx, &mock_policy_call_map, slot);
++}
++
++static volatile const __u8 *ep_mac = mac_one;
++static volatile const __u8 *node_mac = mac_two;
++
++#include "bpf_host.c"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 2);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[0] = &cil_from_netdev,
++	},
++};
++
++PKTGEN("tc", "ipv4_l3_to_l2_fast_redirect")
++int ipv4_l3_to_l2_fast_redirect_pktgen(struct __ctx_buff *ctx)
++{
++	struct pktgen builder;
++	struct ethhdr *l2;
++	struct iphdr *l3;
++	struct tcphdr *l4;
++	void *data;
++
++	/* Init packet builder */
++	pktgen__init(&builder, ctx);
++
++	/* We are building an L3 skb which doesn't hav

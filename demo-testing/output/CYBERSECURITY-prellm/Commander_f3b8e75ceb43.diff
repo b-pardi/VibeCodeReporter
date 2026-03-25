@@ -1,0 +1,94 @@
+@@ -17,7 +17,6 @@ from prompt_toolkit.completion import Completion, Completer
+ 
+ from .params import KeeperParams
+ from .commands.folder import mv_parser
+-from .commands.utils import ConnectCommand
+ from .commands import commands, enterprise_commands
+ from . import api
+ from .subfolder import try_resolve_path as sf_try_resolve_path
+@@ -249,20 +248,6 @@ class CommandCompleter(Completer):
+                         for c in itertools.chain(commands.keys(), enterprise_commands.keys()):
+                             if c.startswith(cmd):
+                                 yield Completion(c, display=c, start_position=-len(cmd))
+-                    elif context == 'connect':
+-                        ConnectCommand.find_endpoints(self.params)
+-                        cmd = extra['prefix']
+-                        comp = cmd.casefold()
+-                        names = []
+-                        unique_names = set()
+-                        for x in ConnectCommand.Endpoints:
+-                            name = (x.name or '').casefold()
+-                            if name not in unique_names:
+-                                unique_names.add(name)
+-                                if name.startswith(comp):
+-                                    names.append(x.name)
+-                        for name in names:
+-                            yield Completion(text=name, display=name, start_position=-len(cmd))
+ 
+         except Exception as e:
+             pass
+
+
+
+
+@@ -57,6 +57,10 @@ def register_commands(commands, aliases, command_info):
+     register_commands(commands)
+     register_command_info(aliases, command_info)
+ 
++    from . import connect
++    connect.connect_commands(commands)
++    connect.connect_command_info(aliases, command_info)
++
+     from . import breachwatch
+     breachwatch.register_commands(commands)
+     breachwatch.register_command_info(aliases, command_info)
+
+
+
+
+@@ -11,97 +11,81 @@
+ #
+ 
+ import argparse
+-import io
+ import logging
+ import os
+-import re
+-import tempfile
+-from typing import Optional, Iterable, Tuple
++import shutil
++from typing import Optional, Callable, Iterator
+ 
+-import itertools
++import sys
++from cryptography.hazmat.primitives import serialization
++from cryptography.hazmat.primitives.asymmetric import rsa, ec, ed25519
+ 
+-from cryptography.hazmat.primitives.asymmetric import rsa  # , dsa, ec
+-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+-
+-from tabulate import tabulate
+-
+-from .base import raise_parse_exception, suppress_exit, Command
+-from .. import api
+-from ..attachment import prepare_attachment_download, KeeperRecord, TypedRecord, PasswordRecord, FileRecord
++from .base import Command
++from .record import find_record, RecordListCommand
++from ..attachment import TypedRecord
+ from ..params import KeeperParams
+-from ..subfolder import try_resolve_path, find_folders, get_folder_path
++from ..vault_extensions import SshKeysFacade, ServerCredentialsFacade, DatabaseCredentialsFacade
+ 
+-connect_parser = argparse.ArgumentParser(prog='connect', description='Establishes connection to external server')
+-connect_parser.add_argument('--syntax-help', dest='syntax_help', action='store_true',
+-                            help='display help on command format and template parameters')
+-connect_parser.add_argument('-s', '--sort', dest='sort_by', action='store', choices=['endpoint', 'title', 'folder'],
+-                            help='sort output')
+-connect_parser.add_argument('-f', '--filter', dest='filter_by', action='store', help='filter output')
+-connect_parser.add_argument('endpoint', nargs='?', action='store', type=str,
+-                            help='endpoint name or full record path to endpoint')
+-connect_parser.error = raise_parse_exception
+-connect_parser.exit = suppress_exit
++ssh_parser = argparse.ArgumentParser(prog='ssh',
++                                     description='Establishes connection to external server using SSH. ')
++ssh_parser.add_argument('record', nargs='?', type=

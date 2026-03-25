@@ -1,0 +1,102 @@
+@@ -8,6 +8,8 @@
+ 
+ #include "common/common/utility.h"
+ 
++#include "cilium_socket_option.h"
++
+ namespace Envoy {
+ namespace Cilium {
+ 
+@@ -80,8 +82,19 @@ void AccessLog::Entry::InitFromRequest(
+   entry.set_policy_name(policy_name);
+ 
+   if (conn) {
+-    if (conn->socketOptions() != nullptr) {
+-      entry.set_source_security_id(conn->socketOptions()->hashKey() >> 16);
++    const auto& options_ = conn->socketOptions();
++    if (options_) {
++      const Cilium::SocketMarkOption* option = nullptr;
++      for (const auto& option_: *options_) {
++	option = dynamic_cast<Cilium::SocketMarkOption*>(option_.get());
++	if (option) {
++	  entry.set_source_security_id(option->identity_);
++	  break;
++	}
++      }
++      if (!option) {
++	ENVOY_CONN_LOG(warn, "accesslog: Cilium Socket Option not found", *conn);
++      }
+     }
+     entry.set_source_address(conn->remoteAddress()->asString());
+     entry.set_destination_address(conn->localAddress()->asString());
+
+
+
+
+@@ -29,7 +29,7 @@ public:
+     // Set the socket mark option for the listen socket.
+     // Can use identity 0 on the listen socket option, as the bpf datapath is only interested
+     // in whether the proxy is ingress, egress, or if there is no proxy at all.
+-    context.setListenSocketOptions(std::make_shared<Cilium::SocketMarkOption>(config->getMark(0)));
++    context.addListenSocketOption(std::make_unique<Cilium::SocketMarkOption>(0, config->is_ingress_));
+ 
+     return [config](Network::ListenerFilterManager &filter_manager) mutable -> void {
+       filter_manager.addAcceptFilter(std::make_unique<Filter::BpfMetadata::Instance>(config));
+@@ -77,7 +77,7 @@ bool Config::getBpfMetadata(Network::ConnectionSocket& socket) {
+   uint16_t orig_dport, proxy_port;
+   bool ok = maps_->getBpfMetadata(socket, &identity, &orig_dport, &proxy_port);
+   if (ok) {
+-    socket.setOptions(std::make_shared<Cilium::SocketOption>(maps_, getMark(identity), identity, is_ingress_, orig_dport, proxy_port));
++    socket.addOption(std::make_unique<Cilium::SocketOption>(maps_, identity, is_ingress_, orig_dport, proxy_port));
+   }
+   return ok;
+ }
+@@ -86,13 +86,12 @@ Network::FilterStatus Instance::onAccept(Network::ListenerFilterCallbacks &cb) {
+   Network::ConnectionSocket &socket = cb.socket();
+   if (!config_->getBpfMetadata(socket)) {
+     ENVOY_LOG(debug,
+-              "cilium.bpf_metadata ({}): no bpf metadata for the connection.",
++              "cilium.bpf_metadata ({}): no bpf metadata for the connection",
+               config_->is_ingress_ ? "ingress" : "egress");
+   } else {
+     ENVOY_LOG(trace,
+-              "cilium.bpf_metadata ({}): GOT bpf metadata for new connection "
+-              "(mark: {:x})",
+-              config_->is_ingress_ ? "ingress" : "egress", socket.options()->hashKey());
++              "cilium.bpf_metadata ({}): GOT bpf metadata for new connection",
++              config_->is_ingress_ ? "ingress" : "egress");
+   }
+   return Network::FilterStatus::Continue;
+ }
+
+
+
+
+@@ -23,11 +23,6 @@ public:
+   Config(const ::cilium::BpfMetadata &config, Server::Configuration::ListenerFactoryContext& context);
+   virtual ~Config() {}
+ 
+-  uint32_t getMark(uint32_t identity) {
+-    // Magic marker values must match with Cilium.
+-    return ((is_ingress_) ? 0xFEA : 0xFEB) | (identity << 16);
+-  }
+-
+   virtual bool getBpfMetadata(Network::ConnectionSocket &socket);
+ 
+   bool is_ingress_;
+
+
+
+
+@@ -36,18 +36,15 @@ namespace BpfMetadata {
+ class TestConfig : public Config {
+ public:
+   TestConfig(const ::cilium::BpfMetadata& config, Server::Configuration::ListenerFactoryContext& context)
+-    : Config(config, context),
+-      socket_mark_(std::make_shared<Cilium::SocketOption>(maps_, 42, 1, true, 80, 10000)) {}
++    : Config(config, context) {}
+ 
+   bool getBpfMetadata(Network::ConnectionSocket &socket) override {
+     // fake setting the local address. It remains the same as required by the test infra, but it will be marked as restored
+     // as required by the original_dst cluster.
+     socket.setL

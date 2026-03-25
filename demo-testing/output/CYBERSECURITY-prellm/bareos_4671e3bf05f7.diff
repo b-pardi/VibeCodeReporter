@@ -1,0 +1,129 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,1768 @@
++/*
++   BAREOS® - Backup Archiving REcovery Open Sourced
++
++   Copyright (C) 2014-2019 Bareos GmbH & Co. KG
++   Copyright (C) 2015-2015 Planets Communications B.V.
++
++   This program is Free Software; you can redistribute it and/or
++   modify it under the terms of version three of the GNU Affero General Public
++   License as published by the Free Software Foundation, which is
++   listed in the file LICENSE.vadp.
++
++   This program is distributed in the hope that it will be useful, but
++   WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++   Affero General Public License for more details.
++
++   You should have received a copy of the GNU Affero General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++   02110-1301, USA.
++*/
++/*
++ * VADP Dumper - vStorage APIs for Data Protection Dumper program.
++ *
++ * Marco van Wieringen, July 2014
++ * Renout Gerrits, Oct 2017, added thumbprint
++ */
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include <fcntl.h>
++#include <time.h>
++#include <unistd.h>
++#include <signal.h>
++
++#include "copy_thread.h"
++
++#include <jansson.h>
++
++/*
++ * json_array_foreach macro was added in jansson version 2.5
++ * we can compile also against an lower version if we define it ourselves.
++ */
++#if JANSSON_VERSION_HEX < 0x020500
++#define json_array_foreach(array, index, value)           \
++  for (index = 0; index < json_array_size(array) &&       \
++                  (value = json_array_get(array, index)); \
++       index++)
++#endif
++
++#include <vixDiskLib.h>
++
++#define VIXDISKLIB_VERSION_MAJOR 6
++#define VIXDISKLIB_VERSION_MINOR 5
++
++#define VSPHERE_DEFAULT_ADMIN_PORT 0
++
++/*
++ * VixDiskLib does all processing in sectors of 512 bytes.
++ */
++#define DEFAULT_SECTOR_SIZE VIXDISKLIB_SECTOR_SIZE
++
++/*
++ * In each call to the VixDiskLib read/write this number of sectors.
++ * e.g. 512 means 256 Kb per call (e.g. 512 x 512 bytes)
++ */
++#define SECTORS_PER_CALL 1024
++
++#define MIN(a, b) ((a) < b) ? (a) : (b)
++#define MAX(a, b) ((a) > b) ? (a) : (b)
++
++#define CON_PARAMS_KEY "ConnParams"
++#define CON_PARAMS_VM_MOREF_KEY "VmMoRef"
++#define CON_PARAMS_HOST_KEY "VsphereHostName"
++#define CON_PARAMS_THUMBPRINT_KEY "VsphereThumbPrint"
++#define CON_PARAMS_USERNAME_KEY "VsphereUsername"
++#define CON_PARAMS_PASSWORD_KEY "VspherePassword"
++#define CON_PARAMS_SNAPSHOT_MOREF_KEY "VsphereSnapshotMoRef"
++
++#define DISK_PARAMS_KEY "DiskParams"
++#define DISK_PARAMS_DISK_PATH_KEY "diskPath"
++
++#define CBT_DISKCHANGEINFO_KEY "DiskChangeInfo"
++#define CBT_DISK_SIZE "length"
++#define CBT_CHANGEDAREA_KEY "changedArea"
++#define CBT_CHANGEDAREA_START_KEY "start"
++#define CBT_CHANGEDAREA_LENGTH_KEY "length"
++#define CBT_START_OFFSET "startOffset"
++
++#define BAREOSMAGIC 0x12122012
++#define PROTOCOL_VERSION 1
++
++#define BAREOS_VADPDUMPER_IDENTITY "BareosVADPDumper"
++
++struct disk_type {
++  const char* type;
++  VixDiskLibDiskType vadp_type;
++};
++
++static struct disk_type disk_types[] = {
++    {"monolithic_sparse", VIXDISKLIB_DISK_MONOLITHIC_SPARSE},
++    {"monolithic_flat", VIXDISKLIB_DISK_MONOLITHIC_FLAT},
++    {"split_sparse", VIXDISKLIB_DISK_SPLIT_SPARSE},
++    {"split_flat", VIXDISKLIB_DISK_SPLIT_FLAT},
++    {"vmfs_flat", VIXDISKLIB_DISK_VMFS_FLAT},
++    {"optimized", VIXDISKLIB_DISK_STREAM_OPTIMIZED},
++    {"vmfs_thin", VIXDISKLIB_DISK_VMFS_THIN},
++    {"vmfs_sparse", VIXDISKLIB_DISK_VMFS_SPARSE},
++    {NULL, VIXDISKLIB_DISK_UNKNOWN}};
++
++/*
++ * Generic identification structure, 128 bytes with padding.
++ * This includes a protocol version.
++ */
++struct runtime_disk_info_encoding {
++  uint32_t start_magic;
++  uint32_t protocol_version;
++  uint64_t absolute_disk_length;
++  uint64_t absolute_start_offset;
++  uint32_t bios_cylinders;
++  uint32_t bios_heads;
++  uint32_t bios_sectors;
++  uint32_t phys_cylinders;
++  uint32

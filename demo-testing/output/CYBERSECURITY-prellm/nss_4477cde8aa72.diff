@@ -1,0 +1,126 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,334 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include <memory>
++#include "nss.h"
++#include "pk11pub.h"
++#include "pk11pqg.h"
++#include "prerror.h"
++#include "secoid.h"
++
++#include "cpputil.h"
++#include "nss_scoped_ptrs.h"
++#include "gtest/gtest.h"
++#include "databuffer.h"
++
++namespace nss_test {
++
++// This deleter deletes a set of objects, unlike the deleter on
++// ScopedPK11GenericObject, which only deletes one.
++struct PK11GenericObjectsDeleter {
++  void operator()(PK11GenericObject* objs) {
++    if (objs) {
++      PK11_DestroyGenericObjects(objs);
++    }
++  }
++};
++
++class Pk11KeyImportTestBase : public ::testing::Test {
++ public:
++  Pk11KeyImportTestBase(CK_MECHANISM_TYPE mech) : mech_(mech) {}
++  virtual ~Pk11KeyImportTestBase() = default;
++
++  void SetUp() override {
++    slot_.reset(PK11_GetInternalKeySlot());
++    ASSERT_TRUE(slot_);
++
++    static const uint8_t pw[] = "pw";
++    SECItem pwItem = {siBuffer, toUcharPtr(pw), sizeof(pw)};
++    password_.reset(SECITEM_DupItem(&pwItem));
++  }
++
++  void Test() {
++    // Generate a key and export it.
++    KeyType key_type;
++    ScopedSECKEYEncryptedPrivateKeyInfo key_info;
++    ScopedSECItem public_value;
++    GenerateAndExport(&key_type, &key_info, &public_value);
++    ASSERT_NE(nullptr, key_info);
++    ASSERT_NE(nullptr, public_value);
++
++    // Now import the encrypted key.
++    static const uint8_t nick[] = "nick";
++    SECItem nickname = {siBuffer, toUcharPtr(nick), sizeof(nick)};
++    SECKEYPrivateKey* priv_tmp;
++    SECStatus rv = PK11_ImportEncryptedPrivateKeyInfoAndReturnKey(
++        slot_.get(), key_info.get(), password_.get(), &nickname,
++        public_value.get(), PR_TRUE, PR_TRUE, key_type, 0, &priv_tmp, NULL);
++    ASSERT_EQ(SECSuccess, rv) << "PK11_ImportEncryptedPrivateKeyInfo failed "
++                              << PORT_ErrorToName(PORT_GetError());
++    ScopedSECKEYPrivateKey priv_key(priv_tmp);
++    ASSERT_NE(nullptr, priv_key);
++
++    CheckForPublicKey(priv_key, public_value.get());
++  }
++
++ protected:
++  class ParamHolder {
++   public:
++    virtual ~ParamHolder() = default;
++    virtual void* get() = 0;
++  };
++
++  virtual std::unique_ptr<ParamHolder> MakeParams() = 0;
++
++  CK_MECHANISM_TYPE mech_;
++
++ private:
++  void CheckForPublicKey(const ScopedSECKEYPrivateKey& priv_key,
++                         const SECItem* expected_public) {
++    // Verify the public key exists.
++    StackSECItem priv_id;
++    SECStatus rv = PK11_ReadRawAttribute(PK11_TypePrivKey, priv_key.get(),
++                                         CKA_ID, &priv_id);
++    ASSERT_EQ(SECSuccess, rv) << "Couldn't read CKA_ID from private key: "
++                              << PORT_ErrorToName(PORT_GetError());
++
++    CK_ATTRIBUTE_TYPE value_type = CKA_VALUE;
++    switch (SECKEY_GetPrivateKeyType(priv_key.get())) {
++      case rsaKey:
++        value_type = CKA_MODULUS;
++        break;
++
++      case dhKey:
++      case dsaKey:
++        value_type = CKA_VALUE;
++        break;
++
++      case ecKey:
++        value_type = CKA_EC_POINT;
++        break;
++
++      default:
++        FAIL() << "unknown key type";
++    }
++
++    std::unique_ptr<PK11GenericObject, PK11GenericObjectsDeleter> objs(
++        PK11_FindGenericObjects(slot_.get(), CKO_PUBLIC_KEY));
++    ASSERT_NE(nullptr, objs);
++    for (PK11GenericObject* obj = objs.get(); obj != nullptr;
++         obj = PK11_GetNextGenericObject(obj)) {
++      StackSECItem pub_id;
++      rv = PK11_ReadRawAttribute(PK11_TypeGeneric, obj, CKA_ID, &pub_id);
++      if (rv != SECSuccess) {
++        // Can't read CKA_ID from object.
++        continue;
++      }
++      if (!SECITEM_ItemsAreEqual(&priv_id, &pub_id)) {
++        // This isn't the obj

@@ -1,0 +1,113 @@
+@@ -433,28 +433,14 @@ static RBinSection *getsection(RBin *bin, int sn) {
+ 		if (lastSection[sn]) {
+ 			RBinSection *ls = lastSection[sn];
+ 			const char *lsn = ls->name;
+-			if (strstr (lsn , name_str)) {
+-				if (r_str_startswith (lsn, ".debug_") && R_BIN_ELF_SCN_IS_COMPRESSED (ls->flags))  {
+-					R_LOG_WARN ("Compressed dwarf sections not yet supported");
+-					return NULL;
+-				}
+-				if (strstr (lsn, "zdebug")) {
+-					R_LOG_WARN ("Compressed dwarf sections not yet supported");
+-					return NULL;
+-				}
++			if (strstr (lsn, name_str)) {
++				/* accept matching section, including compressed or zdebug variants */
+ 				return ls;
+ 			}
+ 		}
+ 		r_list_foreach (o->sections, iter, section) {
+ 			if (strstr (section->name, name_str)) {
+-				if (r_str_startswith (section->name, ".debug_") && R_BIN_ELF_SCN_IS_COMPRESSED (section->flags))  {
+-					R_LOG_WARN ("Compressed dwarf sections not yet supported");
+-					return NULL;
+-				}
+-				if (strstr (section->name, "zdebug")) {
+-					R_LOG_WARN ("Compressed dwarf sections not yet supported");
+-					return NULL;
+-				}
++				/* accept matching section, including compressed or zdebug variants */
+ 				lastSection[sn] = section;
+ 				return section;
+ 			}
+@@ -474,6 +460,54 @@ static ut8 *get_section_bytes(RBin *bin, int sect_name, size_t *len) {
+ 	if (section->size > binfile->size) {
+ 		return NULL;
+ 	}
++	/* Handle compressed DWARF sections (.zdebug_* or SHF_COMPRESSED) */
++	if (R_BIN_ELF_SCN_IS_COMPRESSED (section->flags) || strstr (section->name, "zdebug")) {
++		ut64 raw_size = section->size;
++		ut8 *rawbuf = calloc (1, raw_size);
++		if (!rawbuf) {
++			return NULL;
++		}
++		if (!r_buf_read_at (binfile->buf, section->paddr, rawbuf, raw_size)) {
++			free (rawbuf);
++			return NULL;
++		}
++		/* Determine ELF class and endianness */
++		RBinObject *ro = R_UNWRAP3 (bin, cur, bo);
++		ELFOBJ *eo = (ELFOBJ *)ro->bin_obj;
++		bool is64 = eo && eo->ehdr.e_ident[EI_CLASS] == ELFCLASS64;
++		bool be = r_bin_is_big_endian (bin);
++		/* Parse compression header */
++		ut32 ch_type = r_read_ble32 (rawbuf, be);
++		ut64 ch_size = 0;
++		size_t header_size = 0;
++		if (is64) {
++			/* Elf64_Chdr: type(4), reserved(4), size(8), align(8) */
++			ch_size = r_read_ble64 (rawbuf + 8, be);
++			header_size = 24;
++		} else {
++			/* Elf32_Chdr: type(4), size(4), align(4) */
++			ch_size = r_read_ble32 (rawbuf + 4, be);
++			header_size = 12;
++		}
++		/* Only support zlib compression (type 1) */
++		if (ch_type != 1) {
++			free (rawbuf);
++			return NULL;
++		}
++		/* Decompress data after header */
++		int dst_len = 0;
++		ut8 *decomp = r_inflate (rawbuf + header_size, (int)(raw_size - header_size), NULL, &dst_len);
++		free (rawbuf);
++		if (!decomp) {
++			return NULL;
++		}
++		if ((ut64)dst_len != ch_size) {
++			R_LOG_WARN ("DWARF: decompressed %d bytes, expected %llu", dst_len, ch_size);
++		}
++		*len = dst_len;
++		return decomp;
++	}
++	/* Uncompressed section: read raw bytes */
+ 	*len = section->size;
+ 	ut8 *buf = calloc (1, *len);
+ 	if (R_LIKELY (buf)) {
+@@ -520,14 +554,14 @@ static inline bool is_printable_unit_type(ut64 unit_type) {
+ 	return unit_type > 0 && unit_type <= DW_UT_split_type;
+ }
+ 
+-/**
+- * @brief Reads 64/32 bit unsigned based on format
+- *
+- * @param is_64bit Format of the comp unit
+- * @param buf Pointer to the buffer to read from, to update after read
+- * @param buf_end To check the boundary /for READ macro/
+- * @return ut64 Read value
+- */
++#if 0
++* @brief Reads 64/32 bit unsigned based on format
++*
++* @param is_64bit Format of the comp unit
++* @param buf Pointer to the buffer to read from, to update after read
++* @param buf_end To check the boundary /for READ macro/
++* @return ut64 Read value
++#endif
+ static inline ut64 dwarf_read_offset(bool is_64bit, const ut8 **buf, const ut8 *buf_end, bool be) {
+ 	ut64 result;
+ 	if (!buf || !*buf || !buf_end) {
+@@ -729,6 +763,31 @@ static char *get_section_string(RBin *bin, RBinSection * section, size_t offset)
+ 	if (!section || (section->paddr + offset + 2) > bf->size) {
+ 		

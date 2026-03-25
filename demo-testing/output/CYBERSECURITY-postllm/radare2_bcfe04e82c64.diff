@@ -1,0 +1,143 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,469 @@
++/* radare - Copyright 2014-2023 pancake, defragger */
++
++#define R_LOG_ORIGIN "a2f"
++
++#include <r_types.h>
++#include <r_core.h>
++#include <r_io.h>
++
++#define MAXFCNSIZE 4096
++
++#define Fbb(x) r_strf("bb.%"PFMT64x,x)
++#define Fhandled(x) r_strf("handled.%"PFMT64x,x)
++#define FbbTo(x) r_strf("bb.%"PFMT64x".to",x)
++
++static ut64 getCrossingBlock(Sdb *db, const char *key, ut64 start, ut64 end) {
++	r_strf_buffer (64);
++	ut64 block_start, block_end;
++	ut64 nearest_start = UT64_MAX;
++	const char *s = sdb_const_get (db, key, NULL);
++	const char *next = NULL;
++	const char *ptr = NULL;
++	if (!s) {
++		return UT64_MAX;
++	}
++	ptr = s;
++	do {
++		next = sdb_const_anext (ptr);
++		block_start = sdb_atoi (ptr);
++
++		if (start == block_start) { // case 5
++			return start;
++		}
++
++		block_end = sdb_num_get (db, Fbb (block_start), NULL);
++		if (block_end) {
++			if (start > block_start && start < block_end) { // case 2
++				// start is inside the block
++				return block_start;
++			}
++			if (start < block_start && end >= block_end) {
++				// crossing the start of the block
++				if (nearest_start > block_start) {
++					nearest_start = block_start;
++				}
++			}
++		}
++		ptr = next;
++	} while (next);
++
++	return nearest_start;
++}
++
++/*
++ bb.<addr-of-basic-block>=<end-address-of-basic-block>
++ bb.<addr-of-basic-block>.to=array,of,destination,addresses
++*/
++
++static int bbAdd(Sdb *db, ut64 from, ut64 to, ut64 jump, ut64 fail) {
++	r_strf_buffer (64);
++	ut64 block_start = getCrossingBlock (db, "bbs", from, to);
++	bool add = true;
++	if (block_start == UT64_MAX) {
++		// add = 1;
++	} else if (block_start == from) {
++		// check if size is the same,
++		add = false;
++	} else {
++		/*
++		   from = start address of new basic block
++		   to = end address of new basic block
++		   jump = destination basic block
++		   fail = fallback jump of basic block
++		   addr = previous closer basic block start address
++		   addr_end = previous closer basic block start address
++		 */
++		// found a possible block
++		if (from > block_start) {
++			// from inside
++			// RESIZE this
++			r_strf_var (bbst, 64, "bb.%"PFMT64x, block_start);
++			r_strf_var (bben, 64, "bb.%"PFMT64x".to", block_start);
++			sdb_num_set (db, bbst, from, 0);
++			sdb_num_set (db, bben, from, 0);
++			sdb_array_set_num (db, bben, 0, from, 0);
++			sdb_array_set_num (db, bben, 1, UT64_MAX, 0);
++		} else {
++			// < the current runs into a known block
++			to = block_start;
++			jump = block_start;
++			fail = UT64_MAX;
++		}
++	}
++	if (add) {
++		sdb_array_add_num (db, "bbs", from, 0);
++		sdb_num_set (db, Fbb (from), to, 0);
++		sdb_array_set_num (db, FbbTo (from), 0, jump, 0);
++		sdb_array_set_num (db, FbbTo (from), 1, fail, 0);
++		sdb_num_min (db, "min", from, 0);
++		sdb_num_max (db, "max", to, 0);
++	}
++	return 0;
++}
++
++void addTarget(RCore *core, RStack *stack, Sdb *db, ut64 addr) {
++	r_strf_buffer (64);
++	if (sdb_num_get (db, Fhandled (addr), NULL)) {
++		// already set
++		return;
++	}
++	ut64* value = (ut64*) calloc (1, sizeof (ut64));
++	if (!value) {
++		R_LOG_DEBUG ("Failed to allocate memory for address stack");
++		return;
++	}
++	*value = addr;
++	if (!r_stack_push (stack, (void*)value)) {
++		R_LOG_DEBUG ("Failed to push address on stack");
++		free (value);
++		return;
++	}
++	sdb_num_set (db, Fhandled (addr), 1, 0);
++}
++
++static ut64 analyzeStackBased(RCore *core, Sdb *db, ut64 addr, RList *delayed_commands) {
++#define addCall(x) sdb_array_add_num (db, "calls", x, 0);
++#define addUcall(x) sdb_array_add_num (db, "ucalls", x, 0);
++#define addUjmp(x) sdb_array_add_num (db, "ujmps", x, 0);
++#define addCjmp(x) sdb_array_add_num (db, "cjmps", x, 0);
++#define addRet(x) sdb_array_add_num (db, "rets", x, 0);
++#define bbAddOpcode(x) sdb_array_insert_num (db, r_strf ("bb.%"PFMT64x, addr+cur), -1, x, 0);
++	r_strf_buffer (32);
++	ut64 oaddr = addr;
++	ut64 *value = NULL;
++	RAnalOp *op;
++	int cur = 0;
++	bool block_end = false;
++	RStack *stack = r_stack_newf (10, free);
++	addTarget (core, stack, db, 

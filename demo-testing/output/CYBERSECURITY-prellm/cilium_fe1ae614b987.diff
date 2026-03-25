@@ -1,0 +1,112 @@
+@@ -45,8 +45,6 @@ int main() {
+     DECLARE_STRUCT(ct_entry, iter);
+     DECLARE_STRUCT(ipcache_key, iter);
+     DECLARE_STRUCT(remote_endpoint_info, iter);
+-    DECLARE_STRUCT(lb4_key, iter);
+-    DECLARE_STRUCT(lb4_service, iter);
+     DECLARE_STRUCT(lb4_key_v2, iter);
+     DECLARE_STRUCT(lb4_service_v2, iter);
+     DECLARE_STRUCT(lb4_backend, iter);
+
+
+
+
+@@ -429,8 +429,6 @@ static inline int handle_ipv4_from_lxc(struct __sk_buff *skb, __u32 *dstID)
+ 	}
+ 
+ 	ct_state_new.orig_dport = key.dport;
+-	/* It's safe to lookup the v2 svc instead of the legacy, as the v2 is
+-	 * created before the endpoint datapath code has been reloaded. */
+ 	if ((svc = lb4_lookup_service_v2(skb, &key)) != NULL) {
+ 		ret = lb4_local(get_ct_map4(&tuple), skb, l3_off, l4_off, &csum_off,
+ 				&key, &tuple, svc, &ct_state_new, ip4->saddr);
+
+
+
+
+@@ -482,7 +482,7 @@ struct ct_entry {
+ 	      node_port:1,
+ 	      reserve:10;
+ 	__u16 rev_nat_index;
+-	__u16 slave;
++	__u16 backend_id; /* Populated only in v1.6+ BPF code. */
+ 
+ 	/* *x_flags_seen represents the OR of all TCP flags seen for the
+ 	 * transmit/receive direction of this entry. */
+@@ -541,20 +541,6 @@ struct lb6_reverse_nat {
+ 	__be16 port;
+ } __attribute__((packed));
+ 
+-struct lb4_key {
+-	__be32 address;
+-        __be16 dport;		/* L4 port filter, if unset, all ports apply */
+-	__u16 slave;		/* Backend iterator, 0 indicates the master service */
+-} __attribute__((packed));
+-
+-struct lb4_service {
+-	__be32 target;
+-	__be16 port;
+-	__u16 count;
+-	__u16 rev_nat_index;
+-	__u16 weight;
+-} __attribute__((packed));
+-
+ struct lb4_key_v2 {
+ 	__be32 address;		/* Service virtual IPv4 address */
+ 	__be16 dport;		/* L4 port filter, if unset, all ports apply */
+@@ -565,10 +551,8 @@ struct lb4_key_v2 {
+ 
+ struct lb4_service_v2 {
+ 	__u32 backend_id;	/* Backend ID in lb4_backends */
+-	/* For the master service, count denotes number of service endpoints,
+-	 * while for any service endpoint, count contains a slave slot number
+-	 * in a corresponding legacy service which points to the same backend
+-	 * (used for the backward compatibility)
++	/* For the master service, count denotes number of service endpoints.
++	 * For service endpoints, zero. (Previously, legacy service ID)
+ 	 */
+ 	__u16 count;
+ 	__u16 rev_nat_index;	/* Reverse NAT ID in lb4_reverse_nat */
+@@ -603,7 +587,7 @@ struct ct_state {
+ 	__be32 addr;
+ 	__be32 svc_addr;
+ 	__u32 src_sec_id;
+-	__u16 slave;		/* Slave slot number in a legacy service */
++	__u16 unused;
+ 	__u16 backend_id;	/* Backend ID in lb4_backends */
+ };
+ 
+
+
+
+
+@@ -1,5 +1,5 @@
+ /*
+- *  Copyright (C) 2016-2018 Authors of Cilium
++ *  Copyright (C) 2016-2019 Authors of Cilium
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -230,14 +230,25 @@ static inline __u8 __inline__ __ct_lookup(void *map, struct __sk_buff *skb,
+ 		if (ct_state) {
+ 			ct_state->rev_nat_index = entry->rev_nat_index;
+ 			ct_state->loopback = entry->lb_loopback;
+-			ct_state->slave = entry->slave;
+ 			ct_state->node_port = entry->node_port;
+-			/* As we currently support both types of services (in the code
+-			 * referred as "legacy" and "v2"), we store references to both
+-			 * types of service endpoints. For the legacy, a slave slot
+-			 * number is stored within the "ct_entry.slave" field, while
+-			 * for the v2, a backend id is stored in the "ct_entry.rx_bytes"
+-			 * field which is not used by a entry with dir=CT_SERVICE.
++			/* To support seamless upgrade from an earlier service
++			 * implementation, we store references to the backend
++			 * in the "ct_entry.rx_bytes" field.
++			 * Previously, the field "ct_entry.backend_id" was used
++			 * for legacy services so we co-opted the field
++			 * "ct_entry.rx_bytes" to store the services v2
++			 * backend (as it is not used with dir=CT_SERVICE).
++			 *
++			 * As of v1.6, "ct_entry.backend_id" is zeroed so that
++			 * users who migrate to v1.6 will end up with CT
++			 * entries

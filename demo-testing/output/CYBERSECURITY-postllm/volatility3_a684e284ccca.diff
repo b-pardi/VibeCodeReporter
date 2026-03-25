@@ -1,0 +1,116 @@
+@@ -17,6 +17,7 @@ class WindowsKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+         self.set_type_class("_KTHREAD", extensions.KTHREAD)
+         self.set_type_class("_LIST_ENTRY", extensions.LIST_ENTRY)
+         self.set_type_class("_EPROCESS", extensions.EPROCESS)
++        self.set_type_class("_ERESOURCE", extensions.ERESOURCE)
+         self.set_type_class("_UNICODE_STRING", extensions.UNICODE_STRING)
+         self.set_type_class("_EX_FAST_REF", extensions.EX_FAST_REF)
+         self.set_type_class("_TOKEN", extensions.TOKEN)
+
+
+
+
+@@ -306,16 +306,19 @@ class MMVAD_SHORT(objects.StructType):
+ 
+         raise AttributeError("Unable to find the private memory member")
+ 
++    @property
++    def Protection(self):
++        if self.has_member("u"):
++            return self.u.VadFlags.Protection
++        elif self.has_member("Core"):
++            return self.Core.u.VadFlags.Protection
++        else:
++            return None
++
+     def get_protection(self, protect_values, winnt_protections):
+         """Get the VAD's protection constants as a string."""
+ 
+-        protect = None
+-
+-        if self.has_member("u"):
+-            protect = self.u.VadFlags.Protection
+-
+-        elif self.has_member("Core"):
+-            protect = self.Core.u.VadFlags.Protection
++        protect = self.Protection
+ 
+         try:
+             value = protect_values[protect]
+@@ -593,6 +596,38 @@ class UNICODE_STRING(objects.StructType):
+     String = property(get_string)
+ 
+ 
++class ERESOURCE(objects.StructType):
++    def is_valid(self) -> bool:
++        vollog.debug(f"Checking ERESOURCE Validity: {hex(self.vol.offset)}")
++
++        if not self._context.layers[self.vol.layer_name].is_valid(self.vol.offset):
++            return False
++
++        sym_table = self.get_symbol_table_name()
++
++        waiters_valid = self.SharedWaiters == 0 or self._context.layers[
++            self.vol.layer_name
++        ].is_valid(
++            self.SharedWaiters.vol.offset,
++            self._context.symbol_space.get_type(
++                sym_table + constants.BANG + "_KSEMAPHORE"
++            ).size,
++        )
++
++        try:
++            return (
++                waiters_valid
++                and self.SystemResourcesList.Flink is not None
++                and self.SystemResourcesList.Blink is not None
++                and self.SystemResourcesList.Flink != self.SystemResourcesList.Blink
++                and self.SystemResourcesList.Flink.Blink == self.vol.offset
++                and self.SystemResourcesList.Blink.Flink == self.vol.offset
++                and self.NumberOfSharedWaiters == 0
++            )
++        except exceptions.InvalidAddressException:
++            return False
++
++
+ class EPROCESS(generic.GenericIntelProcess, pool.ExecutiveObject):
+     """A class for executive kernel processes objects."""
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,278 @@
++# This file is Copyright 2019 Volatility Foundation and licensed under the Volatility Software License 1.0
++# which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
++#
++
++import logging
++import struct
++from datetime import datetime
++from typing import Dict, Optional, Tuple, Union
++
++from volatility3.framework import constants, exceptions, interfaces, objects, renderers
++from volatility3.framework.symbols.windows.extensions import conversion
++
++vollog = logging.getLogger(__name__)
++
++
++class SHIM_CACHE_ENTRY(objects.StructType):
++    """Class for abstracting variations in the shimcache LRU list entry structure"""
++
++    def __init__(
++        self,
++        context: interfaces.context.ContextInterface,
++        type_name: str,
++        object_info: interfaces.objects.ObjectInformation,
++        size: int,
++        members: Dict[str, Tuple[int, interfaces.objects.Template]],
++    ) -> None:
++        super().__init__(context, type_name, object_info, size, members)
++        self._exec_flag = None
++        self._file_path = None
++        self._file_size = None
++        self._last_modified = None
++ 

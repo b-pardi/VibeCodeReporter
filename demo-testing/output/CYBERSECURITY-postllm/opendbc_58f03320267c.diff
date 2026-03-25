@@ -1,0 +1,105 @@
+@@ -20,7 +20,7 @@ class CarController(CarControllerBase):
+     super().__init__(dbc_names, CP)
+     self.apply_angle_last = 0
+     self.packer = CANPacker(dbc_names[Bus.party])
+-    self.tesla_can = TeslaCAN(self.packer)
++    self.tesla_can = TeslaCAN(CP, self.packer)
+ 
+     # Vehicle model used for lateral limiting
+     self.VM = VehicleModel(get_safety_CP())
+
+
+
+
+@@ -3,6 +3,7 @@ from opendbc.can import CANDefine, CANParser
+ from opendbc.car import Bus, structs
+ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.interfaces import CarStateBase
++from opendbc.car.tesla.teslacan import get_steer_ctrl_type
+ from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, CAR
+ 
+ ButtonType = structs.CarState.ButtonEvent.Type
+@@ -105,7 +106,11 @@ class CarState(CarStateBase):
+     ret.stockAeb = cp_ap_party.vl["DAS_control"]["DAS_aebEvent"] == 1
+ 
+     # LKAS
+-    ret.stockLkas = cp_ap_party.vl["DAS_steeringControl"]["DAS_steeringControlType"] == 2  # LANE_KEEP_ASSIST
++    # On FSD 14+, ANGLE_CONTROL behavior changed to allow user winddown while actuating.
++    # FSD switched from using ANGLE_CONTROL to LANE_KEEP_ASSIST to likely keep the old steering override disengage logic.
++    # LKAS switched from LANE_KEEP_ASSIST to ANGLE_CONTROL to likely allow overriding LKAS events smoothly
++    lkas_ctrl_type = get_steer_ctrl_type(self.CP.flags, 2)
++    ret.stockLkas = cp_ap_party.vl["DAS_steeringControl"]["DAS_steeringControlType"] == lkas_ctrl_type  # LANE_KEEP_ASSIST
+ 
+     # Stock Autosteer should be off (includes FSD)
+     if self.CP.carFingerprint in (CAR.TESLA_MODEL_3, CAR.TESLA_MODEL_Y):
+
+
+
+
+@@ -36,6 +36,8 @@ FW_VERSIONS = {
+       b'TeMYG4_Legacy3Y_0.0.0 (5),Y4P003.03.2',
+       b'TeMYG4_SingleECU_0.0.0 (28),Y4S002.23.0',
+       b'TeMYG4_SingleECU_0.0.0 (33),Y4S002.26',
++      b'TeMYG4_Legacy3Y_0.0.0 (6),Y4003.04.0',
++      b'TeMYG4_Main_0.0.0 (77),Y4003.05.4',
+     ],
+   },
+   CAR.TESLA_MODEL_X: {
+
+
+
+
+@@ -2,7 +2,7 @@ from opendbc.car import get_safety_config, structs
+ from opendbc.car.interfaces import CarInterfaceBase
+ from opendbc.car.tesla.carcontroller import CarController
+ from opendbc.car.tesla.carstate import CarState
+-from opendbc.car.tesla.values import TeslaSafetyFlags, CAR
++from opendbc.car.tesla.values import TeslaSafetyFlags, TeslaFlags, CAR, FSD_14_FW, Ecu
+ 
+ 
+ class CarInterface(CarInterfaceBase):
+@@ -31,6 +31,11 @@ class CarInterface(CarInterfaceBase):
+       ret.vEgoStarting = 0.1
+       ret.stoppingDecelRate = 0.3
+ 
++    fsd_14 = any(fw.ecu == Ecu.eps and fw.fwVersion in FSD_14_FW.get(candidate, []) for fw in car_fw)
++    if fsd_14:
++      ret.flags |= TeslaFlags.FSD_14.value
++      ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.FSD_14.value
++
+     ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X,)  # dashcam only, pending find invalidLkasSetting signal
+ 
+     return ret
+
+
+
+
+@@ -1,16 +1,29 @@
+ from opendbc.car.common.conversions import Conversions as CV
+-from opendbc.car.tesla.values import CANBUS, CarControllerParams
++from opendbc.car.tesla.values import CANBUS, CarControllerParams, TeslaFlags
++
++
++def get_steer_ctrl_type(flags: int, ctrl_type: int) -> int:
++  # Returns the flipped signal value for DAS_steeringControlType on FSD 14
++  if flags & TeslaFlags.FSD_14:
++    return {1: 2, 2: 1}.get(ctrl_type, ctrl_type)
++  else:
++    return ctrl_type
+ 
+ 
+ class TeslaCAN:
+-  def __init__(self, packer):
++  def __init__(self, CP, packer):
++    self.CP = CP
+     self.packer = packer
+ 
+   def create_steering_control(self, angle, enabled):
++    # On FSD 14+, ANGLE_CONTROL behavior changed to allow user winddown while actuating.
++    # with openpilot, after overriding w/ ANGLE_CONTROL the wheel snaps back to the original angle abruptly
++    # so we now use LANE_KEEP_ASSIST to match stock FSD.
++    # see carstate.py for more details
+     values = {
+       "DAS_steeringAngleRequest": -angle,
+       "DAS_steeringHapticRequest": 0,
+-      "DAS_steeringControlType": 1 if enabled else

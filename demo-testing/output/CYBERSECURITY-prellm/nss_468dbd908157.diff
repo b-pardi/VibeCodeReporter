@@ -1,0 +1,105 @@
+@@ -68,18 +68,6 @@ size_t GetHashLength(SSLHashType hash) {
+   return 0;
+ }
+ 
+-CK_MECHANISM_TYPE GetHkdfMech(SSLHashType hash) {
+-  switch (hash) {
+-    case ssl_hash_sha256:
+-      return CKM_NSS_HKDF_SHA256;
+-    case ssl_hash_sha384:
+-      return CKM_NSS_HKDF_SHA384;
+-    default:
+-      ADD_FAILURE() << "Unknown hash: " << hash;
+-  }
+-  return CKM_INVALID_MECHANISM;
+-}
+-
+ PRUint16 GetSomeCipherSuiteForHash(SSLHashType hash) {
+   switch (hash) {
+     case ssl_hash_sha256:
+@@ -173,7 +161,7 @@ class TlsHkdfTest : public ::testing::Test,
+     ScopedPK11SymKey prkk(prk);
+ 
+     DumpKey("Output", prkk);
+-    VerifyKey(prkk, GetHkdfMech(base_hash), expected);
++    VerifyKey(prkk, CKM_HKDF_DERIVE, expected);
+ 
+     // Now test the public wrapper.
+     PRUint16 cs = GetSomeCipherSuiteForHash(base_hash);
+@@ -181,7 +169,7 @@ class TlsHkdfTest : public ::testing::Test,
+                          ikmk2.get(), &prk);
+     ASSERT_EQ(SECSuccess, rv);
+     ASSERT_NE(nullptr, prk);
+-    VerifyKey(ScopedPK11SymKey(prk), GetHkdfMech(base_hash), expected);
++    VerifyKey(ScopedPK11SymKey(prk), CKM_HKDF_DERIVE, expected);
+   }
+ 
+   void HkdfExpandLabel(ScopedPK11SymKey* prk, SSLHashType base_hash,
+@@ -207,7 +195,7 @@ class TlsHkdfTest : public ::testing::Test,
+                              &secret);
+     EXPECT_EQ(SECSuccess, rv);
+     ASSERT_NE(nullptr, prk);
+-    VerifyKey(ScopedPK11SymKey(secret), GetHkdfMech(base_hash), expected);
++    VerifyKey(ScopedPK11SymKey(secret), CKM_HKDF_DERIVE, expected);
+ 
+     // Verify that a key can be created with a different key type and size.
+     rv = SSL_HkdfExpandLabelWithMech(
+
+
+
+
+@@ -362,6 +362,25 @@ SECStatus PK11_WrapSymKey(CK_MECHANISM_TYPE type, SECItem *params,
+  * currently ignored */
+ PK11SymKey *PK11_MoveSymKey(PK11SlotInfo *slot, CK_ATTRIBUTE_TYPE operation,
+                             CK_FLAGS flags, PRBool perm, PK11SymKey *symKey);
++/*
++ * To do joint operations, we often need two keys in the same slot.
++ * Usually the PKCS #11 wrappers handle this correctly (like for PK11_WrapKey),
++ * but sometimes the wrappers don't know about mechanism specific keys in
++ * the Mechanism params. This function makes sure the two keys are in the
++ * same slot by copying one or both of the keys into a common slot. This
++ * functions makes sure the slot can handle the target mechanism. If the copy
++ * is warranted, this function will prefer to move the movingKey first, then
++ * the preferedKey. If the keys are moved, the new keys are returned in
++ * newMovingKey and/or newPreferedKey. The application is responsible
++ * for freeing those keys one the operation is complete.
++ */
++SECStatus PK11_SymKeysToSameSlot(CK_MECHANISM_TYPE mech,
++                                 CK_ATTRIBUTE_TYPE preferedOperation,
++                                 CK_ATTRIBUTE_TYPE movingOperation,
++                                 PK11SymKey *preferedKey, PK11SymKey *movingKey,
++                                 PK11SymKey **newPreferedKey,
++                                 PK11SymKey **newMovingKey);
++
+ /*
+  * derive a new key from the base key.
+  *  PK11_Derive returns a key which can do exactly one operation, and is
+
+
+
+
+@@ -1372,16 +1372,124 @@ pk11_HandWrap(PK11SymKey *wrappingKey, SECItem *param, CK_MECHANISM_TYPE type,
+     return SECSuccess;
+ }
+ 
++/*
++ * helper function which moves two keys into a new slot based on the
++ * desired mechanism.
++ */
++static SECStatus
++pk11_moveTwoKeys(CK_MECHANISM_TYPE mech,
++                 CK_ATTRIBUTE_TYPE preferedOperation,
++                 CK_ATTRIBUTE_TYPE movingOperation,
++                 PK11SymKey *preferedKey, PK11SymKey *movingKey,
++                 PK11SymKey **newPreferedKey, PK11SymKey **newMovingKey)
++{
++    PK11SlotInfo *newSlot;
++    *newMovingKey = NULL;
++    *newPreferedKey = NULL;
++
++    newSlot = PK11_GetBestSlot(mech, preferedKey->cx);
++    if (newSlot == NULL) {
++        return SECFailure;
++    }
++    *newMovingKey = pk11_CopyToSlot(newSlot, movingKey->type,
++            

@@ -1,0 +1,133 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,558 @@
++#! /usr/bin/env python
++
++# This file is part of IVRE.
++# Copyright 2011 - 2017 Pierre LALET <pierre.lalet@cea.fr>
++#
++# IVRE is free software: you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# IVRE is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
++# License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
++
++
++from __future__ import print_function
++# try:
++#     import argparse
++# except ImportError:
++#     import optparse
++#     USING_ARGPARSE = False
++# else:
++#     USING_ARGPARSE = True
++import json
++import os
++from xml.sax import saxutils
++try:
++    from collections import OrderedDict
++except ImportError:
++    # fallback to dict for Python 2.6
++    OrderedDict = dict
++import sys
++try:
++    reload(sys)
++except NameError:
++    pass
++else:
++    sys.setdefaultencoding('utf-8')
++
++
++from future.utils import viewitems, viewvalues
++from past.builtins import basestring
++
++
++from ivre import utils, db, graphroute, config, xmlnmap
++
++
++HONEYD_ACTION_FROM_NMAP_STATE = {
++    'resets': 'reset',
++    'no-responses': 'block',
++}
++HONEYD_DEFAULT_ACTION = 'block'
++HONEYD_STD_SCRIPTS_BASE_PATH = '/usr/share/honeyd'
++HONEYD_SSL_CMD = 'honeydssl --cert-subject %(subject)s -- %(command)s'
++
++
++def _display_honeyd_preamble(out=sys.stdout):
++    out.write("""create default
++set default default tcp action block
++set default default udp action block
++set default default icmp action block
++
++""")
++
++
++def _getscript(port, sname):
++    for s in port.get('scripts', []):
++        if s['id'] == sname:
++            return s
++    return None
++
++
++def _nmap_port2honeyd_action(port):
++    if port['state_state'] == 'closed':
++        return 'reset'
++    elif port['state_state'] != 'open':
++        return 'block'
++    # if 'service_tunnel' in port and port['service_tunnel'] == 'ssl':
++    #     sslrelay = True
++    # else:
++    #     sslrelay = False
++    if 'service_name' in port:
++        if port['service_name'] == 'tcpwrapped':
++            return '"true"'
++        elif port['service_name'] == 'ssh':
++            s = _getscript(port, 'banner')
++            if s is not None:
++                banner = s['output']
++            else:
++                banner = 'SSH-%s-%s' % (
++                    port.get('service_version', '2.0'),
++                    '_'.join([k for k in
++                              port.get('service_product', 'OpenSSH').split()
++                              if k != 'SSH']),
++                )
++            return '''"%s %s"''' % (
++                os.path.join(config.HONEYD_IVRE_SCRIPTS_PATH, 'sshd'),
++                banner
++            )
++    return 'open'
++
++
++def _display_honeyd_conf(host, honeyd_routes, honeyd_entries, out=sys.stdout):
++    addr = utils.int2ip(host['addr'])
++    hname = "host_%s" % addr.replace('.', '_')
++    out.write("create %s\n" % hname)
++    defaction = HONEYD_DEFAULT_ACTION
++    if 'extraports' in host:
++        extra = host['extraports']
++        defaction = max(
++            max(viewvalues(extra),
++                key=lambda state: viewitems(state['total'])['reasons']),
++            key=lambda reason: reason[1],
++        )[0]
++        defaction = HONEYD_ACTION_FROM_NMAP_STATE.get(defaction)
++    out.write('set %s default tcp action %s\n' % (hname, defaction))
++    for p in host.get('ports', []):
++        try:
++            out.write('add %s %s port %d %s\n' % (
++                hname, p['protocol'], p['port'],
++                _nmap_port2honeyd_action(p),
++            ))
++        except KeyError:
++            # let's skip pseudo-port records t

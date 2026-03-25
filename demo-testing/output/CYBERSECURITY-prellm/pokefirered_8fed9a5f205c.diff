@@ -1,0 +1,132 @@
+@@ -984,5 +984,6 @@ extern u8 gCurrMovePos;
+ extern u8 gChosenMovePos;
+ extern u8 gUnknown_3004FFC[MAX_BATTLERS_COUNT];
+ extern u8 gBattlerStatusSummaryTaskId[MAX_BATTLERS_COUNT];
++extern u16 gDynamicBasePower;
+ 
+ #endif // GUARD_BATTLE_H
+
+
+
+
+@@ -16,6 +16,6 @@ void RecordAbilityBattle(u8 bank, u8 abilityId);
+ void ClearBankAbilityHistory(u8 bank);
+ void RecordItemEffectBattle(u8 bank, u8 itemEffect);
+ void ClearBankItemEffectHistory(u8 bank);
+-u8 BattleAI_GetAIActionToUse(void);
++u8 BattleAI_ChooseMoveOrAction(void);
+ 
+ #endif // GUARD_BATTLE_AI_SCRIPT_COMMANDS_H
+
+
+
+
+@@ -1,16 +1,17 @@
+ #include "global.h"
+ #include "battle.h"
++#include "battle_2.h"
++#include "util.h"
+ #include "item.h"
++#include "random.h"
+ #include "pokemon.h"
++#include "battle_ai_script_commands.h"
+ #include "constants/species.h"
+ #include "constants/abilities.h"
+ #include "constants/battle_ai.h"
+ #include "constants/battle_move_effects.h"
+ #include "constants/moves.h"
+ 
+-extern u16 Random(void);
+-extern void sub_80C7164(void);
+-
+ #define AI_ACTION_DONE          0x0001
+ #define AI_ACTION_FLEE          0x0002
+ #define AI_ACTION_WATCH         0x0004
+@@ -32,8 +33,16 @@ enum
+     AIState_DoNotProcess
+ };
+ 
++/*
++gAIScriptPtr is a pointer to the next battle AI cmd command to read.
++when a command finishes processing, gAIScriptPtr is incremented by
++the number of bytes that the current command had reserved for arguments
++in order to read the next command correctly. refer to battle_ai_scripts.s for the
++AI scripts.
++*/
++
+ extern const u8 *gAIScriptPtr;
+-extern u8 *BattleAIs[];
++extern u8 *gBattleAI_ScriptsTable[];
+ 
+ static void BattleAICmd_if_random_less_than(void);
+ static void BattleAICmd_if_random_greater_than(void);
+@@ -130,6 +139,11 @@ static void BattleAICmd_if_level_compare(void);
+ static void BattleAICmd_if_taunted(void);
+ static void BattleAICmd_if_not_taunted(void);
+ 
++static void RecordLastUsedMoveByTarget(void);
++static void BattleAI_DoAIProcessing(void);
++static void AIStackPushVar(const u8 *ptr);
++static bool8 AIStackPop(void);
++
+ typedef void (*BattleAICmdFunc)(void);
+ 
+ static const BattleAICmdFunc sBattleAICmdTable[] =
+@@ -247,23 +261,6 @@ static const u16 sDiscouragedPowerfulMoveEffects[] =
+     0xFFFF
+ };
+ 
+-// TODO: move these
+-extern u8 gBattlerAttacker;
+-extern const u32 gBitTable[]; // util.h
+-extern u32 gStatuses3[]; // battle_2.h
+-extern u16 gSideStatuses[2];
+-extern const struct BattleMove gBattleMoves[];
+-extern u16 gDynamicBasePower;
+-extern u8 gMoveResultFlags;
+-extern u8 gCritMultiplier;
+-extern u16 gCurrentMove;
+-extern s32 gBattleMoveDamage;
+-
+-void BattleAI_SetupAIData(void);
+-void BattleAI_DoAIProcessing(void);
+-void AIStackPushVar(const u8 *ptr);
+-bool8 AIStackPop(void);
+-
+ void BattleAI_HandleItemUseBeforeAISetup(void)
+ {
+     s32 i;
+@@ -274,9 +271,9 @@ void BattleAI_HandleItemUseBeforeAISetup(void)
+ 
+     // Items are allowed to use in ONLY trainer battles.
+     // TODO: Use proper flags
+-    if ((gBattleTypeFlags & 0x8)
++    if ((gBattleTypeFlags & BATTLE_TYPE_TRAINER)
+         && (gTrainerBattleOpponent_A != 0x400)
+-        && !(gBattleTypeFlags & 0x80982)
++        && !(gBattleTypeFlags & (BATTLE_TYPE_TRAINER_TOWER | BATTLE_TYPE_EREADER_TRAINER | BATTLE_TYPE_BATTLE_TOWER | BATTLE_TYPE_SAFARI | BATTLE_TYPE_LINK))
+         )
+     {
+         for (i = 0; i < 4; i++)
+@@ -366,14 +363,14 @@ void BattleAI_SetupAIData(void)
+     AI_THINKING_STRUCT->aiFlags = gTrainers[gTrainerBattleOpponent_A].aiFlags;
+ }
+ 
+-u8 BattleAI_GetAIActionToUse(void)
++u8 BattleAI_ChooseMoveOrAction(void)
+ {
+     u8 currentMoveArray[MAX_MON_MOVES];
+     u8 consideredMoveArray[MAX_MON_MOVES];
+     u8 numOfBestMoves;
+     s32 i;
+ 
+-    sub_80C7164();
++    RecordLastUsedMoveByTarget();
+     while (AI_THINKING_STRUCT->aiFlags != 0)
+     {
+         if (AI_THINKING_STRUCT->aiFlags & 1)
+@@ -414,7 +411,7 @@ u8 BattleAI_GetAIActionToUse(void)
+     return consideredMoveArray[Random() % numOfBestMoves]; // break any ties that exist.
+ }
+ 
+-void BattleAI_DoAIProcessing(void

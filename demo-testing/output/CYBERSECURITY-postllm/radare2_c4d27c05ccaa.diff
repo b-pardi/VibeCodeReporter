@@ -1,0 +1,168 @@
+@@ -152,6 +152,7 @@ R_API RBinImport *r_bin_import_clone(RBinImport *o) {
+ 	RBinImport *res = r_mem_dup (o, sizeof (*o));
+ 	if (res) {
+ 		res->name = r_bin_name_clone (o->name);
++		res->libname = R_STR_DUP (o->libname);
+ 		res->classname = R_STR_DUP (o->classname);
+ 		res->descriptor = R_STR_DUP (o->descriptor);
+ 	}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,890 @@
++/* radare - LGPL - Copyright 2025 - elliotnunn */
++
++#include <r_lib.h>
++#include <r_bin.h>
++
++typedef struct {
++	ut32 offset;
++	ut16 target; // either section or import
++	bool isimport;
++} PEFReloc;
++
++typedef struct {
++	ut64 addr;
++	void *unpack;
++	RList /*<myreloc>*/ *relocs;
++	ut32 defAddress;
++	ut32 lenTotal, lenUnpack, lenDisk;
++	ut32 offset;
++	ut8 kind, share, align;
++} PEFSection;
++
++typedef struct {
++	ut16 nsec;
++	ut32 ldrsec;
++	PEFSection sec[];
++} RBinPEFObj;
++
++static const char *class2string(ut8 class) {
++	switch (class & 0xf) {
++	case 0: return R_BIN_TYPE_FUNC_STR; // code
++	case 1: return R_BIN_TYPE_OBJECT_STR; // data
++	case 2: return R_BIN_TYPE_OBJECT_STR; // tvector
++	case 3: return R_BIN_TYPE_SECTION_STR; // toc
++	case 4: return R_BIN_TYPE_FUNC_STR; // glue
++	default: return R_BIN_TYPE_UNKNOWN_STR;
++	}
++}
++
++static bool pidata_getcount(const char **ptr, const char *limit, ut32 *ret) {
++	*ret = 0;
++	for (;;) {
++		if (*ptr >= limit) {
++			return true; // fail
++		}
++		ut8 byte = *(*ptr)++;
++		*ret = (*ret << 7) | (byte & 0x7f);
++		if (*ret & 0x80000000) {
++			return true; // unrealistically large, prevent oflow when used as int
++		}
++		if ((byte & 0x80) == 0) {
++			return false; // OK
++		}
++	}
++}
++
++// Do a bounds check for every single byte that is read/written,
++// to guard against overflow in pointer arithmetic.
++// Return nonzero on failure.
++static int unpack_pidata(char *dest, size_t dlen, const char *src, size_t slen) {
++	char *dlim = dest + dlen;
++	const char *slim = src + slen;
++	int i, j;
++
++	while (src < slim) {
++		ut8 firstbyte = *src++;
++		ut8 opcode = firstbyte >> 5;
++		ut32 arg = firstbyte & 0x1f;
++		if (arg == 0) {
++			if (pidata_getcount (&src, slim, &arg)) {
++				return 1;
++			}
++		}
++
++		if (opcode == 0) { // put zeros
++			for (i = 0; i < arg; i++) {
++				if (dest >= dlim) {
++					return 2;
++				}
++				*dest++ = 0;
++			}
++		} else if (opcode == 1) { // copy block
++			for (i = 0; i < arg; i++) {
++				if (src >= slim || dest >= dlim) {
++					return 3;
++				}
++				*dest++ = *src++;
++			}
++		} else if (opcode == 2) { // repeated block
++			ut32 blockSize = arg;
++			ut32 repeatCountMin1;
++			if (pidata_getcount (&src, slim, &repeatCountMin1)) {
++				return 4;
++			}
++
++			do {
++				for (i = 0; i < blockSize; i++) {
++					if (src + i >= slim || dest >= dlim) {
++						return 5;
++					}
++					*dest++ = src[i];
++				}
++			} while (repeatCountMin1--);
++			src += blockSize;
++		} else if (opcode == 3) { // interleave repeatblock with customblock
++			ut32 commonSize = arg;
++			ut32 customSize, repeatCount;
++			if (pidata_getcount (&src, slim, &customSize)) {
++				return 6;
++			}
++			if (pidata_getcount (&src, slim, &repeatCount)) {
++				return 7;
++			}
++
++			const char *common = src;
++			for (i = 0; i < commonSize; i++) {
++				if (src >= slim || dest >= dlim) {
++					return 8;
++				}
++				*dest++ = *src++;
++			}
++
++			for (i = 0; i < repeatCount; i++) {
++				for (j = 0; j < customSize; j++) {
++					if (src >= slim || dest >= dlim) {
++						return 9;
++					}
++					*dest++ = *src++;
++				}
++				const char *comcopy = common;
++				for (j = 0; j < commonSize; j++) {
++					if (dest >= dlim) {
++						return 10;
++					}
++					*dest++ = *comcopy++;
++				}
++			}
++		} else if (opcode == 4) { // interleave repeatblock with zeroblock
++			ut32 commonSize = arg;
++			ut32 customSize, repeatCount;
++			if (pidata_getcount (&src, slim, &customSize)) {
++				return 11;
++			}
++			if (pidata_getcount (&src, slim, &repeatCount)) {
++				return 12;
++			}
++
++			for (i = 0; i < commonSize; i++) {
++				if (dest >= dlim) {
++					return 13;
++				}
++				*dest++ = 0;
++			}
++
++			for (

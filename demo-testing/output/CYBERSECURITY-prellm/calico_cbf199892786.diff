@@ -1,0 +1,96 @@
+@@ -519,8 +519,8 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct ct_ctx
+ 		dport = ctx->dport;
+ 		tcp_header = ctx->tcp;
+ 
+-		CALI_CT_DEBUG("CT-ICMP related lookup from %x:%d\n", be32_to_host(ip_src), sport);
+-		CALI_CT_DEBUG("CT-ICMP related lookup to   %x:%d\n", be32_to_host(ip_dst), dport);
++		CALI_CT_DEBUG("related lookup from %x:%d\n", be32_to_host(ip_src), sport);
++		CALI_CT_DEBUG("related lookup to   %x:%d\n", be32_to_host(ip_dst), dport);
+ 
+ 		srcLTDest = src_lt_dest(ip_src, ip_dst, sport, dport);
+ 		k = ct_make_key(srcLTDest, ctx->proto, ip_src, ip_dst, sport, dport);
+@@ -591,9 +591,13 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct ct_ctx
+ 			dst_to_src = &v->a_to_b;
+ 		}
+ 
++		result.tun_ret_ip = v->tun_ip;
++		CALI_CT_DEBUG("tun_ip:%x\n", be32_to_host(v->tun_ip));
++
+ 		if (ctx->proto == IPPROTO_ICMP || (related && proto_orig == IPPROTO_ICMP)) {
+ 			result.rc =	CALI_CT_ESTABLISHED_SNAT;
+ 			result.nat_ip = v->orig_ip;
++			result.nat_port = v->orig_port;
+ 			break;
+ 		}
+ 
+@@ -623,14 +627,10 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct ct_ctx
+ 			CALI_CT_DEBUG("Hit! NAT REV entry but not connection opener: ESTABLISHED.\n");
+ 			result.rc =	CALI_CT_ESTABLISHED;
+ 		}
+-		result.tun_ret_ip = v->tun_ip;
+-		CALI_CT_DEBUG("tun_ip:%x\n", be32_to_host(v->tun_ip));
+ 		break;
+ 
+ 	case CALI_CT_TYPE_NORMAL:
+-		if (v->type == CALI_CT_TYPE_NORMAL) {
+-			CALI_CT_DEBUG("Hit! NORMAL entry.\n");
+-		}
++		CALI_CT_DEBUG("Hit! NORMAL entry.\n");
+ 		CALI_CT_VERB("Created: %llu.\n", v->created);
+ 		if (tcp_header) {
+ 			CALI_CT_VERB("Last seen: %llu.\n", v->last_seen);
+@@ -734,7 +734,7 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct ct_ctx
+ 		ct_tcp_entry_update(tcp_header, src_to_dst, dst_to_src);
+ 	}
+ 
+-	CALI_CT_DEBUG("result: %d.\n", result.rc);
++	CALI_CT_DEBUG("result: %d\n", result.rc);
+ 
+ 	if (related) {
+ 		ct_result_set_flag(result.rc, CALI_CT_RELATED);
+
+
+
+
+@@ -148,12 +148,14 @@ static CALI_BPF_INLINE int skb_nat_l4_csum_ipv4(struct __sk_buff *skb, size_t of
+ 	int ret = 0;
+ 
+ 	if (ip_from != ip_to) {
+-		CALI_DEBUG("L4 checksum update (csum is at %d) IP from %x to %x\n", off, ip_from, ip_to);
++		CALI_DEBUG("L4 checksum update (csum is at %d) IP from %x to %x\n", off,
++				be32_to_host(ip_from), be32_to_host(ip_to));
+ 		ret = bpf_l4_csum_replace(skb, off, ip_from, ip_to, flags | BPF_F_PSEUDO_HDR | 4);
+ 		CALI_DEBUG("bpf_l4_csum_replace(IP): %d\n", ret);
+ 	}
+ 	if (port_from != port_to) {
+-		CALI_DEBUG("L4 checksum update (csum is at %d) port from %x to %x\n", off, port_from, port_to);
++		CALI_DEBUG("L4 checksum update (csum is at %d) port from %d to %d\n",
++				off, be16_to_host(port_from), be16_to_host(port_to));
+ 		int rc = bpf_l4_csum_replace(skb, off, port_from, port_to, flags | 2);
+ 		CALI_DEBUG("bpf_l4_csum_replace(port): %d\n", rc);
+ 		ret |= rc;
+@@ -680,20 +682,25 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct __sk_buff *skb,
+ 							 struct calico_nat_dest *nat_dest)
+ {
+ 	CALI_DEBUG("Entering calico_tc_skb_accepted\n");
+-	CALI_DEBUG("src=%x dst=%x\n", be32_to_host(state->ip_src), be32_to_host(state->ip_dst));
+-	CALI_DEBUG("post_nat=%x:%d\n", be32_to_host(state->post_nat_ip_dst), state->post_nat_dport);
+-	CALI_DEBUG("nat_tun=%x\n", state->nat_tun_src);
+-	CALI_DEBUG("pol_rc=%d\n", state->pol_rc);
+-	CALI_DEBUG("sport=%d\n", state->sport);
+-	CALI_DEBUG("flags=%x\n", state->flags);
++
+ 	enum calico_reason reason = CALI_REASON_UNKNOWN;
+ 	int rc = TC_ACT_UNSPEC;
+ 	bool fib;
+ 	struct ct_ctx ct_nat_ctx = {};
+ 	int ct_rc = ct_result_rc(state->ct_result.rc);
+ 	bool ct_related = ct_result_is_related(state->ct_result.rc);
+-
+ 	uint32_t seen_mark;
++	size_t csum_off_fixup = 0;
++
++	CALI_DEBUG("src=%x dst=%x\n", be32_to_host(state->ip_src), be32_to_host(state->ip_dst));
++	CALI_DEBUG("post_nat=%x:%d\n", be32_to_host(state->post_nat_ip_dst), state->post_nat_dport);
++	CALI_DEBUG("nat_tun=%x\n", state->nat_tun_src);
++

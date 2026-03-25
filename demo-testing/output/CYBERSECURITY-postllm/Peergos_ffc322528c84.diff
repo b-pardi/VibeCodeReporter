@@ -1,0 +1,83 @@
+@@ -272,7 +272,7 @@ public class CLI implements Runnable {
+                         long fileSize = p.toFile().length();
+                         LocalDateTime modified = LocalDateTime.ofInstant(Instant.ofEpochSecond(p.toFile().lastModified() / 1000, 0), ZoneOffset.UTC);
+                         return new FileWrapper.FileUploadProperties(p.getFileName().toString(), () -> reader(p.toFile()),
+-                                (int) (fileSize >> 32), (int) fileSize, Optional.of(modified), Optional.of(ScryptJava.hashFile(p)), skipExisting, true,
++                                (int) (fileSize >> 32), (int) fileSize, Optional.of(modified), Optional.of(ScryptJava.hashFile(p, cliContext.userContext.crypto.hasher)), skipExisting, true,
+                                 progressCreator.create(remoteRelativeDir, p.getFileName().toString(), Math.max(4096, fileSize)));
+                     })
+                     .collect(Collectors.toList());
+
+
+
+
+@@ -101,21 +101,32 @@ public class ScryptJava implements Hasher {
+                 .thenApply(h -> new Multihash(Multihash.Type.sha2_256, h));
+     }
+ 
+-    public static Blake3state hashFile(Path p) {
++    public static HashTree hashFile(Path p, Hasher hasher) {
+         byte[] buf = new byte[4 * 1024];
+         long size = p.toFile().length();
+-        Blake3 state = Blake3.initHash();
++        int chunkOffset = 0;
++        List<byte[]> chunkHashes = new ArrayList<>();
+ 
+         try (FileInputStream fin = new FileInputStream(p.toFile())) {
++            MessageDigest chunkHash = MessageDigest.getInstance("SHA-256");
+             for (long i = 0; i < size; ) {
+                 int read = fin.read(buf);
+-                state.update(buf, 0, read);
++                chunkOffset += read;
++                if (chunkOffset >= Chunk.MAX_SIZE) {
++                    int thisChunk = read - chunkOffset + Chunk.MAX_SIZE;
++                    chunkHash.update(buf, 0, thisChunk);
++                    chunkHashes.add(chunkHash.digest());
++                    chunkHash = MessageDigest.getInstance("SHA-256");
++                    chunkOffset = 0;
++                } else
++                    chunkHash.update(buf, 0, read);
+                 i += read;
+             }
++            if (size == 0 || size % Chunk.MAX_SIZE != 0)
++                chunkHashes.add(chunkHash.digest());
+ 
+-            byte[] hash = state.doFinalize(32);
+-            return new Blake3state(hash);
+-        } catch (IOException e) {
++            return HashTree.build(chunkHashes, hasher).join();
++        } catch (IOException | NoSuchAlgorithmException e) {
+             throw new RuntimeException(e);
+         }
+     }
+
+
+
+
+@@ -27,7 +27,6 @@ import peergos.shared.util.PathUtil;
+ 
+ import java.io.*;
+ import java.net.URL;
+-import java.nio.file.FileSystem;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+@@ -40,7 +39,6 @@ import java.util.concurrent.ForkJoinPool;
+ import java.util.concurrent.ForkJoinTask;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.atomic.AtomicLong;
+ import java.util.function.Supplier;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+@@ -84,8 +82,8 @@ public class DirectorySync {
+             int minFreeSpacePercent = args.getInt("min-free-space-percent", 5);
+ 
+             PeergosSyncFS remote = new PeergosSyncFS(context);
+-            LocalFileSystem local = new LocalFileSystem();
+-            SyncState syncedState = new JdbcTreeState(args.fromPeergosDir("sync-state-file", "dir-sync-state.sql").toString());
++            LocalFileSystem local = new LocalFileSystem(crypto.hasher);
++            SyncState syncedState = new JdbcTreeState(args.fromPeergosDir("sync-state-file", "dir-sync-state-v2.sql").toString());
+             List<String> localDirs = Arrays.asList(args.getArg("local-dirs").split(","));
+             if (links.size() != localDirs.size())
+                 throw new IllegalArgumentE

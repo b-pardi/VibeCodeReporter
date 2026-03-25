@@ -1,0 +1,133 @@
+@@ -3,6 +3,8 @@
+ #define R_LOG_ORIGIN "esil"
+ 
+ #include <r_anal.h>
++#include <r_io.h>
++#include <r_reg.h>
+ 
+ #if __wasi__ || EMSCRIPTEN
+ #define FE_OVERFLOW 0
+@@ -112,6 +114,95 @@ R_API REsil *r_esil_new(int stacksize, int iotrap, unsigned int addrsize) {
+ 	return esil;
+ }
+ 
++R_API REsil *r_esil_new_ex(int stacksize, bool iotrap, ut32 addrsize,
++	REsilRegInterface *reg_if, REsilMemInterface *mem_if) {
++	R_RETURN_VAL_IF_FAIL (reg_if && reg_if->is_reg && reg_if->reg_read &&
++		reg_if->reg_write && reg_if->reg_size && mem_if && mem_if->mem_read &&
++		mem_if->mem_write && (stacksize > 2), NULL);
++	//do not check for mem_switch, as that is optional
++	REsil *esil = R_NEW0 (REsil);
++	if (R_UNLIKELY (!esil)) {
++		return NULL;
++	}
++	esil->stack = calloc (sizeof (char *), stacksize);
++	if (R_UNLIKELY (!esil->stack)) {
++		goto stack_fail;
++	}
++	esil->ops = ht_pp_new (NULL, esil_ops_free, NULL);
++	if (R_UNLIKELY (!esil->ops)) {
++		goto ops_fail;
++	}
++	if (R_UNLIKELY (!r_esil_setup_ops (esil) || !r_esil_handlers_init (esil))) {
++		goto ops_setup_fail;
++	}
++	if (R_UNLIKELY (!r_esil_plugins_init (esil))) {
++		goto plugins_fail;
++	}
++	//not initializing stats here, it needs get reworked and should live in anal
++	//same goes for trace, probably
++	esil->stacksize = stacksize;
++	esil->parse_goto_count = R_ESIL_GOTO_LIMIT;
++	esil->iotrap = iotrap;
++	esil->addrmask = genmask (addrsize - 1);
++	esil->reg_if = *reg_if;
++	esil->mem_if = *mem_if;
++	return esil;
++plugins_fail:
++	r_esil_handlers_fini (esil);
++ops_setup_fail:
++	ht_pp_free (esil->ops);
++ops_fail:
++	free (esil->stack);
++stack_fail:
++	free (esil);
++	return NULL;
++}
++
++static bool default_is_reg (void *reg, const char *name) {
++	RRegItem *ri = r_reg_get ((RReg *)reg, name, -1);
++	if (!ri) {
++		return false;
++	}
++	r_unref (ri);
++	return true;
++}
++
++static bool default_reg_read (void *reg, const char *name, ut64 *res, int *size) {
++	RRegItem *ri = r_reg_get ((RReg *)reg, name, -1);
++	if (!ri) {
++		return false;
++	}
++	*res = r_reg_get_value ((RReg *)reg, ri);
++	*size = ri->size;
++	r_unref (ri);
++	return true;
++}
++
++static ut32 default_reg_size (void *reg, const char *name) {
++	RRegItem *ri = r_reg_get ((RReg *)reg, name, -1);
++	if (!ri) {
++		return 0;
++	}
++	r_unref (ri);
++	return ri->size;
++}
++
++static REsilRegInterface simple_reg_if = {
++	.is_reg = default_is_reg,
++	.reg_read = default_reg_read,
++	.reg_write = (REsilRegWrite)r_reg_setv,
++	.reg_size = default_reg_size
++};
++
++R_API REsil *r_esil_new_simple(ut32 addrsize, void *reg, void *iob) {
++	RIOBind *bnd = iob;
++	R_RETURN_VAL_IF_FAIL (reg && iob && bnd->io, NULL);
++	simple_reg_if.reg = reg;
++	REsilMemInterface simple_mem_if = {bnd->io, (REsilMemSwitch)bnd->bank_use,
++		(REsilMemRead)bnd->read_at, (REsilMemWrite)bnd->write_at};
++	return r_esil_new_ex (4096, false, addrsize, &simple_reg_if, &simple_mem_if);
++}
++
+ R_API bool r_esil_set_op(REsil *esil, const char *op, REsilOpCb code, ut32 push, ut32 pop, ut32 type) {
+ 	R_RETURN_VAL_IF_FAIL (code && R_STR_ISNOTEMPTY (op) && esil && esil->ops, false);
+ 	REsilOp *eop = ht_pp_find (esil->ops, op, NULL);
+@@ -300,12 +391,9 @@ R_API bool r_esil_mem_read(REsil *esil, ut64 addr, ut8 *buf, int len) {
+ 		return false;
+ 	}
+ 	if (!ret && esil->cb.mem_read) {
+-		ret = esil->cb.mem_read (esil, addr, buf, len);
+-		if (ret != len && ret != 1) { // !ret
+-			if (esil->iotrap) {
+-				esil->trap = R_ANAL_TRAP_READ_ERR;
+-				esil->trap_code = addr;
+-			}
++		if (ret = esil->cb.mem_read (esil, addr, buf, len), (!ret && esil->iotrap)) {
++			esil->trap = R_ANAL_TRAP_READ_ERR;
++			esil->trap_code = addr;
+ 		}
+ 	}
+ 	IFDBG {
+@@ -1137,16 +1225,15 @@ static void pushnums(REsil *esil, const char *src, ut64 num2, const char *dst, u
+ 	if (ri) {
+ 		esil->lastsz = esil_internal_sizeof_reg (esil, dst);
+ 		r_unref (ri);
+-	} else {
+-		ri = r_reg_get (reg, src, -1);
+-		if (ri) {
+-			esil->lastsz = esil_internal_sizeof_reg (esil, src);
+-			r_unref (ri);
+-		} else {
+-			// default size is set to 64 as internally operands are ut64
+-			e

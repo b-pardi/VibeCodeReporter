@@ -1,0 +1,124 @@
+@@ -53,7 +53,7 @@ class AddressTree {
+   int16_t findAddress(int family, void *addr, u_int8_t *network_mask_bits = NULL);
+   int16_t findMac(const u_int8_t addr[]);
+   bool match(char *addr);
+-  bool match(const IpAddress * const ipa, int network_bits) const;
++  patricia_node_t* match(const IpAddress * const ipa, int network_bits) const;
+   void dump();
+   void walk(void_fn3_t func, void * const user_data) const;
+ };
+
+
+
+
+@@ -32,6 +32,8 @@ class BroadcastDomains {
+   AddressTree *inline_broadcast_domains; /* Accessed inline */
+   AddressTree *broadcast_domains, *broadcast_domains_shadow; /* Accessed concurrently non-inline */
+   time_t next_update, last_update;
++  u_int16_t next_domain_id;
++  std::map<u_int16_t, struct bcast_domain_info> domains_info; /* Insertion: inline, read: non-inline */
+ 
+  public:
+   BroadcastDomains(NetworkInterface *_iface);
+
+
+
+
+@@ -142,6 +142,7 @@ class Utils {
+   static patricia_node_t* ptree_match(const patricia_tree_t *tree, int family, const void * const addr, int bits);
+   static patricia_node_t* ptree_add_rule(patricia_tree_t *ptree, const char * const line);
+   static int ptree_remove_rule(patricia_tree_t *ptree, char *line);
++  static bool ptree_prefix_print(prefix_t *prefix, char *buffer, size_t bufsize);
+ 
+   static inline void update_ewma(u_int32_t sample, u_int32_t *ewma, u_int8_t alpha_percent) {
+     if(alpha_percent > 100) alpha_percent = 100;
+
+
+
+
+@@ -738,4 +738,9 @@ typedef struct ts_icmp_stats {
+ class AlertableEntity;
+ typedef void (alertable_callback)(AlertableEntity *alertable, void *user_data);
+ 
++typedef struct bcast_domain_info {
++  bool is_ghost_network;
++  u_int64_t hits;
++} bcast_domain_info;
++
+ #endif /* _NTOP_TYPEDEFS_H_ */
+
+
+
+
+@@ -223,13 +223,13 @@ bool AddressTree::match(char *addr) {
+ 
+ /* ******************************************* */
+ 
+-bool AddressTree::match(const IpAddress * const ipa, int network_bits) const {
++patricia_node_t* AddressTree::match(const IpAddress * const ipa, int network_bits) const {
+   if(!ipa)
+-    return false;
++    return(NULL);
+ 
+   bool is_v4 = ipa->isIPv4();
+   if(!is_v4 && !ptree_v6)
+-    return false;
++    return(NULL);
+ 
+   if(is_v4)
+     return Utils::ptree_match(ptree_v4, AF_INET, &ipa->getIP()->ipType.ipv4, network_bits);
+@@ -280,28 +280,19 @@ int16_t AddressTree::findMac(const u_int8_t addr[]) {
+ /* **************************************************** */
+ 
+ static void address_tree_dump_funct(patricia_node_t * node, void *data, void *user_data) {
+-  char address[64], ret[64], *a;
++  char address[128];
+   prefix_t *prefix;
+ 
+   if(!node || !(prefix = node->prefix))
+     return;
+ 
+-  switch(prefix->family) {
+-  case AF_INET:
+-    a = Utils::intoaV4(ntohl(prefix->add.sin.s_addr), address, sizeof(address));
+-    snprintf(ret, sizeof(ret), "%s/%d", a, prefix->bitlen);
+-    break;
+-
+-  case AF_INET6:
+-    a = Utils::intoaV6(*((struct ndpi_in6_addr*)&prefix->add.sin6), prefix->bitlen, address, sizeof(address));
+-    snprintf(ret, sizeof(ret), "%s/%d", a, prefix->bitlen);
+-    break;
+-  }
++  if(!Utils::ptree_prefix_print(prefix, address, sizeof(address)))
++    return;
+ 
+   if(user_data)
+-    lua_push_uint64_table_entry((lua_State*)user_data, ret, node->user_data);
++    lua_push_uint64_table_entry((lua_State*)user_data, address, node->user_data);
+   else
+-    ntop->getTrace()->traceEvent(TRACE_NORMAL, "[AddressTree] %s", ret);
++    ntop->getTrace()->traceEvent(TRACE_NORMAL, "[AddressTree] %s", address);
+ }
+ 
+ /* **************************************************** */
+
+
+
+
+@@ -21,6 +21,8 @@
+ 
+ #include "ntop_includes.h"
+ 
++// #define DEBUG_BROADCAST_DOMAINS
++
+ /* *************************************** */
+ 
+ BroadcastDomains::BroadcastDomains(NetworkInterface *_iface) {
+@@ -28,6 +30,7 @@ BroadcastDomains::BroadcastDomains(NetworkInterface *_iface) {
+   inline_broadcast_domains = new (std::nothrow) AddressTree(false);
+   broadcast_domains = broadcast_domains_shadow = NULL;
+   next_update = last_update = 0;
++  next_domain_id = 0;
+ }
+ 
+ /* ********

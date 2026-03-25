@@ -1,0 +1,84 @@
+@@ -35,8 +35,6 @@ class AlertsManager : public StoreManager {
+   /* methods used for alerts that have a timespan */
+   void markForMakeRoom(bool on_flows);
+ 
+-  bool notifyFlowAlert(u_int64_t rowid);
+-
+   /* methods used to retrieve alerts and counters with possible sql clause to filter */
+   int queryAlertsRaw(lua_State *vm, const char *selection, const char *clauses, const char *table_name, bool ignore_disabled);
+ 
+@@ -50,12 +48,29 @@ class AlertsManager : public StoreManager {
+   AlertsManager(int interface_id, const char *db_filename);
+   ~AlertsManager();
+ 
+-  int storeAlert(time_t tstart, time_t tend, int granularity, AlertType alert_type, const char *subtype,
+-      AlertLevel alert_severity, AlertEntity alert_entity, const char *alert_entity_value,
++  int storeAlert(time_t tstart, time_t tend, int granularity, 
++      AlertType alert_type, const char *subtype,
++      AlertLevel alert_severity, AlertEntity alert_entity, 
++      const char *alert_entity_value,
+       const char *alert_json, bool *new_alert, u_int64_t *rowid,
+       bool ignore_disabled = false, bool check_maximum = true);
++
++  int storeFlowAlert(time_t tstamp, AlertType alert_type, 
++      AlertLevel alert_severity, FlowStatus status, const char *alert_json,
++      u_int16_t vlan_id,              u_int8_t protocol,
++      u_int16_t ndpi_master_protocol, u_int16_t ndpi_app_protocol, 
++      const char *cli_ip,             const char *srv_ip,
++      const char *cli_country,        const char *srv_country,
++      const char *cli_os,             const char *srv_os,
++      u_int32_t   cli_asn,            u_int32_t   srv_asn,
++      bool        cli_is_localhost,   bool        srv_is_localhost,
++      bool        cli_is_blacklisted, bool        srv_is_blacklisted,
++      u_int64_t   cli2srv_bytes,      u_int64_t   srv2cli_bytes,
++      u_int64_t   cli2srv_packets,    u_int64_t   srv2cli_packets,
++      u_int64_t *rowid);
++
+   bool hasAlerts();
+-  int storeFlowAlert(Flow *f, FlowStatus status, AlertType alert_type, AlertLevel alert_severity, const char *status_info);
++  int enqueueFlowAlert(Flow *f, FlowStatus status, AlertType alert_type, AlertLevel alert_severity, const char *status_info);
+ 
+   inline int queryAlertsRaw(lua_State *vm, const char *selection, const char *clauses, bool ignore_disabled) {
+     return queryAlertsRaw(vm, selection, clauses, ALERTS_MANAGER_TABLE_NAME, ignore_disabled);
+
+
+
+
+@@ -83,7 +83,6 @@ class Flow : public GenericHashEntry {
+   bool iface_alert_inc, iface_alert_dec;
+ #endif
+   u_int16_t diff_num_http_requests;
+-  int64_t alert_rowid;
+ #ifdef NTOPNG_PRO
+   bool counted_in_aggregated_flow, status_counted_in_aggregated_flow;
+   bool ingress2egress_direction;
+@@ -541,7 +540,6 @@ class Flow : public GenericHashEntry {
+   inline bool isTCPReset()       const { return (!isTCPClosed()
+ 						 && ((src2dst_tcp_flags & TH_RST) || (dst2src_tcp_flags & TH_RST))); }
+   inline bool isFlowAlerted() const         { return(is_alerted); };
+-  inline void setFlowAlertId(int64_t rowid) { alert_rowid = rowid; };
+   inline void      setVRFid(u_int32_t v)  { vrfId = v;                              }
+ 
+   inline void setFlowNwLatency(const struct timeval * const tv, bool client) {
+
+
+
+
+@@ -503,6 +503,7 @@
+ #define CONST_INFLUXDB_FLUSH_TIME          10 /* sec */
+ #define CONST_INFLUXDB_MAX_DUMP_SIZE       4194304 /* 4 MB */
+ #define CONST_ALERT_STORE_QUEUE            "ntopng.push_alerts_queue"
++#define CONST_FLOW_ALERT_EVENT_QUEUE       "ntopng.cache.ifid_%d.flow_alerts_events_queue"
+ #define CONST_REMOTE_TO_REMOTE_MAX_QUEUE   32
+ #define CONST_SQL_QUEUE                    "ntopng.sql_queue"
+ #define CONST_SQL_BATCH_SIZE               32
+
+
+
+
+@@ -331,252 +331,280 @@ int AlertsManager::storeAlert(time_t tstart, time_t tend, int granularity, Alert
+ 
+ /* **************************************************** */
+ 
+-/* NOTE: notifications should be handled by Lua. However, since Flow alerts
+- * are generated internally, this function is necessary to handle them.

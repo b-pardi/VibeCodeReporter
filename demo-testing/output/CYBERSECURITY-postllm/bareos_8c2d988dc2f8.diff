@@ -1,0 +1,124 @@
+@@ -1101,7 +1101,7 @@ void* HandleFiledConnection(connection_pool& connections,
+ 
+   Dmsg1(20, "Connected to file daemon %s\n", client_name);
+ 
+-  connections.lock()->emplace_back(std::move(conn));
++  connections.add_authenticated_connection(std::move(conn));
+ 
+   RunOnIncomingConnectInterval(client_name).Run();
+ 
+
+
+
+
+@@ -400,8 +400,9 @@ bool UseWaitingClient(JobControlRecord* jcr, int timeout)
+     Dmsg1(120, "Connection from client \"%s\" to director is not allowed.\n",
+           jcr->dir_impl->res.client->resource_name_);
+   } else {
+-    auto connection = take_by_name(
+-        connections, jcr->dir_impl->res.client->resource_name_, timeout);
++    auto connection
++        = connections.take_by_name(jcr->dir_impl->res.client->resource_name_,
++                                   std::chrono::seconds{timeout});
+     if (connection) {
+       jcr->file_bsock = connection->socket.release();
+       jcr->dir_impl->FDVersion = connection->protocol_version;
+
+
+
+
+@@ -125,10 +125,7 @@ static void* UserAgentShutdownCallback(void* bsock)
+   return nullptr;
+ }
+ 
+-static void CleanupConnectionPool()
+-{
+-  cleanup_connection_pool(client_connections);
+-}
++static void CleanupConnectionPool() { client_connections.cleanup(); }
+ 
+ extern "C" void* connect_thread(void* arg)
+ {
+@@ -193,7 +190,7 @@ bool StartSocketServer(dlist<IPADDR>* addrs)
+   } while (--tries);
+ 
+   if (server_state != BnetServerState::kStarted) {
+-    client_connections.lock()->clear();
++    client_connections.clear();
+     return false;
+   }
+   return true;
+@@ -241,6 +238,6 @@ void StopSocketServer()
+     BnetStopAndWaitForThreadServerTcp(tcp_server_tid);
+     server_running = false;
+   }
+-  client_connections.lock()->clear();
++  client_connections.clear();
+ }
+ } /* namespace directordaemon */
+
+
+
+
+@@ -1270,7 +1270,7 @@ static void ListConnectedClients(UaContext* ua)
+ 
+   ua->send->Decoration("\n");
+   ua->send->Decoration("Client Initiated Connections (waiting for jobs):\n");
+-  auto conn_info = get_connection_info(get_client_connections());
++  auto conn_info = get_client_connections().info();
+   ua->send->Decoration("%-20s%-20s%-20s%-40s\n", "Connect time", "Protocol",
+                        "Authenticated", "Name");
+   ua->send->Decoration("%-20s%-20s%-20s%-20s%-20s\n", separator, separator,
+
+
+
+
+@@ -29,6 +29,8 @@
+ #include "lib/bsock.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <thread>
+ 
+ // connection
+ connection::connection(std::string_view name,
+@@ -79,46 +81,69 @@ void remove_inactive(std::vector<connection>& vec, int timeout)
+ }
+ };  // namespace
+ 
+-std::optional<connection> take_by_name(connection_pool& pool,
+-                                       std::string_view v,
+-                                       int timeout)
++std::optional<connection> connection_pool::take_by_name(
++    std::string_view v,
++    std::chrono::seconds timeout)
+ {
+-  auto locked = pool.lock();
+-  auto& vec = locked.get();
+-  remove_inactive(vec, timeout);
+-
+-  // search from last to first
+-  // this is necessary for cases where the same client connected multiple times
+-  // we want to always take the last connection because that one is the most
+-  // likely to be still alive
+-  if (auto it
+-      = std::find_if(vec.rbegin(), vec.rend(),
+-                     [v](auto& connection) { return v == connection.name; });
+-      it != vec.rend()) {
+-    auto conn = std::move(*it);
+-    // std::next(it).base() points to the same element as it,
+-    // i.e. *it == *next(it).base()
+-    vec.erase(std::next(it).base());
+-    return conn;
++  std::chrono::time_point endpoint = std::chrono::system_clock::now() + timeout;
++
++  if (std::optional opt = conns.try_lock(endpoint)) {
++    auto& locked = opt.value();
++    for (;;) {
++      auto& vec = locked.get();
++      remove_inactive(vec, 0);
++
++      // search from last to first
++      // this is necessary for cases where the same client connected multiple
++      // times we want to always take the last connection because that one is
++      // the m

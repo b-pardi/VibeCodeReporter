@@ -1,0 +1,128 @@
+@@ -1653,13 +1653,23 @@ R_API bool r_cons_pop(RCons *cons) {
+ 		R_LOG_INFO ("Nothing to pop");
+ 		return false;
+ 	}
+-	RConsContext *ctx = r_list_pop (cons->ctx_stack);
++	RConsContext *parent = r_list_pop (cons->ctx_stack);
++	// Propagate palette changes from child to parent before freeing
++	if (cons->context->pal_dirty) {
++		memcpy (&parent->cpal, &cons->context->cpal, sizeof (parent->cpal));
++		parent->pal_dirty = true;
++	}
+ 	r_cons_context_free (cons->context);
+-	cons->context = ctx;
++	cons->context = parent;
++	// Refresh palette if changes were propagated
++	if (parent->pal_dirty && !parent->pal_batch) {
++		r_cons_pal_reload (cons);
++		parent->pal_dirty = false;
++	}
+ 	// global hacks
+ 	RCons *Gcons = r_cons_singleton ();
+ 	if (cons == Gcons) {
+-		Gcons->context = ctx;
++		Gcons->context = parent;
+ 	}
+ 	return true;
+ #if 0
+
+
+
+
+@@ -163,10 +163,9 @@ static bool is_valid_color(RColor c) {
+ }
+ 
+ static void pal_refresh(RCons *cons, bool rain) {
+-	// TODO: unnecessarily slow
+ 	RConsContext *ctx = cons->context;
+-	Sdb *db = sdb_new0 ();
+ 	int i;
++	Sdb *db = rain? sdb_new0 (): NULL;
+ 	/* Compute cons->pal values */
+ 	for (i = 0; keys[i].name; i++) {
+ 		RColor *rcolor = (RColor *) (((ut8 *) &(ctx->cpal)) + keys[i].coff);
+@@ -174,13 +173,12 @@ static void pal_refresh(RCons *cons, bool rain) {
+ 		// Color is dynamically allocated, needs to be freed
+ 		R_FREE (*color);
+ 		*color = r_cons_rgb_str_mode (cons, NULL, 0, rcolor);
+-		if (is_valid_color (*rcolor)) {
++		if (db && is_valid_color (*rcolor)) {
+ 			r_strf_var (rgbstr, 16, "rgb:%02x%02x%02x", rcolor->r, rcolor->g, rcolor->b);
+-			// eprintf ("-> %s\n", rgbstr);
+ 			sdb_set (db, rgbstr, "1", 0);
+ 		}
+ 	}
+-	if (rain) {
++	if (rain && db) {
+ 		SdbList *list = sdb_foreach_list (db, true);
+ 		SdbListIter *iter;
+ 		SdbKv *kv;
+@@ -196,8 +194,8 @@ static void pal_refresh(RCons *cons, bool rain) {
+ 		}
+ 		ctx->pal.rainbow_sz = n;
+ 		ls_free (list);
++		sdb_free (db);
+ 	}
+-	sdb_free (db);
+ }
+ 
+ R_API void r_cons_pal_init(RCons *cons) {
+
+
+
+
+@@ -1760,7 +1760,8 @@ static bool cb_color(void *user, void *data) {
+ 	}
+ 	core->cons->context->color_mode = requested_mode;
+ 
+-	r_cons_pal_reload (core->cons); // double flute
++	// Regenerate palette strings for new color mode (escape sequences differ per mode)
++	r_cons_pal_reload (core->cons);
+ 	r_print_set_flags (core->print, core->print->flags);
+ 	r_log_set_colors (node->i_value);
+ 	return true;
+
+
+
+
+@@ -214,8 +214,13 @@ static bool cmd_load_theme(RCore *core, const char *_arg) {
+ 	char *theme_script = get_theme_script (core, _arg);
+ 	if (R_STR_ISNOTEMPTY (theme_script)) {
+ 		core->cmdfilter = "ec ";
++		// Enable batch mode to skip individual pal_reload calls
++		core->cons->context->pal_batch = true;
+ 		r_core_cmd_lines (core, theme_script);
++		core->cons->context->pal_batch = false;
++		// Single reload after all color changes
+ 		r_cons_pal_reload (core->cons);
++		core->cons->context->pal_dirty = false;
+ 		core->cmdfilter = NULL;
+ 		ret = true; // maybe the script fails?
+ 	} else {
+@@ -614,7 +619,12 @@ static bool cmd_ec(RCore *core, const char *input) {
+ 				// Set color
+ 				*q++ = 0;
+ 				if (r_cons_pal_set (core->cons, p, q)) {
+-					r_cons_pal_reload (core->cons);
++					core->cons->context->pal_dirty = true;
++					if (!core->cons->context->pal_batch) {
++						r_cons_pal_reload (core->cons);
++						// if we uncomment this changing color theme doesnt work from rcore_cmd_str
++						// core->cons->context->pal_dirty = false;
++					}
+ 				}
+ 			} else {
+ 				char color[32] = { 0 };
+
+
+
+
+@@ -452,6 +452,8 @@ typedef struct r_cons_context_t {
+ 	int color_limit; // maximum mode based TERM envvar
+ 	RConsPalette cpal;
+ 	RConsPrintablePalette pal;
++	bool pal_dirty; // cpal was modified, needs refresh
++	bool pal_batch; // batch mode: skip auto-reload after pal_set
+ 
+ 	RList *sorted_lines; // wtf
+ 	RList *unsorted_lines; // wtf

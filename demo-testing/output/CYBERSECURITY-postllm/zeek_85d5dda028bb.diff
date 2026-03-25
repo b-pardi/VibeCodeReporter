@@ -1,0 +1,88 @@
+@@ -444,155 +444,151 @@ bool ZeroMQBackend::DoPublishLogWrites(const logging::detail::LogWriteHeader& he
+     return true;
+ }
+ 
+-void ZeroMQBackend::Run() {
+-    char name[4 + 2 + 16 + 1]{}; // zmq-0x<8byte pointer in hex><nul>
+-    snprintf(name, sizeof(name), "zmq-%p", this);
+-    util::detail::set_thread_name(name);
+-    ZEROMQ_DEBUG_THREAD_PRINTF(DebugFlag::THREAD, "Thread starting (%p)\n", this);
+-
+-    using MultipartMessage = std::vector<zmq::message_t>;
+-
+-    auto HandleLogMessages = [this](const std::vector<MultipartMessage>& msgs) {
+-        for ( const auto& msg : msgs ) {
+-            // sender, format, type,  payload
+-            if ( msg.size() != 4 ) {
+-                ZEROMQ_THREAD_PRINTF("log: error: expected 4 parts, have %zu!\n", msg.size());
+-                continue;
++// Forward messages from the inprocess bridge.
++//
++// Either it's 2 parts (tag and payload) for controlling subscriptions
++// or terminating the thread, or it is 4 parts in which case all the parts
++// are forwarded to the XPUB socket directly for publishing.
++void ZeroMQBackend::HandleInprocMessages(std::vector<MultipartMessage>& msgs) {
++    for ( auto& msg : msgs ) {
++        if ( msg.size() == 2 ) {
++            InprocTag tag = msg[0].data<InprocTag>()[0];
++            switch ( tag ) {
++                case InprocTag::XsubUpdate: {
++                    xsub.send(msg[1], zmq::send_flags::none);
++                    break;
++                }
++                case InprocTag::Terminate: {
++                    if ( self_thread_stop )
++                        ZEROMQ_THREAD_PRINTF("inproc: error: duplicate shutdown message");
++                    self_thread_stop = true;
++                }
+             }
+-
+-            byte_buffer payload{msg[3].data<std::byte>(), msg[3].data<std::byte>() + msg[3].size()};
+-            LogMessage lm{.format = std::string(msg[2].data<const char>(), msg[2].size()),
+-                          .payload = std::move(payload)};
+-
+-            QueueForProcessing(std::move(lm));
+         }
+-    };
+-
+-    auto HandleInprocMessages = [this](std::vector<MultipartMessage>& msgs) {
+-        // Forward messages from the inprocess bridge.
+-        //
+-        // Either it's 2 parts (tag and payload) for controlling subscriptions
+-        // or terminating the thread, or it is 4 parts in which case all the parts
+-        // are forwarded to the XPUB socket directly for publishing.
+-        for ( auto& msg : msgs ) {
+-            if ( msg.size() == 2 ) {
+-                InprocTag tag = msg[0].data<InprocTag>()[0];
+-                switch ( tag ) {
+-                    case InprocTag::XsubUpdate: {
+-                        xsub.send(msg[1], zmq::send_flags::none);
++        else if ( msg.size() == 4 ) {
++            for ( auto& part : msg ) {
++                zmq::send_flags flags = zmq::send_flags::dontwait;
++                if ( part.more() )
++                    flags = flags | zmq::send_flags::sndmore;
++
++                zmq::send_result_t result;
++                int tries = 0;
++                do {
++                    try {
++                        result = xpub.send(part, flags);
++                    } catch ( zmq::error_t& err ) {
++                        if ( err.num() == ETERM )
++                            return;
++
++                        // XXX: What other error can happen here? How should we react?
++                        ZEROMQ_THREAD_PRINTF("xpub: Failed to publish with error %s (%d)\n", err.what(), err.num());
+                         break;
+                     }
+-                    case InprocTag::Terminate: {
+-                        if ( self_thread_stop )
+-                            ZEROMQ_THREAD_PRINTF("inproc: error: duplicate shutdown message");
+-                        self_thread_stop = true;
+-                    }
+-                }
+-            }
+-            else if ( msg.size() == 4 ) {
+-                for ( auto& part : msg ) {
+-                    zmq::send_flags flags = zmq::send_flags::do

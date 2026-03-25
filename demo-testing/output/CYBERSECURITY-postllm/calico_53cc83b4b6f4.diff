@@ -1,0 +1,130 @@
+@@ -1,5 +1,5 @@
+ // Project Calico BPF dataplane programs.
+-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
++// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ 
+ #ifndef __CALI_CONNTRACK_H__
+@@ -186,6 +186,8 @@ create:
+ 	src_to_dst->seqno = seq;
+ 	src_to_dst->syn_seen = syn;
+ 	src_to_dst->opener = 1;
++	src_to_dst->packets = 1;
++	src_to_dst->bytes = ctx->skb->len;
+ 	if (CALI_F_TO_HOST) {
+ 		src_to_dst->ifindex = skb_ingress_ifindex(ctx->skb);
+ 	} else {
+@@ -1028,6 +1030,22 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_lookup(struct cali_tc_c
+ 		result.ifindex_fwd = dst_to_src->ifindex;
+ 	}
+ 
++    if ((CALI_F_INGRESS && CALI_F_TUNNEL) || !skb_seen(ctx->skb)) {
++		/* Account for the src->dst leg if we haven't seen the packet yet.
++		 * Since when the traffic is tunneled, BPF program on the host
++		 * iface sees it first and marks it as seen before another
++		 * program sees the packet as decaped. Only then we can account
++		 * for the bytes and packets. Unfortunately, we need to mark the
++		 * packets as seen otherwise they would get dropped as something
++		 * we missed.
++		 *
++		 * Needs to be done for tunnels that preserve the packet, like
++		 * IPIP and unlike wireguard.
++		 */
++		src_to_dst->packets++;
++		src_to_dst->bytes += ctx->skb->len;
++	}
++
+ 	if (syn) {
+ 		CALI_CT_DEBUG("packet is SYN");
+ 		ct_result_set_flag(result.rc, CT_RES_SYN);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,35 @@
++// Project Calico BPF dataplane programs.
++// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
++
++#ifndef __CALI_EVETNS_H__
++#define __CALI_EVETNS_H__
++
++#include "bpf.h"
++#include "types.h"
++#include "perf.h"
++#include "jump.h"
++#include <linux/bpf_perf_event.h>
++#include "events_type.h"
++#include "log.h"
++
++static CALI_BPF_INLINE void event_flow_log(struct cali_tc_ctx *ctx)
++{
++#ifndef IPVER6
++	ctx->state->eventhdr.type = EVENT_POLICY_VERDICT,
++#else
++	ctx->state->eventhdr.type = EVENT_POLICY_VERDICT_V6,
++#endif
++	ctx->state->eventhdr.len = offsetof(struct cali_tc_state, rule_ids) + sizeof(__u64) * MAX_RULE_IDS;
++
++	/* Due to stack space limitations, the begining of the state is structured as the
++	 * event and so we can send the data straight without copying in BPF.
++	 */
++	int err = perf_commit_event(ctx->skb, ctx->state, ctx->state->eventhdr.len);
++
++	if (err != 0) {
++		CALI_DEBUG("event_flow_log: perf_commit_event returns %d\n", err);
++	}
++}
++
++#endif /* __CALI_EVETNS_H__ */
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,16 @@
++// Project Calico BPF dataplane programs.
++// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
++
++#ifndef __CALI_EVENTS_TYPE_H__
++#define __CALI_EVENTS_TYPE_H__
++
++#define EVENT_PROTO_STATS       1
++#define EVENT_DNS               2
++#define EVENT_POLICY_VERDICT    3
++#define EVENT_TCP_STATS         4
++#define EVENT_PROCESS_PATH      5
++#define EVENT_DNS_L3            6
++
++#define EVENT_POLICY_VERDICT_V6    7
++#endif /* __CALI_EVENTS_TYPE_H__ */
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,25 @@
++// Project Calico BPF dataplane programs.
++// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
++
++#ifndef __CALI_PERF_H__
++#define __CALI_PERF_H__
++
++#include "bpf.h"
++#include "perf_types.h"
++
++/* perf_commit_event commits an event with the provided data */
++static CALI_BPF_INLINE int perf_commit_event(void *ctx, void *data, __u64 size)
++{
++	return bpf_perf_event_output(ctx, &cali_perf_evnt, BPF_F_CURRENT_CPU, data, size);
++}
++
++/* perf_commit_event_ctx commits an event and includes ctx_send_size bytes of the context */
++static CALI_BPF_INLINE int perf_commit_event_ctx(void *ctx, __u32 ctx_send_size, void *data, __u64 size)
++{
++	__u64 flags = BPF_F_CURRENT_CPU | (((__u64)ctx_send_size << 32) & BPF_F_CTXLEN_MASK);
++
++	return bpf_perf_event_output(c

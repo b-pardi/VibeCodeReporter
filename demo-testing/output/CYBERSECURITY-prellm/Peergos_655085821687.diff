@@ -1,0 +1,96 @@
+@@ -100,16 +100,6 @@ public class FileContentAddressedStorage implements ContentAddressedStorage {
+         return CompletableFuture.completedFuture(Arrays.asList(h));
+     }
+ 
+-    @Override
+-    public CompletableFuture<List<Multihash>> getLinks(Multihash root) {
+-        if (root instanceof Cid && ((Cid) root).codec == Cid.Codec.Raw)
+-            return CompletableFuture.completedFuture(Collections.emptyList());
+-        return get(root).thenApply(opt -> opt
+-                .map(cbor -> cbor.links())
+-                .orElse(Collections.emptyList())
+-        );
+-    }
+-
+     private Path getFilePath(Multihash h) {
+         String name = h.toString();
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,337 @@
++package peergos.server.storage;
++
++import com.amazonaws.*;
++import com.amazonaws.auth.*;
++import com.amazonaws.services.s3.*;
++import com.amazonaws.services.s3.model.*;
++import peergos.shared.cbor.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.cid.*;
++import peergos.shared.io.ipfs.multibase.binary.*;
++import peergos.shared.storage.*;
++import peergos.shared.io.ipfs.multihash.*;
++import io.prometheus.client.Histogram;
++import peergos.shared.util.*;
++
++import java.io.*;
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.function.*;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import java.util.stream.*;
++
++public class S3BlockStorage implements ContentAddressedStorage {
++    private static final Logger LOG = Logger.getGlobal();
++
++    private static final Histogram readTimerLog = Histogram.build()
++            .labelNames("filesize")
++            .name("block_read_seconds").help("Time to read a block from immutable storage")
++            .exponentialBuckets(0.01, 2, 16).register();
++    private static final Histogram writeTimerLog = Histogram.build()
++            .labelNames("filesize")
++            .name("s3_block_write_seconds").help("Time to read a block from immutable storage")
++            .exponentialBuckets(0.01, 2, 16).register();
++
++    private final Multihash id;
++    private final AmazonS3 s3Client;
++    private final String bucket, folder;
++
++    public S3BlockStorage(String region, String accessKey, String secretKey, String bucket, String folder, Multihash id) {
++        this.id = id;
++        this.bucket = bucket;
++        this.folder = folder.isEmpty() || folder.endsWith("/") ? folder : folder + "/";
++        AmazonS3ClientBuilder builder = AmazonS3ClientBuilder.standard()
++                .withRegion(region)
++                .withCredentials(new AWSStaticCredentialsProvider(new BasicAWSCredentials(accessKey, secretKey)));
++        s3Client = builder.build();
++    }
++
++    private static String hashToKey(Multihash hash) {
++        // To be compatible with IPFS we use the ame scheme here, the cid bytes encoded as uppercase base32
++        return new Base32().encodeAsString(hash.toBytes());
++    }
++
++    private Multihash keyToHash(String key) {
++        // To be compatible with IPFS we use the ame scheme here, the cid bytes encoded as uppercase base32
++        byte[] decoded = new Base32().decode(key.substring(folder.length()));
++        return Cid.cast(decoded);
++    }
++
++    @Override
++    public CompletableFuture<Optional<CborObject>> get(Multihash hash) {
++        if (hash instanceof Cid && ((Cid) hash).codec == Cid.Codec.Raw)
++            throw new IllegalStateException("Need to call getRaw if cid is not cbor!");
++        return getRaw(hash).thenApply(opt -> opt.map(CborObject::fromByteArray));
++    }
++
++    @Override
++    public CompletableFuture<Optional<byte[]>> getRaw(Multihash hash) {
++        return Futures.of(map(hash, h -> {
++            GetObjectRequest get = new GetObjectRequest(bucket, folder + hashToKey(hash));
++            Histogram.Timer readTimer = readTimerLog.labels(h.toString()).startTimer();
++            try (S3Object res = s3Client.getObject(get); DataInputStream din = new DataInputStream(new BufferedInputStream(res.getObjectConte

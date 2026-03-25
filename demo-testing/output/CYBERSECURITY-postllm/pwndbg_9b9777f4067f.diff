@@ -1,0 +1,139 @@
+@@ -22,6 +22,7 @@ def load_aglib():
+     import pwndbg.aglib.heap
+     import pwndbg.aglib.memory
+     import pwndbg.aglib.nearpc
++    import pwndbg.aglib.next
+     import pwndbg.aglib.proc
+     import pwndbg.aglib.qemu
+     import pwndbg.aglib.regs as regs_mod
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,261 @@
++"""
++Commands for setting temporary breakpoints on the next
++instruction of some type (call, branch, etc.)
++"""
++
++from __future__ import annotations
++
++import re
++from itertools import chain
++
++import capstone
++
++import pwndbg.aglib.disasm
++import pwndbg.aglib.proc
++import pwndbg.aglib.regs
++from pwndbg.color import message
++from pwndbg.dbg import BreakpointLocation
++
++interrupts = {capstone.CS_GRP_INT}
++
++
++def next_int(address=None):
++    """
++    If there is a syscall in the current basic black,
++    return the instruction of the one closest to $PC.
++
++    Otherwise, return None.
++    """
++    if address is None:
++        ins = pwndbg.aglib.disasm.one(pwndbg.aglib.regs.pc)
++        if not ins:
++            return None
++        address = ins.next
++
++    ins = pwndbg.aglib.disasm.one(address)
++    while ins:
++        if ins.jump_like:
++            return None
++        elif ins.groups & interrupts:
++            return ins
++        ins = pwndbg.aglib.disasm.one(ins.next)
++
++    return None
++
++
++def next_branch(address=None):
++    if address is None:
++        ins = pwndbg.aglib.disasm.one(pwndbg.aglib.regs.pc)
++        if not ins:
++            return None
++        address = ins.next
++
++    ins = pwndbg.aglib.disasm.one(address)
++    while ins:
++        if ins.jump_like:
++            return ins
++        ins = pwndbg.aglib.disasm.one(ins.next)
++
++    return None
++
++
++def next_matching_until_branch(address=None, mnemonic=None, op_str=None):
++    """
++    Finds the next instruction that matches the arguments between the given
++    address and the branch closest to it.
++    """
++    if address is None:
++        address = pwndbg.aglib.regs.pc
++
++    ins = pwndbg.aglib.disasm.one(address)
++    while ins:
++        # Check whether or not the mnemonic matches if it was specified
++        mnemonic_match = ins.mnemonic.casefold() == mnemonic.casefold() if mnemonic else True
++
++        # Check whether or not the operands match if they were specified
++        op_str_match = True
++        if op_str is not None:
++            op_str_match = False
++
++            # Remove whitespace and fold the case of both targets.
++            ops = "".join(ins.op_str.split()).casefold()
++            if isinstance(op_str, str):
++                op_str = "".join(op_str.split()).casefold()
++            elif isinstance(op_str, list):
++                op_str = "".join(chain.from_iterable(op.split() for op in op_str)).casefold()
++            else:
++                raise ValueError("op_str value is of an unsupported type")
++            op_str_match = ops == op_str
++
++        # If all of the parameters that were specified match, this is the
++        # instruction we want to stop at.
++        if mnemonic_match and op_str_match:
++            return ins
++
++        if ins.jump_like:
++            # No matching instruction until the next branch, and we're
++            # not trying to match the branch instruction itself.
++            return None
++
++        ins = pwndbg.aglib.disasm.one(ins.next)
++    return None
++
++
++async def break_next_branch(ec: pwndbg.dbg_mod.ExecutionController, address=None):
++    ins = next_branch(address)
++
++    proc = pwndbg.dbg.selected_inferior()
++    if ins:
++        bp = proc.break_at(BreakpointLocation(ins.address), internal=True)
++        await ec.cont(bp)
++        return ins
++
++
++async def break_next_interrupt(ec: pwndbg.dbg_mod.ExecutionController, address=None):
++    ins = next_int(address)
++
++    proc = pwndbg.dbg.selected_inferior()
++    if ins:
++        bp = proc.break_at(BreakpointLocation(ins.address), internal=True)
++        await ec.cont(bp)
++        bp.remove()
++        return ins
++
++
++async def break_next_call(ec: pwndbg.dbg_mod.E

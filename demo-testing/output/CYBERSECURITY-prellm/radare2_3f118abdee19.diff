@@ -1,0 +1,126 @@
+@@ -5,7 +5,9 @@
+ #include <r_list.h>
+ #include <r_core.h>
+ 
++#define USE_FCN_RECURSE 1
+ #define USE_SDB_CACHE 0
++#define READ_AHEAD 1
+ #define SDB_KEY_BB "bb.0x%"PFMT64x ".0x%"PFMT64x
+ // XXX must be configurable by the user
+ #define JMPTBLSZ 512
+@@ -62,6 +64,48 @@ R_API const char *r_anal_fcn_type_tostring(int type) {
+ 	return "unk";
+ }
+ 
++#if READ_AHEAD
++static ut64 cache_addr = UT64_MAX;
++
++// TODO: move into io :?
++static int read_ahead(RAnal *anal, ut64 addr, ut8 *buf, int len) {
++	static ut8 cache[1024];
++	const int cache_len = sizeof (cache);
++
++	if (len < 1) {
++		return 0;
++	}
++	if (len > cache_len) {
++		int a = anal->iob.read_at (anal->iob.io, addr, buf, len); // double read
++		memcpy (cache, buf, cache_len);
++		cache_addr = addr;
++		return a;
++	}
++
++	ut64 addr_end = UT64_ADD_OVFCHK (addr, len)? UT64_MAX: addr + len;
++	ut64 cache_addr_end = UT64_ADD_OVFCHK (cache_addr, cache_len)? UT64_MAX: cache_addr + cache_len;
++	bool isCached = ((addr != UT64_MAX) && (addr >= cache_addr) && (addr_end < cache_addr_end));
++	if (isCached) {
++		memcpy (buf, cache + (addr - cache_addr), len);
++	} else {
++		anal->iob.read_at (anal->iob.io, addr, cache, sizeof (cache));
++		memcpy (buf, cache, len);
++		cache_addr = addr;
++	}
++	return len;
++}
++#else
++static int read_ahead(RAnal *anal, ut64 addr, ut8 *buf, int len) {
++	return anal->iob.read_at (anal->iob.io, addr, buf, len);
++}
++#endif
++
++R_API void r_anal_fcn_invalidate_read_ahead_cache() {
++#if READ_AHEAD
++	cache_addr = UT64_MAX;
++#endif
++}
++
+ static int cmpaddr(const void *_a, const void *_b) {
+ 	const RAnalBlock *a = _a, *b = _b;
+ 	return (a->addr - b->addr);
+@@ -401,23 +445,21 @@ static RAnalBlock *appendBasicBlock(RAnal *anal, RAnalFunction *fcn, ut64 addr)
+ }
+ 
+ #define FITFCNSZ() {\
+-		st64 n = bb->addr + bb->size - fcn->addr;\
+-		if (n >= 0 && r_anal_fcn_size (fcn) < n) { r_anal_fcn_set_size (NULL, fcn, n); } }\
++	st64 n = bb->addr + bb->size - fcn->addr;\
++	if (n >= 0 && r_anal_fcn_size (fcn) < n) {\
++		r_anal_fcn_set_size (NULL, fcn, n); }\
++	}\
+ 	if (r_anal_fcn_size (fcn) > MAX_FCN_SIZE) {\
+ 		/* eprintf ("Function too big at 0x%"PFMT64x" + %d\n", bb->addr, fcn->size); */\
+ 		r_anal_fcn_set_size (NULL, fcn, 0);\
+-		return R_ANAL_RET_ERROR; }
++		return R_ANAL_RET_ERROR;\
++	}
+ 
+-static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut64 len, int depth);
++static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth);
+ #define recurseAt(x) {\
+-		ut8 *bbuf = malloc (anal->opt.bb_max_size);\
+-		if (bbuf) {\
+-			anal->iob.read_at (anal->iob.io, x, bbuf, anal->opt.bb_max_size);\
+-			ret = fcn_recurse (anal, fcn, x, bbuf, anal->opt.bb_max_size, depth - 1);\
+-			r_anal_fcn_update_tinyrange_bbs (fcn);\
+-			r_anal_fcn_set_size (anal, fcn, r_anal_fcn_size (fcn));\
+-			free (bbuf);\
+-		}\
++	ret = fcn_recurse (anal, fcn, x, anal->opt.bb_max_size, depth - 1);\
++	r_anal_fcn_update_tinyrange_bbs (fcn);\
++	r_anal_fcn_set_size (anal, fcn, r_anal_fcn_size (fcn));\
+ }
+ 
+ static void queue_case(RAnal *anal, ut64 switch_addr, ut64 case_addr, ut64 id, ut64 case_addr_loc) {
+@@ -568,42 +610,16 @@ static int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut
+ 	return ret;
+ }
+ 
+-#if 0
+-static ut64 search_reg_val(RAnal *anal, ut8 *buf, ut64 len, ut64 addr, char *regsz) {
+-	ut64 offs, oplen;
+-	RAnalOp op = {
+-		0
+-	};
+-	ut64 ret = UT64_MAX;
+-	const int addrbytes = anal->iob.io ? anal->iob.io->addrbytes : 1;
+-	for (offs = 0; offs < len; offs += addrbytes * oplen) {
+-		r_anal_op_fini (&op);
+-		if ((oplen = r_anal_op (anal, &op, addr + offs, buf + offs, len - offs, R_ANAL_OP_MASK_ALL)) < 1) {
+-			break;
+-		}
+-		if (op.dst && op.dst->reg && op.dst->reg->name && !strcmp (op.dst->reg->name, regsz)) {
+-			if (op.src[0]) {
+-				ret = op.src[0]->delta;
+-			}
+-		}
+-	}
+-	return ret;
+-}
+-#endif
+-
+ #define gotoBeach(x) ret = x; goto beach;
+-#define gotoBeachRet() goto beach;
+ 
+ static bool isInvalidMemory(const ut8 *buf, int len) {
+ 	// can be wrong
+ 	ret

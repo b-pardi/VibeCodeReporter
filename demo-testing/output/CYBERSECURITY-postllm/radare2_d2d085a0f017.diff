@@ -1,0 +1,142 @@
+@@ -52,9 +52,46 @@ R_IPI bool r_coff_supported_arch(const ut8 *buf) {
+ 	return r_coff_supported_arch_le (buf) || r_coff_supported_arch_be (buf);
+ }
+ 
++// copied from bfd
++static bool r_coff_decode_base64(const char *str, ut32 len, ut32 *res) {
++	ut32 i;
++	ut32 val;
++
++	val = 0;
++	for (i = 0; i < len; i++) {
++		char c = str[i];
++		ut32 d;
++		if (c >= 'A' && c <= 'Z') {
++			d = c - 'A';
++		} else if (c >= 'a' && c <= 'z') {
++			d = c - 'a' + 26;
++		} else if (c >= '0' && c <= '9') {
++			d = c - '0' + 52;
++		} else if (c == '+') {
++			d = 62;
++		} else if (c == '/') {
++			d = 63;
++		} else {
++			return false;
++		}
++
++		/* Check for overflow */
++		if ((val >> 26) != 0) {
++			return false;
++		}
++
++		val = (val << 6) + d;
++	}
++
++	*res = val;
++	return true;
++}
++
+ R_IPI char *r_coff_symbol_name(RBinCoffObj *obj, void *ptr) {
+ 	char n[256] = {0};
+ 	int len = 0;
++	ut32 offset = 0; // offset into the string table.
++
+ 	union {
+ 		char name[8];
+ 		struct {
+@@ -65,14 +102,31 @@ R_IPI char *r_coff_symbol_name(RBinCoffObj *obj, void *ptr) {
+ 	if (!ptr) {
+ 		return NULL;
+ 	}
+-	if (p->zero) {
++
++	if (p->zero && *p->name != '/') {
+ 		return r_str_ndup (p->name, 8);
++	} else if (*p->name == '/') {
++		char *offset_str = (p->name + 1);
++		if (*offset_str == '/') {
++			r_coff_decode_base64 (p->name + 2, 6, &offset);
++		} else {
++			offset = atoi (offset_str);
++		}
++	} else {
++		offset = p->offset;
+ 	}
+-	ut64 offset = obj->hdr.f_symptr + (obj->hdr.f_nsyms * sizeof (struct coff_symbol) + p->offset);
+-	if (offset > obj->size) {
++
++	// Calculate the actual pointer to the symbol/section name we're interested in.
++	ut64 name_ptr;
++	if (obj->type == COFF_TYPE_BIGOBJ) {
++		name_ptr = obj->bigobj_hdr.f_symptr + (obj->bigobj_hdr.f_nsyms * sizeof (struct coff_bigobj_symbol) + offset);
++	} else {
++		name_ptr = obj->hdr.f_symptr + (obj->hdr.f_nsyms * sizeof (struct coff_symbol) + offset);
++	}
++	if (name_ptr > obj->size) {
+ 		return NULL;
+ 	}
+-	len = r_buf_read_at (obj->b, offset, (ut8*)n, sizeof (n));
++	len = r_buf_read_at (obj->b, name_ptr, (ut8 *)n, sizeof (n));
+ 	if (len < 1) {
+ 		return NULL;
+ 	}
+@@ -81,11 +135,24 @@ R_IPI char *r_coff_symbol_name(RBinCoffObj *obj, void *ptr) {
+ 	return strdup (n);
+ }
+ 
+-static int r_coff_rebase_sym(RBinCoffObj *obj, RBinAddr *addr, struct coff_symbol *sym) {
+-	if (sym->n_scnum < 1 || sym->n_scnum > obj->hdr.f_nscns) {
++static int r_coff_rebase_sym(RBinCoffObj *obj, RBinAddr *addr, int symbol_index) {
++	ut32 n_scnum = 0;
++	ut32 n_value = 0;
++	ut32 f_nscns = 0;
++	if (obj->type == COFF_TYPE_BIGOBJ) {
++		n_scnum = obj->bigobj_symbols[symbol_index].n_scnum;
++		n_value = obj->bigobj_symbols[symbol_index].n_value;
++		f_nscns = obj->bigobj_hdr.f_nscns;
++	} else {
++		n_scnum = obj->symbols[symbol_index].n_scnum;
++		n_value = obj->symbols[symbol_index].n_value;
++		f_nscns = obj->hdr.f_nscns;
++	}
++
++	if (n_scnum < 1 || n_scnum > f_nscns) {
+ 		return 0;
+ 	}
+-	addr->paddr = obj->scn_hdrs[sym->n_scnum - 1].s_scnptr + sym->n_value;
++	addr->paddr = obj->scn_hdrs[n_scnum - 1].s_scnptr + n_value;
+ 	return 1;
+ }
+ 
+@@ -145,6 +212,40 @@ static RBinAddr *r_xcoff_get_entry(RBinCoffObj *obj) {
+ 	return addr;
+ }
+ 
++static bool r_coff_get_entry_helper(RBinCoffObj *obj, RBinAddr *address) {
++	void *symbols = NULL;
++	size_t symbol_size;
++	size_t symbol_count;
++	if (obj->type == COFF_TYPE_BIGOBJ) {
++		symbols = (void *)obj->bigobj_symbols;
++		symbol_size = sizeof (struct coff_bigobj_symbol);
++		symbol_count = obj->bigobj_hdr.f_nsyms;
++	} else {
++		symbols = (void *)obj->symbols;
++		symbol_size = sizeof (struct coff_symbol);
++		symbol_count = obj->hdr.f_nsyms;
++	}
++
++	int i;
++
++	for (i = 0; i < symbol_count; i++) {
++		const char *name = (const char *)symbols + (i * symbol_size);
++		if ((!strcmp (name, "_start") || !strcmp (name, "start")) &&
++			r_coff_rebase_sym (obj, address, i)) {
++			return true;
++		}
++	}
++
++	for (i = 0; i < symbol_count; i++) {
++		const char *name = (const char *)symbols + (i * symbol_size);
++		if ((!strcmp (name, "_main") || !strc

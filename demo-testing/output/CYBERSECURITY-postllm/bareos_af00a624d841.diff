@@ -1,0 +1,124 @@
+@@ -1,7 +1,7 @@
+ /*
+    BAREOS® - Backup Archiving REcovery Open Sourced
+ 
+-   Copyright (C) 2020-2022 Bareos GmbH & Co. KG
++   Copyright (C) 2020-2025 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -29,8 +29,8 @@ struct plugin_private_context {
+   bool python_path_is_set;          // Python plugin search path is set?
+   char* module_path;                // Plugin Module Path
+   char* module_name;                // Plugin Module Name
+-  PyThreadState*
+-      interpreter;    // Python interpreter for this instance of the plugin
++  PyInterpreterState*
++      interp;         // Python interpreter for this instance of the plugin
+   PyObject* pModule;  // Python Module entry point
+   PyObject* pyModuleFunctionsDict;  // Python Dictionary
+ };
+
+
+
+
+@@ -2,7 +2,7 @@
+    BAREOS® - Backup Archiving REcovery Open Sourced
+ 
+    Copyright (C) 2011-2014 Planets Communications B.V.
+-   Copyright (C) 2013-2024 Bareos GmbH & Co. KG
++   Copyright (C) 2013-2025 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -48,6 +48,19 @@
+ #include "lib/plugins.h"
+ #include "lib/edit.h"
+ 
++namespace {
++uint32_t PyVersion()
++{
++#if PY_VERSION_HEX < VERSION_HEX(3, 11, 0)
++  // bake it in statically
++  return PY_VERSION_HEX;
++#else
++  // determine it at runtime
++  return Py_Version;
++#endif
++}
++}  // namespace
++
+ namespace directordaemon {
+ 
+ static const int debuglevel = 150;
+@@ -66,7 +79,7 @@ static const int debuglevel = 150;
+   "  module_path: Python search path for the module.\n"                        \
+   "               The path '" PYTHON_MODULE_PATH                               \
+   "' is always checked for modules.\n"                                         \
+-  "  instance:    Default is ’0’.\n"                                       \
++  "  instance:    Default is ’0’.\n"                                           \
+   "               Increment the number, when using more than one plugin.\n"    \
+   "  Additional parameters are plugin specific."
+ 
+@@ -108,6 +121,13 @@ static PluginFunctions pluginFuncs
+ 
+ #include "plugin_private_context.h"
+ 
++
++/* List of interpreters accessed by this thread.
++ * We use a vector instead of a set here since we expect that each thread
++ * only accesses very few interpreters (<= 1) at the same time.
++ */
++thread_local std::vector<PyThreadState*> tl_threadstates{};
++
+ /**
+  * We don't actually use this but we need it to tear down the
+  * final python interpreter on unload of the plugin. Each instance of
+@@ -115,6 +135,104 @@ static PluginFunctions pluginFuncs
+  */
+ static PyThreadState* mainThreadState{nullptr};
+ 
++/* Return this threads thread state for interp if it exists.  Returns
++ * nullptr otherwise */
++PyThreadState* GetThreadStateForInterp(PyInterpreterState* interp)
++{
++  for (auto* thread : tl_threadstates) {
++    if (thread->interp == interp) { return thread; }
++  }
++  return nullptr;
++}
++
++PyThreadState* PopThreadStateForInterp(PyInterpreterState* interp)
++{
++  auto iter = std::find_if(
++      tl_threadstates.begin(), tl_threadstates.end(),
++      [interp](const auto& thread) { return thread->interp == interp; });
++
++  if (iter != tl_threadstates.end()) {
++    auto* thread = *iter;
++
++    tl_threadstates.erase(iter);
++
++    return thread;
++  } else {
++    return nullptr;
++  }
++}
++
++class locked_threadstate {
++ private:
++  locked_threadstate(PyThreadState* t_ts, bool t_owns) : ts{t_ts}, owns{t_owns}
++  {
++    // make the given thread state active
++    // we assume that we are currently holding the gil
++    (void)PyThreadState_Swap(t_ts);
++  }
++
++ public:
++  explicit locked_threadstate(PyThreadState* t_ts)
++      : locked_threadstate(t_ts, false)
++  {
++  }
++
++  explicit locked_threadstate(PyInterpreterState* interp)
++      : locked_threadstate(PyThreadState_New(interp),

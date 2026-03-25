@@ -1,0 +1,122 @@
+@@ -1097,7 +1097,16 @@ do_netdev(struct __ctx_buff *ctx, __u16 proto, bool from_host)
+ #ifdef HOST_REDIRECT_TO_INGRESS
+ 		if (proto == bpf_htons(ETH_P_ARP)) {
+ 			union macaddr mac = HOST_IFINDEX_MAC;
+-			return arp_respond(ctx, &mac, BPF_F_INGRESS);
++			union macaddr smac;
++			__be32 sip;
++			__be32 tip;
++
++			/* Pass any unknown ARP requests to the Linux stack */
++			if (!arp_validate(ctx, &mac, &smac, &sip, &tip))
++				return CTX_ACT_OK;
++
++			return arp_respond(ctx, &mac, tip, &smac, sip,
++					   BPF_F_INGRESS);
+ 		}
+ #endif
+ 
+
+
+
+
+@@ -745,7 +745,28 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_ARP)
+ int tail_handle_arp(struct __ctx_buff *ctx)
+ {
+ 	union macaddr mac = NODE_MAC;
+-	return arp_respond(ctx, &mac, 0);
++	union macaddr smac;
++	__be32 sip;
++	__be32 tip;
++
++	/* Pass any unknown ARP requests to the Linux stack */
++	if (!arp_validate(ctx, &mac, &smac, &sip, &tip))
++		return CTX_ACT_OK;
++
++	/*
++	 * The endpoint is expected to make ARP requests for its gateway IP.
++	 * Most of the time, the gateway IP configured on the endpoint is
++	 * IPV4_GATEWAY but it may not be the case if after cilium agent reload
++	 * a different gateway is chosen. In such a case, existing endpoints
++	 * will have an old gateway configured. Since we don't know the IP of
++	 * previous gateways, we answer requests for all IPs with the exception
++	 * of the LXC IP (to avoid specific problems, like IP duplicate address
++	 * detection checks that might run within the container).
++	 */
++	if (tip == LXC_IPV4)
++		return CTX_ACT_OK;
++
++	return arp_respond(ctx, &mac, tip, &smac, sip, 0);
+ }
+ #endif /* ENABLE_ARP_RESPONDER */
+ #endif /* ENABLE_IPV4 */
+
+
+
+
+@@ -30,55 +30,63 @@ static __always_inline int arp_check(struct ethhdr *eth,
+ }
+ 
+ static __always_inline int
+-arp_prepare_response(struct __ctx_buff *ctx, struct ethhdr *eth,
+-		     const struct arp_eth *arp_eth, __be32 ip,
+-		     union macaddr *mac)
++arp_prepare_response(struct __ctx_buff *ctx, union macaddr *smac, __be32 sip,
++		     union macaddr *dmac, __be32 tip)
+ {
+-	union macaddr smac = *(union macaddr *) &eth->h_source;
+-	__be32 sip = arp_eth->ar_sip;
+ 	__be16 arpop = bpf_htons(ARPOP_REPLY);
+ 
+-	if (eth_store_saddr(ctx, mac->addr, 0) < 0 ||
+-	    eth_store_daddr(ctx, smac.addr, 0) < 0 ||
++	if (eth_store_saddr(ctx, smac->addr, 0) < 0 ||
++	    eth_store_daddr(ctx, dmac->addr, 0) < 0 ||
+ 	    ctx_store_bytes(ctx, 20, &arpop, sizeof(arpop), 0) < 0 ||
+-	    ctx_store_bytes(ctx, 22, mac, 6, 0) < 0 ||
+-	    ctx_store_bytes(ctx, 28, &ip, 4, 0) < 0 ||
+-	    ctx_store_bytes(ctx, 32, &smac, sizeof(smac), 0) < 0 ||
+-	    ctx_store_bytes(ctx, 38, &sip, sizeof(sip), 0) < 0)
++	    /* sizeof(macadrr)=8 because of padding, use ETH_ALEN instead */
++	    ctx_store_bytes(ctx, 22, smac, ETH_ALEN, 0) < 0 ||
++	    ctx_store_bytes(ctx, 28, &sip, sizeof(sip), 0) < 0 ||
++	    ctx_store_bytes(ctx, 32, dmac, ETH_ALEN, 0) < 0 ||
++	    ctx_store_bytes(ctx, 38, &tip, sizeof(tip), 0) < 0)
+ 		return DROP_WRITE_ERROR;
+ 
+ 	return 0;
+ }
+ 
+-static __always_inline int arp_respond(struct __ctx_buff *ctx, union macaddr *mac,
+-				       int direction)
++static __always_inline bool
++arp_validate(const struct __ctx_buff *ctx, union macaddr *mac,
++	     union macaddr *smac, __be32 *sip, __be32 *tip)
+ {
+ 	void *data_end = (void *) (long) ctx->data_end;
+ 	void *data = (void *) (long) ctx->data;
+ 	struct arphdr *arp = data + ETH_HLEN;
+ 	struct ethhdr *eth = data;
+ 	struct arp_eth *arp_eth;
+-	int ret;
+ 
+ 	if (data + ETH_HLEN + sizeof(*arp) + sizeof(*arp_eth) > data_end)
+-		return CTX_ACT_OK;
++		return false;
++
++	if (!arp_check(eth, arp, mac))
++		return false;
+ 
+ 	arp_eth = data + ETH_HLEN + sizeof(*arp);
+-	if (arp_check(eth, arp, mac)) {
+-		__be32 target_ip = arp_eth->ar_tip;
+-		ret = arp_prepare_response(ctx, eth, arp_eth, target_ip, mac);
+-		if (unlikely(ret != 0))
+-			goto error;
+-
+-		cilium_dbg_capture(ctx, DBG_CAPTURE_DELIVERY,
+-				   ctx_get_ifindex(ctx));
+-		return ctx_redirect(ctx, ctx_get_ifindex(ctx), direction);
+-	}
+-
+-	/* Pass

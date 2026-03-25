@@ -1,0 +1,106 @@
+@@ -119,12 +119,16 @@ protected:
+   }
+ };
+ 
+-PolicyHostMap::PolicyHostMap(std::unique_ptr<Envoy::Config::Subscription<cilium::NetworkPolicyHosts>>&& subscription,
+-				   ThreadLocal::SlotAllocator& tls)
+-  : tls_(tls.allocateSlot()), subscription_(std::move(subscription)) {
++PolicyHostMap::PolicyHostMap(ThreadLocal::SlotAllocator& tls) : tls_(tls.allocateSlot()) {
+   tls_->set([&](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+       return null_hostmap_;
+   });
++}
++
++PolicyHostMap::PolicyHostMap(std::unique_ptr<Envoy::Config::Subscription<cilium::NetworkPolicyHosts>>&& subscription,
++			     ThreadLocal::SlotAllocator& tls)
++  : PolicyHostMap(tls) {
++  subscription_ = std::move(subscription);
+   subscription_->start({}, *this);
+ }
+ 
+@@ -134,13 +138,16 @@ PolicyHostMap::PolicyHostMap(const envoy::api::v2::core::Node& node, Upstream::C
+   : PolicyHostMap(subscribe<cilium::NetworkPolicyHosts>("cilium.NetworkPolicyHostsDiscoveryService.StreamNetworkPolicyHosts", node, cm, dispatcher, scope), tls) {}
+ 
+ void PolicyHostMap::onConfigUpdate(const ResourceVector& resources) {
+-  ENVOY_LOG(debug, "PolicyHostMap::onConfigUpdate({}), version: {}", resources.size(), subscription_->versionInfo());
++  std::string version;
++  if (subscription_) {
++    version = subscription_->versionInfo();
++  }
++  ENVOY_LOG(debug, "PolicyHostMap::onConfigUpdate({}), version: {}", resources.size(), version);
+ 
+   auto newmap = std::make_shared<ThreadLocalHostMapInitializer>();
+   
+-  // Update the copy.
+   for (const auto& config: resources) {
+-    ENVOY_LOG(debug, "Received NetworkPolicyHosts for policy {} in onConfigUpdate() version {}", config.policy(), subscription_->versionInfo());
++    ENVOY_LOG(debug, "Received NetworkPolicyHosts for policy {} in onConfigUpdate() version {}", config.policy(), version);
+ 
+     MessageUtil::validate(config);
+ 
+
+
+
+
+@@ -53,6 +53,7 @@ public:
+ 		Stats::Scope &scope, ThreadLocal::SlotAllocator& tls);
+   PolicyHostMap(std::unique_ptr<Envoy::Config::Subscription<cilium::NetworkPolicyHosts>>&& subscription,
+ 		ThreadLocal::SlotAllocator& tls);
++  PolicyHostMap(ThreadLocal::SlotAllocator& tls);
+   ~PolicyHostMap() {}
+ 
+   // A shared pointer to a immutable copy is held by each thread. Changes are done by
+
+
+
+
+@@ -13,9 +13,11 @@
+ #include "common/config/utility.h"
+ #include "common/filesystem/filesystem_impl.h"
+ #include "common/protobuf/protobuf.h"
++#include "common/thread_local/thread_local_impl.h"
+ #include "server/config/network/http_connection_manager.h"
+ 
+ #include "test/integration/http_integration.h"
++#include "test/test_common/environment.h"
+ #include "test/test_common/network_utility.h"
+ 
+ #include "cilium_bpf_metadata.h"
+@@ -27,9 +29,35 @@
+ 
+ namespace Envoy {
+ 
++std::string host_map_config;
++std::shared_ptr<const Cilium::PolicyHostMap> hostmap{nullptr};
++
+ Network::Address::InstanceConstSharedPtr original_dst_address;
+-std::string policy_path;
+-std::shared_ptr<const Cilium::NetworkPolicyMap> npmap;
++std::shared_ptr<const Cilium::NetworkPolicyMap> npmap{nullptr};
++
++std::string policy_config;
++
++const std::string BASIC_POLICY = R"EOF(version_info: "0"
++resources:
++- "@type": type.googleapis.com/cilium.NetworkPolicy
++  name: '173'
++  policy: 3
++  ingress_per_port_policies:
++  - port: 80
++    rules:
++    - remote_policies: [ 1 ]
++      http_rules:
++        http_rules:
++        - headers: [ { name: ':path', value: '/allowed', regex: false } ]
++        - headers: [ { name: ':path', value: '.*public$', regex: true } ]
++        - headers: [ { name: ':authority', value: 'allowedHOST', regex: false } ]
++        - headers: [ { name: ':authority', value: '.*REGEX.*', regex: true } ]
++        - headers: [ { name: ':method', value: 'PUT', regex: false }, { name: ':path', value: '/public/opinions', regex: false } ]
++    - remote_policies: [ 2 ]
++      http_rules:
++        http_rules:
++        - headers: [ { name: ':path', value: '/only-2-allowed', regex: false } ]
++)EOF";
+   
+ namespace Filter {
+ namespace BpfMet

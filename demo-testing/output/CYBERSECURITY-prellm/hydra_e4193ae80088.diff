@@ -1,0 +1,120 @@
+@@ -3,9 +3,13 @@
+ Configuration loader
+ """
+ import copy
++from collections import defaultdict
++
++import re
++
+ import os
+ from dataclasses import dataclass
+-from typing import Any, List, Optional, Tuple
++from typing import Any, List, Optional, Tuple, Dict
+ 
+ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+ from omegaconf.errors import OmegaConfBaseException
+@@ -20,6 +24,23 @@ from hydra.errors import MissingConfigException
+ from hydra.plugins.config_source import ConfigLoadError, ConfigSource
+ 
+ 
++@dataclass
++class ParsedOverride:
++    key: str
++    pkg1: str
++    pkg2: str
++    value: str
++
++    def _get_subject_package(self):
++        return self.pkg1 if self.pkg2 is None else self.pkg2
++
++    def _is_package_rename(self):
++        return self.pkg1 is not None and self.pkg2 is not None
++
++    def _is_default_deletion(self):
++        return self.value == "null"
++
++
+ @dataclass
+ class DefaultElement:
+     config_group: Optional[str]
+@@ -27,6 +48,26 @@ class DefaultElement:
+     optional: bool = False
+     package: Optional[str] = None
+ 
++    def __repr__(self):
++        ret = ""
++        if self.config_group is not None:
++            ret += self.config_group
++        if self.package is not None:
++            ret += f"@{self.package}"
++        ret += f"={self.config_name}"
++        if self.optional:
++            ret += " (optional)"
++        return ret
++
++
++@dataclass
++class IndexedDefaultElement:
++    idx: int
++    default: DefaultElement
++
++    def __repr__(self):
++        return f"#{self.idx} : {self.default}"
++
+ 
+ class ConfigLoaderImpl(ConfigLoader):
+     """
+@@ -94,23 +135,18 @@ class ConfigLoaderImpl(ConfigLoader):
+             defaults.append(DefaultElement(config_group=None, config_name="__SELF__"))
+         split_at = len(defaults)
+ 
+-        self._merge_default_lists(defaults, job_defaults)
++        self._combine_default_lists(defaults, job_defaults)
+         consumed = self._apply_overrides_to_defaults(overrides, defaults)
+ 
+-        consumed_free_job_defaults = self._append_free_config_group_overrides_to_defaults(
+-            defaults, overrides
+-        )
+-
+         # Load and defaults and merge them into cfg
+-        cfg = self._merge_defaults(
++        cfg = self._merge_defaults_into_config(
+             hydra_cfg, job_cfg, job_cfg_load_trace, defaults, split_at
+         )
+         OmegaConf.set_struct(cfg.hydra, True)
+         OmegaConf.set_struct(cfg, strict)
+ 
+         # Merge all command line overrides after enabling strict flag
+-        all_consumed = consumed + consumed_free_job_defaults
+-        remaining_overrides = [x for x in overrides if x not in all_consumed]
++        remaining_overrides = [x for x in overrides if x not in consumed]
+         try:
+             merged = OmegaConf.merge(cfg, OmegaConf.from_dotlist(remaining_overrides))
+             assert isinstance(merged, DictConfig)
+@@ -118,7 +154,7 @@ class ConfigLoaderImpl(ConfigLoader):
+         except OmegaConfBaseException as ex:
+             raise HydraException("Error merging overrides") from ex
+ 
+-        remaining = consumed + consumed_free_job_defaults + remaining_overrides
++        remaining = consumed + remaining_overrides
+ 
+         def is_hydra(x: str) -> bool:
+             return x.startswith("hydra.") or x.startswith("hydra/")
+@@ -176,33 +212,62 @@ class ConfigLoaderImpl(ConfigLoader):
+         """
+         return copy.deepcopy(self.all_config_checked)
+ 
+-    @staticmethod
+     def _apply_overrides_to_defaults(
+-        overrides: List[str], defaults: List[DefaultElement]
++        self, overrides: List[str], defaults: List[DefaultElement]
+     ) -> List[str]:
+         consumed = []
+-        key_to_idx = {}
+-        for idx, d in enumerate(defaults):
+-            if d.config_group is not None:
+-                key_to_idx[d.config_group] = idx
+-        for override in copy.deepcopy(overrides):
+-            group, package, value = ConfigLoaderImpl._split_override(override)
+-            if group in key_to_idx:
+-        

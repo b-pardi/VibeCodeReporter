@@ -1,0 +1,102 @@
+@@ -90,7 +90,8 @@ class LuaEngine {
+    */
+   int handle_script_request(struct mg_connection *conn,
+ 			    const struct mg_request_info *request_info, 
+-			    char *script_path, bool *attack_attempt, const char *user, const char *group, bool localuser);
++			    char *script_path, bool *attack_attempt, const char *user, const char *group,
++          const char *session_csrf, bool localuser);
+ 
+   bool setParamsTable(lua_State* vm,
+ 		      const struct mg_request_info *request_info,
+
+
+
+
+@@ -232,7 +232,6 @@
+ #define NTOP_HOSTS_SERIAL       "ntopng.host_serial"
+ #define MAX_NUM_INTERFACE_IDS   256
+ #define DUMMY_BRIDGE_INTERFACE_ID       1 /* Anything but zero */
+-#define MAX_CSRF_DURATION       300 /* 5 mins */
+ #define MAX_FAILED_LOGIN_ATTEMPTS       5
+ #define FAILED_LOGIN_ATTEMPTS_INTERVAL  300 /* seconds */
+ #define CONST_STR_FAILED_LOGIN_KEY     "ntopng.cache.failed_logins.%s"
+@@ -923,6 +922,7 @@
+ #define NTOP_USERNAME_MAXLEN        33 /* NOTE: do not change, is this bound to mg_md5 ? */
+ #define NTOP_GROUP_MAXLEN           33
+ #define NTOP_SESSION_ID_LENGTH      33
++#define NTOP_CSRF_TOKEN_LENGTH      33
+ #define NTOP_UNKNOWN_GROUP "unknown"
+ #define PREF_NTOP_LDAP_AUTH           NTOPNG_PREFS_PREFIX".ldap.auth_enabled"
+ #define PREF_LDAP_ACCOUNT_TYPE        NTOPNG_PREFS_PREFIX".ldap.account_type"
+
+
+
+
+@@ -595,7 +595,7 @@ class ThreadedActivity;
+ class ThreadedActivityStats;
+ 
+ struct ntopngLuaContext {
+-  char *allowed_ifname, *user, *group;
++  char *allowed_ifname, *user, *group, *csrf;
+   char *sqlite_hosts_filter, *sqlite_flows_filter;
+   bool sqlite_filters_loaded;
+   void *zmq_context, *zmq_subscriber;
+
+
+
+
+@@ -114,6 +114,24 @@ static void generate_session_id(char *buf, const char *random, const char *user,
+ 
+ /* ****************************************** */
+ 
++/* Generates a random token to protect against CSRF attacks.
++ * See ntop_get_csrf_value for more details. */
++static void generate_csrf_token(char *csrf) {
++  char random_a[32], random_b[32];
++
++#ifdef __OpenBSD__
++  snprintf(random_a, sizeof(random_a), "%d", arc4random());
++  snprintf(random_b, sizeof(random_b), "%lu", time(NULL)*arc4random());
++#else
++  snprintf(random_a, sizeof(random_a), "%d", rand());
++  snprintf(random_b, sizeof(random_b), "%lu", time(NULL)*rand());
++#endif
++
++  mg_md5(csrf, random_a, random_b, NULL);
++}
++
++/* ****************************************** */
++
+ bool HTTPserver::authorized_localhost_user_login(const struct mg_connection *conn) {
+   if(ntop->getPrefs()->is_localhost_users_login_disabled()
+      && (conn->request_info.remote_ip == 0x7F000001 /* 127.0.0.1 */))
+@@ -138,6 +156,7 @@ static void set_cookie(const struct mg_connection * const conn,
+ 		       bool localuser,
+ 		       const char * const referer) {
+   char key[256], session_id[64], random[64];
++  char csrf[NTOP_CSRF_TOKEN_LENGTH];
+   char val[128];
+   u_int session_duration = ntop->getPrefs()->get_auth_session_duration();
+ 
+@@ -163,6 +182,7 @@ static void set_cookie(const struct mg_connection * const conn,
+   snprintf(random, sizeof(random), "%d", rand());
+ 
+   generate_session_id(session_id, random, user, group);
++  generate_csrf_token(csrf);
+ 
+   // ntop->getTrace()->traceEvent(TRACE_ERROR, "==> %s\t%s", random, session_id);
+ 
+@@ -184,7 +204,7 @@ static void set_cookie(const struct mg_connection * const conn,
+ 
+   /* Save session in redis */
+   snprintf(key, sizeof(key), "sessions.%s", session_id);
+-  snprintf(val, sizeof(val), "%s|%s|%c", user, group, localuser ? '1' : '0');
++  snprintf(val, sizeof(val), "%s|%s|%s|%c", user, group, csrf, localuser ? '1' : '0');
+ 
+   ntop->getRedis()->set(key, val, session_duration);
+   ntop->getTrace()->traceEvent(TRACE_INFO, "[HTTP] Set session sessions.%s", session_id);
+@@ -349,7 +369,8 @@ static bool ssl_client_x509_auth(const struct mg_connection * const conn, const
+ // which can also be "" or NTOP_NOLOGIN_USER .
+ static int getAuthorizedUser(struct mg_connection *conn,
+ 			     const struct mg_request_info *request_info,
+-			  

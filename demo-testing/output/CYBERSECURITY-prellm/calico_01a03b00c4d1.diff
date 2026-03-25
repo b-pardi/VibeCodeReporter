@@ -1,0 +1,70 @@
+@@ -831,18 +831,26 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct cali_t
+ 		// Conntrack entry records a different ingress interface than the one the
+ 		// packet arrived on (or it has no record yet).
+ 		if (CALI_F_TO_HOST) {
++			bool same_if = false;
+ 			// Packet is towards the host so this program is the first to see the packet.
+ 			if (src_to_dst->ifindex == CT_INVALID_IFINDEX) {
+ 				// Conntrack entry has no record of the ingress interface, this should
+ 				// be a response packet but we can't be 100% sure.
+ 				CALI_CT_DEBUG("First response packet? ifindex=%d\n", ifindex);
++				/* Check if the return packet follow the same path as the request. */
++				same_if = dst_to_src->ifindex == ifindex;
+ 			} else {
+ 				// The interface has changed; either a change to routing or someone's doing
+ 				// something nasty.
+ 				CALI_CT_DEBUG("CT RPF failed ifindex %d != %d\n",
+ 						src_to_dst->ifindex, ifindex);
+ 			}
+-			if (!ret_from_tun && !hep_rpf_check(tc_ctx) && !CALI_F_NAT_IF) {
++			/* Do not worry about packets returning from the same direction as
++			 * the outgoing packets.
++			 *
++			 * Do not check if packets are returning from the NP vxlan tunnel.
++			 */
++			if (!same_if && !ret_from_tun && !hep_rpf_check(tc_ctx, false) && !CALI_F_NAT_IF) {
+ 				ct_result_set_flag(result.rc, CALI_CT_RPF_FAILED);
+ 			} else {
+ 				src_to_dst->ifindex = ifindex;
+
+
+
+
+@@ -29,7 +29,7 @@ static CALI_BPF_INLINE bool wep_rpf_check(struct cali_tc_ctx *ctx, struct cali_r
+         return true;
+ }
+ 
+-static CALI_BPF_INLINE bool hep_rpf_check(struct cali_tc_ctx *ctx)
++static CALI_BPF_INLINE bool hep_rpf_check(struct cali_tc_ctx *ctx, bool relax)
+ {
+ 	bool ret = false;
+ 
+@@ -57,7 +57,14 @@ static CALI_BPF_INLINE bool hep_rpf_check(struct cali_tc_ctx *ctx)
+ 	switch(rc) {
+ 		case BPF_FIB_LKUP_RET_SUCCESS:
+ 		case BPF_FIB_LKUP_RET_NO_NEIGH:
+-			ret = ctx->skb->ingress_ifindex == fib_params.ifindex;
++			if (!relax) {
++				ret = ctx->skb->ingress_ifindex == fib_params.ifindex;
++			} else {
++				ret = fib_params.ifindex != CT_INVALID_IFINDEX;
++				CALI_DEBUG("Host RPF check src=%x skb iface=%d loose if %d\n",
++						bpf_ntohl(ctx->state->ip_src), ctx->skb->ifindex,
++						fib_params.ifindex);
++			}
+ 	}
+ 
+ 	CALI_DEBUG("Host RPF check src=%x skb iface=%d fib rc %d\n",
+
+
+
+
+@@ -378,7 +378,7 @@ syn_force_policy:
+ 	/* DNAT in state is set correctly now */
+ 
+ 	if ((!(ctx->state->tun_ip) && CALI_F_FROM_HEP) && !CALI_F_NAT_IF) {
+-		if (!hep_rpf_check(ctx)) {
++		if (!hep_rpf_check(ctx, false)) {
+ 			goto deny;
+ 		}
+ 	}

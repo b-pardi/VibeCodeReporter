@@ -1,0 +1,132 @@
+@@ -3466,7 +3466,9 @@ R_API int r_core_config_init(RCore *core) {
+ 	SETPREF ("http.index", "index.html", "Main html file to check in directory");
+ 	SETPREF ("http.bind", "localhost", "Server address");
+ 	SETPREF ("http.homeroot", R_JOIN_2_PATHS ("~", R2_HOME_WWWROOT), "http home root directory");
+-#if __ANDROID__
++#if __WINDOWS__
++	SETPREF ("http.root", "www", "http root directory");
++#elif __ANDROID__
+ 	SETPREF ("http.root", "/data/data/org.radare.radare2installer/www", "http root directory");
+ #else
+ 	SETPREF ("http.root", R2_WWWROOT, "http root directory");
+
+
+
+
+@@ -792,10 +792,11 @@ static int cmd_rap(void *data, const char *input) {
+ 		eprintf ("TODO: list connections in json\n");
+ 		break;
+ 	case '!': // "=!"
+-		if (input[1] == '=') {
+-			// swap core->cmdremote = core->cmdremote? 0: 1;
+-			core->cmdremote = input[2]? 1: 0;
+-			r_cons_println (r_str_bool (core->cmdremote));
++		if (input[1] == 'q') {
++			R_FREE (core->cmdremote);
++		} else if (input[1] == '=') { // =!=0 or =!= for iosystem
++			R_FREE (core->cmdremote);
++			core->cmdremote = r_str_trim_dup (input + 2);
+ 		} else {
+ 			char *res = r_io_system (core->io, input + 1);
+ 			if (res) {
+@@ -2240,8 +2241,7 @@ static int cmd_system(void *data, const char *input) {
+ 			r_cons_printf ("Usage: !=[!]  - enable/disable remote commands\n");
+ 		} else {
+ 			if (!r_sandbox_enable (0)) {
+-				core->cmdremote = input[1]? 1: 0;
+-				r_cons_println (r_str_bool (core->cmdremote));
++				R_FREE (core->cmdremote);
+ 			}
+ 		}
+ 		break;
+@@ -6744,11 +6744,23 @@ R_API int r_core_cmd(RCore *core, const char *cstr, int log) {
+ 		}
+ 	}
+ 	if (core->cmdremote) {
+-		if (*cstr != '=' && *cstr != 'q' && strncmp (cstr, "!=", 2)) {
+-			char *res = r_io_system (core->io, cstr);
+-			if (res) {
+-				r_cons_printf ("%s\n", res);
+-				free (res);
++		if (*cstr == 'q') {
++			R_FREE (core->cmdremote);
++			goto beach; // false
++		} else if (*cstr != '=' && strncmp (cstr, "!=", 2)) {
++			if (core->cmdremote[0]) {
++				char *s = r_str_newf ("%s %s", core->cmdremote, cstr);
++				r_core_rtr_cmd (core, s);
++				free (s);
++			} else {
++				char *res = r_io_system (core->io, cstr);
++				if (res) {
++					r_cons_printf ("%s\n", res);
++					free (res);
++				}
++			}
++			if (log) {
++				r_line_hist_add (cstr);
+ 			}
+ 			goto beach; // false
+ 		}
+
+
+
+
+@@ -9741,11 +9741,28 @@ static int cmd_anal_all(RCore *core, const char *input) {
+ 			if (!list) {
+ 				break;
+ 			}
+-			r_list_foreach (list, iter, map) {
+-				r_core_seek (core, map->itv.addr, true);
+-				r_core_anal_esil (core, "$SS", NULL);
++			if (!strcmp ("range", r_config_get (core->config, "anal.in"))) {
++				ut64 from = r_config_get_i (core->config, "anal.from");
++				ut64 to = r_config_get_i (core->config, "anal.to");
++				if (to > from) {
++					char *len = r_str_newf (" 0x%"PFMT64x, to - from);
++					r_core_seek (core, from, true);
++					r_core_anal_esil (core, len, NULL);
++					free (len);
++				} else {
++					eprintf ("Assert: anal.from > anal.to\n");
++				}
++			} else {
++				r_list_foreach (list, iter, map) {
++					if (map->perm & R_PERM_X) {
++						char *ss = r_str_newf (" 0x%"PFMT64x, map->itv.size);
++						r_core_seek (core, map->itv.addr, true);
++						r_core_anal_esil (core, ss, NULL);
++						free (ss);
++					}
++				}
++				r_list_free (list);
+ 			}
+-			r_list_free (list);
+ 			r_core_seek (core, at, true);
+ 		}
+ 		break;
+
+
+
+
+@@ -52,6 +52,7 @@ static const char *help_msg_sl[] = {
+ 	"sl", "[+-][line]", "Seek to relative line",
+ 	"slc", "", "Clear line cache",
+ 	"sll", "", "Show total number of lines",
++	"sleep", " [seconds]", "Sleep for an specific amount of time",
+ 	NULL
+ };
+ 
+@@ -751,6 +752,18 @@ static int cmd_seek(void *data, const char *input) {
+ 	{
+ 		int sl_arg = r_num_math (core->num, input + 1);
+ 		switch (input[1]) {
++		case 'e': // "sleep"
++			{
++				const char *arg = strchr (input, ' ');
++				if (arg) {
++					void *bed = r_cons_sleep_begin ();
++					r_sys_sleep (atoi (arg + 1));
++					r_cons_sleep_end (bed);
++				} else {
++					eprintf ("Usage: 

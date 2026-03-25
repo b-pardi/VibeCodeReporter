@@ -1,0 +1,125 @@
+@@ -52,7 +52,7 @@ from faraday.server.web import app
+ 
+ CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
+ 
+-logger = logging.getLogger(__name__)
++#logger = logging.getLogger(__name__)
+ 
+ @click.group(context_settings=CONTEXT_SETTINGS)
+ def cli():
+@@ -213,7 +213,6 @@ def support():
+         required=False,
+         )
+ def migrate(downgrade, revision):
+-    logger.info("Running migrations")
+     try:
+         revision = revision or ("-1" if downgrade else "head")
+         config = Config(os.path.join(FARADAY_BASE,"alembic.ini"))
+@@ -223,15 +222,16 @@ def migrate(downgrade, revision):
+         else:
+             alembic.command.upgrade(config, revision)
+     except OperationalError as e:
++        logger = logging.getLogger(__name__)
+         logger.error("Migration Error: %s", e)
+         logger.exception(e)
+         print('Please verify your configuration on server.ini or the hba configuration!')
+     except Exception as e:
++        logger = logging.getLogger(__name__)
++        logger.error("Migration Error: %s", e)
+         logger.exception(e)
+         print('Migration failed! Please check the logs')
+         sys.exit(1)
+-    else:
+-        logger.info("Migrations finished")
+ 
+ 
+ @click.command(help='Custom field wizard')
+
+
+
+
+@@ -24,6 +24,12 @@ def upgrade():
+             server_default=""
+         )
+     )
++    conn = op.get_bind()
++    conn.execute("""UPDATE vulnerability
++SET tool=SUBQUERY.tool   
++FROM (select v.id, c.tool from vulnerability v, command_object co, command c where v.id = co.object_id and co.object_type = 'vulnerability' and co.command_id = c.id) AS SUBQUERY
++WHERE vulnerability.id=SUBQUERY.id""")
++    conn.execute("UPDATE vulnerability set tool='Web UI' where tool=''")
+     
+ 
+ def downgrade():
+
+
+
+
+@@ -1,3 +1,4 @@
++import logging
+ import flask
+ import sqlalchemy
+ from marshmallow import (
+@@ -33,6 +34,8 @@ from faraday.server.api.modules.websocket_auth import require_agent_token
+ 
+ bulk_create_api = flask.Blueprint('bulk_create_api', __name__)
+ 
++logger = logging.getLogger(__name__)
++
+ class VulnerabilitySchema(vulns.VulnerabilitySchema):
+     class Meta(vulns.VulnerabilitySchema.Meta):
+         fields = tuple(
+@@ -285,6 +288,12 @@ def _create_vuln(ws, vuln_data, command=None, **kwargs):
+         model_class = VulnerabilityWeb
+     else:
+         raise ValidationError("unknown type")
++    tool = vuln_data.get('tool', '')
++    if not tool:
++        if command:
++            vuln_data['tool'] = command.tool
++        else:
++            vuln_data['tool'] = 'Web UI'
+ 
+     (created, vuln) = get_or_create(ws, model_class, vuln_data)
+     db.session.commit()
+
+
+
+
+@@ -96,7 +96,7 @@ class CustomMetadataSchema(MetadataSchema):
+     creator = fields.Method('get_creator', dump_only=True)
+ 
+     def get_creator(self, obj):
+-        return obj.creator_command_tool or 'Web UI'
++        return obj.tool
+ 
+ 
+ class VulnerabilitySchema(AutoSchema):
+@@ -470,7 +470,6 @@ class VulnerabilityView(PaginatedMixin,
+         attachments = data.pop('_attachments', {})
+         references = data.pop('references', [])
+         policyviolations = data.pop('policy_violations', [])
+-
+         try:
+             obj = super(VulnerabilityView, self)._perform_create(data, **kwargs)
+         except TypeError:
+@@ -480,6 +479,11 @@ class VulnerabilityView(PaginatedMixin,
+ 
+         obj.references = references
+         obj.policy_violations = policyviolations
++        if not obj.tool:
++            if obj.creator_command_tool:
++                obj.tool = obj.creator_command_tool
++            else:
++                obj.tool = "Web UI"
+         db.session.commit()
+         self._process_attachments(obj, attachments)
+         return obj
+@@ -505,6 +509,7 @@ class VulnerabilityView(PaginatedMixin,
+ 
+     def _update_object(self, obj, data):
+         data.pop('type') # It's forbidden to change vuln type!
++        data.pop('tool', '')
+         return super(VulnerabilityView, self)._update_object(obj, data)
+ 
+     def _perform_update(self, object_id,

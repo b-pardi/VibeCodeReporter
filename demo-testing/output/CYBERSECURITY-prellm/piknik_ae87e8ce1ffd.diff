@@ -1,0 +1,136 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,1295 @@
++#!/usr/bin/env python3
++#
++# To the extent possible under law, Yawning Angel has waived all copyright
++# and related or neighboring rights to chacha20, using the Creative
++# Commons "CC0" public domain dedication. See LICENSE or
++# <http://creativecommons.org/publicdomain/zero/1.0/> for full details.
++
++#
++# cgo sucks.  Plan 9 assembly sucks.  Real languages have SIMD intrinsics.
++# The least terrible/retarded option is to use a Python code generator, so
++# that's what I did.
++#
++# Code based on Ted Krovetz's vec128 C implementation, with corrections
++# to use a 64 bit counter instead of 32 bit, and to allow unaligned input and
++# output pointers.
++#
++# Dependencies: https://github.com/Maratyszcza/PeachPy
++#
++# python3 -m peachpy.x86_64 -mabi=goasm -S -o chacha20_amd64.s chacha20_amd64.py
++#
++
++from peachpy import *
++from peachpy.x86_64 import *
++
++x = Argument(ptr(uint32_t))
++inp = Argument(ptr(const_uint8_t))
++outp = Argument(ptr(uint8_t))
++nrBlocks = Argument(ptr(size_t))
++
++#
++# SSE2 helper functions.  A temporary register is explicitly passed in because
++# the main fast loop uses every single register (and even spills) so manual
++# control is needed.
++#
++# This used to also have a DQROUNDS helper that did 2 rounds of ChaCha like
++# in the C code, but the C code has the luxury of an optimizer reordering
++# everything, while this does not.
++#
++
++def ROTW16_sse2(tmp, d):
++    MOVDQA(tmp, d)
++    PSLLD(tmp, 16)
++    PSRLD(d, 16)
++    PXOR(d, tmp)
++
++def ROTW12_sse2(tmp, b):
++    MOVDQA(tmp, b)
++    PSLLD(tmp, 12)
++    PSRLD(b, 20)
++    PXOR(b, tmp)
++
++def ROTW8_sse2(tmp, d):
++    MOVDQA(tmp, d)
++    PSLLD(tmp, 8)
++    PSRLD(d, 24)
++    PXOR(d, tmp)
++
++def ROTW7_sse2(tmp, b):
++    MOVDQA(tmp, b)
++    PSLLD(tmp, 7)
++    PSRLD(b, 25)
++    PXOR(b, tmp)
++
++def WriteXor_sse2(tmp, inp, outp, d, v0, v1, v2, v3):
++    MOVDQU(tmp, [inp+d])
++    PXOR(tmp, v0)
++    MOVDQU([outp+d], tmp)
++    MOVDQU(tmp, [inp+d+16])
++    PXOR(tmp, v1)
++    MOVDQU([outp+d+16], tmp)
++    MOVDQU(tmp, [inp+d+32])
++    PXOR(tmp, v2)
++    MOVDQU([outp+d+32], tmp)
++    MOVDQU(tmp, [inp+d+48])
++    PXOR(tmp, v3)
++    MOVDQU([outp+d+48], tmp)
++
++# SSE2 ChaCha20 (aka vec128).  Does not handle partial blocks, and will
++# process 4/2/1 blocks at a time.
++with Function("blocksAmd64SSE2", (x, inp, outp, nrBlocks)):
++    reg_x = GeneralPurposeRegister64()
++    reg_inp = GeneralPurposeRegister64()
++    reg_outp = GeneralPurposeRegister64()
++    reg_blocks = GeneralPurposeRegister64()
++    reg_sp_save = GeneralPurposeRegister64()
++
++    LOAD.ARGUMENT(reg_x, x)
++    LOAD.ARGUMENT(reg_inp, inp)
++    LOAD.ARGUMENT(reg_outp, outp)
++    LOAD.ARGUMENT(reg_blocks, nrBlocks)
++
++    # Align the stack to a 32 byte boundary.
++    MOV(reg_sp_save, registers.rsp)
++    AND(registers.rsp, 0xffffffffffffffe0)
++    SUB(registers.rsp, 0x20)
++
++    # Build the counter increment vector on the stack, and allocate the scratch
++    # space
++    xmm_v0 = XMMRegister()
++    PXOR(xmm_v0, xmm_v0)
++    SUB(registers.rsp, 16+16)
++    MOVDQA([registers.rsp], xmm_v0)
++    reg_tmp = GeneralPurposeRegister32()
++    MOV(reg_tmp, 0x00000001)
++    MOV([registers.rsp], reg_tmp)
++    mem_one = [registers.rsp]     # (Stack) Counter increment vector
++    mem_tmp0 = [registers.rsp+16] # (Stack) Scratch space.
++
++    mem_s0 = [reg_x]           # (Memory) Cipher state [0..3]
++    mem_s1 = [reg_x+16]        # (Memory) Cipher state [4..7]
++    mem_s2 = [reg_x+32]        # (Memory) Cipher state [8..11]
++    mem_s3 = [reg_x+48]        # (Memory) Cipher state [12..15]
++
++    # xmm_v0 allocated above...
++    xmm_v1 = XMMRegister()
++    xmm_v2 = XMMRegister()
++    xmm_v3 = XMMRegister()
++
++    xmm_v4 = XMMRegister()
++    xmm_v5 = XMMRegister()
++    xmm_v6 = XMMRegister()
++    xmm_v7 = XMMRegister()
++
++    xmm_v8 = XMMRegister()
++    xmm_v9 = XMMRegister()
++    xmm_v10 = XMMRegister()
++    xmm_v11 = XMMRegister()
++
++    xmm_v12 = XMMRegister()
++    xmm_v13 = XMMRegister()
++    x

@@ -1,0 +1,84 @@
+@@ -109,7 +109,8 @@ public class StorageHandler implements HttpHandler {
+                 case AUTH_READS: {
+                     CborObject cbor = CborObject.fromByteArray(Serialize.readFully(httpExchange.getRequestBody()));
+                     List<BlockMirrorCap> blockCaps = ((CborObject.CborList) cbor).map(BlockMirrorCap::fromCbor);
+-                    dht.authReads(blockCaps).thenAccept(res -> {
++                    PublicKeyHash owner = null; // TODO parse once all clients support it
++                    dht.authReads(owner, blockCaps).thenAccept(res -> {
+                         replyBytes(httpExchange, new CborObject.CborList(res).serialize(), Optional.empty());
+                     }).exceptionally(Futures::logAndThrow).get();
+                     break;
+
+
+
+
+@@ -113,8 +113,8 @@ public class DelegatingDeletableStorage implements DeletableContentAddressedStor
+     }
+ 
+     @Override
+-    public CompletableFuture<List<PresignedUrl>> authReads(List<BlockMirrorCap> blocks) {
+-        return target.authReads(blocks);
++    public CompletableFuture<List<PresignedUrl>> authReads(PublicKeyHash owner, List<BlockMirrorCap> blocks) {
++        return target.authReads(owner, blocks);
+     }
+ 
+     @Override
+
+
+
+
+@@ -325,7 +325,7 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+     }
+ 
+     @Override
+-    public CompletableFuture<List<PresignedUrl>> authReads(List<BlockMirrorCap> blocks) {
++    public CompletableFuture<List<PresignedUrl>> authReads(PublicKeyHash owner, List<BlockMirrorCap> blocks) {
+         if (noReads)
+             throw new IllegalStateException("Reads from Glacier are disabled!");
+         if (blocks.size() > MAX_BLOCK_AUTHS)
+@@ -364,12 +364,12 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+                 .findFirst();
+         if (mirrorBat.isPresent()) {
+             String username = bats.getOwner(mirrorBat.get());
+-            PublicKeyHash owner = pki.getPublicKeyHash(username).join().get();
++            PublicKeyHash verifiedOwner = pki.getPublicKeyHash(username).join().get();
+             // check rate limits
+             enforceGlobalRequestRateLimit();
+             enforceGlobalBandwidthLimit(byteCount);
+-            enforceUserRequestRateLimits(owner, reqCount);
+-            enforceUserBandwidthRateLimits(owner, byteCount);
++            enforceUserRequestRateLimits(verifiedOwner, reqCount);
++            enforceUserBandwidthRateLimits(verifiedOwner, byteCount);
+         }
+         for (int i=0; i < blocks.size(); i++)
+             blockGetAuths.inc();
+
+
+
+
+@@ -50,7 +50,7 @@ public interface ContentAddressedStorage {
+ 
+     Optional<BlockCache> getBlockCache();
+ 
+-    default CompletableFuture<List<PresignedUrl>> authReads(List<BlockMirrorCap> blocks) {
++    default CompletableFuture<List<PresignedUrl>> authReads(PublicKeyHash owner, List<BlockMirrorCap> blocks) {
+         return Futures.errored(new IllegalStateException("Unimplemented call!"));
+     }
+ 
+@@ -381,10 +381,10 @@ public interface ContentAddressedStorage {
+         }
+ 
+         @Override
+-        public CompletableFuture<List<PresignedUrl>> authReads(List<BlockMirrorCap> blocks) {
++        public CompletableFuture<List<PresignedUrl>> authReads(PublicKeyHash owner, List<BlockMirrorCap> blocks) {
+             if (! isPeergosServer)
+                 return Futures.errored(new IllegalStateException("Cannot auth reads when not talking to a Peergos server!"));
+-            return poster.postUnzip(apiPrefix + AUTH_READS, new CborObject.CborList(blocks).serialize())
++            return poster.postUnzip(apiPrefix + AUTH_READS + "?owner=" + encode(owner.toString()), new CborObject.CborList(blocks).serialize())
+                     .thenApply(raw -> ((CborObject.CborList)CborObject.fromByteArray(raw)).value
+                             .stream()
+                             .map(PresignedUrl::fromCbor)
+@@ -663,8 +663,8 @@ public interface ContentAddressedStorage {
+         }
+ 
+         @Overrid

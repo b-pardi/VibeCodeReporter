@@ -1,0 +1,119 @@
+@@ -73,6 +73,8 @@ class AlertsManager : protected StoreManager {
+ 
+   int releaseEngagedAlerts(time_t when);
+ 
++  bool hasAlerts();
++
+   /*
+     ========== FLOW alerts API =========
+    */
+
+
+
+
+@@ -76,7 +76,7 @@ class NetworkInterface : public AlertableEntity {
+   u_int8_t purgeRuns;
+   u_int32_t bridge_lan_interface_id, bridge_wan_interface_id;
+   u_int32_t num_hashes;
+-  u_int32_t num_alerts_engaged;
++  u_int32_t num_alerts_engaged[MAX_NUM_PERIODIC_SCRIPTS];
+   bool has_alerts;
+ 
+   /* Disaggregations */
+@@ -746,9 +746,11 @@ class NetworkInterface : public AlertableEntity {
+   void nDPILoadHostnameCategory(char *category, ndpi_protocol_category_t id);
+ 
+   inline void setHasAlerts(bool has_alerts)               { this->has_alerts = has_alerts; }
+-  inline void setNumAlertsEngaged(u_int32_t num_alerts)   { num_alerts_engaged = num_alerts; }
++  inline void incNumAlertsEngaged(ScriptPeriodicity p)    { num_alerts_engaged[(u_int)p]++; }
++  inline void decNumAlertsEngaged(ScriptPeriodicity p)    { num_alerts_engaged[(u_int)p]--; }
+   inline bool hasAlerts()                                 { return(has_alerts); }
+-  inline u_int32_t getNumEngagedAlerts()                  { return(num_alerts_engaged); }
++  inline void refreshHasAlerts()                          { has_alerts = alertsManager ? alertsManager->hasAlerts() : false; }
++  u_int32_t getNumEngagedAlerts();
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -391,6 +391,44 @@ bool AlertsManager::incHostTotalAlerts(const char *hostkey) {
+ 
+ /* **************************************************** */
+ 
++bool AlertsManager::hasAlerts() {
++  char query[STORE_MANAGER_MAX_QUERY];
++  int step;
++  bool rc = false;
++  sqlite3_stmt *stmt = NULL;
++
++  if(!store_initialized || !store_opened)
++    return(-1);
++
++  m.lock(__FILE__, __LINE__);
++
++  snprintf(query, sizeof(query),
++     "SELECT rowid "
++     "FROM %s "
++     "LIMIT 1",
++     ALERTS_MANAGER_TABLE_NAME);
++
++  if(sqlite3_prepare_v2(db, query, -1, &stmt, 0)) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "SQL Error: %s", sqlite3_errmsg(db));
++    goto out;
++  }
++
++  if((step = sqlite3_step(stmt)) != SQLITE_DONE) {
++    if(step == SQLITE_ERROR)
++      ntop->getTrace()->traceEvent(TRACE_ERROR, "SQL Error: %s", sqlite3_errmsg(db));
++    else
++      rc = true;
++  }
++
++out:
++  if(stmt) sqlite3_finalize(stmt);
++  m.unlock(__FILE__, __LINE__);
++
++  return(rc);
++}
++
++/* **************************************************** */
++
+ /* NOTE: do not call this from C, use alert queues in LUA */
+ int AlertsManager::triggerAlert(time_t when, int granularity, AlertType alert_type, const char *subtype,
+       AlertLevel alert_severity, AlertEntity alert_entity, const char *alert_entity_value,
+@@ -419,6 +457,8 @@ int AlertsManager::triggerAlert(time_t when, int granularity, AlertType alert_ty
+         goto out;
+     }
+ 
++    iface->setHasAlerts(true);
++
+     if(is_existing) { /* Already existing record found */
+       if((rc = updateExistingAlert(cur_rowid, when, query, sizeof(query))))
+         goto out;
+
+
+
+
+@@ -7740,8 +7740,8 @@ static int ntop_interface_trigger_alert(lua_State* vm) {
+   AlertEntity alert_entity;
+   char *alert_json;
+   AlertsManager *am;
+-  int ret, granularity = 0;
+-  char *alert_subtype = (char*)"";
++  int ret, granularity;
++  char *alert_subtype;
+   bool ignore_disabled = false, check_maximum = true, is_new_alert;
+   time_t when;
+ 
+@@ -7756,20 +7756,20 @@ static int ntop_interface_trigger_alert(lua_State* vm) {
+   if(ntop_lua_check(vm, __FUNCTION__, 3, LUA_TNUMBER) != CONST_LUA_OK) return(CONST_LUA_ERROR);
+   alert_type = (AlertType)((int)lua_tonumber(vm, 3));
+ 
+-  if(ntop_lua_check(vm, __FUNCTION__, 4, LUA_TNUMBER) != CONST_LUA_OK) return(CONST_LUA_ERROR);
+-  alert_severity = (AlertLevel)((int)lua_tonumber(vm, 4));
++  if(ntop_lua_check(vm, __FUNCTION__, 4, LUA_TSTRING) != CONST_LUA_OK) return(CONST_LUA_ERROR);
++  alert_subtype = (char*)lua_tostring(vm, 4);
+ 
+   if(ntop_lua_check(vm, __FUNCTION__, 5, LUA_TNUMBER) != CONST_LUA_OK

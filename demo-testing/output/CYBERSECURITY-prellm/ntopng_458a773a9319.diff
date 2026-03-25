@@ -1,0 +1,126 @@
+@@ -27,6 +27,7 @@ class AlertCheckLuaEngine : public LuaEngine {
+   ScriptPeriodicity p;
+   char script_path[MAX_PATH];
+   u_int num_calls;
++  bool script_ok;
+   ticks total_ticks, tps /* Ticks per second */;
+   virtual void lua_stats_detail(lua_State *vm) const {};
+ 
+
+
+
+
+@@ -39,6 +39,7 @@
+ class LuaEngine {
+  protected:
+   lua_State *L; /**< The LuaEngine state.*/
++  char *loaded_script_path;
+   
+   void lua_register_classes(lua_State *L, bool http_mode);
+ 
+@@ -66,17 +67,8 @@ class LuaEngine {
+   inline NetworkInterface* getNetworkInterface() { return(getLuaVMContext(L)->iface); }
+   NetworkStats* getNetwork() { return(getLuaVMContext(L)->network); }
+ 
+-  /**
+-   * @brief Run a Lua script.
+-   * @details Run a script from within ntopng. No HTTP GUI.
+-   * 
+-   * @param script_path Full path of lua script.
+-   * @param iface Select the specified interface (if not NULL)
+-   * @param load_only Load the Lua script but does not execute it
+-   *
+-   * @return 0 if the script has been executed successfully.
+-   */
+-  int run_script(char *script_path, NetworkInterface *iface, bool load_only = false, time_t deadline = 0, bool no_pcall = false);
++  int load_script(char *script_path, NetworkInterface *iface);
++  int run_loaded_script();
+ 
+   /**
+    * @brief Handling of request info of script.
+
+
+
+
+@@ -38,8 +38,8 @@ class LuaReusableEngine {
+   LuaReusableEngine(const char *_script_path, NetworkInterface *_iface, int _reload_interval);
+   ~LuaReusableEngine();
+ 
+-  bool pcall(time_t deadline);
+   inline void setNextVmReload(time_t t) { next_reload = t; }
++  LuaEngine* getVm(time_t now);
+ };
+ 
+ #endif
+
+
+
+
+@@ -44,8 +44,8 @@ class ThreadedActivity {
+   ThreadedActivityStats **threaded_activity_stats;
+   Mutex vms_mutex;
+ 
+-  /* iface -> engine */
+-  std::map<std::string, LuaReusableEngine*> vms;
++  /* ifid -> engine */
++  std::map<int, LuaReusableEngine*> vms;
+ 
+   void periodicActivityBody();
+   void aperiodicActivityBody();
+@@ -55,6 +55,7 @@ class ThreadedActivity {
+   bool isInterfaceTaskRunning(NetworkInterface *iface);
+   void updateThreadedActivityStats(NetworkInterface *iface, u_long latest_duration);
+   void reloadVm(const char *ifname);
++  LuaEngine* loadVm(char *script_path, NetworkInterface *iface, time_t when);
+ 
+  public:
+   ThreadedActivity(const char* _path,		   
+
+
+
+
+@@ -29,6 +29,7 @@ AlertCheckLuaEngine::AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodi
+   const char *lua_file = NULL;
+   iface = _iface;
+   tps = Utils::gettickspersec();
++  script_ok = false;
+ 
+   p = script_periodicity;
+ 
+@@ -64,14 +65,24 @@ AlertCheckLuaEngine::AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodi
+ 	     lua_file);
+     ntop->fixPath(script_path);
+ 
+-    if(run_script(script_path, iface, true /* Load only */) < 0)
++    if(load_script(script_path, iface) < 0)
+       return;
+ 
++    /* Execute the script so that the "setup" function will be exposed */
++    if(lua_pcall(L, 0, 0, 0)) {
++      ntop->getTrace()->traceEvent(TRACE_WARNING, "Script failure[%s] [%s]", script_path, lua_tostring(L, -1));
++      return;
++    }
++
+     lua_getglobal(L, "setup");         /* Called function   */
+     lua_pushstring(L, Utils::periodicityToScriptName(p)); /* push 1st argument */
+ 
+-    if(!pcall(1 /* 1 argument */, 0))
++    if(lua_pcall(L, 1 /* 1 argument */, 0, 0)) {
++      ntop->getTrace()->traceEvent(TRACE_WARNING, "Script failure[%s] [%s]", script_path, lua_tostring(L, -1));
+       return;
++    }
++
++    script_ok = true;
+   } else {
+     /* Possibly handle a generic entity */
+     script_path[0] = '\0';
+@@ -87,7 +98,7 @@ AlertCheckLuaEngine::~AlertCheckLuaEngine() {
+   ntop->getTrace()->traceEvent(TRACE_WARNING, "[elapsed time: %.4f sec][num calls: %u][calls/sec: %.4f][%s][clocks/sec: %llu]", elapsed_time, num_calls, num_calls / elapsed_time, script_path, tps);
+ #endif
+ 
+-  if(script_path[0] != '\0') {
++  if(script_ok) {
+     lua_getglobal(L, "teardown"); /* Called function */
+ 
+     if(lua_isfunction(L, -1)) {
+@@ -139,6 +150,9 @@ const cha

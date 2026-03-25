@@ -1,0 +1,150 @@
+@@ -428,6 +428,7 @@ auto_allow:
+ 	return -2;
+ 
+ deny:
++	ctx->fwd.res = TC_ACT_SHOT;
+ 	return -1;
+ }
+ 
+
+
+
+
+@@ -18,6 +18,10 @@
+ #ifndef __CALI_PARSING_H__
+ #define __CALI_PARSING_H__
+ 
++#define PARSING_OK 0
++#define PARSING_ERROR -1
++#define PARSING_ALLOW_WITHOUT_ENFORCING_POLICY -2
++
+ static CALI_BPF_INLINE int parse_packet_ip(struct cali_tc_ctx *ctx) {
+ 	__u16 protocol = 0;
+ 
+@@ -94,12 +98,13 @@ static CALI_BPF_INLINE int parse_packet_ip(struct cali_tc_ctx *ctx) {
+ 		goto allow_no_fib;
+ 	}
+ 
+-	return 0;
++	return PARSING_OK;
+ 
+ allow_no_fib:
+-	return -2;
++	return PARSING_ALLOW_WITHOUT_ENFORCING_POLICY;
++
+ deny:
+-	return -1;
++	return PARSING_ERROR;
+ }
+ 
+ static CALI_BPF_INLINE void tc_state_fill_from_iphdr(struct cali_tc_ctx *ctx)
+@@ -188,13 +193,13 @@ static CALI_BPF_INLINE int tc_state_fill_from_nexthdr(struct cali_tc_ctx *ctx)
+ 					(int)ctx->state->ip_proto);
+ 	}
+ 
+-	return 0;
++	return PARSING_OK;
+ 
+ allow:
+-	return -2;
++	return PARSING_ALLOW_WITHOUT_ENFORCING_POLICY;
+ 
+ deny:
+-	return -1;
++	return PARSING_ERROR;
+ }
+ 
+ #endif /* __CALI_PARSING_H__ */
+
+
+
+
+@@ -138,12 +138,12 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 	/* Parse the packet as far as the IP header; as a side-effect this validates the packet size
+ 	 * is large enough for UDP. */
+ 	switch (parse_packet_ip(&ctx)) {
+-	case -1:
++	case PARSING_ERROR:
+ 		// A malformed packet or a packet we don't support
+ 		CALI_DEBUG("Drop malformed or unsupported packet\n");
+ 		ctx.fwd.res = TC_ACT_SHOT;
+ 		goto finalize;
+-	case -2:
++	case PARSING_ALLOW_WITHOUT_ENFORCING_POLICY:
+ 		// A packet that we automatically let through
+ 		fwd_fib_set(&ctx.fwd, false);
+ 		ctx.fwd.res = TC_ACT_UNSPEC;
+@@ -158,7 +158,6 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 		switch (vxlan_attempt_decap(&ctx)) {
+ 		case -1:
+ 			/* Problem decoding the packet. */
+-			ctx.fwd.res = TC_ACT_SHOT;
+ 			goto deny;
+ 		case -2:
+ 			/* Non-BPF VXLAN packet from another Calico node. */
+@@ -173,9 +172,9 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 
+ 	/* Parse out the source/dest ports (or type/code for ICMP). */
+ 	switch (tc_state_fill_from_nexthdr(&ctx)) {
+-	case -1:
++	case PARSING_ERROR:
+ 		goto deny;
+-	case -2:
++	case PARSING_ALLOW_WITHOUT_ENFORCING_POLICY:
+ 		goto allow;
+ 	}
+ 
+
+
+
+
+@@ -68,10 +68,10 @@ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ 
+ 	// Parse packets and drop malformed and unsupported ones
+ 	switch (parse_packet_ip(&ctx)) {
+-	case -1:
++	case PARSING_ERROR:
+ 		ctx.fwd.res = XDP_DROP;
+ 		goto deny;
+-	case -2:
++	case PARSING_ALLOW_WITHOUT_ENFORCING_POLICY:
+ 		ctx.fwd.res = XDP_PASS;
+ 		goto allow;
+ 	}
+@@ -79,17 +79,17 @@ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ 	tc_state_fill_from_iphdr(&ctx);
+ 
+ 	switch(tc_state_fill_from_nexthdr(&ctx)) {
+-	case -1:
++	case PARSING_ERROR:
+ 		ctx.fwd.res = XDP_DROP;
+ 		goto deny;
+-	case -2:
++	case PARSING_ALLOW_WITHOUT_ENFORCING_POLICY:
+ 		ctx.fwd.res = XDP_PASS;
+ 		goto allow;
+ 	}
+ 
+ 	// Allow a packet if it hits an entry in the failsafe map
+ 	if (is_failsafe_in(ctx.state->ip_proto, ctx.state->dport, ctx.state->ip_src)) {
+-		CALI_DEBUG("Inbound failsafe port: %d. Skip policy\n", ctx.state->post_nat_dport);
++		CALI_DEBUG("Inbound failsafe port: %d. Skip policy\n", ctx.state->dport);
+ 		ctx.state->pol_rc = CALI_POL_ALLOW;
+ 		goto allow;
+ 	}
+@@ -97,15 +97,6 @@ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ 	// Jump to the policy program
+ 	CALI_DEBUG("About to jump to policy program.\n");
+ 	bpf_tail_call(xdp_ctx, &cali_jump, PROG_INDEX_POLICY);
+-	if (CALI_F_HEP) {
+-		CALI_DEBUG("HEP with no policy, allow.\n");
+-		ctx.state->pol_rc = CALI_POL_ALLOW;
+-		goto allow;
+-	} else {
+-		/* should not reach here */
+-		CALI_DEBUG("WEP with no policy, deny.\n");
+-		goto deny;
+-	}
+ 
+ allow:
+ 	return XDP_PASS;

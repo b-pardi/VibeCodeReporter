@@ -1,0 +1,121 @@
+@@ -204,17 +204,29 @@ out:
+  * compute_capture_len
+  * @ctx: socket buffer
+  * @monitor: the monitor value
++ * @flags: the classifier flags (CLS_FLAG_*)
++ * @obs_point: the trace observation point (TRACE_{FROM,TO}_*)
+  *
+  * Compute capture length for the trace/drop notification event.
+  * Return at most `ctx_full_len` bytes.
+- * With monitor=0, use the config value `trace_payload_len`.
++ * With monitor=0, use the config value `trace_payload_len` for native packets, and
++ * `trace_payload_len_overlay` for overlay packets with CLS_FLAG_{VXLAN,GENEVE} set. For overlay
++ * packets, reuse the `obs_point` to save complexity.
+  */
+ static __always_inline __u64
+-compute_capture_len(struct __ctx_buff *ctx, __u32 monitor)
++compute_capture_len(struct __ctx_buff *ctx, __u64 monitor,
++		    cls_flags_t flags __maybe_unused,
++		    enum trace_point obs_point __maybe_unused)
+ {
+ 	__u32 cap_len_default = CONFIG(trace_payload_len);
+ 
+-	if (monitor == 0)
++#ifdef HAVE_ENCAP
++	if ((can_observe_overlay_mark(obs_point) || can_observe_overlay_hdr(obs_point)) &&
++	    flags & CLS_FLAG_TUNNEL)
++		cap_len_default = CONFIG(trace_payload_len_overlay);
++#endif
++
++	if (monitor == 0 || monitor == CONFIG(trace_payload_len))
+ 		monitor = cap_len_default;
+ 
+ 	return min_t(__u64, monitor, ctx_full_len(ctx));
+
+
+
+
+@@ -86,7 +86,7 @@ int tail_drop_notify(struct __ctx_buff *ctx)
+ 	}
+ 
+ 	flags = ctx_classify(ctx, 0, TRACE_POINT_UNKNOWN);
+-	cap_len = compute_capture_len(ctx, 0);
++	cap_len = compute_capture_len(ctx, 0, flags, TRACE_POINT_UNKNOWN);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_DROP, (__u8)error),
+
+
+
+
+@@ -229,7 +229,7 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 	}
+ 
+ 	flags = ctx_classify(ctx, proto, obs_point);
+-	cap_len = compute_capture_len(ctx, monitor);
++	cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
+@@ -278,7 +278,7 @@ _send_trace_notify4(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 	}
+ 
+ 	flags = ctx_classify(ctx, bpf_htons(ETH_P_IP), obs_point);
+-	cap_len = compute_capture_len(ctx, monitor);
++	cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
+@@ -327,7 +327,7 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 	}
+ 
+ 	flags = ctx_classify(ctx, bpf_htons(ETH_P_IPV6), obs_point);
+-	cap_len = compute_capture_len(ctx, monitor);
++	cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
+
+
+
+
+@@ -27,6 +27,7 @@
+ 
+ /* Assign lower values for testing, so that we don't need to craft big packet. */
+ ASSIGN_CONFIG(__u32, trace_payload_len, 10UL);
++ASSIGN_CONFIG(__u32, trace_payload_len_overlay, 20UL);
+ 
+ /* Defining checks for packets from L3 devices as a macro for reusability. */
+ #define L3_DEVICE_CHECK(flags, is_ipv4)                                      \
+@@ -195,6 +196,8 @@ int compute_capture_len_check(struct __ctx_buff *ctx)
+ {
+ 	test_init();
+ 
++	enum trace_point obs_point = TRACE_TO_OVERLAY;
++	cls_flags_t flags = CLS_FLAG_NONE;
+ 	__u64 cap_len;
+ 	__u32 monitor;
+ 
+@@ -203,7 +206,7 @@ int compute_capture_len_check(struct __ctx_buff *ctx)
+ 	 */
+ 	TEST("monitor-nonzero", {
+ 		monitor = 1;
+-		cap_len = compute_capture_len(ctx, monitor);
++		cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
+ 		assert(cap_len == monitor);
+ 	})
+ 
+@@ -212,7 +215,7 @@ int compute_capture_len_check(struct __ctx_buff *ctx)
+ 	 */
+ 	TEST("monitor-greater", {
+ 		monitor = (__u32)(ctx_full_len(ctx) + 1);
+-		cap_len = compute_capture_len(ctx, monitor);
++		cap_len = compute_capture_len(ctx, monitor, flags, obs_point);
+ 		assert(cap_len == ctx_full_len(ctx));
+ 	})
+ 
+@@ -221,9 +224,54 @@ int compute_capture_len_check(struct __ctx_buff *ctx)
+ 	 */
+ 	TEST("monitor-zero", {
+ 		monitor = 0;
+-		cap_len = compute_capture_len(c

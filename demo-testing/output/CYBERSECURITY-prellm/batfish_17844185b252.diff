@@ -1,0 +1,96 @@
+@@ -10,15 +10,22 @@ import com.google.common.collect.ImmutableMultiset;
+ import com.google.common.collect.ImmutableSortedMap;
+ import com.google.common.collect.Multiset;
+ import java.io.IOException;
++import java.util.List;
++import java.util.stream.Collectors;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.ConfigurationFormat;
+ import org.batfish.datamodel.HeaderSpace;
++import org.batfish.datamodel.Interface;
++import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.IpAccessList;
+ import org.batfish.datamodel.IpAccessListLine;
++import org.batfish.datamodel.IpSpaceReference;
+ import org.batfish.datamodel.IpWildcard;
+ import org.batfish.datamodel.NetworkFactory;
+ import org.batfish.datamodel.Prefix;
+ import org.batfish.datamodel.acl.FalseExpr;
++import org.batfish.datamodel.acl.MatchHeaderSpace;
++import org.batfish.datamodel.acl.MatchSrcInterface;
+ import org.batfish.datamodel.acl.PermittedByAcl;
+ import org.batfish.datamodel.answers.AclLines2Rows;
+ import org.batfish.datamodel.table.Row;
+@@ -36,17 +43,148 @@ public class AclReachability2Test {
+ 
+   @Rule public TemporaryFolder _folder = new TemporaryFolder();
+ 
+-  private Configuration _c;
++  private Configuration _c1;
++  private Configuration _c2;
+ 
+   private IpAccessList.Builder _aclb;
++  private IpAccessList.Builder _aclb2;
+ 
+   @Before
+   public void setup() {
+     NetworkFactory nf = new NetworkFactory();
+     Configuration.Builder cb =
+         nf.configurationBuilder().setConfigurationFormat(ConfigurationFormat.CISCO_IOS);
+-    _c = cb.build();
+-    _aclb = nf.aclBuilder().setOwner(_c);
++    _c1 = cb.setHostname("c1").build();
++    _c2 = cb.setHostname("c2").build();
++    _aclb = nf.aclBuilder().setOwner(_c1);
++    _aclb2 = nf.aclBuilder().setOwner(_c2);
++    _c1.setIpSpaces(ImmutableSortedMap.of("ipSpace", new Ip("1.2.3.4").toIpSpace()));
++    _c1.setInterfaces(
++        ImmutableSortedMap.of(
++            "iface",
++            Interface.builder().setName("iface").build(),
++            "iface2",
++            Interface.builder().setName("iface2").build()));
++    _c2.setInterfaces(ImmutableSortedMap.of("iface", Interface.builder().setName("iface").build()));
++  }
++
++  @Test
++  public void testCycleAppearsOnce() throws IOException {
++    // acl1 permits anything acl2 permits... twice
++    // acl2 permits anything acl1 permits... twice
++    _aclb
++        .setLines(
++            ImmutableList.of(
++                IpAccessListLine.accepting().setMatchCondition(new PermittedByAcl("acl2")).build(),
++                IpAccessListLine.accepting().setMatchCondition(new PermittedByAcl("acl2")).build()))
++        .setName("acl1")
++        .build();
++    _aclb
++        .setLines(
++            ImmutableList.of(
++                IpAccessListLine.accepting().setMatchCondition(new PermittedByAcl("acl1")).build(),
++                IpAccessListLine.accepting().setMatchCondition(new PermittedByAcl("acl1")).build()))
++        .setName("acl2")
++        .build();
++
++    TableAnswerElement answer = answer(new AclReachability2Question());
++
++    // Construct the expected result. Should find only one cycle result.
++    Multiset<Row> expected =
++        ImmutableMultiset.of(
++            Row.builder()
++                .put(AclLines2Rows.COL_SOURCES, ImmutableList.of(_c1.getName() + ": acl1, acl2"))
++                .put(AclLines2Rows.COL_LINES, null)
++                .put(AclLines2Rows.COL_BLOCKED_LINE_NUM, null)
++                .put(AclLines2Rows.COL_BLOCKING_LINE_NUMS, null)
++                .put(AclLines2Rows.COL_DIFF_ACTION, null)
++                .put(
++                    AclLines2Rows.COL_MESSAGE,
++                    "Cyclic ACL references in node 'c1': acl1 -> acl2 -> acl1")
++                .build());
++    assertThat(answer.getRows().getData(), equalTo(expected));
++  }
++
++  @Test
++  public void testCircularReferences() throws IOException {
++    // acl0 permits anything acl1 permits
++    // acl1 permits anything acl2 permits, plus 1 other line to avoid ac

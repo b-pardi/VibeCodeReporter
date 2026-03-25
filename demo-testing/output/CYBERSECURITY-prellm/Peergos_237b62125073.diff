@@ -1,0 +1,132 @@
+@@ -32,6 +32,18 @@ import static org.jline.builtins.Completers.TreeCompleter.node;
+ 
+ public class CLI implements Runnable {
+ 
++    private final CLIContext cliContext;
++    private final FileSystem peergosFileSystem;
++    private volatile boolean isFinished;
++    private RemoteFilesCompleter remoteFilesCompleter;
++
++    public CLI(CLIContext cliContext) {
++        this.cliContext = cliContext;
++        this.peergosFileSystem = new PeergosFileSystemImpl(cliContext.userContext);
++        this.remoteFilesCompleter = new RemoteFilesCompleter(this::pwdForRemoteFilesCompleter, this::lsForRemoteFilesCompleter);
++    }
++
++
+     /**
+      * resolve against remote pwd if path is relative
+      *
+@@ -130,9 +142,6 @@ public class CLI implements Runnable {
+ 
+     }
+ 
+-    private final CLIContext cliContext;
+-    private final FileSystem peergosFileSystem;
+-    private boolean isFinished;
+ 
+     public String ls(ParsedCommand cmd) {
+ 
+@@ -329,10 +338,6 @@ public class CLI implements Runnable {
+         return formatHelp();
+     }
+ 
+-    public CLI(CLIContext cliContext) {
+-        this.cliContext = cliContext;
+-        this.peergosFileSystem = new PeergosFileSystemImpl(cliContext.userContext);
+-    }
+ 
+     public String buildPrompt() {
+         return new AttributedStringBuilder()
+@@ -346,15 +351,37 @@ public class CLI implements Runnable {
+                 .append(" > ").toAnsi();
+     }
+ 
++    private Path pwdForRemoteFilesCompleter() {
++        return cliContext.pwd;
++    }
++
++    private List<String> lsForRemoteFilesCompleter(Path path) {
++        return peergosFileSystem.ls(path)
++                .stream()
++                .map(Path::getFileName)
++                .map(Path::toString)
++                .collect(Collectors.toList());
++    }
+     /**
+      * Build the command completer.
+      *
+      * @return
+      */
++    private Completers.TreeCompleter.Node buildCompletionNode(Command cmd) {
++        List<Object> nodesForCmd = new ArrayList<>();
++
++        nodesForCmd.add(cmd.name());
++
++        if (cmd.hasRemoteFileFirstArg())
++            nodesForCmd.add(node(remoteFilesCompleter));
++
++        return node(nodesForCmd.toArray(new Object[0]));
++    }
++
+     public Completer buildCompleter() {
+ 
+         List<Completers.TreeCompleter.Node> nodes = Stream.of(Command.values())
+-                .map(cmd -> node(cmd.name()))
++                .map(this::buildCompletionNode)
+                 .collect(Collectors.toList());
+ 
+         return new Completers.TreeCompleter(nodes);
+
+
+
+
+@@ -2,6 +2,8 @@ package peergos.server.cli;
+ 
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.List;
++import java.util.Set;
+ import java.util.stream.Stream;
+ 
+ public enum Command {
+@@ -51,4 +53,15 @@ public enum Command {
+             throw new IllegalStateException("Specified command " + cmd + " is not a valid command : " + new ArrayList<>(Arrays.asList(values())));
+         }
+     }
++
++    private static List<Command> COMMANDS_WITH_REMOTE_FILE_FIRST_ARG = new ArrayList<>(Arrays.asList(get, ls, rm));
++    private static List<Command> COMMANDS_WITH_REMOTE_FILE_SECOND_ARG = new ArrayList<>(Arrays.asList(put));
++
++    public boolean hasRemoteFileFirstArg()  {
++        return COMMANDS_WITH_REMOTE_FILE_FIRST_ARG.contains(this);
++    }
++
++    public boolean hasRemoteFileSecondArg() {
++        return COMMANDS_WITH_REMOTE_FILE_SECOND_ARG.contains(this);
++    }
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,42 @@
++package peergos.server.cli;
++
++import org.jline.reader.*;
++import org.jline.reader.impl.DefaultParser;
++import org.jline.reader.impl.completer.StringsCompleter;
++import org.jline.terminal.Terminal;
++import org.jline.terminal.TerminalBuilder;
++
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.List;
++import java.util.function.Function;
++import java.util.function.Supplier;
++
++public class RemoteFilesCompleter  implements Completer {
++    /**
++     * Auto completer for files/directories in  the pwd

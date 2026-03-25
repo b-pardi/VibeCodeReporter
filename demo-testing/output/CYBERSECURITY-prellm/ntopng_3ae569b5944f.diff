@@ -1,0 +1,100 @@
+@@ -69,7 +69,7 @@ class Flow : public GenericHashEntry {
+     l7_protocol_guessed, flow_dropped_counts_increased,
+     good_tls_hs,
+     quota_exceeded, has_malicious_cli_signature, has_malicious_srv_signature,
+-    is_cli_srv_swapped;
++    is_cli_srv_swapped, swap_check_done;
+ #ifdef ALERTED_FLOWS_DEBUG
+   bool iface_alert_inc, iface_alert_dec;
+ #endif
+@@ -488,6 +488,8 @@ class Flow : public GenericHashEntry {
+   u_int64_t get_current_packets_cli2srv() const;
+   u_int64_t get_current_packets_srv2cli() const;
+ 
++  inline void set_swap_check_done()      { swap_check_done = true; };
++  inline bool is_swap_check_done() const { return swap_check_done; };
+   bool is_hash_entry_state_idle_transition_ready() const;
+   void hosts_periodic_stats_update(NetworkInterface *iface, Host *cli_host, Host *srv_host, PartializableFlowTrafficStats *partial,
+ 				   bool first_partial, const struct timeval *tv) const;
+@@ -629,6 +631,7 @@ class Flow : public GenericHashEntry {
+   inline InterarrivalStats* getCli2SrvIATStats() const { return cli2srvPktTime; }
+   inline InterarrivalStats* getSrv2CliIATStats() const { return srv2cliPktTime; }
+ 
++  inline bool isTCP()            const { return protocol == IPPROTO_TCP; };
+   inline bool isTCPEstablished() const { return (!isTCPClosed() && !isTCPReset() && isThreeWayHandshakeOK()); }
+   inline bool isTCPConnecting()  const { return (src2dst_tcp_flags == TH_SYN
+ 						 && (!dst2src_tcp_flags || (dst2src_tcp_flags == (TH_SYN | TH_ACK)))); }
+
+
+
+
+@@ -55,7 +55,7 @@ Flow::Flow(NetworkInterface *_iface,
+   doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
+   periodic_update_ctr = 0, cli2srv_tos = srv2cli_tos = 0, iec104 = NULL;
+   zero_window_alert_triggered = src2dst_tcp_zero_window = dst2src_tcp_zero_window = 0;
+-  is_cli_srv_swapped = false;
++  is_cli_srv_swapped = swap_check_done = false;
+   
+ #ifdef HAVE_NEDGE
+   last_conntrack_update = 0;
+
+
+
+
+@@ -333,12 +333,6 @@ u_int GenericHash::purgeIdle(const struct timeval * tv, bool force_idle, bool fu
+ 	buckets_checked++;
+ 
+ 	switch(head_state) {
+-	case hash_entry_state_idle:
+-	  /* As an idle entry is always removed immediately from the hash table
+-	     This walk should never find any such entry */
+-	  ntop->getTrace()->traceEvent(TRACE_ERROR, "Unexpected state found [%u]", head_state);
+-	  break;
+-
+ 	case hash_entry_state_allocated:
+ 	  /* TCP flows with 3WH not yet completed (or collected with no TCP flags) fall here */
+ 	  /* Don't break */
+@@ -357,9 +351,15 @@ u_int GenericHash::purgeIdle(const struct timeval * tv, bool force_idle, bool fu
+ 	  if(force_idle) goto detach_idle_hash_entry;
+ 	  break;
+ 
++	case hash_entry_state_idle:
++	  /*
++	    Idle flows can be in the hash table as a flow can be swapped and immediately set
++	    to idle when the heuristic to determine actual client and server is used
++	    https://github.com/ntop/ntopng/issues/5058
++	  */
+ 	case hash_entry_state_active:
+-	  if(
+-	     force_idle
++	  if(head_state == hash_entry_state_idle
++	     || force_idle
+ 	     || (
+ 		 iface->is_purge_idle_interface()
+ 		 && head->is_hash_entry_state_idle_transition_ready())
+@@ -402,9 +402,18 @@ u_int GenericHash::purgeIdle(const struct timeval * tv, bool force_idle, bool fu
+     advance(it, idle_entries_shadow_old_size);
+ 
+     for(; it != idle_entries_shadow->end(); it++) {
+-      (*it)->set_hash_entry_state_idle();
+-      /* Now that the entry has been set to idle, housekeep can executed one last time */
++      if((*it)->get_state() != hash_entry_state_idle)
++	(*it)->set_hash_entry_state_idle();
++
++      /*
++	Now that the entry has been set to idle, housekeep can executed one last time
++      */
+       (*it)->housekeep(now);
++
++      /*
++	Count the number of transitions, that is, the number of times an idle entry
++	has been inserted into the hash table
++       */
+       entry_state_transition_counters.num_idle_transitions++;
+     }
+   }
+
+
+
+
+@@ -1424,6 +1424,7 @@ bool NetworkInterface::processPacket(u_int32_t bridge_iface_id

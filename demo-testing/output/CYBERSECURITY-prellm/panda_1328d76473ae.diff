@@ -1,0 +1,104 @@
+@@ -82,15 +82,18 @@ void tcg_llvm_destroy(void);
+ void tcg_llvm_tb_alloc(struct TranslationBlock *tb);
+ void tcg_llvm_tb_free(struct TranslationBlock *tb);
+ const char* tcg_llvm_get_func_name(struct TranslationBlock *tb);
+-void tcg_llvm_gen_code(__class_compat_var TCGLLVMTranslator *l, struct TCGContext *s, struct TranslationBlock *tb);
+-uintptr_t tcg_llvm_qemu_tb_exec(CPUArchState *env, struct TranslationBlock *tb);
+-void tcg_llvm_write_module(__class_compat_var TCGLLVMTranslator *l, const char *path);
++void tcg_llvm_gen_code(__class_compat_var TCGLLVMTranslator *l,
++    struct TCGContext *s, struct TranslationBlock *tb);
++uintptr_t tcg_llvm_qemu_tb_exec(CPUArchState *env,
++    struct TranslationBlock *tb);
++void tcg_llvm_write_module(__class_compat_var TCGLLVMTranslator *l,
++    const char *path);
+ 
+ struct TCGLLVMRuntime {
+     // NOTE: The order of these are fixed !
+-    //uint64_t helper_ret_addr;
+-    //uint64_t helper_call_addr;
+-    //uint64_t helper_regs[3];
++    uint64_t helper_ret_addr;
++    uint64_t helper_call_addr;
++    uint64_t helper_regs[3];
+     // END of fixed block
+     struct TranslationBlock* last_tb;
+ };
+@@ -110,7 +113,8 @@ extern "C++" {
+ /* External interface for C++ code */
+ 
+ #include <llvm/ExecutionEngine/ExecutionEngine.h>
+-#include <llvm/ExecutionEngine/MCJIT.h>
++#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
++#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+ #include <llvm/IR/DataLayout.h>
+ #include <llvm/IR/DerivedTypes.h>
+ #include <llvm/IR/IRBuilder.h>
+@@ -123,28 +127,31 @@ extern "C++" {
+ #include <llvm/Support/Threading.h>
+ #include <llvm/Transforms/Scalar.h>
+ #include <llvm/Transforms/Scalar/GVN.h>
+-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+ 
+-/* Old TCGLLVMContextPrivate public methods
+-
+-    void generateTraceCall(uintptr_t pc);
+-};
+-*/
++using NewModuleCallback = std::function<void(llvm::Module *module,
++    llvm::legacy::FunctionPassManager *functionPassManager)>;
+ 
+ class TCGLLVMTranslator {
+-   private:
+-    std::map<std::pair<int64_t, llvm::Type *>, llvm::Value *> m_envOffsetValues;
+-    std::unique_ptr<llvm::Module> m_module;
+-    std::unique_ptr<llvm::LLVMContext> m_context = std::make_unique<llvm::LLVMContext>();
+-    llvm::IRBuilder<> m_builder;
++    private:
++    std::vector<NewModuleCallback> newModuleCallbacks;
++    std::map<std::pair<int64_t, llvm::Type *>, llvm::Value *>
++        m_envOffsetValues;
++    llvm::orc::ThreadSafeContext m_tsc = llvm::orc::ThreadSafeContext(
++        std::move(std::make_unique<llvm::LLVMContext>()));
++    llvm::LLVMContext *m_context = m_tsc.getContext();
++    llvm::IRBuilder<> m_builder = llvm::IRBuilder<>(*m_context);
++    std::unique_ptr<llvm::Module> m_module =
++        std::make_unique<llvm::Module>("tcg-llvm", *m_context);
+     std::string m_CPUArchStateName;
+     llvm::Value *m_envInt;
+     llvm::StructType *m_CPUArchStateType = nullptr;
+     llvm::ExitOnError ExitOnErr;
+ 
+-    std::unique_ptr<llvm::orc::LLLazyJIT> jit = ExitOnErr(llvm::orc::LLLazyJITBuilder().create());
++    std::unique_ptr<llvm::orc::LLLazyJIT> jit =
++        ExitOnErr(llvm::orc::LLLazyJITBuilder().create());
+ 
+-    llvm::orc::JITTargetMachineBuilder JTMB = ExitOnErr(llvm::orc::JITTargetMachineBuilder::detectHost());
++    llvm::orc::JITTargetMachineBuilder JTMB =
++        ExitOnErr(llvm::orc::JITTargetMachineBuilder::detectHost());
+ 
+     llvm::DataLayout DL = jit->getDataLayout();
+ 
+@@ -194,14 +201,9 @@ class TCGLLVMTranslator {
+     llvm::Value *m_eip;
+     llvm::Value *m_ccop;
+ 
+-    static unsigned m_eip_last_gep_index;
+-
+-    typedef llvm::DenseMap<std::pair<unsigned, unsigned>, llvm::Instruction *> GepMap;
+-    GepMap m_registers;
+-
+     llvm::Value *getEnv();
+ 
+-   public:
++    public:
+     TCGLLVMTranslator();
+     ~TCGLLVMTranslator();
+ 
+@@ -215,30 +217,18 @@ class TCGLLVMTranslator {
+         return jit->getExecutionSession();
+     }
+ 
+-    static TCGLLVMTranslator *create(const std::string &bitcodeLibraryPath);
+-
+-    /*
+-    llvm::LLVMContext &getContext()

@@ -1,0 +1,88 @@
+@@ -5,12 +5,10 @@ import static org.batfish.common.topology.TopologyUtil.computeNodeInterfaces;
+ import static org.batfish.common.util.CollectionUtil.toImmutableMap;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.collect.HashBasedTable;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Sets;
+-import com.google.common.collect.Table;
+ import io.opentracing.Scope;
+ import io.opentracing.Span;
+ import io.opentracing.util.GlobalTracer;
+@@ -18,7 +16,6 @@ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
+-import java.util.IdentityHashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
+@@ -229,7 +226,8 @@ public final class IpOwners {
+     Map<Ip, Map<String, Set<String>>> ipOwners = new HashMap<>();
+     // vrid -> sync interface -> interface to own IPs if sync interface wins election -> IPs
+     Map<Integer, Map<NodeInterfacePair, Map<String, Set<Ip>>>> vrrpGroups = new HashMap<>();
+-    Table<Ip, Integer, Set<Interface>> hsrpGroups = HashBasedTable.create();
++    // group -> interface -> IPs to own if interface wins election
++    Map<Integer, Map<NodeInterfacePair, Set<Ip>>> hsrpGroups = new HashMap<>();
+     allInterfaces.forEach(
+         (hostname, interfaces) ->
+             interfaces.forEach(
+@@ -250,7 +248,7 @@ public final class IpOwners {
+                                   .add(i.getName()));
+                 }));
+     processVrrpGroups(ipOwners, vrrpGroups, l3Adjacencies, nc);
+-    processHsrpGroups(ipOwners, hsrpGroups);
++    processHsrpGroups(ipOwners, hsrpGroups, l3Adjacencies, nc);
+ 
+     // freeze
+     return toImmutableMap(
+@@ -263,34 +261,57 @@ public final class IpOwners {
+                 hostIpOwnersEntry -> ImmutableSet.copyOf(hostIpOwnersEntry.getValue())));
+   }
+ 
+-  /** extract HSRP info from a given interface and add it to the {@code hsrpGroups} table */
++  /**
++   * Extract HSRP info from a given interface and add it to the {@code hsrpGroups}.
++   *
++   * @param hsrpGroups Output map: groupid -> interface -> IPs to own if interface wins election
++   */
+   @VisibleForTesting
+-  static void extractHsrp(Table<Ip, Integer, Set<Interface>> hsrpGroups, Interface i) {
++  static void extractHsrp(Map<Integer, Map<NodeInterfacePair, Set<Ip>>> hsrpGroups, Interface i) {
+     // Inactive interfaces could never win a HSRP election
+     if (!i.getActive()) {
+       return;
+     }
+     // collect hsrp info
+     i.getHsrpGroups()
+-        .values()
+         .forEach(
+-            g -> {
+-              Set<Ip> ips = g.getIps();
+-              int groupNum = g.getGroupNumber();
++            (groupNum, hsrpGroup) -> {
++              Set<Ip> ips = hsrpGroup.getVirtualAddresses();
++              /*
++               * Invalid HSRP configuration. The HSRP group has no source IP address that
++               * would be used for VRRP election. This interface could never win the
++               * election, so is not a candidate.
++               */
++              if (hsrpGroup.getSourceAddress() == null) {
++                /*
++                 * Invalid VRRP configuration. The VRRP has no source IP address that
++                 * would be used for VRRP election. This interface could never win the
++                 * election, so is not a candidate.
++                 */
++                return;
++              }
+               if (ips.isEmpty()) {
++                /*
++                 * Invalid HSRP configuration. The HSRP group has no virtual IP addresses set, so
++                 * should not participate in HSRP election. This interface could never win the
++                 * election, so is not a candidate.
++                 *
++                 * TODO: Technically according to
++                 *       https://datatracker.ietf.org/doc/html/rfc2281#section-5.1 the virtual IP
++ 

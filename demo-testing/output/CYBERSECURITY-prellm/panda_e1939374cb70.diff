@@ -1,0 +1,106 @@
+@@ -48,11 +48,10 @@
+ #include "taint_api.h"
+ #include "taint2_hypercalls.h"
+ 
++extern "C" {
+ #include "callstack_instr/callstack_instr.h"
+ #include "callstack_instr/callstack_instr_ext.h"
+ 
+-extern "C" {
+-
+ bool init_plugin(void *);
+ void uninit_plugin(void *);
+ int after_block_translate(CPUState *cpu, TranslationBlock *tb);
+@@ -98,229 +97,6 @@ bool optimize_llvm = true;
+ extern bool inline_taint;
+ bool debug_taint = false;
+ 
+-// ============== Hypercall stuff ===============
+-#ifdef TARGET_I386
+-// shorcuts for accesing the values of x86 registers
+-#define EAX ((CPUArchState*)cpu->env_ptr)->regs[R_EAX]
+-#define EBX ((CPUArchState*)cpu->env_ptr)->regs[R_EBX]
+-#define ECX ((CPUArchState*)cpu->env_ptr)->regs[R_ECX]
+-#define EDI ((CPUArchState*)cpu->env_ptr)->regs[R_EDI]
+-#endif
+-
+-// max length of strnlen or taint query
+-#define QUERY_HYPERCALL_MAX_LEN 32
+-
+-/**
+- * @brief Constructs a pandalog message for src-level info.
+- */
+-Panda__SrcInfo *pandalog_src_info_create(PandaHypercallStruct phs) {
+-    Panda__SrcInfo *si = (Panda__SrcInfo *)malloc(sizeof(Panda__SrcInfo));
+-    *si = PANDA__SRC_INFO__INIT;
+-    si->filename = phs.src_filename;
+-    si->astnodename = phs.src_ast_node_name;
+-    si->linenum = phs.src_linenum;
+-    si->has_insertionpoint = 0;
+-    if (phs.insertion_point) {
+-        si->has_insertionpoint = 1;
+-        si->insertionpoint = phs.insertion_point;
+-    }
+-    si->has_ast_loc_id = 1;
+-    si->ast_loc_id = phs.src_filename;
+-    return si;
+-}
+-
+-/**
+- * @brief Hypercall-initiated taint query of some src-level extent.
+- */
+-void taint_query_hypercall(PandaHypercallStruct phs) {
+-    CPUState *cpu = first_cpu;
+-    if  (pandalog && taintEnabled && (taint2_num_labels_applied() > 0)) {
+-        // okay, taint is on and some labels have actually been applied
+-        // is there *any* taint on this extent
+-        uint32_t num_tainted = 0;
+-        bool is_strnlen = ((int) phs.len == -1);
+-        uint32_t offset=0;
+-        while (true) {
+-            uint32_t va = phs.buf + offset;
+-            uint32_t pa =  panda_virt_to_phys(cpu, va);
+-            if (is_strnlen) {
+-                uint8_t c;
+-                panda_virtual_memory_rw(cpu, pa, &c, 1, false);
+-                // null terminator
+-                if (c==0) break;
+-            }
+-            if ((int) pa != -1) {
+-                Addr a = make_maddr(pa);
+-                if (taint2_query(a)) {
+-                    num_tainted ++;
+-                }
+-            }
+-            offset ++;
+-            // end of query by length or max string length
+-            if (!is_strnlen && offset == phs.len) break;
+-            if (is_strnlen && (offset == QUERY_HYPERCALL_MAX_LEN)) break;
+-        }
+-        uint32_t len = offset;
+-        if (num_tainted) {
+-            // ok at least one byte in the extent is tainted
+-            // 1. write the pandalog entry that tells us something was tainted on this extent
+-            Panda__TaintQueryHypercall *tqh = (Panda__TaintQueryHypercall *) malloc (sizeof (Panda__TaintQueryHypercall));
+-            *tqh = PANDA__TAINT_QUERY_HYPERCALL__INIT;
+-            tqh->buf = phs.buf;
+-            tqh->len = len;
+-            tqh->num_tainted = num_tainted;
+-            // obtain the actual data out of memory
+-            // NOTE: first X bytes only!
+-            uint32_t data[QUERY_HYPERCALL_MAX_LEN];
+-            uint32_t n = len;
+-            // grab at most X bytes from memory to pandalog
+-            // this is just a snippet.  we dont want to write 1M buffer
+-            if (QUERY_HYPERCALL_MAX_LEN < len) n = QUERY_HYPERCALL_MAX_LEN;
+-            for (uint32_t i=0; i<n; i++) {
+-                data[i] = 0;
+-                uint8_t c;
+-                panda_virtual_memory_rw(cpu, phs.buf+i, &c, 1, false);
+-                data[i] = c;
+-            }
+-            tqh->n_data = n;
+-            tqh->data = data;
+-            // 2. write out src-level info
+-            Panda__SrcInfo *si = pandalog_src_info_create(phs);
+-

@@ -1,0 +1,118 @@
+@@ -59,7 +59,7 @@ class ThreadPool {
+   inline bool isTerminating() { return terminating; };
+ 
+   void run();
+-  bool queueJob(ThreadedActivity *j, char *path, NetworkInterface *iface, time_t deadline);
++  bool queueJob(ThreadedActivity *ta, char *path, NetworkInterface *iface, time_t deadline);
+ };
+ 
+ 
+
+
+
+
+@@ -51,8 +51,6 @@ class ThreadedActivity {
+   void aperiodicActivityBody();
+   void uSecDiffPeriodicActivityBody();
+   void schedulePeriodicActivity(ThreadPool *pool, time_t deadline);
+-  void setInterfaceTaskRunning(NetworkInterface *iface, bool running);
+-  bool isInterfaceTaskRunning(NetworkInterface *iface);
+   ThreadedActivityStats *getThreadedActivityStats(NetworkInterface *iface, bool allocate_if_missing);
+   void updateThreadedActivityStatsBegin(NetworkInterface *iface, struct timeval *begin);
+   void updateThreadedActivityStatsEnd(NetworkInterface *iface, u_long latest_duration);
+@@ -77,9 +75,12 @@ class ThreadedActivity {
+   inline void shutdown()      { terminating = true; };
+   void terminateEnqueueLoop();
+   bool isTerminating();
++
+   void setNextVmReload(time_t when);
+ 
+   void run();
++  bool isRunning(const NetworkInterface *iface) const;
++  void setRunning(NetworkInterface *iface, bool running);
+ 
+   void lua(NetworkInterface *iface, lua_State *vm);
+ };
+
+
+
+
+@@ -99,7 +99,8 @@ void ThreadPool::run() {
+       break;
+     } else {
+       Utils::setThreadName(q->script_path);
+-      (q->j)->runScript(q->script_path, q->iface, q->deadline);
++      q->j->runScript(q->script_path, q->iface, q->deadline);
++      q->j->setRunning(q->iface, false);
+       delete q;
+     }
+   }
+@@ -111,13 +112,16 @@ void ThreadPool::run() {
+ 
+ /* **************************************************** */
+ 
+-bool ThreadPool::queueJob(ThreadedActivity *j, char *path, NetworkInterface *iface, time_t deadline) {
++bool ThreadPool::queueJob(ThreadedActivity *ta, char *path, NetworkInterface *iface, time_t deadline) {
+   QueuedThreadData *q;
+   
+   if(isTerminating())
+     return(false);
+ 
+-  q = new QueuedThreadData(j, path, iface, deadline);
++  if(ta->isRunning(iface))
++    return(false); /* Task still running, don't re-queue it */
++
++  q = new QueuedThreadData(ta, path, iface, deadline);
+ 
+   if(!q) {
+     ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to create job");
+@@ -126,6 +130,7 @@ bool ThreadPool::queueJob(ThreadedActivity *j, char *path, NetworkInterface *ifa
+ 
+   m->lock(__FILE__, __LINE__);
+   threads.push(q);
++  ta->setRunning(iface, true);
+   pthread_cond_signal(&condvar);
+   m->unlock(__FILE__, __LINE__);
+ 
+
+
+
+
+@@ -113,22 +113,43 @@ bool ThreadedActivity::isTerminating() {
+ 
+ /* ******************************************* */
+ 
+-void ThreadedActivity::setInterfaceTaskRunning(NetworkInterface *iface, bool running) {
+-  const int iface_id = iface->get_id();
++bool ThreadedActivity::isRunning(const NetworkInterface *iface) const {
++  if(iface == ntop->getSystemInterface())
++    return systemTaskRunning;
++  else {
++    const int iface_id = iface->get_id();
++
++    if(iface_id >= 0 && iface_id < MAX_NUM_INTERFACE_IDS)
++      return interfaceTasksRunning[iface_id];
++    else
++      ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to determine whether a task is running [path: %s][iface: %s]", path, iface->get_name());
++  }
+ 
+-  if((iface_id >= 0) && (iface_id < MAX_NUM_INTERFACE_IDS))
+-    interfaceTasksRunning[iface_id] = running;
++  return false;
+ }
+ 
+ /* ******************************************* */
+ 
+-bool ThreadedActivity::isInterfaceTaskRunning(NetworkInterface *iface) {
+-  const int iface_id = iface->get_id();
+-
+-  if((iface_id >= 0) && (iface_id < MAX_NUM_INTERFACE_IDS))
+-    return interfaceTasksRunning[iface_id];
+-
+-  return false;
++void ThreadedActivity::setRunning(NetworkInterface *iface, bool running) {
++  if(iface == ntop->getSystemInterface()) {
++    if(systemTaskRunning != running)
++      systemTaskRunning = running;
++    else
++      ntop->getTrace()->traceEvent(TRACE_ERROR, "Internal error. [path: %s][iface: %s][run

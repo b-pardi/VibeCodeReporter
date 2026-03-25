@@ -1,0 +1,170 @@
+@@ -14,6 +14,22 @@ typedef struct _ulebr {
+ 	ut8 *p;
+ } ulebr;
+ 
++typedef struct {
++	struct symbol_t *symbols;
++	int j;
++	int symbols_count;
++	HtPP *hash;
++} RSymCtx;
++
++typedef void (*RExportsIterator)(struct MACH0_(obj_t) *bin, const char *name, ut64 flags, ut64 offset, void *ctx);
++
++typedef struct {
++	ut8 *node;
++	char *label;
++	int i;
++	ut8 *next_child;
++} RTrieState;
++
+ // OMG; THIS SHOULD BE KILLED; this var exposes the local native endian, which is completely unnecessary
+ // USE THIS: int ws = bf->o->info->big_endian;
+ #define mach0_endian 1
+@@ -91,6 +107,23 @@ static ut64 addr_to_offset(struct MACH0_(obj_t) *bin, ut64 addr) {
+ 	return 0;
+ }
+ 
++static ut64 offset_to_vaddr(struct MACH0_(obj_t) *bin, ut64 offset) {
++	ut64 segment_base, segment_size;
++	int i;
++
++	if (!bin->segs) {
++		return 0;
++	}
++	for (i = 0; i < bin->nsegs; i++) {
++		segment_base = (ut64)bin->segs[i].fileoff;
++		segment_size = (ut64)bin->segs[i].filesize;
++		if (offset >= segment_base && offset < segment_base + segment_size) {
++			return bin->segs[i].vmaddr + (offset - segment_base);
++		}
++	}
++	return 0;
++}
++
+ static bool init_hdr(struct MACH0_(obj_t) *bin) {
+ 	ut8 magicbytes[4] = {0};
+ 	ut8 machohdrbytes[sizeof (struct MACH0_(mach_header))] = {0};
+@@ -1640,7 +1673,7 @@ static bool __isDataSection(RBinSection *sect) {
+ 
+ RList *MACH0_(get_segments)(RBinFile *bf) {
+ 	struct MACH0_(obj_t) *bin = bf->o->bin_obj;
+-	
++
+ 	RList *list = r_list_newf ((RListFree)r_bin_section_free);
+ 
+ 	int i, j;
+@@ -1889,6 +1922,128 @@ static char *get_name(struct MACH0_(obj_t) *mo, ut32 stridx, bool filter) {
+ 	return NULL;
+ }
+ 
++static int walk_exports(struct MACH0_(obj_t) *bin, RExportsIterator iterator, void * ctx) {
++#define ULEB(at) read_uleb128 (&ur, end)
++	r_return_val_if_fail (bin, 0);
++	if (!bin->dyld_info) {
++		return 0;
++	}
++
++	int count = 0;
++	ulebr ur = {NULL};
++	ut8 * trie = NULL;
++	RList * states = NULL;
++	ut64 size = bin->dyld_info->export_size;
++	if (!size) {
++		return count;
++	}
++	trie = malloc (size);
++	if (!trie) {
++		return count;
++	}
++	ut8 * end = trie + size;
++
++	if (r_buf_read_at (bin->b, bin->dyld_info->export_off, trie, bin->dyld_info->export_size) != size) {
++		goto beach;
++	}
++
++	states = r_list_newf ((RListFree)free);
++	if (!states) {
++		goto beach;
++	}
++
++	RTrieState * root = R_NEW0 (RTrieState);
++	if (!root) {
++		goto beach;
++	}
++	root->node = trie;
++	root->i = 0;
++	root->label = NULL;
++	r_list_push (states, root);
++
++	do {
++		RTrieState * state = r_list_get_top (states);
++		ur.p = state->node;
++		ut64 len = ULEB();
++		if (len) {
++			ut64 flags = ULEB();
++			ut64 offset = ULEB();
++			if (iterator) {
++				char * name = NULL;
++				RListIter *iter;
++				RTrieState *s;
++				r_list_foreach (states, iter, s) {
++					if (!s->label) {
++						continue;
++					}
++					name = r_str_append (name, s->label);
++				}
++				if (name == NULL) {
++					eprintf ("malformed export trie\n");
++					goto beach;
++				}
++				iterator (bin, name, flags, offset, ctx);
++				R_FREE (name);
++			}
++			count++;
++		}
++		ut64 child_count = ULEB();
++		if ((len && child_count) || (!len && !child_count)) {
++			eprintf ("malformed export trie\n");
++			goto beach;
++		}
++		if (state->i == child_count) {
++			r_list_pop (states);
++			continue;
++		}
++		if (!state->next_child) {
++			state->next_child = ur.p;
++		} else {
++			ur.p = state->next_child;
++		}
++		RTrieState * next = R_NEW0 (RTrieState);
++		if (!next) {
++			goto beach;
++		}
++		next->label = (char *) ur.p;
++		ur.p += strlen (next->label) + 1;
++		if (ur.p >= end) {
++			eprintf ("malformed export trie\n");
++			R_FREE (next);
++			goto beach;
++		}
++		next->node = ULEB() + trie;
++		if (next->node >= end) {
++			eprintf ("malformed export trie\n");
++			R_FREE (next);
++			goto beach;
++		}
++		next->i = 0;
++		state->i++;
++		state->next_child = ur.p;
++		r_list_push (states, next);
++	} while (r_list_length (states));
++#undef ULEB
++
++beach:
++	r_list_free (states);
++	R_FREE (trie);
++	return count;
++}
++
++static void fill_exports_list(struct MACH0_

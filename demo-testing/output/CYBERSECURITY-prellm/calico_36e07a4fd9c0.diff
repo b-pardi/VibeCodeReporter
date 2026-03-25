@@ -1,0 +1,100 @@
+@@ -34,8 +34,7 @@ static CALI_BPF_INLINE int do_nat_common(struct bpf_sock_addr *ctx, __u8 proto,
+ 	struct calico_nat_dest *nat_dest;
+ 	nat_dest = calico_v4_nat_lookup(0, ctx->user_ip4, proto, dport_he, false, &res,
+ 			proto == IPPROTO_UDP && !connect, /* enforce affinity UDP */
+-			proto == IPPROTO_UDP && !connect /* update affinity timer */,
+-			true /* always cluster local traffic */);
++			proto == IPPROTO_UDP && !connect /* update affinity timer */);
+ 	if (!nat_dest) {
+ 		CALI_INFO("NAT miss.\n");
+ 		if (res == NAT_NO_BACKEND) {
+
+
+
+
+@@ -66,8 +66,7 @@ static CALI_BPF_INLINE struct calico_nat_dest* calico_v4_nat_lookup(__be32 ip_sr
+ 								    bool from_tun,
+ 								    nat_lookup_result *res,
+ 								    bool affinity_always,
+-								    bool affinity_tmr_update,
+-								    bool local_traffic)
++								    bool affinity_tmr_update)
+ {
+ 	struct calico_nat_v4_key nat_key = {
+ 		.prefixlen = NAT_PREFIX_LEN_WITH_SRC_MATCH_IN_BITS,
+@@ -149,11 +148,24 @@ static CALI_BPF_INLINE struct calico_nat_dest* calico_v4_nat_lookup(__be32 ip_sr
+ 	}
+ 	__u32 count = nat_lv1_val->count;
+ 
+-	CALI_DEBUG("local_traffic %d count %d flags 0x%x\n", local_traffic, count, nat_lv1_val->flags);
+-	if (from_tun || (local_traffic && (nat_lv1_val->flags & NAT_FLG_INTERNAL_LOCAL)) ||
+-			(!local_traffic && (nat_lv1_val->flags & NAT_FLG_EXTERNAL_LOCAL))) {
+-		CALI_DEBUG("using local count %d\n", count);
++	if (from_tun) {
+ 		count = nat_lv1_val->local;
++	} else if (nat_lv1_val->flags & (NAT_FLG_INTERNAL_LOCAL | NAT_FLG_EXTERNAL_LOCAL)) {
++		bool local_traffic = true;
++
++		if (CALI_F_FROM_HEP) {
++			struct cali_rt *rt = cali_rt_lookup(ip_src);
++
++			if (!rt || (!cali_rt_is_host(rt) && !cali_rt_is_workload(rt))) {
++				local_traffic = false;
++			}
++		}
++
++		if ((local_traffic && (nat_lv1_val->flags & NAT_FLG_INTERNAL_LOCAL)) ||
++				(!local_traffic && (nat_lv1_val->flags & NAT_FLG_EXTERNAL_LOCAL))) {
++			count = nat_lv1_val->local;
++			CALI_DEBUG("local_traffic %d count %d flags 0x%x\n", local_traffic, count, nat_lv1_val->flags);
++		}
+ 	}
+ 
+ 	CALI_DEBUG("NAT: 1st level hit; id=%d\n", nat_lv1_val->id);
+@@ -234,10 +246,9 @@ skip_affinity:
+ static CALI_BPF_INLINE struct calico_nat_dest* calico_v4_nat_lookup2(__be32 ip_src, __be32 ip_dst,
+ 								    __u8 ip_proto, __u16 dport,
+ 								    bool from_tun,
+-								    nat_lookup_result *res,
+-								    bool local_traffic)
++								    nat_lookup_result *res)
+ {
+-	return calico_v4_nat_lookup(ip_src, ip_dst, ip_proto, dport, from_tun, res, false, false, local_traffic);
++	return calico_v4_nat_lookup(ip_src, ip_dst, ip_proto, dport, from_tun, res, false, false);
+ }
+ 
+ static CALI_BPF_INLINE int vxlan_v4_encap(struct cali_tc_ctx *ctx,  __be32 ip_src, __be32 ip_dst)
+
+
+
+
+@@ -264,8 +264,6 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 		goto skip_policy;
+ 	}
+ 
+-	bool is_local_traffic = true;
+-
+ 	/* Unlike from WEP where we can do RPF by comparing to calico routing
+ 	 * info, we must rely in Linux to do it for us when receiving packets
+ 	 * from outside of the host. We enforce RPF failed on every new flow.
+@@ -273,19 +271,13 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 	 */
+ 	if (CALI_F_FROM_HEP) {
+ 		ct_result_set_flag(ctx.state->ct_result.rc, CALI_CT_RPF_FAILED);
+-
+-		struct cali_rt *rt = cali_rt_lookup(ctx.state->ip_src);
+-
+-		if (!rt || (!cali_rt_is_host(rt) && !cali_rt_is_workload(rt))) {
+-			is_local_traffic = false;
+-		}
+ 	}
+ 
+ 	/* No conntrack entry, check if we should do NAT */
+ 	nat_lookup_result nat_res = NAT_LOOKUP_ALLOW;
+ 	ctx.nat_dest = calico_v4_nat_lookup2(ctx.state->ip_src, ctx.state->ip_dst,
+ 					     ctx.state->ip_proto, ctx.state->dport,
+-					     ctx.state->tun_ip != 0, &nat_res, is_local_traffic);
++					     ctx.state->tun_ip != 0, &nat_res);
+ 
+ 	if (nat_res == NAT_FE_LOOKUP_DROP) {
+ 		CALI_DEBUG("Packet is from an unauthorised source: DROP\n");

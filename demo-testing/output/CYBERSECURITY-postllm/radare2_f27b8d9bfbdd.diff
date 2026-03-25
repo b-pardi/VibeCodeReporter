@@ -1,0 +1,162 @@
+@@ -499,6 +499,7 @@ R_API int r_cmd_call(RCmd *cmd, const char *input) {
+ 			return true;
+ 		}
+ 		r_list_foreach (cmd->plist, iter, cp) {
++			/// XXX the plugin call have no plugin context!! we cant have multiple plugins here
+ 			if (cp->call && cp->call (cmd->data, input)) {
+ 				free (nstr);
+ 				return true;
+
+
+
+
+@@ -516,14 +516,14 @@ static int cmd_plugins(void *data, const char *input) {
+ 		break;
+ 	case 'g': // "Lg"
+ 		if (input[1] == 'j') {
+-			r_core_cmd0 (core, "gLj");
++			r_core_cmd_call (core, "gLj");
+ 		} else {
+-			r_core_cmd0 (core, "gL");
++			r_core_cmd_call (core, "gL");
+ 		}
+ 		break;
+ 	case 'o': // "Lo"
+ 	case 'i': // "Li"
+-		r_core_cmdf (core, "%cL%s", input[0], input + 1);
++		r_core_cmd_callf (core, "%cL%s", input[0], input + 1);
+ 		break;
+ 	case 'c': { // "Lc"
+ 		RListIter *iter;
+@@ -537,8 +537,8 @@ static int cmd_plugins(void *data, const char *input) {
+ 			pj_a (pj);
+ 			r_list_foreach (core->rcmd->plist, iter, cp) {
+ 				pj_o (pj);
+-				pj_ks (pj, "Name", cp->name);
+-				pj_ks (pj, "Description", cp->desc);
++				pj_ks (pj, "name", cp->name);
++				pj_ks (pj, "desc", cp->desc);
+ 				pj_end (pj);
+ 			}
+ 			pj_end (pj);
+
+
+
+
+@@ -84,8 +84,7 @@ static void r_core_debug_breakpoint_hit(RCore *core, RBreakpointItem *bpi) {
+ 
+ static void r_core_debug_syscall_hit(RCore *core) {
+ 	const char *cmdhit = r_config_get (core->config, "cmd.onsyscall");
+-
+-	if (cmdhit && cmdhit[0] != 0) {
++	if (R_STR_ISNOTEMPTY (cmdhit)) {
+ 		r_core_cmd0 (core, cmdhit);
+ 		r_cons_flush ();
+ 	}
+
+
+
+
+@@ -9,15 +9,76 @@
+ #include "../js_require.c"
+ #include "../js_r2papi.c"
+ 
+-static R_TH_LOCAL JSContext *Gctx = NULL;
+-static R_TH_LOCAL JSValue Gfunc;
+-
+ typedef struct {
+-	JSContext *ctx;
+-	JSRuntime *r;
+ 	RCore *core;
++	char *name; // if name != NULL its a plugin reference
++	JSRuntime *r;
++	JSContext *ctx;
++	JSValue func;
+ } QjsContext;
+ 
++// XXX remove globals
++static R_TH_LOCAL RList *Glist = NULL;
++static R_TH_LOCAL int Gplug = 0;
++
++static void qjsctx_free_item(QjsContext *c) {
++	if (c) {
++		free (c->name);
++		free (c);
++	}
++}
++
++static QjsContext *qjsctx_find(RCore *core, const char *name) {
++	r_return_val_if_fail (core, NULL);
++	QjsContext *qc;
++	RListIter *iter;
++	r_list_foreach (Glist, iter, qc) {
++		if (name && core) {
++			if (qc->core == core && qc->name && !strcmp (qc->name, name)) {
++				return qc;
++			}
++		} else if (qc->core == core) {
++			return qc;
++		}
++	}
++	return NULL;
++}
++
++static QjsContext *qjsctx_add(RCore *core, const char *name, JSContext *ctx, JSValue func) {
++	QjsContext *qc = R_NEW0 (QjsContext);
++	if (qc) {
++		qc->name = name? strdup (name): NULL;
++		qc->core = core;
++		qc->ctx = ctx;
++		qc->func = func;
++		if (!Glist) {
++			Glist = r_list_newf ((RListFree)qjsctx_free_item);
++		}
++		r_list_append (Glist, qc);
++	}
++	return qc;
++}
++
++static bool qjsctx_del(RCore *core, const char *name) {
++	r_return_val_if_fail (core && name, false);
++	QjsContext *qc;
++	RListIter *iter;
++	r_list_foreach (Glist, iter, qc) {
++		if (qc->core == core && name && qc->name && !strcmp (qc->name, name)) {
++			r_list_delete (Glist, iter);
++			return true;
++		}
++	}
++	return false;
++}
++
++static void qjsctx_free(void) {
++	r_list_free (Glist);
++	Glist = NULL;
++}
++
++///////////////////////////////////////////////////////////
++
+ static bool eval(JSContext *ctx, const char *code);
+ 
+ static void js_dump_obj(JSContext *ctx, FILE *f, JSValueConst val) {
+@@ -86,49 +147,82 @@ static JSValue b64(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst
+ 			}
+ 		}
+ 	}
+-	// JS_FreeValue (ctx, argv[0]);
+ 	JSValue v = JS_NewString (ctx, r_str_get (ret));
+ 	free (ret);
+ 	return v;
+ }
+ 
++static int r2plugin_core_call2(QjsContext *qc, RCore *core, const char *input) {
++	JSValueConst args[1] = {
++		JS_NewString (qc->ctx, input)
++	};
++	JSValue res = JS_Call (qc->ctx, qc->func, JS_UNDEFINED, countof (args), args);
++	return JS_ToBool (qc->ctx, res) == 1;
++}
++
++// R2_590 - XXX this is a hack to not break the ABI
++#define MAXPLUGS 5
++static R_TH_LOCAL QjsContext *

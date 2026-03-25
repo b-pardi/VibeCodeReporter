@@ -1,0 +1,87 @@
+@@ -261,27 +261,18 @@ class UpdateManager:
+         # is called when the attribute is changed
+         self._func_triggers = {etype: {} for etype in ENTITY_TYPES}
+         
+-        # Initialize a queue for pending update requests
+-        self._request_queue = queue.Queue()#multiprocessing.JoinableQueue()
+-        
+         # List of worker threads for processing the update requests
+         self._workers = []
++        self.num_workers = g.config.get('worker_threads', 8)
++        
++        # Queues for pending update requests (one for each worker)
++        self._request_queues = [queue.Queue() for _ in range(self.num_workers)]
+         
+         # Number of restarts of threads by watchdog
+         self._watchdog_restarts = 0
+         # Register watchdog to scheduler
+         g.scheduler.register(self.watchdog, second="*/30")
+ 
+-        # Temporary storage of records being updated.
+-        # Mapping of "ekey" to the following 3-tuple:
+-        #     (record [JSON-like object], 
+-        #      event handler call queue [queue.Queue containing tuples (func, event)],
+-        #      attributes that may change due to planned handler calls [set]
+-        #     )
+-        self._records_being_processed = {}
+-        # Since _records_being_processed may be accessed by many thread, locking is necessary
+-        self._records_being_processed_lock = threading.Lock()
+-        
+         # Count of update requests processed (per update type)
+         self._update_counter = OrderedDict([
+             ('ip_new_entity',0), # New entity (usually because of new event)
+@@ -392,10 +383,15 @@ class UpdateManager:
+             else:
+                 self._attr2func[etype][attr] = [func]
+ 
++
++    def get_queue_sizes(self):
++        """Return current number of requests in each queue."""
++        return [q.unfinished_tasks for q in self._request_queues]
++
+     def get_queue_size(self):
+-        """Return current number of requests in the queue."""
+-        return self._request_queue.unfinished_tasks
+-        
++        """Return current total number of requests in all queues."""
++        return sum(q.unfinished_tasks for q in self._request_queues)    
++
+ 
+     def update(self, ekey, update_spec):
+         """
+@@ -409,8 +405,9 @@ class UpdateManager:
+         ekey -- Entity type and key (2-tuple)
+         update_spec -- list of 3-tuples ... (see above) TODO
+         """
+-        # TODO check data validity
+-        self._request_queue.put((ekey, update_spec))
++        # Updates are distributed to worker queues based on a hash of entity key
++        index = hash(ekey) % self.num_workers
++        self._request_queues[index].put((ekey, update_spec))
+         
+     
+     # TODO cache results (clear cache when register_handler is called)
+@@ -447,10 +444,9 @@ class UpdateManager:
+         """ 
+         etype = ekey[0]
+         
+-        # Load record corresponding to the key -- either from database, or from
+-        # temporary storage of records being currently updated.
++        # Load record corresponding to the key from database.
+         # If record doesn't exist, create new.
+-        # Also load/create associated auxiliary objects:
++        # Also create associated auxiliary objects:
+         #   call_queue - queue of functions that should be called to update the record.
+         #     queue.Queue of tuples (function, list_of_update_spec), where list_of_update_spec is a list of
+         #     updates (2-tuples (key, new_value) or (event, param) which tirggered the function.
+@@ -458,46 +454,6 @@ class UpdateManager:
+ 
+ #        t1 = time.time()
+ 
+-        self._records_being_processed_lock.acquire()
+-        if ekey in self._records_being_processed:
+-            # *** The record is already being processed by someone else. ***
+-            # Just put our update requests to its list of requests to process.
+-            #self.log.debug("Record {} is already processed by some other worker - handing the request over".format(ekey))
+-            
+-            # I

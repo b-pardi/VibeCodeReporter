@@ -1,0 +1,167 @@
+@@ -350,6 +350,7 @@ static RCoreHelpMessage help_msg_aei = {
+ static RCoreHelpMessage help_msg_ae = {
+ 	"Usage:", "ae[idesr?] [arg]", "ESIL code emulation",
+ 	"ae", " [expr]", "evaluate ESIL expression",
++	"ae!", " [file]", "compile esil file into an esil expression",
+ 	"ae?", "", "show this help",
+ 	"ae??", "", "show ESIL help",
+ 	"aea", "[f] [count]", "analyse n esil instructions accesses (regs, mem..)",
+@@ -8154,6 +8155,22 @@ static void cmd_aeg(RCore *core, int argc, char *argv[]) {
+ 	}
+ }
+ 
++static void esil_compile(RCore *core, const char *input) {
++	const char *file = r_str_trim_head_ro (input);
++	const char *code = r_file_slurp (file, NULL);
++	if (!code) {
++		R_LOG_ERROR ("Cannot open file");
++		return;
++	}
++	REsilCompiler *ec = r_esil_compiler_new ();
++	r_esil_compiler_use (ec, core->anal->esil);
++	r_esil_compiler_parse (ec, code);
++	char *s = r_esil_compiler_tostring (ec);
++	r_cons_printf ("%s\n", s);
++	free (s);
++	r_esil_compiler_free (ec);
++}
++
+ static void cmd_anal_esil(RCore *core, const char *input, bool verbose) {
+ 	REsil *esil = core->anal->esil;
+ 	ut64 addr = core->offset;
+@@ -8166,6 +8183,9 @@ static void cmd_anal_esil(RCore *core, const char *input, bool verbose) {
+ 	RAnalOp *op = NULL;
+ 
+ 	switch (input[0]) {
++	case '!': // "ae!"
++		esil_compile (core, input + 1);
++		break;
+ 	case 'v': // "aev"
+ 		r_core_visual_esil (core, r_str_trim_head_ro (input + 1));
+ 		break;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,231 @@
++/* radare - LGPL - Copyright 2024 - pancake */
++
++#include <r_esil.h>
++#include <r_anal.h>
++
++typedef struct {
++	REsil *esil;
++	bool available;
++	const char *tok;
++	const char *cur;
++	RList *sb;
++	RList *program;
++	Sdb *db;
++	bool comment;
++	int deftoken;
++	char *token;
++	bool error;
++	int line;
++} ParseState;
++
++static ParseState *ps_new(REsilCompiler *ec) {
++	ParseState *ps = R_NEW0 (ParseState);
++	ps->esil = ec->esil;
++	ps->available = true;
++	ps->db = sdb_new0 ();
++	ps->sb = r_list_newf (free);
++	ps->program = r_list_newf (free);
++	ps->line = 1;
++	return ps;
++}
++
++static void ps_init(ParseState *ps, const char *expr) {
++	ps->cur = expr;
++	ps->tok = expr;
++}
++
++static void ps_free(ParseState *ps) {
++	sdb_free (ps->db);
++	r_list_free (ps->program);
++	r_list_free (ps->sb);
++	free (ps);
++}
++
++/////////////
++
++R_API REsilCompiler *r_esil_compiler_new(void) {
++	REsilCompiler *ec = R_NEW0 (REsilCompiler);
++	ParseState *ps = ps_new (ec);
++	ec->priv = (void *)ps;
++	return ec;
++}
++
++R_API void r_esil_compiler_use(REsilCompiler *ec, REsil *esil) {
++	R_RETURN_IF_FAIL (ec);
++	ec->esil = esil;
++}
++
++static char peek(ParseState *ps) {
++	char ch = ps->cur[0];
++	if (ch == 0) {
++		ps->available = false;
++	}
++	ps->cur++;
++	return ch;
++}
++
++static bool is_invalid_token(const char *token) {
++	const char t0 = *token;
++	switch (t0) {
++	case '(':
++	case ')':
++	case ':':
++	case ';':
++		return true;
++	}
++	return false;
++}
++
++static bool checkword(ParseState *ps, const char *s) {
++	if (*s && ps->esil) {
++		if (*s == '$' || isdigit (*s)) {
++			// internal flag or number
++		} else {
++			RAnal *anal = ps->esil->anal;
++			// check if its a valid esil keyword
++			REsilOp *eop = ht_pp_find (ps->esil->ops, s, NULL);
++			if (eop) {
++			} else {
++				RRegItem *ri = r_reg_get (anal->reg, s, -1);
++				if (ri) {
++
++				} else {
++					if (islower (*s)) {
++						R_LOG_ERROR ("Invalid register name '%s' at line %d", s, ps->line);
++					} else {
++						R_LOG_ERROR ("Invalid operation '%s' at line %d", s, ps->line);
++					}
++					ps->error = true;
++				}
++			}
++			// must be a valid register name for the currnet arch
++		}
++	}
++	return !ps->error;
++}
++
++static void sep(ParseState *ps) {
++	int toklen = ps->cur - ps->tok - 1;
++	char *s = r_str_ndup (ps->tok, toklen);
++	if (!strcmp (s, "(")) {
++		ps->comment = true;
++	} else if (!strcmp (s, ")")) {
++		if (ps->comment) {
++			ps->comment = false;
++		} else {
++			R_LOG_ERROR ("Closing a comment when its not open");
++		}
++	} else if (!strcmp (s, ":")) {
++		if (ps->deftoken) {
++			R_LOG_ERROR ("Canno

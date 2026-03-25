@@ -1,0 +1,96 @@
+@@ -39,7 +39,7 @@ int egress_gw_fib_lookup_and_redirect(struct __ctx_buff *ctx, __be32 egress_ip,
+ 				      __u32 egress_ifindex, __s8 *ext_err)
+ {
+ 	struct bpf_fib_lookup_padded fib_params = {};
+-	int oif = 0;
++	__u32 oif;
+ 	int ret;
+ 
+ 	/* Immediate redirect to egress_ifindex requires L2 resolution.
+@@ -64,11 +64,13 @@ int egress_gw_fib_lookup_and_redirect(struct __ctx_buff *ctx, __be32 egress_ip,
+ 		return DROP_NO_FIB;
+ 	}
+ 
++	oif = fib_params.l.ifindex;
++
+ 	/* Skip redirect in to-netdev if we stay on the same iface: */
+-	if (is_defined(IS_BPF_HOST) && fib_params.l.ifindex == ctx_get_ifindex(ctx))
++	if (is_defined(IS_BPF_HOST) && oif == ctx_get_ifindex(ctx))
+ 		return CTX_ACT_OK;
+ 
+-	return fib_do_redirect(ctx, true, &fib_params, false, ret, &oif, ext_err);
++	return fib_do_redirect(ctx, true, &fib_params, false, ret, oif, ext_err);
+ }
+ 
+ # ifdef ENABLE_EGRESS_GATEWAY
+@@ -399,7 +401,7 @@ int egress_gw_fib_lookup_and_redirect_v6(struct __ctx_buff *ctx,
+ 					 __u32 egress_ifindex, __s8 *ext_err)
+ {
+ 	struct bpf_fib_lookup_padded fib_params = {};
+-	int oif = 0;
++	__u32 oif;
+ 	int ret;
+ 
+ 	if (egress_ifindex && neigh_resolver_available())
+@@ -421,11 +423,12 @@ int egress_gw_fib_lookup_and_redirect_v6(struct __ctx_buff *ctx,
+ 		return DROP_NO_FIB;
+ 	}
+ 
+-	if (is_defined(IS_BPF_HOST) &&
+-	    fib_params.l.ifindex == ctx_get_ifindex(ctx))
++	oif = fib_params.l.ifindex;
++
++	if (is_defined(IS_BPF_HOST) && oif == ctx_get_ifindex(ctx))
+ 		return CTX_ACT_OK;
+ 
+-	return fib_do_redirect(ctx, true, &fib_params, false, ret, &oif, ext_err);
++	return fib_do_redirect(ctx, true, &fib_params, false, ret, oif, ext_err);
+ }
+ 
+ static __always_inline
+
+
+
+
+@@ -60,45 +60,31 @@ static __always_inline bool fib_ok(int ret)
+   *   - result of BPF redirect
+   *   - DROP_NO_FIB when DMAC couldn't be resolved
+   *   - other DROP reasons
+-  * the redirect can occur with or without a previous call to fib_lookup.
+   *
+-  * if a previous fib_lookup was performed, this function will attempt to redirect
+-  * to the output interface in the provided 'fib_params', as long as 'fib_ret'
+-  * is set to 'BPF_FIB_LKUP_RET_SUCCESS'
++  * The redirect can occur with or without a preceding FIB lookup.
+   *
+-  * if a previous fib_lookup was performed and the return was 'BPF_FIB_LKUP_NO_NEIGH'
+-  * this function will then attempt to copy the af_family and destination address
+-  * out of 'fib_params' and into 'redir_neigh' struct then perform a
+-  * 'redirect_neigh'.
++  * If a previous FIB lookup was performed with result BPF_FIB_LKUP_RET_SUCCESS,
++  * then the L2 addresses are updated from the provided @fib_params along with a
++  * plain ctx_redirect().
+   *
+-  * if no previous fib_lookup was performed, and the desire is to simply use
+-  * 'redirect_neigh' then set 'fib_params' to nil and 'fib_ret' to
+-  * 'BPF_FIB_LKUP_RET_NO_NEIGH'.
+-  * in this case, the 'oif' value will be used for the 'redirect_neigh' call.
++  * If no FIB lookup was performed (BPF_FIB_LKUP_NO_NEIGH with no @fib_params) or
++  * the FIB lookup returned BPF_FIB_LKUP_NO_NEIGH, then redirect_neigh() is used
++  * for the redirect. Passing through the nh information from @fib_params if available.
+   *
+-  * in a special case, if a previous fib_lookup was performed, and the return
+-  * was 'BPF_FIB_LKUP_RET_NO_NEIGH', and we are on a kernel version where
+-  * the target interface for the fib lookup is not returned
+-  * (due to ARP failing, see Kernel commit d1c362e1dd68) the provided 'oif'
+-  * will be used as output interface for redirect.
++  * If redirect_neigh() is not available (== XDP context), a plain ctx_redirect()
++  * is used. The `dmac` is resolved from the neighbour map.
+   */
+ static __always_inline int
+ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
+ 		const struct bpf_fib_lookup_padded *fib_params,
+-		bool allow_neigh_map, int fib_result, int *oif, __s8 *ext_err)
++		bool allow_neigh_map, int fib_result, __u32 oif, __s8 *ext_err)
+ {
+-	/* determine which oif to use before needs_l2_c

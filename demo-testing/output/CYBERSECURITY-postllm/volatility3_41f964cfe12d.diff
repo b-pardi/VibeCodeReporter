@@ -1,0 +1,103 @@
+@@ -22,7 +22,6 @@ class ProcessSpoofing(plugins.PluginInterface):
+ 
+     _required_framework_version = (2, 0, 0)
+     _version = (1, 1, 0)
+-    deleted = " (deleted)"
+ 
+     @classmethod
+     def get_requirements(cls):
+@@ -51,7 +50,7 @@ class ProcessSpoofing(plugins.PluginInterface):
+         cls,
+         context: interfaces.context.ContextInterface,
+         task: interfaces.objects.ObjectInterface,
+-    ) -> Optional[str]:
++    ) -> Tuple[Optional[str], bool]:
+         """
+         Extract the executable path from task_struct.mm.exe_file
+ 
+@@ -60,33 +59,54 @@ class ProcessSpoofing(plugins.PluginInterface):
+             task: task_struct object of the process
+ 
+         Returns:
+-            Executable path or None if not available
++            Tuple of (basename, is_deleted) or (None, False) if not available
+         """
++        is_deleted = False
++
+         try:
+             mm = task.mm
+-            if not mm or not mm.is_readable():
+-                # Kernel threads don't have mm struct
+-                return None
++        except (exceptions.InvalidAddressException, AttributeError) as e:
++            vollog.debug(f"Unable to access mm for task at {task.vol.offset:#x}: {e}")
++            return None, is_deleted
+ 
++        if not mm or not mm.is_readable():
++            # Kernel threads don't have mm struct
++            return None, is_deleted
++
++        try:
+             exe_file = mm.exe_file
++        except (exceptions.InvalidAddressException, AttributeError) as e:
++            vollog.debug(
++                f"Unable to access exe_file for task at {task.vol.offset:#x}: {e}"
++            )
++            return None, is_deleted
+ 
+-            if not exe_file or not exe_file.is_readable():
+-                return None
++        if not exe_file or not exe_file.is_readable():
++            return None, is_deleted
+ 
++        try:
+             exe_inode = exe_file.f_path.dentry.d_inode
+             exe_path = linux.LinuxUtilities.path_for_file(context, task, exe_file)
++        except (exceptions.InvalidAddressException, AttributeError) as e:
++            vollog.debug(
++                f"Unable to read exe_file path for task at {task.vol.offset:#x}: {e}"
++            )
++            return None, is_deleted
+ 
+-            # If the inode link count is 0, the process image has been deleted
+-            if exe_inode.i_nlink == 0:
+-                exe_path += cls.deleted
+-
+-            return exe_path if exe_path else None
++        if not exe_path:
++            return None, is_deleted
+ 
++        try:
++            # Check if the inode link count is 0 (process image has been deleted)
++            is_deleted = exe_inode.i_nlink == 0
+         except (exceptions.InvalidAddressException, AttributeError) as e:
+             vollog.debug(
+-                f"Unable to read executable path for task at {task.vol.offset:#x}: {e}"
++                f"Unable to check inode link count for task at {task.vol.offset:#x}: {e}"
+             )
+-            return None
++            # Continue without deletion info - we still have the path
++
++        basename = PurePosixPath(exe_path).name
++        return basename, is_deleted
+ 
+     @classmethod
+     def get_cmdline_basename(
+@@ -155,7 +175,7 @@ class ProcessSpoofing(plugins.PluginInterface):
+ 
+     def _extract_process_names(
+         self, task: interfaces.objects.ObjectInterface
+-    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
++    ) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
+         """
+         Extract all three process name sources for comparison
+ 
+@@ -163,21 +183,20 @@ class ProcessSpoofing(plugins.PluginInterface):
+             task: task_struct object of the process
+ 
+         Returns:
+-            Tuple of (exe_path_basename, cmdline_basename, comm)
++            Tuple of (exe_basename, cmdline_basename, comm, is_deleted)
+         """
+-        exe_path = self.get_executable_path(self.context, task)
+-        exe_basename = PurePosixPath(exe_path).name if exe_path else N

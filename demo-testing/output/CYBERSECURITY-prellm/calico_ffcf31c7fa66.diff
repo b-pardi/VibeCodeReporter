@@ -1,0 +1,123 @@
+@@ -124,4 +124,11 @@ enum calico_tc_flags {
+ 	CALICO_TC_INGRESS = 1<<1,
+ };
+ 
++enum calico_skb_mark {
++	// TODO allocate marks from the mark pool.
++	CALICO_SKB_MARK_FROM_WORKLOAD = 0xca110000,
++	CALICO_SKB_MARK_FROM_WORKLOAD_MASK = 0xffff0000,
++	CALICO_SKB_MARK_NO_TRACK      = 1<<1,
++};
++
+ #endif /* __CALICO_BPF_H__ */
+
+
+
+
+@@ -10,7 +10,7 @@ struct calico_ct_key {
+ 	uint32_t protocol;
+ 	__be32 addr_a, addr_b; // NBO
+ 	uint16_t port_a, port_b; // HBO
+-};
++} __attribute__((packed));
+ 
+ enum CALICO_CT_TYPE {
+ 	CALICO_CT_TYPE_NORMAL = 0,  // Non-NATted entry.
+@@ -25,6 +25,9 @@ struct calico_ct_tcp_state {
+ 	__u32 ack_seen:1;
+ 	__u32 fin_seen:1;
+ 	__u32 rst_seen:1;
++
++	__u32 egress_whitelisted:1;
++	__u32 ingress_whitelisted:1;
+ };
+ 
+ struct calico_ct_value {
+@@ -39,6 +42,7 @@ struct calico_ct_value {
+ 			// CALICO_CT_TYPE_NAT_REV only.
+ 			__u32 orig_dst;
+ 			__u16 orig_port;
++
+ 		};
+ 
+ 		// CALICO_CT_TYPE_NAT_FWD; key for the CALICO_CT_TYPE_NAT_REV entry.
+@@ -55,17 +59,77 @@ struct bpf_map_def_extended __attribute__((section("maps"))) calico_ct_map_v4 =
+ 	.pinning_strategy = 2 /* global namespace */,
+ };
+ 
+-static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(struct calico_ct_key *k, enum CALICO_CT_TYPE type,
+-		__be32 ip_src, __be32 ip_dst, __u16 sport, __u16 dport, __be32 orig_dst, __u16 orig_dport, struct tcphdr *tcp_header, enum calico_tc_flags flags) {
+-	__u64 now = bpf_ktime_get_ns();
++static CALICO_BPF_INLINE void dump_ct_key(struct calico_ct_key *k, enum calico_tc_flags flags) {
++	CALICO_DEBUG_AT("CT-TCP   key A=%x:%d proto=%d\n", be32_to_host(k->addr_a), k->port_a, (int)k->protocol);
++	CALICO_DEBUG_AT("CT-TCP   key B=%x:%d size=%d\n", be32_to_host(k->addr_b), k->port_b, (int)sizeof(struct calico_ct_key));
++}
++
++static CALICO_BPF_INLINE int calico_ct_v4_tcp_create_tracking(
++		struct __sk_buff *skb,
++		struct calico_ct_key *k, enum CALICO_CT_TYPE type,
++		__be32 ip_src, __be32 ip_dst, __u16 sport, __u16 dport,
++		__be32 orig_dst, __u16 orig_dport,
++		struct tcphdr *tcp_header, enum calico_tc_flags flags) {
++
++	if ((skb->mark & CALICO_SKB_MARK_FROM_WORKLOAD_MASK) == CALICO_SKB_MARK_FROM_WORKLOAD) {
++		// Packet already marked as being from another workload, which will
++		// have created a conntrack entry.  Look that one up instead of
++		// creating one.
++		CALICO_DEBUG_AT("CT-TCP Asked to create entry but packet is marked as "
++				"from another workload, doing lookup\n");
++		bool srcLTDest = (ip_src < ip_dst) || ((ip_src == ip_dst) && sport < dport);
++		if (srcLTDest) {
++			*k = (struct calico_ct_key) {
++				.protocol = IPPROTO_TCP,
++				.addr_a = ip_src, .port_a = sport,
++				.addr_b = ip_dst, .port_b = dport,
++			};
++		} else  {
++			*k = (struct calico_ct_key) {
++				.protocol = IPPROTO_TCP,
++				.addr_a = ip_dst, .port_a = dport,
++				.addr_b = ip_src, .port_b = sport,
++			};
++		}
++		dump_ct_key(k, flags);
++		struct calico_ct_value *ct_value = bpf_map_lookup_elem(&calico_ct_map_v4, k);
++		if (!ct_value) {
++			CALICO_DEBUG_AT("CT-TCP Packet marked as from workload but got a conntrack miss!\n");
++			goto create;
++		}
++		CALICO_DEBUG_AT("CT-TCP Found expected create entry, updating...\n");
++		if (srcLTDest) {
++			ct_value->a_to_b.seqno = tcp_header->seq;
++			ct_value->a_to_b.syn_seen = 1;
++			if (flags & CALICO_TC_INGRESS) {
++				ct_value->b_to_a.ingress_whitelisted = 1;
++			} else {
++				ct_value->a_to_b.egress_whitelisted = 1;
++			}
++		} else  {
++			ct_value->b_to_a.seqno = tcp_header->seq;
++			ct_value->b_to_a.syn_seen = 1;
++			if (flags & CALICO_TC_INGRESS) {
++				ct_value->a_to_b.ingress_whitelisted = 1;
++			} else {
++				ct_value->b_to_a.egress_whitelisted = 1;
++			}
++		}
++
++		return 0;
++	}
++
++	__u64 now;
++	create:
++	now = bpf_ktime_get_ns();
+ 	CALICO_DEBUG_AT("CT-TCP Creating entry at %llu.\n", now);
+-	struct calico_ct_value ct_value = {
+-		.last_seen = now,
+-		.created = now,
+-	};
++	struct calico_ct_value ct_value = {};
++	ct_value.created=now;
++	ct_value.last_seen=now;
+ 	ct_value.type = type;
+ 	ct_value.ori

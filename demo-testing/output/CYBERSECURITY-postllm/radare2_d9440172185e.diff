@@ -1,0 +1,107 @@
+@@ -5,7 +5,7 @@
+ #include "i/private.h"
+ 
+ // maybe too big sometimes? 2KB of stack eaten here..
+-#define R_STRING_SCAN_BUFFER_SIZE 2048
++#define R_STRING_SCAN_BUFFER_SIZE 4096
+ #define R_STRING_MAX_UNI_BLOCKS 4
+ 
+ static RBinClass *__getClass(RBinFile *bf, const char *name) {
+@@ -105,11 +105,20 @@ static void print_string(RBinFile *bf, RBinString *string, int raw, PJ *pj) {
+ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from, const ut64 to, int type, int raw, RBinSection *section) {
+ 	RBin *bin = bf->rbin;
+ 	const bool strings_nofp = bin->strings_nofp;
+-	ut8 tmp[R_STRING_SCAN_BUFFER_SIZE];
++	ut8 tmp[64]; // temporal buffer to encode characters in utf8 form
++	RStrBuf *sb = r_strbuf_new ("");
+ 	ut64 str_start, needle = from;
+-	int count = 0, i, rc, runes;
++	int i, rc, runes;
+ 	int str_type = R_STRING_TYPE_DETECT;
+ 	const int limit = bf->rbin->limit;
++	int minstr = bin->minstrlen;
++	if (minstr < 1) {
++		minstr = 1;
++	}
++	int maxstr = bin->maxstrlen;
++	if (maxstr < 1) {
++		maxstr = R_STRING_SCAN_BUFFER_SIZE;
++	}
+ 
+ 	// if list is null it means its gonna dump
+ 	r_return_val_if_fail (bf, -1);
+@@ -146,7 +155,7 @@ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from
+ 	}
+ 	r_buf_read_at (bf->buf, from, buf, len);
+ 	char *charset = r_sys_getenv ("RABIN2_CHARSET");
+-	if (!R_STR_ISEMPTY (charset)) {
++	if (R_STR_ISNOTEMPTY (charset)) {
+ 		RCharset *ch = r_charset_new ();
+ 		if (r_charset_use (ch, charset)) {
+ 			int outlen = len * 4;
+@@ -177,21 +186,21 @@ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from
+ 		}
+ 		// smol optimization
+ 		if (to > 4 && needle < to - 4) {
+-			ut32 n1 = r_read_le32 (buf + (needle - from));
++			ut32 n1 = r_read_le32 (buf + needle - from);
+ 			if (!n1) {
+ 				needle += 4;
+ 				continue;
+ 			}
+ 		}
+-		rc = r_utf8_decode (buf + (needle - from), to - needle, NULL);
++		rc = r_utf8_decode (buf + needle - from, to - needle, NULL);
+ 		if (!rc) {
+ 			needle++;
+ 			continue;
+ 		}
+-		bool addr_aligned = !(needle % 4);
++		const bool addr_aligned = !(needle % 4);
+ 
+ 		if (type == R_STRING_TYPE_DETECT) {
+-			char *w = (char *)buf + (needle + rc - from);
++			char *w = (char *)buf + needle + rc - from;
+ 			if (((to - needle) > 8 + rc)) {
+ 				// TODO: support le and be
+ 				bool is_wide32le = (needle + rc + 2 < to) && (!w[0] && !w[1] && !w[2] && w[3] && !w[4]);
+@@ -205,7 +214,7 @@ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from
+ 					is_wide32le = false;
+ 				}
+ 				///is_wide32be &= (n1 < 0xff && n11 < 0xff); // false; // n11 < 0xff;
+-				if (is_wide32le  && addr_aligned) {
++				if (is_wide32le && addr_aligned) {
+ 					str_type = R_STRING_TYPE_WIDE32; // asume big endian,is there little endian w32?
+ 				} else {
+ 					// bool is_wide = (n1 && n2 && n1 < 0xff && (!n2 || n2 < 0xff));
+@@ -227,8 +236,9 @@ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from
+ 		runes = 0;
+ 		str_start = needle;
+ 
++		r_strbuf_set (sb, "");
+ 		/* Eat a whole C string */
+-		for (i = 0; i < sizeof (tmp) - 4 && needle < to; i += rc) {
++		for (i = 0; i < maxstr && needle < to; i += rc) {
+ 			RRune r = {0};
+ 			if (str_type == R_STRING_TYPE_WIDE32) {
+ 				rc = r_utf32le_decode (buf + needle - from, to - needle, &r);
+@@ -241,7 +251,7 @@ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from
+ 					rc = 2;
+ 				}
+ 			} else {
+-				rc = r_utf8_decode (buf + (needle - from), to - needle, &r);
++				rc = r_utf8_decode (buf + needle - from, to - needle, &r);
+ 				if (rc > 1) {
+ 					str_type = R_STRING_TYPE_UTF8;
+ 				}
+@@ -261,16 +271,16 @@ static int string_scan_range(RList *list, RBinFile *bf, int min, const ut64 from
+ 						r = 0;
+ 					}
+ 				}
+-				rc = r_utf8_encode (tmp + i, r);
++				rc = r_utf8_encode (tmp, r);
++				tmp[rc] = 0;
++				r_strbuf_append (sb, (const char *)tmp);
+ 				runes++;
+ 			} else if (r && r < 0x100 && strchr ("\b\v\f\n\r\t\a\033\\", (char)r)) {
+ 				/* Print the

@@ -1,0 +1,145 @@
+@@ -1,39 +1,36 @@
+-
+-
+ import threading
+-from time import time
++from time import sleep
+ from array import array
+ from shutil import move
+-from multiprocessing import Process
+ 
+ from fame.core.module import IsolatedProcessingModule
+ from fame.common.exceptions import ModuleInitializationError
+ 
+ 
+ try:
+-    from winappdbg import Debug, EventHandler, Process, win32
+-    HAVE_WINAPPDBG = True
+-except:
+-    HAVE_WINAPPDBG = False
+-
+-    class EventHandler:
+-        pass
+-
+-
+-try:
++    import win32api
+     import win32gui
+     import win32con
++    import win32process
+ 
+     HAVE_PYWIN32 = True
+ except ImportError:
+     HAVE_PYWIN32 = False
+ 
+ 
++try:
++    import frida
++
++    HAVE_FRIDA = True
++except ImportError:
++    HAVE_FRIDA = False
++
++
+ class ClickThread(threading.Thread):
+     def __init__(self):
+         super(ClickThread, self).__init__()
+         self._windows = {}
+-        self._stop = threading.Event()
++        self._should_stop = threading.Event()
+         self.clicks = {}
+         self.to_close = set()
+ 
+@@ -54,10 +51,10 @@ class ClickThread(threading.Thread):
+         self.to_close.add(window.lower())
+ 
+     def stop(self):
+-        self._stop.set()
++        self._should_stop.set()
+ 
+     def should_run(self):
+-        return not self._stop.isSet()
++        return not self._should_stop.isSet()
+ 
+     def foreach_child(self):
+         def callback(hwnd, window_hwnd):
+@@ -65,7 +62,7 @@ class ClickThread(threading.Thread):
+ 
+             buffer_len = win32gui.SendMessage(hwnd, win32con.WM_GETTEXTLENGTH, 0, 0) + 1
+             text = array('b', b'\x00\x00' * buffer_len)
+-            text_len = win32gui.SendMessage(hwnd, win32con.WM_GETTEXT, buffer_len, text)
++            win32gui.SendMessage(hwnd, win32con.WM_GETTEXT, buffer_len, text)
+             text = win32gui.PyGetString(text.buffer_info()[0], buffer_len - 1).lower()
+ 
+             for match in self._windows[window_hwnd]['matches']:
+@@ -100,7 +97,7 @@ class ClickThread(threading.Thread):
+                     }
+                     try:
+                         win32gui.EnumChildWindows(hwnd, self.foreach_child(), hwnd)
+-                    except:
++                    except Exception:
+                         print("EnumChildWindows failed, moving on.")
+ 
+                     for button_toclick in self._windows[hwnd]['to_click']:
+@@ -119,55 +116,271 @@ class ClickThread(threading.Thread):
+     def run(self):
+         while self.should_run():
+             win32gui.EnumWindows(self.foreach_window(), 0)
+-            self._stop.wait(0.5)
+-
+-
+-class CutTheCrap(IsolatedProcessingModule, EventHandler):
++            self._should_stop.wait(0.5)
++
++
++FRIDA_SCRIPT = """
++Module.load("wininet.dll");
++var moduleMap = new ModuleMap();
++
++Interceptor.attach(Module.getExportByName("kernel32.dll", "CreateFileA"), {
++  onEnter: function (args) {
++    var desiredAccess = args[1].toInt32();
++
++    if (desiredAccess & 0x40000000) {
++      send({
++        api: "CreateFileA",
++        filename: args[0].readCString(),
++        desired_access: desiredAccess,
++        stack_trace: [
++          ...new Set(
++            Thread.backtrace(this.context, Backtracer.ACCURATE).map(
++              (address) => moduleMap.find(address)?.name
++            )
++          ),
++        ],
++      });
++    }
++  },
++});
++
++Interceptor.attach(Module.getExportByName("kernel32.dll", "CreateFileW"), {
++  onEnter: function (args) {
++    var desiredAccess = args[1].toInt32();
++
++    if (desiredAccess & 0x40000000) {
++      send({
++        api: "CreateFileW",
++        filename: args[0].readUtf16String(),
++        desired_access: desiredAccess,
++        stack_trace: [
++          ...new Set(
++            Thread.backtrace(this.context, Backtracer.ACCURATE).map(
++              (address) => moduleMap.find(address)?.name
++            )
++          ),
++        ],
++      });
++    }
++  },
++});
++
++Interceptor.replace(
++  Module.getExportByName("kernel32.dll", "WinExec"),
++  new NativeCallback(
++    (lpCmdLine, uCmdShow) => {
++    

@@ -1,0 +1,97 @@
+@@ -27,7 +27,7 @@ public final class Trace {
+ 
+   public Trace(FlowDisposition disposition, List<Hop> hops) {
+     _disposition = disposition;
+-    _hops = hops;
++    _hops = ImmutableList.copyOf(hops);
+   }
+ 
+   @JsonCreator
+
+
+
+
+@@ -9,7 +9,7 @@ import static org.batfish.datamodel.flow.FilterStep.FilterType.INGRESS_FILTER;
+ import static org.batfish.datamodel.flow.FilterStep.FilterType.PRE_SOURCE_NAT_FILTER;
+ import static org.batfish.datamodel.flow.StepAction.DENIED;
+ import static org.batfish.datamodel.flow.StepAction.TRANSMITTED;
+-import static org.batfish.dataplane.traceroute.TracerouteUtils.createEnterSrcIfaceStep;
++import static org.batfish.dataplane.traceroute.TracerouteUtils.buildEnterSrcIfaceStep;
+ import static org.batfish.dataplane.traceroute.TracerouteUtils.createFilterStep;
+ import static org.batfish.dataplane.traceroute.TracerouteUtils.getFinalActionForDisposition;
+ import static org.batfish.dataplane.traceroute.TracerouteUtils.resolveNextHopIpRoutes;
+@@ -94,6 +94,7 @@ class FlowTracer {
+   private final Set<FirewallSessionTraceInfo> _newSessions;
+   private final NavigableMap<String, IpSpace> _namedIpSpaces;
+   private final Flow _originalFlow;
++  private final String _vrfName;
+ 
+   // Mutable list of hops in the current trace
+   private final List<Hop> _hops;
+@@ -128,6 +129,7 @@ class FlowTracer {
+     _steps = new ArrayList<>();
+ 
+     _currentFlow = originalFlow;
++    _vrfName = initVrfName();
+   }
+ 
+   private FlowTracer(
+@@ -166,6 +168,21 @@ class FlowTracer {
+     _hops = new ArrayList<>(hops);
+     _steps = new ArrayList<>(steps);
+     _newSessions = new HashSet<>(newSessions);
++    _vrfName = initVrfName();
++  }
++
++  private String initVrfName() {
++    String vrfName;
++    if (_ingressInterface == null) {
++      checkState(
++          _currentFlow.getIngressNode().equals(_currentConfig.getHostname()),
++          "Not ingressNode but ingressInterface is null");
++      vrfName = _currentFlow.getIngressVrf();
++    } else {
++      vrfName = _currentConfig.getAllInterfaces().get(_ingressInterface).getVrfName();
++    }
++    checkNotNull(vrfName, "Missing VRF.");
++    return vrfName;
+   }
+ 
+   /** Creates a new TransmissionContext for the specified last-hop node and outgoing interface. */
+@@ -245,9 +262,9 @@ class FlowTracer {
+    */
+   private boolean processArpFailure(String outgoingInterfaceName, Ip arpIp) {
+     String currentNodeName = _currentNode.getName();
+-    String vrf = _currentConfig.getAllInterfaces().get(outgoingInterfaceName).getVrfName();
+     // halt processing and add neighbor-unreachable trace if no one would respond
+-    if (_tracerouteContext.receivesArpReply(currentNodeName, vrf, outgoingInterfaceName, arpIp)) {
++    if (_tracerouteContext.receivesArpReply(
++        currentNodeName, _vrfName, outgoingInterfaceName, arpIp)) {
+       FlowDisposition disposition =
+           _tracerouteContext.computeDisposition(
+               currentNodeName, outgoingInterfaceName, _currentFlow.getDstIp());
+@@ -269,12 +286,9 @@ class FlowTracer {
+       return;
+     }
+ 
+-    Map<String, IpAccessList> aclDefinitions = _currentConfig.getIpAccessLists();
+-    NavigableMap<String, IpSpace> namedIpSpaces = _currentConfig.getIpSpaces();
+-
+     // trace was received on a source interface of this hop
+     if (_ingressInterface != null) {
+-      _steps.add(createEnterSrcIfaceStep(_currentConfig, _ingressInterface));
++      _steps.add(buildEnterSrcIfaceStep(_currentConfig, _ingressInterface));
+ 
+       // apply ingress filter
+       IpAccessList inputFilter =
+@@ -290,35 +304,32 @@ class FlowTracer {
+               _currentConfig.getAllInterfaces().get(_ingressInterface).getIncomingTransformation(),
+               _currentFlow,
+               _ingressInterface,
+-              aclDefinitions,
+-              namedIpSpaces);
++              _aclDefinitions,
++              _namedIpSpaces);
+       _steps.addAll(transformationResult.getTraceSteps());
+       _currentFlow = transformationResult.getOutputFlow();
+-    } else if

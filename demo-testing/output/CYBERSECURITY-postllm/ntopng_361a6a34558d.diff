@@ -1,0 +1,101 @@
+@@ -280,7 +280,7 @@ protected:
+   L4Stats l4Stats;
+   SyslogStats syslogStats;
+   FlowHash *flows_hash; /**< Hash used to store flows information. */
+-  u_int32_t last_remote_pps, last_remote_bps;
++  u_int32_t last_remote_pps, last_remote_bps, last_remote_update;
+   TimeseriesExporter *influxdb_ts_exporter, *rrd_ts_exporter;
+ 
+   TcpFlowStats tcpFlowStats;
+
+
+
+
+@@ -266,7 +266,7 @@ void NetworkInterface::init(const char *interface_name) {
+   mtuWarningShown = false;
+   purge_idle_flows_hosts = true;
+   id = (u_int8_t)-1;
+-  last_remote_pps = 0,last_remote_bps = 0, has_vlan_packets = false,
++  last_remote_pps = 0,last_remote_bps = 0, last_remote_update = 0, has_vlan_packets = false,
+     cpu_affinity = -1 /* no affinity */,
+     interfaceStats = NULL, has_too_many_hosts = has_too_many_flows = false,
+     flow_dump_disabled_by_user = false, flow_dump_disabled_by_backend = false,
+@@ -7544,6 +7544,8 @@ void NetworkInterface::lua(lua_State *vm, bool fullStats) {
+ 
+   lua_push_uint64_table_entry(vm, "remote_pps", last_remote_pps);
+   lua_push_uint64_table_entry(vm, "remote_bps", last_remote_bps);
++  lua_push_uint64_table_entry(vm, "remote_update", last_remote_update);
++  
+   icmp_v4.lua(true, vm);
+   icmp_v6.lua(false, vm);
+   lua_push_uint64_table_entry(vm, "arp.requests", arp_requests);
+
+
+
+
+@@ -33,13 +33,12 @@
+  * flow_utils.lua */
+ ZMQParserInterface::ZMQParserInterface(const char *endpoint,
+                                        const char *custom_interface_type)
+-    : ParserInterface(endpoint, custom_interface_type) {
++  : ParserInterface(endpoint, custom_interface_type) {
+   if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[new] %s", __FILE__);
+ 
+   zmq_initial_bytes = 0, zmq_initial_pkts = 0, zmq_initial_drops = 0;
+   zmq_remote_stats = zmq_remote_stats_shadow = NULL;
+-  memset(&last_zmq_remote_stats_update, 0,
+-         sizeof(last_zmq_remote_stats_update));
++  memset(&last_zmq_remote_stats_update, 0, sizeof(last_zmq_remote_stats_update));
+   zmq_remote_initial_exported_flows = 0;
+   remote_lifetime_timeout = remote_idle_timeout = 0;
+   once = false, is_sampled_traffic = false;
+@@ -270,11 +269,11 @@ void ZMQParserInterface::addMappingFromRedis() {
+ 
+         free(keys[i]);
+       }
+-    #ifdef NTOPNG_DEBUG
++#ifdef NTOPNG_DEBUG
+       ntop->getTrace()->traceEvent(TRACE_NORMAL,
+ 				   "Adding zmq field [label: %s] [pen num: %d.%d] [descr: %s]",
+ 				   label.c_str(), pen_num[1], pen_num[0], descr.c_str());
+-    #endif
++#endif
+       /* Had to invert the pen_num because the addMapping function inverts those */
+       addMapping(label.c_str(), pen_num[1], pen_num[0], descr.empty() ? NULL : descr.c_str());
+     }
+@@ -302,22 +301,28 @@ ZMQParserInterface::~ZMQParserInterface() {
+   source_id_last_zmq_remote_stats.clear();
+   if (!descriptions_map.empty()) {
+     char buf[64];
+-    snprintf(buf, sizeof(buf), DESCRIPTION_HASH_KEY, get_id());
+     descriptions_map_t::iterator it;
++    
++    snprintf(buf, sizeof(buf), DESCRIPTION_HASH_KEY, get_id());
++
+     for (it = descriptions_map.begin(); it != descriptions_map.end(); it++) {
+-      char pen_buf[32];
+-      char descr_buf[512];
++      char pen_buf[32], descr_buf[512];
++      
+       snprintf(pen_buf, sizeof(pen_buf), "%d.%d", it->first.first, it->first.second);
+       snprintf(descr_buf, sizeof(descr_buf), "%s", it->second.first.c_str());
+       ntop->getRedis()->hashSet(buf, pen_buf, descr_buf);
+     }
+   }
++  
+   if (!labels_map.empty()) {
+     char buf[64];
+     labels_map_t::iterator it;
++    
+     snprintf(buf, sizeof(buf), LABEL_HASH_KEY, get_id());
++    
+     for (it = labels_map.begin(); it != labels_map.end(); it++) {
+       char pen_buf[32];
++      
+       snprintf(pen_buf, sizeof(pen_buf), "%d.%d", it->second.first, it->second.second);
+       ntop->getRedis()->hashSet(buf, pen_buf, it->first.c_str());
+     }
+@@ -438,17 +443,17 @@ void ZMQParserInterface::luaGetAllKeyDescription(lua_State *vm) {
+ 
+   for (it = descriptions_map.begin();
+        it != desc

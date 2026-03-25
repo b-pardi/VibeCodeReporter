@@ -1,0 +1,104 @@
+@@ -31,6 +31,7 @@ from functools import reduce
+ import json
+ import os
+ import pickle
++import pipes
+ import random
+ import re
+ import shutil
+@@ -58,6 +59,7 @@ except ImportError:
+ 
+ 
+ from ivre import config, geoiputils, nmapout, utils, xmlnmap, flow
++from ivre.zgrabout import ZGRAB_PARSERS
+ 
+ 
+ class DB(object):
+@@ -1142,6 +1144,9 @@ instead of keys.
+     def store_scan_doc(self, scan):
+         pass
+ 
++    def update_scan_doc(self, scan_id, data):
++        pass
++
+     def remove(self, host):
+         raise NotImplementedError
+ 
+@@ -1590,13 +1595,30 @@ class DBNmap(DBActive):
+             return False
+         with utils.open_file(fname) as fdesc:
+             fchar = fdesc.read(1)
++            if fchar == b'{':
++                firstline = fchar + fdesc.readline()[:-1]
+         try:
+             store_scan_function = {
+                 b'<': self.store_scan_xml,
+-                b'{': self.store_scan_json,
+             }[fchar]
+         except KeyError:
+-            raise ValueError("Unknown file type %s" % fname)
++            if fchar == b'{':
++                try:
++                    firstres = (firstline).decode()
++                except UnicodeDecodeError:
++                    raise ValueError("Unknown file type %s" % fname)
++                try:
++                    firstres = json.loads(firstres)
++                except json.decoder.JSONDecodeError:
++                    raise ValueError("Unknown file type %s" % fname)
++                if 'addr' in firstres:
++                    store_scan_function = self.store_scan_json_ivre
++                elif 'ip' in firstres:
++                    store_scan_function = self.store_scan_json_zgrab
++                else:
++                    raise ValueError("Unknown file type %s" % fname)
++            else:
++                raise ValueError("Unknown file type %s" % fname)
+         return store_scan_function(fname, filehash=scanid, **kargs)
+ 
+     def store_scan_xml(self, fname, callback=None, **kargs):
+@@ -1633,11 +1655,11 @@ class DBNmap(DBActive):
+         self.stop_store_hosts()
+         return False
+ 
+-    def store_scan_json(self, fname, filehash=None,
+-                        needports=False, needopenports=False,
+-                        categories=None, source=None,
+-                        add_addr_infos=True, force_info=False,
+-                        callback=None, **_):
++    def store_scan_json_ivre(self, fname, filehash=None,
++                             needports=False, needopenports=False,
++                             categories=None, source=None,
++                             add_addr_infos=True, force_info=False,
++                             callback=None, **_):
+         """This method parses a JSON scan result as exported using
+         `ivre scancli --json > file`, displays the parsing result, and
+         return True if everything went fine, False otherwise.
+@@ -1701,6 +1723,118 @@ class DBNmap(DBActive):
+         self.stop_store_hosts()
+         return True
+ 
++    def store_scan_json_zgrab(self, fname, filehash=None,
++                              needports=False, needopenports=False,
++                              categories=None, source=None,
++                              add_addr_infos=True, force_info=False,
++                              callback=None, **_):
++        """This method parses a JSON scan result produced by zgrab, displays
++        the parsing result, and return True if everything went fine,
++        False otherwise.
++
++        In backend-specific subclasses, this method stores the result
++        instead of displaying it, thanks to the `store_host`
++        method.
++
++        The callback is a function called after each host insertion
++        and takes this host as a parameter. This should be set to 'None'
++        if no action has to be taken.
++
++        """
++        if categories is None:
++            categories = []
++        scan_doc_saved = False
++        self.start_store_hosts()
++        with utils.open_file(fname) as fdesc:
++         

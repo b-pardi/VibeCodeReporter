@@ -1,0 +1,121 @@
+@@ -328,6 +328,9 @@ enum {
+ /* Cilium error codes, must NOT overlap with TC return codes.
+  * These also serve as drop reasons for metrics,
+  * where reason > 0 corresponds to -(DROP_*)
++ *
++ * These are shared with pkg/monitor/api/drop.go and api/v1/flow/flow.proto.
++ * When modifying any of the below, those files should also be updated.
+  */
+ #define DROP_UNUSED1		-130 /* unused */
+ #define DROP_UNUSED2		-131 /* unused */
+@@ -387,6 +390,9 @@ enum {
+ /* Cilium metrics reasons for forwarding packets and other stats.
+  * If reason is larger than below then this is a drop reason and
+  * value corresponds to -(DROP_*), see above.
++ *
++ * These are shared with pkg/monitor/api/drop.go.
++ * When modifying any of the below, those files should also be updated.
+  */
+ #define REASON_FORWARDED		0
+ #define REASON_PLAINTEXT		3
+@@ -395,6 +401,8 @@ enum {
+ #define REASON_LB_NO_BACKEND		6
+ #define REASON_LB_REVNAT_UPDATE		7
+ #define REASON_LB_REVNAT_STALE		8
++#define REASON_FRAG_PACKET		9
++#define REASON_FRAG_PACKET_UPDATE	10
+ 
+ /* Lookup scope for externalTrafficPolicy=Local */
+ #define LB_LOOKUP_SCOPE_EXT	0
+
+
+
+
+@@ -517,6 +517,7 @@ ipv4_ct_tuple_reverse(struct ipv4_ct_tuple *tuple)
+ 
+ static __always_inline int ipv4_ct_extract_l4_ports(struct __ctx_buff *ctx,
+ 						    int off,
++						    int dir __maybe_unused,
+ 						    struct ipv4_ct_tuple *tuple,
+ 						    bool *has_l4_header __maybe_unused)
+ {
+@@ -531,7 +532,7 @@ static __always_inline int ipv4_ct_extract_l4_ports(struct __ctx_buff *ctx,
+ 		return DROP_CT_INVALID_HDR;
+ 
+ 	if (unlikely(ipv4_is_fragment(ip4)))
+-		return ipv4_handle_fragment(ctx, ip4, off,
++		return ipv4_handle_fragment(ctx, ip4, off, dir,
+ 					    (struct ipv4_frag_l4ports *)&tuple->dport,
+ 					    has_l4_header);
+ #endif
+@@ -616,7 +617,7 @@ static __always_inline int ct_lookup4(const void *map,
+ 		break;
+ 
+ 	case IPPROTO_TCP:
+-		err = ipv4_ct_extract_l4_ports(ctx, off, tuple, &has_l4_header);
++		err = ipv4_ct_extract_l4_ports(ctx, off, dir, tuple, &has_l4_header);
+ 		if (err < 0)
+ 			return err;
+ 
+@@ -632,7 +633,7 @@ static __always_inline int ct_lookup4(const void *map,
+ 		break;
+ 
+ 	case IPPROTO_UDP:
+-		err = ipv4_ct_extract_l4_ports(ctx, off, tuple, NULL);
++		err = ipv4_ct_extract_l4_ports(ctx, off, dir, tuple, NULL);
+ 		if (err < 0)
+ 			return err;
+ 
+
+
+
+
+@@ -7,6 +7,7 @@
+ #include <linux/ip.h>
+ 
+ #include "dbg.h"
++#include "metrics.h"
+ 
+ struct ipv4_frag_id {
+ 	__be32	daddr;
+@@ -107,7 +108,7 @@ ipv4_frag_get_l4ports(const struct ipv4_frag_id *frag_id,
+ }
+ 
+ static __always_inline int
+-ipv4_frag_register_datagram(struct __ctx_buff *ctx, int l4_off,
++ipv4_frag_register_datagram(struct __ctx_buff *ctx, int l4_off, int dir,
+ 			    const struct ipv4_frag_id *frag_id,
+ 			    struct ipv4_frag_l4ports *ports)
+ {
+@@ -117,7 +118,9 @@ ipv4_frag_register_datagram(struct __ctx_buff *ctx, int l4_off,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	map_update_elem(&IPV4_FRAG_DATAGRAMS_MAP, frag_id, ports, BPF_ANY);
++	if (map_update_elem(&IPV4_FRAG_DATAGRAMS_MAP, frag_id, ports, BPF_ANY))
++		update_metrics(ctx_full_len(ctx), dir, REASON_FRAG_PACKET_UPDATE);
++
+ 	/* Do not return an error if map update failed, as nothing prevents us
+ 	 * to process the current packet normally.
+ 	 */
+@@ -126,7 +129,7 @@ ipv4_frag_register_datagram(struct __ctx_buff *ctx, int l4_off,
+ 
+ static __always_inline int
+ ipv4_handle_fragment(struct __ctx_buff *ctx,
+-		     const struct iphdr *ip4, int l4_off,
++		     const struct iphdr *ip4, int l4_off, int dir,
+ 		     struct ipv4_frag_l4ports *ports,
+ 		     bool *has_l4_header)
+ {
+@@ -140,6 +143,8 @@ ipv4_handle_fragment(struct __ctx_buff *ctx,
+ 		.pad = 0,
+ 	};
+ 
++	update_metrics(ctx_full_len(ctx), dir, REASON_FRAG_PACKET);
++
+ 	not_first_fragment = ipv4_is_not_first_fragment(ip4);
+ 	if (has_l4_header)
+ 		*has_l4_header = !not_first_fragment;
+@@ -151,7 +156,7 @@ ipv4_handle_fragment(struct __ctx_buff *ctx,
+ 	 * we receive). Fragment has L4 header, we can retrieve L4 ports and
+ 	 * create an entry in datagrams map.

@@ -1,0 +1,108 @@
+@@ -3,7 +3,7 @@
+ using namespace zeek::telemetry;
+ 
+ Counter::Counter(FamilyType* family, const prometheus::Labels& labels, prometheus::CollectCallbackPtr callback) noexcept
+-    : handle(family->Add(labels)), labels(labels) {
++    : family(family), handle(family->Add(labels)), labels(labels) {
+     if ( callback ) {
+         handle.AddCollectCallback(std::move(callback));
+         has_callback = true;
+
+
+
+
+@@ -56,6 +56,7 @@ public:
+     bool CompareLabels(const prometheus::Labels& lbls) const { return labels == lbls; }
+ 
+ private:
++    FamilyType* family = nullptr;
+     Handle& handle;
+     prometheus::Labels labels;
+     bool has_callback = false;
+
+
+
+
+@@ -15,7 +15,7 @@ double Gauge::Value() const noexcept {
+ 
+ 
+ Gauge::Gauge(FamilyType* family, const prometheus::Labels& labels, prometheus::CollectCallbackPtr callback) noexcept
+-    : handle(family->Add(labels)), labels(labels) {
++    : family(family), handle(family->Add(labels)), labels(labels) {
+     if ( callback ) {
+         handle.AddCollectCallback(std::move(callback));
+         has_callback = true;
+
+
+
+
+@@ -74,6 +74,7 @@ public:
+     bool CompareLabels(const prometheus::Labels& lbls) const { return labels == lbls; }
+ 
+ private:
++    FamilyType* family = nullptr;
+     Handle& handle;
+     prometheus::Labels labels;
+     bool has_callback = false;
+
+
+
+
+@@ -23,6 +23,9 @@ void HeartbeatTimer::Dispatch(double t, bool is_expire) {
+ 
+ } // namespace detail
+ 
++static std::vector<uint64_t> pending_bucket_brackets = {1,    10,    100,
++                                                        1000, 10000, std::numeric_limits<uint64_t>::infinity()};
++
+ Manager::Manager() {
+     DBG_LOG(DBG_THREADING, "Creating thread manager ...");
+ 
+@@ -38,14 +41,128 @@ Manager::~Manager() {
+ }
+ 
+ void Manager::InitPostScript() {
++    static auto get_message_thread_stats = []() -> const BucketedMessages* {
++        if ( ! thread_mgr->terminating ) {
++            double now = util::current_time();
++            if ( thread_mgr->bucketed_messages_last_updated < now - 1 ) {
++                thread_mgr->current_bucketed_messages.pending_in_total = 0;
++                thread_mgr->current_bucketed_messages.pending_out_total = 0;
++                for ( auto& m : thread_mgr->current_bucketed_messages.pending_in )
++                    m.second = 0;
++                for ( auto& m : thread_mgr->current_bucketed_messages.pending_out )
++                    m.second = 0;
++
++                MsgThread::Stats thread_stats;
++                for ( const auto& t : thread_mgr->msg_threads ) {
++                    t->GetStats(&thread_stats);
++
++                    thread_mgr->current_bucketed_messages.sent_in_total += thread_stats.sent_in;
++                    thread_mgr->current_bucketed_messages.sent_out_total += thread_stats.sent_out;
++                    thread_mgr->current_bucketed_messages.pending_in_total += thread_stats.pending_in;
++                    thread_mgr->current_bucketed_messages.pending_out_total += thread_stats.pending_out;
++
++                    for ( auto upper_limit : pending_bucket_brackets ) {
++                        if ( thread_stats.pending_in < upper_limit ) {
++                            thread_mgr->current_bucketed_messages.pending_in[upper_limit]++;
++                            break;
++                        }
++                    }
++                    for ( auto upper_limit : pending_bucket_brackets ) {
++                        if ( thread_stats.pending_out < upper_limit ) {
++                            thread_mgr->current_bucketed_messages.pending_out[upper_limit]++;
++                            break;
++                        }
++                    }
++                }
++
++                thread_mgr->bucketed_messages_last_updated = now;
++            }
++        }
++
++        return &thread_mgr->current_bucketed_messages;
++    };
++
+     num_threads_metric =
+-        telemetry_mgr->GaugeInstance("zeek", "active_threads", {}, "Number of active threads", "",
++        telemetry_mgr->GaugeInsta

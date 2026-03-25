@@ -1,0 +1,100 @@
+@@ -69,7 +69,7 @@ class Flow : public GenericHashEntry {
+     l7_protocol_guessed, flow_dropped_counts_increased,
+     good_tls_hs,
+     quota_exceeded, has_malicious_cli_signature, has_malicious_srv_signature,
+-    is_cli_srv_swapped, swap_check_done;
++    is_cli_srv_swapped, swap_done, swap_requested;
+ #ifdef ALERTED_FLOWS_DEBUG
+   bool iface_alert_inc, iface_alert_dec;
+ #endif
+@@ -396,7 +396,7 @@ class Flow : public GenericHashEntry {
+ 		    u_int out_pkts, u_int out_bytes, u_int out_goodput_bytes, 
+ 		    u_int in_fragments, u_int out_fragments,
+ 		    time_t first_seen, time_t last_seen);
+-  void set_swapped_cli_srv(Host *cli_h, Host *srv_h);
++  void check_swap();
+   
+   inline bool isThreeWayHandshakeOK()    const { return(twh_ok);                          };
+   inline bool isDetectionCompleted()     const { return(detection_completed);             };
+@@ -488,8 +488,8 @@ class Flow : public GenericHashEntry {
+   u_int64_t get_current_packets_cli2srv() const;
+   u_int64_t get_current_packets_srv2cli() const;
+ 
+-  inline void set_swap_check_done()      { swap_check_done = true; };
+-  inline bool is_swap_check_done() const { return swap_check_done; };
++  inline bool is_swap_requested()  const { return swap_requested;  };
++  inline void set_swap_done()            { swap_done = true;       };
+   bool is_hash_entry_state_idle_transition_ready() const;
+   void hosts_periodic_stats_update(NetworkInterface *iface, Host *cli_host, Host *srv_host, PartializableFlowTrafficStats *partial,
+ 				   bool first_partial, const struct timeval *tv) const;
+
+
+
+
+@@ -55,7 +55,7 @@ Flow::Flow(NetworkInterface *_iface,
+   doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
+   periodic_update_ctr = 0, cli2srv_tos = srv2cli_tos = 0, iec104 = NULL;
+   zero_window_alert_triggered = src2dst_tcp_zero_window = dst2src_tcp_zero_window = 0;
+-  is_cli_srv_swapped = swap_check_done = false;
++  is_cli_srv_swapped = swap_done = swap_requested = false;
+   
+ #ifdef HAVE_NEDGE
+   last_conntrack_update = 0;
+@@ -412,11 +412,12 @@ void Flow::processDetectedProtocol() {
+ 
+   l7proto = ndpi_get_lower_proto(ndpiDetectedProtocol);
+ 
++  check_swap();
++
+   switch(l7proto) {
+   case NDPI_PROTOCOL_DHCP:
+     if(cli_port == ntohs(67) /* client */ && cli_h) {
+       cli_h->setDhcpServer();
+-      set_swapped_cli_srv(cli_h, srv_h);
+     } else if(srv_port == ntohs(67) /* server */ && srv_h)
+       srv_h->setDhcpServer();
+     break;
+@@ -424,8 +425,6 @@ void Flow::processDetectedProtocol() {
+   case NDPI_PROTOCOL_NTP:
+     if(cli_h && cli_port == ntohs(123))  {
+       cli_h->setNtpServer();
+-      set_swapped_cli_srv(cli_h, srv_h);
+-
+       if(srv_h) srv_h->incNTPContactCardinality(cli_h); 
+     } else if(srv_h && srv_port == ntohs(123)) {
+       srv_h->setNtpServer();
+@@ -444,8 +443,6 @@ void Flow::processDetectedProtocol() {
+     } else if(cli_h
+ 	      && (cli_port == ntohs(25) || cli_port == ntohs(465) || cli_port == ntohs(587))) {
+       cli_h->setSmtpServer();
+-      set_swapped_cli_srv(cli_h, srv_h);
+-      
+       if(srv_h) srv_h->incSMTPContactCardinality(cli_h);
+     }
+     break;
+@@ -453,7 +450,6 @@ void Flow::processDetectedProtocol() {
+   case NDPI_PROTOCOL_DNS:
+     if(cli_h && cli_port == ntohs(53)) {
+       cli_h->setDnsServer();
+-      set_swapped_cli_srv(cli_h, srv_h);
+ 
+       if(srv_h) srv_h->incDNSContactCardinality(cli_h);
+     } else if(srv_h && srv_port == ntohs(53))  {
+@@ -469,11 +465,9 @@ void Flow::processDetectedProtocol() {
+     if(ndpiDetectedProtocol.app_protocol == NDPI_PROTOCOL_DOH_DOT
+        && cli_h && srv_h && cli_h->isLocalHost())
+       cli_h->incDohDoTUses(srv_h);
+-    set_swapped_cli_srv(cli_h, srv_h);
+     break;
+ 
+   default:
+-    set_swapped_cli_srv(cli_h, srv_h);
+     break;
+   } /* switch */
+ }
+@@ -2866,7 +2860,8 @@ void Flow::housekeep(time_t t) {
+     }
+     break;
+   case hash_entry_state_flow_protocoldetected:
+-    hookProtocolDetectedCheck(t);
++    if(!swap_requested) /* The flow will be swapped, hook

@@ -1,0 +1,153 @@
+@@ -12,16 +12,29 @@
+ #if !defined(_WIN32)
+ #include <arpa/inet.h>
+ #else
+-#include <winsock.h>
++#include <winsock2.h>
+ #include <ws2tcpip.h>
++
++// <windows.h> uses macros to #define a ton of symbols,
++// many of which interfere with our code here and down
++// the line in various extensions.
++#undef DELETE
++#undef ERROR
++#undef GetMessage
++#undef interface
++#undef TRUE
++
+ #endif
+ 
++#include "google/protobuf/stubs/strutil.h" // for UTF8Len
++
+ namespace pgv {
+ using std::string;
+ 
+ class UnimplementedException : public std::runtime_error {
+ public:
+   UnimplementedException() : std::runtime_error("not yet implemented") {}
++  UnimplementedException(const std::string& message) : std::runtime_error(message) {}
+   // Thrown by C++ validation code that is not yet implemented.
+ };
+ 
+@@ -76,6 +89,11 @@ static inline bool Contains(const string& search_in, const string& to_find)
+   return search_in.find(to_find) != string::npos;
+ }
+ 
++static inline bool NotContains(const string& search_in, const string& to_find)
++{
++  return !Contains(search_in, to_find);
++}
++
+ static inline bool IsIpv4(const string& to_validate) {
+ 	struct sockaddr_in sa;
+ 	return !(inet_pton(AF_INET, to_validate.c_str(), &sa.sin_addr) < 1);
+@@ -119,6 +137,20 @@ static inline bool IsHostname(const string& to_validate) {
+   return true;
+ }
+ 
++static inline size_t Utf8Len(const string& narrow_string) {
++  const char *str_char = narrow_string.c_str();
++  ptrdiff_t byte_len = narrow_string.length();
++  size_t unicode_len = 0;
++  int char_len = 1;
++  while (byte_len > 0 && char_len > 0) {
++    char_len = google::protobuf::UTF8FirstLetterNumBytes(str_char, byte_len);
++    str_char += char_len;
++    byte_len -= char_len;
++    ++unicode_len;
++  }
++  return unicode_len;
++}
++
+ } // namespace pgv
+ 
+ #endif // _VALIDATE_H
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,943 @@
++import re
++from validate_email import validate_email
++import ipaddress
++try:
++    import urlparse
++except ImportError:
++    import urllib.parse as urlparse
++import uuid
++import struct
++from jinja2 import Template
++import time
++import sys
++
++printer = ""
++
++# Well known regex mapping.
++regex_map = {
++    "UNKNOWN": "",
++    "HTTP_HEADER_NAME": r'^:?[0-9a-zA-Z!#$%&\'*+-.^_|~\x60]+$',
++    "HTTP_HEADER_VALUE": r'^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
++}
++
++def validate(proto_message):
++    func = file_template(proto_message)
++    global printer
++    printer += func + "\n"
++    exec(func)
++    try:
++        return generate_validate
++    except NameError:
++        return locals()['generate_validate']
++
++def print_validate(proto_message):
++    return "".join([s for s in printer.splitlines(True) if s.strip()])
++
++def has_validate(field):
++    if field.GetOptions() is None:
++        return False
++    for option_descriptor, option_value in field.GetOptions().ListFields():
++        if option_descriptor.full_name == "validate.rules":
++            return True
++    return False
++
++def byte_len(s):
++    try:
++        return len(s.encode('utf-8'))
++    except:
++        return len(s)
++
++def _validateHostName(host):
++    if len(host) > 253:
++        return False
++
++    s = host.rsplit(".",1)[0].lower()
++
++    for part in s.split("."):
++        if len(part) == 0 or len(part) > 63:
++            return False
++
++        # Host names cannot begin or end with hyphens
++        if s[0] == "-" or s[len(s)-1] == '-':
++            return False
++        for r in part:
++            if (r < 'A' or r > 'Z') and (r < 'a' or r > 'z') and (r < '0' or r > '9') and r != '-':
++                return False
++    return True
++
++def _validateEmail(addr):
++    if '<' in addr and '>' in addr: addr = addr.split("<")[1].split(">")[0]
++
++    if not validate_email(addr):
++        return False
++
++    if len(addr) > 254:
++        return False
++
++    parts = addr.split("@")
++    if len(parts[0]) > 64:
++        return False
++    return _validateHostName(parts[1])
++
++def _has_field(message_pb, property_name):
++    # NOTE: As of proto3, HasField() only works for message fie

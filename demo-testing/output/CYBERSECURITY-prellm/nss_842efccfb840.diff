@@ -1,0 +1,98 @@
+@@ -310,22 +310,16 @@ auto kTrueFalse = ::testing::ValuesIn(kTrueFalseArr);
+ INSTANTIATE_TEST_SUITE_P(TlsPadding, TlsPaddingTest,
+                          ::testing::Combine(kContentSizes, kTrueFalse));
+ 
+-/* This filter modifies any application data record, changes its inner content
+- * type to the specified one (default handshake) and optionally add padding,
+- * to create records/fragments invalid in TLS 1.3.
+- *
+- * Implementations MUST NOT send Handshake and Alert records that have a
+- * zero-length TLSInnerPlaintext.content; if such a message is received,
+- * the receiving implementation MUST terminate the connection with an
+- * "unexpected_message" alert [RFC8446, Section 5.4].
+- *
+- * !!! TLS 1.3 ONLY !!! */
+-class ZeroLengthInnerPlaintextCreatorFilter : public TlsRecordFilter {
++/* Filter to modify record header and content */
++class Tls13RecordModifier : public TlsRecordFilter {
+  public:
+-  ZeroLengthInnerPlaintextCreatorFilter(
+-      const std::shared_ptr<TlsAgent>& a,
+-      SSLContentType contentType = ssl_ct_handshake, size_t padding = 0)
+-      : TlsRecordFilter(a), contentType_(contentType), padding_(padding) {}
++  Tls13RecordModifier(const std::shared_ptr<TlsAgent>& a,
++                      uint8_t contentType = ssl_ct_handshake, size_t size = 0,
++                      size_t padding = 0)
++      : TlsRecordFilter(a),
++        contentType_(contentType),
++        size_(size),
++        padding_(padding) {}
+ 
+  protected:
+   PacketFilter::Action FilterRecord(const TlsRecordHeader& header,
+@@ -350,7 +344,7 @@ class ZeroLengthInnerPlaintextCreatorFilter : public TlsRecordFilter {
+ 
+     DataBuffer ciphertext;
+     bool ok = Protect(spec(protection_epoch), out_header, contentType_,
+-                      DataBuffer(0), &ciphertext, &out_header, padding_);
++                      DataBuffer(size_), &ciphertext, &out_header, padding_);
+     EXPECT_TRUE(ok);
+     if (!ok) {
+       return KEEP;
+@@ -361,7 +355,8 @@ class ZeroLengthInnerPlaintextCreatorFilter : public TlsRecordFilter {
+   }
+ 
+  private:
+-  SSLContentType contentType_;
++  uint8_t contentType_;
++  size_t size_;
+   size_t padding_;
+ };
+ 
+@@ -389,13 +384,18 @@ class ZeroLengthInnerPlaintextSetupTls13
+ };
+ 
+ /* Test correct rejection of TLS 1.3 encrypted handshake/alert records with
+- * zero-length inner plaintext content length with and without padding. */
++ * zero-length inner plaintext content length with and without padding.
++ *
++ * Implementations MUST NOT send Handshake and Alert records that have a
++ * zero-length TLSInnerPlaintext.content; if such a message is received,
++ * the receiving implementation MUST terminate the connection with an
++ * "unexpected_message" alert [RFC8446, Section 5.4]. */
+ TEST_P(ZeroLengthInnerPlaintextSetupTls13, ZeroLengthInnerPlaintextRun) {
+   EnsureTlsSetup();
+ 
+   // Filter modifies record to be zero-length
+-  auto filter = MakeTlsFilter<ZeroLengthInnerPlaintextCreatorFilter>(
+-      client_, contentType_, padding_);
++  auto filter =
++      MakeTlsFilter<Tls13RecordModifier>(client_, contentType_, 0, padding_);
+   filter->EnableDecryption();
+   filter->Disable();
+ 
+@@ -603,4 +603,202 @@ INSTANTIATE_TEST_SUITE_P(
+       return variant + "ZeroLength" + contentType + "Test";
+     });
+ 
++/* Test correct handling of records with invalid content types.
++ *
++ * TLS:
++ * If a TLS implementation receives an unexpected record type, it MUST
++ * terminate the connection with an "unexpected_message" alert
++ * [RFC8446, Section 5].
++ *
++ * DTLS:
++ * In general, invalid records SHOULD be silently discarded...
++ * [RFC6347, Section 4.1.2.7]. */
++class UndefinedContentTypeSetup : public TlsConnectGeneric {
++ public:
++  UndefinedContentTypeSetup() : TlsConnectGeneric() { StartConnect(); };
++
++  void createUndefinedContentTypeRecord(DataBuffer& buffer, unsigned epoch = 0,
++                                        unsigned seqn = 0) {
++    // dummy data
++    uint8_t data[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
++
++    size_t idx = 0;
++    // Set

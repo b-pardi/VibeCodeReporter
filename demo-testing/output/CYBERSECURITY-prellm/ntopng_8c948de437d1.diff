@@ -1,0 +1,126 @@
+@@ -91,7 +91,7 @@ class LuaEngine {
+   int handle_script_request(struct mg_connection *conn,
+ 			    const struct mg_request_info *request_info, 
+ 			    char *script_path, bool *attack_attempt, const char *user, const char *group,
+-          const char *session_csrf, bool localuser);
++			    const char *session_csrf, bool localuser);
+ 
+   bool setParamsTable(lua_State* vm,
+ 		      const struct mg_request_info *request_info,
+
+
+
+
+@@ -36,7 +36,7 @@ class SNMP {
+   
+   int _get(char *agentIP, char *community, char *oid, u_int8_t snmp_version);
+   int _getnext(char *agentIP, char *community, char *oid, u_int8_t snmp_version);
+-  int snmp_get_fctn(lua_State* vm, bool isGetNext);  
++  int snmp_get_fctn(lua_State* vm, bool isGetNext, bool skip_first_param);  
+   int snmp_read_response(lua_State* vm, u_int timeout);
+   
+   public:
+@@ -48,7 +48,7 @@ class SNMP {
+   void snmp_fetch_responses(lua_State* vm);
+   
+   int get(lua_State* vm);
+-  int getnext(lua_State* vm);
++  int getnext(lua_State* vm, bool skip_first_param);
+ };
+   
+ #endif /* _SNMP_H_ */
+
+
+
+
+@@ -1051,6 +1051,7 @@ extern struct ntopngLuaContext* getUserdata(struct lua_State *vm);
+ #define DEFAULT_ZMQ_TCP_KEEPALIVE_INTVL 3  /* Keepalive probes sent every 3 seconds */
+ #define PERIODIC_TASK_POOL_SIZE      8 /* Threads */
+ 
++#define MAX_NUM_ASYNC_SNMP_ENGINES   8
+ #define MIN_NUM_HASH_WALK_ELEMS      512
+ 
+ #define COMPANION_QUEUE_LEN          4096
+
+
+
+
+@@ -607,7 +607,7 @@ struct ntopngLuaContext {
+   Ping *ping;
+ #endif
+ #ifndef HAVE_NEDGE
+-  SNMP *snmp;
++  SNMP *snmpBatch, *snmpAsyncEngine[MAX_NUM_ASYNC_SNMP_ENGINES];
+ #endif
+   Host *host;
+   NetworkStats *network;
+
+
+
+
+@@ -90,6 +90,7 @@ static void stackDump(lua_State *L) {
+ LuaEngine::LuaEngine(lua_State *vm) {
+   std::bad_alloc bax;
+   void *ctx;
++
+   loaded_script_path = NULL;
+ 
+ #ifdef HAVE_NEDGE
+@@ -137,8 +138,12 @@ LuaEngine::~LuaEngine() {
+ 
+     if(ctx) {
+ #ifndef HAVE_NEDGE
+-      SNMP *snmp = ctx->snmp;
+-      if(snmp) delete snmp;
++      if(ctx->snmpBatch) delete ctx->snmpBatch;
++
++      for(u_int8_t slot_id=0; slot_id<MAX_NUM_ASYNC_SNMP_ENGINES; slot_id++) {
++	if(ctx->snmpAsyncEngine[slot_id] != NULL)
++	  delete ctx->snmpAsyncEngine[slot_id];
++      }
+ #endif
+ 
+       if(ctx->pkt_capture.end_capture > 0) {
+
+
+
+
+@@ -122,34 +122,38 @@ int SNMP::snmp_read_response(lua_State* vm, u_int timeout) {
+ 
+ /* ******************************************* */
+ 
+-int SNMP::snmp_get_fctn(lua_State* vm, bool isGetNext) {
++int SNMP::snmp_get_fctn(lua_State* vm, bool isGetNext, bool skip_first_param) {
+   char *agent_host, *community;
+-  u_int timeout = 5, version = snmp_version, oid_idx = 0, i;
++  u_int timeout = 5, version = snmp_version, oid_idx = 0, idx = skip_first_param ? 2 : 1;
+   char *oid[SNMP_MAX_NUM_OIDS] = { NULL };
+     
+-  if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK)  return(CONST_LUA_ERROR);
+-  agent_host = (char*)lua_tostring(vm, 1);
++  if(ntop_lua_check(vm, __FUNCTION__, idx, LUA_TSTRING) != CONST_LUA_OK)  return(CONST_LUA_ERROR);
++  agent_host = (char*)lua_tostring(vm, idx++);
+ 
+-  if(ntop_lua_check(vm, __FUNCTION__, 2, LUA_TSTRING) != CONST_LUA_OK)  return(CONST_LUA_ERROR);
+-  community = (char*)lua_tostring(vm, 2);
++  if(ntop_lua_check(vm, __FUNCTION__, idx, LUA_TSTRING) != CONST_LUA_OK)  return(CONST_LUA_ERROR);
++  community = (char*)lua_tostring(vm, idx++);
+ 
+-  if(ntop_lua_check(vm, __FUNCTION__, 3, LUA_TSTRING) != CONST_LUA_OK)  return(CONST_LUA_ERROR);
+-  oid[oid_idx++] = (char*)lua_tostring(vm, 3);
+-
+-  i = 4;
++  if(ntop_lua_check(vm, __FUNCTION__, idx, LUA_TSTRING) != CONST_LUA_OK)  return(CONST_LUA_ERROR);
++  oid[oid_idx++] = (char*)lua_tostring(vm, idx++);
+   
+   /* Optional timeout: take the minimum */
+-  if(lua_type(vm, 4) == LUA_TNUMBER)
+-    timeout = min(timeout, (u_int)lua_tointeger(vm, 4)), i++;
+-
++  if(lua_type(vm, idx) == LUA_TNUMBER) {
++    timeout = min(timeout, (u_int)lua_tointeger(vm, idx));
++    idx++;
++  }
++  
+   /* Optional version */
+-  if(lua_type(vm, 5) == LUA_T

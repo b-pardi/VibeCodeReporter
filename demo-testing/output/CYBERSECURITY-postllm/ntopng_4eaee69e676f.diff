@@ -1,0 +1,113 @@
+@@ -1421,6 +1421,8 @@ public:
+   inline BroadcastDomains* getBroadcastDomains() { return(bcast_domains); }
+ 
+   void resetBroacastDomains();
++  inline u_int getNumDPIProtocols() { return(ndpi_struct ? ndpi_get_num_protocols(ndpi_struct) : 0); }
++  inline bool  isCustomDPIProtocol(u_int16_t proto_id) { return(ndpi_struct ? ndpi_is_custom_protocol(ndpi_struct, proto_id) : false); }
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -400,9 +400,7 @@ struct vm_ptree {
+ };
+ 
+ struct active_flow_stats {
+-  u_int32_t num_flows,
+-      ndpi_bytes[NDPI_MAX_SUPPORTED_PROTOCOLS + NDPI_MAX_NUM_CUSTOM_PROTOCOLS],
+-      breeds_bytes[NUM_BREEDS];
++  u_int32_t num_flows, *ndpi_bytes, breeds_bytes[NUM_BREEDS];
+ };
+ 
+ struct grev1_header {
+
+
+
+
+@@ -7236,10 +7236,7 @@ void Flow::fillZMQFlowCategory(ndpi_protocol *res) {
+     /* Match for custom protocols (protos.txt) */
+     if((rc = ndpi_match_string_subprotocol(ndpi_struct, (char *)dst_name,
+                                             strlen(dst_name), &tmp)) != 0) {
+-      if(rc >= NDPI_MAX_SUPPORTED_PROTOCOLS) {
+-        /* If the protocol is greater than NDPI_MAX_SUPPORTED_PROTOCOLS, it
+-           means it is a custom protocol so the application protocol received
+-           from nprobe can be overridden */
++      if(iface->isCustomDPIProtocol(rc)) {
+         if(res->proto.master_protocol == NDPI_PROTOCOL_UNKNOWN)
+           res->proto.master_protocol = res->proto.app_protocol;
+ 
+
+
+
+
+@@ -7527,13 +7527,16 @@ static int ntop_recipient_register(lua_State *vm) {
+ /* **************************************************************** */
+ 
+ static int ndpi_is_custom_application(lua_State *vm) {
+-  int app_id;
+-
+-  if (ntop_lua_check(vm, __FUNCTION__, 1, LUA_TNUMBER) != CONST_LUA_OK)
++  u_int16_t app_id;
++  NetworkInterface *iface = getCurrentInterface(vm);
++  
++  if((iface == NULL)
++     || (ntop_lua_check(vm, __FUNCTION__, 1, LUA_TNUMBER) != CONST_LUA_OK))
+     return (ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
+-  app_id = lua_tonumber(vm, 1);
+ 
+-  lua_pushboolean(vm, app_id >= NDPI_MAX_SUPPORTED_PROTOCOLS);
++  app_id = (u_int16_t)lua_tonumber(vm, 1);
++
++  lua_pushboolean(vm, iface->isCustomDPIProtocol(app_id));
+ 
+   return (ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_OK));
+ }
+
+
+
+
+@@ -7003,11 +7003,8 @@ static bool flow_stats_walker(GenericHashEntry *h, void *user_data,
+   if(iface) {
+     u_int32_t proto_id = ndpi_map_user_proto_id_to_ndpi_id(
+         iface->get_ndpi_struct(), flow->get_detected_protocol().proto.app_protocol);
+-    stats->num_flows++,
+-      stats->ndpi_bytes[proto_id] +=
+-      (u_int32_t)flow->get_bytes(),
+-      stats->breeds_bytes[flow->get_protocol_breed()] +=
+-      (u_int32_t)flow->get_bytes();
++    stats->num_flows++, stats->ndpi_bytes[proto_id] += (u_int32_t)flow->get_bytes(),
++      stats->breeds_bytes[flow->get_protocol_breed()] += (u_int32_t)flow->get_bytes();
+ 
+     *matched = true;
+ 
+@@ -7020,18 +7017,24 @@ static bool flow_stats_walker(GenericHashEntry *h, void *user_data,
+ 
+ void NetworkInterface::getFlowsStats(lua_State *vm) {
+   struct active_flow_stats stats;
+-  u_int32_t begin_slot = 0;
++  u_int32_t begin_slot = 0, num_protos = getNumDPIProtocols();
+   bool walk_all = true;
+ 
+   memset(&stats, 0, sizeof(stats));
+-  walker(&begin_slot, walk_all, walker_flows, flow_stats_walker,
+-         (void *)&stats);
++  stats.ndpi_bytes = (u_int32_t*)calloc(num_protos, sizeof(u_int32_t));
++
++  if(stats.ndpi_bytes == NULL) {
++    ntop->getTrace()->traceEvent(TRACE_WARNING, "Out of memory :-(");
++    return;
++  }
++  
++  walker(&begin_slot, walk_all, walker_flows, flow_stats_walker, (void *)&stats);
+ 
+   lua_newtable(vm);
+   lua_push_uint64_table_entry(vm, "num_flows", stats.num_flows);
+   lua_newtable(vm);
+-  for (int i = 0;
+-       i < NDPI_MAX_SUPPORTED_PROTOCOLS + NDPI_MAX_NUM_CUSTOM_PROTOCOLS; i++) {
++
++  for (u_int i = 0; i < num_protos; i++) {
+     if (stats.ndpi_bytes[i] > 0)
+       lua_push_uint64_table_entry(vm, ndpi_get_proto_name(get_ndpi_stru

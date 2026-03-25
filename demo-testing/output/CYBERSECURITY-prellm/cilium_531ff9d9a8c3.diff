@@ -1,0 +1,117 @@
+@@ -68,6 +68,15 @@ static void BPF_FUNC(tail_call, void *ctx, const void *map, __u32 index);
+ /* System helpers */
+ static __u32 BPF_FUNC(get_smp_processor_id);
+ 
++/* Padded struct so the dmac at the end can be passed to another helper
++ * e.g. as a map value buffer. Otherwise verifier will trip over it with
++ * 'invalid indirect read from stack off'.
++ */
++struct bpf_fib_lookup_padded {
++	struct bpf_fib_lookup l;
++	__u8 pad[2];
++};
++
+ /* Routing helpers */
+ static int BPF_FUNC(fib_lookup, void *ctx, struct bpf_fib_lookup *params,
+ 		    __u32 plen, __u32 flags);
+
+
+
+
+@@ -316,9 +316,11 @@ static __always_inline int xlate_dsr_v6(struct __ctx_buff *ctx,
+ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_DSR)
+ int tail_nodeport_ipv6_dsr(struct __ctx_buff *ctx)
+ {
+-	struct bpf_fib_lookup fib_params = {
+-		.family		= AF_INET6,
+-		.ifindex	= DIRECT_ROUTING_DEV_IFINDEX,
++	struct bpf_fib_lookup_padded fib_params = {
++		.l = {
++			.family		= AF_INET6,
++			.ifindex	= DIRECT_ROUTING_DEV_IFINDEX,
++		},
+ 	};
+ 	union macaddr *dmac = NULL;
+ 	void *data, *data_end;
+@@ -345,30 +347,32 @@ int tail_nodeport_ipv6_dsr(struct __ctx_buff *ctx)
+ 	if (nodeport_lb_hairpin())
+ 		dmac = map_lookup_elem(&NODEPORT_NEIGH6, &ip6->daddr);
+ 	if (dmac) {
+-		union macaddr mac = NATIVE_DEV_MAC_BY_IFINDEX(fib_params.ifindex);
++		union macaddr mac = NATIVE_DEV_MAC_BY_IFINDEX(fib_params.l.ifindex);
+ 
+ 		if (eth_store_daddr(ctx, dmac->addr, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+ 		if (eth_store_saddr(ctx, mac.addr, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+ 	} else {
+-		ipv6_addr_copy((union v6addr *) &fib_params.ipv6_src,
++		ipv6_addr_copy((union v6addr *) &fib_params.l.ipv6_src,
+ 			       (union v6addr *) &ip6->saddr);
+-		ipv6_addr_copy((union v6addr *) &fib_params.ipv6_dst,
++		ipv6_addr_copy((union v6addr *) &fib_params.l.ipv6_dst,
+ 			       (union v6addr *) &ip6->daddr);
+ 
+-		ret = fib_lookup(ctx, &fib_params, sizeof(fib_params),
++		ret = fib_lookup(ctx, &fib_params.l, sizeof(fib_params),
+ 				 BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
+ 		if (ret != 0)
+ 			return DROP_NO_FIB;
+-
+-		if (eth_store_daddr(ctx, fib_params.dmac, 0) < 0)
++		if (nodeport_lb_hairpin())
++			map_update_elem(&NODEPORT_NEIGH6, &ip6->daddr,
++					fib_params.l.dmac, 0);
++		if (eth_store_daddr(ctx, fib_params.l.dmac, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+-		if (eth_store_saddr(ctx, fib_params.smac, 0) < 0)
++		if (eth_store_saddr(ctx, fib_params.l.smac, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+ 	}
+ 
+-	return ctx_redirect(ctx, fib_params.ifindex, 0);
++	return ctx_redirect(ctx, fib_params.l.ifindex, 0);
+ }
+ # endif /* ENABLE_DSR */
+ 
+@@ -377,9 +381,11 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ {
+ 	int ret, dir = ctx_load_meta(ctx, CB_NAT);
+ 	union v6addr tmp = IPV6_DIRECT_ROUTING;
+-	struct bpf_fib_lookup fib_params = {
+-		.family		= AF_INET6,
+-		.ifindex	= DIRECT_ROUTING_DEV_IFINDEX,
++	struct bpf_fib_lookup_padded fib_params = {
++		.l = {
++			.family		= AF_INET6,
++			.ifindex	= DIRECT_ROUTING_DEV_IFINDEX,
++		},
+ 	};
+ 	struct ipv6_nat_target target = {
+ 		.min_port = NODEPORT_PORT_MIN_NAT,
+@@ -408,12 +414,12 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 				return ret;
+ 
+ 			BPF_V6(target.addr, ROUTER_IP);
+-			fib_params.ifindex = ENCAP_IFINDEX;
++			fib_params.l.ifindex = ENCAP_IFINDEX;
+ 
+ 			/* fib lookup not necessary when going over tunnel. */
+-			if (eth_store_daddr(ctx, fib_params.dmac, 0) < 0)
++			if (eth_store_daddr(ctx, fib_params.l.dmac, 0) < 0)
+ 				return DROP_WRITE_ERROR;
+-			if (eth_store_saddr(ctx, fib_params.smac, 0) < 0)
++			if (eth_store_saddr(ctx, fib_params.l.smac, 0) < 0)
+ 				return DROP_WRITE_ERROR;
+ 		}
+ 	}
+@@ -444,7 +450,7 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 		goto drop_err;
+ 	}
+ #ifdef ENCAP_IFINDEX
+-	if (fib_params.ifindex == ENCAP_IFINDEX)
++	if (fib_params.l.ifindex == ENCAP_IFINDEX)
+ 		goto out_send;
+ #endif
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
+@@ -455,7 +461,7 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *c

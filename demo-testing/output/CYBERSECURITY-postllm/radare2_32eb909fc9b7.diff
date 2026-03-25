@@ -1,0 +1,147 @@
+@@ -117,11 +117,6 @@ R_API RVecR2RCmdTestPtr *r2r_load_cmd_test_file(const char *file) {
+ 		return NULL;
+ 	}
+ 	R2RCmdTest *test = r2r_cmd_test_new ();
+-	if (!test) {
+-		free (contents);
+-		RVecR2RCmdTestPtr_free (ret);
+-		return NULL;
+-	}
+ 
+ 	ut64 linenum = 0;
+ 	char *line = contents;
+
+
+
+
+@@ -1331,14 +1331,11 @@ static char *replace_lines(const char *src, size_t from, size_t to, const char *
+ 	while (line < from) {
+ 		begin = strchr (begin, '\n');
+ 		if (!begin) {
+-			break;
++			return NULL;
+ 		}
+ 		begin++;
+ 		line++;
+ 	}
+-	if (!begin) {
+-		return NULL;
+-	}
+ 
+ 	const char *end = begin;
+ 	while (line < to) {
+
+
+
+
+@@ -23,7 +23,7 @@ R_LIB_VERSION_HEADER (r_lib);
+ // double-indirection required because cpp is crap
+ #define STRINGIFY2(x) #x
+ #define STRINGIFY(x) STRINGIFY2(x)
+-#define R2_ABIVERSION 49
++#define R2_ABIVERSION 50
+ #define R2_ABIVERSION_STRING STRINGIFY(R2_ABIVERSION)
+ 
+ #define R_LIB_ENV "R2_LIBR_PLUGINS"
+
+
+
+
+@@ -40,8 +40,8 @@ R_API char *r_strbuf_drain(RStrBuf *sb);
+ R_API char *r_strbuf_drain_nofree(RStrBuf *sb); // rename to _tostring() or asstring() ?
+ R_API bool r_strbuf_replace(RStrBuf *sb, const char *key, const char *val);
+ R_API bool r_strbuf_replacef(RStrBuf *sb, const char *key, const char *fmt, ...) R_PRINTF_CHECK(3, 4);
+-R_API int r_strbuf_length(RStrBuf *sb);
+-R_API int r_strbuf_size(RStrBuf *sb);
++R_API int r_strbuf_length(RStrBuf *sb); // returns its length
++R_API size_t r_strbuf_size(RStrBuf *sb); // returns its capacity
+ R_API void r_strbuf_free(RStrBuf *sb);
+ R_API void r_strbuf_fini(RStrBuf *sb);
+ R_API void r_strbuf_init(RStrBuf *sb);
+
+
+
+
+@@ -2,7 +2,21 @@
+ 
+ #include <r_util.h>
+ 
+-R_API RStrBuf * R_NONNULL r_strbuf_new(const char *str) {
++// Base growth: +12.5%, with adaptive slack to avoid size-class boundaries
++static inline size_t growlog(size_t cap, size_t required) {
++	// assume cap can't be zero because minimum if sizeof (buf)
++	if (cap >= required) {
++		return cap;
++	}
++	size_t grown = cap + (cap >> 3); // +12.5%
++	if (grown < required) {
++		grown = required + (required >> 3);
++	}
++	// avoids sharp size-class boundaries
++	return grown + (grown < 1024? 64: (grown >> 4));
++}
++
++R_API RStrBuf *R_NONNULL r_strbuf_new(const char *str) {
+ 	RStrBuf *s = R_NEW0 (RStrBuf);
+ 	if (str) {
+ 		r_strbuf_set (s, str);
+@@ -37,9 +51,15 @@ R_API int r_strbuf_length(RStrBuf *sb) {
+ 	return sb->len;
+ }
+ 
++R_API size_t r_strbuf_size(RStrBuf *sb) {
++	// return its capacity
++	R_RETURN_VAL_IF_FAIL (sb, 0);
++	return sb->ptr? sb->ptrlen: sizeof (sb->buf);
++}
++
+ R_API void r_strbuf_init(RStrBuf *sb) {
+ 	R_RETURN_IF_FAIL (sb);
+-	*sb = (const RStrBuf){0};
++	*sb = (const RStrBuf){ 0 };
+ }
+ 
+ R_API const char *r_strbuf_initf(RStrBuf *sb, const char *fmt, ...) {
+@@ -162,7 +182,7 @@ R_API const char *r_strbuf_set(RStrBuf *sb, const char *s) {
+ 		return r_strbuf_get (sb);
+ 	}
+ 	size_t len = strlen (s);
+-	if (!r_strbuf_setbin (sb, (const ut8*)s, len)) {
++	if (!r_strbuf_setbin (sb, (const ut8 *)s, len)) {
+ 		return NULL;
+ 	}
+ 	sb->len = len;
+@@ -215,7 +235,7 @@ R_API bool r_strbuf_prepend(RStrBuf *sb, const char *s) {
+ 	bool ret = false;
+ 	if (ns) {
+ 		memcpy (ns, s, l);
+-		char *s = sb->ptr ? sb->ptr: sb->buf;
++		char *s = sb->ptr? sb->ptr: sb->buf;
+ 		memcpy (ns + l, s, sb->len);
+ 		ns[newlen] = 0;
+ 		ret = r_strbuf_set (sb, ns);
+@@ -245,12 +265,18 @@ R_API bool r_strbuf_append_n(RStrBuf *sb, const char *s, size_t l) {
+ 	if ((sb->len + l + 1) <= sizeof (sb->buf)) {
+ 		memcpy (sb->buf + sb->len, s, l);
+ 		sb->buf[sb->len + l] = 0;
++		sb->len += l;
+ 		R_FREE (sb->ptr);
+-	} else {
+-		int ll = (l < 256)? 256: (l * 2);
+-		int newlen = sb->len + ll;
+-		char *p = sb->ptr;
+-		bool allocated = true;
++		return true;
++	}
++
++	char *p = sb->ptr;
++	size_t required = sb->len + l + 1;
++	size_t current = sb->ptr? sb->ptrlen: sizeof (sb->buf);
++
++	// Only grow if current capacity is insufficient
++	if (current < required) {
++		size_t newlen = growlog (current, required);
+ 		if (!sb->ptr) {
+ 			p = malloc (newlen);
+ 			if (!p) {
+@@ -259,21 +285

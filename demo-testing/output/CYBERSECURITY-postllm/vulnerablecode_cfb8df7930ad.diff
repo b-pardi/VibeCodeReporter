@@ -1,0 +1,117 @@
+@@ -46,6 +46,9 @@ from vulnerabilities.pipelines.v2_importers import apache_httpd_importer as apac
+ from vulnerabilities.pipelines.v2_importers import apache_kafka_importer as apache_kafka_importer_v2
+ from vulnerabilities.pipelines.v2_importers import apache_tomcat_importer as apache_tomcat_v2
+ from vulnerabilities.pipelines.v2_importers import archlinux_importer as archlinux_importer_v2
++from vulnerabilities.pipelines.v2_importers import (
++    collect_repo_fix_commits as collect_repo_fix_commits,
++)
+ from vulnerabilities.pipelines.v2_importers import curl_importer as curl_importer_v2
+ from vulnerabilities.pipelines.v2_importers import debian_importer as debian_importer_v2
+ from vulnerabilities.pipelines.v2_importers import (
+@@ -145,5 +148,6 @@ IMPORTERS_REGISTRY = create_registry(
+         ubuntu_usn.UbuntuUSNImporter,
+         fireeye.FireyeImporter,
+         oss_fuzz.OSSFuzzImporter,
++        collect_repo_fix_commits.CollectRepoFixCommitPipeline,
+     ]
+ )
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,117 @@
++import os
++import re
++import shutil
++import subprocess
++import tempfile
++from collections import defaultdict
++
++from git import Repo
++
++from vulnerabilities.importer import AdvisoryData
++from vulnerabilities.importer import ReferenceV2
++from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipelineV2
++
++SECURITY_PATTERNS = [
++    r"\bCVE-\d{4}-\d{4,19}\b",
++    r"\bGHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}\b",
++    r"\bPYSEC-\d{4}-\d{1,6}\b",
++    r"\bXSA-\d{1,4}\b",
++]
++
++
++class CollectRepoFixCommitPipeline(VulnerableCodeBaseImporterPipelineV2):
++    """
++    Pipeline to collect fix commits from any git repository.
++    """
++
++    pipeline_id = "repo_fix_commit"
++
++    @classmethod
++    def steps(cls):
++        return (
++            cls.clone,
++            cls.collect_and_store_advisories,
++            cls.clean_downloads,
++        )
++
++    def clone(self):
++        """Clone the repository."""
++        self.repo_url = "https://github.com/torvalds/linux"
++        repo_path = tempfile.mkdtemp()
++        cmd = [
++            "git",
++            "clone",
++            "--bare",
++            "--filter=blob:none",
++            "--no-checkout",
++            self.repo_url,
++            repo_path,
++        ]
++        subprocess.run(cmd, check=True)
++        self.repo = Repo(repo_path)
++
++    def advisories_count(self) -> int:
++        return int(self.repo.git.rev_list("--count", "HEAD"))
++
++    def classify_commit_type(self, commit) -> list[str]:
++        """
++        Extract vulnerability identifiers from a commit message.
++        Returns a list of matched vulnerability IDs (normalized to uppercase).
++        """
++        matches = []
++        for pattern in SECURITY_PATTERNS:
++            found = re.findall(pattern, commit.message, flags=re.IGNORECASE)
++            matches.extend(found)
++        return matches
++
++    def collect_fix_commits(self):
++        """
++        Iterate through repository commits and group them by vulnerability identifiers.
++        return a list with (vuln_id, [(commit_id, commit_message)]).
++        """
++        self.log("Processing git repository fix commits (grouped by vulnerability IDs).")
++
++        grouped_commits = defaultdict(list)
++        for commit in self.repo.iter_commits("--all"):
++            matched_ids = self.classify_commit_type(commit)
++            if not matched_ids:
++                continue
++
++            commit_id = commit.hexsha
++            commit_message = commit.message.strip()
++
++            for vuln_id in matched_ids:
++                grouped_commits[vuln_id].append((commit_id, commit_message))
++
++        self.log(f"Found {len(grouped_commits)} vulnerabilities with related commits.")
++        self.log("Finished processing all commits.")
++        return grouped_commits
++
++    def collect_advisories(self):
++        """
++        Generate AdvisoryData objects for each vulnerability ID grouped with its related commits.
++        """
++        self.log("Generating AdvisoryData

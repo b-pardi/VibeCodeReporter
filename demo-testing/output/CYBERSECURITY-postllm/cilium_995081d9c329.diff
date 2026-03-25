@@ -1,0 +1,145 @@
+@@ -612,6 +612,82 @@ drop_err:
+ 	return send_drop_notify_error_ext(ctx, 0, ret, ext_err,
+ 					  CTX_ACT_DROP, METRIC_EGRESS);
+ }
++
++declare_tailcall_if(__not(is_defined(IS_BPF_LXC)), CILIUM_CALL_IPV6_NODEPORT_DSR_INGRESS)
++int tail_nodeport_dsr_ingress_ipv6(struct __ctx_buff *ctx)
++{
++	struct ct_state ct_state_new = {};
++	struct ipv6_ct_tuple tuple = {};
++	struct ct_state ct_state = {};
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++	__u32 monitor = 0;
++	union v6addr addr;
++	int ret, l4_off;
++	__be16 port;
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
++		ret = DROP_INVALID;
++		goto drop_err;
++	}
++
++	ret = lb6_extract_tuple(ctx, ip6, ETH_HLEN, &l4_off, &tuple);
++	if (IS_ERR(ret))
++		goto drop_err;
++
++	addr.p1 = ctx_load_meta(ctx, CB_ADDR_V6_1);
++	addr.p2 = ctx_load_meta(ctx, CB_ADDR_V6_2);
++	addr.p3 = ctx_load_meta(ctx, CB_ADDR_V6_3);
++	addr.p4 = ctx_load_meta(ctx, CB_ADDR_V6_4);
++	port = (__be16)ctx_load_meta(ctx, CB_PORT);
++
++	ctx_store_meta(ctx, CB_PORT, 0);
++	ctx_store_meta(ctx, CB_ADDR_V6_1, 0);
++	ctx_store_meta(ctx, CB_ADDR_V6_2, 0);
++	ctx_store_meta(ctx, CB_ADDR_V6_3, 0);
++	ctx_store_meta(ctx, CB_ADDR_V6_4, 0);
++
++	ret = ct_lb_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off,
++			    CT_EGRESS, &ct_state, &monitor);
++	switch (ret) {
++	case CT_NEW:
++	case CT_REOPENED:
++create_ct:
++		if (port == 0) {
++			ret = DROP_INVALID;
++			goto drop_err;
++		}
++
++		ct_state_new.src_sec_id = WORLD_ID;
++		ct_state_new.dsr = 1;
++		ct_state_new.ifindex = (__u16)NATIVE_DEV_IFINDEX;
++		ret = ct_create6(get_ct_map6(&tuple), NULL, &tuple, ctx,
++				 CT_EGRESS, &ct_state_new, false, false);
++		if (!IS_ERR(ret))
++			ret = snat_v6_create_dsr(&tuple, &addr, port);
++
++		if (IS_ERR(ret))
++			goto drop_err;
++		break;
++	case CT_ESTABLISHED:
++		if ((tuple.nexthdr == IPPROTO_TCP && port) || !ct_state.dsr)
++			goto create_ct;
++		break;
++	case CT_REPLY:
++		ipv6_ct_tuple_reverse(&tuple);
++		goto create_ct;
++	default:
++		ret = DROP_UNKNOWN_CT;
++		goto drop_err;
++	}
++
++	ctx_skip_nodeport_set(ctx);
++	ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_NETDEV);
++	ret = DROP_MISSED_TAIL_CALL;
++
++drop_err:
++	return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, METRIC_INGRESS);
++}
+ #endif /* ENABLE_DSR */
+ 
+ #ifdef ENABLE_NAT_46X64_GATEWAY
+@@ -818,82 +894,6 @@ drop_err:
+ 					  CTX_ACT_DROP, METRIC_EGRESS);
+ }
+ 
+-declare_tailcall_if(__not(is_defined(IS_BPF_LXC)), CILIUM_CALL_IPV6_NODEPORT_DSR_INGRESS)
+-int tail_nodeport_dsr_ingress_ipv6(struct __ctx_buff *ctx)
+-{
+-	struct ct_state ct_state_new = {};
+-	struct ipv6_ct_tuple tuple = {};
+-	struct ct_state ct_state = {};
+-	void *data, *data_end;
+-	struct ipv6hdr *ip6;
+-	__u32 monitor = 0;
+-	union v6addr addr;
+-	int ret, l4_off;
+-	__be16 port;
+-
+-	if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
+-		ret = DROP_INVALID;
+-		goto drop_err;
+-	}
+-
+-	ret = lb6_extract_tuple(ctx, ip6, ETH_HLEN, &l4_off, &tuple);
+-	if (IS_ERR(ret))
+-		goto drop_err;
+-
+-	addr.p1 = ctx_load_meta(ctx, CB_ADDR_V6_1);
+-	addr.p2 = ctx_load_meta(ctx, CB_ADDR_V6_2);
+-	addr.p3 = ctx_load_meta(ctx, CB_ADDR_V6_3);
+-	addr.p4 = ctx_load_meta(ctx, CB_ADDR_V6_4);
+-	port = (__be16)ctx_load_meta(ctx, CB_PORT);
+-
+-	ctx_store_meta(ctx, CB_PORT, 0);
+-	ctx_store_meta(ctx, CB_ADDR_V6_1, 0);
+-	ctx_store_meta(ctx, CB_ADDR_V6_2, 0);
+-	ctx_store_meta(ctx, CB_ADDR_V6_3, 0);
+-	ctx_store_meta(ctx, CB_ADDR_V6_4, 0);
+-
+-	ret = ct_lb_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off,
+-			    CT_EGRESS, &ct_state, &monitor);
+-	switch (ret) {
+-	case CT_NEW:
+-	case CT_REOPENED:
+-create_ct:
+-		if (port == 0) {
+-			ret = DROP_INVALID;
+-			goto drop_err;
+-		}
+-
+-		ct_state_new.src_sec_id = WORLD_ID;
+-		ct_state_new.dsr = 1;
+-		ct_state_new.ifindex = (__u16)NATIVE_DEV_IFINDEX;
+-		ret = ct_create6(get_ct_map6(&tuple), NULL, &tuple, ctx,
+-				 CT_EGRESS, &ct_state_new, false, false);
+-		if (!IS_ERR(ret))
+-			ret = snat_v6_create_dsr(&tuple, &addr, port);
+-
+-		if (IS_ERR(ret))
+-			goto drop_err;
+-		break;
+-	case CT_ESTABLISHED:
+-		if ((tuple.nexthdr == IPPROTO_TCP && port) || 

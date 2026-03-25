@@ -1,0 +1,129 @@
+@@ -1202,11 +1202,10 @@ repeat:
+ 			goto repeat;
+ 		}
+ #endif
+-#if __WINDOWS__
+ 		if (reason != R_DEBUG_REASON_DEAD) {
+-			// XXX(jjd): returning a thread id?!
+ 			ret = dbg->tid;
+ 		}
++#if __WINDOWS__
+ 		if (reason == R_DEBUG_REASON_NEW_LIB ||
+ 			reason == R_DEBUG_REASON_EXIT_LIB ||
+ 			reason == R_DEBUG_REASON_NEW_TID ||
+@@ -1239,7 +1238,9 @@ repeat:
+ 
+ 		/* choose the thread that was returned from the continue function */
+ 		// XXX(jjd): there must be a cleaner way to do this...
+-		r_debug_select (dbg, dbg->pid, ret);
++		if (ret != dbg->tid) {
++			r_debug_select (dbg, dbg->pid, ret);
++		}
+ 		sig = 0; // clear continuation after signal if needed
+ 
+ 		/* handle general signals here based on the return from the wait
+@@ -1272,6 +1273,11 @@ repeat:
+ 	}
+ #if __WINDOWS__
+ 	r_cons_break_pop ();
++#elif __linux__
++	// Letting threads continue after the debugger breaks is currently problematic in linux
++	if (dbg->continue_all_threads) {
++		r_debug_stop (dbg);
++	}
+ #endif
+ 	// Unset breakpoints before leaving
+ 	if (reason != R_DEBUG_REASON_BREAKPOINT) {
+
+
+
+
+@@ -93,9 +93,7 @@ R_API RList *r_w32_dbg_maps(RDebug *);
+ 
+ #if !__WINDOWS__ || (!__APPLE__ && defined(WAIT_ON_ALL_CHILDREN))
+ static int r_debug_handle_signals(RDebug *dbg) {
+-#if __linux__
+-	return linux_handle_signals (dbg);
+-#elif __KFBSD__
++#if __KFBSD__
+ 	return bsd_handle_signals (dbg);
+ #else
+ 	return -1;
+@@ -201,12 +199,20 @@ static int r_debug_native_continue_syscall (RDebug *dbg, int pid, int num) {
+ 
+ #if !__WINDOWS__ && !__APPLE__ && !__BSD__
+ /* Callback to trigger SIGINT signal */
+-static void r_debug_native_stop(RDebug *dbg) {
++static void interrupt_process(RDebug *dbg) {
+ 	r_debug_kill (dbg, dbg->pid, dbg->tid, SIGINT);
+ 	r_cons_break_pop ();
+ }
+ #endif
+ 
++static int r_debug_native_stop(RDebug *dbg) {
++#if __linux__
++	return linux_stop_threads (dbg, dbg->reason.tid);
++#else
++	return 0;
++#endif
++}
++
+ /* TODO: specify thread? */
+ /* TODO: must return true/false */
+ static int r_debug_native_continue(RDebug *dbg, int pid, int tid, int sig) {
+@@ -231,7 +237,7 @@ static int r_debug_native_continue(RDebug *dbg, int pid, int tid, int sig) {
+ 	}
+ 	/* SIGINT handler for attached processes: dbg.consbreak (disabled by default) */
+ 	if (dbg->consbreak) {
+-		r_cons_break_push ((RConsBreak)r_debug_native_stop, dbg);
++		r_cons_break_push ((RConsBreak)interrupt_process, dbg);
+ 	}
+ 
+ 	if (dbg->continue_all_threads && dbg->n_threads) {
+@@ -450,7 +456,6 @@ static RDebugReasonType r_debug_native_wait(RDebug *dbg, int pid) {
+ 		}
+ 	}
+ 
+-	dbg->reason.tid = pid;
+ 	dbg->reason.type = reason;
+ 	return reason;
+ }
+@@ -1649,6 +1654,7 @@ RDebugPlugin r_debug_plugin_native = {
+ 	.init = &r_debug_native_init,
+ 	.step = &r_debug_native_step,
+ 	.cont = &r_debug_native_continue,
++	.stop = &r_debug_native_stop,
+ 	.contsc = &r_debug_native_continue_syscall,
+ 	.attach = &r_debug_native_attach,
+ 	.detach = &r_debug_native_detach,
+
+
+
+
+@@ -66,10 +66,9 @@ static bool linux_stop_thread (int tid);
+ static bool linux_kill_thread (int tid, int signo);
+ static void linux_dbg_wait_break (RDebug *dbg);
+ 
+-int linux_handle_signals (RDebug *dbg) {
+-	int pid = dbg->tid;
++int linux_handle_signals (RDebug *dbg, int tid) {
+ 	siginfo_t siginfo = { 0 };
+-	int ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, pid, 0, (r_ptrace_data_t)(size_t)&siginfo);
++	int ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, tid, 0, (r_ptrace_data_t)(size_t)&siginfo);
+ 	if (ret == -1) {
+ 		/* ESRCH means the process already went away :-/ */
+ 		if (errno == ESRCH) {
+@@ -117,6 +116,9 @@ int linux_handle_signals (RDebug *dbg) {
+ 				dbg->reason.type != R_DEBUG_REASON_EXIT_LIB) {
+ 				dbg->reason.bp_addr = (ut64)(size_t)siginfo.si_addr;
+ 				dbg->reason.type = R_DEBUG_REASON_BREAKPOINT;
++				// Switch to the thread that hit the breakpoint
++				r_debug_select (dbg, dbg->pid, tid);
++				dbg->tid = tid;
+ 			}
+ 		}
+ 			break;
+@@ -128,6 +130,7 @@ int linux_handle_signals (RDebug *dbg) {
+ 			break;
+ 		case SIGCHLD:
+ 			dbg->reason.type = R_DEBUG_REASON_SIG

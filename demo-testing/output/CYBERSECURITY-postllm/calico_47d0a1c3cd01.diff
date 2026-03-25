@@ -1,0 +1,115 @@
+@@ -255,6 +255,8 @@ static CALI_BPF_INLINE __attribute__((noreturn)) void bpf_exit(int rc) {
+ 
+ #define ip_is_dnf(ip) ((ip)->frag_off & bpf_htons(0x4000))
+ #define ip_is_frag(ip) ((ip)->frag_off & bpf_htons(0x3fff))
++#define ip_is_first_frag(ip) (((ip)->frag_off & bpf_htons(0x3fff)) == bpf_htons(0x2000))
++#define ip_is_last_frag(ip) (!((ip)->frag_off & bpf_htons(0x2000)))
+ #endif
+ 
+ #ifndef IP_FMT
+
+
+
+
+@@ -30,6 +30,15 @@ CALI_MAP(cali_v4_frgtmp, 2,
+ 		__u32, struct frags4_value,
+ 		1, 0)
+ 
++CALI_MAP(cali_v4_frgfwd, 2, BPF_MAP_TYPE_LRU_HASH, struct frags4_fwd_key, __u32, 10000, 0)
++
++struct frags4_fwd_key {
++	ipv4_addr_t src;
++	ipv4_addr_t dst;
++	__u16 id;
++	__u16 __pad;
++};
++
+ static CALI_BPF_INLINE struct frags4_value *frags4_get_scratch()
+ {
+ 	__u32 key = 0;
+@@ -200,4 +209,39 @@ out:
+ 	return false;
+ }
+ 
++static CALI_BPF_INLINE void frags4_record_ct(struct cali_tc_ctx *ctx)
++{
++	struct frags4_fwd_key k = {
++		.src = ip_hdr(ctx)->saddr,
++		.dst = ip_hdr(ctx)->daddr,
++		.id = ip_hdr(ctx)->id,
++	};
++
++	__u32 v = 0;
++
++	cali_v4_frgfwd_update_elem(&k, &v, 0);
++}
++
++static CALI_BPF_INLINE void frags4_remove_ct(struct cali_tc_ctx *ctx)
++{
++	struct frags4_fwd_key k = {
++		.src = ip_hdr(ctx)->saddr,
++		.dst = ip_hdr(ctx)->daddr,
++		.id = ip_hdr(ctx)->id,
++	};
++
++	cali_v4_frgfwd_delete_elem(&k);
++}
++
++static CALI_BPF_INLINE bool frags4_lookup_ct(struct cali_tc_ctx *ctx)
++{
++	struct frags4_fwd_key k = {
++		.src = ip_hdr(ctx)->saddr,
++		.dst = ip_hdr(ctx)->daddr,
++		.id = ip_hdr(ctx)->id,
++	};
++
++	return cali_v4_frgfwd_lookup_elem(&k) != NULL;
++}
++
+ #endif /* __CALI_IP_V4_FRAGMENT_H__ */
+
+
+
+
+@@ -89,6 +89,7 @@ static CALI_BPF_INLINE int hep_rpf_check(struct cali_tc_ctx *ctx)
+ 	switch(rc) {
+ 		case BPF_FIB_LKUP_RET_SUCCESS:
+ 		case BPF_FIB_LKUP_RET_NO_NEIGH:
++		case BPF_FIB_LKUP_RET_FRAG_NEEDED:
+ 			if (strict) {
+ 				if (ctx->skb->ingress_ifindex == fib_params.ifindex) {
+ 					ret = RPF_RES_STRICT;
+
+
+
+
+@@ -270,6 +270,17 @@ static CALI_BPF_INLINE int pre_policy_processing(struct cali_tc_ctx *ctx)
+ 		}
+ 	}
+ 
++#ifndef IPVER6
++	if (CALI_F_FROM_HOST && ip_is_frag(ip_hdr(ctx)) && !ip_is_first_frag(ip_hdr(ctx))) {
++		if (frags4_lookup_ct(ctx)) {
++			if (ip_is_last_frag(ip_hdr(ctx))) {
++				frags4_remove_ct(ctx);
++			}
++			goto allow;
++		}
++	}
++#endif
++
+ 	ctx->state->pol_rc = CALI_POL_NO_MATCH;
+ 
+ 	/* Do conntrack lookup before anything else */
+@@ -1276,6 +1287,12 @@ int calico_tc_skb_accepted_entrypoint(struct __sk_buff *skb)
+ 		skb_log(ctx, true);
+ 	}
+ 
++#ifndef IPVER6
++	if (CALI_F_FROM_HOST && ip_is_first_frag(ip_hdr(ctx))) {
++		frags4_record_ct(ctx);
++	}
++#endif
++
+ 	ctx->fwd = calico_tc_skb_accepted(ctx);
+ 	return forward_or_drop(ctx);

@@ -1,0 +1,102 @@
+@@ -899,10 +899,10 @@ import org.batfish.representation.arista.MlagConfiguration;
+ import org.batfish.representation.arista.NamedRsaPubKey;
+ import org.batfish.representation.arista.NatPool;
+ import org.batfish.representation.arista.NssaSettings;
++import org.batfish.representation.arista.OspfNetwork;
+ import org.batfish.representation.arista.OspfNetworkType;
+ import org.batfish.representation.arista.OspfProcess;
+ import org.batfish.representation.arista.OspfRedistributionPolicy;
+-import org.batfish.representation.arista.OspfWildcardNetwork;
+ import org.batfish.representation.arista.Prefix6List;
+ import org.batfish.representation.arista.Prefix6ListLine;
+ import org.batfish.representation.arista.PrefixList;
+@@ -6441,19 +6441,26 @@ public class AristaControlPlaneExtractor extends AristaParserBaseListener
+ 
+   @Override
+   public void exitRo_network(Ro_networkContext ctx) {
+-    Ip address;
+-    Ip wildcard;
++    Prefix prefix;
++    long area = toLong(ctx.area);
+     if (ctx.prefix != null) {
+-      Prefix prefix = Prefix.parse(ctx.prefix.getText());
+-      address = prefix.getStartIp();
+-      wildcard = prefix.getPrefixWildcard();
++      prefix = Prefix.parse(ctx.prefix.getText());
+     } else {
+-      address = toIp(ctx.ip);
+-      wildcard = toIp(ctx.wildcard);
++      Ip address = toIp(ctx.ip);
++      Ip wildcard = toIp(ctx.wildcard);
++      Ip mask = wildcard.inverted();
++      if (!mask.isValidNetmask1sLeading()) {
++        // Tested on 4.18 and 4.23
++        warn(
++            ctx,
++            String.format(
++                "Invalid wildcard mask (expecting the inverse of a subnet mask): %s", wildcard));
++        return;
++      }
++      prefix = Prefix.create(address, mask);
+     }
+-    long area = toLong(ctx.area);
+-    OspfWildcardNetwork network = new OspfWildcardNetwork(address, wildcard, area);
+-    _currentOspfProcess.getWildcardNetworks().add(network);
++    OspfNetwork network = new OspfNetwork(prefix, area);
++    _currentOspfProcess.getNetworks().add(network);
+   }
+ 
+   @Override
+@@ -6746,7 +6753,6 @@ public class AristaControlPlaneExtractor extends AristaParserBaseListener
+ 
+   @Override
+   public void exitS_router_ospf(S_router_ospfContext ctx) {
+-    _currentOspfProcess.computeNetworks(_configuration.getInterfaces().values());
+     _currentOspfProcess = null;
+     _currentVrf = AristaConfiguration.DEFAULT_VRF_NAME;
+   }
+
+
+
+
+@@ -1132,8 +1132,8 @@ public final class AristaConfiguration extends VendorConfiguration {
+    */
+   private static @Nullable OspfNetwork getOspfNetworkForInterface(
+       Interface iface, OspfProcess process) {
+-    ConcreteInterfaceAddress interfaceAddress = iface.getAddress();
+-    if (interfaceAddress == null) {
++    Ip interfaceIp = iface.getAddress() != null ? iface.getAddress().getIp() : null;
++    if (interfaceIp == null) {
+       // Iface has no IP address / isn't associated with a network in this OSPF process
+       return null;
+     }
+@@ -1147,11 +1147,7 @@ public final class AristaConfiguration extends VendorConfiguration {
+                 .thenComparingLong(OspfNetwork::getArea),
+             process.getNetworks());
+     for (OspfNetwork network : networks) {
+-      Prefix networkPrefix = network.getPrefix();
+-      Ip networkAddress = networkPrefix.getStartIp();
+-      Ip maskedInterfaceAddress =
+-          interfaceAddress.getIp().getNetworkAddress(networkPrefix.getPrefixLength());
+-      if (maskedInterfaceAddress.equals(networkAddress)) {
++      if (network.getPrefix().containsIp(interfaceIp)) {
+         // Found a longest prefix match, so found the network in this OSPF process for the iface
+         return network;
+       }
+
+
+
+
+@@ -1,7 +1,6 @@
+ package org.batfish.representation.arista;
+ 
+ import java.io.Serializable;
+-import java.util.Collection;
+ import java.util.EnumMap;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -11,7 +10,6 @@ import java.util.TreeMap;
+ import java.util.TreeSet;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+-import

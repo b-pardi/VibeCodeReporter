@@ -1,0 +1,107 @@
+@@ -1,6 +1,6 @@
+ import uuid
+ 
+-from django.db import transaction, connection
++from django.db import connection, transaction
+ from rest_framework import permissions
+ from rest_framework.exceptions import NotAuthenticated
+ from rest_framework.filters import SearchFilter
+@@ -69,10 +69,32 @@ class BaseTenantViewset(BaseViewSet):
+             return super().dispatch(request, *args, **kwargs)
+ 
+     def initial(self, request, *args, **kwargs):
+-        user_id = str(request.user.id)
++        if (
++            request.resolver_match.url_name != "tenant-detail"
++            and request.method != "DELETE"
++        ):
++            user_id = str(request.user.id)
++
++            with connection.cursor() as cursor:
++                cursor.execute(f"SELECT set_config('api.user_id', '{user_id}', TRUE);")
++                return super().initial(request, *args, **kwargs)
++
++        # TODO: DRY this when we have time
++        if request.auth is None:
++            raise NotAuthenticated
++
++        tenant_id = request.auth.get("tenant_id")
++        if tenant_id is None:
++            raise NotAuthenticated("Tenant ID is not present in token")
++
++        try:
++            uuid.UUID(tenant_id)
++        except ValueError:
++            raise ValidationError("Tenant ID must be a valid UUID")
+ 
+         with connection.cursor() as cursor:
+-            cursor.execute(f"SELECT set_config('api.user_id', '{user_id}', TRUE);")
++            cursor.execute(f"SELECT set_config('api.tenant_id', '{tenant_id}', TRUE);")
++            self.request.tenant_id = tenant_id
+             return super().initial(request, *args, **kwargs)
+ 
+ 
+
+
+
+
+@@ -418,13 +418,24 @@ class TestTenantViewSet:
+         )
+         assert response.status_code == status.HTTP_400_BAD_REQUEST
+ 
+-    def test_tenants_delete(self, authenticated_client, tenants_fixture):
++    @patch("api.db_router.MainRouter.admin_db", new="default")
++    @patch("api.v1.views.delete_tenant_task.apply_async")
++    def test_tenants_delete(
++        self, delete_tenant_mock, authenticated_client, tenants_fixture
++    ):
++        def _delete_tenant(kwargs):
++            Tenant.objects.filter(pk=kwargs.get("tenant_id")).delete()
++
++        delete_tenant_mock.side_effect = _delete_tenant
+         tenant1, *_ = tenants_fixture
+         response = authenticated_client.delete(
+             reverse("tenant-detail", kwargs={"pk": tenant1.id})
+         )
+         assert response.status_code == status.HTTP_204_NO_CONTENT
+         assert Tenant.objects.count() == len(tenants_fixture) - 1
++        assert Membership.objects.filter(tenant_id=tenant1.id).count() == 0
++        # User is not deleted because it has another membership
++        assert User.objects.count() == 1
+ 
+     def test_tenants_delete_invalid(self, authenticated_client):
+         response = authenticated_client.delete(
+
+
+
+
+@@ -31,6 +31,7 @@ from tasks.beat import schedule_provider_scan
+ from tasks.tasks import (
+     check_provider_connection_task,
+     delete_provider_task,
++    delete_tenant_task,
+     perform_scan_summary_task,
+     perform_scan_task,
+ )
+@@ -171,7 +172,7 @@ class SchemaView(SpectacularAPIView):
+ 
+     def get(self, request, *args, **kwargs):
+         spectacular_settings.TITLE = "Prowler API"
+-        spectacular_settings.VERSION = "1.0.0"
++        spectacular_settings.VERSION = "1.0.1"
+         spectacular_settings.DESCRIPTION = (
+             "Prowler API specification.\n\nThis file is auto-generated."
+         )
+@@ -401,6 +402,25 @@ class TenantViewSet(BaseTenantViewset):
+         )
+         return Response(data=serializer.data, status=status.HTTP_201_CREATED)
+ 
++    def destroy(self, request, *args, **kwargs):
++        # This will perform validation and raise a 404 if the tenant does not exist
++        tenant_id = kwargs.get("pk")
++        get_object_or_404(Tenant, id=tenant_id)
++
++        with transaction.atomic():
++            # Delete memberships
++            Membership.objects.using(MainRouter.admin_db).filter(
++                tenant_id=t

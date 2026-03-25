@@ -1,0 +1,150 @@
+@@ -35,6 +35,17 @@ typedef struct {
+ 	RSkipList *relocs;
+ } RWalkBindChainsContext;
+ 
++struct symbol_t {
++	ut64 offset;
++	ut64 addr;
++	ut64 size;
++	int bits;
++	int type;
++	bool is_imported;
++	char *name;
++};
++
++
+ // OMG; THIS SHOULD BE KILLED; this var exposes the local native endian, which is completely unnecessary
+ // USE THIS: int ws = bf->o->info->big_endian;
+ #define mach0_endian 1
+@@ -2154,12 +2165,6 @@ void *MACH0_(mach0_free)(struct MACH0_(obj_t) *mo) {
+ 	}
+ 
+ 	size_t i;
+-	if (mo->symbols) {
+-		for (i = 0; !mo->symbols[i].last; i++) {
+-			free (mo->symbols[i].name);
+-		}
+-		free (mo->symbols);
+-	}
+ 	free (mo->segs);
+ 	free (mo->sects);
+ 	free (mo->symtab);
+@@ -2177,11 +2182,9 @@ void *MACH0_(mach0_free)(struct MACH0_(obj_t) *mo) {
+ 	free (mo->signature);
+ 	free (mo->intrp);
+ 	free (mo->compiler);
+-#if FEATURE_SYMLIST
+ 	if (mo->symbols_loaded) {
+ 		r_vector_fini (&mo->symbols_cache);
+ 	}
+-#endif
+ 	r_list_free (mo->sections_cache);
+ 	if (mo->imports_loaded) {
+ 		r_pvector_fini (&mo->imports_cache);
+@@ -3124,7 +3127,6 @@ static void _r_bin_symbol_fini(void *_sym, void *user) {
+ 		free (sym->name);
+ 		free (sym->libname);
+ 		free (sym->classname);
+-		// TODO remove free (sym);
+ 	}
+ }
+ 
+@@ -3155,219 +3157,6 @@ const RVector *MACH0_(load_symbols)(RBinFile *bf, struct MACH0_(obj_t) *bin) {
+ 	return &bin->symbols_cache;
+ }
+ 
+-static void assign_export_symbol_t(struct MACH0_(obj_t) *bin, const char *name, ut64 flags, ut64 offset, void *ctx) {
+-	RSymCtx *sym_ctx = (RSymCtx*) ctx;
+-	int j = sym_ctx->j;
+-	if (j < sym_ctx->symbols_count) {
+-		sym_ctx->symbols[j].offset = offset;
+-		sym_ctx->symbols[j].addr = offset_to_vaddr (bin, offset);
+-		if (hash_find_or_insert (sym_ctx->hash, name, sym_ctx->symbols[j].addr)) {
+-			return;
+-		}
+-		sym_ctx->symbols[j].size = 0;
+-		sym_ctx->symbols[j].type = R_BIN_MACH0_SYMBOL_TYPE_EXT;
+-		sym_ctx->symbols[j].name = strdup (name);
+-		sym_ctx->j++;
+-	}
+-}
+-
+-const struct symbol_t *MACH0_(get_symbols)(struct MACH0_(obj_t) *bin) {
+-	r_return_val_if_fail (bin, NULL);
+-	struct symbol_t *symbols;
+-	int j = 0, s, stridx, symbols_size, symbols_count;
+-	ut32 to = UT32_MAX;
+-	ut32 from = UT32_MAX;
+-	ut32 i;
+-
+-	if (bin->symbols) {
+-		return bin->symbols;
+-	}
+-
+-	HtPP *hash = ht_pp_new0 ();
+-	if (!hash) {
+-		return NULL;
+-	}
+-
+-	int n_exports = walk_exports (bin, NULL, NULL);
+-
+-	symbols_count = n_exports;
+-	j = 0; // symbol_idx
+-
+-	int bits = MACH0_(get_bits_from_hdr) (&bin->hdr);
+-	if (bin->symtab && bin->symstr) {
+-		int n0 = bin->dysymtab.nextdefsym;
+-		int n1 = bin->dysymtab.nlocalsym;
+-		int n2 = bin->dysymtab.nundefsym;
+-		int n3 = bin->nsymtab;
+-		symbols_count = R_MAX (n0, 0);
+-		symbols_count += R_MAX (n1, 0);
+-		symbols_count += R_MAX (n2, 0);
+-		symbols_count += R_MAX (n3, 0);
+-		/* parse dynamic symbol table */
+-		if (symbols_count < 0 || ((st64)symbols_count * 2) > ST32_MAX) {
+-			R_LOG_WARN ("Symbols count overflow");
+-			ht_pp_free (hash);
+-			return NULL;
+-		}
+-		symbols_size = (symbols_count + 1) * 2 * sizeof (struct symbol_t);
+-
+-		if (symbols_size < 1) {
+-			ht_pp_free (hash);
+-			return NULL;
+-		}
+-		if (!(symbols = calloc (1, symbols_size))) {
+-			ht_pp_free (hash);
+-			return NULL;
+-		}
+-		bin->main_addr = 0;
+-		for (s = 0; s < 2; s++) {
+-			switch (s) {
+-			case 0:
+-				from = bin->dysymtab.iextdefsym;
+-				to = from + bin->dysymtab.nextdefsym;
+-				break;
+-			case 1:
+-				from = bin->dysymtab.ilocalsym;
+-				to = from + bin->dysymtab.nlocalsym;
+-				break;
+-#if NOT_USED
+-			case 2:
+-				from = bin->dysymtab.iundefsym;
+-				to = from + bin->dysymtab.nundefsym;
+-				break;
+-#endif
+-			}
+-			if (from == to) {
+-				continue;
+-			}
+-
+-			from = R_MIN (from, symbols_size / sizeof (struct symbol_t));
+-			to = R_MIN (R_MIN (to, bin->nsymtab), symbols_size / sizeof (struct symbol_t));
+-
+-			ut32 maxsymbols = symbols_size / sizeof (struct symbol_t);
+-			if (symbols_count >= maxsymbols) {
+-				symbols_count = maxsymbols - 1;
+-				R_LOG_WARN ("Symbol table truncated");
+-			}
+-			for (i = from; 

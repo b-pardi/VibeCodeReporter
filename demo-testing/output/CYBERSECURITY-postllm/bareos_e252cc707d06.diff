@@ -1,0 +1,106 @@
+deleted file mode 100644
+
+
+
+@@ -1,611 +0,0 @@
+-#!/usr/bin/env python
+-# -*- coding: utf-8 -*-
+-# BAREOS - Backup Archiving REcovery Open Sourced
+-#
+-# Copyright (C) 2014-2023 Bareos GmbH & Co. KG
+-#
+-# This program is Free Software; you can redistribute it and/or
+-# modify it under the terms of version three of the GNU Affero General Public
+-# License as published by the Free Software Foundation, which is
+-# listed in the file LICENSE.
+-#
+-# This program is distributed in the hope that it will be useful, but
+-# WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+-# Affero General Public License for more details.
+-#
+-# You should have received a copy of the GNU Affero General Public License
+-# along with this program; if not, write to the Free Software
+-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+-# 02110-1301, USA.
+-#
+-# Author: Maik Aussendorf
+-#
+-# Bareos python plugins class that performs online backups (full and incremental)
+-# from Postgres databases. Supports point-in-time (PIT) restores.
+-
+-import os
+-import pg8000  # minimum required version is 1.16
+-import time
+-import datetime
+-import dateutil.parser
+-import dateutil
+-import json
+-import getpass
+-from BareosFdPluginLocalFilesBaseclass import BareosFdPluginLocalFilesBaseclass
+-import bareosfd
+-
+-
+-class BareosFdPluginPostgres(BareosFdPluginLocalFilesBaseclass):  # noqa
+-    """
+-    Bareos-FD-Plugin-Class for PostgreSQL online (Hot) backup of database
+-    files and database transaction logs (WAL) archiving to allow incrmental
+-    backups and point-in-time recovery.
+-    """
+-
+-    def __init__(self, plugindef):
+-        bareosfd.DebugMessage(
+-            100,
+-            "Constructor called in module %s with plugindef=%s\n"
+-            % (__name__, plugindef),
+-        )
+-
+-        # check if pg8000 module is new enough
+-        major, minor, iter = pg8000.__version__.split(".")
+-        if int(major) < 1 or (int(major) == 1 and int(minor) < 16):
+-            bareosfd.JobMessage(
+-                bareosfd.M_FATAL,
+-                "FATAL ERROR: pg8000 module is too old({}), required is >=1.16\n".format(
+-                    pg8000.__version__
+-                ),
+-            )
+-
+-        # Last argument of super constructor is a list of mandatory arguments
+-        super(BareosFdPluginPostgres, self).__init__(
+-            plugindef, ["postgresDataDir", "walArchive"]
+-        )
+-        self.ignoreSubdirs = ["pg_wal", "pg_log", "pg_xlog"]
+-
+-        self.dbCon = None
+-        # This will be set to True between SELECT pg_start_backup
+-        # and SELECT pg_stop_backup. We backup database file during
+-        # this time
+-        self.PostgressFullBackupRunning = False
+-        # Here we store items found in file backup_label, produced by Postgres
+-        self.labelItems = dict()
+-        # We will store the starttime from backup_label here
+-        self.backupStartTime = None
+-        # Postgresql backup stop time
+-        self.lastBackupStopTime = 0
+-        # Our label, will be used for SELECT pg_start_backup and there
+-        # be used as backup_label
+-        self.backupLabelString = "Bareos.pgplugin.jobid.%d" % self.jobId
+-        # Raw restore object data (json-string)
+-        self.row_rop_raw = None
+-        # Dictionary to store passed restore object data
+-        self.rop_data = {}
+-        # we need our timezone information for some timestamp comparisons
+-        # this one respects daylight saving timezones
+-        self.tzOffset = -(
+-            time.altzone
+-            if (time.daylight and time.localtime().tm_isdst)
+-            else time.timezone
+-        )
+-
+-    def check_options(self, mandatory_options=None):
+-        """
+-        Check for mandatory options and verify database connection
+-        """
+-        result = super(BareosFdPluginPostgres, self).check_options(mandatory_options)
+-        if not result == bareosfd.bRC_OK:
+-            retu

@@ -1,0 +1,119 @@
+@@ -1103,6 +1103,15 @@ class Conf(ConfClass):
+     )
+     #: Dictionary containing parsed NSS Keys
+     tls_nss_keys: Dict[str, bytes] = None
++    #: When TCPSession is used, parse DCE/RPC sessions automatically.
++    #: This should be used for passive sniffing.
++    dcerpc_session_enable = False
++    #: Some implementations of DCE/RPC incorrectly use header signing
++    #: without properly negotiating it. This forces it on.
++    dcerpc_force_header_signing = False
++    #: Windows SSPs for sniffing. This is used with
++    #: dcerpc_session_enable
++    winssps_passive = []
+ 
+     def __getattribute__(self, attr):
+         # type: (str) -> Any
+
+
+
+
+@@ -93,12 +93,15 @@ from scapy.sessions import DefaultSession
+ from scapy.supersocket import StreamSocket
+ 
+ from scapy.layers.kerberos import (
+-    KRB_GSS_Wrap_RFC1964,
+-    KRB_GSS_Wrap,
+     KRB_InnerToken,
+     Kerberos,
+ )
+-from scapy.layers.gssapi import GSSAPI_BLOB, GSSAPI_BLOB_SIGNATURE, SSP
++from scapy.layers.gssapi import (
++    GSS_S_COMPLETE,
++    GSSAPI_BLOB_SIGNATURE,
++    GSSAPI_BLOB,
++    SSP,
++)
+ from scapy.layers.inet import TCP
+ 
+ from scapy.contrib.rtps.common_types import (
+@@ -454,7 +457,24 @@ class CommonAuthVerifier(Packet):
+                         Kerberos,
+                         length_from=lambda pkt: pkt.parent.auth_len,
+                     ),
+-                    lambda pkt: pkt.auth_type == 0x10,
++                    lambda pkt: pkt.auth_type == 0x10 and pkt.parent and
++                    # Bind/Alter
++                    pkt.parent.ptype in [11, 12, 13, 14, 15, 16],
++                ),
++                (
++                    PacketLenField(
++                        "auth_value",
++                        KRB_InnerToken(),
++                        KRB_InnerToken,
++                        length_from=lambda pkt: pkt.parent.auth_len,
++                    ),
++                    lambda pkt: pkt.auth_type == 0x10
++                    and pkt.parent
++                    and (
++                        # Other
++                        not pkt.parent
++                        or pkt.parent.ptype not in [11, 12, 13, 14, 15, 16]
++                    ),
+                 ),
+                 # NTLM
+                 (
+@@ -520,18 +540,18 @@ class CommonAuthVerifier(Packet):
+     ]
+ 
+     def is_protected(self):
+-        if self.auth_type == 0x09 and isinstance(self.auth_value, GSSAPI_BLOB):
+-            return isinstance(
+-                self.auth_value.innerToken, KRB_InnerToken
+-            ) and isinstance(  # noqa: E501
+-                self.auth_value.innerToken.root,
+-                (KRB_GSS_Wrap_RFC1964, KRB_GSS_Wrap),
+-            )
+-        elif self.auth_type == 0x44:
+-            return isinstance(self.auth_value, NL_AUTH_SIGNATURE)
+-        elif self.auth_type in [0x0A, 0xFF] and self.auth_value:
+-            return isinstance(self.auth_value, NTLMSSP_MESSAGE_SIGNATURE)
+-        return False
++        if not self.auth_value:
++            return False
++        if self.parent and self.parent.ptype in [11, 12, 13, 14, 15, 16]:
++            return False
++        return True
++
++    def is_ssp(self):
++        if not self.auth_value:
++            return False
++        if self.parent and self.parent.ptype not in [11, 12, 13, 14, 15, 16]:
++            return False
++        return True
+ 
+     def default_payload_class(self, pkt):
+         return conf.padding_layer
+@@ -731,6 +751,19 @@ _DCE_RPC_ERROR_CODES = {
+     0x000006D8: "EPT_S_CANT_PERFORM_OP",
+ }
+ 
++_DCE_RPC_REJECTION_REASONS = {
++    0: "REASON_NOT_SPECIFIED",
++    1: "TEMPORARY_CONGESTION",
++    2: "LOCAL_LIMIT_EXCEEDED",
++    3: "CALLED_PADDR_UNKNOWN",
++    4: "PROTOCOL_VERSION_NOT_SUPPORTED",
++    5: "DEFAULT_CONTEXT_NOT_SUPPORTED",
++    6: "USER_DATA_NOT_READABLE",
++    7: "NO_PSAP_AVAILABLE",
++    8: "AUTHENTICATION_TYPE_NOT_RECOGNIZED",
++    9: "INVALID_CHECKSUM",
++}
++
+ 
+ class DceRpc5(DceRpc):
+     """
+@@ -857,6 +890,13 @@ class DceRpc5(DceRpc):
+             return
+         length = struct.unpack((

@@ -1,0 +1,132 @@
+@@ -99,7 +99,6 @@ R_API RAnalEsil *r_anal_esil_new(int stacksize, int iotrap, unsigned int addrsiz
+ 	esil->iotrap = iotrap;
+ 	r_anal_esil_sources_init (esil);
+ 	r_anal_esil_interrupts_init (esil);
+-	esil->sessions = r_list_newf (r_anal_esil_session_free);
+ 	esil->addrmask = genmask (addrsize - 1);
+ 	return esil;
+ }
+@@ -170,14 +169,13 @@ R_API void r_anal_esil_free(RAnalEsil *esil) {
+ 	r_anal_esil_sources_fini (esil);
+ 	sdb_free (esil->stats);
+ 	esil->stats = NULL;
+-	sdb_free (esil->db_trace);
+-	esil->db_trace = NULL;
+ 	r_anal_esil_stack_free (esil);
+ 	free (esil->stack);
+ 	if (esil->anal && esil->anal->cur && esil->anal->cur->esil_fini) {
+ 		esil->anal->cur->esil_fini (esil);
+ 	}
+-	r_list_free (esil->sessions);
++	r_anal_esil_trace_free (esil->trace);
++	esil->trace = NULL;
+ 	free (esil->cmd_intr);
+ 	free (esil->cmd_trap);
+ 	free (esil->cmd_mdev);
+
+
+
+
+@@ -1,15 +1,109 @@
+-/* radare - LGPL - Copyright 2015-2018 - pancake */
++/* radare - LGPL - Copyright 2015-2020 - pancake, rkx1209 */
+ 
+ #include <r_anal.h>
+ 
+-#define DB esil->db_trace
+-#define KEY(x) sdb_fmt ("%d."x, esil->trace_idx)
+-#define KEYAT(x,y) sdb_fmt ("%d."x".0x%"PFMT64x, esil->trace_idx, y)
+-#define KEYREG(x,y) sdb_fmt ("%d."x".%s", esil->trace_idx, y)
++#define DB esil->trace->db
++#define KEY(x) sdb_fmt ("%d."x, esil->trace->idx)
++#define KEYAT(x,y) sdb_fmt ("%d."x".0x%"PFMT64x, esil->trace->idx, y)
++#define KEYREG(x,y) sdb_fmt ("%d."x".%s", esil->trace->idx, y)
++#define CMP_REG_CHANGE(x, y) ((x) - ((RAnalEsilRegChange *)y)->idx)
++#define CMP_MEM_CHANGE(x, y) ((x) - ((RAnalEsilMemChange *)y)->idx)
+ 
+ static int ocbs_set = false;
+ static RAnalEsilCallbacks ocbs = {0};
+ 
++static void htup_vector_free(HtUPKv *kv) {
++	r_vector_free (kv->value);
++}
++
++R_API RAnalEsilTrace *r_anal_esil_trace_new(RAnalEsil *esil) {
++	r_return_val_if_fail (esil && esil->stack_addr && esil->stack_size, NULL);
++	size_t i;
++	RAnalEsilTrace *trace = R_NEW0 (RAnalEsilTrace);
++	if (!trace) {
++		return NULL;
++	}
++	trace->registers = ht_up_new (NULL, htup_vector_free, NULL);
++	if (!trace->registers) {
++		goto error;
++	}
++	trace->memory = ht_up_new (NULL, htup_vector_free, NULL);
++	if (!trace->memory) {
++		goto error;
++	}
++	trace->db = sdb_new0 ();
++	if (!trace->db) {
++		goto error;
++	}
++	// Save initial ESIL stack memory
++	trace->stack_addr = esil->stack_addr;
++	trace->stack_size = esil->stack_size;
++	trace->stack_data = malloc (esil->stack_size);
++	if (!trace->stack_data) {
++		goto error;
++	}
++	esil->anal->iob.read_at (esil->anal->iob.io, trace->stack_addr,
++		trace->stack_data, trace->stack_size);
++	// Save initial registers arenas
++	for (i = 0; i < R_REG_TYPE_LAST; i++) {
++		RRegArena *a = esil->anal->reg->regset[i].arena;
++		RRegArena *b = r_reg_arena_new (a->size);
++		if (!b) {
++			goto error;
++		}
++		memcpy (b->bytes, a->bytes, b->size);
++		trace->arena[i] = b;
++	}
++	return trace;
++error:
++	eprintf ("error\n");
++	r_anal_esil_trace_free (trace);
++	return NULL;
++}
++
++R_API void r_anal_esil_trace_free(RAnalEsilTrace *trace) {
++	size_t i;
++	if (trace) {
++		ht_up_free (trace->registers);
++		ht_up_free (trace->memory);
++		for (i = 0; i < R_REG_TYPE_LAST; i++) {
++			r_reg_arena_free (trace->arena[i]);
++		}
++		free (trace->stack_data);
++		sdb_free (trace->db);
++		R_FREE (trace);
++	}
++}
++
++static void add_reg_change(RAnalEsilTrace *trace, int idx, RRegItem *ri, ut64 data) {
++	ut64 addr = ri->offset | (ri->arena << 16);
++	RVector *vreg = ht_up_find (trace->registers, addr, NULL);
++	if (!vreg) {
++		vreg = r_vector_new (sizeof (RAnalEsilRegChange), NULL, NULL);
++		if (!vreg) {
++			eprintf ("Error: creating a register vector.\n");
++			return;
++		}
++		ht_up_insert (trace->registers, addr, vreg);
++	}
++	RAnalEsilRegChange reg = { idx, data };
++	r_vector_push (vreg, &reg);
++}
++
++static void add_mem_change(RAnalEsilTrace *trace, int idx, ut64 addr, ut8 data) {
++	RVector *vmem = ht_up_find (trace->memory, addr, NULL);
++	if (!vmem) {
++		vmem = r_vector_new (sizeof (RAnalEsilMemChange), NULL, NULL);
++		if (!vmem) {

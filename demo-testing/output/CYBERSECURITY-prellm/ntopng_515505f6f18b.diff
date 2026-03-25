@@ -1,0 +1,99 @@
+@@ -26,22 +26,28 @@
+ 
+ #include "ntop_includes.h"
+ 
++#define PF_RING_MAX_SOCKETS 2
++
+ class PF_RINGInterface : public NetworkInterface {
+  private:
+-  pfring *pfring_handle;
++  pfring *pfring_handle[PF_RING_MAX_SOCKETS];
++  int num_pfring_handles;
+ 
+   pfring_stat last_pfring_stat;
+   u_int32_t getNumDroppedPackets();
++  pfring *pfringSocketInit(const char *name);
+ 
+  public:
+   PF_RINGInterface(const char *name);
+   ~PF_RINGInterface();
+ 
++  void singlePacketPollLoop();
++  void multiPacketPollLoop();
+   inline bool areTrafficDirectionsSupported()  { return(true); };
+   inline bool isDiscoverableInterface()        { return(true);                         };
+   inline InterfaceType getIfType()             { return(interface_type_PF_RING);       };
+   inline const char* get_type()                { return(CONST_INTERFACE_TYPE_PF_RING); };
+-  inline pfring* get_pfring_handle()           { return(pfring_handle);                };
++  inline int get_num_pfring_handles()          { return(num_pfring_handles); };
+   void startPacketPolling();
+   void shutdown();
+   bool set_packet_filter(char *filter);
+
+
+
+
+@@ -29,9 +29,11 @@
+ 
+ /* **************************************************** */
+ 
+-PF_RINGInterface::PF_RINGInterface(const char *name) : NetworkInterface(name) {
++pfring *PF_RINGInterface::pfringSocketInit(const char *name) {
+   u_int flags = ntop->getPrefs()->use_promiscuous() ? PF_RING_PROMISC : 0;
++  pfring *handle;
+   packet_direction direction;
++  u_int32_t version;
+ 
+   flags |= PF_RING_LONG_HEADER;
+   flags |= PF_RING_DNA_SYMMETRIC_RSS;  /* Note that symmetric RSS is ignored by non-DNA drivers */
+@@ -44,22 +46,17 @@ PF_RINGInterface::PF_RINGInterface(const char *name) : NetworkInterface(name) {
+   else if(ntop->getPrefs()->are_vss_apcon_timestamps_enabled())
+     flags |= PF_RING_VSS_APCON_TIMESTAMP;
+ 
+-  if((pfring_handle = pfring_open(ifname, ntop->getGlobals()->getSnaplen(), flags)) == NULL) {
+-    throw errno;
+-  } else {
+-    u_int32_t version;
+-
+-    pfring_version(pfring_handle, &version);
+-    ntop->getTrace()->traceEvent(TRACE_NORMAL, "Reading packets from PF_RING v.%d.%d.%d interface %s...",
+-				 (version & 0xFFFF0000) >> 16, (version & 0x0000FF00) >> 8, version & 0x000000FF,
+-				 ifname);
+-  }
++  if((handle = pfring_open(name, ntop->getGlobals()->getSnaplen(), flags)) == NULL)
++    return NULL;
+ 
+-  pcap_datalink_type = DLT_EN10MB;
++  pfring_version(handle, &version);
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Reading packets from PF_RING v.%d.%d.%d interface %s...",
++			       (version & 0xFFFF0000) >> 16, (version & 0x0000FF00) >> 8, version & 0x000000FF,
++			       name);
+ 
+-  pfring_set_poll_watermark(pfring_handle, 8);
+-  pfring_set_application_name(pfring_handle, (char*)"ntopng");
+-  pfring_enable_rss_rehash(pfring_handle);
++  pfring_set_poll_watermark(handle, 8);
++  pfring_set_application_name(handle, (char*)"ntopng");
++  pfring_enable_rss_rehash(handle);
+   
+   switch(ntop->getPrefs()->getCaptureDirection()) {
+   case PCAP_D_INOUT: direction = rx_and_tx_direction; break;
+@@ -67,45 +64,83 @@ PF_RINGInterface::PF_RINGInterface(const char *name) : NetworkInterface(name) {
+   case PCAP_D_OUT:   direction = tx_only_direction;   break;
+   }
+ 
+-  if(pfring_set_direction(pfring_handle, direction) != 0)
+-    ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to set packet capture direction");
++  if(pfring_set_direction(handle, direction) != 0)
++    ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to set packet capture direction on %s", name);
+ 
+-  if(pfring_set_socket_mode(pfring_handle, recv_only_mode) != 0)
+-    ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to set socket mode");
++  if(pfring_set_socket_mode(handle, recv_only_mode) != 0)
++    ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to set socket mode on %s", name);
+   
+   memset(&last_pfring_stat, 0, sizeof(last_pfring_stat));
+ 
+   /* 
+-     We need to enable the ring here and not in packetPollLoop() as otherwise
+-     with ZC we cannot 

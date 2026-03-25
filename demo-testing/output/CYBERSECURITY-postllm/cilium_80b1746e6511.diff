@@ -1,0 +1,137 @@
+@@ -1050,7 +1050,30 @@ int cil_from_netdev(struct __ctx_buff *ctx)
+ 
+ 	if (flags & XFER_PKT_ENCAP) {
+ 		edt_set_aggregate(ctx, 0);
+-
++#if defined(ENABLE_DSR) && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE
++		{
++			struct geneve_dsr_opt4 gopt;
++			__be16 port = (__be16)ctx_get_xfer(ctx, XFER_ENCAP_PORT);
++			__be32 addr = ctx_get_xfer(ctx, XFER_ENCAP_ADDR);
++
++			if (port && addr) {
++				set_geneve_dsr_opt4(port, addr, &gopt);
++
++				return encap_and_redirect_with_nodeid_opt(ctx,
++								  ctx_get_xfer(ctx,
++									       XFER_ENCAP_NODEID),
++								  ctx_get_xfer(ctx,
++									       XFER_ENCAP_SECLABEL),
++								  ctx_get_xfer(ctx,
++									       XFER_ENCAP_DSTID),
++								  NOT_VTEP_DST,
++								  &gopt,
++								  sizeof(gopt),
++								  false,
++								  &trace);
++			}
++		}
++#endif
+ 		return __encap_and_redirect_with_nodeid(ctx, ctx_get_xfer(ctx, XFER_ENCAP_NODEID),
+ 							ctx_get_xfer(ctx, XFER_ENCAP_SECLABEL),
+ 							ctx_get_xfer(ctx, XFER_ENCAP_DSTID),
+
+
+
+
+@@ -46,6 +46,8 @@
+ #define ctx_get_tunnel_key	skb_get_tunnel_key
+ #define ctx_set_tunnel_key	skb_set_tunnel_key
+ 
++#define ctx_set_tunnel_opt	skb_set_tunnel_opt
++
+ #define ctx_event_output	skb_event_output
+ 
+ #define ctx_adjust_meta		({ -ENOTSUPP; })
+
+
+
+
+@@ -100,6 +100,8 @@ xdp_store_bytes(const struct xdp_md *ctx, __u64 off, const void *from,
+ #define ctx_get_tunnel_key		xdp_get_tunnel_key__stub
+ #define ctx_set_tunnel_key		xdp_set_tunnel_key__stub
+ 
++#define ctx_set_tunnel_opt		xdp_set_tunnel_opt__stub
++
+ #define ctx_event_output		xdp_event_output
+ 
+ #define ctx_adjust_meta			xdp_adjust_meta
+
+
+
+
+@@ -48,6 +48,8 @@ static int BPF_FUNC(skb_get_tunnel_key, struct __sk_buff *skb,
+ static int BPF_FUNC(skb_set_tunnel_key, struct __sk_buff *skb,
+ 		    const struct bpf_tunnel_key *from, __u32 size,
+ 		    __u32 flags);
++static int BPF_FUNC(skb_set_tunnel_opt, struct __sk_buff *skb,
++		    void *opt, __u32 size);
+ 
+ /* Events for user space */
+ static int BPF_FUNC_REMAP(skb_event_output, struct __sk_buff *skb, void *map,
+
+
+
+
+@@ -46,6 +46,8 @@ static int BPF_STUB(xdp_get_tunnel_key, struct xdp_md *xdp,
+ static int BPF_STUB(xdp_set_tunnel_key, struct xdp_md *xdp,
+ 		    const struct bpf_tunnel_key *from, __u32 size,
+ 		    __u32 flags);
++static int BPF_STUB(xdp_set_tunnel_opt, struct xdp_md *xdp, void *opt,
++		    __u32 size);
+ 
+ /* Events for user space */
+ static int BPF_FUNC_REMAP(xdp_event_output, struct xdp_md *xdp, void *map,
+
+
+
+
+@@ -46,7 +46,8 @@
+ #define CONDITIONAL_PREALLOC BPF_F_NO_PREALLOC
+ #endif
+ 
+-#if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY)
++#if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY) || \
++    (defined(ENABLE_DSR) && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
+ #define HAVE_ENCAP
+ 
+ /* NOT_VTEP_DST is passed to an encapsulation function when the
+@@ -75,6 +76,8 @@ enum {
+ 	XFER_ENCAP_NODEID = 1,
+ 	XFER_ENCAP_SECLABEL = 2,
+ 	XFER_ENCAP_DSTID = 3,
++	XFER_ENCAP_PORT = 4,
++	XFER_ENCAP_ADDR = 5,
+ };
+ 
+ /* FIB errors from BPF neighbor map. */
+@@ -561,6 +564,7 @@ enum {
+ #define DROP_CT_NO_MAP_FOUND	-190
+ #define DROP_SNAT_NO_MAP_FOUND	-191
+ #define DROP_INVALID_CLUSTER_ID	-192
++#define DROP_DSR_ENCAP_UNSUPP_PROTO	-193
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ #define NAT_46X64_RECIRC	100
+@@ -672,6 +676,27 @@ enum metric_dir {
+ #define DSR_IPV6_OPT_LEN	(sizeof(struct dsr_opt_v6) - 4)
+ #define DSR_IPV6_EXT_LEN	((sizeof(struct dsr_opt_v6) - 8) / 8)
+ 
++/* The high-order bit of the Geneve option type indicates that
++ * this is a critical option.
++ *
++ * https://www.rfc-editor.org/rfc/rfc8926.html#name-tunnel-options
++ */
++#define GENEVE_OPT_TYPE_CRIT	0x80
++
++/* Geneve option used to carry service addr and port for DSR.
++ *
++ * Class = 0x014B (Cilium according to [1])
++ * Type  = 0x1   (vendor-specific)
++ *
++ * [1]: https://www.iana.org/assignments/nvo3/nvo3.xhtml#geneve-option-class
++ */
++#define DSR_GENEVE_OPT_CLASS	0x014B
++#define DSR_GENEVE_OPT_TYPE	(GENEVE_OPT_TYPE_CRIT | 0x01)
++#define DSR_IPV4_GENEVE_OPT_LEN	\
++	((sizeof(struct ge

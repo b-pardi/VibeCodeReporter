@@ -1,0 +1,123 @@
+@@ -55,8 +55,6 @@ static CALI_BPF_INLINE int forward_or_drop(struct cali_tc_ctx *ctx)
+ 			CALI_DEBUG("Too short\n");
+ 			goto deny;
+ 		}
+-		skb_refresh_iphdr(ctx);
+-		ctx->nh = (void*)(ctx->ip_header+1);
+ 
+ 		/* Swap the MACs as we are turning it back */
+ 		struct ethhdr *eth_hdr = ctx->data_start;
+@@ -131,13 +129,10 @@ skip_redir_ifindex:
+ 			CALI_DEBUG("Too short\n");
+ 			goto deny;
+ 		}
+-		skb_refresh_iphdr(ctx);
+-		ctx->nh = (void*)(ctx->ip_header+1);
+ 
+-		struct iphdr *ip_header = ctx->ip_header;
+ 		struct bpf_fib_lookup fib_params = {
+ 			.family = 2, /* AF_INET */
+-			.tot_len = bpf_ntohs(ip_header->tot_len),
++			.tot_len = bpf_ntohs(ctx->ip_header->tot_len),
+ 			.ifindex = skb->ingress_ifindex,
+ 			.l4_protocol = state->ip_proto,
+ 			.sport = bpf_htons(state->sport),
+@@ -169,18 +164,13 @@ skip_redir_ifindex:
+ 			 * IP stack handle it. It was approved by policy, so it
+ 			 * is safe.
+ 			 */
+-			if ip_ttl_exceeded(ip_header) {
++			if ip_ttl_exceeded(ctx->ip_header) {
+ 				rc = TC_ACT_UNSPEC;
+ 				goto cancel_fib;
+ 			}
+ 
+-			// Update the MACs.  NAT may have invalidated pointer into the packet so need to
+-			// revalidate.
+-			if (skb_start_ptr(skb) + sizeof(struct ethhdr) > skb_end_ptr(skb)) {
+-				reason = CALI_REASON_SHORT;
+-				goto deny;
+-			}
+-			struct ethhdr *eth_hdr = skb_start_ptr(skb);
++			// Update the MACs.
++			struct ethhdr *eth_hdr = ctx->data_start;
+ 			__builtin_memcpy(&eth_hdr->h_source, fib_params.smac, sizeof(eth_hdr->h_source));
+ 			__builtin_memcpy(&eth_hdr->h_dest, fib_params.dmac, sizeof(eth_hdr->h_dest));
+ 
+@@ -189,7 +179,7 @@ skip_redir_ifindex:
+ 			rc = bpf_redirect(fib_params.ifindex, 0);
+ 			/* now we know we will bypass IP stack and ip->ttl > 1, decrement it! */
+ 			if (rc == TC_ACT_REDIRECT) {
+-				ip_dec_ttl(ip_header);
++				ip_dec_ttl(ctx->ip_header);
+ 			}
+ 		} else if (rc < 0) {
+ 			CALI_DEBUG("FIB lookup failed (bad input): %d.\n", rc);
+
+
+
+
+@@ -44,12 +44,9 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ 		CALI_DEBUG("ICMP v4 reply: too short\n");
+ 		return -1;
+ 	}
+-	skb_refresh_iphdr(ctx);
+-	ctx->nh = ctx->ip_header + 1;
+ 
+-	struct iphdr *ip = ctx->ip_header;
+-	struct iphdr ip_orig = *ip;
+-	CALI_DEBUG("ip->ihl: %d\n", ip->ihl);
++	struct iphdr ip_orig = *ctx->ip_header;
++	CALI_DEBUG("ip->ihl: %d\n", ctx->ip_header->ihl);
+ 	if (ctx->ip_header->ihl > 5) {
+ 		CALI_DEBUG("ICMP v4 reply: IP options\n");
+ 		return -1;
+@@ -59,7 +56,7 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ 	 * part-way through the UDP/TCP header.
+ 	 */
+ 	len = sizeof(struct ethhdr) + sizeof(struct iphdr) + 64;
+-	switch (ip->protocol) {
++	switch (ctx->ip_header->protocol) {
+ 	case IPPROTO_TCP:
+ 		len += sizeof(struct tcphdr);
+ 		break;
+@@ -97,18 +94,17 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ 	}
+ 	skb_refresh_iphdr(ctx);
+ 	ctx->nh = ctx->ip_header + 1;
+-	ip = ctx->ip_header;
+ 
+ 	/* we do not touch ethhdr, we rely on linux to rewrite it after routing
+ 	 * XXX we might want to swap MACs and bounce it back from the same device
+ 	 */
+-	ip->version = 4;
+-	ip->ihl = 5;
+-	ip->tos = 0;
+-	ip->ttl = 64; /* good default */
+-	ip->protocol = IPPROTO_ICMP;
+-	ip->check = 0;
+-	ip->tot_len = bpf_htons(len - sizeof(struct ethhdr));
++	ctx->ip_header->version = 4;
++	ctx->ip_header->ihl = 5;
++	ctx->ip_header->tos = 0;
++	ctx->ip_header->ttl = 64; /* good default */
++	ctx->ip_header->protocol = IPPROTO_ICMP;
++	ctx->ip_header->check = 0;
++	ctx->ip_header->tot_len = bpf_htons(len - sizeof(struct ethhdr));
+ 
+ #ifdef CALI_PARANOID
+ 	/* XXX verify that ip_orig.daddr is always the node's IP
+@@ -121,17 +117,17 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ #endif
+ 
+ 	/* use the host IP of the program that handles the packet */
+-	ip->saddr = HOST_IP;
+-	ip->daddr = ip_orig.saddr;
++	ctx->ip_header->saddr = HOST_IP;
++	ctx->ip_header->daddr = ip_orig.saddr;
+ 
+ 	icmp = ctx->icmp_header;
+ 	icmp->type = type;
+ 	icmp->code = code;
+ 	*((__be32 *)&icmp->un) = un;
+ 

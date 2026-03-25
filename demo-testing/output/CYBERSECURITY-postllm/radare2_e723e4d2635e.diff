@@ -1,0 +1,168 @@
+@@ -70,6 +70,9 @@ R_API RBuffer *r_buf_new_slice(RBuffer *b, ut64 offset, ut64 size);
+ R_API RBuffer *r_buf_new_empty(ut64 len);
+ R_API RBuffer *r_buf_new_mmap(const char *file, int flags);
+ R_API RBuffer *r_buf_new_sparse(ut8 Oxff);
++#if R2_USE_NEW_ABI
++R_API RBuffer *r_buf_new_with_cache(RBuffer *b, bool steal);
++#endif
+ 
+ /* methods */
+ R_API bool r_buf_dump(RBuffer *buf, const char *file);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2022 - ret2libc, pancake */
++/* radare - LGPL - Copyright 2009-2024 - ret2libc, pancake */
+ 
+ #include <r_types.h>
+ #include <r_util.h>
+@@ -11,6 +11,9 @@ typedef enum {
+ 	R_BUFFER_MMAP,
+ 	R_BUFFER_SPARSE,
+ 	R_BUFFER_REF,
++#if R2_USE_NEW_ABI
++	R_BUFFER_CACHE,
++#endif
+ } RBufferType;
+ 
+ #include "buf_file.c"
+@@ -20,6 +23,10 @@ typedef enum {
+ #include "buf_io.c"
+ #include "buf_ref.c"
+ 
++#if R2_USE_NEW_ABI
++#include "buf_cache.c"
++#endif
++
+ static bool buf_init(RBuffer *b, const void *user) {
+ 	r_return_val_if_fail (b && b->methods, false);
+ 	const RBufferInit init = b->methods->init;
+@@ -108,6 +115,11 @@ static RBuffer *new_buffer(RBufferType type, const void *user) {
+ 	case R_BUFFER_MMAP:
+ 		b->methods = &buffer_mmap_methods;
+ 		break;
++#if R2_USE_NEW_ABI
++	case R_BUFFER_CACHE:
++		b->methods = &buffer_cache_methods;
++		break;
++#endif
+ 	case R_BUFFER_SPARSE:
+ 		b->methods = &buffer_sparse_methods;
+ 		break;
+@@ -202,6 +214,24 @@ R_API RBuffer *r_buf_new_sparse(ut8 Oxff) {
+ 	return b;
+ }
+ 
++#if R2_USE_NEW_ABI
++R_API RBuffer *r_buf_new_with_cache(RBuffer *sb, bool steal) {
++	RBuffer *b = new_buffer (R_BUFFER_CACHE, NULL);
++	if (b) {
++		struct minicachebuf {
++			RBuffer *sb;
++			bool owned;
++			ut64 length;
++		};
++		struct minicachebuf *mcb = b->priv;
++		mcb->sb = sb;
++		mcb->owned = steal;
++		mcb->length = r_buf_size (sb);
++	}
++	return b;
++}
++#endif
++
+ R_API RBuffer *r_buf_new(void) {
+ 	struct buf_bytes_user u = {0};
+ 	u.data = NULL;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,274 @@
++/* radare2 - LGPL - Copyright 2024 - pancake */
++
++#include <r_util.h>
++
++#if R2_USE_NEW_ABI
++
++typedef struct buf_cache_priv {
++	// init
++	RBuffer *sb; // source/parent buffer
++	bool is_bufowner;
++	ut64 length;
++	// internal
++	RIOCacheLayer *cl;
++	ut64 offset;
++	ut8 *buf;
++} RBufCache;
++
++static inline RBufCache *get_priv_cache_bytes(RBuffer *b) {
++	RBufCache *priv = (RBufCache*)b->priv;
++	r_warn_if_fail (priv);
++	return priv;
++}
++
++static void iocache_item_free(void *data) {
++	RIOCacheItem *ci = (RIOCacheItem *)data;
++	if (ci) {
++		free (ci->tree_itv);
++		free (ci->data);
++		free (ci->odata);
++		free (ci);
++	}
++}
++
++static RIOCacheLayer *iocache_layer_new(void) {
++	RIOCacheLayer *cl = R_NEW (RIOCacheLayer);
++	cl->tree = r_crbtree_new (NULL);
++	cl->vec = r_pvector_new ((RPVectorFree)iocache_item_free);
++	return cl;
++}
++
++static void iocache_layer_free(void *arg) {
++	RIOCacheLayer *cl = arg;
++	if (cl) {
++		r_crbtree_free (cl->tree);
++		r_pvector_free (cl->vec);
++		// cl->cache.mode = 0;
++		free (cl);
++	}
++}
++
++static RIOCacheItem *iocache_item_new(RInterval *itv) {
++	RIOCacheItem *ci = R_NEW0 (RIOCacheItem);
++	if (R_LIKELY (ci)) {
++		ci->data = R_NEWS (ut8, itv->size);
++		ci->odata = R_NEWS (ut8, itv->size);
++		ci->tree_itv = R_NEWCOPY (RInterval, itv);
++		if (ci->data && ci->odata && ci->tree_itv) {
++			ci->itv = (*itv);
++			return ci;
++		}
++	}
++	free (ci->odata);
++	free (ci->data);
++	free (ci);
++	return NULL;
++}
++
++static int _find_lowest_intersection_ci_cb(void *incoming, void *in, void *user) {
++	RInterval *itv = (RInterval *)incoming;
++	RIOCacheItem *ci = (RIOCacheItem *)in;
++	if (r_itv_overlap (itv[0], ci->tree_itv[0])) {
++		return 0;
++	}
++	if (itv->addr < ci->tree_itv->addr) {
++		return -1;
++	}
++	return 1;
++}
++
++// returns the node containing the submap with lowest itv.addr, that intersects with sm
++static RRBNode *_find_entry_ci_node(RRBTree *cache_tree, RInterval *itv) {
++	RRBNode *node = r_crbtree_find_node (cache_tree, itv, _find_lowest_intersection_ci_cb, NULL);
++	if (node) {
++		RRBNode *prev = r_rbnode_

@@ -1,0 +1,97 @@
+@@ -322,8 +322,8 @@ void TlsConnectTestBase::SetupEch(std::shared_ptr<TlsAgent>& client,
+       {HpkeKdfHkdfSha256, HpkeAeadChaCha20Poly1305},
+       {HpkeKdfHkdfSha256, HpkeAeadAes128Gcm}};
+ 
+-  GenerateEchConfig(kem_id, kDefaultSuites, "public.name", maxConfigSize, record,
+-                    priv);
++  GenerateEchConfig(kem_id, kDefaultSuites, "public.name", maxConfigSize,
++                    record, priv);
+   ASSERT_NE(0U, record.len());
+   SECStatus rv;
+   if (set_server_config) {
+
+
+
+
+@@ -9809,21 +9809,26 @@ ssl_ConstructServerHello(sslSocket *ss, PRBool helloRetry,
+         return SECFailure;
+     }
+     if (SSL_BUFFER_LEN(extensionBuf)) {
++        /* Directly copy the extensions */
+         rv = sslBuffer_AppendBufferVariable(messageBuf, extensionBuf, 2);
+         if (rv != SECSuccess) {
+             return SECFailure;
+         }
+     }
+ 
+-    if (!helloRetry && ss->xtnData.ech && ss->xtnData.ech->receivedInnerXtn) {
++    if (ss->xtnData.ech && ss->xtnData.ech->receivedInnerXtn) {
+         /* Signal ECH acceptance if we handled handled both CHOuter/CHInner (i.e.
+          * in shared mode), or if we received a CHInner in split/backend mode. */
+         if (ss->ssl3.hs.echAccepted || ss->opt.enableTls13BackendEch) {
+-            return tls13_WriteServerEchSignal(ss, SSL_BUFFER_BASE(messageBuf),
+-                                              SSL_BUFFER_LEN(messageBuf));
++            if (helloRetry) {
++                return tls13_WriteServerEchHrrSignal(ss, SSL_BUFFER_BASE(messageBuf),
++                                                     SSL_BUFFER_LEN(messageBuf));
++            } else {
++                return tls13_WriteServerEchSignal(ss, SSL_BUFFER_BASE(messageBuf),
++                                                  SSL_BUFFER_LEN(messageBuf));
++            }
+         }
+     }
+-
+     return SECSuccess;
+ }
+ 
+@@ -13499,6 +13504,7 @@ ssl3_InitState(sslSocket *ss)
+     ss->ssl3.hs.serverTrafficSecret = NULL;
+     ss->ssl3.hs.echHpkeCtx = NULL;
+     ss->ssl3.hs.echAccepted = PR_FALSE;
++    ss->ssl3.hs.echDecided = PR_FALSE;
+ 
+     PORT_Assert(!ss->ssl3.hs.messages.buf && !ss->ssl3.hs.messages.space);
+     ss->ssl3.hs.messages.buf = NULL;
+
+
+
+
+@@ -82,6 +82,7 @@ static const ssl3ExtensionHandler serverHelloHandlersTLS[] = {
+ static const ssl3ExtensionHandler helloRetryRequestHandlers[] = {
+     { ssl_tls13_key_share_xtn, tls13_ClientHandleKeyShareXtnHrr },
+     { ssl_tls13_cookie_xtn, tls13_ClientHandleHrrCookie },
++    { ssl_tls13_encrypted_client_hello_xtn, tls13_ClientHandleHrrEchXtn },
+     { 0, NULL }
+ };
+ 
+@@ -166,6 +167,7 @@ static const sslExtensionBuilder tls13_hrr_senders[] = {
+     { ssl_tls13_key_share_xtn, &tls13_ServerSendHrrKeyShareXtn },
+     { ssl_tls13_cookie_xtn, &tls13_ServerSendHrrCookieXtn },
+     { ssl_tls13_supported_versions_xtn, &tls13_ServerSendSupportedVersionsXtn },
++    { ssl_tls13_encrypted_client_hello_xtn, &tls13_ServerSendHrrEchXtn },
+     { 0, NULL }
+ };
+ 
+
+
+
+
+@@ -38,6 +38,7 @@ typedef struct sslSocketStr sslSocket;
+ typedef struct sslNamedGroupDefStr sslNamedGroupDef;
+ typedef struct sslEchConfigStr sslEchConfig;
+ typedef struct sslEchConfigContentsStr sslEchConfigContents;
++typedef struct sslEchCookieDataStr sslEchCookieData;
+ typedef struct sslEchXtnStateStr sslEchXtnState;
+ typedef struct sslPskStr sslPsk;
+ typedef struct sslDelegatedCredentialStr sslDelegatedCredential;
+@@ -745,12 +746,13 @@ typedef struct SSL3HandshakeStateStr {
+                                 * used to generate ACKs. */
+ 
+     /* TLS 1.3 ECH state. */
+-    PRBool echAccepted;        /* Client/Server: True if we've commited to using CHInner. */
++    PRBool echAccepted; /* Client/Server: True if we've commited to using CHInner. */
++    PRBool echDecided;
+     HpkeContext *echHpkeCtx;   /* Client/Server: HPKE context for ECH. */
+     const char *echPublicName; /* Client: If rejected, the ECHConfig.publicName to
+                                 * use for certificate verification. */
+-    sslBuffer greaseEchBuf;    /* C

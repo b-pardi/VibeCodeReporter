@@ -1,0 +1,151 @@
+@@ -735,10 +735,12 @@ static int cmd_mount(void *data, const char *_input) {
+ 				r_cons_write (core->cons, (const char *)file->data, file->size);
+ 				r_fs_close (core->fs, file);
+ 				r_cons_write (core->cons, "\n", 1);
++#if 0
+ 			} else {
+ 				if (!r_fs_dir_dump (core->fs, input, "")) {
+ 					R_LOG_ERROR ("Cannot open file");
+ 				}
++#endif
+ 			}
+ 		}
+ 		break;
+
+
+
+
+@@ -31,6 +31,7 @@ static const RFSType fstypes[] = {
+ 	{ "ext2", 0x438, "\x53\xef", 2, 0, 0, 0 },
+ 	{ "btrfs", 0x10040, "_BHRfS_M", 8, 0, 0, 0x0 },
+ 	{ "iso9660", 0x8000, "\x01" "CD0", 4, 0, 0, 0x8000 },
++	{ "apfs", 0x5020, "\x4e\x58\x53\x42", 4, 0, 0, 0 },
+ 	{ "ntfs", 0x3, "NTFS    ", 8, 0, 0, 0 },
+ 	{ "minix", 0x410, "\x7f\x13", 2, 0, 0, 0 },
+ 	{ "jfs", 0x8000, "JFS1", 4, 0, 0, 0 },
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1199 @@
++/* radare2: APFS (Apple File System) - MIT - Copyright 2025 - pancake */
++
++// R2R db/cmd/cmd_fs_apfs
++
++#include <r_fs.h>
++#include <r_lib.h>
++#include <r_util.h>
++#include "fs_apfs.h"
++
++
++static void apfs_free_inode(ApfsInodeCache *inode) {
++	if (!inode) {
++		return;
++	}
++	free (inode->name);
++	free (inode->inode);
++	free (inode);
++}
++
++static bool apfs_free_inode_cb(void *user, const ut64 key, const void *value) {
++	apfs_free_inode ((ApfsInodeCache *)value);
++	return true;
++}
++
++static ApfsInodeCache *apfs_get_inode(ApfsFS *ctx, ut64 inode_num) {
++	return ht_up_find (ctx->inodes, inode_num, NULL);
++}
++
++static bool apfs_walk_catalog_btree(ApfsFS *ctx, ut64 root_oid, ut64 parent_inode_num);
++static bool apfs_resolve_omap(ApfsFS *ctx, ut64 oid, ut64 *paddr);
++static bool apfs_parse_omap_btree(ApfsFS *ctx, ut64 omap_root_oid);
++static bool apfs_parse_simple_image(ApfsFS *ctx);
++static bool apfs_scan_for_btree_nodes(ApfsFS *ctx);
++static bool apfs_dir_iter_cb(void *user, const ut64 key, const void *value);
++static ut64 apfs_resolve_path(ApfsFS *ctx, const char *path);
++
++static void apfs_cleanup_ctx(ApfsFS *ctx) {
++	if (!ctx) {
++		return;
++	}
++	if (ctx->inodes) {
++		ht_up_free (ctx->inodes);
++	}
++	free (ctx->nx_sb);
++	free (ctx->vol_sb);
++	free (ctx);
++}
++
++static bool fs_apfs_mount(RFSRoot *root) {
++	R_RETURN_VAL_IF_FAIL (root, false);
++
++	ApfsFS *ctx = R_NEW0 (ApfsFS);
++	ctx->iob = &root->iob;
++	ctx->delta = root->delta;
++	ctx->inodes = ht_up_new0 ();
++	if (!ctx->inodes) {
++		free (ctx);
++		return false;
++	}
++	// Scan for container superblock
++	ut64 nx_off = 0;
++	ut64 off;
++	for (off = 0; off < APFS_NX_SEARCH_RANGE; off += 0x20) {
++		ut8 buf[4];
++		if (apfs_read_at (ctx, off, buf, 4)) {
++			ut32 magic = r_read_be32 (buf);
++			if (magic == APFS_NX_MAGIC) {
++				nx_off = off;
++				break;
++			}
++		}
++	}
++	if (!nx_off) {
++		R_LOG_ERROR ("APFS container superblock not found");
++		apfs_cleanup_ctx (ctx);
++		return false;
++	}
++
++	ctx->delta += nx_off;
++
++	// Read container superblock
++	ApfsNxSuperblock *nx_sb = malloc (sizeof (ApfsNxSuperblock));
++	if (!nx_sb) {
++		apfs_cleanup_ctx (ctx);
++		return false;
++	}
++
++	if (!apfs_read_at (ctx, 0, (ut8 *)nx_sb, sizeof (ApfsNxSuperblock))) {
++		R_LOG_ERROR ("Failed to read APFS container superblock");
++		free (nx_sb);
++		apfs_cleanup_ctx (ctx);
++		return false;
++	}
++
++	// Check magic
++	ut32 magic = r_read_be32 ((ut8 *)&nx_sb->nx_magic);
++	if (magic != APFS_NX_MAGIC) {
++		R_LOG_ERROR ("Invalid APFS container magic: 0x%x", magic);
++		free (nx_sb);
++		apfs_cleanup_ctx (ctx);
++		return false;
++	}
++
++	ctx->nx_sb = nx_sb;
++	ctx->is_le = true; // APFS uses little-endian
++	ctx->block_size = apfs_read32 (ctx, (ut8 *)&nx_sb->nx_block_size);
++	if (ctx->block_size == 0 || (ctx->block_size &(ctx->block_size - 1)) != 0 || ctx->block_size < 512 || ctx->block_size > 1024 * 1024) {
++		// Invalid block size, use default
++		ctx->block_size = APFS_NX_DEFAULT_BLOCK_SIZE;
++	}
++	ctx->block_shift = 0;
++	ut32 i;
++	for (i = ctx->block_size; i > 1; i >>= 1) {
++		ctx->block_shift++;
++	}
++
++	// Get the first volume superblock
++	ut64 first_vol_oid;
++	if (!apfs_read_at (ctx, 0x50, (ut8 *)&first_vol_oid, sizeof (ut64))) {
++		R_LOG_ER

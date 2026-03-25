@@ -1,0 +1,99 @@
+@@ -288,7 +288,8 @@ class Flow : public GenericHashEntry {
+   bool setStatus(FlowStatus status, u_int16_t flow_inc, u_int16_t cli_inc, u_int16_t srv_inc, const char*script_key, ScriptCategory script_category);
+   bool triggerAlert(FlowStatus status, AlertType atype, AlertLevel severity, u_int16_t alerted_status_score, const char* alert_json);
+   FlowStatus getAlertedStatus() const;
+-  inline const char* getStatusInfo() const      { return(alert_status_info);    }
++  inline AlertLevel getAlertedSeverity() const { return alert_level;        };
++  inline const char* getStatusInfo()     const { return(alert_status_info); };
+ 
+   bool isBlacklistedFlow()   const;
+   bool isBlacklistedClient() const;
+
+
+
+
+@@ -30,12 +30,13 @@ class FlowStats {
+  private:
+   u_int32_t counters[BITMAP_NUM_BITS];
+   u_int32_t protocols[0x100];
++  u_int32_t alert_levels[ALERT_LEVEL_MAX_LEVEL];
+ 
+  public:
+   FlowStats();
+   ~FlowStats();
+ 
+-  void incStats(Bitmap status_bitmap, u_int8_t l4_protocol);
++  void incStats(Bitmap status_bitmap, u_int8_t l4_protocol, AlertLevel alert_level);
+ 
+   void lua(lua_State* vm);
+ 
+
+
+
+
+@@ -67,7 +67,10 @@ class NetworkInterface : public AlertableEntity {
+   u_int8_t purgeRuns;  
+   u_int32_t bridge_lan_interface_id, bridge_wan_interface_id;
+   std::atomic<u_int32_t> num_alerts_engaged; /* Possibly touched by multiple concurrent threads */
+-  std::atomic<u_int64_t> num_active_alerted_flows; /* Changed by multiple concurrent threads */
++  /* Counters for active alerts. Changed by multiple concurrent threads */
++  std::atomic<u_int64_t> num_active_alerted_flows_notice;  /* Counts all flow alerts with severity <= notice  */
++  std::atomic<u_int64_t> num_active_alerted_flows_warning; /* Counts all flow alerts with severity == warning */
++  std::atomic<u_int64_t> num_active_alerted_flows_error;   /* Counts all flow alerts with severity >= error   */
+   u_int32_t num_dropped_alerts, prev_dropped_alerts, checked_dropped_alerts, num_dropped_flow_scripts_calls;
+   u_int64_t num_written_alerts, num_alerts_queries;
+   u_int64_t num_new_flows;
+@@ -545,6 +548,7 @@ class NetworkInterface : public AlertableEntity {
+   virtual u_int32_t getFlowMaxIdle();
+ 
+   virtual void lua(lua_State* vm);
++  void luaAlertedFlows(lua_State* vm);
+   void luaPeriodicityStats(lua_State* vm, IpAddress *ip_address);
+   void luaServiceMap(lua_State* vm, IpAddress *ip_address, u_int16_t vlan_id);
+ #if defined(NTOPNG_PRO) && !defined(HAVE_NEDGE)
+@@ -876,8 +880,8 @@ class NetworkInterface : public AlertableEntity {
+   inline void profiling_section_exit(int id) { PROFILING_SECTION_EXIT(id); };
+ #endif
+ 
+-  void incNumAlertedFlows(Flow *f);
+-  void decNumAlertedFlows(Flow *f);
++  void incNumAlertedFlows(Flow *f, AlertLevel severity);
++  void decNumAlertedFlows(Flow *f, AlertLevel severity);
+   virtual u_int64_t getNumActiveAlertedFlows()      const;
+   inline void setHasAlerts(bool has_stored_alerts)        { this->has_stored_alerts = has_stored_alerts; }
+   inline void incNumAlertsEngaged()                       { num_alerts_engaged++; }
+
+
+
+
+@@ -44,6 +44,7 @@ class Paginator {
+   u_int32_t deviceIP;
+   u_int16_t inIndex, outIndex;
+   u_int16_t pool_filter, flow_status_filter;
++  AlertLevel flow_status_severity_filter;
+   u_int8_t *mac_filter, icmp_type, icmp_code;
+   DetailsLevel details_level;
+   bool details_level_set;
+@@ -142,6 +143,10 @@ class Paginator {
+     if(flow_status_filter != ((u_int16_t)-1)) { (*f) = flow_status_filter; return true; } return false;
+   }
+ 
++  inline bool flowStatusFilter(AlertLevel *f) const {
++    if(flow_status_severity_filter != alert_level_none) { (*f) = flow_status_severity_filter; return true; } return false;
++  }
++
+   inline bool macFilter(u_int8_t **f) const {
+     if(mac_filter) { (*f) = mac_filter; return true; } return false;
+   }
+
+
+
+
+@@ -157,15 +157,16 @@ typedef u_int32_t AlertType;
+ #define alert_none ((u_int8_t)-1)
+ 
+ typedef enum {
+-  alert_level_none = -1,
+-  alert_level_debug = 0,
+-  alert_level_info = 1,
+-  alert_l

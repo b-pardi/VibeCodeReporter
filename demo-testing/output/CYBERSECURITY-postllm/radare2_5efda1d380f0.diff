@@ -1,0 +1,135 @@
+@@ -160,14 +160,14 @@ static int string_scan_range(RBinFile *bf, RList *list, int min, const ut64 from
+ 	}
+ 	r_buf_read_at (bf->buf, from, buf, len);
+ 	const char *charset = getenv ("RABIN2_CHARSET");
+-	if (R_STR_ISNOTEMPTY (charset)) {
++	if (R_STR_ISNOTEMPTY (charset) && bin->mb.muta) {
+ 		// Decode the buffer using the specified charset
+-		RMutaSession *ms = r_muta_use (bin->muta, charset);
++		RMutaSession *ms = bin->mb.muta_use (bin->mb.muta, charset);
+ 		if (ms) {
+ 			ms->dir = R_CRYPTO_DIR_DECRYPT;
+ 			r_muta_session_update (ms, buf, len);
+ 			int outlen = 0;
+-			ut8 *obuf = r_muta_session_get_output (ms, &outlen);
++			ut8 *obuf = bin->mb.muta_session_get_output (ms, &outlen);
+ 			if (outlen > 0 && obuf) {
+ 				ut8 *out = calloc (len, 1);
+ 				if (out) {
+@@ -185,7 +185,7 @@ static int string_scan_range(RBinFile *bf, RList *list, int min, const ut64 from
+ 				}
+ 			}
+ 			free (obuf);
+-			r_muta_session_free (ms);
++			bin->mb.muta_session_free (ms);
+ 		} else {
+ 			R_LOG_ERROR ("Invalid value for RABIN2_CHARSET");
+ 		}
+
+
+
+
+@@ -519,8 +519,6 @@ R_API void r_bin_free(RBin *bin) {
+ 		sdb_free (bin->sdb);
+ 		r_id_storage_free (bin->ids);
+ 		r_str_constpool_fini (&bin->constpool);
+-		/* Free per-RBin RMuta instance */
+-		r_muta_free (bin->muta);
+ 		free (bin);
+ 	}
+ }
+@@ -858,7 +856,6 @@ R_API RBin *r_bin_new(void) {
+ 	if (!r_str_constpool_init (&bin->constpool)) {
+ 		goto trashbin;
+ 	}
+-	bin->muta = r_muta_new ();
+ 	bin->force = NULL;
+ 	bin->filter_rules = UT64_MAX;
+ 	bin->sdb = sdb_new0 ();
+
+
+
+
+@@ -2,7 +2,6 @@
+ 
+ #define R_LOG_ORIGIN "bin.macho"
+ 
+-#include <r_hash.h>
+ #include "mach0.h"
+ 
+ // R2R db/formats/mach0/strip
+@@ -743,7 +742,7 @@ static char *readString(ut8 *p, int off, int len) {
+ 	return r_str_ndup ((const char *)p + off, len - off);
+ }
+ 
+-static void parseCodeDirectory(RBuffer *b, int offset, int datasize) {
++static void parseCodeDirectory(RMutaBind *mb, RBuffer *b, int offset, int datasize) {
+ 	typedef struct __CodeDirectory {
+ 		uint32_t magic;		/* magic number (CSMAGIC_CODEDIRECTORY) */
+ 		uint32_t length;	/* total length of CodeDirectory blob */
+@@ -808,81 +807,72 @@ static void parseCodeDirectory(RBuffer *b, int offset, int datasize) {
+ 	free (teamId);
+ 
+ 	int hashSize = 20; // SHA1 is default
+-	int algoType = R_HASH_SHA1;
+ 	const char *hashName = "sha1";
+ 	switch (cscd.hashType) {
+ 	case 0: // SHA1 == 20 bytes
+ 	case 1: // SHA1 == 20 bytes
+ 		hashSize = 20;
+ 		hashName = "sha1";
+-		algoType = R_HASH_SHA1;
+ 		break;
+ 	case 2: // SHA256 == 32 bytes
+ 		hashSize = 32;
+-		algoType = R_HASH_SHA256;
+ 		hashName = "sha256";
+ 		break;
+ 	}
+ 	// computed cdhash
+-	RHash *ctx = r_hash_new (true, algoType);
+ 	int fofsz = cscd.length;
+ 	if (fofsz > 0 && fofsz < (r_buf_size (b) - off)) {
+ 		ut8 *fofbuf = calloc (fofsz, 1);
+ 		if (fofbuf) {
+-			int i;
+ 			if (r_buf_read_at (b, off, fofbuf, fofsz) != fofsz) {
+ 				R_LOG_WARN ("Invalid cdhash offset/length values");
+ 			}
+-			r_hash_do_begin (ctx, algoType);
+-			if (algoType == R_HASH_SHA1) {
+-				r_hash_do_sha1 (ctx, fofbuf, fofsz);
+-			} else {
+-				r_hash_do_sha256 (ctx, fofbuf, fofsz);
+-			}
+-			r_hash_do_end (ctx, algoType);
+-			eprintf ("ph %s @ 0x%"PFMT64x"!%d\n", hashName, off, fofsz);
+-			eprintf ("ComputedCDHash: ");
+-			for (i = 0; i < hashSize;i++) {
+-				eprintf ("%02x", ctx->digest[i]);
++			int outlen = 0;
++			ut8 *digest = mb->hash (mb, hashName, fofbuf, fofsz, &outlen);
++			if (digest) {
++				eprintf ("ph %s @ 0x%"PFMT64x"!%d\n", hashName, off, fofsz);
++				eprintf ("ComputedCDHash: ");
++				int i;
++				for (i = 0; i < hashSize; i++) {
++					eprintf ("%02x", digest[i]);
++				}
++				eprintf ("\n");
++				free (digest);
+ 			}
+-			eprintf ("\n");
+ 			free (fofbuf);
+ 		}
+ 	}
+ 	// show and check the rest of hashes
+ 	ut8 *hash = p + cscd.hashOffset;
+-	int j = 0;
+-	int k = 0;
++	int j;
+ 	eprintf ("Hashed region: 0x%08"PFMT64x" - 0x%08"PFMT64x"\n", (ut64)0, (ut64)cscd.codeLimit);
+ 	for (j = 0; j < cscd.nCodeSlots; j++) {
+ 		int fof = 4096 * j;
+ 		int idx = j * hashSize;
+ 	

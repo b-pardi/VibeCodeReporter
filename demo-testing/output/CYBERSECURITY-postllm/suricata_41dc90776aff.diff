@@ -1,0 +1,104 @@
+@@ -56,7 +56,7 @@
+ #include "app-layer-imap.h"
+ 
+ struct AppLayerParserThreadCtx_ {
+-    void *alproto_local_storage[FLOW_PROTO_MAX][ALPROTO_MAX];
++    void *(*alproto_local_storage)[FLOW_PROTO_MAX];
+ };
+ 
+ 
+@@ -123,7 +123,7 @@ typedef struct AppLayerParserProtoCtx_
+ } AppLayerParserProtoCtx;
+ 
+ typedef struct AppLayerParserCtx_ {
+-    AppLayerParserProtoCtx ctxs[FLOW_PROTO_MAX][ALPROTO_MAX];
++    AppLayerParserProtoCtx (*ctxs)[FLOW_PROTO_MAX];
+ } AppLayerParserCtx;
+ 
+ struct AppLayerParserState_ {
+@@ -218,7 +218,7 @@ int AppLayerParserProtoIsRegistered(uint8_t ipproto, AppProto alproto)
+ {
+     uint8_t ipproto_map = FlowGetProtoMapping(ipproto);
+ 
+-    return (alp_ctx.ctxs[ipproto_map][alproto].StateAlloc != NULL) ? 1 : 0;
++    return (alp_ctx.ctxs[alproto][ipproto_map].StateAlloc != NULL) ? 1 : 0;
+ }
+ 
+ AppLayerParserState *AppLayerParserStateAlloc(void)
+@@ -248,7 +248,12 @@ void AppLayerParserStateFree(AppLayerParserState *pstate)
+ int AppLayerParserSetup(void)
+ {
+     SCEnter();
+-    memset(&alp_ctx, 0, sizeof(alp_ctx));
++    // initial allocation that will later be grown using realloc,
++    // when new protocols register themselves and make ALPROTO_MAX grow
++    alp_ctx.ctxs = SCCalloc(ALPROTO_MAX, sizeof(AppLayerParserProtoCtx[FLOW_PROTO_MAX]));
++    if (unlikely(alp_ctx.ctxs == NULL)) {
++        FatalError("Unable to alloc alp_ctx.ctxs.");
++    }
+     SCReturnInt(0);
+ }
+ 
+@@ -257,10 +262,9 @@ void AppLayerParserPostStreamSetup(void)
+     /* lets set a default value for stream_depth */
+     for (int flow_proto = 0; flow_proto < FLOW_PROTO_DEFAULT; flow_proto++) {
+         for (AppProto alproto = 0; alproto < ALPROTO_MAX; alproto++) {
+-            if (!(alp_ctx.ctxs[flow_proto][alproto].internal_flags &
++            if (!(alp_ctx.ctxs[alproto][flow_proto].internal_flags &
+                         APP_LAYER_PARSER_INT_STREAM_DEPTH_SET)) {
+-                alp_ctx.ctxs[flow_proto][alproto].stream_depth =
+-                    stream_config.reassembly_depth;
++                alp_ctx.ctxs[alproto][flow_proto].stream_depth = stream_config.reassembly_depth;
+             }
+         }
+     }
+@@ -270,6 +274,8 @@ int AppLayerParserDeSetup(void)
+ {
+     SCEnter();
+ 
++    SCFree(alp_ctx.ctxs);
++
+     FTPParserCleanup();
+     SMTPParserCleanup();
+ 
+@@ -284,12 +290,18 @@ AppLayerParserThreadCtx *AppLayerParserThreadCtxAlloc(void)
+     if (tctx == NULL)
+         goto end;
+ 
++    tctx->alproto_local_storage = SCCalloc(ALPROTO_MAX, sizeof(void *[FLOW_PROTO_MAX]));
++    if (unlikely(tctx->alproto_local_storage == NULL)) {
++        SCFree(tctx);
++        tctx = NULL;
++        goto end;
++    }
+     for (uint8_t flow_proto = 0; flow_proto < FLOW_PROTO_DEFAULT; flow_proto++) {
+         for (AppProto alproto = 0; alproto < ALPROTO_MAX; alproto++) {
+             uint8_t ipproto = FlowGetReverseProtoMapping(flow_proto);
+ 
+-            tctx->alproto_local_storage[flow_proto][alproto] =
+-                AppLayerParserGetProtocolParserLocalStorage(ipproto, alproto);
++            tctx->alproto_local_storage[alproto][flow_proto] =
++                    AppLayerParserGetProtocolParserLocalStorage(ipproto, alproto);
+         }
+     }
+ 
+@@ -305,11 +317,12 @@ void AppLayerParserThreadCtxFree(AppLayerParserThreadCtx *tctx)
+         for (AppProto alproto = 0; alproto < ALPROTO_MAX; alproto++) {
+             uint8_t ipproto = FlowGetReverseProtoMapping(flow_proto);
+ 
+-            AppLayerParserDestroyProtocolParserLocalStorage(ipproto, alproto,
+-                                                            tctx->alproto_local_storage[flow_proto][alproto]);
++            AppLayerParserDestroyProtocolParserLocalStorage(
++                    ipproto, alproto, tctx->alproto_local_storage[alproto][flow_proto]);
+         }
+     }
+ 
++    SCFree(tctx->alproto_local_storage);
+     SCFree(tctx);
+     SCReturn;
+ }
+@@ -381,8 +394,8 @@ int AppLayerParserRegisterParser(uint8_t ipproto, AppProto alproto,
+ {
+     SCEnter();
+ 
+-    alp_ctx.ctxs[FlowGetProtoMapping(ipproto)][alpro

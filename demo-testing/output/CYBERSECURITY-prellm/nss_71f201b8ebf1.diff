@@ -1,0 +1,132 @@
+@@ -54,10 +54,8 @@ extern void SECU_PrintAsHex(FILE *out, const SECItem *i, const char *m,
+ /* dump a buffer in hex and ASCII */
+ extern void SECU_PrintBuf(FILE *out, const char *msg, const void *vp, int len);
+ 
+-#ifdef HAVE_EPV_TEMPLATE
+ /* Dump contents of private key */
+ extern int SECU_PrintPrivateKey(FILE *out, SECItem *der, char *m, int level);
+-#endif
+ 
+ /* Init PKCS11 stuff */
+ extern SECStatus SECU_PKCS11Init(PRBool readOnly);
+
+
+
+
+@@ -562,20 +562,110 @@ SECU_ReadDERFromFile(SECItem *der, PRFileDesc *inFile, PRBool ascii,
+ 
+ #define INDENT_MULT 4
+ 
++/*
++ * remove the tag and length and just leave the bare BER data
++ */
+ SECStatus
+ SECU_StripTagAndLength(SECItem *i)
+ {
+     unsigned int start;
++    PRBool isIndefinite;
+ 
+     if (!i || !i->data || i->len < 2) { /* must be at least tag and length */
++        PORT_SetError(SEC_ERROR_BAD_DER);
+         return SECFailure;
+     }
++    isIndefinite = (i->data[1] == 0x80);
+     start = ((i->data[1] & 0x80) ? (i->data[1] & 0x7f) + 2 : 2);
+     if (i->len < start) {
++        PORT_SetError(SEC_ERROR_BAD_DER);
+         return SECFailure;
+     }
+     i->data += start;
+     i->len -= start;
++    /* we are using indefinite encoding, drop the trailing zero */
++    if (isIndefinite) {
++        if (i->len <= 1) {
++            PORT_SetError(SEC_ERROR_BAD_DER);
++            return SECFailure;
++        }
++        /* verify tags are zero */
++        if ((i->data[i->len - 1] != 0) || (i->data[i->len - 2] != 0)) {
++            PORT_SetError(SEC_ERROR_BAD_DER);
++            return SECFailure;
++        }
++        i->len -= 2;
++    }
++
++    return SECSuccess;
++}
++
++/*
++ * Create a new SECItem which points to the current BER tag and length with
++ * all it's data. For indefinite encoding, this will also include the trailing
++ * indefinite markers
++ * The 'in' item is advanced to point to the next BER tag.
++ * You don't want to use this in an actual BER/DER parser as NSS already
++ * has 3 to choose from)
++ */
++SECStatus
++SECU_ExtractBERAndStep(SECItem *in, SECItem *out)
++{
++    if (!in || !in->data || in->len < 2) { /* must be at least tag and length */
++        PORT_SetError(SEC_ERROR_BAD_DER);
++        return SECFailure;
++    }
++
++    *out = *in;
++
++    /* first handle indefinite encoding */
++    if (out->data[1] == 0x80) {
++        SECItem this = *out;
++        SECItem next;
++        this.data += 2;
++        this.len -= 2;
++        out->len = 2;
++        /* walk through all the entries until we find the '0' */
++        while ((this.len >= 2) && (this.data[0] != 0)) {
++            SECStatus rv = SECU_ExtractBERAndStep(&this, &next);
++            if (rv != SECSuccess) {
++                return rv;
++            }
++            out->len += next.len;
++        }
++        if ((this.len < 2) || ((this.data[0] != 0) && (this.data[1] != 0))) {
++            PORT_SetError(SEC_ERROR_BAD_DER);
++            return SECFailure;
++        }
++        out->len += 2; /* include the trailing zeros */
++        in->data += out->len;
++        in->len -= out->len;
++        return SECSuccess;
++    }
++
++    /* now handle normal DER encoding */
++    if (out->data[1] & 0x80) {
++        unsigned int i;
++        unsigned int lenlen = out->data[1] & 0x7f;
++        unsigned int len = 0;
++        if (lenlen > sizeof out->len) {
++            PORT_SetError(SEC_ERROR_BAD_DER);
++            return SECFailure;
++        }
++        for (i = 0; i < lenlen; i++) {
++            len = (len << 8) | out->data[2 + i];
++        }
++        out->len = len + lenlen + 2;
++    } else {
++        out->len = out->data[1] + 2;
++    }
++    if (out->len > in->len) {
++        /* we've ran into a truncated file */
++        PORT_SetError(SEC_ERROR_BAD_DER);
++        return SECFailure;
++    }
++    in->data += out->len;
++    in->len -= out->len;
+     return SECSuccess;
+ }
+ 
+@@ -786,26 +876,10 @@ SECU_PrintSet(FILE *out, const SECItem *t, const char *m, int level)
+     fprintf(out, "%s{\n", label); /* } */
+ 
+     while (my.len >= 2) {
+-        SECItem tmp = my;
+-

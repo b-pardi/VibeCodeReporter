@@ -1,0 +1,159 @@
+@@ -8,12 +8,93 @@
+ 
+ #include <8051_ops.h>
+ 
+-#define IRAM_BASE 0x10000
+-#define XRAM_BASE 0x10100
++typedef struct {
++	const char *name;
++	ut32 map_code;
++	ut32 map_idata;
++	ut32 map_sfr;
++	ut32 map_xdata;
++	ut32 map_pdata;
++} i8051_cpu_model;
++
++static i8051_cpu_model cpu_models[] = {
++	{
++		.name = "8051-generic",
++		.map_code	= 0,
++		.map_idata	= 0x00010000,
++		.map_sfr	= 0x00010000,
++		.map_xdata	= 0x00010100,
++		.map_pdata	= 0x00000000
++	},
++	{
++		.name = "8051-shared-code-xdata",
++		.map_code	= 0,
++		.map_idata	= 0x00010000,
++		.map_sfr	= 0x00010000,
++		.map_xdata	= 0x00000000,
++		.map_pdata	= 0x00000000
++	},
++	{
++		.name = NULL	// last entry
++	}
++};
+ 
+ static bool i8051_is_init = false;
+-// doesnt needs to be global, but anyway :D
+-static RAnalEsilCallbacks ocbs = {0};
++static const i8051_cpu_model *cpu_curr_model = NULL;
++
++static bool i8051_reg_write (RReg *reg, const char *regname, ut32 num) {
++	if (reg) {
++		RRegItem *item = r_reg_get (reg, regname, R_REG_TYPE_GPR);
++		if (item) {
++			r_reg_set_value (reg, item, num);
++			return true;
++		}
++	}
++	return false;
++}
++
++static ut32 i8051_reg_read (RReg *reg, const char *regname) {
++	if (reg) {
++		RRegItem *item = r_reg_get (reg, regname, R_REG_TYPE_GPR);
++		if (item) {
++			return r_reg_get_value (reg, item);
++		}
++	}
++	return 0;
++}
++
++static void set_cpu_model(RAnal *anal, bool force) {
++	if (!anal->reg) {
++		return;
++	}
++
++	const char *cpu = anal->cpu;
++	if (!cpu || !cpu[0]) {
++		cpu = cpu_models[0].name;
++	}
++
++	// if cpu model changed, reinitalize emulation
++	if (force || !cpu_curr_model || strcasecmp (cpu, cpu_curr_model->name) != 0) {
++		// find model by name
++		int i = 0;
++		while (cpu_models[i].name && strcasecmp (cpu, cpu_models[i].name) != 0) i++;
++		if (!cpu_models[i].name) {
++			i = 0;	// if not found, default to generic 8051
++		}
++		cpu_curr_model = &cpu_models[i];
++
++		// TODO: Allocate new memory (r_io sections?) as needed
++		// TODO: Add flags as needed
++		// TODO: Rearrange above gracefully when switching cpu
++
++		// set memory map registers
++		i8051_reg_write (anal->reg, "_code", cpu_models[i].map_code);
++		i8051_reg_write (anal->reg, "_idata", cpu_models[i].map_idata);
++		i8051_reg_write (anal->reg, "_sfr", cpu_models[i].map_sfr);
++		i8051_reg_write (anal->reg, "_xdata", cpu_models[i].map_xdata);
++		i8051_reg_write (anal->reg, "_pdata", cpu_models[i].map_pdata);
++	}
++}
+ 
+ static ut8 bitindex[] = {
+ 	// bit 'i' can be found in (ram[bitindex[i>>3]] >> (i&7)) & 1
+@@ -23,6 +104,7 @@ static ut8 bitindex[] = {
+ 	0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8  // 0xC0
+ };
+ 
++#if 0
+ typedef struct {
+ 	const char *name;
+ 	ut8 offset; // offset into memory, where the value is held
+@@ -32,7 +114,6 @@ typedef struct {
+ 	ut8 isdptr : 1;
+ } RI8051Reg;
+ 
+-#if 0
+ // custom reg read/write temporarily disabled - see r2 issue #9242
+ static RI8051Reg registers[] = {
+ 	// keep these sorted
+@@ -101,15 +182,23 @@ static void exr_a(RAnalOp *op, ut8 dummy) {
+ }
+ 
+ static void exr_bit(RAnalOp *op, ut8 addr) {
+-	ef ("%d,%d,+,[1],", IRAM_BASE, addr);
++	if (addr < 0x80) {
++		ef ("_idata,%d,+,[1],", addr);
++	} else {
++		ef ("_sfr,%d,+,[1],", addr);
++	}
+ }
+ 
+ static void exr_dir1(RAnalOp *op, ut8 addr) {
+-	ef ("%d,%d,+,[1],", IRAM_BASE, addr);
++	if (addr < 0x80) {
++		ef ("_idata,%d,+,[1],", addr);
++	} else {
++		ef ("_sfr,%d,+,[1],", addr);
++	}
+ }
+ 
+ static void exr_dpx (RAnalOp *op, ut8 dummy) {
+-	ef ("%d,dptr,+,[1],", XRAM_BASE);
++	e ("_xdata,dptr,+,[1],");
+ }
+ 
+ static void exr_imm1(RAnalOp *op, ut8 val) {
+@@ -125,11 +214,11 @@ static void exr_imm16(RAnalOp *op, ut16 val) {
+ }
+ 
+ static void exr_ri(RAnalOp *op, ut8 reg) {
+-	ef ("%d,r%d,+,[1],", IRAM_BASE, reg);
++	ef ("_idata,r%d,+,[1],", reg);
+ }
+ 
+ static void exr_rix(RAnalOp *op, ut8 reg) {
+-	ef ("%d,r%d,+,[1],", XRAM_BASE, reg);
++	ef ("8,0xff,_pdata,&,<<,_xdata,+,r%d,+,[1],", reg);
+ }
+ 
+ static void exr_rn(RAnalOp *op, ut8 reg) {
+@@ -137,13 +226,13 @@ static void exr_rn(RAnalOp *op, ut8 reg) {
+ }
+ 
+ static void exr_sp1(RAnalOp *

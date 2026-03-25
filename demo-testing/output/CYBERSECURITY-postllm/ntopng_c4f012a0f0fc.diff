@@ -1,0 +1,122 @@
+@@ -103,6 +103,7 @@ class Flow : public GenericHashEntry {
+   std::map<FlowAlertTypeEnum, FlowAlert *> triggered_alerts;
+   FlowAlertType predominant_alert;   /* This is the predominant alert */
+   u_int16_t predominant_alert_score; /* The score associated to the predominant alert */
++  bool pending_alerts; /* alerts triggered with triggerAlert but waiting to be enqueued */
+   FlowSource flow_source;
+ 
+   struct {
+@@ -395,11 +396,16 @@ class Flow : public GenericHashEntry {
+   bool enqueueAlertToRecipients(FlowAlert *alert);
+ 
+   /*
+-     Called by FlowCheck subclasses to trigger a flow alert. This is a
+-     syncrhonous call that causes the alert (FlowAlert) to be
+-     enqueued to all recipients.
++     Called by FlowCheck subclasses to trigger a flow alert. Setting sync
++     will causes the alert (FlowAlert) to be immediatly enqueued to recipients.
+    */
+-  bool triggerAlert(FlowAlert *alert);
++  bool triggerAlert(FlowAlert *alert, bool sync = false);
++  /*
++     Alerts are not flushed immediatly as optimization (unless sync is set in
++     triggerAlert). If pending_alerts, they are enqueued to recipients, in a single
++     notification for the predominant one.
++   */
++  void flushAlerts();
+ 
+   /*
+     Enqueues the predominant alert of the flow to all available flow recipients.
+@@ -445,6 +451,7 @@ class Flow : public GenericHashEntry {
+     return alert_info.is_srv_victim;
+   };
+   inline char *getProtocolInfo() { return json_protocol_info; };
++  void updateJSONAlert();
+   inline char *getAlertJSON() { return json_alert; };
+   const char* getDomainName();
+ 
+
+
+
+
+@@ -68,6 +68,7 @@ Flow::Flow(NetworkInterface *_iface,
+     alert_info.is_srv_attacker =
+     alert_info.is_srv_victim = 0;
+   alert_info.auto_acknowledge = 1;
++  pending_alerts = false;
+   category_list_name_shared_pointer = NULL;
+   ndpiAddressFamilyProtocol = NULL;
+   ndpi_confidence = NDPI_CONFIDENCE_UNKNOWN;
+@@ -8133,10 +8134,6 @@ void Flow::getProtocolJSONInfo(ndpi_serializer *serializer) {
+ /* ***************************************************** */
+ 
+ void Flow::setAlertInfo(FlowAlert *alert) {
+-  ndpi_serializer serializer;
+-  char *json = NULL;
+-  u_int32_t json_len = 0;
+-
+   if(!alert) return;
+ 
+   alert_info.is_cli_attacker |= alert->isCliAttacker();
+@@ -8146,6 +8143,14 @@ void Flow::setAlertInfo(FlowAlert *alert) {
+ 
+   if (!alert->autoAck())
+     alert_info.auto_acknowledge = 0;
++}
++
++/* ***************************************************** */
++
++void Flow::updateJSONAlert() {
++  ndpi_serializer serializer;
++  char *json = NULL;
++  u_int32_t json_len = 0;
+ 
+   if (ndpi_init_serializer(&serializer, ndpi_serialization_format_json) == -1)
+     return;
+@@ -8316,15 +8321,11 @@ bool Flow::setAlertsMap(FlowAlert *alert) {
+ 
+ /* *************************************** */
+ 
+-bool Flow::triggerAlert(FlowAlert *alert) {
++bool Flow::triggerAlert(FlowAlert *alert, bool sync) {
+   bool res;
+ 
+   if (alert == NULL) return false;
+ 
+-  /* TODO Optimization: defer enqueueFlowAlert in case of multiple alerts created in the same
+-   * FlowChecksExecutor iteration. Also add a flag as some alerts should be emitted directly
+-   * (even if they have been already triggered) */
+-
+   res = setAlertsMap(alert);
+ 
+   if(ntop->getPrefs()->dontEmitFlowAlerts()) {
+@@ -8334,13 +8335,13 @@ bool Flow::triggerAlert(FlowAlert *alert) {
+   }
+ 
+   if (res) {
+-    /* enqueue the alert (memory is disposed automatically upon failing
+-     * enqueues) */
+-    iface->enqueueFlowAlert(alert);
+ 
+-    /* Update JSON */
+     setAlertInfo(alert);
+ 
++    pending_alerts = true;
++
++    if (sync) flushAlerts();
++
+   } else {
+     delete alert;
+   }
+@@ -8350,6 +8351,24 @@ bool Flow::triggerAlert(FlowAlert *alert) {
+ 
+ /* *************************************** */
+ 
++void Flow::flushAlerts() {
++  if (!pending_alerts) return;
++
++  /* Always enqueue the predominant alert, with json info for all alerts */
++  FlowAlert *alert = triggered_alerts[predominant_alert.id];
++
++  /* Update JSON */
++  updateJSONAlert(

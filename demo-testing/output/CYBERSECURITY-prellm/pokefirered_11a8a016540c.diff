@@ -1,0 +1,160 @@
+@@ -18,9 +18,9 @@ struct MultiBootParam
+     u8 response_bit;
+     u8 client_bit;
+     u8 reserved1;
+-    u8 *boot_srcp;
+-    u8 *boot_endp;
+-    u8 *masterp;
++    const u8 *boot_srcp;
++    const u8 *boot_endp;
++    const u8 *masterp;
+     u8 *reserved2[MULTIBOOT_NCHILD];
+     u32 system_work2[4];
+     u8 sendflag;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,420 @@
++#include "global.h"
++#include "multiboot.h"
++
++static IWRAM_DATA u16 MultiBoot_required_data[MULTIBOOT_NCHILD];
++
++static int MultiBootSend(struct MultiBootParam *mp, u16 data);
++static int MultiBootHandShake(struct MultiBootParam *mp);
++static void MultiBootWaitCycles(u32 cycles);
++static void MultiBootWaitSendDone(void);
++
++void MultiBootInit(struct MultiBootParam *mp)
++{
++    mp->client_bit = 0;
++    mp->probe_count = 0;
++    mp->response_bit = 0;
++    mp->check_wait = MULTIBOOT_CONNECTION_CHECK_WAIT;
++    mp->sendflag = 0;
++    mp->handshake_timeout = 0;
++    REG_RCNT = 0;
++    REG_SIOCNT = SIO_MULTI_MODE | SIO_115200_BPS;
++    REG_SIODATA8 = 0;
++}
++
++int MultiBootMain(struct MultiBootParam *mp)
++{
++    int i;
++    int j;
++    int k;
++
++    if (MultiBootCheckComplete(mp))
++    {
++        return 0;
++    }
++    if (mp->check_wait > MULTIBOOT_CONNECTION_CHECK_WAIT)
++    {
++        mp->check_wait--;
++        return 0;
++    }
++output_burst:
++    if (mp->sendflag)
++    {
++        mp->sendflag = 0;
++
++        i = REG_SIOCNT & (SIO_MULTI_BUSY | SIO_ERROR | SIO_ID | SIO_MULTI_SD | SIO_MULTI_SI);
++        if (i != SIO_MULTI_SD)
++        {
++            MultiBootInit(mp);
++            return i ^ SIO_MULTI_SD;
++        }
++    }
++    if (mp->probe_count >= 0xe0)
++    {
++        i = MultiBootHandShake(mp);
++        if (i)
++        {
++            return i;
++        }
++
++        if (mp->server_type == MULTIBOOT_SERVER_TYPE_QUICK
++         && mp->probe_count > 0xe1
++         && MultiBootCheckComplete(mp) == 0)
++        {
++            MultiBootWaitSendDone();
++            goto output_burst;
++        }
++
++        if (MultiBootCheckComplete(mp) == 0)
++        {
++            if (mp->handshake_timeout == 0)
++            {
++                MultiBootInit(mp);
++                return MULTIBOOT_ERROR_HANDSHAKE_FAILURE;
++            }
++            mp->handshake_timeout--;
++        }
++
++        return 0;
++    }
++    switch (mp->probe_count)
++    {
++    case 0:
++        k = 0x0e;
++        for (i = MULTIBOOT_NCHILD; i != 0; i--)
++        {
++            if (*(vu16 *)(REG_ADDR_SIOMULTI0 + i * 2) != 0xffff)
++            {
++                break;
++            }
++            k >>= 1;
++        }
++        k &= 0x0e;
++        mp->response_bit = k;
++        for (i = MULTIBOOT_NCHILD; i != 0; i--)
++        {
++            j = *(vu16 *)(REG_ADDR_SIOMULTI0 + i * 2);
++            if (mp->client_bit & (1 << i))
++            {
++                if (j != ((MULTIBOOT_CLIENT_INFO << 8) | (1 << i)))
++                {
++                    k = 0;
++                    break;
++                }
++            }
++        }
++        mp->client_bit &= k;
++        if (k == 0)
++        {
++            mp->check_wait = MULTIBOOT_CONNECTION_CHECK_WAIT;
++        }
++
++        if (mp->check_wait)
++        {
++            mp->check_wait--;
++        }
++        else
++        {
++            if (mp->response_bit != mp->client_bit)
++            {
++                MultiBootStartProbe(mp);
++                goto case_1;
++            }
++        }
++    output_master_info:
++        return MultiBootSend(mp, (MULTIBOOT_MASTER_INFO << 8) | mp->client_bit);
++    case_1:
++    case 1:
++        mp->probe_target_bit = 0;
++        for (i = MULTIBOOT_NCHILD; i != 0; i--)
++        {
++            j = *(vu16 *)(REG_ADDR_SIOMULTI0 + i * 2);
++            if ((j >> 8) == MULTIBOOT_CLIENT_INFO)
++            {
++                MultiBoot_required_data[i - 1] = j;
++                j &= 0xff;
++                if (j == (1 << i))
++                {
++                    mp->probe_target_bit |= j;
++                }
++            }
++        }
++        if (mp->response_bit !

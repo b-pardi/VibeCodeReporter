@@ -1,0 +1,113 @@
+@@ -1,7 +1,7 @@
+ /*
+    BAREOS® - Backup Archiving REcovery Open Sourced
+ 
+-   Copyright (C) 2020-2022 Bareos GmbH & Co. KG
++   Copyright (C) 2020-2023 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -35,9 +35,8 @@ struct plugin_private_context {
+   char* link;                       // Target symlink points to
+   char* object_name;                // Restore Object Name
+   char* object;                     // Restore Object Content
+-  PyThreadState*
+-      interpreter;    // Python interpreter for this instance of the plugin
+-  PyObject* pModule;  // Python Module entry point
++  PyInterpreterState* interp;
++  PyObject* pModule;                // Python Module entry point
+   PyObject* pyModuleFunctionsDict;  // Python Dictionary
+ };
+ 
+
+
+
+
+@@ -207,8 +207,37 @@ bRC unloadPlugin()
+  * plugin instance must be thread safe and keep its own
+  * local data.
+  */
++thread_local PyThreadState* global_interpreter = nullptr;
++
++// return if global_interpreter needs to be freed on release
++static bool AcquireLock(PyInterpreterState* interp)
++{
++  bool needs_free = false;
++  if (!global_interpreter) {
++    global_interpreter = PyThreadState_New(interp);
++    needs_free = true;
++  }
++  ASSERT(global_interpreter->interp == interp);
++  PyEval_RestoreThread(global_interpreter);
++
++  return needs_free;
++}
++
++static void ReleaseLock(bool needs_free)
++{
++  ASSERT(global_interpreter);
++  if (needs_free) {
++    PyThreadState_Clear(global_interpreter);
++    PyThreadState_DeleteCurrent();
++    global_interpreter = nullptr;
++  } else {
++    PyEval_ReleaseThread(global_interpreter);
++  }
++}
++
+ static bRC newPlugin(PluginContext* plugin_ctx)
+ {
++  ASSERT(global_interpreter == nullptr);
+   struct plugin_private_context* plugin_priv_ctx
+       = (struct plugin_private_context*)malloc(
+           sizeof(struct plugin_private_context));
+@@ -223,8 +252,9 @@ static bRC newPlugin(PluginContext* plugin_ctx)
+ 
+   /* For each plugin instance we instantiate a new Python interpreter. */
+   PyEval_AcquireThread(mainThreadState);
+-  plugin_priv_ctx->interpreter = Py_NewInterpreter();
+-  PyEval_ReleaseThread(plugin_priv_ctx->interpreter);
++  global_interpreter = Py_NewInterpreter();
++  plugin_priv_ctx->interp = global_interpreter->interp;
++  PyEval_ReleaseThread(global_interpreter);
+ 
+   /* Always register some events the python plugin itself can register
+      any other events it is interested in. */
+@@ -242,6 +272,7 @@ static bRC newPlugin(PluginContext* plugin_ctx)
+  */
+ static bRC freePlugin(PluginContext* plugin_ctx)
+ {
++  ASSERT(global_interpreter);
+   struct plugin_private_context* plugin_priv_ctx
+       = (struct plugin_private_context*)plugin_ctx->plugin_private_context;
+ 
+@@ -264,12 +295,12 @@ static bRC freePlugin(PluginContext* plugin_ctx)
+   if (plugin_priv_ctx->object) { free(plugin_priv_ctx->object); }
+ 
+   // Stop any sub interpreter started per plugin instance.
+-  PyEval_AcquireThread(plugin_priv_ctx->interpreter);
++  PyEval_AcquireThread(global_interpreter);
+ 
+ 
+   if (plugin_priv_ctx->pModule) { Py_DECREF(plugin_priv_ctx->pModule); }
+ 
+-  Py_EndInterpreter(plugin_priv_ctx->interpreter);
++  Py_EndInterpreter(global_interpreter);
+ #if PY_VERSION_HEX < VERSION_HEX(3, 2, 0)
+   PyEval_ReleaseLock();
+ #else
+@@ -355,7 +386,7 @@ static bRC handlePluginEvent(PluginContext* plugin_ctx,
+    * we only do a dispatch to the python entry point when that internal
+    * processing was successful (e.g. retval == bRC_OK). */
+   if (!event_dispatched || retval == bRC_OK) {
+-    PyEval_AcquireThread(plugin_priv_ctx->interpreter);
++    auto l = AcquireLock(plugin_priv_ctx->interp);
+ 
+     /* Now dispatch the event to Python.
+      * First the calls that need special handling. */
+@@ -422,7 +453,7 @@ static bRC handlePluginEvent(PluginContext* plugin_ctx,
+         break;
+     }
+ 
+-    PyEval_ReleaseThread(plugin_priv_ctx->interpreter);
++    ReleaseLock(l)

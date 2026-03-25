@@ -1,0 +1,121 @@
+@@ -1,5 +1,6 @@
+ package org.batfish.dataplane.rib;
+ 
++import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import javax.annotation.ParametersAreNonnullByDefault;
+ import org.batfish.datamodel.AbstractRoute;
+@@ -7,7 +8,10 @@ import org.batfish.datamodel.AnnotatedRoute;
+ import org.batfish.datamodel.BgpTieBreaker;
+ import org.batfish.datamodel.Bgpv4Route;
+ import org.batfish.datamodel.GenericRibReadOnly;
++import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.MultipathEquivalentAsPathMatchMode;
++import org.batfish.datamodel.Route;
++import org.batfish.datamodel.RoutingProtocol;
+ 
+ /** BGPv4-specific RIB implementation */
+ @ParametersAreNonnullByDefault
+@@ -28,4 +32,28 @@ public final class Bgpv4Rib extends BgpRib<Bgpv4Route> {
+         withBackups,
+         clusterListAsIgpCost);
+   }
++
++  @Nonnull
++  @Override
++  public RibDelta<Bgpv4Route> mergeRouteGetDelta(Bgpv4Route route) {
++    Ip nextHopIp = route.getNextHopIp();
++    /*
++      Do not merge routes for which next hop is not reachable.
++      However, due to some complications with how we create routes, we must skip this check for:
++      - routes with link-local address as next hop (i.e., next-hop interface is set to something)
++      - routes with Ip.AUTO as next hop or protocol AGGREGATE (for locally-generated routes/aggregates)
++    */
++    if (Route.UNSET_NEXT_HOP_INTERFACE.equals(route.getNextHopInterface())
++        && !nextHopIp.equals(Ip.AUTO)
++        && route.getProtocol() != RoutingProtocol.AGGREGATE
++        && _mainRib != null
++        && _mainRib.longestPrefixMatch(nextHopIp).isEmpty()) {
++      /*
++      TODO: when backups are enabled again, we should probably put this in as a backup
++         and then return empty delta
++      */
++      return RibDelta.empty();
++    }
++    return super.mergeRouteGetDelta(route);
++  }
+ }
+
+
+
+
+@@ -184,7 +184,22 @@ public class BgpNextHopUnchangedTest {
+             .setConfigurationFormat(ConfigurationFormat.CISCO_IOS)
+             .build();
+     Vrf r3Vrf = _nf.vrfBuilder().setName(DEFAULT_VRF_NAME).setOwner(r3).setOwner(r3).build();
+-    _nf.interfaceBuilder().setName("r3_r2").setAddress(_r3Addr1).setVrf(r3Vrf).setOwner(r3).build();
++    Interface i3 =
++        _nf.interfaceBuilder()
++            .setName("r3_r2")
++            .setAddress(_r3Addr1)
++            .setVrf(r3Vrf)
++            .setOwner(r3)
++            .build();
++    // Static route required, otherwise IBGP routes from r1 won't be accepted (no reach. to nexthop
++    // ip)
++    r3Vrf.setStaticRoutes(
++        ImmutableSortedSet.of(
++            StaticRoute.builder()
++                .setNetwork(_r1Addr1.getPrefix())
++                .setAdmin(1)
++                .setNextHopInterface(i3.getName())
++                .build()));
+     BgpProcess bgpProcessR3 = _bgpProcessBuilder.setRouterId(_routerId3).setVrf(r3Vrf).build();
+     _nf.bgpNeighborBuilder()
+         .setLocalIp(_r3Addr1.getIp())
+
+
+
+
+@@ -46,19 +46,12 @@ import org.junit.Test;
+ public class RouteReflectionTest {
+ 
+   private static final Prefix AS1_PREFIX = Prefix.parse("1.0.0.0/8");
+-
+   private static final Prefix AS3_PREFIX = Prefix.parse("3.0.0.0/8");
+-
+   private static final int EDGE_PREFIX_LENGTH = 24;
+-
+   private static final String EDGE1_NAME = "edge1";
+-
+   private static final String EDGE2_NAME = "edge2";
+-
+   private static final String RR_NAME = "rr";
+-
+   private static final String RR1_NAME = "rr1";
+-
+   private static final String RR2_NAME = "rr2";
+ 
+   private static <T extends AbstractRoute> void assertIbgpRoute(
+@@ -83,21 +76,13 @@ public class RouteReflectionTest {
+   }
+ 
+   private BgpAdvertisement.Builder _ab;
+-
+   private Configuration.Builder _cb;
+-
+   private RoutingPolicy.Builder _defaultExportPolicyBuilder;
+-
+   private Interface.Builder _ib;
+-
+   private BgpActivePeerConfig.Builder _nb;
+-
+   private NetworkFactory _nf;
+-
+   private RoutingPolicy.Builder _nullExportPolicyBuilder;
+-
+   private BgpProcess.Builder _pb;
+-
+   private Vrf.Builder _vb;
+ 
+   /*

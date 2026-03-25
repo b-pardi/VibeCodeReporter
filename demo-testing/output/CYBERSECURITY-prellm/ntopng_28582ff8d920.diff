@@ -1,0 +1,120 @@
+@@ -53,6 +53,7 @@ class AddressTree {
+   inline patricia_tree_t* getTree(bool isV4) { return(isV4 ? ptree_v4 : ptree_v6); }
+   bool addAddress(char *_net, const int16_t user_data = -1);
+   patricia_node_t *addAddress(const IpAddress * const ipa);
++  patricia_node_t *addAddress(const IpAddress * const ipa, int network_bits, bool compact_after_add);
+   bool addAddresses(char *net, const int16_t user_data = -1);
+   void getAddresses(lua_State* vm);
+   int16_t findAddress(int family, void *addr, u_int8_t *network_mask_bits = NULL);
+
+
+
+
+@@ -88,9 +88,8 @@ class NetworkInterface : public Checkpointable {
+   MDNS *mdns;
+ 
+   /* Broadcast domain */
+-  std::map<u_int32_t /* net */, u_int8_t /* mask */> localBroadcastDomains;
+ #ifdef USE_BROADCAST_DOMAINS
+-  patricia_tree_t *broadcastDomains;
++  AddressTree broadcast_domains;
+ #endif
+   
+ #ifdef HAVE_EBPF
+
+
+
+
+@@ -83,6 +83,65 @@ patricia_node_t *AddressTree::addAddress(const IpAddress * const ipa) {
+ 
+ /* ******************************************* */
+ 
++typedef struct {
++  int cur_bitlen;
++  vector<prefix_t*>larger_bitlens;
++} compact_tree_t;
++
++/* ******************************************* */
++
++static void compact_tree_funct(prefix_t *prefix, void *data, void *user_data) {
++  compact_tree_t *compact = (compact_tree_t*)user_data;
++
++  if(!prefix) return;
++
++  if(prefix->bitlen > compact->cur_bitlen)
++    compact->larger_bitlens.push_back(prefix);
++}
++
++/* **************************************************** */
++
++patricia_node_t *AddressTree::addAddress(const IpAddress * const ipa, int network_bits, bool compact_after_add) {
++  if(!ipa)
++    return NULL;
++
++  bool is_v4 = ipa->isIPv4();
++  patricia_node_t *res;
++  patricia_tree_t *cur_ptree = is_v4 ? ptree_v4 : ptree_v6;
++  int cur_family = is_v4 ? AF_INET : AF_INET6;
++  int cur_bits = network_bits;
++
++  if(network_bits < 0) network_bits = 0;
++  else if(is_v4 && network_bits > 32) network_bits = 32;
++  else if(!is_v4 && network_bits > 128) network_bits = 128;
++
++  void *cur_addr = is_v4 ? (void*)&ipa->getIP()->ipType.ipv4 : (void*)&ipa->getIP()->ipType.ipv6;
++
++  res = Utils::ptree_match(cur_ptree, cur_family, cur_addr, cur_bits);
++
++  if(!res)
++    res = Utils::add_to_ptree(cur_ptree, cur_family, cur_addr, cur_bits);
++
++  if(compact_after_add && res) {
++    compact_tree_t compact;
++    compact.cur_bitlen = network_bits;
++
++    /* navigate this subtree */
++    patricia_walk_inorder(res, compact_tree_funct, &compact);
++
++    for (std::vector<prefix_t*>::const_iterator it = compact.larger_bitlens.begin(); it != compact.larger_bitlens.end(); ++it) {
++      patricia_node_t *compacted = patricia_search_exact(cur_ptree, *it);
++      assert(compacted);
++      patricia_remove(cur_ptree, compacted);
++    }
++  }
++
++
++  return res;
++}
++
++/* ******************************************* */
++
+ bool AddressTree::addAddress(char *_what, const int16_t user_data) {
+   u_int32_t _mac[6];
+   int16_t id = (user_data == -1) ? numAddresses : user_data;
+
+
+
+
+@@ -296,9 +296,6 @@ void NetworkInterface::init() {
+     macs_hash = NULL, ases_hash = NULL, countries_hash = NULL, vlans_hash = NULL, 
+       arp_hash_matrix = NULL;
+ 
+-#ifdef USE_BROADCAST_DOMAINS
+-    broadcastDomains = New_Patricia(32);
+-#endif
+     numSubInterfaces = 0;
+     memset(subInterfaces, 0, sizeof(subInterfaces));
+   reload_custom_categories = reload_hosts_blacklist = false;
+@@ -555,8 +552,6 @@ bool NetworkInterface::checkIdle() {
+ 
+ /* **************************************************** */
+ 
+-static void free_ptree_data(void *data) { if(data) free(data); }
+-
+ void NetworkInterface::deleteDataStructures() {
+   if(flows_hash)            { delete(flows_hash); flows_hash = NULL; }
+   if(hosts_hash)            { delete(hosts_hash); hosts_hash = NULL; }
+@@ -565,10 +560,6 @@ void NetworkInterface::deleteDataStructures() {
+   if(vlans_hash)            { delete(vlans_hash); vlans_hash = NULL; }
+   if(macs_hash)             { delete(macs_hash);  macs_hash = NULL;  }
+   if(arp_hash_matrix)       { dele

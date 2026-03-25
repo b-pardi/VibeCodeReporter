@@ -1,0 +1,85 @@
+@@ -1,5 +1,6 @@
+ package org.batfish.bddreachability;
+ 
++import static com.google.common.base.MoreObjects.firstNonNull;
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static org.batfish.common.util.CommonUtil.toImmutableMap;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.matchDst;
+@@ -26,6 +27,7 @@ import java.util.function.Function;
+ import java.util.function.Supplier;
+ import java.util.stream.Stream;
+ import javax.annotation.Nonnull;
++import javax.annotation.Nullable;
+ import javax.annotation.ParametersAreNonnullByDefault;
+ import net.sf.javabdd.BDD;
+ import org.batfish.common.BatfishException;
+@@ -127,6 +129,9 @@ public final class BDDReachabilityAnalysisFactory {
+ 
+   private final Map<String, BDDSourceManager> _bddSourceManagers;
+ 
++  // node --> iface --> source nats
++  private final Map<String, Map<String, List<BDDNat>>> _bddSourceNats;
++
+   private final Map<String, Configuration> _configs;
+ 
+   private IpSpaceToBDD _dstIpSpaceToBDD;
+@@ -190,12 +195,17 @@ public final class BDDReachabilityAnalysisFactory {
+ 
+     _aclPermitBDDs = computeAclBDDs(_bddPacket, _bddSourceManagers, configs);
+     _aclDenyBDDs = computeAclDenyBDDs(_aclPermitBDDs);
++    _bddSourceNats = computeBDDSourceNats();
+ 
+     _arpTrueEdgeBDDs = computeArpTrueEdgeBDDs(forwardingAnalysis, _dstIpSpaceToBDD);
+-    _neighborUnreachableBDDs = computeNeighborUnreachableBDDs(forwardingAnalysis, _dstIpSpaceToBDD);
+-    _deliveredToSubnetBDDs = computerDeliveredToSubnetBDDs(forwardingAnalysis, _dstIpSpaceToBDD);
+-    _exitsNetworkBDDs = computerExitsNetworkBDDs(forwardingAnalysis, _dstIpSpaceToBDD);
+-    _insufficientInfoBDDs = computerInsufficientInfo(forwardingAnalysis, _dstIpSpaceToBDD);
++    _neighborUnreachableBDDs =
++        computeDispositionBDDs(forwardingAnalysis.getNeighborUnreachable(), _dstIpSpaceToBDD);
++    _deliveredToSubnetBDDs =
++        computeDispositionBDDs(forwardingAnalysis.getDeliveredToSubnet(), _dstIpSpaceToBDD);
++    _exitsNetworkBDDs =
++        computeDispositionBDDs(forwardingAnalysis.getExitsNetwork(), _dstIpSpaceToBDD);
++    _insufficientInfoBDDs =
++        computeDispositionBDDs(forwardingAnalysis.getInsufficientInfo(), _dstIpSpaceToBDD);
+     _routableBDDs = computeRoutableBDDs(forwardingAnalysis, _dstIpSpaceToBDD);
+     _vrfAcceptBDDs = computeVrfAcceptBDDs(configs, _dstIpSpaceToBDD);
+     _vrfNotAcceptBDDs = computeVrfNotAcceptBDDs(_vrfAcceptBDDs);
+@@ -243,6 +253,36 @@ public final class BDDReachabilityAnalysisFactory {
+                 aclEntry -> Suppliers.memoize(() -> aclEntry.getValue().get().not())));
+   }
+ 
++  private Map<String, Map<String, List<BDDNat>>> computeBDDSourceNats() {
++    return toImmutableMap(
++        _configs,
++        Entry::getKey, /* node */
++        nodeEntry ->
++            toImmutableMap(
++                nodeEntry.getValue().getAllInterfaces(),
++                Entry::getKey, /* iface */
++                ifaceEntry -> computeBDDSourceNats(ifaceEntry.getValue())));
++  }
++
++  private List<BDDNat> computeBDDSourceNats(Interface iface) {
++    String hostname = iface.getOwner().getHostname();
++    List<SourceNat> sourceNats = firstNonNull(iface.getSourceNats(), ImmutableList.of());
++    return sourceNats
++        .stream()
++        .map(
++            sourceNat -> {
++              String aclName = sourceNat.getAcl().getName();
++              BDD match = aclPermitBDD(hostname, aclName);
++              BDD setSrcIp =
++                  _bddPacket
++                      .getSrcIp()
++                      .geq(sourceNat.getPoolIpFirst().asLong())
++                      .and(_bddPacket.getSrcIp().leq(sourceNat.getPoolIpLast().asLong()));
++              return new BDDNat(match, setSrcIp);
++            })
++        .collect(ImmutableList.toImmutableList());
++  }
++
+   private static Map<StateExpr, Map<StateExpr, Edge>> computeEdges(Stream<Edge> edgeStream) {
+     Map<StateExpr, Map<StateExpr, Edge>> edges = new HashMap<>();
+ 
+@@ -317,26 +357,6 @@ public final class BDDReach

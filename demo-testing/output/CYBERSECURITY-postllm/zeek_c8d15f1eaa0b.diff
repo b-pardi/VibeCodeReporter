@@ -1,0 +1,122 @@
+@@ -24,12 +24,17 @@ ZAMCompiler::ZAMCompiler(ScriptFuncPtr f, std::shared_ptr<ProfileFuncs> _pfs, st
+     reducer = std::move(_rd);
+     frame_sizeI = 0;
+ 
++    auto loc = body->GetLocationInfo();
++    ASSERT(loc->first_line != 0 || body->Tag() == STMT_NULL);
++    auto loc_copy =
++        std::make_shared<Location>(loc->filename, loc->first_line, loc->last_line, loc->first_column, loc->last_column);
++    curr_func = func->Name();
++    curr_loc = std::make_shared<ZAMLocInfo>(curr_func, std::move(loc_copy), nullptr);
++
+     Init();
+ }
+ 
+ ZAMCompiler::~ZAMCompiler() {
+-    curr_stmt = nullptr;
+-
+     for ( auto i : insts1 )
+         delete i;
+ }
+@@ -117,8 +122,6 @@ void ZAMCompiler::TrackMemoryManagement() {
+ }
+ 
+ StmtPtr ZAMCompiler::CompileBody() {
+-    curr_stmt = nullptr;
+-
+     if ( func->Flavor() == FUNC_FLAVOR_HOOK )
+         PushBreaks();
+ 
+@@ -193,12 +196,17 @@ StmtPtr ZAMCompiler::CompileBody() {
+ 
+     ConcretizeSwitches();
+ 
+-    // Could erase insts1 here to recover memory, but it's handy
+-    // for debugging.
++    std::string fname = func->Name();
+ 
+-    auto zb = make_intrusive<ZBody>(func->Name(), this);
++    if ( func->Flavor() == FUNC_FLAVOR_FUNCTION )
++        fname = func_name_at_loc(fname, body->GetLocationInfo());
++
++    auto zb = make_intrusive<ZBody>(fname, this);
+     zb->SetInsts(insts2);
+ 
++    // Could erase insts1 here to recover memory, but it's handy
++    // for debugging.
++
+     return zb;
+ }
+ 
+@@ -388,7 +396,7 @@ void ZAMCompiler::Dump() {
+ 
+         printf("%d %s%s: ", i, liveness.c_str(), depth.c_str());
+ 
+-        inst->Dump(&frame_denizens, remappings);
++        inst->Dump(stdout, &frame_denizens, remappings);
+     }
+ 
+     if ( ! insts2.empty() )
+@@ -396,8 +404,9 @@ void ZAMCompiler::Dump() {
+ 
+     for ( auto i = 0U; i < insts2.size(); ++i ) {
+         auto& inst = insts2[i];
++        // printf("%s:%d\n", inst->loc->filename, inst->loc->first_line);
+         printf("%d: ", i);
+-        inst->Dump(&frame_denizens, remappings);
++        inst->Dump(stdout, &frame_denizens, remappings);
+     }
+ 
+     DumpCases(int_cases, "int");
+@@ -445,7 +454,7 @@ void ZAMCompiler::DumpInsts1(const FrameReMap* remappings) {
+ 
+         printf("%d %s%s: ", i, liveness.c_str(), depth.c_str());
+ 
+-        inst->Dump(&frame_denizens, remappings);
++        inst->Dump(stdout, &frame_denizens, remappings);
+     }
+ }
+ 
+
+
+
+
+@@ -18,7 +18,7 @@ public:
+     // No constructor needed, as all of our member variables are
+     // instead instantiated via BeginLoop().  This allows us to
+     // reuse TableIterInfo objects to lower the overhead associated
+-    // with executing ZBody::DoExec for non-recursive functions.
++    // with executing ZBody::Exec for non-recursive functions.
+ 
+     // We do, however, want to make sure that when we go out of scope,
+     // if we have any pending iterators we clear them.
+
+
+
+
+@@ -10,8 +10,13 @@
+ namespace zeek::detail {
+ 
+ const ZAMStmt ZAMCompiler::CompileStmt(const Stmt* s) {
+-    curr_stmt = const_cast<Stmt*>(s)->ThisPtr();
+-    ASSERT(curr_stmt->Tag() == STMT_NULL || curr_stmt->GetLocationInfo()->first_line != 0);
++    auto loc = s->GetLocationInfo();
++    ASSERT(loc->first_line != 0 || s->Tag() == STMT_NULL);
++    auto loc_copy =
++        std::make_shared<Location>(loc->filename, loc->first_line, loc->last_line, loc->first_column, loc->last_column);
++    ASSERT(! blocks || s->Tag() == STMT_NULL || blocks->HaveExpDesc(loc_copy.get()));
++    auto loc_parent = curr_loc->Parent();
++    curr_loc = std::make_shared<ZAMLocInfo>(curr_func, std::move(loc_copy), curr_loc->Parent());
+ 
+     switch ( s->Tag() ) {
+         case STMT_PRINT: return CompilePrint(static_cast<const PrintStmt*>(s));
+@@ -902,6 +907,16 @@ const ZAMStmt ZAMCompiler::CompileReturn(const ReturnStmt* r) {
+ const ZAMStmt ZAMCompiler::CompileCatchReturn(const CatchReturnStmt* cr) {
+     retvars.push_back(cr->RetVar());
+ 
++    auto hold_func = curr_func;
++    auto hold_loc = curr_loc;
++
++    curr_func = cr->Func()->Name();
++
++    

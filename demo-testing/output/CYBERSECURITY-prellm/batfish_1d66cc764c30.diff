@@ -1,0 +1,89 @@
+@@ -39,8 +39,6 @@ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.IsisRoute;
+ import org.batfish.datamodel.NetworkConfigurations;
+-import org.batfish.datamodel.OspfExternalType1Route;
+-import org.batfish.datamodel.OspfExternalType2Route;
+ import org.batfish.datamodel.Topology;
+ import org.batfish.datamodel.answers.IncrementalBdpAnswerElement;
+ import org.batfish.datamodel.eigrp.EigrpEdge;
+@@ -164,7 +162,8 @@ class IncrementalBdpEngine {
+        */
+       IncrementalBdpAnswerElement answerElement = new IncrementalBdpAnswerElement();
+       // TODO: eventually, IGP needs to be part of fixed-point below, because tunnels.
+-      computeIgpDataPlane(nodes, topology, eigrpTopology, answerElement, networkConfigurations);
++      computeIgpDataPlane(
++          nodes, topology, eigrpTopology, answerElement, networkConfigurations, ospfTopology);
+ 
+       /*
+        * Perform a fixed-point computation.
+@@ -252,14 +251,12 @@ class IncrementalBdpEngine {
+    * @param iterationLabel iteration label (for stats tracking)
+    * @param allNodes all nodes in the network (for correct neighbor referencing)
+    * @param bgpTopology the bgp peering relationships
+-   * @param ospfTopology the OSPF topology to use
+    */
+   private void computeDependentRoutesIteration(
+       Map<String, Node> nodes,
+       String iterationLabel,
+       Map<String, Node> allNodes,
+       ValueGraph<BgpPeerConfigId, BgpSessionProperties> bgpTopology,
+-      OspfTopology ospfTopology,
+       NetworkConfigurations networkConfigurations) {
+     try (ActiveSpan overallSpan =
+         GlobalTracer.get().buildSpan(iterationLabel + ": Compute dependent routes").startActive()) {
+@@ -404,68 +401,33 @@ class IncrementalBdpEngine {
+       }
+ 
+       try (ActiveSpan span =
+-          GlobalTracer.get().buildSpan(iterationLabel + ": Recompute OSPF exports").startActive()) {
++          GlobalTracer.get()
++              .buildSpan(iterationLabel + ": propagate OSPF external")
++              .startActive()) {
+         assert span != null; // avoid unused warning
+-        // OSPF external routes
+-        // recompute exports
+         nodes
+             .values()
+             .parallelStream()
+-            .forEach(
+-                n -> {
+-                  for (VirtualRouter vr : n.getVirtualRouters().values()) {
+-                    vr.initOspfExports(allNodes);
+-                  }
+-                });
++            .flatMap(n -> n.getVirtualRouters().values().stream())
++            .forEach(vr -> vr.ospfIteration(allNodes));
++        nodes
++            .values()
++            .parallelStream()
++            .flatMap(n -> n.getVirtualRouters().values().stream())
++            .forEach(VirtualRouter::mergeOspfRoutesToMainRib);
+       }
+ 
++      computeIterationOfBgpRoutes(
++          nodes, iterationLabel, allNodes, bgpTopology, networkConfigurations);
++
+       try (ActiveSpan span =
+-          GlobalTracer.get()
+-              .buildSpan(iterationLabel + ": Re-propagate OSPF exports")
+-              .startActive()) {
++          GlobalTracer.get().buildSpan(iterationLabel + ": Redistribute").startActive()) {
+         assert span != null; // avoid unused warning
+-        // Re-propagate OSPF exports
+-        AtomicBoolean ospfExternalChanged = new AtomicBoolean(true);
+-        int ospfExternalSubIterations = 0;
+-        while (ospfExternalChanged.get()) {
+-          try (ActiveSpan innerSpan =
+-              GlobalTracer.get()
+-                  .buildSpan(
+-                      iterationLabel
+-                          + ": Propagate OSPF external routes: subIteration: "
+-                          + ospfExternalSubIterations)
+-                  .startActive()) {
+-            assert innerSpan != null; // avoid unused warning
+-            ospfExternalSubIterations++;
+-            AtomicInteger propagateOspfExternalCompleted =
+-                _newBatch.apply(
+-                    iterationLabel
+-                        + ": Propa

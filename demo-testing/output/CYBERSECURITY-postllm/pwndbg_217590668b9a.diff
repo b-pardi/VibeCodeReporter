@@ -1,0 +1,101 @@
+@@ -691,3 +691,9 @@ def map_idr() -> pwndbg.dbg_mod.Value:
+     if (syms := arch_symbols()) is not None:
+         return syms.map_idr()
+     return None
++
++
++def current_task() -> pwndbg.dbg_mod.Value:
++    if (syms := arch_symbols()) is not None:
++        return syms.current_task()
++    return None
+
+
+
+
+@@ -259,11 +259,7 @@ class x86_64PagingInfo(ArchPagingInfo):
+     @property
+     @pwndbg.lib.cache.cache_until("stop")
+     def paging_level(self) -> int:
+-        # CONFIG_X86_5LEVEL is only a hint -- whether 5lvl paging is used depends on the hardware
+-        # see also: https://www.kernel.org/doc/html/next/x86/x86_64/mm.html
+-        if first_kernel_page_start() < (0xFFF << (4 * 13)):
+-            return 5
+-        return 4
++        return 4 if (pwndbg.aglib.regs["cr4"] & (1 << 12)) == 0 else 5
+ 
+     @pwndbg.lib.cache.cache_until("stop")
+     def markers(self) -> Tuple[Tuple[str, int], ...]:
+
+
+
+
+@@ -273,6 +273,7 @@ class ArchSymbols:
+         )
+         self.bpf_prog_heuristic_func = "bpf_prog_free_id"
+         self.bpf_map_heuristic_func = "bpf_map_free_id"
++        self.current_task_heuristic_func = "common_cpu_up"
+ 
+     def disass(self, name, lines=None):
+         sym = pwndbg.aglib.symbol.lookup_symbol(name)
+@@ -353,6 +354,21 @@ class ArchSymbols:
+             prog_idr = self._prog_idr()
+         return pwndbg.aglib.memory.get_typed_pointer("unsigned long", prog_idr)
+ 
++    def current_task(self):
++        current_task = pwndbg.aglib.symbol.lookup_symbol("current_task")
++        if current_task:
++            current_task = pwndbg.aglib.kernel.per_cpu(current_task)
++            return current_task.dereference()
++        if pwndbg.aglib.arch.name == "aarch64":
++            current_task = self._current_task()
++        elif pwndbg.aglib.kernel.has_debug_symbols(self.current_task_heuristic_func):
++            current_task = self._current_task()
++            if current_task is not None:
++                current_task = pwndbg.aglib.kernel.per_cpu(current_task)
++            # current_task is int but needed here to make the linter happy
++            current_task = pwndbg.aglib.memory.read_pointer_width(int(current_task))
++        return pwndbg.aglib.memory.get_typed_pointer("unsigned long", current_task)
++
+     def _node_data(self):
+         raise NotImplementedError()
+ 
+@@ -374,29 +390,32 @@ class ArchSymbols:
+     def _prog_idr(self):
+         raise NotImplementedError()
+ 
++    def _current_task(self):
++        raise NotImplementedError()
++
+ 
+ class x86_64Symbols(ArchSymbols):
+-    # mov reg, [... - 0x...]
+-    # the ``-0x...` is a kernel address displayed as a negative number
++    # op ... [... +/- (0x...)]
++    # if negative, the `-0x...`` is a kernel address displayed as a negative number
+     # returns the first 0x... as an int if exists
+-    def dword_mov_reg_memoff(self, disass, nth=0):
+-        result = self.regex(disass, r".*?\bmov.*\[.*-.*(0x[0-9a-f]+)\]", nth)
++    def qword_op_reg_memoff(self, disass, op, sign="-", nth=0):
++        result = self.regex(disass, rf"{op}.*\[.*{re.escape(sign)}\s(0x[0-9a-f]+)\]", nth)
+         if result is not None:
+-            return (1 << 64) - int(result.group(1), 16)
++            if sign == "-":
++                return (1 << 64) - int(result.group(1), 16)
++            else:
++                return int(result.group(1), 16)
+         return None
+ 
+-    # add reg, [... - 0x...]
+-    # the `-0x...`` is a kernel address displayed as a negative number
+-    # returns the first 0x... as an int if exists
+-    def dword_add_reg_memoff(self, disass, nth=0):
+-        result = self.regex(disass, r".*?\badd.*\[.*-.*(0x[0-9a-f]+)\]", nth)
++    # mov reg, <kernel address as a constant>
++    def qword_mov_reg_const(self, disass, nth=0):
++        result = self.regex(disass, r"mov.*(0x[0-9a-f]{16})", nth)
+         if result is not None:
+-            return (1 << 64) - int(result.group(1), 16)
++            return int(result.group(1), 16)
+         return None
+ 
+-    # mov reg, <kernel address as a cons

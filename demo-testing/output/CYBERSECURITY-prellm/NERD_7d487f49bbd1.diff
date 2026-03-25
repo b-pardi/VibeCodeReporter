@@ -1,0 +1,99 @@
+@@ -4,20 +4,20 @@ NERD update manager.
+ Provides UpdateManager class - a NERD component which handles updates of entity
+ records, including chain reaction of updates caused by other updates.
+ """
++# TODO: split this class into two separate classes
++#  - "task distribution" and "performing tasks (doing changes, calling callbacks, etc.)"
+ import sys
+ import os
+ import threading
+-# import multiprocessing
+ import queue
+-from datetime import datetime, timezone
++from datetime import datetime
+ import time
+-from collections import defaultdict, deque, Iterable, OrderedDict, Counter
++from collections import deque, Iterable, OrderedDict, Counter
+ import logging
+-import traceback
+ 
+ import g
+ import core.scheduler
+-from common import task_queue
++from common.task_queue import TaskQueueReader, TaskQueueWriter
+ 
+ ENTITY_TYPES = ['ip', 'asn', 'bgppref', 'ipblock', 'org']
+ 
+@@ -173,10 +173,10 @@ def perform_update(rec, updreq):
+     
+     elif op == 'next_step':
+         key_base = updreq[2]
+-        min = updreq[3]
++        minimum = updreq[3]
+         step = updreq[4]
+         base = rec[key_base]
+-        rec[key] = base + ((min - base) // step + 1) * step 
++        rec[key] = base + ((minimum - base) // step + 1) * step
+     
+     elif op == 'array_update' or op == 'array_upsert':
+         query = updreq[2]
+@@ -237,7 +237,7 @@ class UpdateManager:
+     TODO: detailed description
+     """
+ 
+-    def __init__(self, config, db, process_index):
++    def __init__(self, config, db, process_index, num_processes):
+         """
+         Initialize update manager.
+         
+@@ -245,16 +245,25 @@ class UpdateManager:
+         config -- global NERDd configuration (dict)
+         db -- instance of EntityDatabase which should be used to load/store 
+               entity records.
++        process_index -- index of this process (0 to num_processes-1)
++        num_processes -- total number of worker processes in the system
+         """
++        assert(isinstance(process_index, int) and isinstance(num_processes, int))
++        assert(num_processes >= 1)
++        assert(0 <= process_index < num_processes)
++
+         self.log = logging.getLogger("UpdateManager")
+         #self.log.setLevel('DEBUG')
+         
+         self.process_index = process_index
++        self.num_processes = num_processes
+         
+         self.db = db
+         
+         self.rabbit_params = config.get('rabbitmq', {})
+-        
++
++        self.running = False
++
+         # Mapping of names of attributes to a list of functions that should be 
+         # called when the attribute is updated
+         # (One such mapping for each entity type)
+@@ -268,20 +277,26 @@ class UpdateManager:
+         self._func_triggers = {etype: {} for etype in ENTITY_TYPES}
+         
+         # List of worker threads for processing the update requests
+-        self._workers = []
+-        self.num_workers = g.config.get('worker_threads', 8)
+-        
+-        # Connections to main task queue (RabbitMQ channel),
+-        # one for each worker thread for consuming tasks and one global for writing new requests
+-        self.task_queues = [task_queue.TaskQueue(self.rabbit_params) for _ in range(self.num_workers)]
+-        self.write_task_queue = task_queue.TaskQueue(self.rabbit_params)
+-        # Lock for the queue writer
+-        self.write_task_queue_lock = threading.Lock()
+-        
++        self._worker_threads = []
++        self.num_threads = g.config.get('worker_threads', 8)
++
++        # Internal queues for each worker
++        # TODO - rozhodnout jak velké maxsize by to mělo být (a jestli je to vůbec nutné, možná není, pokud bude na úrovni RMQ omezen počet nepotvrzených zpráv)
++        self._queues = [queue.Queue(10) for _ in range(self.num_threads)]
++
++        # Connections to main task queue
++        # One global reader  - it reads tasks from a single queue (one queue per process) and distributes them to worker threads
++        self._task_queue_reader = TaskQueueReader(self._distribute_task, self.process_ind

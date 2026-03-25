@@ -1,0 +1,121 @@
+@@ -67,7 +67,7 @@ capabilities = {
+ }
+ 
+ 
+-def tcp():
++def tcp(tid: int):
+     # For reference, see:
+     # https://www.kernel.org/doc/Documentation/networking/proc_net_tcp.txt
+     """
+@@ -75,20 +75,25 @@ def tcp():
+     TCP connections. A typical entry of /proc/net/tcp would look like this (split
+     up into 3 parts because of the length of the line):
+     """
+-    data = pwndbg.aglib.file.get("/proc/net/tcp").decode()
++    data = pwndbg.aglib.file.get(f"/proc/{tid}/net/tcp").decode()
+     return pwndbg.lib.net.tcp(data)
+ 
+ 
+-def unix():
++def tcp6(tid: int):
++    data = pwndbg.aglib.file.get(f"/proc/{tid}/net/tcp6").decode()
++    return pwndbg.lib.net.tcp6(data)
++
++
++def unix(tid: int):
+     # We use errors=ignore because of https://github.com/pwndbg/pwndbg/issues/1544
+     # TODO/FIXME: this may not be the best solution because we may end up with
+     # invalid UDS data. Can this be a problem?
+-    data = pwndbg.aglib.file.get("/proc/net/unix").decode(errors="ignore")
++    data = pwndbg.aglib.file.get(f"/proc/{tid}/net/unix").decode(errors="ignore")
+     return pwndbg.lib.net.unix(data)
+ 
+ 
+-def netlink():
+-    data = pwndbg.aglib.file.get("/proc/net/netlink").decode()
++def netlink(tid: int):
++    data = pwndbg.aglib.file.get(f"/proc/{tid}/net/netlink").decode()
+     return pwndbg.lib.net.netlink(data)
+ 
+ 
+@@ -203,7 +208,7 @@ class Process:
+         socket = "socket:["
+         result = []
+ 
+-        functions = [tcp, unix, netlink]
++        functions = [tcp, tcp6, unix, netlink]
+ 
+         for fd, path in fds.items():
+             if socket not in path:
+@@ -213,7 +218,7 @@ class Process:
+             inode = int(inode)
+ 
+             for func in functions:
+-                for x in func():
++                for x in func(self.tid):
+                     if x.inode == inode:
+                         x.fd = fd
+                         result.append(x)
+
+
+
+
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ 
+ import binascii
+ import socket
++import struct
+ from typing import List
+ 
+ import pwndbg.aglib.arch
+@@ -27,6 +28,13 @@ TCP_STATUSES = {
+ }
+ 
+ 
++def format_host_port(ip, port):
++    if ":" in ip and not ip.startswith("["):
++        return f"[{ip}]:{port}"
++    else:
++        return f"{ip}:{port}"
++
++
+ class inode:
+     inode: int | None = None
+ 
+@@ -44,9 +52,7 @@ class Connection(inode):
+     family: str | None = None
+ 
+     def __str__(self) -> str:
+-        return (
+-            f"{self.family} {self.lhost}:{self.lport} => {self.rhost}:{self.rport} ({self.status})"
+-        )
++        return f"{self.family} {format_host_port(self.lhost, self.lport)} => {format_host_port(self.rhost, self.rport)} ({self.status})"
+ 
+     def __repr__(self) -> str:
+         return f'Connection("{self}")'
+@@ -62,7 +68,7 @@ class UnixSocket(inode):
+         return f"UnixSocket({self})"
+ 
+ 
+-def tcp(data: str) -> List[Connection]:
++def _tcp_parser(data: str, ip_family: socket.AddressFamily) -> List[Connection]:
+     # For reference, see:
+     # https://www.kernel.org/doc/Documentation/networking/proc_net_tcp.txt
+     """
+@@ -120,9 +126,18 @@ def tcp(data: str) -> List[Connection]:
+             host = binascii.unhexlify(host)
+ 
+             if pwndbg.aglib.arch.endian == "little":
+-                host = host[::-1]
+-
+-            host = socket.inet_ntop(socket.AF_INET, host)
++                if ip_family == socket.AF_INET:
++                    words = struct.unpack("<1I", host)
++                    host = struct.pack(">1I", *words)
++                elif ip_family == socket.AF_INET6:
++                    # The kernel outputs the IPv6 address as 4 little-endian 32-bit chunks.
++                    # This behavior is specific to little-endian kernels, such as x86.
++                    # On a big-endian kernel, the byte order would differ.
++                    # Reference: https://github.com/torvalds/linux/blob/a7c428ee8f59f171a3b57474f2bd5cee0ef1e036/net/ipv6/tcp_ipv6.c#L2153
++                    words = struct.unpack("<4I", host)
++                  

@@ -1,0 +1,108 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,177 @@
++import aiohttp
++import asyncio
++import json
++import re
++import uuid
++
++from base64 import b64encode
++
++from app.utility.base_world import BaseWorld
++
++
++def api_access(func):
++    async def process(*args, **kwargs):
++        async with aiohttp.ClientSession(headers=dict(Authorization='token {}'.format(args[0].key)),
++                                         connector=aiohttp.TCPConnector(verify_ssl=False)) as session:
++            kwargs['session'] = session
++            return await func(*args, **kwargs)
++    return process
++
++
++class Gist(BaseWorld):
++
++    def __init__(self, services):
++        self.name = 'gist'
++        self.description = 'Use gist for C2'
++        self.file_svc = services.get('file_svc')
++        self.contact_svc = services.get('contact_svc')
++        self.log = self.create_logger('contact_gist')
++        self.key = ''
++
++    def retrieve_config(self):
++        return self.key
++
++    async def start(self):
++        if await self.valid_config():
++            self.key = self.get_config('app.contact.gist')
++            loop = asyncio.get_event_loop()
++            loop.create_task(self.gist_operation_loop())
++
++    async def gist_operation_loop(self):
++        while True:
++            await self.handle_beacons(await self.get_results())
++            await self.handle_beacons(await self.get_beacons())
++            await asyncio.sleep(15)
++
++    async def valid_config(self):
++        return re.compile(pattern='[a-zA-Z0-9]{40,40}').match(self.get_config('app.contact.gist'))
++
++    async def handle_beacons(self, beacons):
++        """
++        Handles various beacons types (beacon and results)
++        """
++        for beacon in beacons:
++            beacon['contact'] = self.name
++            agent, instructions = await self.contact_svc.handle_heartbeat(**beacon)
++            await self._send_payloads(agent, instructions)
++            await self._send_instructions(agent, instructions)
++
++    async def get_results(self):
++        """
++        Retrieve all GIST posted results for a this C2's api key
++        :return:
++        """
++        try:
++            return await self._get_gist_data(comm_type='results')
++        except Exception:
++            self.log.debug('Retrieving results over c2 (%s) failed!' % self.__class__.__name__)
++            return []
++
++    async def get_beacons(self):
++        """
++        Retrieve all GIST beacons for a particular api key
++        :return: the beacons
++        """
++        try:
++            return await self._get_gist_data(comm_type='beacon')
++        except Exception:
++            self.log.debug('Receiving beacons over c2 (%s) failed!' % self.__class__.__name__)
++            return []
++
++    """ PRIVATE """
++
++    async def _send_instructions(self, agent, instructions):
++        response = dict(paw=agent.paw,
++                        sleep=await agent.calculate_sleep(),
++                        watchdog=agent.watchdog,
++                        instructions=json.dumps([json.dumps(i.display) for i in instructions]))
++        await self._post_instructions(self._encode_string(json.dumps(response).encode('utf-8')), agent.paw)
++
++    async def _post_instructions(self, text, paw):
++        try:
++            if await self._wait_for_paw(paw, comm_type='instructions'):
++                return
++            return await self._post_gist(self._build_gist_content(comm_type='instructions', paw=paw,
++                                                                  files={str(uuid.uuid4()): dict(content=text)}))
++        except Exception:
++            self.log.warning('Posting instructions over c2 (%s) failed!' % self.__class__.__name__)
++
++    async def _send_payloads(self, agent, instructions):
++        for i in instructions:
++            if i.payload:
++                filename, payload_contents = await self._get_payload_content(i.payload, agent)
++                await self._post_payloads(filename, payload_contents, '%s-%s' % (agent.paw, filename))

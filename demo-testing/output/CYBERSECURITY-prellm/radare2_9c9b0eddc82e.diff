@@ -1,0 +1,163 @@
+@@ -16,6 +16,8 @@
+ #define IFDBG if (DO_THE_DBG)
+ #define IFINT if (0)
+ 
++#define MIPS_PLT_OFFSET 108
++
+ #define ELF_PAGE_MASK 0xFFFFFFFFFFFFF000LL
+ #define ELF_PAGE_SIZE 12
+ 
+@@ -1350,237 +1352,319 @@ out:
+ 	return NULL;
+ }
+ 
+-static ut64 get_import_addr(ELFOBJ *bin, int sym) {
+-	ut64 plt_sym_addr = -1;
+-	ut64 got_addr, got_offset, plt_addr;
+-	int len, nrel;
++static ut64 get_dyn_entry(ELFOBJ *bin, int dyn_entry) {
++	int i;
++	for (i = 0; i < bin->dyn_entries; i++) {
++		if (bin->dyn_buf[i].d_tag == dyn_entry) {
++			switch (bin->dyn_buf[i].d_tag) {
++			case DT_REL:
++			case DT_RELA:
++			case DT_PLTGOT:
++			case DT_JMPREL:
++				return bin->dyn_buf[i].d_un.d_ptr;
++			case DT_RELSZ:
++			case DT_RELASZ:
++			case DT_PLTRELSZ:
++				return bin->dyn_buf[i].d_un.d_val;
++			default:
++				r_warn_if_reached ();
++				break;
++			}
++		}
++	}
+ 
+-	if ((!bin->shdr || !bin->strtab) && !bin->phdr) {
+-		return -1;
++	return -1;
++}
++
++static ut64 get_got_addr(ELFOBJ *bin) {
++	ut64 ret = get_dyn_entry (bin, DT_PLTGOT);
++	if (ret != -1) {
++		return ret;
+ 	}
+ 
+-	// create rel/rela cache if not already there
+-	if (!bin->rel_cache) {
+-		bin->rel_cache = rel_cache_new (bin);
+-		if (!bin->rel_cache) {
+-			return -1;
+-		}
++	ret = Elf_(r_bin_elf_get_section_addr) (bin, ".got");
++	if (ret) {
++		return ret;
+ 	}
+ 
+-	// lookup the right rel/rela entry
+-	struct ht_rel_t *rel = ht_up_find (bin->rel_cache, sym, NULL);
+-	if (!rel) {
++	ret = Elf_(r_bin_elf_get_section_addr) (bin, ".got.plt");
++	if (ret) {
++		return ret;
++	}
++
++	return -1;
++}
++
++static ut64 get_import_addr_ppc(ELFOBJ *bin, struct ht_rel_t *rel, RBinElfSection *plt_section, int nrel) {
++	ut8 buf[4] = { 0 };
++	int len = r_buf_read_at (bin->b, plt_section->offset, buf, sizeof (buf));
++	if (len < 4) {
+ 		return -1;
+ 	}
+ 
+-	nrel = bin->rel_cache->count;
+-	RBinElfSection *got_section = get_section_by_name (bin, ".got");
+-	if (!got_section) {
+-		got_section = get_section_by_name (bin, ".got.plt");
++	if (bin->endian) {
++		ut64 base = r_read_be32 (buf);
++		base -= (nrel * 16);
++		base += (rel->k * 16);
++		return base;
++	}
++	// FIXME: this does not seem to work as
++	// expected. Commenting for now because it makes
++	// refactoring much easier and it seems weird
++	// anyway.
++	// if (bin->is_rela == DT_RELA) {
++	// 	len = r_buf_read_at (bin->b, rel_sec->offset, buf, sizeof (buf));
++	// 	if (len < 4) {
++	// 		goto out;
++	//	}
++	// }
++	ut64 base = r_read_le32 (buf);
++	base -= (nrel * 12) + 20;
++	base += (rel->k * 8);
++	return base;
++}
++
++static ut64 get_import_addr_sparc(ELFOBJ *bin, struct ht_rel_t *rel, RBinElfSection *plt_section) {
++	if (!plt_section) {
++		return UT64_MAX;
+ 	}
+-	if (!got_section) {
+-		return -1;
++	ut64 plt_addr = plt_section->rva;
++	switch (REL_TYPE) {
++	case R_SPARC_JMP_SLOT:
++		plt_addr += rel->k * 12 + 20;
++		// thumb symbol
++		if (plt_addr & 1) {
++			plt_addr--;
++		}
++		return plt_addr;
++	default:
++		bprintf ("Unknown sparc reloc type %d\n", REL_TYPE);
++		return UT64_MAX;
+ 	}
++}
+ 
+-	got_offset = got_section->offset;
+-	got_addr = got_section->rva;
++static ut64 get_import_addr_arm(ELFOBJ *bin, struct ht_rel_t *rel, RBinElfSection *plt_section) {
++	if (!plt_section) {
++		return UT32_MAX;
++	}
++	ut64 plt_addr = plt_section->rva;
++	switch (REL_TYPE) {
++	case R_ARM_JUMP_SLOT: {
++		plt_addr += rel->k * 12 + 20;
++		// thumb symbol
++		if (plt_addr & 1) {
++			plt_addr--;
++		}
++		return plt_addr;
++	}
++	case R_AARCH64_JUMP_SLOT:
++		return plt_addr + rel->k * 16 + 32;
++	default:
++		bprintf ("Unsupported relocation type for imports %d\n", REL_TYPE);
++		return UT64_MAX;
++	}
++}
+ 
+-	RBinElfSection *plt_section = get_section_by_name (bin, ".plt");
++static ut64 get_import_addr_x86(ELFOBJ *bin, struct ht_rel_t *rel, RBinElfSection *plt_section) {
++	ut64 plt_addr, plt_sym_addr = -1;
++	ut8 buf[sizeof (Elf_(Addr))];
++	int len;
+ 
+-	int of = REL_OFFSET - got_addr + got_offset;
+-	switch (bin->ehdr.e_machine) {
+-	case EM_PPC:
+-	case EM_PPC64: {
+-		RBinElfSection *s = plt_section;
+-		if (s) {
+-			ut8 buf[4] = { 0 };
+-			

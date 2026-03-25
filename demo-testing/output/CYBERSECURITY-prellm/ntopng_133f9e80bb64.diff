@@ -1,0 +1,110 @@
+@@ -39,7 +39,7 @@ class ThreadedActivity {
+   bool thread_started;
+   bool systemTaskRunning;
+   bool reuse_vm;
+-  bool *interfaceTasksRunning;
++  ThreadedActivityState *interfaceTasksRunning;
+   Mutex m;
+   ThreadPool *pool;
+   ThreadedActivityStats **threaded_activity_stats;
+@@ -54,10 +54,14 @@ class ThreadedActivity {
+   void uSecDiffPeriodicActivityBody();
+   void schedulePeriodicActivity(ThreadPool *pool, time_t deadline);
+   ThreadedActivityStats *getThreadedActivityStats(NetworkInterface *iface, bool allocate_if_missing);
++  ThreadedActivityState *getThreadedActivityState(NetworkInterface *iface) const;
+   void updateThreadedActivityStatsBegin(NetworkInterface *iface, struct timeval *begin);
+   void updateThreadedActivityStatsEnd(NetworkInterface *iface, u_long latest_duration);
+   void reloadVm(const char *ifname);
+   LuaEngine* loadVm(char *script_path, NetworkInterface *iface, time_t when);
++  void set_state(NetworkInterface *iface, ThreadedActivityState ta_state);
++  static const char* get_state_label(ThreadedActivityState ta_state);
++  ThreadedActivityState get_state(NetworkInterface *iface) const;
+ 
+  public:
+   ThreadedActivity(const char* _path,		   
+@@ -81,8 +85,10 @@ class ThreadedActivity {
+   void setNextVmReload(time_t when);
+ 
+   void run();
+-  bool isRunning(const NetworkInterface *iface) const;
+-  void setRunning(NetworkInterface *iface, bool running);
++  void set_state_sleeping(NetworkInterface *iface);
++  void set_state_queued(NetworkInterface *iface);
++  void set_state_running(NetworkInterface *iface);
++  bool isQueueable(NetworkInterface *iface) const;
+   bool isDeadlineApproaching(time_t deadline) const;
+ 
+   void lua(NetworkInterface *iface, lua_State *vm, bool reset_after_get);
+
+
+
+
+@@ -440,6 +440,13 @@ typedef enum {
+   hash_entry_state_idle,
+ } HashEntryState;
+ 
++typedef enum {
++  threaded_activity_state_unknown = -1,
++  threaded_activity_state_sleeping,
++  threaded_activity_state_queued,
++  threaded_activity_state_running,
++} ThreadedActivityState;
++
+ typedef enum {
+   device_proto_allowed = 0,
+   device_proto_forbidden_master,
+
+
+
+
+@@ -99,8 +99,9 @@ void ThreadPool::run() {
+       break;
+     } else {
+       Utils::setThreadName(q->script_path);
++      q->j->set_state_running(q->iface);
+       q->j->runScript(q->script_path, q->iface, q->deadline);
+-      q->j->setRunning(q->iface, false);
++      q->j->set_state_sleeping(q->iface);
+       delete q;
+     }
+   }
+@@ -118,8 +119,8 @@ bool ThreadPool::queueJob(ThreadedActivity *ta, char *path, NetworkInterface *if
+   if(isTerminating())
+     return(false);
+ 
+-  if(ta->isRunning(iface))
+-    return(false); /* Task still running, don't re-queue it */
++  if(!ta->isQueueable(iface))
++    return(false); /* Task still running or already queued, don't re-queue it */
+ 
+   q = new QueuedThreadData(ta, path, iface, deadline);
+ 
+@@ -130,7 +131,7 @@ bool ThreadPool::queueJob(ThreadedActivity *ta, char *path, NetworkInterface *if
+ 
+   m->lock(__FILE__, __LINE__);
+   threads.push(q);
+-  ta->setRunning(iface, true);
++  ta->set_state_queued(iface);
+   pthread_cond_signal(&condvar);
+   m->unlock(__FILE__, __LINE__);
+ 
+
+
+
+
+@@ -47,7 +47,7 @@ ThreadedActivity::ThreadedActivity(const char* _path,
+   reuse_vm = _reuse_vm;
+   thread_started = false, systemTaskRunning = false;
+   path = strdup(_path); /* ntop->get_callbacks_dir() */;
+-  interfaceTasksRunning = (bool *) calloc(MAX_NUM_INTERFACE_IDS, sizeof(bool));
++  interfaceTasksRunning = (ThreadedActivityState*) calloc(MAX_NUM_INTERFACE_IDS + 1 /* For the system interface */, sizeof(ThreadedActivityState));
+   threaded_activity_stats = new (std::nothrow) ThreadedActivityStats*[MAX_NUM_INTERFACE_IDS + 1 /* For the system interface */]();
+   pool = _pool;
+   setDeadlineApproachingSecs();
+@@ -127,47 +127,106 @@ bool ThreadedActivity::isTerminating() {
+ 
+ /* ******************************************* */
+ 
+-bool ThreadedActivity::isRunning(const NetworkInterface *iface) const {
+-  if(iface == ntop->getSystemInterface())
+-    

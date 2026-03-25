@@ -1,0 +1,130 @@
+@@ -49,13 +49,6 @@ class SNMPSession {
+   SNMPSession();
+   ~SNMPSession();
+ };
+-
+-//constant for trap collection
+-#define TRAP_PORT  "udp:162"
+-#define APPLICATION "ntopng snmp trap"
+-//callback
+-int read_snmp_trap(int operation, struct snmp_session *sp, int reqid,
+-                    struct snmp_pdu *pdu, void *magic);
+ #endif
+ 
+ class SNMP {
+@@ -67,10 +60,11 @@ class SNMP {
+   /* Variables below are used for the async check */
+   lua_State *vm;
+   //trap variables
++  netsnmp_transport *trap_transport;
+   SNMPSession *trap_session; 
+-  netsnmp_transport *snmpTransport;
+-  netsnmp_session* rc;
+-  volatile bool cease_collecting_trap;
++  netsnmp_session *trap_session_internal;
++  pthread_t trap_loop;
++  bool trap_collection_running;
+ #else
+   int udp_sock;
+   u_int32_t request_id;
+@@ -95,8 +89,6 @@ class SNMP {
+  public:
+   SNMP();
+   ~SNMP();
+-
+-
+   
+ #ifdef HAVE_LIBSNMP
+   void handle_async_response(struct snmp_pdu *pdu, const char *agent_ip);
+@@ -113,13 +105,21 @@ class SNMP {
+                            char *oid[SNMP_MAX_NUM_OIDS],
+                            char value_types[SNMP_MAX_NUM_OIDS],
+                            char *values[SNMP_MAX_NUM_OIDS], bool _batch_mode);
+-  //
+-  void handle_trap(struct snmp_pdu*pdu);
+-  //call to commence trap collection
+-  void collectTraps(int timeout);
+-  //call to cease trap collection
+-  void cease_trap_collection();
++
++  // Call to commence trap collection
++  void startTrapCollection();
++  // Call to cease trap collection
++  void stopTrapCollection();
++  // Call to check if trap collection is active
++  bool isTrapCollectionRunning();
++  // Trap collection loop
++  void trapCollection();
++  // Handle traps
++  void handleTrap(struct snmp_pdu *pdu);
++  // Release trap session data structures
++  void releaseTrapSession();
+ #endif
++
+   void send_snmpv1v2c_request(char *agent_host, char *community,
+                               snmp_pdu_primitive pduType, u_int version,
+                               char *oid[SNMP_MAX_NUM_OIDS], bool _batch_mode);
+
+
+
+
+@@ -30,6 +30,7 @@ extern "C" {
+ 
+ #ifdef HAVE_LIBSNMP
+ 
++/* ******************************* */
+ /* ******************************* */
+ 
+ SNMPSession::SNMPSession() { session_ptr = NULL; }
+@@ -47,7 +48,16 @@ SNMP::SNMP() {
+   if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[new] %s", __FILE__);
+   batch_mode = false;
+ #ifdef HAVE_LIBSNMP
+-  init_snmp("ntopng");  
++  init_snmp("ntopng");
++
++  trap_transport = NULL;
++  trap_session = NULL;
++  trap_session_internal = NULL;
++  trap_collection_running = false;
++#if 0
++  startTrapCollection();
++#endif
++
+ #endif
+   getbulk_max_num_repetitions = 10;
+ }
+@@ -56,9 +66,9 @@ SNMP::SNMP() {
+ 
+ SNMP::~SNMP() {
+   for (unsigned int i = 0; i < sessions.size(); i++) delete sessions.at(i);
+-  if(trap_session) delete trap_session;
+-  if(snmpTransport)  netsnmp_transport_free(snmpTransport);
+-  if(rc)  netsnmp_free(rc);
++#ifdef HAVE_LIBSNMP
++  releaseTrapSession();
++#endif
+ }
+ 
+ /* ******************************* */
+@@ -1127,129 +1137,199 @@ int SNMP::snmp_get_fctn(lua_State *vm, snmp_pdu_primitive pduType,
+ /* ******************************************* */
+ #ifdef HAVE_LIBSNMP
+ 
+-  void SNMP::collectTraps(int timeout) {
+-    this->snmpTransport = netsnmp_transport_open_server(APPLICATION,TRAP_PORT);
+-    if(this->snmpTransport == NULL){
+-      ntop->getTrace()->traceEvent(TRACE_ERROR,__FILE__,__LINE__,"opening snmp transport failed\n");
+-      snmp_perror("netsnmp_transport_open_server ");
+-      return;
+-    }
+-    //trap session
+-    this->trap_session = new  (std::nothrow)  SNMPSession;
+-    if(this->trap_session == NULL){
+-      ntop->getTrace()->traceEvent(TRACE_ERROR,__FILE__,__LINE__,"new trap session failed\n");
+-      netsnmp_transport_free(this->snmpTransport);
+-    }
+-    snmp_sess_init(&this->trap_session->session);
+-    this->trap_session->session.callback = read_snmp_trap;
+-    this->trap_session->session.callback_magic = (void *) this;
+-    this->trap_session->session.authent

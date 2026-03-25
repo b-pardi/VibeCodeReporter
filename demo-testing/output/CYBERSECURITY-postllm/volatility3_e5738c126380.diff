@@ -1,0 +1,107 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,241 @@
++import datetime
++import logging
++import string
++from itertools import chain
++from typing import Dict, Iterable, List
++
++from volatility3.framework import constants, exceptions, renderers
++from volatility3.framework.configuration import requirements
++from volatility3.framework.interfaces import plugins
++from volatility3.framework.renderers import format_hints
++from volatility3.framework.symbols.windows import extensions
++from volatility3.plugins.windows import handles, pslist, psscan, thrdscan
++
++vollog = logging.getLogger(__name__)
++
++
++class PsXView(plugins.PluginInterface):
++    """Lists all processes found via four of the methods described in \"The Art of Memory Forensics\" which may help \
++identify processes that are trying to hide themselves.
++
++We recommend using -r pretty if you are looking at this plugin's output in a terminal."""
++
++    # I've omitted the desktop thread scanning method because Volatility3 doesn't appear to have the functionality
++    # which the original plugin used to do it.
++
++    # The sessions method is omitted because it begins with the list of processes found by Pslist anyway.
++
++    # Lastly, I've omitted the pspcid method because I could not for the life of me get it to work. I saved the
++    # code I do have from it, and will happily share it if anyone else wants to add it.
++
++    _required_framework_version = (2, 0, 0)
++    _version = (1, 0, 0)
++
++    valid_proc_name_chars = set(
++        string.ascii_lowercase + string.ascii_uppercase + "." + " "
++    )
++
++    @classmethod
++    def get_requirements(cls):
++        return [
++            requirements.ModuleRequirement(
++                name="kernel",
++                description="Windows kernel",
++                architectures=["Intel32", "Intel64"],
++            ),
++            requirements.VersionRequirement(
++                name="pslist", component=pslist.PsList, version=(3, 0, 0)
++            ),
++            requirements.VersionRequirement(
++                name="psscan", component=psscan.PsScan, version=(2, 0, 0)
++            ),
++            requirements.VersionRequirement(
++                name="thrdscan", component=thrdscan.ThrdScan, version=(2, 0, 0)
++            ),
++            requirements.VersionRequirement(
++                name="handles", component=handles.Handles, version=(4, 0, 0)
++            ),
++            requirements.BooleanRequirement(
++                name="physical-offsets",
++                description="List processes with physical offsets instead of virtual offsets.",
++                optional=True,
++            ),
++        ]
++
++    def _proc_name_to_string(self, proc):
++        return proc.ImageFileName.cast(
++            "string", max_length=proc.ImageFileName.vol.count, errors="replace"
++        )
++
++    def _is_valid_proc_name(self, string: str) -> bool:
++        return all(c in self.valid_proc_name_chars for c in string)
++
++    def _filter_garbage_procs(
++        self, proc_list: Iterable[extensions.EPROCESS]
++    ) -> List[extensions.EPROCESS]:
++        return [
++            p
++            for p in proc_list
++            if p.is_valid() and self._is_valid_proc_name(self._proc_name_to_string(p))
++        ]
++
++    def _translate_offset(self, offset: int) -> int:
++        if not self.config["physical-offsets"]:
++            return offset
++
++        kernel = self.context.modules[self.config["kernel"]]
++        layer_name = kernel.layer_name
++
++        try:
++            _original_offset, _original_length, offset, _length, _layer_name = list(
++                self.context.layers[layer_name].mapping(offset=offset, length=0)
++            )[0]
++        except exceptions.PagedInvalidAddressException:
++            vollog.debug(f"Page fault: unable to translate {offset:0x}")
++
++        return offset
++
++    def _proc_list_to_dict(
++        self, tasks: Iterable[extensions.EPROCESS]
++    ) -> Dict[int, extensions.EPROCESS]:
++        tasks = self._filter_garbage_procs(tasks)
++       

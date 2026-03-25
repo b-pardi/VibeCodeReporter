@@ -1,0 +1,118 @@
+@@ -6,15 +6,17 @@ debugging a remote process over SSH or similar, where e.g.
+ 
+ from __future__ import annotations
+ 
+-import binascii
+ import os
+ import shutil
+ import tempfile
++from typing import Iterator
++from typing import Tuple
+ 
+ import pwndbg.aglib.proc
+ import pwndbg.aglib.qemu
+ import pwndbg.aglib.remote
+-from pwndbg.color import message
++import pwndbg.color.message as M
++import pwndbg.lib.cache
+ 
+ _remote_files_dir = None
+ 
+@@ -43,6 +45,29 @@ def get_proc_exe_file() -> str:
+     return get_file(pwndbg.aglib.proc.exe, try_local_path=True)
+ 
+ 
++@pwndbg.lib.cache.cache_until("start")
++def can_download_remote_file() -> bool:
++    if not pwndbg.aglib.remote.is_remote():
++        return False
++    elif pwndbg.aglib.qemu.is_qemu_kernel():
++        return False
++
++    # Some[1] gdb servers don't implement vFile packets.
++    # [1] - qemu-user <8.1
++    # [1] - Rosetta2
++    # [1] - maybe embedded probe like: `Black Magic Probe V2.3`
++    # WTF: There is no indication in `qSupported` when `vFile` packets are supported
++    # Probe and check what it returns
++    try:
++        vfile_open("", 0, 0)
++    except OSError:
++        return True
++    except NotImplementedError:
++        return False
++
++    return False
++
++
+ def get_file(path: str, try_local_path: bool = False) -> str:
+     """
+     Downloads the specified file from the system where the current process is
+@@ -65,28 +90,30 @@ def get_file(path: str, try_local_path: bool = False) -> str:
+         path = path[7:]  # len('target:') == 7
+ 
+     local_path = path
+-    qemu_root = pwndbg.aglib.qemu.root()
++    if not pwndbg.aglib.remote.is_remote():
++        return local_path
+ 
+-    if qemu_root:
+-        return os.path.join(qemu_root, path)
++    if try_local_path and not has_target_prefix and os.path.exists(local_path):
++        return local_path
+ 
+-    elif pwndbg.aglib.remote.is_remote():
+-        if not pwndbg.aglib.qemu.is_qemu():
+-            if try_local_path and not has_target_prefix and os.path.exists(local_path):
+-                return local_path
+-            local_path = tempfile.mktemp(dir=remote_files_dir())
+-            try:
+-                pwndbg.dbg.selected_inferior().download_remote_file(path, local_path)
+-            except pwndbg.dbg_mod.Error as e:
+-                # This module originally raised this as an OSError.
+-                raise OSError(e)
+-        else:
+-            print(
+-                message.warn(
+-                    f"pwndbg.aglib.file.get_file({path}) returns local path as we can't download file from QEMU"
+-                )
++    if can_download_remote_file():
++        local_path = tempfile.mktemp(dir=remote_files_dir())
++        try:
++            pwndbg.dbg.selected_inferior().download_remote_file(path, local_path)
++        except pwndbg.dbg_mod.Error as e:
++            # This module originally raised this as an OSError.
++            raise OSError(e)
++    else:
++        print(
++            M.warn(
++                f"pwndbg.aglib.file.get_file({path}) returns local path as we can't download file"
+             )
++        )
+ 
++    # FIXME: get_sysroot, if nonempty only then get-local-file by default
++    #   GDB is only getting local files when `set sysroot /` in remote debugging
++    #   So we should show warning to user `set sysroot /` and remote debugging will be faster?
++    # TODO: don't fallback to local filesystem
+     return local_path
+ 
+ 
+@@ -107,72 +134,138 @@ def get(path: str) -> bytes:
+         return b""
+ 
+ 
+-def readlink(path):
++def readlink(path: str) -> str:
+     """readlink(path) -> str
+ 
+     Read the link specified by 'path' on the system being debugged.
+ 
+     Handles local, qemu-usermode, and remote debugging cases.
+     """
+-    is_qemu = pwndbg.aglib.qemu.is_qemu_usermode()
+-
+-    if is_qemu:
+-        if not os.path.exists(path):
+-            # The or "" is needed since .root() may return None
+-            # Then we just use the path (it can also be absolute too)
+-            path = os.path.join(pwndbg.aglib.qemu

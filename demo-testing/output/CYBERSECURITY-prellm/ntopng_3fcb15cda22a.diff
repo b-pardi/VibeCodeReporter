@@ -1,0 +1,96 @@
+@@ -257,6 +257,7 @@ class Flow : public GenericHashEntry {
+   inline char* getBitTorrentHash() { return(bt_hash);          };
+   inline void  setBTHash(char *h)  { if(!h) return; if(bt_hash) { free(bt_hash); bt_hash = NULL; }; bt_hash = strdup(h); }
+   inline void  setServerName(char *v)  { if(host_server_name) free(host_server_name);  host_server_name = strdup(v); }
++  void setTcpFlags(u_int8_t flags, bool src2dst_direction);
+   void updateTcpFlags(const struct bpf_timeval *when,
+ 		      u_int8_t flags, bool src2dst_direction);
+   void incTcpBadStats(bool src2dst_direction,
+@@ -430,8 +431,17 @@ class Flow : public GenericHashEntry {
+   inline void      setVRFid(u_int32_t v)  { vrfId = v;                              }
+ 
+   inline void setFlowNwLatency(const struct timeval * const tv, bool client) {
+-    if(client) memcpy(&clientNwLatency, tv, sizeof(*tv));
+-    else memcpy(&serverNwLatency, tv, sizeof(*tv));
++    if(client) {
++      memcpy(&clientNwLatency, tv, sizeof(*tv));
++      if(cli_host) cli_host->updateRoundTripTime(Utils::timeval2ms(&clientNwLatency));
++    } else {
++      memcpy(&serverNwLatency, tv, sizeof(*tv));
++      if(srv_host) srv_host->updateRoundTripTime(Utils::timeval2ms(&serverNwLatency));
++    }
++  }
++  inline void setRtt() {
++    rttSec = ((float)(serverNwLatency.tv_sec + clientNwLatency.tv_sec))
++      +((float)(serverNwLatency.tv_usec + clientNwLatency.tv_usec)) / (float)1000000;
+   }
+   inline void setFlowApplLatency(float latency_msecs) { applLatencyMsec = latency_msecs; }
+   inline bool      setFlowDevice(u_int32_t device_ip, u_int16_t inidx, u_int16_t outidx) {
+
+
+
+
+@@ -221,7 +221,7 @@ class Host : public GenericHashEntry {
+   virtual void  serialize2redis() {};
+   bool addIfMatching(lua_State* vm, AddressTree * ptree, char *key);
+   bool addIfMatching(lua_State* vm, u_int8_t *mac);
+-  void updateSynFlags(time_t when, u_int8_t flags, Flow *f, bool syn_sent);
++  void updateSynAlertsCounter(time_t when, u_int8_t flags, Flow *f, bool syn_sent);
+   inline void updateRoundTripTime(u_int32_t rtt_msecs) {
+     if(as) as->updateRoundTripTime(rtt_msecs);
+   }
+
+
+
+
+@@ -158,11 +158,13 @@
+ #define DST_AS_MAP  NTOP_BASE_ID+444
+ #define NPROBE_IPV4_ADDRESS  NTOP_BASE_ID+471 /* Exported only via ZMQ */
+ /* NTOP_BASE_ID+82 ->87  Available (deprecated) */
+-#define NUM_PKTS_UP_TO_128_BYTES   NTOP_BASE_ID+88
++#define CLIENT_TCP_FLAGS            NTOP_BASE_ID+78
++#define SERVER_TCP_FLAGS            NTOP_BASE_ID+79
++#define NUM_PKTS_UP_TO_128_BYTES    NTOP_BASE_ID+88
+ #define NUM_PKTS_128_TO_256_BYTES   NTOP_BASE_ID+89
+ #define NUM_PKTS_256_TO_512_BYTES   NTOP_BASE_ID+90
+-#define NUM_PKTS_512_TO_1024_BYTES   NTOP_BASE_ID+91
+-#define NUM_PKTS_1024_TO_1514_BYTES   NTOP_BASE_ID+92
++#define NUM_PKTS_512_TO_1024_BYTES  NTOP_BASE_ID+91
++#define NUM_PKTS_1024_TO_1514_BYTES NTOP_BASE_ID+92
+ #define NUM_PKTS_OVER_1514_BYTES   NTOP_BASE_ID+93
+ #define CUMULATIVE_ICMP_TYPE NTOP_BASE_ID+98
+ #define SRC_IP_COUNTRY   NTOP_BASE_ID+101
+
+
+
+
+@@ -189,10 +189,11 @@ typedef struct zmq_flow_core {
+   u_int16_t src_port, dst_port, inIndex, outIndex;
+   ndpi_proto l7_proto;
+   u_int16_t vlan_id, pkt_sampling_rate;
+-  u_int8_t l4_proto, tcp_flags;
++  u_int8_t l4_proto;
+   u_int32_t in_pkts, in_bytes, out_pkts, out_bytes, vrfId;
+   u_int8_t absolute_packet_octet_counters;
+   struct {
++    u_int8_t tcp_flags, client_tcp_flags, server_tcp_flags;
+     u_int32_t ooo_in_pkts, ooo_out_pkts;
+     u_int32_t retr_in_pkts, retr_out_pkts;
+     u_int32_t lost_in_pkts, lost_out_pkts;
+
+
+
+
+@@ -2412,18 +2412,59 @@ void Flow::addFlowStats(bool cli2srv_direction,
+       pkts_thpt = (cli2srv_packets + srv2cli_packets) / (float)(last_seen - first_seen);
+   }
+ }
++/* *************************************** */
++
++void Flow::setTcpFlags(u_int8_t flags, bool src2dst_direction) {
++  if(iface->isPacketInterface())
++    return; /* Use updateTcpFlags for packet interfaces */
++
++  iface->incFlagsStats(flags);
++
++  if(cli_host) cli_host->incFlagStats(src2dst_direction, flags)

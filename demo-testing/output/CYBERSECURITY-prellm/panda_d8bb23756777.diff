@@ -1,0 +1,111 @@
+@@ -10,10 +10,10 @@
+ #include "tcg.h"
+ 
+ /**
+- * Search the TCG context for the first guest instruction marker and return a
++ * Search the TCG context for the guest instruction marker at index and return a
+  * pointer to it.
+  */
+-TCGOp *find_first_guest_insn();
++TCGOp *find_guest_insn(int index);
+ 
+ /**
+  * Template that converts host pointers to TCG constants. Not really intended
+@@ -30,6 +30,19 @@ intptr_t insert_tcg_tmp(TCGOp **after_op, A *value)
+     return GET_TCGV_I64(tmp);
+ }
+ 
++/**
++ * Template that converts uin64_t to a TCG constants. Not really inteded to be called directly.*/
++template<typename A>
++intptr_t insert_tcg_tmp(TCGOp **after_op, A value)
++{
++    auto tmp = tcg_temp_new_i64();
++    *after_op = tcg_op_insert_after(&tcg_ctx, *after_op, INDEX_op_movi_i64, 2);
++    TCGArg *store_args = &tcg_ctx.gen_opparam_buf[(*after_op)->args];
++    store_args[0] = GET_TCGV_I64(tmp);
++    store_args[1] = static_cast<TCGArg>(value);
++    return GET_TCGV_I64(tmp);
++}
++
+ /**
+  * Base case for call argument insertion. Not really intended to be called
+  * directly.
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,379 @@
++#include <cstddef>
++#include <iostream>
++#include <memory>
++#include <unordered_map>
++#include <unordered_set>
++
++#include <capstone/capstone.h>
++
++#include "Block.h"
++#include "Edge.h"
++#include "EdgeInstrumentationPass.h"
++#include "RecordProcessor.h"
++
++#include "osi/osi_types.h"
++#include "osi/osi_ext.h"
++
++#include "panda/tcg-utils.h"
++
++namespace coverage
++{
++
++using RegisterFetcher = std::function<target_ulong()>;
++
++#ifdef TARGET_I386
++static target_ulong fetch_register_value(size_t cpu_offset, target_ulong mask, target_ulong shr)
++{
++    CPUArchState *env = static_cast<CPUArchState *>(first_cpu->env_ptr);
++    return (*(reinterpret_cast<target_ulong *>((env + cpu_offset))) & mask) >> shr;
++}
++#define MK_REG_FETCHER(cpu_state_variable, mask, shift_right) std::bind(fetch_register_value, offsetof(CPUArchState, cpu_state_variable), mask, shift_right)
++
++#endif
++
++std::unordered_map<x86_reg, RegisterFetcher> CS_TO_QEMU_REG_FETCH = {
++#ifdef TARGET_I386
++    { X86_REG_AH, MK_REG_FETCHER(regs[R_EAX], 0x0000FF00, 8) },
++    { X86_REG_AL, MK_REG_FETCHER(regs[R_EAX], 0x000000FF, 0) },
++    { X86_REG_AX, MK_REG_FETCHER(regs[R_EAX], 0x0000FFFF, 0) },
++    { X86_REG_EAX, MK_REG_FETCHER(regs[R_EAX], 0xFFFFFFFF, 0) },
++
++    { X86_REG_BH, MK_REG_FETCHER(regs[R_EBX], 0x0000FF00, 8) },
++    { X86_REG_BL, MK_REG_FETCHER(regs[R_EBX], 0x000000FF, 0) },
++    { X86_REG_BX, MK_REG_FETCHER(regs[R_EBX], 0x0000FFFF, 0) },
++    { X86_REG_EBX, MK_REG_FETCHER(regs[R_EBX], 0xFFFFFFFF, 0) },
++
++    { X86_REG_CH, MK_REG_FETCHER(regs[R_ECX], 0x0000FF00, 8) },
++    { X86_REG_CL, MK_REG_FETCHER(regs[R_ECX], 0x000000FF, 0) },
++    { X86_REG_CX, MK_REG_FETCHER(regs[R_ECX], 0x0000FFFF, 0) },
++    { X86_REG_ECX, MK_REG_FETCHER(regs[R_ECX], 0xFFFFFFFF, 0) },
++
++    { X86_REG_DH, MK_REG_FETCHER(regs[R_ECX], 0x0000FF00, 8) },
++    { X86_REG_DL, MK_REG_FETCHER(regs[R_ECX], 0x000000FF, 0) },
++    { X86_REG_DX, MK_REG_FETCHER(regs[R_ECX], 0x0000FFFF, 0) },
++    { X86_REG_EDX, MK_REG_FETCHER(regs[R_ECX], 0xFFFFFFFF, 0) },
++
++    { X86_REG_ESI, MK_REG_FETCHER(regs[R_ESI], 0xFFFFFFFF, 0) },
++
++    { X86_REG_EDI, MK_REG_FETCHER(regs[R_EDI], 0xFFFFFFFF, 0) },
++
++    { X86_REG_SP, MK_REG_FETCHER(regs[R_ESP], 0x0000FFFF, 0) },
++    { X86_REG_ESP, MK_REG_FETCHER(regs[R_ESP], 0xFFFFFFFF, 0) },
++
++    { X86_REG_BP, MK_REG_FETCHER(regs[R_EBP], 0x0000FFFF, 0) },
++    { X86_REG_EBP, MK_REG_FETCHER(regs[R_EBP], 0xFFFFFFFF, 0) },
++
++#ifdef TARGET_X86_64
++    { X86_REG_RAX, MK_REG_FETCHER(regs[R_EAX], 0xFFFFFFFFFFFFFFFF, 0) },
++    { X86_REG_RBX, MK_REG_FETCHER(regs[R_EBX], 0xFFFFFFFFFFFFFFFF, 0) },
++    { X86_REG_RCX, MK_REG_FETCHER(regs[R_ECX], 0xFFFFFFFFFFFFFFFF, 0) },
++    { X86_REG_RDX, MK_REG_FETCHER(regs[R_EDX], 0xFFFFFFFFFFFFFFFF, 0) },
++    { X86_REG_RBP, MK_REG_FETCHER(regs[R_EBP], 0xFFFFFFFFFFFFFFFF, 0) },
++    { X86_REG_R9, MK_REG_FETCHER(regs[9], 0xFFFFFFFFFFFFF

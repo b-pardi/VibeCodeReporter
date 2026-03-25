@@ -1,0 +1,133 @@
+@@ -37,6 +37,9 @@
+ #include <regex.h>
+ #endif
+ 
++#include <fstream>
++#include <type_traits>
++
+ static pthread_mutex_t timer_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t timer = PTHREAD_COND_INITIALIZER;
+ static const char* secure_erase_cmdline = NULL;
+@@ -519,115 +522,150 @@ int DeletePidFile(char* dir, const char* progname, int port)
+   return 1;
+ }
+ 
+-struct s_state_hdr {
++struct StateFileHeader {
+   char id[14];
+   int32_t version;
+   uint64_t last_jobs_addr;
+-  uint64_t reserved[20];
++  uint64_t end_of_recent_job_results_list;
++  uint64_t reserved[19];
+ };
+ 
+-static struct s_state_hdr state_hdr = {"Bareos State\n", 4, 0};
++static struct StateFileHeader state_hdr = {{"Bareos State\n"}, 4, 0, 0, {0}};
+ 
+-/*
+- * Open and read the state file for the daemon
+- */
+-void ReadStateFile(char* dir, const char* progname, int port)
++static bool CheckHeader(const StateFileHeader& hdr)
+ {
+-  int sfd;
+-  ssize_t status;
+-  bool ok = false;
+-  POOLMEM* fname = GetPoolMemory(PM_FNAME);
+-  struct s_state_hdr hdr;
+-  int hdr_size = sizeof(hdr);
+-
+-  Mmsg(fname, "%s/%s.%d.state", dir, progname, port);
+-  /*
+-   * If file exists, see what we have
+-   */
+-  if ((sfd = open(fname, O_RDONLY | O_BINARY)) < 0) {
+-    BErrNo be;
+-    Dmsg3(010, "Could not open state file. sfd=%d size=%d: ERR=%s\n", sfd,
+-          sizeof(hdr), be.bstrerror());
+-    goto bail_out;
+-  }
+-  if ((status = read(sfd, &hdr, hdr_size)) != hdr_size) {
+-    BErrNo be;
+-    Dmsg4(010, "Could not read state file. sfd=%d status=%d size=%d: ERR=%s\n",
+-          sfd, (int)status, hdr_size, be.bstrerror());
+-    goto bail_out;
+-  }
+   if (hdr.version != state_hdr.version) {
+-    Dmsg2(010, "Bad hdr version. Wanted %d got %d\n", state_hdr.version,
++    Dmsg2(100, "Bad hdr version. Wanted %d got %d\n", state_hdr.version,
+           hdr.version);
+-    goto bail_out;
++    return false;
+   }
+-  hdr.id[13] = 0;
+-  if (!bstrcmp(hdr.id, state_hdr.id)) {
+-    Dmsg0(000, "State file header id invalid.\n");
+-    goto bail_out;
++
++  if (strncmp(hdr.id, state_hdr.id, sizeof(hdr.id))) {
++    Dmsg0(100, "State file header id invalid.\n");
++    return false;
+   }
++  return true;
++}
+ 
+-  if (!RecentJobResultsList::ImportFromFile(sfd, hdr.last_jobs_addr)) { goto bail_out; }
+-  ok = true;
+-bail_out:
+-  if (sfd >= 0) { close(sfd); }
++class SecureEraseGuard {
++  std::string filename;
++  bool cleanup = true;
+ 
+-  if (!ok) { SecureErase(NULL, fname); }
++ public:
++  SecureEraseGuard(const std::string& fname_in) : filename(fname_in) {}
++  ~SecureEraseGuard()
++  {
++    if (cleanup) { SecureErase(nullptr, filename.c_str()); }
++  }
++  void Release() { cleanup = false; }
++};
+ 
+-  FreePoolMemory(fname);
++static std::string CreateFileNameFrom(char* dir, const char* progname, int port)
++{
++  int amount = snprintf(nullptr, 0, "%s/%s.%d.state", dir, progname, port) + 1;
++  std::vector<char> filename(amount);
++  snprintf(filename.data(), amount, "%s/%s.%d.state", dir, progname, port);
++  return std::string(filename.data());
+ }
+ 
+-/*
+- * Write the state file
+- */
+-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+-
+-void WriteStateFile(char* dir, const char* progname, int port)
++void ReadStateFile(char* dir, const char* progname, int port)
+ {
+-  int sfd;
+-  bool ok = false;
+-  POOLMEM* fname = GetPoolMemory(PM_FNAME);
+-
+-  P(state_mutex); /* Only one job at a time can call here */
+-  Mmsg(fname, "%s/%s.%d.state", dir, progname, port);
+-
+-  /*
+-   * Create new state file
+-   */
+-  SecureErase(NULL, fname);
+-  if ((sfd = open(fname, O_CREAT | O_WRONLY | O_BINARY, 0640)) < 0) {
++  std::string filename = CreateFileNameFrom(dir, progname, port);
++  SecureEraseGuard secure_erase_guard(filename.data());
++
++  static_assert(std::is_trivially_copyable<StateFileHeader>::value,
++                "StateFileHeader must be trivially copyable");
++  struct StateFileHeader hdr {
++    {0}, 0, 0, 0, { 0 }
++  };
++
++  std::ifstream file;
++  file.exceptions(file.exceptions() | std::ios::failbit | std::ios::badbit)

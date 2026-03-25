@@ -1,0 +1,131 @@
+@@ -246,8 +246,13 @@ void volume::update_config()
+   WriteFile(conf_fd.fileno(), serialized);
+ }
+ 
+-save_state volume::BeginBlock()
++save_state volume::BeginBlock(block_header header)
+ {
++  if (current_block) {
++    throw std::runtime_error(
++        "Trying to start new block before finishing last block.");
++  }
++
+   save_state s;
+ 
+   s.block_size = backing->blocks.size();
+@@ -255,16 +260,23 @@ save_state volume::BeginBlock()
+ 
+   for (auto& vec : backing->datafiles) { s.data_sizes.push_back(vec.size()); }
+ 
++  current_block.emplace(header);
++
+   return s;
+ }
+ 
+-void volume::CommitBlock(save_state s, block_header header)
++void volume::CommitBlock(save_state s)
+ {
++  if (!current_block) {
++    throw std::runtime_error("Cannot commit block that was not started.");
++  }
+   auto start = s.record_size;
+   auto count = backing->records.size() - s.record_size;
+-  backing->blocks.push_back(to_dedup(header, start, count));
++  backing->blocks.push_back(to_dedup(current_block.value(), start, count));
+ 
+   update_config();
++
++  current_block.reset();
+ }
+ 
+ void volume::AbortBlock(save_state s)
+@@ -272,9 +284,12 @@ void volume::AbortBlock(save_state s)
+   backing->blocks.resize_uninitialized(s.block_size);
+   backing->records.resize_uninitialized(s.record_size);
+   ASSERT(s.data_sizes.size() == backing->datafiles.size());
++
+   for (std::size_t i = 0; i < s.data_sizes.size(); ++i) {
+     backing->datafiles[i].resize_uninitialized(s.data_sizes[i]);
+   }
++
++  if (current_block) { current_block.reset(); }
+ }
+ 
+ void volume::PushRecord(record_header header,
+
+
+
+
+@@ -201,8 +201,8 @@ class volume {
+ 
+ 
+   // writing interface
+-  save_state BeginBlock();
+-  void CommitBlock(save_state save, block_header header);
++  save_state BeginBlock(block_header header);
++  void CommitBlock(save_state save);
+   void AbortBlock(save_state save);
+   void PushRecord(record_header header, const char* data, std::size_t size);
+ 
+@@ -221,6 +221,8 @@ class volume {
+   std::optional<data> backing;
+   void update_config();
+ 
++  std::optional<block_header> current_block;
++
+   struct record_space {
+     std::uint32_t FileIdx; /* in which data file was the space reserved */
+     std::uint32_t Size;    /* Size left of reserved space */
+
+
+
+
+@@ -132,14 +132,14 @@ ssize_t dedup_device::d_write(int dird, const void* data, size_t size)
+     dedup::volume* vol;
+     dedup::save_state save;
+ 
+-    raii_save_state(dedup::volume& opened_volume)
+-        : vol{&opened_volume}, save{opened_volume.BeginBlock()}
++    raii_save_state(dedup::volume& opened_volume, block_header header)
++        : vol{&opened_volume}, save{opened_volume.BeginBlock(header)}
+     {
+     }
+ 
+-    void commit(block_header hdr)
++    void commit()
+     {
+-      vol->CommitBlock(std::move(save), hdr);
++      vol->CommitBlock(std::move(save));
+       vol = nullptr;
+     }
+ 
+@@ -188,10 +188,6 @@ ssize_t dedup_device::d_write(int dird, const void* data, size_t size)
+     chunked_reader stream{data, size};
+ 
+     while (!stream.finished()) {
+-      // when save goes out of scope without being commited, it will get
+-      // aborted
+-      auto save = raii_save_state(openvol.value());
+-
+       block_header block;
+       if (!stream.read(&block, sizeof(block))) {
+         throw std::runtime_error("Could not read block header from stream.");
+@@ -199,6 +195,10 @@ ssize_t dedup_device::d_write(int dird, const void* data, size_t size)
+ 
+       auto blocksize = sizeof(block);
+ 
++      // when save goes out of scope without being commited, it will get
++      // aborted
++      auto save = raii_save_state(openvol.value(), block);
++
+       if (auto* block_data = stream.get(block.size()); !block_data) {
+         throw std::runtime_error("Could not read block data from stream.");
+       } else {
+@@ -222,7 +222,7 @@ ssize_t dedup_device::d_write(int dird, const void* data, size_t size)
+         }
+       }
+ 
+-      save.commit(block);
++      save.commit();
+       datawritten += blocksize;
+     }

@@ -1,0 +1,151 @@
+@@ -41,6 +41,7 @@ struct cali_ctlb_globals {
+ 
+ struct cali_xdp_globals {
+ 	__u8 iface_name[16];
++	__u32 jumps[16];
+ };
+ 
+ #endif /* __CALI_GLOBALS_H__ */
+
+
+
+
+@@ -8,6 +8,9 @@
+ struct ifstate_val {
+ 	__u32 flags;
+ 	char  name[16];
++	__s32 xdp_policy;
++	__s32 ingress_policy;
++	__s32 egress_policy;
+ };
+ 
+ CALI_MAP(cali_iface, 2,
+
+
+
+
+@@ -33,24 +33,37 @@ static CALI_BPF_INLINE struct cali_xdp_globals *state_get_globals_xdp(void)
+ 	return cali_state_lookup_elem(&key);
+ }
+ 
+-#define cali_jump_map map_symbol(cali_jump, 3)
++#if CALI_F_XDP
++
++#define cali_jump_map map_symbol(xdp_cali_progs, 2)
+ 
+ struct bpf_map_def_extended __attribute__((section("maps"))) cali_jump_map = {
+ 	.type = BPF_MAP_TYPE_PROG_ARRAY,
+ 	.key_size = 4,
+ 	.value_size = 4,
+-	.max_entries = 1100,
++	.max_entries = 200,
+ };
+ 
+-#if CALI_F_XDP
+-#define CALI_JUMP_TO(ctx, index) bpf_tail_call((ctx)->xdp, &cali_jump_map, index)
++#define CALI_JUMP_TO(ctx, index) bpf_tail_call((ctx)->xdp, &cali_jump_map, (ctx)->xdp_globals->jumps[index])
+ #else
+-#define CALI_JUMP_TO(ctx, index) bpf_tail_call((ctx)->skb, &cali_jump_map, (ctx)->globals->jumps[index])
++
++#define cali_jump_map map_symbol(cali_progs, 2)
++
++struct bpf_map_def_extended __attribute__((section("maps"))) cali_jump_map = {
++	.type = BPF_MAP_TYPE_PROG_ARRAY,
++	.key_size = 4,
++	.value_size = 4,
++	.max_entries = 200,
++};
++
++#define CALI_JUMP_TO(ctx, index) do {	\
++	CALI_DEBUG("jump to idx %d prog at %d\n", index, (ctx)->globals->jumps[index]);	\
++	bpf_tail_call((ctx)->skb, &cali_jump_map, (ctx)->globals->jumps[index]);	\
++} while (0)
+ #endif
+ 
+ /* Add new values to the end as these are program indices */
+ enum cali_jump_index {
+-	PROG_INDEX_PREAMBLE,
+ 	PROG_INDEX_MAIN,
+ 	PROG_INDEX_POLICY,
+ 	PROG_INDEX_ALLOWED,
+@@ -63,4 +76,35 @@ enum cali_jump_index {
+ 	PROG_INDEX_V6_ICMP,
+ 	PROG_INDEX_V6_DROP,
+ };
++
++#if CALI_F_XDP
++
++#define cali_policy_map map_symbol(xdp_cali_pols, 2)
++
++struct bpf_map_def_extended __attribute__((section("maps"))) cali_policy_map = {
++	.type = BPF_MAP_TYPE_PROG_ARRAY,
++	.key_size = 4,
++	.value_size = 4,
++	.max_entries = 100,
++};
++
++#define CALI_JUMP_TO_POLICY(ctx) bpf_tail_call((ctx)->xdp, &cali_policy_map, (ctx)->xdp_globals->jumps[PROG_INDEX_POLICY])
++#else
++
++#define cali_policy_map map_symbol(cali_pols, 2)
++
++struct bpf_map_def_extended __attribute__((section("maps"))) cali_policy_map = {
++	.type = BPF_MAP_TYPE_PROG_ARRAY,
++	.key_size = 4,
++	.value_size = 4,
++	.max_entries = 1100,
++};
++
++#define CALI_JUMP_TO_POLICY(ctx) do {	\
++	CALI_DEBUG("jump to policy prog at %d\n", (ctx)->globals->jumps[PROG_INDEX_POLICY]);		\
++	bpf_tail_call((ctx)->skb, &cali_policy_map, (ctx)->globals->jumps[PROG_INDEX_POLICY]);	\
++} while (0)
++
++#endif
++
+ #endif /* __CALI_BPF_JUMP_H__ */
+
+
+
+
+@@ -74,7 +74,7 @@ static CALI_BPF_INLINE int parse_packet_ip(struct cali_tc_ctx *ctx) {
+ 	}
+ 
+ 	CALI_DEBUG("IP id=%d\n",bpf_ntohs(ip_hdr(ctx)->id)); 
+-	CALI_DEBUG("IP id=%d s=%x d=%x\n", bpf_ntohl(ip_hdr(ctx)->saddr), bpf_ntohl(ip_hdr(ctx)->daddr));
++	CALI_DEBUG("IP s=%x d=%x\n", bpf_ntohl(ip_hdr(ctx)->saddr), bpf_ntohl(ip_hdr(ctx)->daddr));
+ 	// Drop malformed IP packets
+ 	if (ip_hdr(ctx)->ihl < 5) {
+ 		CALI_DEBUG("Drop malformed IP packets\n");
+
+similarity index 58%
+rename from felix/bpf-gpl/policy_program.h
+rename to felix/bpf-gpl/policy_default.c
+
+
+
+@@ -1,5 +1,5 @@
+ // Project Calico BPF dataplane programs.
+-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
++// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ 
+ /*
+@@ -10,17 +10,19 @@
+  * before Felix replaces the policy program with its generated version.
+  */
+ 
+-#ifndef __CALI_POL_PROG_H__
+-#define __CALI_POL_PROG_H__
++#include <stdbool.h>
+ 
+-#ifndef CALI_NO_DEFAULT_POLICY_PROG
+-#ifdef CALI_DEBUG_ALLOW_ALL
++#include "bpf.h"
++#include "log.h"
++#include "types.h"
++#include "jump.h"
++#include "policy.h"
+ 
+ /* If we want to just compile the code without defining any policies and to
+  * avoid compiling out code 

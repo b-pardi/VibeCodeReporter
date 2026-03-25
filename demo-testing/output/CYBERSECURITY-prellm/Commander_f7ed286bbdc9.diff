@@ -1,0 +1,95 @@
+@@ -10,25 +10,27 @@
+ # Contact: ops@keepersecurity.com
+ #
+ 
++from typing import Optional, Callable, Iterator, List, Iterable, Tuple
++
+ import argparse
+ import logging
++import io
+ import os
+ import re
+ import shutil
+ import sys
+ import tempfile
+ 
+-from typing import Optional, Callable, Iterator
+-
+ from cryptography.hazmat.primitives import serialization
+ from cryptography.hazmat.primitives.asymmetric import rsa, ec, ed25519
+ 
+-from .base import Command
++from .base import Command, dump_report_data
+ from .record import find_record, RecordListCommand
+-from ..vault import TypedRecord
+ from ..attachment import prepare_attachment_download
+ from ..params import KeeperParams
+-from ..vault_extensions import SshKeysFacade, ServerCredentialsFacade, DatabaseCredentialsFacade, TypedRecordFacade
++from ..subfolder import find_folders, get_folder_path, try_resolve_path
++from ..vault import TypedRecord, KeeperRecord, PasswordRecord
++from ..vault_extensions import SshKeysFacade
+ 
+ ssh_parser = argparse.ArgumentParser(prog='ssh',
+                                      description='Establishes connection to external server using SSH. ')
+@@ -54,11 +56,22 @@ rdp_parser.add_argument('record', nargs='?', type=str, action='store',
+                         help='record path or UID. Record types: "Server"')
+ 
+ 
++connect_parser = argparse.ArgumentParser(prog='connect', description='Establishes connection to external server')
++connect_parser.add_argument('--syntax-help', dest='syntax_help', action='store_true',
++                            help='display help on command format and template parameters')
++connect_parser.add_argument('-n', '--new', dest='new_data', action='store_true', help='request per-user data')
++connect_parser.add_argument('-s', '--sort', dest='sort_by', action='store', choices=['endpoint', 'title', 'folder'],
++                            help='sort output')
++connect_parser.add_argument('-f', '--filter', dest='filter_by', action='store', help='filter output')
++connect_parser.add_argument('endpoint', nargs='?', action='store', type=str,
++                            help='endpoint name or full record path to endpoint')
++
+ mysql = ''
+ postgresql = ''
+ 
+ endpoint_parameter_pattern = re.compile(r'\${(.+?)}')
+ 
++
+ def detect_clients():
+     global mysql, postgresql
+     if shutil.which('mysql'):
+@@ -73,6 +86,7 @@ detect_clients()
+ 
+ 
+ def connect_commands(commands):
++    commands['connect'] = ConnectCommand()
+     commands['ssh'] = ConnectSshCommand()
+     if mysql:
+         commands['mysql'] = ConnectMysqlCommand()
+@@ -83,6 +97,7 @@ def connect_commands(commands):
+ 
+ 
+ def connect_command_info(aliases, command_info):
++    command_info[connect_parser.prog] = connect_parser.description
+     command_info[ssh_parser.prog] = ssh_parser.description
+     if mysql:
+         command_info['mysql'] = mysql_parser.description
+@@ -285,11 +300,12 @@ class BaseConnectCommand(Command):
+                     logging.debug(e)
+             self.run_at_the_end.clear()
+ 
+-    def get_extra_options(self, params, facade, application):
+-        record_options = facade.get_custom_field(f'{application}:option')
++    def get_extra_options(self, params, record, application):
++        # type: (KeeperParams, KeeperRecord, str) -> str
++        record_options = BaseConnectCommand.get_custom_field(record, f'{application}:option')
+         if record_options:
+             temp_files = []
+-            record_options = BaseConnectCommand.get_command_string(params, facade, record_options, temp_files)
++            record_options = BaseConnectCommand.get_command_string(params, record, record_options, temp_files)
+             if temp_files:
+                 def remove_files():
+                     for file in temp_files:
+@@ -326,11 +342,53 @@ class BaseConnectCommand(Command):
+         return record
+ 
+     @staticmethod
+-    def get_parameter_value(params, facade, parameter, temp_files):
+-        # type: (KeeperParams, TypedRecordFacade, str, list) -> Optional[str]
+-        if parameter

@@ -1,0 +1,109 @@
+@@ -1330,7 +1330,7 @@ TEST_F(TlsConnectDatagram13, AuthCompleteBeforeFinished) {
+ // This test uses a simple AuthCertificateCallback.  Due to the way that the
+ // entire server flight is processed, the call to SSL_AuthCertificateComplete
+ // will trigger after the Finished message is processed.
+-TEST_F(TlsConnectDatagram13, AuthCompleteAfterFinished) {
++TEST_P(TlsConnectTls13, AuthCompleteAfterFinished) {
+   SetDeferredAuthCertificateCallback(client_, 0);  // 0 = success.
+   Connect();
+ }
+
+
+
+
+@@ -413,8 +413,7 @@ dtls13_HandleOutOfEpochRecord(sslSocket *ss, const ssl3CipherSpec *spec,
+              * server, we might have processed the client's Finished and
+              * moved on to application data keys, but the client has
+              * retransmitted Finished (e.g., because our ACK got lost.)
+-             * We just retransmit the previous Finished to let the client
+-             * complete. */
++             * We just retransmit the ACK to let the client complete. */
+             if (rType == ssl_ct_handshake) {
+                 if ((ss->sec.isServer) &&
+                     (ss->ssl3.hs.ws == idle_handshake)) {
+
+
+
+
+@@ -270,12 +270,6 @@ SECStatus
+ dtls_HandleHandshake(sslSocket *ss, DTLSEpoch epoch, sslSequenceNumber seqNum,
+                      sslBuffer *origBuf)
+ {
+-    /* XXX OK for now.
+-     * This doesn't work properly with asynchronous certificate validation.
+-     * because that returns a WOULDBLOCK error. The current DTLS
+-     * applications do not need asynchronous validation, but in the
+-     * future we will need to add this.
+-     */
+     sslBuffer buf = *origBuf;
+     SECStatus rv = SECSuccess;
+     PRBool discarded = PR_FALSE;
+@@ -310,7 +304,8 @@ dtls_HandleHandshake(sslSocket *ss, DTLSEpoch epoch, sslSequenceNumber seqNum,
+         if (message_length > MAX_HANDSHAKE_MSG_LEN) {
+             (void)ssl3_DecodeError(ss);
+             PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+-            return SECFailure;
++            rv = SECFailure;
++            goto loser;
+         }
+ #undef MAX_HANDSHAKE_MSG_LEN
+ 
+@@ -485,7 +480,7 @@ dtls_HandleHandshake(sslSocket *ss, DTLSEpoch epoch, sslSequenceNumber seqNum,
+     }
+ 
+     // This should never happen, but belt and suspenders.
+-    if (rv == SECFailure) {
++    if (rv != SECSuccess) {
+         PORT_Assert(0);
+         goto loser;
+     }
+@@ -505,9 +500,6 @@ dtls_HandleHandshake(sslSocket *ss, DTLSEpoch epoch, sslSequenceNumber seqNum,
+ 
+ loser:
+     origBuf->len = 0; /* So ssl3_GatherAppDataRecord will keep looping. */
+-
+-    /* XXX OK for now. In future handle rv == SECWouldBlock safely in order
+-     * to deal with asynchronous certificate verification */
+     return rv;
+ }
+ 
+
+
+
+
+@@ -11299,6 +11299,8 @@ static SECStatus ssl3_FinishHandshake(sslSocket *ss);
+ static SECStatus
+ ssl3_AlwaysFail(sslSocket *ss)
+ {
++    /* The caller should have cleared the callback. */
++    ss->ssl3.hs.restartTarget = ssl3_AlwaysFail;
+     PORT_SetError(PR_INVALID_STATE_ERROR);
+     return SECFailure;
+ }
+@@ -11734,7 +11736,6 @@ ssl3_CacheWrappedSecret(sslSocket *ss, sslSessionID *sid,
+ static SECStatus
+ ssl3_HandleFinished(sslSocket *ss, PRUint8 *b, PRUint32 length)
+ {
+-    sslSessionID *sid = ss->sec.ci.sid;
+     SECStatus rv = SECSuccess;
+     PRBool isServer = ss->sec.isServer;
+     PRBool isTLS;
+@@ -11878,15 +11879,6 @@ xmit_loser:
+         return rv;
+     }
+ 
+-    if (sid->cached == never_cached && !ss->opt.noCache) {
+-        rv = ssl3_FillInCachedSID(ss, sid, ss->ssl3.crSpec->masterSecret);
+-
+-        /* If the wrap failed, we don't cache the sid.
+-         * The connection continues normally however.
+-         */
+-        ss->ssl3.hs.cacheSID = rv == SECSuccess;
+-    }
+-
+     if (ss->ssl3.hs.authCertificatePending) {
+         if (ss->ssl3.hs.restartTarget) {
+             PR_NOT_REACHED("ssl3_HandleFinished: unexpected restartTarget");
+@@ -11951,33 +11943,45 @@ ssl3_FinishHandshake(sslSocket *ss)
+     PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+     PORT_Assert(ss-

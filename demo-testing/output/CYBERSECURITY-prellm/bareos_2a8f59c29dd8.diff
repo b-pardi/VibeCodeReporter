@@ -1,0 +1,122 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,651 @@
++#!/usr/bin/env python
++
++# Bareos python class for Ovirt related backup and restore
++
++import bareosfd
++from bareos_fd_consts import bJobMessageType, bFileType, bRCs, bIOPS
++from bareos_fd_consts import bEventType, bVariable, bCFs
++
++import os
++import sys
++import time
++import uuid
++
++import ovirtsdk4 as sdk
++import ovirtsdk4.types as types
++
++import ssl
++
++from httplib import HTTPSConnection
++
++try:
++    from urllib.parse import urlparse
++except ImportError:
++    from urlparse import urlparse
++
++import BareosFdPluginBaseclass
++import BareosFdWrapper
++
++# The name of the application, to be used as the 'origin' of events
++# sent to the audit log:
++APPLICATION_NAME = 'BareOS Ovirt plugin'
++
++class BareosFdPluginOvirt(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
++    '''
++        Plugin for Ovirt backup and restore
++    '''
++    def __init__(self, context, plugindef):
++        bareosfd.DebugMessage(
++            context, 100,
++            "Constructor called in module %s with plugindef=%s\n" %
++            (__name__, plugindef))
++        super(BareosFdPluginOvirt, self).__init__(context, plugindef)
++
++        self.ovirt = BareosOvirtWrapper()
++
++    def start_backup_job(self, context):
++        '''
++        Start of Backup Job. Called just before backup job really start.
++        Overload this to arrange whatever you have to do at this time.
++        '''
++        bareosfd.DebugMessage(
++            context, 100,
++            "BareosFdPluginOvirt:start_backup_job() called\n")
++
++        if not self.ovirt.connect_api(context, self.options):
++            return bRCs['bRC_Error']
++
++        return self.ovirt.prepare_vm_backup(context, self.options)
++
++    def start_backup_file(self, context, savepkt):
++        '''
++        Defines the file to backup and creates the savepkt.
++        '''
++        bareosfd.DebugMessage(
++            context, 100,
++            "BareosFdPluginOvirt:start_backup_file() called\n")
++
++        if not self.ovirt.backup_objects:
++            bareosfd.JobMessage(
++                context, bJobMessageType['M_ERROR'],
++                "Nothing to backup.\n")
++            return bRCs['bRC_Skip']
++
++        backup_obj = self.ovirt.backup_objects.pop(0)
++
++        # create a stat packet for a restore object
++        statp = bareosfd.StatPacket()
++        savepkt.statp = statp
++
++        if 'file' in backup_obj:
++
++            # regular file
++            vmfile = backup_obj['file']
++
++            bareosfd.DebugMessage(
++                context, 100,
++                "BareosFdPluginOvirt:start_backup_file() backup regular file '%s' of VM '%s'\n" % (vmfile['filename'],backup_obj['vmname']))
++
++            savepkt.type = bFileType['FT_RESTORE_FIRST']
++            savepkt.fname = "/VMS/%s-%s/%s" % (backup_obj['vmname'],backup_obj['vmid'],vmfile['filename'])
++            savepkt.object_name = savepkt.fname
++            savepkt.object = bytearray(vmfile['data'])
++            savepkt.object_len = len(savepkt.object)
++            savepkt.object_index = int(time.time())
++
++        elif 'disk' in backup_obj:
++
++            # disk file
++            disk = backup_obj['disk']
++
++            bareosfd.DebugMessage(
++                context, 100,
++                "BareosFdPluginOvirt:start_backup_file() backup disk file '%s' of VM '%s'\n" % (disk.alias,backup_obj['vmname']))
++
++            savepkt.type = bFileType['FT_REG']
++            savepkt.fname = "/VMS/%s-%s/%s-%s" % (backup_obj['vmname'],backup_obj['vmid'],disk.alias,disk.id)
++
++            try:
++                self.ovirt.start_transfer(context, backup_obj['snapshot'], disk)
++            except Exception as e:
++                bareosfd.JobMessage(
++                    context, bJobMessageType['M_ERROR'],
++                    "BareosFdPluginOvirt:start_backup_file() Error: %s" % str(e))
++                self.ovirt.end_transfer(context)
++                return bRCs['bRC_Error']
++        else:
++            return bRCs['bRC_Error']

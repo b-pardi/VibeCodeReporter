@@ -1,0 +1,95 @@
+@@ -5,9 +5,11 @@ import static com.google.common.base.Preconditions.checkState;
+ import static com.google.common.base.Predicates.not;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
++import com.google.common.collect.BoundType;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableRangeSet;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import com.google.common.collect.Range;
+ import com.google.common.collect.RangeSet;
+ import java.util.Arrays;
+@@ -16,7 +18,7 @@ import java.util.List;
+ import java.util.Set;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+-import java.util.stream.IntStream;
++import java.util.stream.LongStream;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import org.antlr.v4.runtime.ParserRuleContext;
+@@ -32,6 +34,7 @@ import org.batfish.datamodel.InterfaceAddress;
+ import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.Ip6;
+ import org.batfish.datamodel.LineAction;
++import org.batfish.datamodel.LongSpace;
+ import org.batfish.datamodel.MacAddress;
+ import org.batfish.datamodel.Prefix;
+ import org.batfish.grammar.ParseTreePrettyPrinter;
+@@ -164,6 +167,7 @@ public class CumulusNcluConfigurationBuilder extends CumulusNcluParserBaseListen
+   private static final Pattern PHYSICAL_INTERFACE_PATTERN = Pattern.compile("(swp|eth)[0-9]+");
+   private static final Pattern SUBINTERFACE_PATTERN = Pattern.compile("^(.*)\\.([0-9]+)$");
+   private static final Pattern VLAN_INTERFACE_PATTERN = Pattern.compile("^vlan([0-9]+)$");
++  private static final int MAX_VXLAN_ID = (1 << 24) - 1; // 24 bit number
+ 
+   private static int toInteger(Uint16Context ctx) {
+     return Integer.parseInt(ctx.getText(), 10);
+@@ -210,31 +214,75 @@ public class CumulusNcluConfigurationBuilder extends CumulusNcluParserBaseListen
+     return Prefix.parse(ctx.getText());
+   }
+ 
+-  private static @Nonnull Range<Integer> toRange(RangeContext ctx) {
+-    int low = toInteger(ctx.low);
+-    int high = ctx.high != null ? toInteger(ctx.high) : low;
++  private static @Nonnull Range<Long> toRange(RangeContext ctx) {
++    long low = toLong(ctx.low);
++    long high = ctx.high != null ? toLong(ctx.high) : low;
+     return Range.closed(low, high);
+   }
+ 
++  /**
++   * Convert a range context to an integer range.
++   *
++   * @throws IllegalArgumentException if the values are out of range
++   */
++  private static @Nonnull Range<Integer> toRangeInt(RangeContext ctx) {
++    long low = toLong(ctx.low);
++    long high = ctx.high != null ? toLong(ctx.high) : low;
++    checkArgument(
++        low <= Integer.MAX_VALUE && high <= Integer.MAX_VALUE,
++        "Invalid integer range: %s",
++        ctx.getText());
++    return Range.closed((int) low, (int) high);
++  }
++
+   private static @Nonnull Range<Integer> toRange(Vlan_rangeContext ctx) {
+     int low = toInteger(ctx.low);
+     int high = ctx.high != null ? toInteger(ctx.high) : low;
+     return Range.closed(low, high);
+   }
+ 
+-  private static @Nonnull RangeSet<Integer> toRangeSet(Range_setContext ctx) {
++  private static @Nonnull RangeSet<Long> toRangeSet(Range_setContext ctx) {
+     return ctx.range().stream()
+         .map(CumulusNcluConfigurationBuilder::toRange)
+         .collect(ImmutableRangeSet.toImmutableRangeSet());
+   }
+ 
++  /**
++   * Convert a range set context to a range set of integers.
++   *
++   * @throws IllegalArgumentException if the values are out of range
++   */
++  private static @Nonnull RangeSet<Integer> toRangeSetInt(Range_setContext ctx) {
++    return ctx.range().stream()
++        .map(CumulusNcluConfigurationBuilder::toRangeInt)
++        .collect(ImmutableRangeSet.toImmutableRangeSet());
++  }
++
++  /**
++   * Check that the given RangeSet is upper-bounded by {@code maxValue}, otherwise throw {@link
++   * IllegalArgumentException}
++   */
++  private static void checkUpperBound(RangeSet<? extends Number> rangeSet, long maxValue) {
++    Range<? extends Number> ra

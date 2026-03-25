@@ -1,0 +1,149 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2019 - pancake */
++/* radare - LGPL - Copyright 2009-2021 - pancake */
+ 
+ #include <stdio.h>
+ #include <r_asm.h>
+@@ -26,6 +26,7 @@ R_API void r_asm_equ_item_free(RAsmEqu *equ) {
+ }
+ 
+ static RAsmEqu *__asm_equ_new(const char *key, const char *value) {
++	r_return_val_if_fail (key && value, NULL);
+ 	RAsmEqu *equ = R_NEW0 (RAsmEqu);
+ 	if (equ) {
+ 		equ->key = strdup (key);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2018-2020 - pancake */
++/* radare - LGPL - Copyright 2018-2021 - pancake */
+ 
+ #include <r_asm.h>
+ 
+@@ -7,8 +7,10 @@ R_API RAsmOp *r_asm_op_new(void) {
+ }
+ 
+ R_API void r_asm_op_free(RAsmOp *op) {
+-	r_asm_op_fini (op);
+-	free (op);
++	if (op) {
++		r_asm_op_fini (op);
++		free (op);
++	}
+ }
+ 
+ R_API void r_asm_op_init(RAsmOp *op) {
+@@ -18,6 +20,7 @@ R_API void r_asm_op_init(RAsmOp *op) {
+ }
+ 
+ R_API void r_asm_op_fini(RAsmOp *op) {
++	r_return_if_fail (op);
+ 	r_strbuf_fini (&op->buf);
+ 	r_strbuf_fini (&op->buf_asm);
+ 	r_buf_fini (op->buf_inc);
+@@ -55,6 +58,7 @@ R_API void r_asm_op_set_asm(RAsmOp *op, const char *str) {
+ }
+ 
+ R_API int r_asm_op_set_hex(RAsmOp *op, const char *str) {
++	r_return_val_if_fail (op && str, 0);
+ 	ut8 *bin = (ut8*)strdup (str);
+ 	if (bin) {
+ 		int len = r_hex_str2bin (str, bin);
+
+
+
+
+@@ -56,7 +56,7 @@ int binutils_assemble(RAsm *a, RAsmOp *op, const char *buf, const char *as, cons
+ 		len = read (ofd, obuf, sizeof (obuf));
+ 		begin = r_mem_mem (obuf, len, (const ut8*)"BEGINMARK", 9);
+ 		end = r_mem_mem (obuf, len, (const ut8*)"ENDMARK", 7);
+-		if (!begin || !end) {
++		if (!begin || !end || end > begin) {
+ 			eprintf ("Cannot find water marks\n");
+ 			len = 0;
+ 		} else {
+
+
+
+
+@@ -211,6 +211,7 @@ R_API void r_cons_color(int fg, int r, int g, int b) {
+ }
+ 
+ R_API void r_cons_println(const char* str) {
++	// this is not thread safe!
+ 	r_cons_print (str);
+ 	r_cons_newline ();
+ }
+@@ -854,6 +855,7 @@ R_API void r_cons_context_load(RConsContext *context) {
+ 
+ R_API void r_cons_context_reset(void) {
+ 	I.context = &r_cons_context_default;
++	I.context->sorted_column = -1;
+ }
+ 
+ R_API bool r_cons_context_is_main(void) {
+
+
+
+
+@@ -59,11 +59,6 @@ static const char *help_detail_tilde[] = {
+ 	NULL
+ };
+ 
+-/* TODO: remove globals */
+-static RList *sorted_lines = NULL;
+-static RList *unsorted_lines = NULL;
+-static int sorted_column = -1;
+-
+ R_API void r_cons_grep_help(void) {
+ 	r_cons_cmd_help (help_detail_tilde, true);
+ }
+@@ -77,9 +72,10 @@ static void parse_grep_expression(const char *str) {
+ 	ut64 range_begin, range_end;
+ 	size_t ptrs_length;
+ 
+-	if (!str || !*str) {
++	if (R_STR_ISEMPTY (str)) {
+ 		return;
+ 	}
++	RConsContext *ctx = r_cons_singleton()->context;
+ 	RCons *cons = r_cons_singleton ();
+ 	RConsGrep *grep = &cons->context->grep;
+ 
+@@ -115,7 +111,7 @@ static void parse_grep_expression(const char *str) {
+ 	free (grep->str);
+ 	grep->str = NULL;
+ 	bool first = true;
+-	sorted_column = 0;
++	ctx->sorted_column = 0;
+ 	size_t i;
+ 	for (i = 0; i < ptrs_length; i++) {
+ 		ptr = ptrs[i];
+@@ -454,13 +450,14 @@ static int cmp(const void *a, const void *b) {
+ 	if (!a || !b) {
+ 		return (int) (size_t) ((char *) a - (char *) b);
+ 	}
+-	if (sorted_column > 0) {
++	RConsContext *ctx = r_cons_singleton()->context;
++	if (ctx->sorted_column > 0) {
+ 		da = strdup (ca);
+ 		db = strdup (cb);
+ 		int colsa = r_str_word_set0 (da);
+ 		int colsb = r_str_word_set0 (db);
+-		ca = (colsa > sorted_column)? r_str_word_get0 (da, sorted_column): "";
+-		cb = (colsb > sorted_column)? r_str_word_get0 (db, sorted_column): "";
++		ca = (colsa > ctx->sorted_column)? r_str_word_get0 (da, ctx->sorted_column): "";
++		cb = (colsb > ctx->sorted_column)? r_str_word_get0 (db, ctx->sorted_column): "";
+ 	}
+ 	if (IS_DIGIT (*ca) && IS_DIGIT (*cb)) {
+ 		ut64 na = r_num_get (NULL, ca);
+@@ -728,22 +725,25 @@ R_API void r_cons_grepbuf(void) {
+ 		int nl = 0;
+ 		char *ptr = cons->context->buffer;
+ 		char *str;
+-		sorted_column = grep->sort;
+-		r_list_sort (sorted_lines, cmp);
++		RConsContext *ctx = cons->context;
++		c

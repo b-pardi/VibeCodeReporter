@@ -1,0 +1,87 @@
+@@ -137,6 +137,8 @@ enum calico_tc_flags {
+ 
+ #define CALI_TC_FLAGS_FROM_WORKLOAD(flags) (!(flags & CALI_TC_HOST_EP) && !(flags & CALI_TC_INGRESS))
+ 
++#define CALI_TC_FLAGS_TO_WORKLOAD(flags) (!(flags & CALI_TC_HOST_EP) && (flags & CALI_TC_INGRESS))
++
+ #define CALI_TC_FLAGS_L3(flags) ((flags & CALI_TC_HOST_EP) && !(flags & CALI_TC_INGRESS) && (flags & CALI_TC_TUNNEL))
+ 
+ #define CALI_TC_FLAGS_IPIP_ENCAPPED(flags) ((flags & CALI_TC_INGRESS) && (flags & CALI_TC_TUNNEL))
+
+
+
+
+@@ -1,6 +1,8 @@
+ #ifndef __CALI_POLICY_H__
+ #define __CALI_POLICY_H__
+ 
++#include "../xdp/bpf_maps.h"
++
+ struct port_range {
+        __u64 ip_set_id;
+        __u16 min, max;
+@@ -69,19 +71,20 @@ struct cidr {
+ 		RULE_MATCH(id, match, negate); \
+ 	} while (false)
+ 
++bool cali_ip_set_lookup(uint64_t ip_set_id, __be32 addr) {
++	union ip4_set_bpf_lpm_trie_key k;
++	k.ip.mask = sizeof(struct ip4setkey)*8;
++	k.ip.set_id = host_to_be64(ip_set_id);
++	k.ip.addr = addr;
++	k.ip.protocol = 0;
++	k.ip.port = 0;
++	k.ip.pad = 0;
++	return bpf_map_lookup_elem(&calico_ip_sets, &k) != NULL;
++}
++
+ #define RULE_MATCH_IP_SET(id, negate, saddr_or_daddr, ip_set_id) do { \
+ 		CALI_DEBUG("  look up " #saddr_or_daddr " (%x) in IP set " #ip_set_id "\n", be32_to_host(saddr_or_daddr)); \
+-		bool match = false; \
+-		union ip4_set_bpf_lpm_trie_key k; \
+-		k.ip.mask = sizeof(struct ip4setkey)*8 ; \
+-		k.ip.set_id = host_to_be64(ip_set_id); \
+-		k.ip.addr = saddr_or_daddr; \
+-		k.ip.protocol = 0; \
+-		k.ip.port = 0; \
+-		k.ip.pad = 0; \
+-		if (bpf_map_lookup_elem(&calico_ip_sets, &k)) { \
+-			match=true; \
+-		} \
++		bool match = cali_ip_set_lookup(id, saddr_or_daddr); \
+ 		RULE_MATCH(id, match, negate); \
+ 	} while (false)
+ 
+
+
+
+
+@@ -25,6 +25,10 @@
+ #define CALI_FIB_LOOKUP_ENABLED true
+ #endif
+ 
++#ifndef CALI_HOST_IPS_IP_SET_ID
++#define CALI_HOST_IPS_IP_SET_ID 0
++#endif
++
+ enum calico_policy_result {
+ 	CALI_POL_NO_MATCH,
+ 	CALI_POL_ALLOW,
+@@ -346,7 +350,16 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb, enum calico_tc_flags
+ 			if (false) {
+ 				pol_rc = execute_policy_aof(skb, ip_proto, ip_src, post_nat_ip_dst,  sport,  post_nat_dport, flags);
+ 			}
+-			pol_rc = execute_policy_norm(skb, ip_proto, ip_src, post_nat_ip_dst,  sport,  post_nat_dport, flags);
++			if (CALI_TC_FLAGS_TO_WORKLOAD(flags) &&
++					skb->mark != CALI_SKB_MARK_SEEN &&
++					cali_ip_set_lookup(CALI_HOST_IPS_IP_SET_ID, ip_src)) {
++				// Host to workload traffic always allowed.  We discount traffic that was seen by
++				// another program since it must have come in via another interface.
++				CALI_DEBUG("Packet is from the host: ACCEPT\n");
++				pol_rc = CALI_POL_ALLOW;
++			} else {
++				pol_rc = execute_policy_norm(skb, ip_proto, ip_src, post_nat_ip_dst,  sport,  post_nat_dport, flags);
++			}
+ 		}
+ 		switch (pol_rc) {
+ 		case CALI_POL_NO_MATCH:

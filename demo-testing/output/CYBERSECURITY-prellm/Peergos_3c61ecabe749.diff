@@ -1,0 +1,82 @@
+@@ -1682,17 +1682,23 @@ public class PeergosNetworkUtils {
+         controllerB = msgB.mergeMessages(controllerB, a.username).join();
+         List<MessageEnvelope> messages = controllerB.getMessages(0, 10).join();
+         Assert.assertEquals(messages.size(), 4);
+-        Assert.assertEquals(messages.get(messages.size() - 1).payload, msg1);
++        MessageEnvelope fromA = messages.get(messages.size() - 1);
++        Assert.assertEquals(fromA.payload, msg1);
+         Assert.assertEquals(controllerB.host().messagesMergedUpto, 4);
+ 
+-        ApplicationMessage msg2 = ApplicationMessage.text("Isn't this cool!!");
++        ReplyTo msg2 = ReplyTo.build(fromA, ApplicationMessage.text("Isn't this cool!!"), hasher).join();
+         controllerB = msgB.sendMessage(controllerB, msg2).join();
+         controllerA = msgA.mergeMessages(controllerA, b.username).join();
+         List<MessageEnvelope> messagesA = controllerA.getMessages(0, 10).join();
++        MessageEnvelope fromB = messagesA.get(4);
+         Assert.assertEquals(messagesA.size(), 5);
+         Assert.assertEquals(messagesA.get(messagesA.size() - 1).payload, msg2);
+         Assert.assertEquals(controllerA.host().messagesMergedUpto, 5);
+         Assert.assertEquals(controllerB.host().messagesMergedUpto, 5);
++        Assert.assertTrue(fromB.payload instanceof ReplyTo);
++        MessageRef parentRef = ((ReplyTo) fromB.payload).parent;
++        MessageEnvelope parent = controllerA.getMessage(parentRef).join();
++        Assert.assertTrue(parent.equals(fromA));
+ 
+         // test setting group properties
+         String random_chat = "Random chat";
+
+
+
+
+@@ -5,6 +5,7 @@ import peergos.shared.crypto.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.messaging.messages.*;
+ import peergos.shared.storage.*;
++import peergos.shared.util.*;
+ 
+ import java.util.*;
+ import java.util.concurrent.*;
+@@ -49,6 +50,17 @@ public class ChatController {
+         return state.members.values().stream().map(m -> m.username).collect(Collectors.toSet());
+     }
+ 
++    @JsMethod
++    public CompletableFuture<MessageEnvelope> getMessage(MessageRef ref) {
++        long msgCount = state.host().messagesMergedUpto;
++        // Todo try most recent 100 first, then try previous chunks
++        // Todo cache hashes in LRU
++        return store.getMessagesFrom(0)
++                .thenCompose(allSigned -> Futures.findFirst(allSigned, s -> hasher.bareHash(s.msg.serialize())
++                        .thenApply(h -> h.equals(ref.envelopeHash) ? Optional.of(s.msg) : Optional.empty())))
++                .thenApply(Optional::get);
++    }
++
+     @JsMethod
+     public CompletableFuture<List<MessageEnvelope>> getMessages(int from, int to) {
+         return store.getMessages(from, to)
+
+
+
+
+@@ -23,21 +23,21 @@ public class FileBackedMessageStore implements MessageStore {
+     }
+ 
+     private CompletableFuture<Pair<Long, Integer>> getChunkByteOffset(long index) {
+-//        if (messages.getSize() < 5*1024*1024)
+-//            return Futures.of(new Pair<>(0L, (int) index));
++        if (messages.getSize() < 5*1024*1024)
++            return Futures.of(new Pair<>(0L, (int) index));
+         return indexFile.getUpdated(network)
+                 .thenCompose(updated -> updated.getInputStream(network, crypto, x -> {})
+-                        .thenCompose(reader -> findIndex(reader, new byte[1024],
++                        .thenCompose(reader -> findOffset(reader, new byte[1024],
+                                 0L, 0L, index, updated.getSize())));
+ 
+     }
+ 
+-    private CompletableFuture<Pair<Long, Integer>> findIndex(AsyncReader r,
+-                                                             byte[] buf,
+-                                                             long previousIndex,
+-                                                             long previousByteOffset,
+-                                                             long index,
+-                                                             long remainingBy

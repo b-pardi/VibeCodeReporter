@@ -1,0 +1,129 @@
+@@ -32,8 +32,8 @@ SECMOD_DestroyListLock(SECMODListLock *lock)
+ }
+ 
+ /*
+- * Lock the List for Read: NOTE: this assumes the reading isn't so common
+- * the writing will be starved.
++ * Lock the list for reading.
++ * Note: this uses a non-reentrant lock. Writers are given preference.
+  */
+ void
+ SECMOD_GetReadLock(SECMODListLock *modLock)
+
+
+
+
+@@ -1002,6 +1002,8 @@ SECMOD_CanDeleteInternalModule(void)
+  * C_GetSlotList(flag, &data, &count) so that the array doesn't accidently
+  * grow on the caller. It is permissible for the slots to increase between
+  * successive calls with NULL to get the size.
++ *
++ * Caller must not hold a module list read lock.
+  */
+ SECStatus
+ SECMOD_UpdateSlotList(SECMODModule *mod)
+@@ -1344,14 +1346,27 @@ loser:
+ PRBool
+ SECMOD_HasRemovableSlots(SECMODModule *mod)
+ {
+-    int i;
+     PRBool ret = PR_FALSE;
+-
+     if (!moduleLock) {
+         PORT_SetError(SEC_ERROR_NOT_INITIALIZED);
+         return ret;
+     }
+     SECMOD_GetReadLock(moduleLock);
++    ret = SECMOD_LockedModuleHasRemovableSlots(mod);
++    SECMOD_ReleaseReadLock(moduleLock);
++    return ret;
++}
++
++PRBool
++SECMOD_LockedModuleHasRemovableSlots(SECMODModule *mod)
++{
++    int i;
++    PRBool ret;
++    if (mod->slotCount == 0) {
++        return PR_TRUE;
++    }
++
++    ret = PR_FALSE;
+     for (i = 0; i < mod->slotCount; i++) {
+         PK11SlotInfo *slot = mod->slots[i];
+         /* perm modules are not inserted or removed */
+@@ -1361,10 +1376,6 @@ SECMOD_HasRemovableSlots(SECMODModule *mod)
+         ret = PR_TRUE;
+         break;
+     }
+-    if (mod->slotCount == 0) {
+-        ret = PR_TRUE;
+-    }
+-    SECMOD_ReleaseReadLock(moduleLock);
+     return ret;
+ }
+ 
+
+
+
+
+@@ -143,7 +143,31 @@ extern unsigned long SECMOD_PubMechFlagstoInternal(unsigned long publicFlags);
+ extern unsigned long SECMOD_InternaltoPubMechFlags(unsigned long internalFlags);
+ extern unsigned long SECMOD_PubCipherFlagstoInternal(unsigned long publicFlags);
+ 
++/*
++ * Check to see if the module has removable slots that we may need to
++ * watch for.
++ *
++ * NB: This function acquires the module list lock in order to access
++ * mod->slotCount and mod->slots. Deadlock can occur if the caller holds the
++ * module list lock. Callers that already hold the module list lock must use
++ * SECMOD_LockedModuleHasRemovableSlots instead.
++ */
+ PRBool SECMOD_HasRemovableSlots(SECMODModule *mod);
++
++/*
++ * Like SECMOD_HasRemovableSlots but this function does not acquire the module
++ * list lock.
++ */
++PRBool SECMOD_LockedModuleHasRemovableSlots(SECMODModule *mod);
++
++/*
++ * this function waits for a token event on any slot of a given module
++ * This function should not be called from more than one thread of the
++ * same process (though other threads can make other library calls
++ * on this module while this call is blocked).
++ *
++ * Caller must not hold a module list read lock.
++ */
+ PK11SlotInfo *SECMOD_WaitForAnyTokenEvent(SECMODModule *mod,
+                                           unsigned long flags, PRIntervalTime latency);
+ /*
+@@ -153,6 +177,7 @@ PK11SlotInfo *SECMOD_WaitForAnyTokenEvent(SECMODModule *mod,
+  * shutting down  the module.
+  */
+ SECStatus SECMOD_CancelWait(SECMODModule *mod);
++
+ /*
+  * check to see if the module has added new slots. PKCS 11 v2.20 allows for
+  * modules to add new slots, but never remove them. Slots not be added between
+@@ -160,6 +185,8 @@ SECStatus SECMOD_CancelWait(SECMODModule *mod);
+  * C_GetSlotList(flag, &data, &count) so that the array doesn't accidently
+  * grow on the caller. It is permissible for the slots to increase between
+  * corresponding calls with NULL to get the size.
++ *
++ * Caller must not hold a module list read lock.
+  */
+ SECStatus SECMOD_UpdateSlotList(SECMODModule *mod);
+ SEC_END_PROTOS
+
+
+
+
+@@ -5,12 +5,13 @@
+ /*
+ ** File:        nsrwlock.h
+ ** Description: API to basic reader-writer lock functions of NSS.
+-**  These are re-entrant reader writer locks; that is,
++**  These locks allow re-entry from writers but not readers. That is,
+ **  

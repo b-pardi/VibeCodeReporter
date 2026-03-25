@@ -1,0 +1,125 @@
+@@ -401,7 +401,7 @@ static int num_loaders = NLOADERS;
+ 
+ /** \param loader -1 for auto select
+  *  \retval loader_id or negative in case of error */
+-int DetectLoaderQueueTask(int loader_id, LoaderFunc Func, void *func_ctx)
++int DetectLoaderQueueTask(int loader_id, LoaderFunc Func, void *func_ctx, LoaderFreeFunc FreeFunc)
+ {
+     if (loader_id == -1) {
+         loader_id = cur_loader;
+@@ -421,6 +421,7 @@ int DetectLoaderQueueTask(int loader_id, LoaderFunc Func, void *func_ctx)
+ 
+     t->Func = Func;
+     t->ctx = func_ctx;
++    t->FreeFunc = FreeFunc;
+ 
+     SCMutexLock(&loader->m);
+     TAILQ_INSERT_TAIL(&loader->task_list, t, next);
+@@ -596,7 +597,7 @@ static TmEcode DetectLoader(ThreadVars *th_v, void *thread_data)
+             int r = task->Func(task->ctx, ftd->instance);
+             loader->result |= r;
+             TAILQ_REMOVE(&loader->task_list, task, next);
+-            SCFree(task->ctx);
++            task->FreeFunc(task->ctx);
+             SCFree(task);
+         }
+ 
+
+
+
+
+@@ -32,10 +32,12 @@
+  * \param loader_id id of the loader that executed the task
+  */
+ typedef int (*LoaderFunc)(void *ctx, int loader_id);
++typedef void (*LoaderFreeFunc)(void *ctx);
+ 
+ typedef struct DetectLoaderTask_ {
+     LoaderFunc Func;
+     void *ctx;
++    LoaderFreeFunc FreeFunc;
+     TAILQ_ENTRY(DetectLoaderTask_) next;
+ } DetectLoaderTask;
+ 
+@@ -46,7 +48,7 @@ typedef struct DetectLoaderControl_ {
+     TAILQ_HEAD(, DetectLoaderTask_) task_list;
+ } DetectLoaderControl;
+ 
+-int DetectLoaderQueueTask(int loader_id, LoaderFunc Func, void *func_ctx);
++int DetectLoaderQueueTask(int loader_id, LoaderFunc Func, void *func_ctx, LoaderFreeFunc FreeFunc);
+ int DetectLoadersSync(void);
+ void DetectLoadersInit(void);
+ 
+
+
+
+
+@@ -3918,9 +3918,18 @@ error:
+ typedef struct TenantLoaderCtx_ {
+     uint32_t tenant_id;
+     int reload_cnt; /**< used by reload */
+-    const char *yaml;
++    char *yaml;     /**< heap alloc'd copy of file path for the yaml */
+ } TenantLoaderCtx;
+ 
++static void DetectLoaderFreeTenant(void *ctx)
++{
++    TenantLoaderCtx *t = (TenantLoaderCtx *)ctx;
++    if (t->yaml != NULL) {
++        SCFree(t->yaml);
++    }
++    SCFree(t);
++}
++
+ static int DetectLoaderFuncLoadTenant(void *vctx, int loader_id)
+ {
+     TenantLoaderCtx *ctx = (TenantLoaderCtx *)vctx;
+@@ -3939,9 +3948,13 @@ static int DetectLoaderSetupLoadTenant(uint32_t tenant_id, const char *yaml)
+         return -ENOMEM;
+ 
+     t->tenant_id = tenant_id;
+-    t->yaml = yaml;
++    t->yaml = SCStrdup(yaml);
++    if (t->yaml == NULL) {
++        SCFree(t);
++        return -ENOMEM;
++    }
+ 
+-    return DetectLoaderQueueTask(-1, DetectLoaderFuncLoadTenant, t);
++    return DetectLoaderQueueTask(-1, DetectLoaderFuncLoadTenant, t, DetectLoaderFreeTenant);
+ }
+ 
+ static int DetectLoaderFuncReloadTenant(void *vctx, int loader_id)
+@@ -3969,12 +3982,17 @@ static int DetectLoaderSetupReloadTenant(uint32_t tenant_id, const char *yaml, i
+         return -ENOMEM;
+ 
+     t->tenant_id = tenant_id;
+-    t->yaml = yaml;
++    t->yaml = SCStrdup(yaml);
++    if (t->yaml == NULL) {
++        SCFree(t);
++        return -ENOMEM;
++    }
+     t->reload_cnt = reload_cnt;
+ 
+     SCLogDebug("loader_id %d", loader_id);
+ 
+-    return DetectLoaderQueueTask(loader_id, DetectLoaderFuncReloadTenant, t);
++    return DetectLoaderQueueTask(
++            loader_id, DetectLoaderFuncReloadTenant, t, DetectLoaderFreeTenant);
+ }
+ 
+ /** \brief Load a tenant and wait for loading to complete
+@@ -4223,6 +4241,13 @@ int DetectEngineMultiTenantSetup(const bool unix_socket)
+         ConfNode *tenant_node = NULL;
+ 
+         if (tenants_root_node != NULL) {
++            const char *path = NULL;
++            ConfNode *path_node = ConfGetNode("multi-detect.config-path");
++            if (path_node) {
++                path = path_node->val;
++                SCLogConfig("tenants config path: %s", path);
++            }
++
+             TAILQ_FOREACH(tenant_node, &tenants_root_node->head, next) {
+                 ConfNode *id_node = ConfNodeLookupC

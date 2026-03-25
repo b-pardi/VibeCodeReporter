@@ -1,0 +1,110 @@
+@@ -65,13 +65,18 @@
+ 
+ #include "tcpip.h"
+ #include "TargetGroup.h"
++#include "targets.h"
+ #include "NmapOps.h"
+ #include "nmap_error.h"
++#include "nmap_dns.h"
+ #include "nmap.h"
+ #include "libnetutil/netutil.h"
+ 
+ #include <string>
+ #include <sstream>
++#include <vector>
++#include <algorithm>
++#include <typeinfo>
+ #include <errno.h>
+ #include <limits.h> // CHAR_BIT
+ 
+@@ -102,7 +107,7 @@ public:
+   /* Parses an expression such as 192.168.0.0/16, 10.1.0-5.1-254, or
+      fe80::202:e3ff:fe14:1102/112 and returns a newly allocated NetBlock. The af
+      parameter is AF_INET or AF_INET6. Returns NULL in case of error. */
+-  static NetBlock *parse_expr(const char *target_expr, int af);
++  static NetBlock *parse_expr(const char *target_expr, int af, std::vector<DNS::Request> &requests);
+ 
+   bool is_resolved_address(const struct sockaddr_storage *ss) const;
+ 
+@@ -110,7 +115,7 @@ public:
+    * NetBlock subclass, override this method. Otherwise, it's safe to reassign
+    * the return value to the pointer that this method was called through.
+    * On error, return NULL. */
+-  virtual NetBlock *resolve() { return this; }
++  virtual NetBlock *resolve(const DNS::Request &reqA, const DNS::Request &reqAAAA) { return this; }
+   virtual void reject_last_host() {}
+   virtual bool next(struct sockaddr_storage *ss, size_t *sslen) = 0;
+   virtual void apply_netmask(int bits) = 0;
+@@ -169,7 +174,7 @@ public:
+   int af;
+   int bits;
+ 
+-  NetBlock *resolve();
++  NetBlock *resolve(const DNS::Request &reqA, const DNS::Request &reqAAAA);
+ 
+   bool next(struct sockaddr_storage *ss, size_t *sslen);
+   void apply_netmask(int bits);
+@@ -270,7 +275,7 @@ static int parse_ipv4_ranges(octet_bitvector octets[4], const char *spec) {
+   return 0;
+ }
+ 
+-static NetBlock *parse_expr_without_netmask(const char *hostexp, int af) {
++static NetBlock *parse_expr_without_netmask(const char *hostexp, int af, std::vector<DNS::Request> &requests) {
+   struct sockaddr_storage ss;
+   size_t sslen;
+ 
+@@ -297,13 +302,21 @@ static NetBlock *parse_expr_without_netmask(const char *hostexp, int af) {
+     return netblock_ipv6;
+   }
+ 
+-  return new NetBlockHostname(hostexp, af);
++  NetBlockHostname *nb = new NetBlockHostname(hostexp, af);
++  DNS::Request req;
++  req.name = hostexp;
++  req.userdata = nb;
++  req.type = DNS::A;
++  requests.push_back(req);
++  req.type = DNS::AAAA;
++  requests.push_back(req);
++  return nb;
+ }
+ 
+ /* Parses an expression such as 192.168.0.0/16, 10.1.0-5.1-254, or
+    fe80::202:e3ff:fe14:1102/112 and returns a newly allocated NetBlock. The af
+    parameter is AF_INET or AF_INET6. Returns NULL in case of error. */
+-NetBlock *NetBlock::parse_expr(const char *target_expr, int af) {
++NetBlock *NetBlock::parse_expr(const char *target_expr, int af, std::vector<DNS::Request> &requests) {
+   NetBlock *netblock;
+   char *hostexp;
+   int bits;
+@@ -319,7 +332,7 @@ NetBlock *NetBlock::parse_expr(const char *target_expr, int af) {
+     bits = -1;
+   }
+ 
+-  netblock = parse_expr_without_netmask(hostexp, af);
++  netblock = parse_expr_without_netmask(hostexp, af, requests);
+   if (netblock == NULL)
+     goto bail;
+   netblock->apply_netmask(bits);
+@@ -693,48 +706,45 @@ std::string NetBlockIPv6Netmask::str() const {
+   return result.str();
+ }
+ 
+-NetBlock *NetBlockHostname::resolve() {
+-  struct addrinfo *addrs, *addr;
++NetBlock *NetBlockHostname::resolve(const DNS::Request &reqA, const DNS::Request &reqAAAA) {
+   std::list<struct sockaddr_storage> resolvedaddrs;
+   std::list<struct sockaddr_storage> unscanned_addrs;
+   NetBlock *netblock;
+-  struct sockaddr_storage ss;
+-  size_t sslen;
+ 
+-  addrs = resolve_all(this->hostname.c_str(), AF_UNSPEC);
+-  for (addr = addrs; addr != NULL; addr = addr->ai_next) {
+-    if (addr->ai_addrlen < sizeof(ss)) {
+-      memcpy(&ss, addr->ai_addr, addr->ai_addrlen);
+-      if ((o.resolve_all || resolvedaddrs.empty()) && addr->ai_family == this->af) {
+-        resolvedaddrs.push_back(ss);
+-      }
+-      else {
+-        unscanned_addrs.push_back

@@ -1,0 +1,73 @@
+@@ -285,10 +285,14 @@ public class Main {
+ 
+                     args.setArg("ipfs-api-address", getLocalMultiAddress(ipfsApiPort).toString());
+ 
+-                    Multihash pkiIpfsNodeId = useIPFS ?
+-                            new IpfsDHT(getLocalMultiAddress(ipfsApiPort)).id().get() :
+-                            new FileContentAddressedStorage(blockstorePath(args),
+-                                    JdbcTransactionStore.build(Sqlite.build(":memory:"), new SqliteCommands())).id().get();
++                    JdbcTransactionStore transactions = JdbcTransactionStore.build(Sqlite.build(":memory:"), new SqliteCommands());
++                    ContentAddressedStorage storage = useIPFS ?
++                            new IpfsDHT(getLocalMultiAddress(ipfsApiPort)) :
++                            S3Config.useS3(args) ?
++                                    new S3BlockStorage(S3Config.build(args), Cid.decode(args.getArg("ipfs.id")), transactions) :
++                                    new FileContentAddressedStorage(blockstorePath(args),
++                                            transactions);
++                    Multihash pkiIpfsNodeId = storage.id().get();
+ 
+                     if (ipfs != null)
+                         ipfs.stop();
+@@ -480,7 +484,7 @@ public class Main {
+             Optional<UserService.TlsProperties> tlsProps =
+                     tlsHostname.map(host -> new UserService.TlsProperties(host, a.getArg("tls.keyfile.password")));
+             peergos.initAndStart(localAddress, tlsProps, webroot, useWebAssetCache);
+-            if (! isPkiNode) {
++            if (! isPkiNode && useIPFS) {
+                 int pkiNodeSwarmPort = a.getInt("pki.node.swarm.port");
+                 InetAddress pkiNodeIpAddress = InetAddress.getByName(a.getArg("pki.node.ipaddress"));
+                 ipfsWrapper.connectToNode(new InetSocketAddress(pkiNodeIpAddress, pkiNodeSwarmPort), pkiServerNodeId);
+
+
+
+
+@@ -2,6 +2,7 @@ package peergos.server.storage;
+ 
+ import com.amazonaws.*;
+ import com.amazonaws.auth.*;
++import com.amazonaws.client.builder.*;
+ import com.amazonaws.services.s3.*;
+ import com.amazonaws.services.s3.model.*;
+ import peergos.server.corenode.*;
+@@ -51,16 +52,19 @@ public class S3BlockStorage implements ContentAddressedStorage {
+         this.bucket = config.bucket;
+         this.folder = config.path.isEmpty() || config.path.endsWith("/") ? config.path : config.path + "/";
+         AmazonS3ClientBuilder builder = AmazonS3ClientBuilder.standard()
+-                .withRegion(config.region)
++                .withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(config.regionEndpoint, config.region))
+                 .withCredentials(new AWSStaticCredentialsProvider(
+                         new BasicAWSCredentials(config.accessKey, config.secretKey)));
+         s3Client = builder.build();
++        LOG.info("Using S3 Block Storage at " + config.regionEndpoint + ", bucket " + config.bucket + ", path: " + config.path);
+         this.transactions = transactions;
+     }
+ 
+     private static String hashToKey(Multihash hash) {
+-        // To be compatible with IPFS we use the ame scheme here, the cid bytes encoded as uppercase base32
+-        return new Base32().encodeAsString(hash.toBytes());
++        // To be compatible with IPFS we use the same scheme here, the cid bytes encoded as uppercase base32
++        String padded = new Base32().encodeAsString(hash.toBytes());
++        int padStart = padded.indexOf("=");
++        return padStart > 0 ? padded.substring(0, padStart) : padded;
+     }
+ 
+     private Multihash keyToHash(String key) {
+@@ -93,12 +97,12 @@ public class S3BlockStorage implements ContentAddressedStorage {
+ 
+     @Override
+     public CompletableFuture<List<Multihash>> pinUpdate(PublicKeyHash owner, Multihash existing, Multihash updated) {
+-        return Futures.of(Collections.emptyList());
++        return Futures.of(Collections.singletonList(updated));
+     }
+ 
+     @Override
+     public Compl

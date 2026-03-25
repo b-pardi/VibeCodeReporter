@@ -1,0 +1,80 @@
+@@ -175,6 +175,7 @@ class NetworkInterface : public AlertableEntity {
+     hookLoop /* Thread for the execution of flow user script hooks */;
+   FlowAlertCheckLuaEngine *hooksEngine;   /* Lua engine used to execute flow user script hooks */
+   volatile bool hooks_engine_reload;      /* Boolean indicating whether the hooksEngine should be reloaded */
++  volatile bool user_scripts_reload;      /* Boolean indicating whether a reload of user scripts has been requested */
+   time_t        hooks_engine_next_reload; /* The minimunm time for the next reload of the hooksEngine */
+   Condvar       hooks_condition;          /* Condition variable used to wait when no flows have been enqueued for hooks exec. */
+   bool pollLoopCreated, flowDumpLoopCreated, hookLoopCreated;
+@@ -863,6 +864,11 @@ class NetworkInterface : public AlertableEntity {
+   virtual bool read_from_pcap_dump()      const { return(false); };
+   virtual bool read_from_pcap_dump_done() const { return(false); };
+   virtual void set_read_from_pcap_dump_done()   { ; };
++  /*
++    Issue a request for user scripts reload. This is called by ntopng when user scripts should be reloaded,
++    e.g., after a configuration change.
++   */
++  inline void request_user_scripts_reload()  { if(!user_scripts_reload) user_scripts_reload = true;    };
+   virtual void updateDirectionStats()        { ; }
+   void reloadDhcpRanges();
+   inline bool hasConfiguredDhcpRanges()      { return(dhcp_ranges && !dhcp_ranges->last_ip.isEmpty()); };
+
+
+
+
+@@ -495,7 +495,7 @@ class Ntop {
+   inline ndpi_protocol_category_t get_ndpi_proto_category(ndpi_protocol proto) { return(ndpi_get_proto_category(get_ndpi_struct(), proto)); };
+   ndpi_protocol_category_t get_ndpi_proto_category(u_int protoid);
+   void setnDPIProtocolCategory(u_int16_t protoId, ndpi_protocol_category_t protoCategory);
+-  inline void reloadPeriodicScripts() { if(pa) pa->reloadVMs(); };
++  void reloadPeriodicScripts();
+ #ifndef WIN32
+   inline ContinuousPing* getContinuousPing() { return(cping); }
+ #endif
+
+
+
+
+@@ -52,6 +52,7 @@ NetworkInterface::NetworkInterface(const char *name,
+   influxdb_ts_exporter = rrd_ts_exporter = NULL;
+   hooksEngine = NULL;
+   hooks_engine_reload = false;
++  user_scripts_reload = false;
+   hooks_engine_next_reload = 0;
+   flows_dump_json = true; /* JSON dump enabled by default, possibly disabled in NetworkInterface::startFlowDumping */
+   flows_dump_json_use_labels = false; /* Dump of JSON labels disabled by default, possibly enabled in NetworkInterface::startFlowDumping */
+@@ -2403,8 +2404,14 @@ u_int64_t NetworkInterface::dequeueFlows(SPSCQueue<Flow *> *q, FlowLuaCall flow_
+ void NetworkInterface::updateHooksEngineReload() {
+   time_t now = time(NULL);
+ 
+-  if(hooks_engine_next_reload == 0 /* Need to be set for the first time */
+-     || now > hooks_engine_next_reload /* Time to reload */) {
++  if(user_scripts_reload) { /* A user scripts reload has been requested (e.g., due to a config change): hooks MUST be reloaded as well */
++    hooks_engine_next_reload = 0; /* Reset to force a reload as soon as possible below */
++    user_scripts_reload = false;   /* Notify ntop */
++  }
++
++  if(!hooks_engine_reload /* Make sure a reload is not already in progress */
++     && (hooks_engine_next_reload == 0 /* Need to be set for the first time (or has been reset) */
++	 || now > hooks_engine_next_reload /* Time to reload */)) {
+     hooks_engine_reload = true;
+     hooks_engine_next_reload = now + HOOKS_ENGINE_LIFETIME;
+   }
+
+
+
+
+@@ -2957,6 +2957,24 @@ void Ntop::setnDPIProtocolCategory(u_int16_t protoId, ndpi_protocol_category_t p
+ 
+ /* *************************************** */
+ 
++void Ntop::reloadPeriodicScripts() {
++  /*
++    Request a reload of all the VMs currently executing periodic activities
++   */
++  if(pa) pa->reloadVMs();
++
++  /*
++    Notify interfaces that a reload of user scripts should be performed.
++    Interfaces need to know this for example to reload the VM responsible for
++    the execution of flow hook user scr

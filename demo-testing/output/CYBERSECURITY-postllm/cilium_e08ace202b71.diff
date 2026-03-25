@@ -1,0 +1,135 @@
+@@ -306,6 +306,7 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
+ 	void *data, *data_end;
+ 	struct iphdr *ip4;
+ 	int l4_off, ret;
++	struct endpoint_info *ep;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+ 		return DROP_INVALID;
+@@ -313,6 +314,35 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
+ 	snat_v4_init_tuple(ip4, NAT_DIR_EGRESS, &tuple);
+ 	l4_off = ETH_HLEN + ipv4_hdrlen(ip4);
+ 
++	if (is_defined(IS_BPF_HOST)) {
++		ep = __lookup_ip4_endpoint(ip4->saddr);
++		if (ep && ep->parent_ifindex && ep->parent_ifindex != NATIVE_DEV_IFINDEX) {
++			/* This packet came from an endpoint with a parent interface and
++			 * it is currently not egressing on its parent interface.
++			 * Check if its a reply packet, if it is, redirect it to the
++			 * parent interface.
++			 */
++			if (ipv4_load_l4_ports(ctx, ip4, l4_off, CT_EGRESS,
++					       (__be16 *)&tuple.dport, NULL) < 0)
++				return DROP_INVALID;
++
++			if (ct_is_reply4(get_ct_map4(&tuple), &tuple)) {
++				/* Look up the parent interface's MAC address and set it as the
++				 * source MAC address of the packet. We will assume the destination
++				 * MAC address is still correct. This assumption only holds if the
++				 * current and parent interfaces are on the same L2 network such as
++				 * in EKS.
++				 */
++				union macaddr smac = NATIVE_DEV_MAC_BY_IFINDEX(ep->parent_ifindex);
++
++				if (eth_store_saddr_aligned(ctx, smac.addr, 0) < 0)
++					return DROP_WRITE_ERROR;
++
++				return ctx_redirect(ctx, ep->parent_ifindex, 0);
++			}
++		}
++	}
++
+ 	if (lb_is_svc_proto(tuple.nexthdr) &&
+ 	    nodeport_has_nat_conflict_ipv4(ip4, &target))
+ 		goto apply_snat;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++
++/* Enable CT debug output */
++#undef QUIET_CT
++
++#define DEBUG
++
++#include <bpf/ctx/skb.h>
++#include "pktgen.h"
++
++/* Enable code paths under test*/
++#define ENABLE_IPV4
++#define ENABLE_NODEPORT
++#define ENABLE_ROUTING
++
++#define PRIMARY_IFACE 1
++#define SECONDARY_IFACE 2
++#define BACKEND_IFACE 123
++
++#define NATIVE_DEV_IFINDEX PRIMARY_IFACE
++
++#define BACKEND_EP_ID 127
++
++#define DEFAULT_ROUTE_MAC mac_one
++#define NODE_MAC mac_two
++#define LOCAL_BACKEND_MAC mac_three
++
++#define ctx_redirect mock_ctx_redirect
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__type(key, __u32);
++	__type(value, __u32);
++	__uint(max_entries, 1);
++} redirect_ifindex_map __section_maps_btf;
++
++static __always_inline __maybe_unused int
++mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
++		  int ifindex __maybe_unused, __u32 flags __maybe_unused)
++{
++	__u32 key = 0;
++	__u32 *value = map_lookup_elem(&redirect_ifindex_map, &key);
++
++	if (value)
++		*value = ifindex;
++
++	return CTX_ACT_REDIRECT;
++}
++
++#include <bpf_host.c>
++
++#include "lib/endpoint.h"
++#include "lib/ipcache.h"
++
++#define TO_NETDEV	0
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 1);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[TO_NETDEV] = &cil_to_netdev,
++	},
++};
++
++/* Setup for this test:
++ *
++ * +-------World IP---------+    +----------Pod IP---------+
++ * | v4_ext_one:tcp_src_one | -> | v4_pod_one:tcp_dst_one |
++ * +------------------------+    +------------------------+
++ *          ^                            |
++ *          \---------------------------/
++ *
++ * This happens when in ENI mode and we get traffic via a NLB in ip-mode + preserve-client-ip.
++ * NLB NAT'ing is invisible to us, so we effectively see world to pod IP traffic.
++ * We need to make sure that in BPF masquerade mode, we do not masquerade the pod IP for the return traffic
++ * and route it out of the interface associated with the pod IP, even though egress traffic to
++ * the world is normally routed via the primary interface.
++ *
++ * This test simulates an original incoming packet already 

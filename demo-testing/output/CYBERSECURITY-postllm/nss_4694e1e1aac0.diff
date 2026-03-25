@@ -1,0 +1,138 @@
+@@ -445,7 +445,7 @@ cleanup:
+ PRBool
+ KEA_Verify(SECItem *Y, SECItem *prime, SECItem *subPrime)
+ {
+-    mp_int p, q, y, r;
++    mp_int p, q, y, r, psub1;
+     mp_err err;
+     int cmp = 1; /* default is false */
+     if (!Y || !prime || !subPrime) {
+@@ -456,13 +456,30 @@ KEA_Verify(SECItem *Y, SECItem *prime, SECItem *subPrime)
+     MP_DIGITS(&q) = 0;
+     MP_DIGITS(&y) = 0;
+     MP_DIGITS(&r) = 0;
++    MP_DIGITS(&psub1) = 0;
+     CHECK_MPI_OK(mp_init(&p));
+     CHECK_MPI_OK(mp_init(&q));
+     CHECK_MPI_OK(mp_init(&y));
+     CHECK_MPI_OK(mp_init(&r));
++    CHECK_MPI_OK(mp_init(&psub1));
+     SECITEM_TO_MPINT(*prime, &p);
+     SECITEM_TO_MPINT(*subPrime, &q);
+     SECITEM_TO_MPINT(*Y, &y);
++    CHECK_MPI_OK(mp_sub_d(&p, 1, &psub1));
++    /*
++     * We check that the public value isn't zero (which isn't in the
++     * group), one (subgroup of order one) or p-1 (subgroup of order 2). We
++     * also check that the public value is less than p, to avoid being fooled
++     * by values like p+1 or 2*p-1.
++     * This check is required by SP-800-56Ar3. It's also done in derive,
++     * but this is only called in various FIPS cases, so put it here to help
++     * reviewers find it.
++     */
++    if (mp_cmp_d(&y, 1) <= 0 ||
++        mp_cmp(&y, &psub1) >= 0) {
++        err = MP_BADARG;
++        goto cleanup;
++    }
+     /* compute r = y**q mod p */
+     CHECK_MPI_OK(mp_exptmod(&y, &q, &p, &r));
+     /* compare to 1 */
+@@ -472,6 +489,7 @@ cleanup:
+     mp_clear(&q);
+     mp_clear(&y);
+     mp_clear(&r);
++    mp_clear(&psub1);
+     if (err) {
+         MP_TO_SEC_ERROR(err);
+         return PR_FALSE;
+
+
+
+
+@@ -90,14 +90,6 @@ extern const float s_logv_2[];
+ 
+ /* }}} */
+ 
+-/* {{{ Comparison constants */
+-
+-#define MP_LT -1
+-#define MP_EQ 0
+-#define MP_GT 1
+-
+-/* }}} */
+-
+ /* {{{ private function declarations */
+ 
+ void s_mp_setz(mp_digit *dp, mp_size count);                     /* zero digits           */
+
+
+
+
+@@ -45,6 +45,11 @@ SEC_BEGIN_PROTOS
+ #define MP_UNDEF -5  /* answer is undefined   */
+ #define MP_LAST_CODE MP_UNDEF
+ 
++/* Comparison constants */
++#define MP_LT -1
++#define MP_EQ 0
++#define MP_GT 1
++
+ typedef unsigned int mp_sign;
+ typedef unsigned int mp_size;
+ typedef int mp_err;
+
+
+
+
+@@ -140,11 +140,11 @@ rsa_build_from_primes(const mp_int *p, const mp_int *q,
+     /* at least one exponent must be given */
+     PORT_Assert(!(needPublicExponent && needPrivateExponent));
+ 
+-    /* 2.  Compute phi = (p-1)*(q-1) */
++    /* 2.  Compute phi = lcm((p-1),(q-1)) */
+     CHECK_MPI_OK(mp_sub_d(p, 1, &psub1));
+     CHECK_MPI_OK(mp_sub_d(q, 1, &qsub1));
++    CHECK_MPI_OK(mp_lcm(&psub1, &qsub1, &phi));
+     if (needPublicExponent || needPrivateExponent) {
+-        CHECK_MPI_OK(mp_lcm(&psub1, &qsub1, &phi));
+         /* 3.  Compute d = e**-1 mod(phi) */
+         /*     or      e = d**-1 mod(phi) as necessary */
+         if (needPublicExponent) {
+@@ -165,6 +165,15 @@ rsa_build_from_primes(const mp_int *p, const mp_int *q,
+         goto cleanup;
+     }
+ 
++    /* make sure we weren't passed in a d or e = 1 mod phi */
++    /* just need to check d, because if one is = 1 mod phi, they both are */
++    CHECK_MPI_OK(mp_mod(d, &phi, &tmp));
++    if (mp_cmp_d(&tmp, 1) == MP_EQ) {
++        PORT_SetError(SEC_ERROR_INVALID_ARGS);
++        rv = SECFailure;
++        goto cleanup;
++    }
++
+     /* 4.  Compute exponent1 = d mod (p-1) */
+     CHECK_MPI_OK(mp_mod(d, &psub1, &tmp));
+     MPINT_TO_SECITEM(&tmp, &key->exponent1, key->arena);
+@@ -1157,6 +1166,8 @@ rsa_PrivateKeyOpCRTCheckedPubKey(RSAPrivateKey *key, mp_int *m, mp_int *c)
+     /* Perform a public key operation v = m ** e mod n */
+     CHECK_MPI_OK(mp_exptmod(m, &e, &n, &v));
+     if (mp_cmp(&v, c) != 0) {
++        /* this error triggers a fips fatal error lock */
++        PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+         rv = SECFailure;
+     }
+ cleanup:
+
+
+
+
+@@ -44,6 +44,7 @@
+ 
+ #include "prprf.h"
+ #include "prenv.h"
++#include "prerror.h"
+ 
+ #define __PASTE(x, y) x##y
+ #define BAD_PARAM_CAST(pMech, typeSize)

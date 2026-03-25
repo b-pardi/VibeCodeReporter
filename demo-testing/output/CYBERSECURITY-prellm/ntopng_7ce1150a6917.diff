@@ -1,0 +1,121 @@
+@@ -76,6 +76,7 @@ class Flow : public GenericHashEntry {
+   u_int32_t last_conntrack_update; 
+   u_int32_t marker;
+ #endif
++  json_object *suricata_alert;
+  
+   union {
+     struct {
+@@ -406,6 +407,9 @@ class Flow : public GenericHashEntry {
+   inline char* getSSLCertificate()  { return(isSSL() ? protos.ssl.certificate : (char*)""); }
+   bool isSSLProto();
+ 
++  inline void setSuricataAlert(json_object *a) { if (suricata_alert) json_object_put(suricata_alert); suricata_alert = a; };
++  inline json_object *getSuricataAlert() { return suricata_alert; };
++
+ #if defined(NTOPNG_PRO) && !defined(HAVE_NEDGE)
+   inline void updateProfile()     { trafficProfile = iface->getFlowProfile(this); }
+   inline char* get_profile_name() { return(trafficProfile ? trafficProfile->getName() : (char*)"");}
+
+
+
+
+@@ -44,6 +44,8 @@ class ICMPinfo {
+   virtual ~ICMPinfo();
+   unreachable_t *getUnreach() const { return unreach; };
+   void dissectICMP(u_int16_t const payload_len, const u_int8_t * const payload_data);
++  inline void setType(u_int8_t type) { icmp_type = type; };
++  inline void setCode(u_int8_t code) { icmp_code = code; };
+   void print() const;
+   u_int32_t key() const;
+   bool equal(const ICMPinfo * const icmp_info) const;
+
+
+
+
+@@ -28,7 +28,7 @@ class SyslogParserInterface : public ParserInterface {
+  private:
+ 
+   void parseSuricataFlow(json_object *f, Parsed_Flow *flow);
+-  void parseSuricataAlert(json_object *a, Parsed_Flow *flow, bool flow_alert);
++  void parseSuricataAlert(json_object *a, Parsed_Flow *flow, ICMPinfo *icmp_info, bool flow_alert);
+ 
+  public:
+   SyslogParserInterface(const char *endpoint, const char *custom_interface_type = NULL);
+
+
+
+
+@@ -89,6 +89,7 @@ typedef enum {
+   alert_user_activity = 25,
+   alert_influxdb_export_failure = 26,
+   alert_port_errors = 27,
++  alert_ids = 35,
+ } AlertType; /*
+ 	       NOTE:
+ 	       keep it in sync with alert_type_keys
+
+
+
+
+@@ -79,6 +79,8 @@ Flow::Flow(NetworkInterface *_iface,
+     last_db_dump.cli2srv_goodput_bytes = 0, last_db_dump.srv2cli_goodput_bytes = 0,
+     last_db_dump.last_dump = 0;
+ 
++  suricata_alert = NULL;
++
+   memset(&protos, 0, sizeof(protos));
+   memset(&flow_device, 0, sizeof(flow_device));
+ 
+@@ -243,6 +245,7 @@ Flow::~Flow() {
+ 
+   freeDPIMemory();
+   if(icmp_info)        delete(icmp_info);
++  if(suricata_alert) json_object_put(suricata_alert); 
+ }
+ 
+ /* *************************************** */
+@@ -2026,7 +2029,11 @@ json_object* Flow::flow2statusinfojson() {
+   }
+ 
+   FlowStatus fs = getFlowStatus();
+-  if(fs == status_elephant_local_to_remote)
++  if(fs == status_ids_alert) {
++    json_object *json_alert = getSuricataAlert();
++    if (json_alert)
++      json_object_object_add(obj, "ids_alert", json_object_get(json_alert));
++  } else if(fs == status_elephant_local_to_remote)
+     json_object_object_add(obj, "elephant.l2r_threshold",
+ 			   json_object_new_int64(ntop->getPrefs()->get_elephant_flow_local_to_remote_bytes()));    
+   else if(fs == status_elephant_remote_to_local)
+@@ -3422,6 +3429,9 @@ FlowStatus Flow::getFlowStatus() {
+   if(ndpiDetectedProtocol.category == CUSTOM_CATEGORY_MINING)
+     return status_web_mining_detected;
+ 
++  if(getSuricataAlert())
++    return status_ids_alert;
++
+ #ifndef HAVE_NEDGE
+   /* All flows */
+   threshold = cli2srv_packets / CONST_TCP_CHECK_ISSUES_RATIO;
+
+
+
+
+@@ -73,16 +73,32 @@ void SyslogParserInterface::parseSuricataFlow(json_object *f, Parsed_Flow *flow)
+ 
+ /* **************************************************** */
+ 
+-void SyslogParserInterface::parseSuricataAlert(json_object *a, Parsed_Flow *flow, bool flow_alert) {
+-  char *json_alert;
++void SyslogParserInterface::parseSuricataAlert(json_object *a, Parsed_Flow *flow, ICMPinfo *icmp_info, bool flow_alert) {
++
++  if (flow_alert) {
++    Flow *f;
++    bool src2dst_direction, new_flow;
++
++    f = getFlow(NULL, NULL, flow->core.vlan_id, 0, 0, 0,
++      icmp_info,
++      &flow->core.src_ip, &flow->core.dst_ip,
++      flow->core.src_port, flow->core.dst_port,
++      flow->core.l4_

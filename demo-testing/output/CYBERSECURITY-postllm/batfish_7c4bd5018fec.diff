@@ -1,0 +1,102 @@
+@@ -13,6 +13,7 @@ import com.google.common.collect.ImmutableSet;
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.SortedSet;
+@@ -184,6 +185,11 @@ public abstract class BgpRib<R extends BgpRoute<?, ?>> extends AbstractRib<R> {
+   @Nonnull
+   @Override
+   public RibDelta<R> mergeRouteGetDelta(R route) {
++    // Evict older non-trackable-local routes for same prefix, receivedFrom, and path-id.
++    // Note that trackable local routes are managed elsewhere,
++    // e.g. in Bgpv4Rib.{add,remove}LocalRoute
++    RibDelta<R> evictionDelta =
++        route.isTrackableLocalRoute() ? RibDelta.empty() : evictSamePrefixReceivedFromPathId(route);
+     Map<NextHop, SortedSet<R>> routesByNh = null;
+     boolean multipath = isMultipath();
+     if (multipath) {
+@@ -200,7 +206,39 @@ public abstract class BgpRib<R extends BgpRoute<?, ?>> extends AbstractRib<R> {
+     if (!delta.isEmpty()) {
+       delta.getPrefixes().forEach(this::selectBestPath);
+     }
+-    return delta;
++    return RibDelta.<R>builder().from(evictionDelta).from(delta).build();
++  }
++
++  /**
++   * Evict any distinct existing route with the same values as {@code route} for {@link
++   * BgpRoute#getNetwork()}, {@link BgpRoute#getReceivedFrom()}, and {@link BgpRoute#getPathId()}.
++   */
++  private @Nonnull RibDelta<R> evictSamePrefixReceivedFromPathId(R route) {
++    Prefix prefix = route.getNetwork();
++    R oldRoute =
++        getRouteSamePrefixReceivedFromPathId(
++            route, _backupRoutes != null ? _backupRoutes.get(prefix) : super.getRoutes(prefix));
++    if (oldRoute == null || route.equals(oldRoute)) {
++      return RibDelta.empty();
++    } else {
++      return removeRouteGetDelta(oldRoute);
++    }
++  }
++
++  /**
++   * Return a BGP route with the same values as {@code route} for {@link BgpRoute#getNetwork()},
++   * {@link BgpRoute#getReceivedFrom()}, and {@link BgpRoute#getPathId()} from {@code oldRoutes}.
++   *
++   * <p>If no such route is found in {@code oldRoutes}, return {@code null}.
++   */
++  protected final @Nullable R getRouteSamePrefixReceivedFromPathId(R route, Iterable<R> oldRoutes) {
++    for (R oldRoute : oldRoutes) {
++      if (route.getReceivedFrom().equals(oldRoute.getReceivedFrom())
++          && Objects.equals(route.getPathId(), oldRoute.getPathId())) {
++        return oldRoute;
++      }
++    }
++    return null;
+   }
+ 
+   @Override
+
+
+
+
+@@ -22,6 +22,7 @@ import javax.annotation.Nullable;
+ import javax.annotation.ParametersAreNonnullByDefault;
+ import org.batfish.datamodel.AbstractRoute;
+ import org.batfish.datamodel.AnnotatedRoute;
++import org.batfish.datamodel.BgpRoute;
+ import org.batfish.datamodel.BgpTieBreaker;
+ import org.batfish.datamodel.Bgpv4Route;
+ import org.batfish.datamodel.GenericRibReadOnly;
+@@ -46,27 +47,43 @@ public final class Bgpv4Rib extends BgpRib<Bgpv4Route> {
+     /** Map of NHIP to {@link Bgpv4Route} with that NHIP */
+     private final @Nonnull SetMultimap<Ip, Bgpv4Route> _bgpRoutesByNhip;
+ 
++    /**
++     * Mapping : prefix -> routes tracked herein with that prefix.
++     *
++     * <p>Needed for efficient bookkeeping
++     */
++    private final @Nonnull SetMultimap<Prefix, Bgpv4Route> _bgpRoutesByPrefix;
++
+     private final @Nonnull RibResolutionTrie _mainRibPrefixesAndBgpNhips;
+ 
+     private ResolvabilityEnforcer() {
+       _bgpRoutesByNhip = Multimaps.newSetMultimap(new HashMap<>(), HashSet::new);
++      _bgpRoutesByPrefix = Multimaps.newSetMultimap(new HashMap<>(), HashSet::new);
+       _mainRibPrefixesAndBgpNhips = new RibResolutionTrie();
+     }
+ 
+     void addBgpRoute(Bgpv4Route route) {
+       Ip nhip = route.getNextHopIp();
+       _bgpRoutesByNhip.put(nhip, route);
++      _bgpRoutesByPrefix.put(route.getNetwork(), route);
+       _mainRibPrefixesAndBgpNhips.addNextHopIp(nhip);
+     }
+ 
+     void removeBgpRoute(Bgpv4Route route) {
+       Ip nhip = route.getNextHopIp();
+       _bgpRoutesByNhip.r

@@ -1,0 +1,167 @@
+@@ -57,7 +57,7 @@ static RDebugReasonType r_debug_windbg_wait(RDebug *dbg, int pid) {
+ 	RDebugReasonType reason = R_DEBUG_REASON_UNKNOWN;
+ 	kd_packet_t *pkt = NULL;
+ 	kd_stc_64 *stc;
+-	r_cons_break_push (windbg_break, wctx);
++	windbg_lock_enter (wctx);
+ 	for (;;) {
+ 		void *bed = r_cons_sleep_begin ();
+ 		int ret = windbg_wait_packet (wctx, KD_PACKET_TYPE_STATE_CHANGE64, &pkt);
+@@ -82,7 +82,7 @@ static RDebugReasonType r_debug_windbg_wait(RDebug *dbg, int pid) {
+ 		}
+ 		R_FREE (pkt);
+ 	}
+-	r_cons_break_pop ();
++	windbg_lock_leave (wctx);
+ 	free (pkt);
+ 	return reason;
+ }
+
+
+
+
+@@ -5,6 +5,7 @@
+ #include <stdbool.h>
+ #include <string.h>
+ #include <r_util.h>
++#include <r_cons.h>
+ #include <r_list.h>
+ #include "transport.h"
+ #include "windbg.h"
+@@ -83,6 +84,26 @@ struct _WindCtx {
+ 	RThreadLock *dontmix;
+ };
+ 
++bool windbg_lock_enter(WindCtx *ctx) {
++	r_cons_break_push (windbg_break, ctx);
++	r_th_lock_enter (ctx->dontmix);
++	return true;
++}
++
++bool windbg_lock_tryenter(WindCtx *ctx) {
++	if (!r_th_lock_tryenter (ctx->dontmix)) {
++		return false;
++	}
++	r_cons_break_push (windbg_break, ctx);
++	return true;
++}
++
++bool windbg_lock_leave(WindCtx *ctx) {
++	r_cons_break_pop ();
++	r_th_lock_leave (ctx->dontmix);
++	return true;
++}
++
+ int windbg_get_bits(WindCtx *ctx) {
+ 	return ctx->is_x64 ? R_SYS_BITS_64 : R_SYS_BITS_32;
+ }
+@@ -208,7 +229,7 @@ static int do_io_reply(WindCtx *ctx, kd_packet_t *pkt) {
+ 	int ret;
+ 	ioc.req = 0x3430;
+ 	ioc.ret = KD_RET_ENOENT;
+-	r_th_lock_enter (ctx->dontmix);
++	windbg_lock_enter (ctx);
+ 	id = pkt->id;
+ 	ret = kd_send_data_packet (ctx->io_ptr, KD_PACKET_TYPE_FILE_IO,
+ 		(ctx->seq_id ^= 1), (uint8_t *) &ioc, sizeof (kd_ioc_t), NULL, 0);
+@@ -221,12 +242,12 @@ static int do_io_reply(WindCtx *ctx, kd_packet_t *pkt) {
+ 		goto error;
+ 	}
+ 	id = 0;
+-	r_th_lock_leave (ctx->dontmix);
++	windbg_lock_leave (ctx);
+ 	WIND_DBG eprintf("Ack received, restore flow\n");
+ 	return true;
+ error:
+ 	id = 0;
+-	r_th_lock_leave (ctx->dontmix);
++	windbg_lock_leave (ctx);
+ 	return 0;
+ }
+ 
+@@ -579,7 +600,7 @@ bool windbg_read_ver(WindCtx *ctx) {
+ 	req.req = 0x3146;
+ 	req.cpu = ctx->cpu;
+ 
+-	r_th_lock_enter (ctx->dontmix);
++	windbg_lock_enter (ctx);
+ 
+ 	ret = kd_send_data_packet (ctx->io_ptr, KD_PACKET_TYPE_STATE_MANIPULATE,
+ 		(ctx->seq_id ^= 1), (uint8_t *) &req, sizeof(kd_req_t), NULL, 0);
+@@ -597,7 +618,7 @@ bool windbg_read_ver(WindCtx *ctx) {
+ 		goto error;
+ 	}
+ 
+-	r_th_lock_leave (ctx->dontmix);
++	windbg_lock_leave (ctx);
+ 
+ 	kd_req_t *rr = PKT_REQ (pkt);
+ 
+@@ -661,12 +682,12 @@ bool windbg_read_ver(WindCtx *ctx) {
+ 	free (pkt);
+ 	return true;
+ error:
+-	r_th_lock_leave (ctx->dontmix);
++	windbg_lock_leave (ctx);
+ 	return 0;
+ }
+ 
+ int windbg_sync(WindCtx *ctx) {
+-	int ret;
++	int ret = -1;
+ 	kd_packet_t *s;
+ 
+ 	if (!ctx || !ctx->io_ptr) {
+@@ -677,21 +698,26 @@ int windbg_sync(WindCtx *ctx) {
+ 		return 1;
+ 	}
+ 
++	windbg_lock_enter (ctx);
++
+ 	// Send the breakin packet
+ 	if (iob_write (ctx->io_ptr, (const uint8_t *) "b", 1) != 1) {
+-		return 0;
++		ret = 0;
++		goto end;
+ 	}
+ 
+ 	// Reset the host
+ 	ret = kd_send_ctrl_packet (ctx->io_ptr, KD_PACKET_TYPE_RESET, 0);
+ 	if (ret != KD_E_OK) {
+-		return 0;
++		ret = 0;
++		goto end;
+ 	}
+ 
+ 	// Wait for the response
+ 	ret = windbg_wait_packet (ctx, KD_PACKET_TYPE_RESET, NULL);
+ 	if (ret != KD_E_OK) {
+-		return 0;
++		ret = 0;
++		goto end;
+ 	}
+ 
+ 	// Syncronize with the first KD_PACKET_TYPE_STATE_CHANGE64 packet
+@@ -714,7 +740,11 @@ int windbg_sync(WindCtx *ctx) {
+ 
+ 	free (s);
+ 	eprintf ("Sync done! (%i cpus found)\n", ctx->cpu_count);
+-	return 1;
++	ret = 1;
++
++end:
++	windbg_lock_leave (ctx);
++	return ret;
+ }
+ 
+ int windbg_continue(WindCtx *ctx) {
+@@ -733,6 +763,8 @@ int windbg_continue(WindCtx *ctx) {
+ 	// behave like suggested by ReactOS source
+ 	req.r_cont.tf = 0x400;
+ 
++	windbg_lock_enter (ctx);
++
+ 	ret = kd_send_data_packet (ctx->io_ptr, KD_PACKET_TYPE_STATE_MANIPULATE,
+ 		(ctx->seq_id ^= 1), (uint8_t *) &req, sizeof (kd_req_t), NULL, 0);
+ 	if (ret == KD_E_OK) {
+@@ -740,10 +772,15 @@ int windbg_co

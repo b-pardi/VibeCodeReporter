@@ -1,0 +1,92 @@
+@@ -1,6 +1,7 @@
+ package app.nzyme.core.rest.resources.system.authentication.mgmt;
+ 
+ import app.nzyme.core.NzymeNode;
++import app.nzyme.core.crypto.Crypto;
+ import app.nzyme.core.rest.requests.*;
+ import app.nzyme.core.rest.responses.authentication.mgmt.*;
+ import app.nzyme.core.rest.responses.misc.ErrorResponse;
+@@ -14,6 +15,7 @@ import com.google.common.collect.Lists;
+ import org.apache.commons.lang3.RandomStringUtils;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
++import org.bouncycastle.util.encoders.Base64;
+ 
+ import javax.inject.Inject;
+ import javax.ws.rs.*;
+@@ -464,13 +466,20 @@ public class OrganizationsResource {
+     }
+ 
+     private TapPermissionDetailsResponse tapPermissionEntryToResponse(TapPermissionEntry tpe) {
++        String decryptedSecret;
++        try {
++            decryptedSecret = new String(nzyme.getCrypto().decryptWithClusterKey(Base64.decode(tpe.secret())));
++        } catch (Crypto.CryptoOperationException e) {
++            throw new RuntimeException("Could not decrypt tap secret.", e);
++        }
++
+         return TapPermissionDetailsResponse.create(
+                 tpe.uuid(),
+                 tpe.organizationId(),
+                 tpe.tenantId(),
+                 tpe.name(),
+                 tpe.description(),
+-                tpe.secret(),
++                decryptedSecret,
+                 tpe.createdAt(),
+                 tpe.updatedAt(),
+                 tpe.lastReport()
+
+
+
+
+@@ -1,10 +1,13 @@
+ package app.nzyme.core.security.authentication;
+ 
+ import app.nzyme.core.NzymeNode;
++import app.nzyme.core.crypto.Crypto;
+ import app.nzyme.core.security.authentication.db.OrganizationEntry;
+ import app.nzyme.core.security.authentication.db.TapPermissionEntry;
+ import app.nzyme.core.security.authentication.db.TenantEntry;
+ import app.nzyme.core.security.authentication.db.UserEntry;
++import com.google.common.io.BaseEncoding;
++import io.netty.handler.codec.base64.Base64;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.joda.time.DateTime;
+@@ -336,6 +339,13 @@ public class AuthenticationService {
+     }
+ 
+     public TapPermissionEntry createTap(long organizationId, long tenantId, String secret, String name, String description) {
++        String encryptedSecret;
++        try {
++            encryptedSecret = BaseEncoding.base64().encode(nzyme.getCrypto().encryptWithClusterKey(secret.getBytes()));
++        } catch (Crypto.CryptoOperationException e) {
++            throw new RuntimeException("Could not encrypt tap secret.", e);
++        }
++
+         return nzyme.getDatabase().withHandle(handle ->
+                 handle.createQuery("INSERT INTO taps(uuid, organization_id, tenant_id, secret, name, " +
+                                 "description, deleted, created_at, updated_at) VALUES(:uuid, :organization_id, :tenant_id, " +
+@@ -343,7 +353,7 @@ public class AuthenticationService {
+                         .bind("uuid", UUID.randomUUID())
+                         .bind("organization_id", organizationId)
+                         .bind("tenant_id", tenantId)
+-                        .bind("secret", secret)
++                        .bind("secret", encryptedSecret)
+                         .bind("name", name)
+                         .bind("description", description)
+                         .bind("created_at", DateTime.now())
+@@ -381,15 +391,36 @@ public class AuthenticationService {
+     }
+ 
+     public Optional<TapPermissionEntry> findTapBySecret(String secret) {
+-        return nzyme.getDatabase().withHandle(handle ->
++        /*
++         * We have to pull all taps here and then loop over them because the secret is encrypted, and we can't use
++         * a SELECT WHERE with a non-deterministic encryption like PGP.
++         */
++
++        List<TapPermissionEntry> taps = nzyme.getDatabase().withHandle(handle ->
+                 handle.createQuery("SELECT uuid, organization_id, tenant_id, name, description, secret, " +
+-  

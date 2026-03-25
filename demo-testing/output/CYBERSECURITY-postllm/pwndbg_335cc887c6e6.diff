@@ -1,0 +1,157 @@
+@@ -1085,8 +1085,6 @@ class MallocContext:
+         2. When musl is dynmically linked, due to the ld donation logic,
+            the heap will usually be initialized before the start of main().
+         """
+-        print(f"{self.addr:#x} says {self.init_done}")
+-
+         if self.init_done != 1:
+             return False
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,35 @@
++#include <stdlib.h>
++#include <string.h>
++
++void break_here() {};
++
++int main () {
++  char* buffer1 = malloc(0x20);
++  char* buffer2 = malloc(0x20);
++  char* buffer3 = malloc(0x20);
++  char* buffer4 = malloc(0x211);
++  char* buffer5 = malloc(0x211);
++
++  break_here();
++
++  memset(buffer1, 0xA, 0x20);
++  memset(buffer2, 0xB, 0x20);
++  memset(buffer3, 0xC, 0x20);
++  memset(buffer4, 0xD, 0x211);
++  memset(buffer5, 0xE, 0x211);
++
++  break_here();
++
++  free(buffer1);
++  free(buffer2);
++
++  break_here();
++
++  free(buffer3);
++  free(buffer4);
++  free(buffer5);
++
++  break_here();
++
++  return 0;
++}
+
+
+
+
+@@ -188,6 +188,12 @@ class Controller:
+         """
+         raise NotImplementedError()
+ 
++    def finish(self) -> Awaitable[None]:
++        """
++        Resume execution; stop after the current function returns.
++        """
++        raise NotImplementedError()
++
+ 
+ def start(controller: Callable[[Controller], Coroutine[Any, Any, None]]) -> None:
+     """
+
+
+
+
+@@ -43,6 +43,9 @@ class _GDBController(host.Controller):
+     async def step_instruction(self) -> None:
+         gdb.execute("stepi")
+ 
++    async def finish(self) -> None:
++        gdb.execute("finish")
++
+ 
+ def _start(outer: Callable[[host.Controller], Coroutine[Any, Any, None]]) -> None:
+     # The GDB controller is entirely synchronous, so keep advancing the
+
+
+
+
+@@ -47,6 +47,9 @@ async def _run(ctrl: Any, outer: Callable[..., Coroutine[Any, Any, None]]) -> No
+         async def step_instruction(self) -> None:
+             await self.pc.execute("thread step-inst")
+ 
++        async def finish(self) -> None:
++            await self.pc.execute("thread step-out")
++
+     await outer(_LLDBController(ctrl))
+ 
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,400 @@
++from __future__ import annotations
++
++import re
++from typing import List
++
++import pytest
++
++import pwndbg
++import pwndbg.color as color
++import pwndbg.dbg
++
++from ....host import Controller
++from . import break_at_sym
++from . import get_binary
++from . import launch_to
++from . import pwndbg_test
++
++HEAP_MALLOCNG_DYN = get_binary("heap_musl_dyn.out")
++HEAP_MALLOCNG_STATIC = get_binary("heap_musl_static.out")
++
++# Userland only
++re_addr = r"0x[0-9a-fA-F]{1,12}"
++
++
++@pwndbg_test
++@pytest.mark.parametrize(
++    "binary", [HEAP_MALLOCNG_DYN, HEAP_MALLOCNG_STATIC], ids=["dynamic", "static"]
++)
++async def test_mallocng_slot_user(ctrl: Controller, binary: str):
++    await launch_to(ctrl, binary, "break_here")
++    # Get out of the break_here() function.
++    await ctrl.finish()
++
++    # == Check generic command output ==
++
++    buffer1_out = (await ctrl.execute_and_capture("ng-slotu buffer1")).splitlines()
++
++    # Strip the colors. FIXME: After #3142 is figured out.
++    buffer1_out = [color.strip(x) for x in buffer1_out]
++
++    expected_output = [
++        "slab",
++        f"  group:          {re_addr}    ",
++        f"  meta:           {re_addr}    ",
++        "general",
++        f"  start:          {re_addr}    ",
++        f"  user start:     {re_addr}    aka `p`",
++        rf"  end:            {re_addr}    start \+ stride - 4",
++        "  stride:         0x30              distance between adjacent slots",
++        """  user size:      0x20              aka "nominal size", `n`""",
++        r"  slack:          0x0 \(0x0\)         slot's unused memory \/ 0x10",
++        "in-band",
++        r"  offset:         0x[0-9] \(0x[0-9]{0,1}0\)         distance to first slot start \/ 0x10",
++        r"  index:          0x0               index of slot in its group",
++        "  hdr reserved:   0x5               describes: end - p - n",
++        "                                    use ft

@@ -1,0 +1,151 @@
+@@ -7,6 +7,18 @@
+ 
+ #include "cil.inc.c"
+ 
++static char table_to_type(int table) {
++	switch (table) {
++	case 0x70: return 's'; // string
++	case 0x02: return 't'; // typedef
++	case 0x01: return 'r'; // typeref
++	case 0x04: return 'f'; // field
++	case 0x06: return 'm'; // methoddef
++	case 0x0A: return 'm'; // memberref
++	default: return 0;
++	}
++}
++
+ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
+ 	const ut8 *buf = op->bytes;
+ 	int len = op->size;
+@@ -102,9 +114,24 @@ static bool decode(RArchSession *as, RAnalOp *op, RArchDecodeMask mask) {
+ 				mnemonic = r_str_appendf (mnemonic, " 0x%08" PFMT64x, target);
+ 			}
+ 			break;
+-		case CIL_OP_TOKEN:
+-			mnemonic = r_str_appendf (mnemonic, " 0x%08x", r_read_le32 (buf + 1));
+-			break;
++ 		case CIL_OP_TOKEN:
++ 			{
++ 				ut32 token = r_read_le32 (buf + 1);
++ 				int table = token >> 24;
++ 				int rid = token & 0xffffff;
++ 				char type = table_to_type(table);
++				if (type && as->arch->binb.bin && as->arch->binb.get_name) {
++					const char *name = as->arch->binb.get_name (as->arch->binb.bin, type, rid, false);
++ 					if (name) {
++ 						mnemonic = r_str_appendf (mnemonic, " %s", name);
++ 					} else {
++ 						mnemonic = r_str_appendf (mnemonic, " 0x%08x", token);
++ 					}
++ 				} else {
++ 					mnemonic = r_str_appendf (mnemonic, " 0x%08x", token);
++ 				}
++ 			}
++ 			break;
+ 		case CIL_OP_VAR_S:
+ 			mnemonic = r_str_appendf (mnemonic, " %u", buf[op->size - 1]);
+ 			break;
+
+
+
+
+@@ -3400,6 +3400,7 @@ static int bin_pe_init(RBinPEObj* pe) {
+ 	pe->big_endian = 0;
+ 	pe->cms = NULL;
+ 	pe->spcinfo = NULL;
++	pe->dotnet_symbols = NULL;
+ 	if (!bin_pe_init_hdr (pe)) {
+ 		R_LOG_WARN ("File is not PE");
+ 		return false;
+@@ -4544,6 +4545,7 @@ void* PE_(r_bin_pe_free)(RBinPEObj* pe) {
+ 	free (pe->authentihash);
+ 	r_list_free (pe->rich_entries);
+ 	r_list_free (pe->resources);
++	r_list_free (pe->dotnet_symbols);
+ 	r_pkcs7_cms_free (pe->cms);
+ 	r_pkcs7_spcinfo_free (pe->spcinfo);
+ 	r_buf_free (pe->b);
+
+
+
+
+@@ -2,6 +2,7 @@
+ #include <r_bin.h>
+ 
+ #include "pe_specs.h"
++#include "dotnet.h"
+ 
+ #ifndef _INCLUDE_R_BIN_PE_H_
+ #define _INCLUDE_R_BIN_PE_H_
+@@ -115,6 +116,7 @@ struct PE_(r_bin_pe_obj_t) {
+ 	PE_(image_clr_header) * clr_hdr;
+ 	PE_(image_metadata_header) * metadata_header;
+ 	PE_(image_metadata_stream) * *streams;
++	RList *dotnet_symbols;
+ 
+ 	/* store the section information for future use */
+ 	struct r_bin_pe_section_t *sections;
+
+
+
+
+@@ -1,6 +1,7 @@
+ /* radare - LGPL - Copyright 2009-2024 - nibble, pancake, alvarofe */
+ 
+ #include "bin_pe.inc.c"
++#include "../format/pe/dotnet.h"
+ 
+ extern struct r_bin_write_t r_bin_write_pe;
+ 
+@@ -441,6 +442,7 @@ RBinPlugin r_bin_plugin_pe = {
+ 		.license = "LGPL-3.0-only",
+ 	},
+ 	.get_sdb = &get_sdb,
++	.get_name = &getname,
+ 	.load = &load,
+ 	.destroy = &destroy,
+ 	.check = &check,
+
+
+
+
+@@ -414,9 +414,6 @@ static RList* symbols(RBinFile *bf) {
+ 				RListIter *iter;
+ 				DotNetSymbol *dsym;
+ 				r_list_foreach (dotnet_symbols, iter, dsym) {
+-					if (!dsym->type) {
+-						continue;
+-					}
+ 					if (!strcmp (dsym->type, "methoddef")) {
+ 						// Add methoddef at its RVA
+ 						ptr = R_NEW0 (RBinSymbol);
+@@ -885,3 +882,86 @@ static RList *compute_hashes(RBinFile *bf) {
+ 	}
+ 	return file_hashes;
+ }
++
++#ifndef R_BIN_PE64
++static const char *getname(RBinFile *bf, int type, int idx, bool sd) {
++	RBinPEObj *pe = PE_(get) (bf);
++	if (!pe || !pe->clr_hdr) {
++		return NULL;
++	}
++	if (!pe->dotnet_symbols) {
++		RBuffer *buf = bf->buf;
++		const ut8 *data = r_buf_data (buf, NULL);
++		size_t size = r_buf_size (buf);
++		ut64 image_base = PE_(r_bin_pe_get_image_base)(pe);
++		pe->dotnet_symbols = dotnet_parse (data, size, image_base);
++	}
++	if (!pe->dotnet_symbols) {
++		return NULL;
++	}
++	RListIter *iter;
++	DotNetSymbol *dsym;
++	ut32 token = 0;
++	switch (type) {
++	case 'm': // methoddef or memberref
++		token = (0x06 << 24) | idx; // try methoddef first
++		r_list_foreach (pe->dotnet_symbols, iter, dsym) {
++			if (dsym->token == token) {
++				return dsym->name

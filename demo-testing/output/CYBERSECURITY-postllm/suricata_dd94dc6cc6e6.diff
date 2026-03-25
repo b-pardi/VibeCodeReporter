@@ -1,0 +1,137 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,985 @@
++/* Copyright (C) 2025 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Eric Leblond <el@stamus-networks.com>
++ */
++
++#include "suricata-common.h"
++#include "suricata.h"
++#include "rust.h"
++#include "datasets.h"
++#include "datajson.h"
++#include "datasets-ipv4.h"
++#include "datasets-ipv6.h"
++#include "datasets-md5.h"
++#include "datasets-sha256.h"
++#include "datasets-string.h"
++#include "util-byte.h"
++#include "util-ip.h"
++#include "util-debug.h"
++
++static int DatajsonAdd(
++        Dataset *set, const uint8_t *data, const uint32_t data_len, DataJsonType *json);
++
++static inline void DatajsonUnlockData(THashData *d)
++{
++    (void)THashDecrUsecnt(d);
++    THashDataUnlock(d);
++}
++
++/* return true if number is a float or an integer */
++static bool IsFloat(const char *in, size_t ins)
++{
++    char *endptr;
++    float val = strtof(in, &endptr);
++    const char *end_ins = in + ins - 1;
++    if (val != 0 && (endptr == end_ins)) {
++        return true;
++    }
++    /* if value is 0 then we need to check if some parsing has been done */
++    if (val == 0 && (endptr == in)) {
++        return false;
++    }
++    return true;
++}
++
++static int ParseJsonLine(const char *in, size_t ins, DataJsonType *rep_out)
++{
++    json_error_t jerror;
++    json_t *msg = json_loads(in, 0, &jerror);
++    if (msg == NULL) {
++        /* JANSSON does not see an integer, float or a string as valid JSON.
++           So we need to exclude them from failure. */
++        if (!IsFloat(in, ins) && !((in[0] == '"') && (in[ins - 1] == '"'))) {
++            SCLogWarning("dataset: Invalid json: %s: '%s'\n", jerror.text, in);
++            return -1;
++        }
++    } else {
++        json_decref(msg);
++    }
++    rep_out->len = ins;
++    rep_out->value = SCStrndup(in, ins);
++    if (rep_out->value == NULL) {
++        return -1;
++    }
++    return 0;
++}
++
++static json_t *GetSubObjectByKey(json_t *json, const char *key)
++{
++    if (!json || !key || !json_is_object(json)) {
++        return NULL;
++    }
++
++    const char *current_key = key;
++    json_t *current = json;
++    while (current_key) {
++        const char *dot = strchr(current_key, '.');
++
++        size_t key_len = dot ? (size_t)(dot - current_key) : strlen(current_key);
++        char key_buffer[key_len + 1];
++        strlcpy(key_buffer, current_key, key_len + 1);
++
++        if (json_is_object(current) == false) {
++            return NULL;
++        }
++        current = json_object_get(current, key_buffer);
++        if (current == NULL) {
++            return NULL;
++        }
++        current_key = dot ? dot + 1 : NULL;
++    }
++    return current;
++}
++
++static int ParseJsonFile(const char *file, json_t **array, char *key)
++{
++    json_t *json;
++    json_error_t error;
++    /* assume we have one single JSON element in FILE */
++    json = json_load_file(file, 0, &error);
++    if (json == NULL) {
++        FatalErrorOnInit("can't load JSON, error on line %d: %s", error.line, error.text);
++        return -1;
++    }
++
++    if (key == NULL || strlen(key) == 0) {
++        *array = json;
++    } else {
++        *array = GetSubObjectByKey(json, key);
++        if (*array == NULL) {
++            SCLogError("dataset: %s failed to get key '%s'", file, key);
++            json_decref(json);
++            return -1;
++        }
++

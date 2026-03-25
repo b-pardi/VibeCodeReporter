@@ -1,0 +1,130 @@
+@@ -13,6 +13,7 @@
+ #include "zeek/analyzer/Manager.h"
+ #include "zeek/packet_analysis/protocol/icmp/ICMPSessionAdapter.h"
+ #include "zeek/packet_analysis/protocol/icmp/events.bif.h"
++#include "zeek/packet_analysis/protocol/ip/SessionAdapter.h"
+ #include "zeek/session/Manager.h"
+ 
+ using namespace zeek::packet_analysis::ICMP;
+@@ -80,6 +81,7 @@ void ICMPAnalyzer::DeliverPacket(Connection* c, double t, bool is_orig, int rema
+ 
+         if ( chksum != 0xffff ) {
+             adapter->Weird("bad_ICMP_checksum");
++            adapter->TapPacket(pkt, PacketAction::Skip, SkipReason::BadChecksum);
+             return;
+         }
+     }
+@@ -112,6 +114,9 @@ void ICMPAnalyzer::DeliverPacket(Connection* c, double t, bool is_orig, int rema
+ 
+     ForwardPacket(std::min(len, remaining), data, pkt);
+ 
++    // Tap the packet before sending it to protocol analysis.
++    adapter->TapPacket(pkt);
++
+     if ( remaining >= len )
+         adapter->ForwardPacket(len, data, is_orig, -1, ip.get(), remaining);
+ 
+
+
+
+
+@@ -8,7 +8,14 @@
+ 
+ using namespace zeek::packet_analysis::IP;
+ 
+-void SessionAdapter::Done() { Analyzer::Done(); }
++void SessionAdapter::Done() {
++    Analyzer::Done();
++    for ( const auto& ta : tap_analyzers )
++        ta->Done();
++
++    // Ensure no more TapPacket() calls after Done() on TapAnalyzer instances.
++    tap_analyzers.clear();
++}
+ 
+ bool SessionAdapter::IsReuse(double t, const u_char* pkt) { return parent->IsReuse(t, pkt); }
+ 
+@@ -28,3 +35,37 @@ void SessionAdapter::PacketContents(const u_char* data, int len) {
+         EnqueueConnEvent(packet_contents, ConnVal(), std::move(contents));
+     }
+ }
++
++void SessionAdapter::AddTapAnalyzer(TapAnalyzerPtr ta) {
++    assert(! IsFinished());
++    tap_analyzers.push_back(std::move(ta));
++    tap_analyzers.back()->Init();
++}
++
++bool SessionAdapter::RemoveTapAnalyzer(const TapAnalyzer* ta) {
++    // Find the raw pointer, call Done(), remove it, thereby destructing it.
++    for ( auto it = tap_analyzers.begin(); it != tap_analyzers.end(); ++it ) {
++        if ( it->get() == ta ) {
++            // Ensure Done() is called only after removal from tap_analyzers.
++            auto ptr{std::move(*it)};
++            tap_analyzers.erase(it);
++            ptr->Done();
++            ptr.reset();
++            return true;
++        }
++    }
++
++    return false;
++}
++
++void SessionAdapter::TapPacket(const Packet* pkt, PacketAction action, SkipReason skip_reason) const {
++    for ( const auto& ta : tap_analyzers )
++        ta->TapPacket(*pkt, action, skip_reason);
++}
++
++void SessionAdapter::UpdateConnVal(RecordVal* conn_val) {
++    Analyzer::UpdateConnVal(conn_val);
++
++    for ( const auto& ta : tap_analyzers )
++        ta->UpdateConnVal(conn_val);
++}
+
+
+
+
+@@ -2,13 +2,90 @@
+ 
+ #pragma once
+ 
++#include <memory>
++
+ #include "zeek/analyzer/Analyzer.h"
++#include "zeek/iosource/Packet.h"
+ 
+ namespace zeek::analyzer::pia {
+ class PIA;
+ }
+ 
+-namespace zeek::packet_analysis::IP {
++namespace zeek::packet_analysis {
++
++/**
++ * Indicator for a TapAnalyzer to determine what will happen to a packet.
++ */
++enum class PacketAction : uint8_t {
++    Deliver, ///< Packet will be delivered to child protocol analyzers.
++    Skip,    ///< Processing of this packet will be skipped.
++};
++
++/**
++ * Reason why delivery of a packet would be skipped.
++ */
++enum class SkipReason : uint8_t {
++    None,           ///< None is used when the verdict is Deliver.
++    Unknown,        ///< Placeholder if no other value fits.
++    BadChecksum,    ///< The packet's checksum is invalid and ignore_checksums is false.
++    BadProtoHeader, ///< Something was off with the lengths or offsets in the protocol header.
++};
++
++/**
++ * A lightweight analyzer that receives all packets passing through session adapters.
++ *
++ * A use case of tap analyzers is to attach them during HookSetupAnalyzerTree() to
++ * observe all raw packets of a session, including those that are invalid or corrupt
++ * and aren't delivered to child protocol analyzers.
++ *
++ * The 

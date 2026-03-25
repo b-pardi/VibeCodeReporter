@@ -1,0 +1,120 @@
+@@ -27,7 +27,8 @@
+ class MySQLDB : public DB {
+  protected:
+   MYSQL mysql;
+-  bool db_operational;
++  MYSQL mysql_alt;
++  bool db_operational, mysql_alt_connected;
+   struct timeval lastUpdateTime;
+   u_int32_t mysqlDroppedFlows, mysqlConsumerDroppedFlows;
+   u_int32_t mysqlEnqueuedFlows;
+@@ -43,6 +44,7 @@ class MySQLDB : public DB {
+   char* get_last_db_error(MYSQL *conn) { return((char*)mysql_error(conn)); }
+   int exec_sql_query(MYSQL *conn, const char *sql, bool doReconnect = true,
+ 		     bool ignoreErrors = false, bool doLock = true);
++  void try_exec_sql_query(MYSQL *conn, char *sql);
+ 
+  public:
+   MySQLDB(NetworkInterface *_iface);
+
+
+
+
+@@ -33,41 +33,29 @@ static void* queryLoop(void* ptr) {
+ 
+ void* MySQLDB::queryLoop() {
+   Redis *r = ntop->getRedis();
+-  MYSQL mysql_alt;
+   char sql[CONST_MAX_SQL_QUERY_LEN];
++  bool queue_not_empty = false;
+ 
+   while(!ntop->getGlobals()->isShutdown()
+ 	&& !MySQLDB::isDbCreated() /* wait until the db has been created */) {
+     sleep(1);
+   }
+ 
+-  if(ntop->getGlobals()->isShutdown() || !connectToDB(&mysql_alt, true))
++  if(ntop->getGlobals()->isShutdown() || !mysql_alt_connected)
+     return(NULL);
+ 
+-  while(isRunning()) {
++  while(isRunning() || queue_not_empty) {
+     int rc = r->lpop(CONST_SQL_QUEUE, sql, sizeof(sql));
+ 
+     if(rc == 0) {
+-      if (strlen(sql) >= CONST_MAX_SQL_QUERY_LEN - 1){
+-	ntop->getTrace()->traceEvent(TRACE_WARNING,
+-				     "Tried to execute a query longer than %u. Skipping.",
+-				     CONST_MAX_SQL_QUERY_LEN - 2);
+-	continue;  // prevents overflown queries to generate mysql errors
+-      } else if((rc = exec_sql_query(&mysql_alt, sql, true /* Attempt to reconnect */, true /* Don't print errors */, false)) < 0) {
+-	ntop->getTrace()->traceEvent(TRACE_ERROR, "MySQL error: %s [rc=%d]", get_last_db_error(&mysql_alt), rc);
+-	ntop->getTrace()->traceEvent(TRACE_ERROR, "%s", sql);
+-
+-	/* Don't give up, manually re-connect */
+-	disconnectFromDB(&mysql_alt);
+-	if(!connectToDB(&mysql_alt, true)) _usleep(100);
+-      } else {
+-	mysqlExportedFlows++;
+-      }
+-    } else
+-      sleep(1);    
++      queue_not_empty = true;
++      try_exec_sql_query(&mysql_alt, sql);
++    } else {
++      queue_not_empty = false;
++      _usleep(10000);
++    }
+   }
+ 
+-  disconnectFromDB(&mysql_alt);
+   return(NULL);
+ }
+ 
+@@ -480,12 +468,14 @@ MySQLDB::MySQLDB(NetworkInterface *_iface) : DB(_iface) {
+   checkpointDroppedFlows = checkpointExportedFlows = 0;
+   lastUpdateTime.tv_sec = 0, lastUpdateTime.tv_usec = 0;
+   connectToDB(&mysql, false);
++  mysql_alt_connected = connectToDB(&mysql_alt, true);
+ }
+ 
+ /* ******************************************* */
+ 
+ MySQLDB::~MySQLDB() {
+   shutdown();
++  disconnectFromDB(&mysql_alt);
+   disconnectFromDB(&mysql);
+ }
+ 
+@@ -644,6 +634,26 @@ int MySQLDB::flow2InsertValues(Flow *f, char *json,
+ 
+ /* ******************************************* */
+ 
++void MySQLDB::try_exec_sql_query(MYSQL *conn, char *sql) {
++  int rc;
++
++  if (strlen(sql) >= CONST_MAX_SQL_QUERY_LEN - 1) {
++    ntop->getTrace()->traceEvent(TRACE_WARNING, "Tried to execute a query longer than %u. Skipping.",
++      CONST_MAX_SQL_QUERY_LEN - 2);
++  } else if((rc = exec_sql_query(conn, sql, true /* Attempt to reconnect */, true /* Don't print errors */, false)) < 0) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "MySQL error: %s [rc=%d]", get_last_db_error(conn), rc);
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "%s", sql);
++
++    /* Don't give up, manually re-connect */
++    disconnectFromDB(conn);
++    if(!connectToDB(conn, true)) _usleep(100);
++  } else {
++    mysqlExportedFlows++;
++  }
++}
++
++/* ******************************************* */
++
+ bool MySQLDB::dumpFlow(time_t when, Flow *f, char *json) {
+   char sql[CONST_MAX_SQL_QUERY_LEN];
+ 
+@@ -660,17 +670,28 @@ bool MySQLDB::dumpFlow(time_t when, Flow *f, char *json) {
+   /* do the actual flow insertion as a tuple */
+   flow2InsertValues(f, json, &sql[strlen(sql)], sizeof(sql) - strlen(sql) - 1);
+ 
+-  if (ntop->getRedis()->llen(

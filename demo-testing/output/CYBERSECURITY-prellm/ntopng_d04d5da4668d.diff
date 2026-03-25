@@ -1,0 +1,122 @@
+@@ -750,6 +750,7 @@ class NetworkInterface : public AlertableEntity {
+   inline void decNumAlertsEngaged(ScriptPeriodicity p)    { num_alerts_engaged[(u_int)p]--; }
+   inline bool hasAlerts()                                 { return(has_alerts); }
+   inline void refreshHasAlerts()                          { has_alerts = alertsManager ? alertsManager->hasAlerts() : false; }
++  virtual bool reproducePcapOriginalSpeed()               { return(false); }
+   u_int32_t getNumEngagedAlerts();
+ };
+ 
+
+
+
+
+@@ -49,8 +49,9 @@ class PcapInterface : public NetworkInterface {
+   void startPacketPolling();
+   void shutdown();
+   bool set_packet_filter(char *filter);
+-  inline bool read_from_pcap_dump() { return(read_pkts_from_pcap_dump); };
+-  inline void sendTermination()     { if(pcap_handle) pcap_breakloop(pcap_handle); }
++  inline bool read_from_pcap_dump() { return(read_pkts_from_pcap_dump);            };
++  inline void sendTermination()     { if(pcap_handle) pcap_breakloop(pcap_handle); };
++  bool reproducePcapOriginalSpeed();
+   virtual void updateDirectionStats();
+ };
+ 
+
+
+
+
+@@ -42,7 +42,7 @@ class Prefs {
+   char **deferred_interfaces_to_register, *cli;
+   char *http_binding_address1, *http_binding_address2;
+   char *https_binding_address1, *https_binding_address2;
+-  bool enable_client_x509_auth;
++  bool enable_client_x509_auth, reproduce_at_original_speed;
+   char *lan_interface;
+   Ntop *ntop;
+   bool enable_dns_resolution, sniff_dns_responses,
+@@ -377,7 +377,9 @@ class Prefs {
+   inline bool isGlobalDnsForgingEnabled()        { return(global_dns_forging_enabled);                  };
+   inline u_int8_t getNumTsSlots()                { return(num_ts_slots);                                };
+   inline u_int8_t getNumTsSteps()                { return(ts_num_steps);                                };
+-
++  inline bool     reproduceOriginalSpeed()       { return(reproduce_at_original_speed);                 };
++  inline void     doReproduceOriginalSpeed()     { reproduce_at_original_speed = true;                  };
++  
+   void validate();
+ };
+ 
+
+
+
+
+@@ -1264,7 +1264,8 @@ void Host::dissectDropbox(const char *payload, u_int16_t payload_len) {
+   enum json_tokener_error jerr;
+   char str[1500];
+ 
+-  if ((payload_len + 1) > sizeof(str)) return; /* Too long: this isn't a valid Dropbox packet */
++  if ((payload_len + 1) > (u_int16_t)sizeof(str))
++    return; /* Too long: this isn't a valid Dropbox packet */
+ 
+   strncpy(str, payload, payload_len);
+   str[payload_len] = '\0';
+
+
+
+
+@@ -262,6 +262,37 @@ static void* packetPollLoop(void* ptr) {
+       }
+       
+       if((rc = pcap_next_ex(pd, &hdr, &pkt)) > 0) {
++	if(iface->reproducePcapOriginalSpeed()) {
++	  struct timeval now;
++	  static struct timeval lastPktProcessed = { 0, 0 }, lastPcapTime;
++	    
++	  gettimeofday(&now, NULL);
++
++	  if(lastPktProcessed.tv_sec > 0) {
++	    u_int32_t n, m = Utils::msTimevalDiff(&hdr->ts, &lastPcapTime);
++
++	    if(m < 100000) { /* Catch wrong timestamps */
++	      n = (u_int32_t)Utils::msTimevalDiff(&now, &lastPktProcessed);
++
++	      if(n < m) {
++		ntop->getTrace()->traceEvent(TRACE_INFO,
++					     "Sleeping %.3f sec [delta %.3f sec]",
++					     ((float)(m-n))/1000, ((float)m)/1000);
++		
++		usleep((m - n)*1000);
++	      }
++	    }
++
++	    /* Recompute after sleep */
++	    gettimeofday(&now, NULL);
++	  }
++
++	  lastPcapTime = hdr->ts;
++	  lastPktProcessed = now;
++	  
++	  hdr->ts = now;
++	}
++	  
+ 	if((pkt != NULL) && (hdr->caplen > 0)) {
+ 	  u_int16_t p;
+ 	  Host *srcHost = NULL, *dstHost = NULL;
+@@ -300,7 +331,6 @@ static void* packetPollLoop(void* ptr) {
+ 	iface->purgeIdle(time(NULL));
+       }
+     } /* while */
+-
+   } while(pcap_list != NULL);
+ 
+   if(iface->read_from_pcap_dump()) {
+@@ -432,3 +462,10 @@ void PcapInterface::updateDirectionStats() {
+ }
+ 
+ #endif
++
++/* **************************************************** */
++
++bool PcapInterface::reproducePcapOriginalSpeed() {
++  return(read_pkts_from_pcap_dump && ntop->getPrefs()->reproduceOriginalSpeed());
++}

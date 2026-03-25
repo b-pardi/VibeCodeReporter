@@ -1,0 +1,131 @@
+@@ -321,9 +321,8 @@ class JobControlRecord {
+   int32_t Protocol_ = 0;           /**< Backup Protocol */
+   bool my_thread_killable = false; /**< Can we kill the thread? */
+  public:
+-  JobControlRecord() { Dmsg0(100, "Construct JobControlRecord\n"); }
+-
+-  ~JobControlRecord() { Dmsg0(100, "Destruct JobControlRecord\n"); }
++  JobControlRecord();
++  ~JobControlRecord();
+ 
+   void lock() { P(mutex); }
+   void unlock() { V(mutex); }
+@@ -705,4 +704,11 @@ extern void b_free_jcr(const char* file, int line, JobControlRecord* jcr);
+ typedef void(dbg_jcr_hook_t)(JobControlRecord* jcr, FILE* fp);
+ extern void DbgJcrAddHook(dbg_jcr_hook_t* fct);
+ 
++
++/* new interface */
++void InitJcr(std::shared_ptr<JobControlRecord> jcr,
++             JCR_free_HANDLER* daemon_free_jcr);
++/* ************* */
++
++
+ #endif /** BAREOS_INCLUDE_JCR_H_ */
+
+
+
+
+@@ -76,6 +76,7 @@ int num_jobs_run;
+ dlist* last_jobs = nullptr;
+ const int max_last_jobs = 10;
+ 
++static std::vector<std::weak_ptr<JobControlRecord>> job_control_record_cache;
+ static dlist* job_control_record_chain = nullptr;
+ static int watch_dog_timeout = 0;
+ 
+@@ -370,68 +371,61 @@ void setup_tsd_key()
+ #endif
+ }
+ 
+-/*
+- * Create a Job Control Record and link it into JobControlRecord chain
+- * Returns newly allocated JobControlRecord
+- *
+- * Note, since each daemon has a different JobControlRecord, he passes us the
+- * size.
+- */
+-JobControlRecord* new_jcr(int size, JCR_free_HANDLER* daemon_free_jcr)
++JobControlRecord::JobControlRecord()
+ {
+-  JobControlRecord* jcr;
+-  MessageQueueItem* item = nullptr;
+-  struct sigaction sigtimer;
+-  int status;
+-
+-  Dmsg0(debuglevel, "Enter new_jcr\n");
++  Dmsg0(100, "Construct JobControlRecord\n");
+ 
+   setup_tsd_key();
+ 
+-  jcr = (JobControlRecord*)malloc(size);
+-  memset(jcr, 0, size);
+-  jcr = new (jcr) JobControlRecord();
++  MessageQueueItem* item = nullptr;
++  msg_queue = new dlist(item, &item->link_);  // calculate offset
+ 
+-  jcr->msg_queue = new dlist(item, &item->link_);
+-  if ((status = pthread_mutex_init(&jcr->msg_queue_mutex, nullptr)) != 0) {
++  int status;
++  if ((status = pthread_mutex_init(&msg_queue_mutex, nullptr)) != 0) {
+     BErrNo be;
+     Jmsg(nullptr, M_ABORT, 0, _("Could not init msg_queue mutex. ERR=%s\n"),
+          be.bstrerror(status));
+   }
+ 
+-  jcr->my_thread_id = pthread_self();
+-  jcr->job_end_callbacks.init(1, false);
+-  jcr->sched_time = time(nullptr);
+-  jcr->initial_sched_time = jcr->sched_time;
+-  jcr->daemon_free_jcr = daemon_free_jcr; /* plug daemon free routine */
+-  jcr->InitMutex();
+-  jcr->IncUseCount();
+-  jcr->VolumeName = GetPoolMemory(PM_FNAME);
+-  jcr->VolumeName[0] = 0;
+-  jcr->errmsg = GetPoolMemory(PM_MESSAGE);
+-  jcr->errmsg[0] = 0;
+-  jcr->comment = GetPoolMemory(PM_FNAME);
+-  jcr->comment[0] = 0;
++  my_thread_id = pthread_self();
++  job_end_callbacks.init(1, false);
++  sched_time = time(nullptr);
++  initial_sched_time = sched_time;
++  InitMutex();
++  IncUseCount();
++  VolumeName = GetPoolMemory(PM_FNAME);
++  VolumeName[0] = 0;
++  errmsg = GetPoolMemory(PM_MESSAGE);
++  errmsg[0] = 0;
++  comment = GetPoolMemory(PM_FNAME);
++  comment[0] = 0;
+ 
+   /*
+    * Setup some dummy values
+    */
+-  bstrncpy(jcr->Job, "*System*", sizeof(jcr->Job));
+-  jcr->JobId = 0;
+-  jcr->setJobType(JT_SYSTEM); /* internal job until defined */
+-  jcr->setJobLevel(L_NONE);
+-  jcr->setJobStatus(JS_Created); /* ready to run */
++  bstrncpy(Job, "*System*", sizeof(Job));
++  JobId = 0;
++  setJobType(JT_SYSTEM); /* internal job until defined */
++  setJobLevel(L_NONE);
++  setJobStatus(JS_Created); /* ready to run */
++  struct sigaction sigtimer;
+   sigtimer.sa_flags = 0;
+   sigtimer.sa_handler = TimeoutHandler;
+   sigfillset(&sigtimer.sa_mask);
+   sigaction(TIMEOUT_SIGNAL, &sigtimer, nullptr);
++}
++
++JobControlRecord* new_jcr(int size, JCR_free_HANDLER* daemon_free_jcr)
++{
++  Dmsg0(debuglevel, "Enter new_jcr\n");
++
++  JobControlRecord* jcr;
++  jcr = (JobControlRecord*)malloc(size);
++  memset(jcr, 0, size);
++  jcr = new (jcr) JobControlRecord();
++
++

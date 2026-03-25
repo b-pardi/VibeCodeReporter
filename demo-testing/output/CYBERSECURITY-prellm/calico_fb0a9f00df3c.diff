@@ -1,0 +1,100 @@
+@@ -56,8 +56,10 @@ struct bpf_map_def_extended {
+ // ports is encapped on the "request" leg but the response is returned directly from the
+ // node with the backing workload.
+ #define CALI_TC_DSR		(1<<4)
+-// CALI_TC_WIREGUARD is set for the programs attached to the wireguard interface.
+-#define CALI_TC_WIREGUARD	(1<<5)
++// CALI_L3_DEV is set for any L3 device such as wireguard and IPIP tunnels that act fully
++// at layer 3. In kernerls before 5.14 (rhel 4.18.0-330) IPIP tunnels on inbound
++// direction were acting differently, where they could see outer ethernet and ip headers.
++#define CALI_L3_DEV 	(1<<5)
+ // CALI_XDP_PROG is set for programs attached to the XDP hook
+ #define CALI_XDP_PROG 	(1<<6)
+ 
+@@ -75,7 +77,7 @@ struct bpf_map_def_extended {
+ #define CALI_F_HEP     	 ((CALI_COMPILE_FLAGS) & CALI_TC_HOST_EP)
+ #define CALI_F_WEP     	 (!CALI_F_HEP)
+ #define CALI_F_TUNNEL  	 ((CALI_COMPILE_FLAGS) & CALI_TC_TUNNEL)
+-#define CALI_F_WIREGUARD ((CALI_COMPILE_FLAGS) & CALI_TC_WIREGUARD)
++#define CALI_F_L3_DEV ((CALI_COMPILE_FLAGS) & CALI_L3_DEV)
+ 
+ #define CALI_F_XDP ((CALI_COMPILE_FLAGS) & CALI_XDP_PROG)
+ 
+@@ -87,9 +89,9 @@ struct bpf_map_def_extended {
+ 
+ #define CALI_F_TO_HOST       (CALI_F_FROM_HEP || CALI_F_FROM_WEP)
+ #define CALI_F_FROM_HOST     (!CALI_F_TO_HOST)
+-#define CALI_F_L3            ((CALI_F_TO_HEP && CALI_F_TUNNEL) || CALI_F_WIREGUARD)
+-#define CALI_F_IPIP_ENCAPPED (CALI_F_INGRESS && CALI_F_TUNNEL)
+-#define CALI_F_WG_INGRESS    (CALI_F_INGRESS && CALI_F_WIREGUARD)
++#define CALI_F_L3            ((CALI_F_TO_HEP && CALI_F_TUNNEL) || CALI_F_L3_DEV)
++#define CALI_F_IPIP_ENCAPPED ((CALI_F_INGRESS && CALI_F_TUNNEL))
++#define CALI_F_L3_INGRESS    (CALI_F_INGRESS && CALI_F_L3_DEV)
+ 
+ #define CALI_F_CGROUP	(((CALI_COMPILE_FLAGS) & CALI_CGROUP) != 0)
+ #define CALI_F_DSR	(CALI_COMPILE_FLAGS & CALI_TC_DSR)
+
+
+
+
+@@ -19,9 +19,9 @@
+ #define CALI_VXLAN_VNI 0xca11c0
+ #endif
+ 
+-#define dnat_should_encap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_WIREGUARD)
+-#define dnat_return_should_encap() (CALI_F_FROM_WEP && !CALI_F_TUNNEL && !CALI_F_WIREGUARD)
+-#define dnat_should_decap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_WIREGUARD)
++#define dnat_should_encap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV)
++#define dnat_return_should_encap() (CALI_F_FROM_WEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV)
++#define dnat_should_decap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV)
+ 
+ /* Number of bytes we add to a packet when we do encap. */
+ #define VXLAN_ENCAP_SIZE	(sizeof(struct ethhdr) + sizeof(struct iphdr) + \
+
+
+
+
+@@ -1,5 +1,5 @@
+ // Project Calico BPF dataplane programs.
+-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
++// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+ 
+ #ifndef __CALI_NAT_LOOKUP_H__
+@@ -11,7 +11,6 @@
+ #include <linux/udp.h>
+ 
+ #include "bpf.h"
+-#include "skb.h"
+ #include "routes.h"
+ #include "nat_types.h"
+ 
+
+
+
+
+@@ -159,7 +159,7 @@ static CALI_BPF_INLINE int tc_state_fill_from_nexthdr(struct cali_tc_ctx *ctx)
+ 				tc_icmphdr(ctx)->type, tc_icmphdr(ctx)->code);
+ 		break;
+ 	case IPPROTO_IPIP:
+-		if (CALI_F_TUNNEL | CALI_F_WIREGUARD) {
++		if (CALI_F_TUNNEL | CALI_F_L3_DEV) {
+ 			// IPIP should never be sent down the tunnel.
+ 			CALI_DEBUG("IPIP traffic to/from tunnel: drop\n");
+ 			ctx->fwd.reason = CALI_REASON_UNAUTH_SOURCE;
+@@ -174,7 +174,7 @@ static CALI_BPF_INLINE int tc_state_fill_from_nexthdr(struct cali_tc_ctx *ctx)
+ 				ctx->fwd.reason = CALI_REASON_UNAUTH_SOURCE;
+ 				goto deny;
+ 			}
+-		} else if (CALI_F_TO_HEP && !CALI_F_TUNNEL && !CALI_F_WIREGUARD) {
++		} else if (CALI_F_TO_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV) {
+ 			if (rt_addr_is_remote_host(ctx->state->ip_dst)) {
+ 				CALI_DEBUG("IPIP packet to known Calico host, allow.\n");
+ 				goto allow;
+
+
+
+
+@@ -71,7 +71,7 @@ static CALI_BPF_INLINE long skb_iphdr_offset(void)
+ 		// Ingress on an IPIP tunnel: skb is [ether|outer IP|inner IP|payload]
+ 		return sizeof(

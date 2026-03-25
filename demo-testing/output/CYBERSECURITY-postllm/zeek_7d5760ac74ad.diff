@@ -1,0 +1,153 @@
+@@ -25,6 +25,7 @@
+ #include "zeek/digest.h"
+ #include "zeek/module_util.h"
+ #include "zeek/script_opt/ExprOptInfo.h"
++#include "zeek/script_opt/ScriptOpt.h"
+ 
+ namespace zeek::detail
+ 	{
+
+
+
+
+@@ -138,6 +138,13 @@ void Func::AddBody(detail::StmtPtr new_body, const std::vector<detail::IDPtr>& n
+ 	AddBody(new_body, new_inits, new_frame_size, priority, groups);
+ 	}
+ 
++void Func::AddBody(detail::StmtPtr new_body, size_t new_frame_size)
++	{
++	std::vector<detail::IDPtr> no_inits;
++	std::set<EventGroupPtr> no_groups;
++	AddBody(new_body, no_inits, new_frame_size, 0, no_groups);
++	}
++
+ void Func::AddBody(detail::StmtPtr /* new_body */,
+                    const std::vector<detail::IDPtr>& /* new_inits */, size_t /* new_frame_size */,
+                    int /* priority */, const std::set<EventGroupPtr>& /* groups */)
+@@ -288,10 +295,12 @@ void Func::CheckPluginResult(bool handled, const ValPtr& hook_result, FunctionFl
+ namespace detail
+ 	{
+ 
+-ScriptFunc::ScriptFunc(const IDPtr& arg_id) : Func(SCRIPT_FUNC)
++ScriptFunc::ScriptFunc(const IDPtr& id) : ScriptFunc::ScriptFunc(id.get()) { }
++
++ScriptFunc::ScriptFunc(const ID* id) : Func(SCRIPT_FUNC)
+ 	{
+-	name = arg_id->Name();
+-	type = arg_id->GetType<zeek::FuncType>();
++	name = id->Name();
++	type = id->GetType<zeek::FuncType>();
+ 	frame_size = 0;
+ 	}
+ 
+@@ -658,11 +667,32 @@ void ScriptFunc::ReplaceBody(const StmtPtr& old_body, StmtPtr new_body)
+ 
+ bool ScriptFunc::DeserializeCaptures(const broker::vector& data)
+ 	{
+-	auto result = Frame::Unserialize(data, GetType()->GetCaptures());
++	auto result = Frame::Unserialize(data);
+ 
+ 	ASSERT(result.first);
+ 
+-	SetCaptures(result.second.release());
++	auto& f = result.second;
++
++	if ( bodies[0].stmts->Tag() == STMT_ZAM )
++		{
++		auto& captures = *type->GetCaptures();
++		int n = f->FrameSize();
++
++		ASSERT(captures.size() == n);
++
++		auto cvec = std::make_unique<std::vector<ZVal>>();
++
++		for ( int i = 0; i < n; ++i )
++			{
++			auto& f_i = f->GetElement(i);
++			cvec->push_back(ZVal(f_i, captures[i].Id()->GetType()));
++			}
++
++		CreateCaptures(std::move(cvec));
++		}
++
++	else
++		SetCaptures(f.release());
+ 
+ 	return true;
+ 	}
+
+
+
+
+@@ -172,6 +172,7 @@ class ScriptFunc : public Func
+ 	{
+ public:
+ 	ScriptFunc(const IDPtr& id);
++	ScriptFunc(const ID* id);
+ 
+ 	// For compiled scripts.
+ 	ScriptFunc(std::string name, FuncTypePtr ft, std::vector<StmtPtr> bodies,
+
+
+
+
+@@ -17,10 +17,11 @@ void UseDefSet::Dump() const
+ 		printf(" %s", u->Name());
+ 	}
+ 
+-UseDefs::UseDefs(StmtPtr _body, std::shared_ptr<Reducer> _rc)
++UseDefs::UseDefs(StmtPtr _body, std::shared_ptr<Reducer> _rc, FuncTypePtr _ft)
+ 	{
+ 	body = std::move(_body);
+ 	rc = std::move(_rc);
++	ft = std::move(_ft);
+ 	}
+ 
+ void UseDefs::Analyze()
+@@ -164,6 +165,13 @@ bool UseDefs::CheckIfUnused(const Stmt* s, const ID* id, bool report)
+ 	if ( id->IsGlobal() )
+ 		return false;
+ 
++	if ( auto& captures = ft->GetCaptures() )
++		{
++		for ( auto& c : *captures )
++			if ( c.Id() == id )
++				return false;
++		}
++
+ 	auto uds = FindSuccUsage(s);
+ 	if ( ! uds || ! uds->HasID(id) )
+ 		{
+@@ -283,9 +291,7 @@ UDs UseDefs::PropagateUDs(const Stmt* s, UDs succ_UDs, const Stmt* succ_stmt, bo
+ 			auto true_UDs = PropagateUDs(i->TrueBranch(), succ_UDs, succ_stmt, second_pass);
+ 			auto false_UDs = PropagateUDs(i->FalseBranch(), succ_UDs, succ_stmt, second_pass);
+ 
+-			auto uds = CreateUDs(s, UD_Union(cond_UDs, true_UDs, false_UDs));
+-
+-			return uds;
++			return CreateUDs(s, UD_Union(cond_UDs, true_UDs, false_UDs));
+ 			}
+ 
+ 		case STMT_INIT:
+@@ -450,6 +456,7 @@ UDs UseDefs::ExprUDs(const Expr* e)
+ 	switch ( e->Tag() )
+ 		{
+ 		case EXPR_NAME:
++		case EXPR_LAMBDA:
+ 			AddInExprUDs(uds, e);
+ 			break;
+ 
+@@ -482,19 +489,23 @@ UDs UseDefs::ExprUDs(const Expr* e)
+ 			break;
+ 			}
+ 
+-		case EXPR_CONST:
+-			break;
+-
+-		case EXPR_LAMBDA:
++		case EXPR_TABLE_CONSTRUCTOR:
+ 			{
+-			auto l = static_cast<const LambdaExpr*>(e);
+-			auto ids = l->OuterIDs();
++			auto t = static_cast<const TableConstructorExpr*>(e);
++			AddInExprUDs(uds, t->GetOp1().get

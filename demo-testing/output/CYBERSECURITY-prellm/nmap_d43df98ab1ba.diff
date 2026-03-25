@@ -1,0 +1,122 @@
+@@ -473,11 +473,14 @@ nsock_event_id nsock_connect_ssl(nsock_pool nsp, nsock_iod nsiod, nsock_ev_handl
+   struct npool *ms = (struct npool *)nsp;
+   struct nevent *nse;
+ 
+-  if (!ms->sslctx)
++  if (proto == IPPROTO_UDP)
+   {
+-    if (proto == IPPROTO_UDP)
++    if (!ms->dtlsctx)
+       nsock_pool_dtls_init(ms, 0);
+-    else
++  }
++  else
++  {
++    if (!ms->sslctx)
+       nsock_pool_ssl_init(ms, 0);
+   }
+ 
+@@ -523,6 +526,8 @@ nsock_event_id nsock_reconnect_ssl(nsock_pool nsp, nsock_iod nsiod, nsock_ev_han
+   struct niod *nsi = (struct niod *)nsiod;
+   struct npool *ms = (struct npool *)nsp;
+   struct nevent *nse;
++  /* nsock_reconnect_ssl not supported for DTLS (yet?) */
++  assert(nsi->lastproto != IPPROTO_UDP);
+ 
+   if (!ms->sslctx)
+     nsock_pool_ssl_init(ms, 0);
+
+
+
+
+@@ -340,6 +340,7 @@ void handle_connect_result(struct npool *ms, struct nevent *nse, enum nse_status
+   int sslconnect_inprogress = nse->type == NSE_TYPE_CONNECT_SSL && nse->iod &&
+     (nse->sslinfo.ssl_desire == SSL_ERROR_WANT_READ ||
+      nse->sslinfo.ssl_desire == SSL_ERROR_WANT_WRITE);
++  SSL_CTX *sslctx = NULL;
+ #else
+   int sslconnect_inprogress = 0;
+ #endif
+@@ -366,11 +367,12 @@ void handle_connect_result(struct npool *ms, struct nevent *nse, enum nse_status
+     if (nse->type == NSE_TYPE_CONNECT_SSL &&
+         nse->status == NSE_STATUS_SUCCESS) {
+ #if HAVE_OPENSSL
+-      assert(ms->sslctx != NULL);
++      sslctx = iod->lastproto == IPPROTO_UDP ? ms->dtlsctx : ms->sslctx;
++      assert(sslctx != NULL);
+       /* Reuse iod->ssl if present. If set, this is the second try at connection
+          without the SSL_OP_NO_SSLv2 option set. */
+       if (iod->ssl == NULL) {
+-        iod->ssl = SSL_new(ms->sslctx);
++        iod->ssl = SSL_new(sslctx);
+         if (!iod->ssl)
+           fatal("SSL_new failed: %s", ERR_error_string(ERR_get_error(), NULL));
+       }
+
+
+
+
+@@ -202,6 +202,9 @@ struct npool {
+ #if HAVE_OPENSSL
+   /* The SSL Context (options and such) */
+   SSL_CTX *sslctx;
++#ifdef HAVE_DTLS_CLIENT_METHOD
++  SSL_CTX *dtlsctx;
++#endif
+ #endif
+ 
+   /* Optional proxy chain (NULL is not set). Can only be set once per NSP (using
+
+
+
+
+@@ -181,6 +181,7 @@ nsock_pool nsock_pool_new(void *userdata) {
+ 
+ #if HAVE_OPENSSL
+   nsp->sslctx = NULL;
++  nsp->dtlsctx = NULL;
+ #endif
+ 
+   nsp->px_chain = NULL;
+
+
+
+
+@@ -98,8 +98,15 @@ void nsp_ssl_cleanup(struct npool *nsp)
+   {
+     if (nsp->sslctx != NULL)
+       SSL_CTX_free(nsp->sslctx);
++#ifdef HAVE_DTLS_CLIENT_METHOD
++    if (nsp->dtlsctx != NULL)
++      SSL_CTX_free(nsp->dtlsctx);
++#endif
+   }
+   nsp->sslctx = NULL;
++#ifdef HAVE_DTLS_CLIENT_METHOD
++  nsp->dtlsctx = NULL;
++#endif
+ }
+ 
+ static SSL_CTX *ssl_init_helper(const SSL_METHOD *method) {
+@@ -152,7 +159,7 @@ static SSL_CTX *ssl_init_common() {
+  * are made from it. The connections made from this context will use only secure
+  * ciphers but no server certificate verification is done. Returns the SSL_CTX
+  * so you can set your own options. */
+-static nsock_ssl_ctx nsock_pool_ssl_init_helper(struct npool *ms, int flags) {
++static nsock_ssl_ctx nsock_pool_ssl_init_helper(SSL_CTX *ctx, int flags) {
+   char rndbuf[128];
+ 
+   /* Get_random_bytes may or may not provide high-quality randomness. Add it to
+@@ -171,17 +178,17 @@ static nsock_ssl_ctx nsock_pool_ssl_init_helper(struct npool *ms, int flags) {
+   /* SSL_OP_ALL sets bug-compatibility for pretty much everything.
+    * SSL_OP_NO_SSLv2 disables the less-secure SSLv2 while allowing us to use the
+    * SSLv2-compatible SSLv23_client_method. */
+-  SSL_CTX_set_verify(ms->sslctx, SSL_VERIFY_NONE, NULL);
+-  SSL_CTX_clear_options(ms->sslctx, SSL_OP_NO_SSLv2);
+-  SSL_CTX_set_options(ms->sslctx, flags & NSOCK_SSL_MAX_SPEED ?
++  SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
++  SSL_CTX_clear_options(ctx, SSL_OP_NO_SSLv2);
++  SSL_CTX_set_options(ctx, flags & NSOCK_SSL_MAX_SPEED ?
+                                   SSL_OP_ALL : SSL_OP_ALL|SSL_OP_NO_SSLv2);
+ 
+-  if (!SSL_CTX_set_cipher_list(ms->sslctx, flags & NSOCK_SSL_MAX_SPEED

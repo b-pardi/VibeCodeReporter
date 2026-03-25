@@ -1,0 +1,97 @@
+@@ -33,6 +33,7 @@ class PartializableFlowTrafficStats {
+   u_int64_t cli2srv_goodput_bytes, srv2cli_goodput_bytes;
+   FlowTCPPacketStats cli2srv_tcp_stats, srv2cli_tcp_stats;
+   u_int16_t cli_host_score[MAX_NUM_SCORE_CATEGORIES], srv_host_score[MAX_NUM_SCORE_CATEGORIES];
++  bool is_flow_alerted; /* NOTE: only used by view interfaces. Potentially removed in the future after views rework */
+   union {
+     FlowHTTPStats http;
+     FlowDNSStats dns;
+@@ -49,6 +50,7 @@ class PartializableFlowTrafficStats {
+   void incTcpStats(bool cli2srv_direction, u_int retr, u_int ooo, u_int lost, u_int keepalive);
+ 
+   void incScore(u_int16_t score, ScoreCategory score_category, bool as_client);
++  void setFlowAlerted();
+ 
+   inline void incHTTPReqPOST()  { protos.http.num_post++;  };
+   inline void incHTTPReqPUT()   { protos.http.num_put++;   };
+@@ -96,6 +98,7 @@ class PartializableFlowTrafficStats {
+ 
+   inline const u_int16_t get_cli_score(ScoreCategory score_category) const { return cli_host_score[score_category]; };
+   inline const u_int16_t get_srv_score(ScoreCategory score_category) const { return srv_host_score[score_category]; };
++  inline const bool      get_is_flow_alerted() const { return is_flow_alerted; };
+ };
+ 
+ #endif /* _PARTIALIZABLE_FLOW_TRAFFIC_STATS_H_ */
+
+
+
+
+@@ -264,7 +264,7 @@ Flow::~Flow() {
+ 
+   /*
+     Get client and server hosts. Use unsafe* methods to get the client and server also for 'viewed' interfaces.
+-    For 'viewed' interfaces, host pointers are shared across multiple 'viewed' interfaces and thus they are termed as unsafe.
++    For 'Viewed' interfaces, host pointers are shared across multiple 'viewed' interfaces and thus they are termed as unsafe.
+ 
+     IMPORTANT: only call here methods that are safe (e.g., locked or atomic-ed).
+ 
+@@ -272,6 +272,9 @@ Flow::~Flow() {
+    */
+   Host *cli_u = getViewSharedClient(), *srv_u = getViewSharedServer();
+ 
++  if(getInterface()->isViewed()) /* Score decrements done here for 'viewed' interfaces to avoid races. */
++    decAllFlowScores();
++
+   if(cli_u) {
+     cli_u->decUses(); /* Decrease the number of uses */
+     cli_u->decNumFlows(get_last_seen(), true);
+@@ -1752,11 +1755,6 @@ void Flow::periodic_stats_update(const struct timeval *tv) {
+   }
+ #endif
+ 
+-  /*
+-     Check (and possibly enqueue) the flow for processing by a view interface
+-   */
+-  getInterface()->viewEnqueue(tv->tv_sec, this);
+-
+   memcpy(&last_update_time, tv, sizeof(struct timeval));
+   GenericHashEntry::periodic_stats_update(tv);
+ }
+@@ -2890,8 +2888,16 @@ void Flow::decAllFlowScores() {
+ 
+   if(isFlowAlerted()) {
+     iface->decNumAlertedFlows(this, Utils::mapScoreToSeverity(getPredominantAlertScore()));
+-    if(cli_u) cli_u->decNumAlertedFlows(true /* As client */);
+-    if(srv_u) srv_u->decNumAlertedFlows(false /* As server */);
++
++    if(!getInterface()->isViewed() /* Always for non-viewed interfaces (increments are always performed and in the same thread) */
++      /*
++	For viewed interfaces, do the decrement only if previously incremented.
++	A previous increment can fail when the view flows queue is full and enqueues fail.
++      */
++       || (getViewInterfaceFlowStats() && getViewInterfaceFlowStats()->getPartializableStats()->get_is_flow_alerted())) {
++      if(cli_u) cli_u->decNumAlertedFlows(true /* As client */);
++      if(srv_u) srv_u->decNumAlertedFlows(false /* As server */);
++    }
+ 
+ #ifdef ALERTED_FLOWS_DEBUG
+     iface_alert_dec = true;
+@@ -2945,14 +2951,23 @@ void Flow::housekeep(time_t t) {
+ 
+     /*
+       Score decrements MUST be performed here as this is the same thread of callbacks execution where
+-      scores are increased
++      scores are increased.
++      NOTE: for view interfaces, decrement are performed in ~Flow to avoid races.
+      */
+-    decAllFlowScores();
++    if(!getInterface()->isViewed()) decAllFlowScores();
+     break;
+ 
+   default:
+     break;
+   }
++
++  /*
++    Check (and possibly enqueue) the flow for processing by a view interface.
++    Make sure to enqueue t

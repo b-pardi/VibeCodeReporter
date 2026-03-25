@@ -1,0 +1,109 @@
+@@ -3815,12 +3815,12 @@ InExpr::InExpr(ExprPtr arg_op1, ExprPtr arg_op2) : BinaryExpr(EXPR_IN, std::move
+         }
+     }
+ 
+-    // Support <string> in table[pattern] of X
++    // Support <string> in table[pattern] / set[pattern]
+     if ( op1->GetType()->Tag() == TYPE_STRING ) {
+         if ( op2->GetType()->Tag() == TYPE_TABLE ) {
+             const auto& table_type = op2->GetType()->AsTableType();
+ 
+-            if ( table_type->IsPatternIndex() && table_type->Yield() ) {
++            if ( table_type->IsPatternIndex() ) {
+                 SetType(base_type(TYPE_BOOL));
+                 return;
+             }
+@@ -3868,8 +3868,9 @@ ValPtr InExpr::Fold(Val* v1, Val* v2) const {
+     else {
+         const auto& table_val = v2->AsTableVal();
+         const auto& table_type = table_val->GetType<zeek::TableType>();
+-        if ( table_type->IsPatternIndex() && table_type->Yield() && v1->GetType()->Tag() == TYPE_STRING )
+-            res = table_val->LookupPattern({NewRef{}, v1->AsStringVal()})->Size() > 0;
++        // Special table[pattern] / set[pattern] in expression.
++        if ( table_type->IsPatternIndex() && v1->GetType()->Tag() == TYPE_STRING )
++            res = table_val->MatchPattern({NewRef{}, v1->AsStringVal()});
+         else
+             res = (bool)v2->AsTableVal()->Find({NewRef{}, v1});
+     }
+
+
+
+
+@@ -1443,6 +1443,9 @@ public:
+ 
+     VectorValPtr Lookup(const StringValPtr& s);
+ 
++    // Delegate to matcher->MatchAll().
++    bool MatchAll(const StringValPtr& s);
++
+     void GetStats(detail::DFA_State_Cache_Stats* stats) const {
+         if ( matcher && matcher->DFA() )
+             matcher->DFA()->Cache()->GetStats(stats);
+@@ -1490,6 +1493,17 @@ VectorValPtr detail::TablePatternMatcher::Lookup(const StringValPtr& s) {
+     return results;
+ }
+ 
++bool detail::TablePatternMatcher::MatchAll(const StringValPtr& s) {
++    if ( ! matcher ) {
++        if ( tbl->Get()->Length() == 0 )
++            return false;
++
++        Build();
++    }
++
++    return matcher->MatchAll(s->AsString());
++}
++
+ void detail::TablePatternMatcher::Build() {
+     matcher_yields.clear();
+     matcher_yields.push_back(nullptr);
+@@ -1556,7 +1570,7 @@ void TableVal::Init(TableTypePtr t, bool ordered) {
+     else
+         subnets = nullptr;
+ 
+-    if ( table_type->IsPatternIndex() && table_type->Yield() )
++    if ( table_type->IsPatternIndex() )
+         pattern_matcher = new detail::TablePatternMatcher(this, table_type->Yield());
+ 
+     table_hash = new detail::CompositeHash(table_type->GetIndices());
+@@ -1674,7 +1688,7 @@ bool TableVal::Assign(ValPtr index, ValPtr new_val, bool broker_forward, bool* i
+     }
+ 
+     if ( pattern_matcher )
+-        pattern_matcher->Insert(index->AsListVal()->Idx(0), new_val);
++        pattern_matcher->Insert(index, new_val);
+ 
+     return Assign(std::move(index), std::move(k), std::move(new_val), broker_forward, iterators_invalidated);
+ }
+@@ -2032,12 +2046,19 @@ TableValPtr TableVal::LookupSubnetValues(const SubNetVal* search) {
+ }
+ 
+ VectorValPtr TableVal::LookupPattern(const StringValPtr& s) {
+-    if ( ! pattern_matcher )
++    if ( ! pattern_matcher || ! GetType()->Yield() )
+         reporter->InternalError("LookupPattern called on wrong table type");
+ 
+     return pattern_matcher->Lookup(s);
+ }
+ 
++bool TableVal::MatchPattern(const StringValPtr& s) {
++    if ( ! pattern_matcher )
++        reporter->InternalError("LookupPattern called on wrong table type");
++
++    return pattern_matcher->MatchAll(s);
++}
++
+ void TableVal::GetPatternMatcherStats(detail::DFA_State_Cache_Stats* stats) const {
+     if ( ! pattern_matcher )
+         reporter->InternalError("GetPatternMatcherStats called on wrong table type");
+
+
+
+
+@@ -871,6 +871,11 @@ public:
+     // Causes an internal error if called for any other kind of table.
+     VectorValPtr LookupPattern(const StringValPtr& s);
+ 
++    // For a table[pattern] or set[pattern], returns True if any of the
++    // patterns in the index matches the given string, else False.
++    // Causes 

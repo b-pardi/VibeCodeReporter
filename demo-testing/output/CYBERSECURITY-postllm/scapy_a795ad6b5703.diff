@@ -1,0 +1,115 @@
+@@ -18,7 +18,8 @@ from scapy.data import (
+     ARPHDR_LOOPBACK,
+     ARPHDR_PPP,
+     ARPHDR_TUN,
+-    IPV6_ADDR_GLOBAL
++    IPV6_ADDR_GLOBAL,
++    IPV6_ADDR_LOOPBACK,
+ )
+ from scapy.error import log_loading, Scapy_Exception
+ from scapy.interfaces import _GlobInterfaceType, network_name
+@@ -104,8 +105,11 @@ def get_if_addr6(niff):
+     None is returned.
+     """
+     iff = network_name(niff)
++    scope = IPV6_ADDR_GLOBAL
++    if iff == conf.loopback_name:
++        scope = IPV6_ADDR_LOOPBACK
+     return next((x[0] for x in in6_getifaddr()
+-                 if x[2] == iff and x[1] == IPV6_ADDR_GLOBAL), None)
++                 if x[2] == iff and x[1] == scope), None)
+ 
+ 
+ def get_if_raw_addr6(iff):
+
+
+
+
+@@ -8,6 +8,7 @@ DNS: Domain Name System.
+ """
+ 
+ import abc
++import collections
+ import operator
+ import itertools
+ import socket
+@@ -39,6 +40,7 @@ from scapy.fields import (
+     I,
+     IP6Field,
+     IntField,
++    MACField,
+     MultipleTypeField,
+     PacketListField,
+     ShortEnumField,
+@@ -49,6 +51,7 @@ from scapy.fields import (
+     XStrFixedLenField,
+     XStrLenField,
+ )
++from scapy.interfaces import resolve_iface
+ from scapy.sendrecv import sr1
+ from scapy.supersocket import StreamSocket
+ from scapy.pton_ntop import inet_ntop, inet_pton
+@@ -243,7 +246,7 @@ def dns_compress(pkt):
+                 for field in current.fields_desc:
+                     if isinstance(field, DNSStrField) or \
+                         (isinstance(field, MultipleTypeField) and
+-                         current.type in [2, 3, 4, 5, 12, 15, 39]):
++                         current.type in [2, 3, 4, 5, 12, 15, 39, 47]):
+                         # Get the associated data and store it accordingly  # noqa: E501
+                         dat = current.getfieldval(field.name)
+                         yield current, field.name, dat
+@@ -423,7 +426,7 @@ class DNSTextField(StrLenField):
+ 
+ # RFC 2671 - Extension Mechanisms for DNS (EDNS0)
+ 
+-edns0types = {0: "Reserved", 1: "LLQ", 2: "UL", 3: "NSID", 4: "Reserved",
++edns0types = {0: "Reserved", 1: "LLQ", 2: "UL", 3: "NSID", 4: "Owner",
+               5: "DAU", 6: "DHU", 7: "N3U", 8: "edns-client-subnet", 10: "COOKIE",
+               15: "Extended DNS Error"}
+ 
+@@ -458,7 +461,7 @@ class DNSRROPT(Packet):
+     name = "DNS OPT Resource Record"
+     fields_desc = [DNSStrField("rrname", ""),
+                    ShortEnumField("type", 41, dnstypes),
+-                   ShortField("rclass", 4096),
++                   ShortEnumField("rclass", 4096, dnsclasses),
+                    ByteField("extrcode", 0),
+                    ByteField("version", 0),
+                    # version 0 means EDNS0
+@@ -469,6 +472,30 @@ class DNSRROPT(Packet):
+                                    length_from=lambda pkt: pkt.rdlen)]
+ 
+ 
++# draft-cheshire-edns0-owner-option-01 - EDNS0 OWNER Option
++
++class EDNS0OWN(_EDNS0Dummy):
++    name = "EDNS0 Owner (OWN)"
++    fields_desc = [ShortEnumField("optcode", 4, edns0types),
++                   FieldLenField("optlen", None, count_of="primary_mac", fmt="H"),
++                   ByteField("v", 0),
++                   ByteField("s", 0),
++                   MACField("primary_mac", "00:00:00:00:00:00"),
++                   ConditionalField(
++                       MACField("wakeup_mac", "00:00:00:00:00:00"),
++                       lambda pkt: (pkt.optlen or 0) >= 18),
++                   ConditionalField(
++                       StrLenField("password", "",
++                                   length_from=lambda pkt: pkt.optlen - 18),
++                       lambda pkt: (pkt.optlen or 0) >= 22)]
++
++    def post_build(self, pkt, pay):
++        pkt += pay
++        if self.optlen is None:
++            pkt = pkt[:2] + struct.pack("!H", len(pkt) - 4) + pkt[4:]
++        return pkt
++
++
+ # RFC 6975 - Signaling Cryptographic Algorithm Understanding in
+ # DNS Security Extensions (DNSSEC)
+ 
+@@ -637,6 +664,7 @@ class EDNS0ExtendedDNSError(_EDNS0Dummy):
+ 
+ 
+ EDNS0OPT_DISPATCHER = {
++    4: EDNS0OWN,
+     5: EDNS

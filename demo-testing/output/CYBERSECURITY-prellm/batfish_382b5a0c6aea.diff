@@ -1,0 +1,78 @@
+@@ -909,7 +909,8 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+    */
+   private boolean createEigrpRedistributionPolicy(
+       EigrpVrfConfiguration vrfConfig, String policyName) {
+-    Set<NxosRoutingProtocol> supportedProtocols = ImmutableSet.of(NxosRoutingProtocol.STATIC);
++    Set<NxosRoutingProtocol> supportedProtocols =
++        ImmutableSet.of(NxosRoutingProtocol.BGP, NxosRoutingProtocol.STATIC);
+     List<RedistributionPolicy> redistPolicies =
+         Stream.of(vrfConfig.getV4AddressFamily(), vrfConfig.getVrfIpv4AddressFamily())
+             .filter(Objects::nonNull)
+@@ -947,12 +948,24 @@ public final class CiscoNxosConfiguration extends VendorConfiguration {
+         .filter(policy -> getRouteMaps().containsKey(policy.getRouteMap()))
+         .map(
+             policy -> {
+-              List<Statement> routeMapCallExpr = ImmutableList.of(call(policy.getRouteMap()));
+-              NxosRoutingProtocol protocol = policy.getInstance().getProtocol();
+-              switch (protocol) {
++              switch (policy.getInstance().getProtocol()) {
+                   // If adding support for a new protocol, also add it to supportedProtocols above
++                case BGP:
++                  assert policy.getInstance().getTag() != null;
++                  long asn = Long.parseLong(policy.getInstance().getTag());
++                  if (_bgpGlobalConfiguration.getLocalAs() != asn) {
++                    // NXOS won't let you configure multiple BGP processes, but it will let you
++                    // "redistribute bgp 1" in EIGRP even if there is no BGP process with ASN 1.
++                    return null;
++                  }
++                  BooleanExpr matchBgp =
++                      new MatchProtocol(RoutingProtocol.BGP, RoutingProtocol.IBGP);
++                  Statement setTag = new SetTag(new LiteralLong(asn));
++                  return new If(matchBgp, ImmutableList.of(setTag, call(policy.getRouteMap())));
+                 case STATIC:
+-                  return new If(new MatchProtocol(RoutingProtocol.STATIC), routeMapCallExpr);
++                  return new If(
++                      new MatchProtocol(RoutingProtocol.STATIC),
++                      ImmutableList.of(call(policy.getRouteMap())));
+                 default:
+                   return null;
+               }
+
+
+
+
+@@ -1508,54 +1508,68 @@ public final class CiscoNxosGrammarTest {
+         c.getRoutingPolicies().get(eigrpRedistributionPolicyName("vrf1", 1));
+     EigrpProcess vrfEigrpProc = c.getVrfs().get("vrf1").getEigrpProcesses().get(1L);
+ 
+-    // Redistribution policy should permit static routes to 1.1.1.1/32.
+-    // Redistributed routes should have default EIGRP metric: bw 100000 kbps, delay 1E9 ps.
+-    Prefix permittedPrefix = Prefix.parse("1.1.1.1/32");
+-    ConnectedRoute connected =
+-        ConnectedRoute.builder()
+-            .setNetwork(permittedPrefix)
+-            .setNextHopInterface("foo")
+-            .setAdmin(1)
+-            .build();
++    /*
++    Redistribution policy should permit:
++    - static routes to 1.1.1.1/32
++    - BGP routes to 2.2.2.2/32
++    */
++    Prefix staticPermittedPrefix = Prefix.parse("1.1.1.1/32");
++    Prefix bgpPermittedPrefix = Prefix.parse("2.2.2.2/32");
++    org.batfish.datamodel.StaticRoute.Builder staticRb =
++        org.batfish.datamodel.StaticRoute.builder().setNextHopInterface("foo").setAdmin(1);
+     org.batfish.datamodel.StaticRoute staticDenied =
+-        org.batfish.datamodel.StaticRoute.builder()
+-            .setNetwork(Prefix.parse("2.2.2.2/32"))
+-            .setNextHopInterface("foo")
+-            .setAdmin(1)
+-            .build();
++        staticRb.setNetwork(bgpPermittedPrefix).build();
+     org.batfish.datamodel.StaticRoute staticPermitted =
+-        org.batfish.datamodel.StaticRoute.builder()
+-            .setNetwork(permittedPrefix)
+-            .setNextHopInterface("foo")
++        staticRb.setNetwork(staticPermittedPrefix).build();
++    Bgpv4Route.Builder

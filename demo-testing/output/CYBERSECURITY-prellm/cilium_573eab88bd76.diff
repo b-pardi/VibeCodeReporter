@@ -1,0 +1,116 @@
+@@ -56,8 +56,7 @@ AccessLog::~AccessLog() {}
+ 
+ void AccessLog::Entry::InitFromRequest(
+     std::string listener_id, const Network::Connection *conn,
+-    const Http::HeaderMap &headers, const RequestInfo::RequestInfo &info,
+-    const Router::RouteEntry *route) {
++    const Http::HeaderMap &headers, const RequestInfo::RequestInfo &info) {
+   auto time = info.startTime();
+   entry.set_timestamp(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           time.time_since_epoch())
+@@ -81,15 +80,6 @@ void AccessLog::Entry::InitFromRequest(
+ 
+   entry.set_cilium_resource_name(listener_id);
+ 
+-  // Get rule reference from the opaque config of the route entry
+-  if (route) {
+-    auto ocmap = route->opaqueConfig();
+-    auto it = ocmap.find("cilium_rule_ref");
+-    if (it != ocmap.end()) {
+-      entry.set_cilium_rule_ref(it->second);
+-    }
+-  }
+-
+   if (conn) {
+     if (conn->socketOptions() != nullptr) {
+       entry.set_source_security_id(conn->socketOptions()->hashKey() >> 16);
+
+
+
+
+@@ -25,8 +25,7 @@ public:
+   class Entry {
+   public:
+     void InitFromRequest(std::string listener_id, const Network::Connection *,
+-                         const Http::HeaderMap &, const RequestInfo::RequestInfo &,
+-                         const Router::RouteEntry *);
++                         const Http::HeaderMap &, const RequestInfo::RequestInfo &);
+     void UpdateFromResponse(const Http::HeaderMap &, const RequestInfo::RequestInfo &);
+ 
+     ::cilium::HttpLogEntry entry{};
+
+
+
+
+@@ -9,6 +9,8 @@
+ 
+ #include "common/common/assert.h"
+ 
++#include "cilium_socket_option.h"
++
+ namespace Envoy {
+ namespace Server {
+ namespace Configuration {
+@@ -27,8 +29,9 @@ public:
+ 	new Filter::BpfMetadata::Config(MessageUtil::downcastAndValidate<const ::cilium::BpfMetadata&>(proto_config),
+ 					context.scope()));
+     // Set the socket mark option for the listen socket.
+-    // TODO: Share
+-    context.setListenSocketOptions(std::make_shared<Cilium::SocketMarkOption>(config->getMark(config->identity_)));
++    // Can use identity 0 on the listen socket option, as the bpf datapath is only interested
++    // in whether the proxy is ingress, egress, or if there is no proxy at all.
++    context.setListenSocketOptions(std::make_shared<Cilium::SocketMarkOption>(config->getMark(0)));
+ 
+     return [config](Network::ListenerFilterManager &filter_manager) mutable -> void {
+       filter_manager.addAcceptFilter(std::make_unique<Filter::BpfMetadata::Instance>(config));
+@@ -57,9 +60,8 @@ namespace BpfMetadata {
+ 
+ Config::Config(const ::cilium::BpfMetadata &config, Stats::Scope &scope)
+     : bpf_root_(config.bpf_root().length() ? config.bpf_root() : "/sys/fs/bpf"),
+-      stats_{ALL_BPF_METADATA_STATS(POOL_COUNTER(scope))},
+-      is_ingress_(config.is_ingress()),
+-      identity_(config.identity()), maps_(bpf_root_, *this) {}
++      stats_{ALL_BPF_METADATA_STATS(POOL_COUNTER(scope))}, is_ingress_(config.is_ingress()),
++      maps_(bpf_root_, *this) {}
+ 
+ bool Instance::getBpfMetadata(Network::ConnectionSocket &socket) {
+   return config_->maps_.getBpfMetadata(socket);
+
+
+
+
+@@ -49,7 +49,6 @@ private:
+ public:
+   BpfStats stats_;
+   bool is_ingress_;
+-  uint32_t identity_;
+   Cilium::ProxyMap maps_;
+ };
+ 
+
+
+
+
+@@ -3,19 +3,32 @@
+ #include "envoy/network/listen_socket.h"
+ #include "envoy/registry/registry.h"
+ #include "envoy/server/filter_config.h"
++#include "envoy/singleton/manager.h"
+ 
+ #include "common/common/assert.h"
+ #include "common/network/address_impl.h"
+ #include "common/network/utility.h"
+ 
++#include "common/config/filesystem_subscription_impl.h"
++#include "common/config/utility.h"
++#include "common/filesystem/filesystem_impl.h"
++#include "common/protobuf/protobuf.h"
++#include "server/config/network/http_connection_manager.h"
++
+ #include "test/integration/http_integration.h"
+ 
+ #include "cilium_bpf_metadata.h"
++#include "cilium_l7policy.h"
++#include "cilium_network_policy.h"
++#include "cilium_socket_option.h"
+ #include "cilium/cilium_bpf_metadata.

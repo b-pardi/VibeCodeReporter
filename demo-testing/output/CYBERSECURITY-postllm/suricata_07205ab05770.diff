@@ -1,0 +1,94 @@
+@@ -163,6 +163,8 @@ int SCDetectHelperTransformRegister(const SCTransformTableElmt *kw)
+     sigmatch_table[transform_id].Setup =
+             (int (*)(DetectEngineCtx * de, Signature * s, const char *raw)) kw->Setup;
+     sigmatch_table[transform_id].Free = (void (*)(DetectEngineCtx * de, void *ptr)) kw->Free;
++    sigmatch_table[transform_id].TransformId =
++            (void (*)(const uint8_t **id_data, uint32_t *length, void *context))kw->TransformId;
+ 
+     return transform_id;
+ }
+
+
+
+
+@@ -71,6 +71,7 @@ typedef struct SCTransformTableElmt {
+     void (*Free)(DetectEngineCtx *, void *);
+     void (*Transform)(DetectEngineThreadCtx *, InspectionBuffer *, void *context);
+     bool (*TransformValidate)(const uint8_t *content, uint16_t content_len, void *context);
++    void (*TransformId)(const uint8_t **id_data, uint32_t *id_length, void *context);
+ } SCTransformTableElmt;
+ 
+ int SCDetectHelperNewKeywordId(void);
+
+
+
+
+@@ -984,12 +984,40 @@ int DetectBufferTypeMaxId(void)
+     return g_buffer_type_id;
+ }
+ 
++static void DetectBufferAddTransformData(DetectBufferType *map)
++{
++    for (int i = 0; i < map->transforms.cnt; i++) {
++        const TransformData *t = &map->transforms.transforms[i];
++        if (sigmatch_table[t->transform].TransformId) {
++            sigmatch_table[t->transform].TransformId(
++                    &map->xform_id[i].id_data, &map->xform_id[i].id_data_len, t->options);
++            SCLogDebug("transform identity data: [%p] \"%s\" [%d]", map->xform_id[i].id_data,
++                    (char *)map->xform_id[i].id_data, map->xform_id[i].id_data_len);
++        }
++    }
++}
++
+ static uint32_t DetectBufferTypeHashNameFunc(HashListTable *ht, void *data, uint16_t datalen)
+ {
+     const DetectBufferType *map = (DetectBufferType *)data;
+     uint32_t hash = hashlittle_safe(map->name, strlen(map->name), 0);
+-    hash += hashlittle_safe((uint8_t *)&map->transforms, sizeof(map->transforms), 0);
++
++    // Add the transform data
++    // - Collect transform id and position
++    // - Collect identity data, if any
++    hash += hashlittle_safe((uint8_t *)&map->transforms.cnt, sizeof(map->transforms.cnt), 0);
++    for (int i = 0; i < map->transforms.cnt; i++) {
++        const TransformData *t = &map->transforms.transforms[i];
++        int tval = t->transform;
++        hash += hashlittle_safe((uint8_t *)&tval, sizeof(tval), 0);
++        if (map->xform_id[i].id_data) {
++            hash += hashlittle_safe(
++                    &map->xform_id[i].id_data_len, sizeof(map->xform_id[i].id_data_len), 0);
++            hash += hashlittle_safe(map->xform_id[i].id_data, map->xform_id[i].id_data_len, 0);
++        }
++    }
+     hash %= ht->array_size;
++    SCLogDebug("map->name %s, hash %d", map->name, hash);
+     return hash;
+ }
+ 
+@@ -1007,7 +1035,49 @@ static char DetectBufferTypeCompareNameFunc(void *data1, uint16_t len1, void *da
+     DetectBufferType *map2 = (DetectBufferType *)data2;
+ 
+     char r = (strcmp(map1->name, map2->name) == 0);
+-    r &= (memcmp((uint8_t *)&map1->transforms, (uint8_t *)&map2->transforms, sizeof(map2->transforms)) == 0);
++
++    // Compare the transforms
++    // the transform supports identity, that data will also be added.
++    r &= map1->transforms.cnt == map2->transforms.cnt;
++    if (r && map1->transforms.cnt) {
++        for (int i = 0; i < map1->transforms.cnt; i++) {
++            if (map1->transforms.transforms[i].transform !=
++                    map2->transforms.transforms[i].transform) {
++                r = 0;
++                break;
++            }
++
++            SCLogDebug("%s: transform ids match; checking specialized data", map1->name);
++            // Checks
++            // - Both NULL: --> ok, continue
++            // - One NULL: --> no match, break?
++            // - identity data lengths match: --> ok, continue
++            // - identity data matches: ok
++
++            // Stop if only one is NULL
++            if ((map1->xform_id[i].id_data == NULL) ^ (map2->xform_id[i].id_data == NULL)) {
++       

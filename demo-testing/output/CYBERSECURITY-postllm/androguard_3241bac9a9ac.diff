@@ -1,0 +1,91 @@
+@@ -14,17 +14,18 @@ from typing import Iterator, Union
+ import zipfile
+ from zlib import crc32
+ 
+-
+ # Androguard
+ from androguard.core import androconf
+ from androguard.util import get_certificate_name_string
+ from apkInspector.headers import ZipEntry
++from oscrypto import asymmetric, errors
++from hashlib import md5, sha1, sha256, sha224, sha384, sha512
+ 
+ from androguard.core.axml import (ARSCParser,
+     AXMLPrinter,
+     ARSCResTableConfig,
+     AXMLParser,
+-    format_value, 
++    format_value,
+     START_TAG,
+     END_TAG,
+     TEXT,
+@@ -36,6 +37,7 @@ import lxml.sax
+ from xml.dom.pulldom import SAX2DOM
+ # Used for reading Certificates
+ from asn1crypto import cms, x509, keys
++from asn1crypto.util import OrderedDict
+ from loguru import logger
+ 
+ NS_ANDROID_URI = 'http://schemas.android.com/apk/res/android'
+@@ -1499,32 +1501,105 @@ class APK:
+     def get_certificate_der(self, filename:str) -> bytes:
+         """
+         Return the DER coded X.509 certificate from the signature file.
+-        The public key of the certificate is used to validate the .SF.
+-        If multiple certificates are found, the one that validates the .SF is returned.
+-        If none validates the .SF then the first one is returned.
++        If minSdkVersion is prior to Android N only the first SignerInfo is used.
++        If signed attributes are present, they are taken into account
+ 
+         :param filename: Signature filename in APK
+         :returns: DER coded X.509 certificate as binary
+         """
+-        from oscrypto import asymmetric, errors
+-        from hashlib import md5, sha1, sha256, sha224, sha384, sha512
+ 
+         # Get the signature
+         pkcs7message = self.get_file(filename)
+         # Get the .SF
+         sf_filename = os.path.splitext(filename)[0] + '.SF'
+-        sf_obj = self.get_file(sf_filename)
++        sf_object = self.get_file(sf_filename)
+         # Load the signature
+-        pkcs7obj = cms.ContentInfo.load(pkcs7message)
++        signed_data = cms.ContentInfo.load(pkcs7message)
+         # Locate the SignerInfo structure
+-        signer_infos = pkcs7obj['content']['signer_infos']
+-
+-        # Check if signer_infos is empty
++        signer_infos = signed_data['content']['signer_infos']
+         if not signer_infos:
+             raise ValueError('No signer information found in the PKCS7 object. The APK may not be properly signed.')
+-        signer_info = signer_infos[0]
+-        signature = signer_info['signature'].native
+ 
++        # Prior to Android N, Android attempts to verify only the first SignerInfo. From N onwards, Android attempts
++        # to verify all SignerInfos and then picks the first verified SignerInfo.
++        min_sdk_version = self.get_min_sdk_version()
++        if min_sdk_version is None or int(min_sdk_version) < 24:  # AndroidSdkVersion.N
++            logger.info(f"minsdkversion: {min_sdk_version} is less than 24. Getting the first signerInfo only!")
++            unverified_signer_infos_to_try = [signer_infos[0]]
++        else:
++            unverified_signer_infos_to_try = signer_infos
++
++        # Extract certificates from the PKCS7 object
++        certificates = signed_data['content']['certificates']
++        matching_certificate_verified = None
++        for signer_info in unverified_signer_infos_to_try:
++            matching_certificate_verified = self.verify_signer_info_against_sig_file(
++                signed_data,
++                certificates,
++                signer_info,
++                sf_object)
++            if matching_certificate_verified is not None:
++                # Return the first certificate that was verified
++                break
++        if not matching_certificate_verified:
++            logger.warning(f"minSdkVersion: {min_sdk_version}, # of SignerInfos: {len(unverified_signer_infos_to_try)}. None Verified!")
++        return matching_certificate_verified
++
++    def verify_signer_info_against_sig_file(self, signed_data, certificates, signer_info, sf_object):
++        

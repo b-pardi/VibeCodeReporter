@@ -1,0 +1,171 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,67 @@
++/* radare - LGPL - Copyright 2020 - thestr4ng3r, Yaroslav Stavnichiy */
++
++#ifndef R_JSON_H
++#define R_JSON_H
++
++#include <r_types.h>
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++/*
++ * r_json is a JSON parsing API,
++ * heavily based on nxjson by Yaroslav Stavnichiy <yarosla@gmail.com>,
++ * which is available under LGPLv3 or later.
++ *
++ * r_json does NOT format json, it only parses. To format json, see pj.h instead.
++ * It operates in-place, which means the parsed string will be MODIFIED.
++ * This means all string values in RJson point directly into the input string,
++ * removing the need to copy them.
++ *
++ * It also supports both line and block style comments.
++ */
++
++typedef enum r_json_type_t {
++	R_JSON_NULL,
++	R_JSON_OBJECT,  // properties can be found in child nodes
++	R_JSON_ARRAY,   // items can be found in child nodes
++	R_JSON_STRING,  // value can be found in the str_value field
++	R_JSON_INTEGER, // value can be found in the num.u_value/num.s_value fields
++	R_JSON_DOUBLE,  // value can be found in the num.dbl_value field
++	R_JSON_BOOLEAN  // value can be found in the num.u_value field
++} RJsonType;
++
++typedef struct r_json_t {
++	RJsonType type;             // type of json node, see above
++	const char *key;            // key of the property; for object's children only
++	union {
++		const char *str_value;  // text value of STRING node
++		struct {
++			union {
++				ut64 u_value;   // the value of INTEGER or BOOLEAN node
++				st64 s_value;
++			};
++			double dbl_value;   // the value of DOUBLE node
++		} num;
++		struct {                // children of OBJECT or ARRAY
++			size_t count;
++			struct r_json_t *first;
++			struct r_json_t *last;
++		} children;
++	};
++	struct r_json_t *next;    // points to next child
++} RJson;
++
++R_API RJson *r_json_parse(char *text);
++
++R_API void r_json_free(RJson *js);
++
++R_API const RJson *r_json_get(const RJson *json, const char *key); // get object's property by key
++R_API const RJson *r_json_item(const RJson *json, size_t idx); // get array element by index
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif  /* NXJSON_H */
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,407 @@
++/* radare - LGPL - Copyright 2020 - thestr4ng3r, Yaroslav Stavnichiy */
++
++#include <errno.h>
++
++#include <r_util/r_utf8.h>
++#include <r_util/r_hex.h>
++#include <r_util/r_json.h>
++
++#if 0
++// optional error printing
++#define R_JSON_REPORT_ERROR(msg, p) fprintf(stderr, "R_JSON PARSE ERROR (%d): " msg " at %s\n", __LINE__, p)
++#else
++#define R_JSON_REPORT_ERROR(msg, p) do { (void)(msg); (void)(p); } while (0)
++#endif
++
++static RJson *json_new(void) {
++	return R_NEW0 (RJson);
++}
++
++static RJson *create_json(RJsonType type, const char *key, RJson *parent) {
++	RJson *js = json_new ();
++	if (!js) {
++		return NULL;
++	}
++	js->type = type;
++	js->key = key;
++	if (!parent->children.last) {
++		parent->children.first = parent->children.last = js;
++	} else {
++		parent->children.last->next = js;
++		parent->children.last = js;
++	}
++	parent->children.count++;
++	return js;
++}
++
++R_API void r_json_free(RJson *js) {
++	if (!js) {
++		return;
++	}
++	if (js->type == R_JSON_OBJECT || js->type == R_JSON_ARRAY) {
++		RJson *p = js->children.first;
++		RJson *p1;
++		while (p) {
++			p1 = p->next;
++			r_json_free (p);
++			p = p1;
++		}
++	}
++	free (js);
++}
++
++static char *unescape_string(char *s, char **end) {
++	char *p = s;
++	char *d = s;
++	char c;
++	while ((c = *p++)) {
++		if (c == '"') {
++			*d = '\0';
++			*end = p;
++			return s;
++		}
++		if (c == '\\') {
++			switch (*p) {
++			case '\\':
++			case '/':
++			case '"':
++				*d++ = *p++;
++				break;
++			case 'b':
++				*d++ = '\b';
++				p++;
++				break;
++			case 'f':
++				*d++ = '\f';
++				p++;
++				break;
++			case 'n':
++				*d++ = '\n';
++				p++;
++				break;
++			case 'r':
++				*d++ = '\r';
++				p++;
++				break;
++			case 't':
++				*d++ = '\t';
++				p++;
++				break;
++			case 'u': { // unicode
++				char *ps = p - 1;
++				ut8 high = 0, low = 0;
++				if (r_hex_to_byte (&high, p[1]) || r

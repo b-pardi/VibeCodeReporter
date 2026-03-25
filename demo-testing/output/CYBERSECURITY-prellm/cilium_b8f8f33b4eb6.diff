@@ -1,0 +1,137 @@
+@@ -51,8 +51,6 @@
+ #include "lib/lb.h"
+ #include "lib/nodeport.h"
+ 
+-#define CB_SRC_IDENTITY 0
+-
+ #if defined FROM_HOST && (defined ENABLE_IPV4 || defined ENABLE_IPV6)
+ static inline int rewrite_dmac_to_host(struct __sk_buff *skb, __u32 src_identity)
+ {
+@@ -69,13 +67,6 @@ static inline int rewrite_dmac_to_host(struct __sk_buff *skb, __u32 src_identity
+ }
+ #endif
+ 
+-static inline void tc_index_clear_nodeport(struct __sk_buff *skb)
+-{
+-#ifdef ENABLE_NODEPORT
+-	skb->tc_index &= ~TC_INDEX_F_SKIP_NODEPORT;
+-#endif
+-}
+-
+ #if defined ENABLE_IPV4 || defined ENABLE_IPV6
+ static inline __u32 finalize_sec_ctx(__u32 secctx, __u32 src_identity)
+ {
+@@ -89,15 +80,6 @@ static inline __u32 finalize_sec_ctx(__u32 secctx, __u32 src_identity)
+ #endif /* ENABLE_SECCTX_FROM_IPCACHE */
+ 	return secctx;
+ }
+-
+-#ifdef ENABLE_NODEPORT
+-static inline bool __inline__ tc_index_skip_nodeport(struct __sk_buff *skb)
+-{
+-	volatile __u32 tc_index = skb->tc_index;
+-	tc_index_clear_nodeport(skb);
+-	return tc_index & TC_INDEX_F_SKIP_NODEPORT;
+-}
+-#endif /* ENABLE_NODEPORT */
+ #endif
+ 
+ #ifdef ENABLE_IPV6
+@@ -117,181 +99,6 @@ static inline __u32 derive_sec_ctx(struct __sk_buff *skb, const union v6addr *no
+ #endif
+ }
+ 
+-#ifdef ENABLE_NODEPORT
+-__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT) int tail_nodeport_nat_ipv6(struct __sk_buff *skb)
+-{
+-	struct bpf_fib_lookup fib_params = {};
+-	struct ipv6_nat_target target = {
+-		.min_port = NODEPORT_PORT_MIN_NAT,
+-		.max_port = NODEPORT_PORT_MAX_NAT,
+-		.force_range = true,
+-	};
+-	void *data, *data_end;
+-	struct ipv6hdr *ip6;
+-	int ret, dir = skb->cb[CB_NAT];
+-
+-	BPF_V6(target.addr, IPV6_NODEPORT);
+-
+-	ret = snat_v6_process(skb, dir, &target);
+-	if (IS_ERR(ret)) {
+-		/* In case of no mapping, recircle back to main path. SNAT is very
+-		 * expensive in terms of instructions (since we don't have BPF to
+-		 * BPF calls as we use tail calls) and complexity, hence this is
+-		 * done inside a tail call here.
+-		 */
+-		if (dir == NAT_DIR_INGRESS) {
+-			skb->tc_index |= TC_INDEX_F_SKIP_NODEPORT;
+-			ep_tail_call(skb, CILIUM_CALL_IPV6_FROM_LXC);
+-			ret = DROP_MISSED_TAIL_CALL;
+-		}
+-		goto drop_err;
+-	}
+-
+-	if (dir == NAT_DIR_INGRESS) {
+-		ep_tail_call(skb, CILIUM_CALL_IPV6_NODEPORT_REVNAT);
+-		ret = DROP_MISSED_TAIL_CALL;
+-		goto drop_err;
+-	}
+-
+-	if (!revalidate_data(skb, &data, &data_end, &ip6)) {
+-		ret = DROP_INVALID;
+-		goto drop_err;
+-	}
+-
+-	fib_params.family = AF_INET6;
+-	fib_params.ifindex = NATIVE_DEV_IFINDEX;
+-	ipv6_addr_copy((union v6addr *) &fib_params.ipv6_src, (union v6addr *) &ip6->saddr);
+-	ipv6_addr_copy((union v6addr *) &fib_params.ipv6_dst, (union v6addr *) &ip6->daddr);
+-
+-	ret = fib_lookup(skb, &fib_params, sizeof(fib_params),
+-			 BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
+-	if (ret != 0) {
+-		ret = DROP_NO_FIB;
+-		goto drop_err;
+-	}
+-
+-	if (eth_store_daddr(skb, fib_params.dmac, 0) < 0) {
+-		ret = DROP_WRITE_ERROR;
+-		goto drop_err;
+-	}
+-	if (eth_store_saddr(skb, fib_params.smac, 0) < 0) {
+-		ret = DROP_WRITE_ERROR;
+-		goto drop_err;
+-	}
+-
+-	return redirect(fib_params.ifindex, 0);
+-drop_err:
+-	return send_drop_notify_error(skb, 0, ret, TC_ACT_SHOT,
+-				      dir == NAT_DIR_INGRESS ?
+-				      METRIC_INGRESS : METRIC_EGRESS);
+-}
+-
+-/* See nodeport_lb4(). */
+-static inline int nodeport_lb6(struct __sk_buff *skb, __u32 src_identity)
+-{
+-	int ret, l3_off = ETH_HLEN, l4_off, hdrlen;
+-	struct ipv6_ct_tuple tuple = {};
+-	void *data, *data_end;
+-	struct ipv6hdr *ip6;
+-	struct csum_offset csum_off = {};
+-	struct lb6_service_v2 *svc;
+-	struct lb6_key_v2 key = {};
+-	struct ct_state ct_state_new = {};
+-	struct ct_state ct_state = {};
+-	bool backend_local;
+-	__u32 monitor = 0;
+-	__u16 service_port;
+-
+-	if (!revalidate_data(skb, &data, &data_end, &ip6))
+-		return DROP_INVALID;
+-
+-	tuple.nexthdr = ip6->nexthdr;
+-	ipv6_addr_copy(&tuple.daddr, (union v6addr *) &ip6->daddr);
+-	ipv6_addr_copy(&tuple.saddr, (union v6addr *) &ip6->saddr);
+-
+-	hdrlen = ipv6_hdrlen(skb, l3_off, &tuple.nexthdr);
+-	if (hdrlen <

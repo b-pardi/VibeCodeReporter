@@ -1,0 +1,91 @@
+@@ -73,8 +73,9 @@ public interface SqlSupplier {
+     default String createServerIdentitiesTableCommand() {
+         return "CREATE TABLE IF NOT EXISTS serverids (" +
+                 "id " + getSerialIdType() + " primary key not null," +
+-                "peerid varchar(64) not null, " +
+-                "private varchar(512) not null, record varchar(1024) not null);";
++                "peerid " + getByteArrayType() + " not null, " +
++                "private " + getByteArrayType() + " not null, " +
++                "record " + getByteArrayType() + " not null);";
+     }
+ 
+     default String createBlockMetadataStoreTableCommand() {
+
+
+
+
+@@ -62,7 +62,6 @@ public class JdbcServerIdentityStore implements ServerIdentityStore {
+     public void addIdentity(PrivKey privateKey, byte[] signedIpnsRecord) {
+         try (Connection conn = getConnection();
+              PreparedStatement insert = conn.prepareStatement(commands.insertServerIdCommand())) {
+-            insert.clearParameters();
+             insert.setBytes(1, PeerId.fromPubKey(privateKey.publicKey()).getBytes());
+             insert.setBytes(2, privateKey.bytes());
+             insert.setBytes(3, signedIpnsRecord);
+
+
+
+
+@@ -1,16 +1,27 @@
+ package peergos.server.tests.slow;
+ 
++import io.libp2p.core.*;
++import io.libp2p.core.crypto.*;
++import io.libp2p.crypto.keys.*;
+ import org.junit.*;
+ import org.junit.runner.*;
+ import org.junit.runners.*;
++import org.peergos.protocol.ipns.*;
+ import peergos.server.*;
++import peergos.server.sql.*;
++import peergos.server.storage.*;
+ import peergos.server.tests.*;
+ import peergos.server.util.*;
+ import peergos.shared.*;
++import peergos.shared.cbor.*;
++import peergos.shared.io.ipfs.*;
++import peergos.shared.resolution.*;
+ import peergos.shared.social.*;
+ import peergos.shared.user.*;
+ import peergos.shared.user.fs.*;
++import peergos.shared.util.*;
+ 
++import java.nio.charset.*;
+ import java.nio.file.*;
+ import java.util.*;
+ 
+@@ -66,4 +77,36 @@ public class PostgresUserTests extends UserTests {
+     public Args getArgs() {
+         return args;
+     }
++
++    @Test
++    public void rsaRotation() {
++        JdbcServerIdentityStore idstore = JdbcServerIdentityStore.build(Builder.getPostgresConnector(args, ""), new PostgresCommands(), Main.initCrypto());
++        // create a new identity
++        PrivKey currentPrivate = RsaKt.generateRsaKeyPair(2048).getFirst();
++        byte[] signedRecord = ServerIdentity.generateSignedIpnsRecord(currentPrivate, Optional.empty(), false,  1);
++        idstore.addIdentity(currentPrivate, signedRecord);
++
++        List<PeerId> ids = idstore.getIdentities();
++        Assert.assertEquals(1, ids.size());
++        PeerId current = ids.get(0);
++        Assert.assertEquals(current, PeerId.fromPubKey(currentPrivate.publicKey()));
++
++        String password = Passwords.generate();
++        Crypto crypto = Main.initCrypto();
++        PrivKey nextPriv = ServerIdentity.generateNextIdentity(password, current, crypto);
++        PeerId nextPeerId = PeerId.fromPubKey(nextPriv.publicKey());
++        idstore.setRecord(current, ServerIdentity.generateSignedIpnsRecord(currentPrivate, Optional.of(Multihash.decode(nextPeerId.getBytes())), true,2));
++        idstore.addIdentity(nextPriv, ServerIdentity.generateSignedIpnsRecord(nextPriv, Optional.empty(), false, 1));
++
++        List<PeerId> updated = idstore.getIdentities();
++        Assert.assertEquals(2, updated.size());
++        Assert.assertEquals(nextPeerId, updated.get(1));
++        byte[] prevRecord = idstore.getRecord(current);
++        Optional<IpnsMapping> prevIpnsMapping = IPNS.parseAndValidateIpnsEntry(
++                ArrayOps.concat("/ipns/".getBytes(StandardCharsets.UTF_8), current.getBytes()),
++                prevRecord);
++        ResolutionRecord prevRes = ResolutionRecord.fromCbor(CborObject.fromByteArray(prevIpnsMapping.get().value.value));
++        Assert.assertEquals(prevRes.moved, true);
++        Assert.assertEquals(prevRes.host, Optional.of(Multihash.fromBase58(

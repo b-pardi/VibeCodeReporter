@@ -1,0 +1,134 @@
+@@ -36,8 +36,8 @@ from pwnlib.log import getLogger
+ from pwnlib.memleak import MemLeak, RelativeMemLeak
+ from pwnlib.regsort import *
+ from pwnlib.replacements import *
++from pwnlib.ret2dlresolve import Ret2dlresolvePayload
+ from pwnlib.rop import ROP
+-from pwnlib.rop.ret2dlresolve import Ret2dlresolve, Ret2dlresolveRop
+ from pwnlib.rop.srop import SigreturnFrame
+ from pwnlib.runner import *
+ from pwnlib.timeout import Timeout
+
+similarity index 60%
+rename from pwnlib/rop/ret2dlresolve.py
+rename to pwnlib/ret2dlresolve.py
+
+
+
+@@ -5,17 +5,16 @@ from pwnlib.log import getLogger
+ from pwnlib.rop import ROP
+ from pwnlib.util.packing import *
+ 
+-
+ log = getLogger(__name__)
+ 
+ class Elf32_Rel(object):
+-    size=1 # see build method for explanation
+     """
+     typedef struct elf32_rel {
+         Elf32_Addr	r_offset;
+         Elf32_Word	r_info;
+     } Elf32_Rel;
+     """
++    size=1 # see _build_structures method for explanation
+     def __init__(self, r_offset=0, r_info=0):
+         self.r_offset = r_offset
+         self.r_info = r_info
+@@ -31,13 +30,13 @@ class Elf32_Rel(object):
+ 
+ 
+ class Elf64_Rel(object):
+-    size=24
+     """
+     typedef struct elf64_rel {
+         Elf64_Addr r_offset;
+         Elf64_Xword r_info;
+     } Elf64_Rel;
+     """
++    size=24
+     def __init__(self, r_offset=0, r_info=0):
+         self.r_offset = r_offset
+         self.r_info = r_info
+@@ -53,7 +52,6 @@ class Elf64_Rel(object):
+ 
+ 
+ class Elf32_Sym(object):
+-    size = 16
+     """
+     typedef struct elf32_sym{
+         Elf32_Word	st_name;
+@@ -64,14 +62,8 @@ class Elf32_Sym(object):
+         Elf32_Half	st_shndx;
+     } Elf32_Sym;
+     """
++    size = 16
+     def __init__(self, st_name=0, st_value=0, st_size=0, st_info=0, st_other=0, st_shndx=0):
+-        # St_info and st_other can be int, str or byte,
+-        # they'll be saved as int
+-        if not isinstance(st_info, int):
+-            st_info = context._encode(st_info)[0]
+-        if not isinstance(st_other, int):
+-            st_other = context._encode(st_other)[0]
+-
+         self.st_name = st_name
+         self.st_value = st_value
+         self.st_size = st_size
+@@ -93,8 +85,8 @@ class Elf32_Sym(object):
+     def __flat__(self):
+         return bytes(self)
+ 
++
+ class Elf64_Sym(object):
+-    size=24
+     """
+     typedef struct elf64_sym {
+         Elf64_Word st_name;
+@@ -105,12 +97,8 @@ class Elf64_Sym(object):
+         Elf64_Xword st_size;
+     } Elf64_Sym;
+     """
++    size=24
+     def __init__(self, st_name=0, st_value=0, st_size=0, st_info=0, st_other=0, st_shndx=0):
+-        if not isinstance(st_info, int):
+-            st_info = context._encode(st_info)[0]
+-        if not isinstance(st_other, int):
+-            st_other = context._encode(st_other)[0]
+-            
+         self.st_name = st_name
+         self.st_value = st_value
+         self.st_size = st_size
+@@ -133,54 +121,72 @@ class Elf64_Sym(object):
+         return bytes(self)
+ 
+ 
++class Queue(list):
++    def size(self):
++        size = 0
++        for v in self:
++            # Lists, strings and ints all have size context.size
++            # Assuming int size equals address size
++            if isinstance(v, MarkedBytes):
++                size += len(v)
++            else:
++                size += context.bytes
++        return size
++
++
+ class MarkedBytes(bytes):
+     pass
+ 
+ 
+-class Ret2dlresolve(object):
+-    def __init__(self, elf, symbol_name):
++class Ret2dlresolvePayload(object):
++    def __init__(self, elf, symbol, args, data_addr=None):
+         self.elf = elf
+         self.elf_base = elf.address if elf.pie else 0
+         self.strtab = elf.dynamic_value_by_tag("DT_STRTAB") + self.elf_base
+         self.symtab = elf.dynamic_value_by_tag("DT_SYMTAB") + self.elf_base
+         self.jmprel = elf.dynamic_value_by_tag("DT_JMPREL") + self.elf_base
+-        self.symbol_name = context._encode(symbol_name)
++        self.symbol = context._encode(symbol)
++        self.args = args
++        self.real_args = self._format_args()        
++  

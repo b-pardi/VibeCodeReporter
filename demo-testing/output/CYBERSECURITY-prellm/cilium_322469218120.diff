@@ -1,0 +1,128 @@
+@@ -831,10 +831,11 @@ static inline int __inline__ ipv6_policy(struct __sk_buff *skb, int ifindex, __u
+ 
+ 	/* Reply packets and related packets are allowed, all others must be
+ 	 * permitted by policy */
+-	if (ret != CT_REPLY && ret != CT_RELATED && verdict != TC_ACT_OK)
++	if (ret != CT_REPLY && ret != CT_RELATED && verdict < 0)
+ 		return DROP_POLICY;
+ 
+ 	if (ret == CT_NEW) {
++		ct_state_new.proxy_port = skip_proxy ? 0 : verdict;
+ 		ct_state_new.orig_dport = tuple.dport;
+ 		ct_state_new.src_sec_id = src_label;
+ 		ret = ct_create6(&CT_MAP6, &tuple, skb, CT_INGRESS, &ct_state_new,
+@@ -932,10 +933,11 @@ static inline int __inline__ ipv4_policy(struct __sk_buff *skb, int ifindex, __u
+ 
+ 	/* Reply packets and related packets are allowed, all others must be
+ 	 * permitted by policy */
+-	if (ret != CT_REPLY && ret != CT_RELATED && verdict != TC_ACT_OK)
++	if (ret != CT_REPLY && ret != CT_RELATED && verdict < 0)
+ 		return DROP_POLICY;
+ 
+ 	if (ret == CT_NEW) {
++		ct_state_new.proxy_port = skip_proxy ? 0 : verdict;
+ 		ct_state_new.orig_dport = tuple.dport;
+ 		ct_state_new.src_sec_id = src_label;
+ 		ret = ct_create4(&CT_MAP4, &tuple, skb, CT_INGRESS, &ct_state_new,
+
+
+
+
+@@ -472,7 +472,7 @@ __section_tail(CILIUM_MAP_RES_POLICY, SECLABEL) int handle_policy(struct __sk_bu
+ 	__u32 src_label = skb->cb[CB_SRC_LABEL];
+ 	int ifindex = skb->cb[CB_IFINDEX];
+ 
+-	if (policy_can_access_ingress(skb, src_label, 0, 0, 0, NULL) != TC_ACT_OK) {
++	if (policy_can_access_ingress(skb, src_label, 0, 0, 0, NULL) < 0) {
+ 		return send_drop_notify(skb, src_label, SECLABEL, 0, ifindex,
+ 					DROP_POLICY, TC_ACT_SHOT);
+ 	} else {
+
+
+
+
+@@ -204,7 +204,7 @@ __section_tail(CILIUM_MAP_RES_POLICY, SECLABEL) int handle_policy(struct __sk_bu
+ 	__u32 src_label = skb->cb[CB_SRC_LABEL];
+ 	int ifindex = skb->cb[CB_IFINDEX];
+ 
+-	if (policy_can_access_ingress(skb, src_label, 0, 0, 0, NULL) != TC_ACT_OK) {
++	if (policy_can_access_ingress(skb, src_label, 0, 0, 0, NULL) < 0) {
+ 		return send_drop_notify(skb, src_label, SECLABEL, 0,
+ 					ifindex, DROP_POLICY, TC_ACT_SHOT);
+ 	} else {
+
+
+
+
+@@ -185,8 +185,8 @@ struct policy_key {
+ };
+ 
+ struct policy_entry {
+-	__u32		action;
+-	__u32		pad;
++	__be16		proxy_port;
++	__u16		pad[3];
+ 	__u64		packets;
+ 	__u64		bytes;
+ };
+
+
+
+
+@@ -437,9 +437,13 @@ static inline int __inline__ ct_create6(void *map, struct ipv6_ct_tuple *tuple,
+ 	entry.lb_loopback = ct_state->loopback;
+ 	ct_update_timeout(&entry);
+ 
+-	proxy_port = l4_policy_lookup6(skb, tuple, dir, orig_was_proxy);
+-	if (IS_ERR(proxy_port))
+-		return proxy_port;
++	if (ct_state->proxy_port) {
++		proxy_port = ct_state->proxy_port;
++	} else {
++		proxy_port = l4_policy_lookup6(skb, tuple, dir, orig_was_proxy);
++		if (IS_ERR(proxy_port))
++			return proxy_port;
++	}
+ 
+ 	if (dir == CT_INGRESS) {
+ 		entry.rx_packets = 1;
+@@ -497,9 +501,13 @@ static inline int __inline__ ct_create4(void *map, struct ipv4_ct_tuple *tuple,
+ 	entry.lb_loopback = ct_state->loopback;
+ 	ct_update_timeout(&entry);
+ 
+-	proxy_port = l4_policy_lookup4(skb, tuple, dir, orig_was_proxy);
+-	if (IS_ERR(proxy_port))
+-		return proxy_port;
++	if (ct_state->proxy_port) {
++		proxy_port = ct_state->proxy_port;
++	} else {
++		proxy_port = l4_policy_lookup4(skb, tuple, dir, orig_was_proxy);
++		if (IS_ERR(proxy_port))
++			return proxy_port;
++	}
+ 
+ 	if (dir == CT_INGRESS) {
+ 		entry.rx_packets = 1;
+
+
+
+
+@@ -23,7 +23,7 @@
+ 
+ #if defined POLICY_INGRESS || defined REQUIRES_CAN_ACCESS
+ 
+-static inline int
++static inline int __inline__
+ __policy_can_access(void *map, struct __sk_buff *skb, __u32 src_identity,
+ 		    __u16 dport, __u8 proto, size_t cidr_addr_size,
+ 		    void *cidr_addr)
+@@ -49,7 +49,7 @@ __policy_can_access(void *map, struct __sk_buff *skb, __u32 src_identity,
+ 		/* FIXME: Use per cpu counters */
+ 		__sync_fetch_and_add(&policy->packets, 1);
+ 		__sync_fetch_and_add(&policy->bytes, skb->len);
+-		return TC_ACT_OK;
++		goto get_proxy_port;
+ 	}
+ #endif /* HAVE_L4_POLICY */
+ 
+@@ -73,7 +73,7 @@ __policy_can_access(void *map, struct __sk_buff *skb,

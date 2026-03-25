@@ -1,0 +1,94 @@
+@@ -113,6 +113,7 @@ static const char *help_msg_slash[] = {
+ 	"/g", "[g] [from]", "find all graph paths A to B (/gg follow jumps, see search.count and anal.depth)",
+ 	"/h", "[t] [hash] [len]", "find block matching this hash. See ph",
+ 	"/i", " foo", "search for string 'foo' ignoring case",
++	"/k", " foo", "search for string 'foo' using Rabin Karp alg",
+ 	"/m", "[?][ebm] magicfile", "search for magic, filesystems or binary headers",
+ 	"/o", " [n]", "show offset of n instructions backward",
+ 	"/O", " [n]", "same as /o, but with a different fallback if anal cannot be used",
+@@ -4051,6 +4052,27 @@ reread:
+ 		r_search_begin (core->search);
+ 		dosearch = true;
+ 		break;
++	case 'k': // "/k" Rabin Karp String search
++		inp = r_str_trim_dup (input + 1);
++		len = r_str_unescape (inp);
++		r_search_reset (core->search, R_SEARCH_RABIN_KARP);
++		r_search_set_distance (core->search, (int)r_config_get_i (core->config, "search.distance"));
++		{
++			RSearchKeyword *skw;
++			skw = r_search_keyword_new ((const ut8 *)inp, len, NULL, 0, NULL);
++			free (inp);
++			if (skw) {
++				skw->icase = ignorecase;
++				skw->type = R_SEARCH_KEYWORD_TYPE_STRING;
++				r_search_kw_add (core->search, skw);
++			} else {
++				eprintf ("Invalid keyword\n");
++				break;
++			}
++		}
++		r_search_begin (core->search);
++		dosearch_read = true;
++		break;
+ 	case 'e': // "/e" match regexp
+ 		if (input[1] == '?') {
+ 			eprintf ("Usage: /e /foo/i or /e/foo/i\n");
+
+
+
+
+@@ -24,6 +24,7 @@ enum {
+ 	R_SEARCH_PRIV_KEY,
+ 	R_SEARCH_DELTAKEY,
+ 	R_SEARCH_MAGIC,
++	R_SEARCH_RABIN_KARP,
+ 	R_SEARCH_LAST
+ };
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,192 @@
++/* radare - LGPL - Copyright 2021 pancake bemodtwz */
++
++#include <r_search.h>
++#include "search.h"
++
++#define rhash      ut64
++#define RHASH_BITS (sizeof (rhash) * 8)
++#define RSHIFT     17
++
++#define ROL(x, n) ((x << n) | (x >> (RHASH_BITS - n)))
++#define ROR(x, n) ((x >> n) | (x << (RHASH_BITS - n)))
++
++const ut64 UT_MAP[256] = {
++	0x000000000000000, 0x000000000000001, 0x000000000000100, 0x000000000000101,
++	0x000000000010000, 0x000000000010001, 0x000000000010100, 0x000000000010101,
++	0x000000001000000, 0x000000001000001, 0x000000001000100, 0x000000001000101,
++	0x000000001010000, 0x000000001010001, 0x000000001010100, 0x000000001010101,
++	0x000000100000000, 0x000000100000001, 0x000000100000100, 0x000000100000101,
++	0x000000100010000, 0x000000100010001, 0x000000100010100, 0x000000100010101,
++	0x000000101000000, 0x000000101000001, 0x000000101000100, 0x000000101000101,
++	0x000000101010000, 0x000000101010001, 0x000000101010100, 0x000000101010101,
++	0x000010000000000, 0x000010000000001, 0x000010000000100, 0x000010000000101,
++	0x000010000010000, 0x000010000010001, 0x000010000010100, 0x000010000010101,
++	0x000010001000000, 0x000010001000001, 0x000010001000100, 0x000010001000101,
++	0x000010001010000, 0x000010001010001, 0x000010001010100, 0x000010001010101,
++	0x000010100000000, 0x000010100000001, 0x000010100000100, 0x000010100000101,
++	0x000010100010000, 0x000010100010001, 0x000010100010100, 0x000010100010101,
++	0x000010101000000, 0x000010101000001, 0x000010101000100, 0x000010101000101,
++	0x000010101010000, 0x000010101010001, 0x000010101010100, 0x000010101010101,
++	0x001000000000000, 0x001000000000001, 0x001000000000100, 0x001000000000101,
++	0x001000000010000, 0x001000000010001, 0x001000000010100, 0x001000000010101,
++	0x001000001000000, 0x001000001000001, 0x001000001000100, 0x001000001000101,
++	0x001000001010000, 0x001000001010001, 0x001000001010100, 0x001000001010101,
++	0x001000100000000, 0x001000100000001, 0x001000100000100, 0x001000100000101,
++	0x001000100010000, 0x001000100010001, 0x001000100010100, 0x001000100010101,
++	0x001000101000000, 0x001000101000001, 0x001000101000100, 0x001000101000101,
++	0x001000101010000, 0x001000101010001, 0x001000101010100, 0x001000101010101,
++	0x001010000000000, 0x001010000000001, 0x001010000000100, 0x001010000000101,
++	0x001010000010000, 0x001010000010001, 0x001010000010100, 0x001010000010101,
++	0x001010001000000, 0x

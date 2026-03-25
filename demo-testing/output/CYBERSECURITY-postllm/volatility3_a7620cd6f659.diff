@@ -1,0 +1,121 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,314 @@
++# This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
++# which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
++#
++import logging
++import io
++
++# Image manipulation functions are kept in the plugin,
++# to prevent a general exit on missing PIL (pillow) dependency.
++from PIL import Image
++from dataclasses import dataclass
++from typing import Type, List, Dict, Tuple
++from volatility3.framework import constants, exceptions, interfaces
++from volatility3.framework.configuration import requirements
++from volatility3.framework.renderers import format_hints, TreeGrid, NotAvailableValue
++from volatility3.framework.objects import utility
++from volatility3.framework.constants import architectures
++from volatility3.framework.symbols import linux
++
++vollog = logging.getLogger(__name__)
++
++
++@dataclass
++class Framebuffer:
++    """Framebuffer object internal representation. This is useful to unify an framebuffer with precalculated
++    properties and pass it through functions conveniently."""
++
++    id: str
++    xres_virtual: int
++    yres_virtual: int
++    line_length: int
++    bpp: int
++    """Bits Per Pixel"""
++    size: int
++    color_fields: Dict[str, Tuple[int, int, int]]
++    fb_info: interfaces.objects.ObjectInterface
++
++
++class Fbdev(interfaces.plugins.PluginInterface):
++    """Extract framebuffers from the fbdev graphics subsystem"""
++
++    _version = (1, 0, 0)
++    _required_framework_version = (2, 11, 0)
++
++    @classmethod
++    def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
++        return [
++            requirements.ModuleRequirement(
++                name="kernel",
++                description="Linux kernel",
++                architectures=architectures.LINUX_ARCHS,
++            ),
++            requirements.BooleanRequirement(
++                name="dump",
++                description="Dump framebuffers",
++                default=False,
++                optional=True,
++            ),
++        ]
++
++    @classmethod
++    def parse_fb_pixel_bitfields(
++        cls, fb_var_screeninfo: interfaces.objects.ObjectInterface
++    ) -> Dict[str, Tuple[int, int, int]]:
++        """Organize a framebuffer pixel format into a dictionary.
++        This is needed to know the position and bitlength of a color inside
++        a pixel.
++
++        Args:
++            fb_var_screeninfo: a fb_var_screeninfo kernel object instance
++
++        Returns:
++            The color fields mappings
++
++        Documentation:
++            include/uapi/linux/fb.h:
++                struct fb_bitfield {
++                    __u32 offset;			/* beginning of bitfield	*/
++                    __u32 length;			/* length of bitfield		*/
++                    __u32 msb_right;		/* != 0 : Most significant bit is right */
++                };
++        """
++        # Naturally order by RGBA
++        color_mappings = [
++            ("R", fb_var_screeninfo.red),
++            ("G", fb_var_screeninfo.green),
++            ("B", fb_var_screeninfo.blue),
++            ("A", fb_var_screeninfo.transp),
++        ]
++        color_fields = {}
++        for color_code, fb_bitfield in color_mappings:
++            color_fields[color_code] = (
++                int(fb_bitfield.offset),
++                int(fb_bitfield.length),
++                int(fb_bitfield.msb_right),
++            )
++        return color_fields
++
++    @classmethod
++    def convert_fb_raw_buffer_to_image(
++        cls,
++        context: interfaces.context.ContextInterface,
++        kernel_name: str,
++        fb: Framebuffer,
++    ) -> Image.Image:
++        """Convert raw framebuffer pixels to an image.
++
++        Args:
++            fb: the relevant Framebuffer object
++
++        Returns:
++            A PIL Image object
++
++        Documentation:
++            include/uapi/linux/fb.h:
++                /* Interpretation of offset for color fields: All offsets are from the right,
++      

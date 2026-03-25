@@ -1,0 +1,164 @@
+@@ -1282,7 +1282,7 @@ R_API void r_cons_visual_write(char *buffer) {
+ }
+ 
+ R_API void r_cons_printf_list(const char *format, va_list ap) {
+-	size_t size, written;
++	size_t written;
+ 	va_list ap2, ap3;
+ 
+ 	va_copy (ap2, ap);
+@@ -1293,11 +1293,13 @@ R_API void r_cons_printf_list(const char *format, va_list ap) {
+ 		return;
+ 	}
+ 	if (strchr (format, '%')) {
++		int left = 0;
+ 		if (palloc (MOAR + strlen (format) * 20)) {
+ club:
+-			size = C->buffer_sz - C->buffer_len; /* remaining space in C->buffer */
+-			written = vsnprintf (C->buffer + C->buffer_len, size, format, ap3);
+-			if (written >= size) { /* not all bytes were written */
++			left = C->buffer_sz - C->buffer_len; /* remaining space in C->buffer */
++			// if (left > 0) {}
++			written = vsnprintf (C->buffer + C->buffer_len, left, format, ap3);
++			if (written >= left) { /* not all bytes were written */
+ 				if (palloc (written + 1)) {  /* + 1 byte for \0 termination */
+ 					va_end (ap3);
+ 					va_copy (ap3, ap2);
+
+
+
+
+@@ -37,6 +37,7 @@ static const char *help_detail_tilde[] = {
+ 	" ..",       "", "internal 'less'",
+ 	" ...",      "", "internal 'hud' (like V_)",
+ 	" ....",     "", "internal 'hud' in one line",
++	" :)",       "", "parse C-like output from decompiler",
+ 	" {:",       "", "human friendly indentation (yes, it's a smiley)",
+ 	" {:..",     "", "less the output of {:",
+ 	" {:...",    "", "hud the output of {:",
+@@ -123,6 +124,12 @@ static void parse_grep_expression(const char *str) {
+ 		end_ptr = ptr2 = ptr3 = NULL;
+ 		while (*ptr) {
+ 			switch (*ptr) {
++			case ':':
++				if (ptr[1] == ')') { // ":)"
++					grep->code = true;
++					ptr++;
++				}
++				goto while_end;
+ 			case '.':
+ 				if (ptr[1] == '.') {
+ 					if (ptr[2] == '.') {
+@@ -503,6 +510,25 @@ R_API void r_cons_grepbuf(void) {
+ 		R_FREE (cons->context->buffer);
+ 		return;
+ 	}
++	if (grep->code) {
++		char *buf = r_str_ndup (cons->context->buffer, cons->context->buffer_len);
++		if (buf) {
++			char *res = r_str_tokenize_json (buf);
++			free (buf);
++			if (res) {
++				cons->context->buffer_len = strlen (res);
++				cons->context->buffer_sz = cons->context->buffer_len;
++				free (cons->context->buffer);
++				cons->context->buffer = res;
++			} else {
++				cons->context->buffer_len = 0;
++				cons->context->buffer_sz = 0;
++				free (cons->context->buffer);
++				cons->context->buffer = strdup ("");
++			}
++		}
++		return;
++	}
+ 
+ 	if ((!len || !buf || !*buf) && (grep->json || grep->less)) {
+ 		grep->json = 0;
+
+
+
+
+@@ -110,6 +110,7 @@ typedef struct r_cons_grep_t {
+ 	int end[R_CONS_GREP_WORDS];
+ 	bool icase;
+ 	bool ascart;
++	bool code;
+ } RConsGrep;
+ 
+ enum { ALPHA_RESET = 0x00, ALPHA_FG = 0x01, ALPHA_BG = 0x02, ALPHA_FGBG = 0x03 };
+
+
+
+
+@@ -79,6 +79,7 @@ int gettimeofday (struct timeval* p, void* tz);
+ #include "r_util/r_protobuf.h"
+ #include "r_util/r_big.h"
+ #include "r_util/r_w32.h"
++#include "r_util/r_token.h"
+ #include "r_util/r_axml.h"
+ // requires io, core, ... #include "r_util/r_print.h"
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,37 @@
++#ifndef R2_UTIL_TOKEN_H
++#define R2_UTIL_TOKEN_H
++
++typedef enum {
++	R_TOKEN_NONE,
++	R_TOKEN_INT,
++	R_TOKEN_FLOAT,
++	R_TOKEN_WORD,
++	R_TOKEN_HASH,
++	R_TOKEN_STRING,
++	R_TOKEN_COMMENT,
++	R_TOKEN_MATH,
++	R_TOKEN_GROUP,
++	R_TOKEN_BEGIN,
++	R_TOKEN_END
++} RTokenType;
++
++typedef bool (*RTokenizerCallback)(void *tok);
++
++typedef struct r_tokenizer_t {
++	bool hex;
++	bool escape;
++	const char *buf;
++	char ch;
++	size_t begin;
++	int indent;
++	size_t end;
++	RTokenType type;
++	RTokenizerCallback cb;
++	void *user;
++} RTokenizer;
++
++R_API char *r_str_tokenize_json(const char *buf);
++R_API RTokenizer *r_tokenizer_new(void);
++R_API void r_str_tokenize(const char *buf, RTokenizerCallback cb, void *user);
++
++#endif
+
+
+
+
+@@ -894,7 +894,7 @@ R_API char *r_str_append_owned(char *ptr, char *string) {
+ 	if (!ptr) {
+ 		return string;
+ 	}
+-	char *r = r_str_append(ptr, string);
++	char *r = r_str_append (ptr, string);
+ 	free (string);
+ 	return r;
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,525 @@
++/* radare - LGPL - Copy

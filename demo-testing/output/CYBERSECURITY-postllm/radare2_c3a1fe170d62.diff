@@ -1,0 +1,173 @@
+@@ -1520,7 +1520,7 @@ static int show_syscall(RDebug *dbg, const char *sysreg) {
+ 		sysname = "unknown";
+ 		args = 3;
+ 	}
+-	RStrBuf *sb = r_str_newf ("--> %s 0x%08"PFMT64x" syscall %d %s (", sysreg,
++	RStrBuf *sb = r_strbuf_newf ("--> %s 0x%08"PFMT64x" syscall %d %s (", sysreg,
+ 			r_debug_reg_get (dbg, "PC"), reg, sysname);
+ 	for (i = 0; i < args; i++) {
+ 		snprintf (regname, sizeof (regname) - 1, "A%d", i);
+
+
+
+
+@@ -9,6 +9,7 @@ R_LIB_VERSION (r_lang);
+ #if HAVE_SYSTEM
+ #include "p/pipe.c"
+ #include "p/c.c"
++#include "p/s.c"
+ #include "p/v.c"
+ #include "p/vala.c"
+ #include "p/rust.c"
+@@ -44,6 +45,7 @@ R_API RLang *r_lang_new(void) {
+ 	lang->cb_printf = (PrintfCallback)printf;
+ #if HAVE_SYSTEM
+ #if R2__UNIX__
++	r_lang_add (lang, &r_lang_plugin_s);
+ 	r_lang_add (lang, &r_lang_plugin_c);
+ 	r_lang_add (lang, &r_lang_plugin_cpipe);
+ #endif
+
+
+
+
+@@ -12,7 +12,7 @@ static bool lang_asm_run(RLangSession *s, const char *code, int len) {
+ 	if (kode) {
+ 		int i;
+ 		eprintf ("CODE: %d\nBYTES: ", kode->len);
+-		for (i = 0; i< kode->len; i++) {
++		for (i = 0; i < kode->len; i++) {
+ 			eprintf ("%02x ", kode->bytes[i]);
+ 		}
+ 		eprintf ("\n");
+@@ -49,9 +49,8 @@ static RLangPlugin r_lang_plugin_asm = {
+ #endif
+ };
+ #else
+-#ifdef _MSC_VER
++
+ #pragma message("Warning: C RLangPlugin is not implemented on this platform")
+-#else
+-#warning C RLangPlugin is not implemented on this platform
+-#endif
++static RLangPlugin r_lang_plugin_asm = {NULL};
++
+ #endif
+
+
+
+
+@@ -607,7 +607,7 @@ static bool fini(RLangSession *s) {
+ 	k->r = NULL;
+ 	qjsctx_free ();
+ // 	free (k);
+-	return NULL;
++	return true;
+ }
+ 
+ static RLangPlugin r_lang_plugin_qjs = {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,167 @@
++/* radare - LGPL - Copyright 2023 pancake */
++
++#include "r_lib.h"
++#include "r_core.h"
++#include "r_lang.h"
++
++#if R2__UNIX__ && !__wasi__
++
++static int lang_s_file(RLangSession *s, const char *file) {
++	char *a, *cc, *p;
++	const char *libpath, *libname;
++	void *lib;
++
++	char *name = NULL;
++	if (r_str_endswith (file, ".s")) {
++		name = strdup (file);
++	} else {
++		name = r_str_newf ("%s.s", file);
++	}
++	if (!r_file_exists (name)) {
++		R_LOG_ERROR ("file not found (%s)", name);
++		free (name);
++		return false;
++	}
++
++	a = (char*)r_str_lchr (name, '/');
++	if (a) {
++		*a = 0;
++		libpath = name;
++		libname = a + 1;
++	} else {
++		libpath = ".";
++		libname = name;
++	}
++	// XXX check if ends with not just strstr
++	p = strstr (name, ".s");
++	if (p) {
++		*p = 0;
++	}
++	cc = r_sys_getenv ("CC");
++	if (R_STR_ISEMPTY (cc)) {
++		cc = strdup ("gcc");
++	}
++	char *file_esc = r_str_escape_sh (file);
++	char *libpath_esc = r_str_escape_sh (libpath);
++	char *libname_esc = r_str_escape_sh (libname);
++	char *buf = r_str_newf ("%s -fPIC -shared \"%s\" -o \"%s/lib%s." R_LIB_EXT "\""
++		" $(PKG_CONFIG_PATH=%s pkg-config --cflags --libs r_core)",
++		cc, file_esc, libpath_esc, libname_esc, R2_LIBDIR "/pkgconfig");
++	free (libname_esc);
++	free (libpath_esc);
++	free (file_esc);
++	free (cc);
++	if (r_sandbox_system (buf, 1) != 0) {
++		free (buf);
++		free (name);
++		return false;
++	}
++	free (buf);
++	buf = r_str_newf ("%s/lib%s."R_LIB_EXT, libpath, libname);
++	lib = r_lib_dl_open (buf);
++	if (lib) {
++		void (*fcn)(RCore *, int argc, const char **argv);
++		fcn = r_lib_dl_sym (lib, "entry");
++		if (!fcn) {
++			fcn = r_lib_dl_sym (lib, "main");
++			if (!fcn) {
++				fcn = r_lib_dl_sym (lib, "_main");
++			}
++		}
++		if (fcn) {
++			fcn (s->lang->user, ac, av);
++			ac = 0;
++			av = NULL;
++		} else {
++			R_LOG_ERROR ("Cannot find 'entry' symbol in library");
++		}
++		r_lib_dl_close (lib);
++	} else {
++		R_LOG_ERROR ("Cannot open library");
++	}
++	r_file_rm (buf); // remove lib
++	free (buf);
++	free (name);
++	return 0;
++}
++
++static bool lang_s_run(RLangSession *s, const char *code, int len) {
++	if (!r_file_dump (".tmp.s", (const ut8*)code, len, false)) {
++		R_LOG_ERROR ("Cannot open .tmp.s");
++		return false;
++	}
++	lang_s_file (s, ".tmp.s");
++	r_file_rm (".tmp.s");
++	return true;
++}
++
++#define r_lang_s_example "" \
++	".ext

@@ -1,0 +1,138 @@
+@@ -646,7 +646,12 @@ R_API bool r_line_hist_add(RLine *line, const char *text) {
+ 		return false;
+ 	}
+ 	if (!line->history.data) {
+-		inithist (line);
++		if (!inithist (line)) {
++			return false;
++		}
++	}
++	if (!line->history.data || line->history.size <= 0) {
++		return false;
+ 	}
+ 	/* ignore dup */
+ 	if (line->history.top > 0) {
+
+
+
+
+@@ -22,6 +22,7 @@ R_API RLine *r_line_new(RCons *cons) {
+ 	line->contents = NULL;
+ 	line->enable_vi_mode = false;
+ 	line->clipboard = NULL;
++	line->hist_size = R_LINE_HISTSIZE;
+ 	line->kill_ring = r_list_newf (free);
+ 	line->kill_ring_ptr = -1;
+ #if R2__WINDOWS__
+@@ -111,5 +112,4 @@ R_API void r_line_completion_clear(RLineCompletion *completion) {
+ 	r_pvector_clear (&completion->args);
+ }
+ 
+-
+ #include "dietline.c"
+
+
+
+
+@@ -65,6 +65,17 @@ static void cmd_debug_reg(RCore *core, const char *str);
+ 
+ R_VEC_TYPE(RVecAnalRef, RAnalRef);
+ 
++R_API ut8 *r_core_readblock(RCore *core, ut64 size) {
++	if (size == 0) {
++		size = core->blocksize;
++	}
++	ut8 *buf = malloc (size);
++	if (buf) {
++		r_io_read_at (core->io, core->addr, buf, size);
++	}
++	return buf;
++}
++
+ #define R_INCLUDE_BEGIN 1
+ #include "cmd_quit.inc.c"
+ #include "cmd_hash.inc.c"
+@@ -89,6 +100,7 @@ R_VEC_TYPE(RVecAnalRef, RAnalRef);
+ #include "cmd_mount.inc.c"
+ #include "cmd_seek.inc.c"
+ #include "cmd_search.inc.c" // defines incDigitBuffer... used by cmd_print
++
+ #include "cmd_print.inc.c"
+ #include "cmd_help.inc.c"
+ 
+
+
+
+
+@@ -16062,6 +16062,7 @@ static void cmd_an(RCore *core, const char *input) {
+ static int cmd_anal(void *data, const char *input) {
+ 	const char *r;
+ 	RCore *core = (RCore *)data;
++	ut64 addr = core->addr;
+ 	ut32 tbs = core->blocksize;
+ 	switch (input[0]) {
+ 	case 0: // "a"
+@@ -16203,17 +16204,21 @@ static int cmd_anal(void *data, const char *input) {
+ 			}
+ 			break;
+ 		case 'k': // "adk"
+-			r = r_anal_data_kind (core->anal, core->addr, core->block, core->blocksize);
+-			r_cons_println (core->cons, r);
++			{
++				ut8 *data = r_core_readblock (core, tbs);
++				r = r_anal_data_kind (core->anal, addr, data, tbs);
++				r_cons_println (core->cons, r);
++				free (data);
++			}
+ 			break;
+ 		case '\0': // "ad"
+-			r_core_anal_data (core, core->addr, 2 + (core->blocksize / 4), 1, 0);
++			r_core_anal_data (core, core->addr, 2 + (tbs / 4), 1, 0);
+ 			break;
+ 		case '4': // "ad4"
+-			r_core_anal_data (core, core->addr, 2 + (core->blocksize / 4), 1, 4);
++			r_core_anal_data (core, core->addr, 2 + (tbs / 4), 1, 4);
+ 			break;
+ 		case '8': // "ad8"
+-			r_core_anal_data (core, core->addr, 2 + (core->blocksize / 4), 1, 8);
++			r_core_anal_data (core, core->addr, 2 + (tbs / 4), 1, 8);
+ 			break;
+ 		case '?':
+ 			r_core_cmd_help (core, help_msg_ad);
+
+
+
+
+@@ -2385,16 +2385,19 @@ static void cmd_print_format(RCore *core, const char *_input, const ut8* block,
+ 
+ 			/* Load format from name into fmt to get the size */
+ 			/* Make sure the structure will be printed entirely */
++			int bufsize = core->blocksize;
+ 			char *fmt = sdb_get (core->print->formats, name, NULL);
+ 			if (fmt) {
+ 				// TODO: what is +10 magic number?
+ 				// Backtracks to commit e5e23c237755cdeb13ba15938c93ada590e453db / issue #2808
+-				int size = r_print_format_struct_size (core->print, fmt, mode, 0) + 10;
+-				if (size > core->blocksize) {
+-					r_core_block_size (core, size);
+-				}
++				int struct_size = r_print_format_struct_size (core->print, fmt, mode, 0) + 10;
++				bufsize = R_MAX (bufsize, struct_size);
+ 				free (fmt);
+ 			}
++			ut8 *buf = r_core_readblock (core, bufsize);
++			if (!buf) {
++				goto err_name;
++			}
+ 			/* display a format */
+ 			if (dot) {
+ 				*dot++ = 0;
+@@ -2404,15 +2407,17 @@ static void cmd_print_format(RCore *core, const char *_input, const ut8* block,
+ 					r_str_trim_tail (name);
+ 					mode = R_PRINT_MUSTSET;
+ 					r_print_format (core->print, core->addr,
+-						core->block, core->blocksize, name, mode, eq, dot);
++						buf, bufsize, name, mode, eq, dot);
++					r_io_write_at (core->io, core->addr, buf, bufsize);
+ 				} else {
+ 					r_print_format

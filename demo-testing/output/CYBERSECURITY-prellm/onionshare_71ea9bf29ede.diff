@@ -1,0 +1,117 @@
+@@ -18,859 +18,4 @@ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ """
+ 
+-import hmac
+-import logging
+-import mimetypes
+-import os
+-import queue
+-import socket
+-import sys
+-import tempfile
+-import zipfile
+-import re
+-import io
+-from distutils.version import LooseVersion as Version
+-from urllib.request import urlopen
+-from datetime import datetime
+-
+-import flask
+-from flask import (
+-    Flask, Response, Request, request, render_template, abort, make_response,
+-    flash, redirect, __version__ as flask_version
+-)
+-from werkzeug.utils import secure_filename
+-
+-from .. import strings
+-from ..common import DownloadsDirErrorCannotCreate, DownloadsDirErrorNotWritable
+-
+-
+-# Stub out flask's show_server_banner function, to avoiding showing warnings that
+-# are not applicable to OnionShare
+-def stubbed_show_server_banner(env, debug, app_import_path, eager_loading):
+-    pass
+-
+-flask.cli.show_server_banner = stubbed_show_server_banner
+-
+-
+-class Web(object):
+-    """
+-    The Web object is the OnionShare web server, powered by flask
+-    """
+-    REQUEST_LOAD = 0
+-    REQUEST_STARTED = 1
+-    REQUEST_PROGRESS = 2
+-    REQUEST_OTHER = 3
+-    REQUEST_CANCELED = 4
+-    REQUEST_RATE_LIMIT = 5
+-    REQUEST_CLOSE_SERVER = 6
+-    REQUEST_UPLOAD_FILE_RENAMED = 7
+-    REQUEST_UPLOAD_FINISHED = 8
+-    REQUEST_ERROR_DOWNLOADS_DIR_CANNOT_CREATE = 9
+-    REQUEST_ERROR_DOWNLOADS_DIR_NOT_WRITABLE = 10
+-
+-    def __init__(self, common, gui_mode, receive_mode=False):
+-        self.common = common
+-
+-        # The flask app
+-        self.app = Flask(__name__,
+-                         static_folder=self.common.get_resource_path('static'),
+-                         template_folder=self.common.get_resource_path('templates'))
+-        self.app.secret_key = self.common.random_string(8)
+-
+-        # Debug mode?
+-        if self.common.debug:
+-            self.debug_mode()
+-
+-        # Are we running in GUI mode?
+-        self.gui_mode = gui_mode
+-
+-        # Are we using receive mode?
+-        self.receive_mode = receive_mode
+-        if self.receive_mode:
+-            # Use custom WSGI middleware, to modify environ
+-            self.app.wsgi_app = ReceiveModeWSGIMiddleware(self.app.wsgi_app, self)
+-            # Use a custom Request class to track upload progess
+-            self.app.request_class = ReceiveModeRequest
+-
+-        # Starting in Flask 0.11, render_template_string autoescapes template variables
+-        # by default. To prevent content injection through template variables in
+-        # earlier versions of Flask, we force autoescaping in the Jinja2 template
+-        # engine if we detect a Flask version with insecure default behavior.
+-        if Version(flask_version) < Version('0.11'):
+-            # Monkey-patch in the fix from https://github.com/pallets/flask/commit/99c99c4c16b1327288fd76c44bc8635a1de452bc
+-            Flask.select_jinja_autoescape = self._safe_select_jinja_autoescape
+-
+-        # Information about the file
+-        self.file_info = []
+-        self.is_zipped = False
+-        self.download_filename = None
+-        self.download_filesize = None
+-        self.zip_writer = None
+-
+-        self.security_headers = [
+-            ('Content-Security-Policy', 'default-src \'self\'; style-src \'self\'; script-src \'self\'; img-src \'self\' data:;'),
+-            ('X-Frame-Options', 'DENY'),
+-            ('X-Xss-Protection', '1; mode=block'),
+-            ('X-Content-Type-Options', 'nosniff'),
+-            ('Referrer-Policy', 'no-referrer'),
+-            ('Server', 'OnionShare')
+-        ]
+-
+-        self.q = queue.Queue()
+-
+-        self.slug = None
+-
+-        self.download_count = 0
+-        self.upload_count = 0
+-
+-        self.error404_count = 0
+-
+-        # If "Stop After First Download" is checked (stay_open == False), only allow
+-        # one download at a time.
+-        self.download_in_progress = False
+-
+-        self.done = False
+-

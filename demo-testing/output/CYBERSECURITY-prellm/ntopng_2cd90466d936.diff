@@ -1,0 +1,107 @@
+@@ -70,6 +70,7 @@ class Utils {
+   static bool purifyHTTPparam(char * const param, bool strict, bool allowURL, bool allowDots);
+   static char* stripHTML(const char * const str);
+   static bool postHTTPJsonData(char *username, char *password, char *url, char *json, HTTPTranferStats *stats);
++  static bool postHTTPJsonData(char *username, char *password, char *url, char *json, HTTPTranferStats *stats, char *return_data, int return_data_size);
+   static bool sendMail(char *from, char *to, char *message, char *smtp_server);
+   static bool postHTTPTextFile(char *username, char *password, char *url, char *path, int timeout, HTTPTranferStats *stats);
+   static bool httpGetPost(lua_State* vm, char *url, char *username,
+@@ -113,6 +114,7 @@ class Utils {
+   static const char* captureDirection2Str(pcap_direction_t dir);
+   static bool shouldResolveHost(const char *host_ip);
+   static bool mg_write_retry(struct mg_connection *conn, u_char *b, int len);
++  static bool parseAuthenticatorJson(HTTPAuthenticator *auth, char *content);
+ 
+   /* Patricia Tree */
+   static patricia_node_t* ptree_match(patricia_tree_t *tree, int family, void *addr, int bits);
+
+
+
+
+@@ -817,6 +817,14 @@
+ #ifdef HAVE_LDAP
+ #define MAX_LDAP_LEN     256  /* Keep it in sync with lua preferences file prefs.lua */
+ #endif
++#define PREF_RADIUS_SERVER              NTOPNG_PREFS_PREFIX".radius.radius_server_address"
++#define PREF_RADIUS_SECRET              NTOPNG_PREFS_PREFIX".radius.radius_secret"
++#ifdef HAVE_RADIUS
++#define MAX_RADIUS_LEN   256
++#endif
++#define PREF_HTTP_AUTHENTICATOR_URL   NTOPNG_PREFS_PREFIX".http_authenticator.url"
++#define MAX_HTTP_AUTHENTICATOR_LEN    256
++#define MAX_HTTP_AUTHENTICATOR_RETURN_DATA_LEN      4096
+ #define PREF_USER_TYPE_LOG            NTOPNG_PREFS_PREFIX".user.%s.type_log"
+ 
+ /* Elastic Search */
+
+
+
+
+@@ -244,6 +244,10 @@ using namespace std;
+ #if defined(NTOPNG_PRO) && defined(HAVE_NINDEX)
+ #include "nindex_api.h"
+ #endif
++#ifdef HAVE_RADIUS
++#include <radcli/radcli.h>
++#endif
++
+ 
+ #include "TimeseriesPoint.h"
+ #include "TimeseriesRingStatus.h"
+
+
+
+
+@@ -559,6 +559,10 @@ typedef enum {
+   after_shutdown_restart_self = 3,
+ } AfterShutdownAction;
+ 
++typedef struct {
++  bool admin;
++} HTTPAuthenticator;
++
+ typedef struct {
+   double namelookup, connect, appconnect, pretransfer, redirect, start, total;
+ } HTTPTranferStats;
+
+
+
+
+@@ -1008,6 +1008,10 @@ bool Ntop::checkUserPassword(const char * const user, const char * const passwor
+ #if defined(NTOPNG_PRO) && defined(HAVE_LDAP)
+   bool localAuth = true;
+ #endif
++#ifdef HAVE_RADIUS
++  bool radiusLocalAuth = true;
++#endif
++  bool httpLocalAuth = true;
+ 
+   if((user == NULL) || (user[0] == '\0'))
+     return(false);
+@@ -1093,6 +1097,155 @@ bool Ntop::checkUserPassword(const char * const user, const char * const passwor
+   if(!localAuth) return(false);
+ #endif
+ 
++#ifdef HAVE_RADIUS
++  if(ntop->getRedis()->get((char*)PREF_NTOP_AUTHENTICATION_TYPE, val, sizeof(val)) >= 0) {
++    if(!strcmp(val, "radius") /* radius only */) radiusLocalAuth = false;
++    if(strncmp(val, "radius", 4) == 0) {
++      int result;
++      bool radius_ret = false;
++      char *radiusServer = NULL, *radiusSecret = NULL, *authServer = NULL;
++      rc_handle       *rh = NULL;
++      VALUE_PAIR      *send = NULL, *received = NULL;
++
++      if (!password || !password[0])
++        return false;
++
++      if (!(radiusServer = (char*)calloc(sizeof(char), MAX_RADIUS_LEN)) ||
++          !(radiusSecret = (char*)calloc(sizeof(char), MAX_RADIUS_LEN)) ||
++          !(authServer = (char*)calloc(sizeof(char), MAX_RADIUS_LEN))) {
++        ntop->getTrace()->traceEvent(TRACE_ERROR, "Radius: unable to allocate memory");
++        goto radius_auth_out;
++      }
++      ntop->getRedis()->get((char*)PREF_RADIUS_SERVER, radiusServer, MAX_RADIUS_LEN);
++      ntop->getRedis()->get((char*)PREF_RADIUS_SECRET, radiusSecret, MAX_RADIUS_LEN);
++      if (!radiusServer[0] || !radiusSecret[0]) {
++        ntop->getTrace()->traceEvent(TRACE_ERROR, "Radius: no radiu

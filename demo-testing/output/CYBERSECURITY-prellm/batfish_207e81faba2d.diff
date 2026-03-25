@@ -1,0 +1,107 @@
+@@ -3,12 +3,9 @@ package org.batfish.common.bdd;
+ import static org.batfish.datamodel.PacketHeaderConstraintsUtil.DEFAULT_PACKET_LENGTH;
+ 
+ import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.ImmutableList.Builder;
+ import io.opentracing.ActiveSpan;
+ import io.opentracing.util.GlobalTracer;
+-import java.util.Arrays;
+ import java.util.List;
+-import java.util.stream.Collectors;
+ import net.sf.javabdd.BDD;
+ import org.batfish.common.BatfishException;
+ import org.batfish.datamodel.IcmpType;
+@@ -18,23 +15,26 @@ import org.batfish.datamodel.NamedPort;
+ 
+ /** This class generates common useful flow constraints as BDDs. */
+ public final class BDDFlowConstraintGenerator {
+-  /**
+-   * Difference preferences of flow constraints: DEBUGGING: 1. ICMP 2. UDP 3. TCP APPLICATION : 1.
+-   * TCP 2. UDP 3. ICMP
+-   */
++  /** Allows a caller to express preferences on how packets should be retrieved. */
+   public enum FlowPreference {
++    /** Prefers ICMP over UDP over TCP. */
+     DEBUGGING,
++    /** Prefers TCP over UDP over ICMP. */
+     APPLICATION,
++    /**
++     * Prefers TCP over UDP over ICMP. Not currently different from {@link #APPLICATION}, but may
++     * change.
++     */
+     TESTFILTER
+   }
+ 
+   private final BDDPacket _bddPacket;
+   private final BDDOps _bddOps;
+-  private final BDD _icmpFlow;
+-  private final BDD _udpFlow;
+-  private final BDD _tcpFlow;
++  private final List<BDD> _icmpConstraints;
++  private final List<BDD> _udpConstraints;
++  private final List<BDD> _tcpConstraints;
+   private final BDD _defaultPacketLength;
+-  private final List<BDD> _testFilterPrefBdds;
++  private final List<BDD> _ipConstraints;
+ 
+   BDDFlowConstraintGenerator(BDDPacket pkt) {
+     try (ActiveSpan span =
+@@ -43,109 +43,149 @@ public final class BDDFlowConstraintGenerator {
+       _bddPacket = pkt;
+       _bddOps = new BDDOps(pkt.getFactory());
+       _defaultPacketLength = _bddPacket.getPacketLength().value(DEFAULT_PACKET_LENGTH);
+-      _icmpFlow = computeICMPConstraint();
+-      _udpFlow = computeUDPConstraint();
+-      _tcpFlow = computeTCPConstraint();
+-      _testFilterPrefBdds = computeTestFilterPreference();
++      _icmpConstraints = computeICMPConstraint();
++      _udpConstraints = computeUDPConstraints();
++      _tcpConstraints = computeTCPConstraints();
++      _ipConstraints = computeIpConstraints();
+     }
+   }
+ 
+-  public BDD getUDPFlow() {
+-    return _udpFlow;
++  private List<BDD> computeICMPConstraint() {
++    BDD icmp = _bddPacket.getIpProtocol().value(IpProtocol.ICMP);
++    BDDIcmpType type = _bddPacket.getIcmpType();
++    BDD codeZero = _bddPacket.getIcmpCode().value(0);
++    // Prefer ICMP Echo_Request, then anything with code 0, then anything ICMP/
++    return ImmutableList.of(
++        _bddOps.and(icmp, type.value(IcmpType.ECHO_REQUEST), codeZero),
++        _bddOps.and(icmp, codeZero),
++        icmp);
+   }
+ 
+-  public BDD getTCPFlow() {
+-    return _tcpFlow;
++  private BDD emphemeralPort(BDDInteger portInteger) {
++    return portInteger.geq(NamedPort.EPHEMERAL_LOWEST.number());
+   }
+ 
+-  public BDD getICMPFlow() {
+-    return _icmpFlow;
++  private List<BDD> tcpPortPreferences(BDD tcp, BDDInteger tcpPort) {
++    return ImmutableList.of(
++        _bddOps.and(tcp, tcpPort.value(NamedPort.HTTP.number())),
++        _bddOps.and(tcp, tcpPort.value(NamedPort.HTTPS.number())),
++        _bddOps.and(tcp, tcpPort.value(NamedPort.SSH.number())),
++        // at least not zero if possible
++        _bddOps.and(tcp, tcpPort.value(0).not()));
+   }
+ 
+-  // Get ICMP echo request packets
+-  BDD computeICMPConstraint() {
+-    return _bddOps.and(
+-        _defaultPacketLength,
+-        _bddPacket.getIpProtocol().value(IpProtocol.ICMP),
+-        _bddPacket
+-            .getIcmpType()
+-            .value(IcmpType.ECHO_REQUEST)
+-            .and(_bddPacket.getIcmpCode().value(0)));
+-  }
+-
+-  // Get TCP packets with names ports:
+-  // 1. Considers both directions of a TCP flow.
+-  // 2. Set src (dst, respectively) port t

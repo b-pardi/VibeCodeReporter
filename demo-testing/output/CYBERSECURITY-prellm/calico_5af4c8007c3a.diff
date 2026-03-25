@@ -1,0 +1,122 @@
+@@ -277,30 +277,29 @@ static CALI_BPF_INLINE int calico_ct_v4_create_nat(struct ct_ctx *ctx, int nat)
+  */
+ static CALI_BPF_INLINE bool skb_is_icmp_err_unpack(struct cali_tc_ctx *ctx2, struct ct_ctx *ctx)
+ {
+-	struct iphdr *ip;
+-	struct icmphdr *icmp;
+-
+-	if (!icmp_skb_get_hdr(ctx2, &icmp)) {
+-		CALI_DEBUG("CT-ICMP: failed to get inner IP\n");
+-		return false;
+-	}
+-
+-	if (!icmp_type_is_err(icmp->type)) {
+-		CALI_DEBUG("CT-ICMP: type %d not an error\n", icmp->type);
++	/* ICMP packet is an error, its payload should contain the full IP header and
++	 * at least the first 8 bytes of the next header. */
++
++	skb_refresh_ptrs(ctx2);
++	if (skb_validate_ptrs(ctx2, ICMP_SIZE + sizeof(struct iphdr) + 8)) {
++		ctx2->fwd.reason = CALI_REASON_SHORT;
++		ctx2->fwd.res = TC_ACT_SHOT;
++		CALI_DEBUG("ICMP v4 reply: too short getting hdr\n");
+ 		return false;
+ 	}
+ 
+-	ip = (struct iphdr *)(icmp + 1); /* skip to inner ip */
+-	CALI_DEBUG("CT-ICMP: proto %d\n", ip->protocol);
++	struct iphdr *ip_inner;
++	ip_inner = (struct iphdr *)(ctx2->icmp_header + 1); /* skip to inner ip */
++	CALI_DEBUG("CT-ICMP: proto %d\n", ip_inner->protocol);
+ 
+-	ctx->proto = ip->protocol;
+-	ctx->src = ip->saddr;
+-	ctx->dst = ip->daddr;
++	ctx->proto = ip_inner->protocol;
++	ctx->src = ip_inner->saddr;
++	ctx->dst = ip_inner->daddr;
+ 
+-	switch (ip->protocol) {
++	switch (ip_inner->protocol) {
+ 	case IPPROTO_TCP:
+ 		{
+-			struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
++			struct tcphdr *tcp = (struct tcphdr *)(ip_inner + 1);
+ 			ctx->sport = bpf_ntohs(tcp->source);
+ 			ctx->dport = bpf_ntohs(tcp->dest);
+ 			ctx->tcp = tcp;
+@@ -308,7 +307,7 @@ static CALI_BPF_INLINE bool skb_is_icmp_err_unpack(struct cali_tc_ctx *ctx2, str
+ 		break;
+ 	case IPPROTO_UDP:
+ 		{
+-			struct udphdr *udp = (struct udphdr *)(ip + 1);
++			struct udphdr *udp = (struct udphdr *)(ip_inner + 1);
+ 			ctx->sport = bpf_ntohs(udp->source);
+ 			ctx->dport = bpf_ntohs(udp->dest);
+ 		}
+@@ -393,6 +392,13 @@ static CALI_BPF_INLINE void ct_tcp_entry_update(struct tcphdr *tcp_header,
+ 	}
+ }
+ 
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Winvalid-noreturn"
++static CALI_BPF_INLINE _Noreturn void bpf_exit() {
++	asm volatile("exit\n");
++}
++#pragma clang diagnostic pop
++
+ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct cali_tc_ctx *tc_ctx)
+ {
+ 	struct ct_ctx ct_lookup_ctx = {
+@@ -444,11 +450,17 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct cali_t
+ 			CALI_CT_DEBUG("Miss.\n");
+ 			goto out_lookup_fail;
+ 		}
+-		if (!skb_is_icmp_err_unpack(tc_ctx, ctx)) {
+-			CALI_CT_DEBUG("unrelated icmp\n");
++		if (!icmp_type_is_err(tc_ctx->icmp_header->type)) {
++			CALI_DEBUG("CT-ICMP: type %d not an error\n", tc_ctx->icmp_header->type);
++			bpf_exit();
+ 			goto out_lookup_fail;
+ 		}
+ 
++		if (!skb_is_icmp_err_unpack(tc_ctx, ctx)) {
++			CALI_CT_DEBUG("Failed to parse ICMP error.\n");
++			goto out_invalid;
++		}
++
+ 		CALI_CT_DEBUG("related lookup from %x:%d\n", bpf_ntohl(ctx->src), ctx->sport);
+ 		CALI_CT_DEBUG("related lookup to   %x:%d\n", bpf_ntohl(ctx->dst), ctx->dport);
+ 
+@@ -739,6 +751,10 @@ out_lookup_fail:
+ 	result.rc = CALI_CT_NEW;
+ 	CALI_CT_DEBUG("result: NEW.\n");
+ 	return result;
++out_invalid:
++	result.rc = CALI_CT_INVALID;
++	CALI_CT_DEBUG("result: INVALID.\n");
++	return result;
+ }
+ 
+ /* creates connection tracking for tracked protocols */
+
+
+
+
+@@ -55,7 +55,7 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ 	 * payload but the SKB implementation gets upset if we try to trim
+ 	 * part-way through the UDP/TCP header.
+ 	 */
+-	len = sizeof(struct ethhdr) + sizeof(struct iphdr) + 64;
++	len = skb_iphdr_offset(skb) + sizeof(struct iphdr) + 64;
+ 	switch (ctx->ip_header->protocol) {
+ 	case IPPROTO_TCP:
+ 		len += sizeof(struct tcphdr);
+@@ -68,6 +68,7 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ 		break;
+ 	}
+ 
++	CALI_DEBUG("Trimming to %d\n", len);
+ 	int err = bpf_skb_change_tail(skb, len,  0);
+ 	if (err) {
+ 		CALI_DEBUG("ICM

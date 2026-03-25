@@ -1,0 +1,127 @@
+new file mode 100755
+
+
+
+@@ -0,0 +1,928 @@
++#!/usr/bin/env python3
++""" Bareos Module for Media Vault
++    Define and search a list of tapes to vault
++    Eject that list up to import/export slots available
++"""
++#   BAREOS - Backup Archiving REcovery Open Sourced
++#
++#   Copyright (C) 2023-2025 Bareos GmbH & Co. KG
++#
++#   This program is Free Software; you can redistribute it and/or
++#   modify it under the terms of version three of the GNU Affero General Public
++#   License as published by the Free Software Foundation and included
++#   in the file LICENSE.
++#
++#   This program is distributed in the hope that it will be useful, but
++#   WITHOUT ANY WARRANTY; without even the implied warranty of
++#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++#   Affero General Public License for more details.
++#
++#   You should have received a copy of the GNU Affero General Public License
++#   along with this program; if not, write to the Free Software
++#   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++#   02110-1301, USA.
++
++# -*- coding: utf-8 -*-
++
++import logging
++import logging.config
++import os
++import sys
++import hashlib
++from io import StringIO
++
++try:
++    from pathlib import Path
++    import datetime
++    import configargparse
++    import bareos.bsock
++    import bareos.exceptions
++except ImportError as err_import:
++    print(f"Error: missing module please install: {err_import})\n")
++except Exception as err_unknown:
++    print(f"Fatal: Unknown error {err_unknown}\n")
++
++
++
++def filter_maker(level):
++    """ global redefinition for filtering lower log level """
++    level = getattr(logging, level)
++    def filter(record):
++        return record.levelno <= level
++    return filter
++
++# Prepare a global logger which is not the root one.
++me = Path(__file__).stem
++# Better use dictConfig than basicConfig.
++logging_config = {
++    "version" : 1,
++    "disable_existing_logger" : False,
++    "level": "WARNING",
++    "formatters" : {
++        "simple" : {
++            "format" : '%(asctime)s: %(levelname)s %(module)s.%(funcName)s: %(message)s',
++        }
++    },
++    "filters": {
++        "warnings_and_below": {
++            "()" : "__main__.filter_maker",
++            "level": "WARNING"
++        },
++    },
++    "handlers" : {
++        "stdout":{
++            "class": "logging.StreamHandler",
++            "formatter": "simple",
++            "filters": ["warnings_and_below"],
++            "stream": "ext://sys.stdout",
++        },
++        "stderr":{
++            "class": "logging.StreamHandler",
++            "level": "ERROR",
++            "formatter": "simple",
++            "stream": "ext://sys.stderr",
++        },
++    },
++    "loggers":{
++        "root": {"level": "INFO", "handlers":["stderr"]},
++        f"{me}": {"level": "WARNING", "handlers":["stdout","stderr"]}
++    },
++}
++
++logging.config.dictConfig(config=logging_config)
++logger = logging.getLogger(me)
++
++class MediaVault():
++    """ Class used for volume export management """
++    def __init__(self):
++        logger.debug("init start")
++        now = datetime.datetime.now()
++        # DirectorConsoleConnectionJson the main usage
++        self.dcj = None
++        # Script arguments call
++        self.args = None
++        self.bareos_args = None
++        self.config_file = None
++        self.config_parsed = False
++
++        self.sql = None
++        self.sql_result = None
++        # List of pools considered for exports
++        self.pools = []
++        # List of volumes to export
++        self.volumes_candidates = []
++        self.volumes_exported = []
++        # bareos-dir storage autochanger name
++        self.autochanger = None
++        # exp/imp slots range in notation 20-24
++        self.export_slots = None
++        # minimal bytes on volumes before exporting default 4TB
++        self.min_volbytes = 4096*1024*1024*1024
++        # This flag if present will order to run update slots before any other action
++        self.update_slots_before = 

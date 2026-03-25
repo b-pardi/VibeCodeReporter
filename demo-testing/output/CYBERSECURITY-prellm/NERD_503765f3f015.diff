@@ -1,0 +1,113 @@
+@@ -1,14 +1,10 @@
+ #!/usr/bin/env python3
+ 
+-import time
+ import os
+-import socket
+-import json
+ import logging
+ import signal
+ import sys
+ from datetime import datetime, timedelta
+-import jsonpath_rw_ext
+ 
+ import argparse
+ import yaml
+@@ -16,8 +12,6 @@ import requests
+ import re
+ from apscheduler.schedulers.blocking import BlockingScheduler
+ from apscheduler.triggers.cron import CronTrigger
+-from apscheduler.executors.pool import ThreadPoolExecutor
+-import time
+ import ipaddress
+ 
+ # Add to path the "one directory above the current file location" to find modules from "common"
+@@ -25,137 +19,202 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
+ 
+ from common.utils import parse_rfc_time
+ import common.config
+-import common.eventdb_psql
+ import common.task_queue
+ 
+ # script global variables
+-
+ running_flag = True  # read_dir function terminates when this is set to False
+ 
+-db_queue = []  # queue of events waiting to be written do DB in a batch
+-
+ LOGFORMAT = "%(asctime)-15s,%(name)s [%(levelname)s] %(message)s"
+ LOGDATEFORMAT = "%Y-%m-%dT%H:%M:%S"
+ logging.basicConfig(level=logging.INFO, format=LOGFORMAT, datefmt=LOGDATEFORMAT)
+ 
+ log = logging.getLogger('Blacklists:')
+ 
+-###############################################################################
++# dictionary of supported blacklist types
++# 'singular' and 'plural' is just for correct printing purposes
++bl_all_types = {
++    'ip': {'singular': "IP", 'plural': "IPs"}
++}
++
+ 
+ ###############################################################################
+ 
+-# Main module code
++def vprint(*_args, **kwargs):
++    # Verbose print
++    if not args.quiet:
++        print("[{}] ".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")), end="")
++        print(*_args, **kwargs)
++
++
++def compile_regex(regex):
++    if "\\A" in regex:
++        # replace "special" configuration character for IP address
++        regex = regex.replace("\\A", "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}")
++    if "\\CA" in regex:
++        # replace "special" configuration character for CIDR IP address (192.168.0.0/16)
++        regex = regex.replace("\\CA", "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2}")
++    if "\\P" in regex:
++        # replace "special" configuration character for IP or CIDR
++        regex = regex.replace("\\P", "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(\/\d{1,2})?")
++    return re.compile(regex)
++
++
++def parse_bl_with_regex(bl_data, cregex):
++    bl_records = []
++    if cregex.groups == 0:
++        # if there are no groups in regex (most probably blacklist with multiple records on one line), try to find
++        # all occurrences
++        all_records = cregex.finditer(bl_data)
++        for ip_match in all_records:
++            # for every occurrence found, check if IP address valid and add it to bl_records
++            record_start = ip_match.span()[0]
++            record_end = ip_match.span()[1]
++            try:
++                # classic IP address blacklist
++                bl_records.append(str(ipaddress.IPv4Address(bl_data[record_start:record_end])))
++            except ipaddress.AddressValueError:
++                continue
++    return bl_records
+ 
+-'''
+-def put_to_db_queue(event):
+-    """
+-    Function for writing events to EventDB
+ 
+-    Pull new events from Queue and stores them to EventDB.
++def parse_bl_without_regex(bl_data):
++    bl_records = []
++
++    # records of blacklist are formatted as one IP record per line and does not need additional parsing
++    bl_records_non_validated = [line.strip() for line in bl_data.split('\n') if not line.startswith('#') and
++                                line.strip() and not line.startswith("//")]
++    for record in bl_records_non_validated:
++        try:
++            ipaddr = ipaddress.IPv4Address(record)
++        except ipaddress.AddressValueError:
++            continue
++        bl_records.append(str(ipaddr))
++    return bl_records
++
++
++def parse_blacklist(bl_data, bl_type, regex=Non

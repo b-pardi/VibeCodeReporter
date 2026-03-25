@@ -1,0 +1,167 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,72 @@
++/*
++   BAREOS® - Backup Archiving REcovery Open Sourced
++
++   Copyright (C) 2023-2024 Bareos GmbH & Co. KG
++
++   This program is Free Software; you can redistribute it and/or
++   modify it under the terms of version three of the GNU Affero General Public
++   License as published by the Free Software Foundation and included
++   in the file LICENSE.
++
++   This program is distributed in the hope that it will be useful, but
++   WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++   General Public License for more details.
++
++   You should have received a copy of the GNU Affero General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++   02110-1301, USA.
++*/
++
++extern "C" {
++#include <unistd.h>
++#include <fcntl.h>
++}
++
++#include "volume.h"
++
++namespace dedup {
++namespace {
++
++};
++
++volume::volume(open_type type,
++               int creation_mode,
++               const char* path,
++               std::size_t blocksize)
++    : sys_path{path}, blocksize{blocksize}
++{
++  int dir_mode
++      = creation_mode | S_IXUSR;  // directories need execute permissions
++
++  int flags = 0;
++  bool read_only = type == open_type::ReadOnly;
++  if (read_only) {
++    flags |= O_RDONLY;
++  } else {
++    flags |= O_RDWR | O_CREAT;
++  }
++
++  int dir_flags = flags | O_DIRECTORY;
++  dird = open(path, dir_flags, dir_mode);
++
++  if (dird < 0) { throw std::invalid_argument("dird < 0"); }
++
++  int aligned_fd = openat(dird, "aligned.data", flags, creation_mode);
++  int unaligned_fd = openat(dird, "unaligned.data", flags, creation_mode);
++  int records_fd = openat(dird, "records.data", flags, creation_mode);
++  int blocks_fd = openat(dird, "blocks.data", flags, creation_mode);
++
++  if (aligned_fd < 0 || unaligned_fd < 0 || records_fd < 0 || blocks_fd < 0) {
++    throw std::invalid_argument("fd < 0");
++  }
++
++  aligned = decltype(aligned){read_only, aligned_fd};
++  unaligned = decltype(unaligned){read_only, unaligned_fd};
++  records = decltype(records){read_only, records_fd};
++  blocks = decltype(blocks){read_only, blocks_fd};
++}
++
++
++};  // namespace dedup
+
+
+
+
+@@ -22,7 +22,17 @@
+ #ifndef BAREOS_STORED_BACKENDS_DEDUP_VOLUME_H_
+ #define BAREOS_STORED_BACKENDS_DEDUP_VOLUME_H_
+ 
++#include <cstdlib>
++#include <string>
++#include "fvec.h"
++
+ namespace dedup {
++struct block {};
++
++struct record {};
++
++struct save_state {};
++
+ class volume {
+  public:
+   enum open_type
+@@ -34,20 +44,24 @@ class volume {
+   volume(open_type type,
+          int creation_mode,
+          const char* path,
+-         std::size_t blocksize)
+-      : sys_path{path}
+-  {
+-    (void)type;
+-    (void)creation_mode;
+-    (void)blocksize;
+-  }
++         std::size_t blocksize);
++
+   const char* path() const { return sys_path.c_str(); }
++  int fileno() const { return dird; }
+ 
+-  int fileno() const { return fd; }
++  save_state begin() { return {}; }
++  void abort(save_state) {}
++  void commit(save_state) {}
+ 
+  private:
+   std::string sys_path;
+-  int fd;
++  int dird;
++  std::size_t blocksize;
++
++  fvec<char> aligned;
++  fvec<char> unaligned;
++  fvec<record> records;
++  fvec<block> blocks;
+ };
+ };  // namespace dedup
+ 
+
+
+
+
+@@ -27,12 +27,14 @@
+ #include "lib/berrno.h"
+ #include "lib/util.h"
+ #include "lib/edit.h"
++#include "lib/network_order.h"
+ #include "dedup_device.h"
+ #include "dedup/device_options.h"
+ 
+ #include <unistd.h>
+ #include <utility>
+ #include <stdexcept>
++#include <cstring>
+ 
+ namespace storagedaemon {
+ 
+@@ -114,12 +116,135 @@ int dedup_device::d_open(const char* path, int, int mode)
+   }
+ }
+ 
++class chunked_reader {
++ public:
++  chunked_reader(const void* data, std::size_t size)
++      : begin{(const char*)data}, end{begin + size}
++  {
++  }
++
++  const char* get(std::size_t size)
++  {
++    ASSERT(begin < end);
++    if (static_cast<std::size_t>(end - begin) < size) { return nullpt

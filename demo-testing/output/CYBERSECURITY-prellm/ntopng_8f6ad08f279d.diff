@@ -1,0 +1,125 @@
+@@ -30,8 +30,6 @@ class Mac;
+ 
+ class HostPools {
+  private:
+-  Mutex *swap_lock;
+-  volatile time_t latest_swap;
+   VLANAddressTree *tree, *tree_shadow;
+   NetworkInterface *iface;
+   u_int16_t max_num_pools;
+@@ -160,7 +158,6 @@ class HostPools {
+   inline u_int32_t getPoolSchedule(u_int16_t pool_id) {
+     return(((pool_id != NO_HOST_POOL_ID) && (pool_id < max_num_pools)) ? schedule_bitmap[pool_id] : DEFAULT_TIME_SCHEDULE);
+   }
+-  void addToPool(char *host_or_mac, u_int16_t user_pool_id);
+ 
+   inline bool isChildrenSafePool(u_int16_t pool_id) {
+     return((pool_id < max_num_pools) ? children_safe[pool_id] : false);
+
+
+
+
+@@ -771,6 +771,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   inline FlowInterfacesStats* getFlowInterfacesStats() { return(flow_interfaces_stats);  }
+ #endif
+   inline HostPools* getHostPools()                     { return(host_pools);    }
++  inline void reloadHostPools()     { if(host_pools) host_pools->reloadPools(); }
+ 
+   bool registerLiveCapture(struct ntopngLuaContext * const luactx, int *id);
+   bool deregisterLiveCapture(struct ntopngLuaContext * const luactx);
+
+
+
+
+@@ -45,6 +45,7 @@ class Ntop {
+   bool purgeLoop_started; /* Flag that indicates whether the purgeLoop has been started */
+   bool ndpiReloadInProgress;
+   bool flowCallbacksReloadInProgress, hostCallbacksReloadInProgress, alertExclusionsReloadInProgress;
++  bool hostPoolsReloadInProgress;
+   Bloom *resolvedHostsBloom; /* Used by all redis class instances */
+   AddressTree local_interface_addresses;
+   char epoch_buf[11];
+@@ -133,6 +134,7 @@ class Ntop {
+   void checkReloadFlowCallbacks();
+   void checkReloadHostCallbacks();
+   void checkReloadAlertExclusions();
++  void checkReloadHostPools();
+   
+  public:
+   /**
+@@ -538,6 +540,9 @@ class Ntop {
+   inline void reloadFlowCallbacks()   { flowCallbacksReloadInProgress = true;    };
+   inline void reloadHostCallbacks()   { hostCallbacksReloadInProgress = true;    };
+   inline void reloadAlertExclusions() { alertExclusionsReloadInProgress = true;  };
++  inline void reloadHostPools()       { hostPoolsReloadInProgress = true;        };
++
++  void addToPool(char *host_or_mac, u_int16_t user_pool_id);
+ 
+   char *getAlertJSON(FlowAlertType fat, Flow *f) const;
+   ndpi_serializer *getAlertSerializer(FlowAlertType fat, Flow *f) const;
+
+
+
+
+@@ -21,7 +21,7 @@
+ 
+ #include "ntop_includes.h"
+ 
+-/* #define HOST_POOLS_DEBUG 1 */
++// #define HOST_POOLS_DEBUG 1
+ 
+ /* *************************************** */
+ 
+@@ -57,10 +57,6 @@ HostPools::HostPools(NetworkInterface *_iface) {
+      || (num_active_l2_devices_offline = (int32_t*)calloc(sizeof(int32_t), MAX_NUM_HOST_POOLS)) == NULL)
+     throw 1;
+ 
+-  latest_swap = 0;
+-  if((swap_lock = new (std::nothrow) Mutex()) == NULL)
+-    throw 3;
+-
+   if(_iface)
+     iface = _iface;
+ 
+@@ -101,7 +97,6 @@ HostPools::~HostPools() {
+ 
+   if(tree_shadow)   delete tree_shadow;
+   if(tree)          delete tree;
+-  if(swap_lock)     delete swap_lock;
+ 
+   dumpToRedis();
+   if(stats)        deleteStats(&stats);
+@@ -126,14 +121,6 @@ HostPools::~HostPools() {
+ /* *************************************** */
+ 
+ void HostPools::swap(VLANAddressTree *new_trees, HostPoolStats **new_stats) {
+-  swap_lock->lock(__FILE__, __LINE__);
+-
+-  while(time(NULL) - latest_swap < 1) {
+-    swap_lock->unlock(__FILE__, __LINE__);
+-    sleep(1); /* Force at least 1 sec. time between consecutive swaps */
+-    swap_lock->lock(__FILE__, __LINE__);
+-  }
+-
+   /* Swap statistics */
+   if(new_stats) {
+     if(stats) {
+@@ -153,9 +140,6 @@ void HostPools::swap(VLANAddressTree *new_trees, HostPoolStats **new_stats) {
+ 
+     tree = new_trees;
+   }
+-
+-  latest_swap = time(NULL);
+-  swap_lock->unlock(__FILE__, __LINE__);
+ }
+ 
+ /* *************************************** */
+@@ -322,26 +306,6 @@ void HostPools::checkPoolsStatsReset() {
+   }
+ }
+ 
+-/* *************************************** */
+-
+-void HostPools::addToPool(char *host_or_mac,
+-			  u_int16_t user_pool_id) {
+-  char key[128], poo

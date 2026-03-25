@@ -1,0 +1,98 @@
+@@ -1,6 +1,8 @@
+ # This file is Copyright 2019 Volatility Foundation and licensed under the Volatility Software License 1.0
+ # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
+ #
++import math
++from abc import ABC, abstractmethod
+ from typing import Iterator, List, Tuple, Optional, Union
+ 
+ from volatility3 import framework
+@@ -30,6 +32,9 @@ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+         self.set_type_class("kobject", extensions.kobject)
+         self.set_type_class("cred", extensions.cred)
+         self.set_type_class("inode", extensions.inode)
++        self.set_type_class("idr", extensions.IDR)
++        self.set_type_class("address_space", extensions.address_space)
++        self.set_type_class("page", extensions.page)
+         # Might not exist in the current symbols
+         self.optional_set_type_class("module", extensions.module)
+         self.optional_set_type_class("bpf_prog", extensions.bpf_prog)
+@@ -67,7 +72,7 @@ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+ class LinuxUtilities(interfaces.configuration.VersionableInterface):
+     """Class with multiple useful linux functions."""
+ 
+-    _version = (2, 1, 0)
++    _version = (2, 2, 0)
+     _required_framework_version = (2, 0, 0)
+ 
+     framework.require_interface_version(*_required_framework_version)
+@@ -425,3 +430,342 @@ class LinuxUtilities(interfaces.configuration.VersionableInterface):
+         kernel = context.modules[kernel_module_name]
+ 
+         return kernel
++
++    @classmethod
++    def choose_kernel_tree(cls, vmlinux: interfaces.context.ModuleInterface) -> "Tree":
++        """Returns the appropriate tree data structure instance for the current kernel implementation.
++        This is used by the IDR and the PageCache to choose between the XArray and RadixTree.
++
++        Args:
++            vmlinux: The kernel module object
++
++        Returns:
++            The appropriate Tree instance for the current kernel
++        """
++        address_space_type = vmlinux.get_type("address_space")
++        address_space_has_i_pages = address_space_type.has_member("i_pages")
++        i_pages_type_name = (
++            address_space_type.child_template("i_pages").vol.type_name
++            if address_space_has_i_pages
++            else ""
++        )
++        i_pages_is_xarray = i_pages_type_name.endswith(constants.BANG + "xarray")
++        i_pages_is_radix_tree_root = i_pages_type_name.endswith(
++            constants.BANG + "radix_tree_root"
++        ) and vmlinux.get_type("radix_tree_root").has_member("xa_head")
++
++        if i_pages_is_xarray or i_pages_is_radix_tree_root:
++            return XArray(vmlinux)
++        else:
++            return RadixTree(vmlinux)
++
++
++class Tree(ABC):
++    """Abstraction to support both XArray and RadixTree"""
++
++    # Dynamic values, these will be initialized later
++    CHUNK_SHIFT = None
++    CHUNK_SIZE = None
++    CHUNK_MASK = None
++
++    def __init__(self, vmlinux: interfaces.context.ModuleInterface):
++        self.vmlinux = vmlinux
++        self.vmlinux_layer = vmlinux.context.layers[vmlinux.layer_name]
++
++        self.pointer_size = self.vmlinux.get_type("pointer").size
++        # Dynamically work out the (XA_CHUNK|RADIX_TREE_MAP)_SHIFT values based on
++        # the node.slots[] array size
++        node_type = self.vmlinux.get_type(self.node_type_name)
++        slots_array_size = node_type.child_template("slots").count
++
++        # Calculate the LSB index - 1
++        self.CHUNK_SHIFT = slots_array_size.bit_length() - 1
++        self.CHUNK_SIZE = 1 << self.CHUNK_SHIFT
++        self.CHUNK_MASK = self.CHUNK_SIZE - 1
++
++    @property
++    @abstractmethod
++    def node_type_name(self) -> str:
++        """Returns the Tree implementation node type name
++
++        Returns:
++            A string with the node type name
++        """
++        raise NotImplementedError()
++
++    @property
++    def tag_internal_value(self) -> int:
++        """Returns the internal node fla

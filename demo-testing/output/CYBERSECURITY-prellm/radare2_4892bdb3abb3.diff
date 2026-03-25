@@ -1,0 +1,125 @@
+@@ -130,6 +130,7 @@ static int string_scan_range(RList *list, RBinFile *bf, int min,
+ 	}
+ 	st64 vdelta = 0, pdelta = 0;
+ 	RBinSection *s = NULL;
++	bool ascii_only = false;
+ 	r_buf_read_at (bf->buf, from, buf, len);
+ 	// may oobread
+ 	while (needle < to) {
+@@ -179,7 +180,7 @@ static int string_scan_range(RList *list, RBinFile *bf, int min,
+ 			}
+ 
+ 			/* Invalid sequence detected */
+-			if (!rc) {
++			if (!rc || (ascii_only && r > 0x7f)) {
+ 				needle++;
+ 				break;
+ 			}
+@@ -216,9 +217,14 @@ static int string_scan_range(RList *list, RBinFile *bf, int min,
+ 
+ 		tmp[i++] = '\0';
+ 
++		if (runes < min && runes >= 2 && str_type == R_STRING_TYPE_ASCII && needle < to) {
++			// back up past the \0 to the last char just in case it starts a wide string
++			needle -= 2;
++		}
+ 		if (runes >= min) {
+ 			// reduce false positives
+ 			int j, num_blocks, *block_list;
++			int *freq_list = NULL, expected_ascii, actual_ascii, num_chars;
+ 			if (str_type == R_STRING_TYPE_ASCII) {
+ 				for (j = 0; j < i; j++) {
+ 					char ch = tmp[j];
+@@ -234,12 +240,31 @@ static int string_scan_range(RList *list, RBinFile *bf, int min,
+ 			case R_STRING_TYPE_WIDE:
+ 			case R_STRING_TYPE_WIDE32:
+ 				num_blocks = 0;
+-				block_list = r_utf_block_list ((const ut8*)tmp, i - 1);
++				block_list = r_utf_block_list ((const ut8*)tmp, i - 1,
++				                               str_type == R_STRING_TYPE_WIDE ? &freq_list : NULL);
+ 				if (block_list) {
+ 					for (j = 0; block_list[j] != -1; j++) {
+ 						num_blocks++;
+ 					}
+ 				}
++				if (freq_list) {
++					num_chars = 0;
++					actual_ascii = 0;
++					for (j = 0; freq_list[j] != -1; j++) {
++						num_chars += freq_list[j];
++						if (!block_list[j]) { // ASCII
++							actual_ascii = freq_list[j];
++						}
++					}
++					free (freq_list);
++					expected_ascii = num_blocks ? num_chars / num_blocks : 0;
++					if (actual_ascii > expected_ascii) {
++						ascii_only = true;
++						needle = str_start;
++						free (block_list);
++						continue;
++					}
++				}
+ 				free (block_list);
+ 				if (num_blocks > R_STRING_MAX_UNI_BLOCKS) {
+ 					continue;
+@@ -300,6 +325,7 @@ static int string_scan_range(RList *list, RBinFile *bf, int min,
+ 				s = NULL;
+ 			}
+ 		}
++		ascii_only = false;
+ 	}
+ 	free (buf);
+ 	return count;
+
+
+
+
+@@ -256,7 +256,7 @@ static void _print_strings(RCore *r, RList *list, int mode, int va) {
+ 			case R_STRING_TYPE_UTF8:
+ 			case R_STRING_TYPE_WIDE:
+ 			case R_STRING_TYPE_WIDE32:
+-				block_list = r_utf_block_list ((const ut8*)string->string, -1);
++				block_list = r_utf_block_list ((const ut8*)string->string, -1, NULL);
+ 				if (block_list) {
+ 					if (block_list[0] == 0 && block_list[1] == -1) {
+ 						/* Don't include block list if
+@@ -327,7 +327,7 @@ static void _print_strings(RCore *r, RList *list, int mode, int va) {
+ 			case R_STRING_TYPE_UTF8:
+ 			case R_STRING_TYPE_WIDE:
+ 			case R_STRING_TYPE_WIDE32:
+-				block_list = r_utf_block_list ((const ut8*)string->string, -1);
++				block_list = r_utf_block_list ((const ut8*)string->string, -1, NULL);
+ 				if (block_list) {
+ 					if (block_list[0] == 0 && block_list[1] == -1) {
+ 						/* Don't show block list if
+
+
+
+
+@@ -15,7 +15,7 @@ R_API char *r_utf16_to_utf8_l(const wchar_t *wc, int len);
+ R_API const char *r_utf_block_name(int idx);
+ R_API wchar_t *r_utf8_to_utf16_l(const char *cstring, int len);
+ R_API int r_utf_block_idx (RRune ch);
+-R_API int *r_utf_block_list (const ut8 *str, int len);
++R_API int *r_utf_block_list (const ut8 *str, int len, int **freq_list);
+ #define r_utf16_to_utf8(wc) r_utf16_to_utf8_l ((wc), -1)
+ #define r_utf8_to_utf16(cstring) r_utf8_to_utf16_l ((cstring), -1)
+ #if __WINDOWS__
+
+
+
+
+@@ -731,18 +731,26 @@ R_API int r_utf_block_idx(RRune ch) {
+ }
+ 
+ /* str must be UTF8-encoded */
+-R_API int *r_utf_block_list(const ut8 *str, int len) {
++R_API int *r_utf_block_list(const ut8 *str, int len, int **freq_list) {
+ 	if (!str) {
+ 		return NULL;
+ 	}
+ 	if (len < 0) {
+ 		len = strlen ((const char *)str);
+ 	}
+-	static bool has_block[r_utf_blocks_count] = 

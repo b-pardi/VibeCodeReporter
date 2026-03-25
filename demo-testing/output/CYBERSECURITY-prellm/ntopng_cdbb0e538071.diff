@@ -1,0 +1,110 @@
+@@ -32,10 +32,17 @@ class IEC104Stats {
+   struct {
+     u_int32_t tx, rx;
+   } pkt_lost; /* Counter for packet loss sequences */
++
+   struct {
+     u_int32_t type_i, type_s, type_u, type_other;
+     u_int32_t forward_msgs, reverse_msgs, retransmitted_msgs;
+   } stats;
++
++  struct {
++    /* m = monitoring, c = command */
++    u_int32_t m_to_m, c_to_m, m_to_c, c_to_c;
++  } transitions;
++  
+   char infobuf[32];
+   std::unordered_map<u_int16_t, u_int32_t> type_i_transitions;
+   std::unordered_map<u_int16_t, u_int32_t> typeid_uses;
+
+
+
+
+@@ -27,17 +27,23 @@
+ class IECInvalidCommandTransitionAlert : public FlowAlert {
+  private:
+   u_int32_t packet_epoch;
+-  u_int16_t prev_type_id, curr_type_id;
++  u_int32_t transitions_m_to_c, transitions_c_to_m, transitions_c_to_c;
+ 
+   ndpi_serializer* getAlertJSON(ndpi_serializer* serializer);
+ 
+  public:
+-  static FlowAlertType getClassType() { return { flow_alert_iec_invalid_command_transition, alert_category_security }; }
++  static FlowAlertType getClassType() {
++    return { flow_alert_iec_invalid_command_transition, alert_category_security };
++  }
+   static u_int8_t      getDefaultScore() { return SCORE_LEVEL_NOTICE; };
+ 
+-  IECInvalidCommandTransitionAlert(FlowCheck *c, Flow *f, struct timeval *_time, u_int16_t _prev_type_id, u_int16_t _curr_type_id) : FlowAlert(c, f) {
+-    prev_type_id = _prev_type_id;
+-    curr_type_id = _curr_type_id;
++  IECInvalidCommandTransitionAlert(FlowCheck *c, Flow *f, struct timeval *_time,
++				   u_int32_t _transitions_m_to_c,
++				   u_int32_t _transitions_c_to_m,
++				   u_int32_t _transitions_c_to_c) : FlowAlert(c, f) {
++    transitions_m_to_c = _transitions_m_to_c;
++    transitions_c_to_m = _transitions_c_to_m;
++    transitions_c_to_c = _transitions_c_to_c;
+     packet_epoch = _time->tv_sec;
+   };
+   ~IECInvalidCommandTransitionAlert() { };
+
+
+
+
+@@ -37,6 +37,8 @@ IEC104Stats::IEC104Stats() {
+   last_type_i = 0;
+   memset(&last_i_apdu, 0, sizeof(last_i_apdu));
+   memset(&stats, 0, sizeof(stats));
++  memset(&transitions, 0, sizeof(transitions));
++
+   i_s_apdu = ndpi_alloc_data_analysis(32 /* sliding window side */);
+   tx_seq_num = rx_seq_num = 0, infobuf[0] = '\0';
+   invalid_command_transition_detected = false;
+@@ -271,20 +273,32 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+ 	      type_i_transitions[transition] = it->second + 1;
+ 	  }
+ 
+-	  if((invalid_command_transition_detected == false) && (!initial_run)) {
+-	    if(
+-	       (isMonitoringTypeId(last_type_i) && isCommandTypeId(type_id))
+-	       || (isCommandTypeId(last_type_i) && isMonitoringTypeId(type_id))
+-	       || (isCommandTypeId(last_type_i) && isCommandTypeId(type_id))
+-	       ) {
++	  if(!initial_run) {
++	    if(isMonitoringTypeId(last_type_i) && isMonitoringTypeId(type_id))
++	      transitions.m_to_m++;
++	    else if(isMonitoringTypeId(last_type_i) && isCommandTypeId(type_id))
++	      transitions.m_to_c++;
++	    else if(isCommandTypeId(last_type_i) && isMonitoringTypeId(type_id))
++	      transitions.c_to_m++;
++	    else if(isCommandTypeId(last_type_i) && isCommandTypeId(type_id))
++	      transitions.c_to_c++;	  
++	  
++	    if((invalid_command_transition_detected == false)
++	       && ((transitions.m_to_c > 20)
++		   || (transitions.c_to_m > 20)
++		   || (transitions.c_to_c > 5))) { 
++	      /* https://github.com/ntop/ntopng/issues/6598 */
+ 	      FlowAlert *alert;
+ 	      u_int16_t c_score = CLIENT_ALERT_SCORE, s_score = SERVER_ALERT_SCORE;
+ 	      
+-	      alert = new IECInvalidCommandTransitionAlert(NULL, f, packet_time, last_type_i, type_id);
++	      alert = new IECInvalidCommandTransitionAlert(NULL, f, packet_time,
++							   transitions.m_to_c,
++							   transitions.c_to_m,
++							   transitions.c_to_c);
+ 	      
+ 	      if(alert)
+ 		f->triggerAlertSync(alert, c_score, s_score);
+-
++	      
+ 	      // ntop->getTrace()->traceEvent(TRACE_WARNING, "*** INVALID TRANSITION %u -> %u", last_type_i, type_id);
+ 		
+ 	      invalid_command_transition_detected = true;
+
+
+
+
+@@ -635

@@ -1,0 +1,94 @@
+@@ -36,6 +36,7 @@ class AgentFieldsSchema(ma.Schema):
+     links = ma.fields.List(ma.fields.Nested(LinkSchema()))
+     proxy_receivers = ma.fields.Dict(keys=ma.fields.String(), values=ma.fields.List(ma.fields.String()))
+     proxy_chain = ma.fields.List(ma.fields.List(ma.fields.String()))
++    origin_link_id = ma.fields.Integer()
+ 
+     @ma.pre_load
+     def remove_nulls(self, in_data, **_):
+@@ -52,7 +53,7 @@ class AgentSchema(AgentFieldsSchema):
+ class Agent(FirstClassObjectInterface, BaseObject):
+ 
+     schema = AgentSchema()
+-    load_schema = AgentSchema(partial=['paw'])
++    load_schema = AgentSchema(partial=['paw', 'origin_link_id'])
+ 
+     RESERVED = dict(server='#{server}', group='#{group}', agent_paw='#{paw}', location='#{location}',
+                     exe_name='#{exe_name}', payload=re.compile('#{payload:(.*?)}', flags=re.DOTALL))
+@@ -68,7 +69,7 @@ class Agent(FirstClassObjectInterface, BaseObject):
+     def __init__(self, sleep_min, sleep_max, watchdog, platform='unknown', server='unknown', host='unknown',
+                  username='unknown', architecture='unknown', group='red', location='unknown', pid=0, ppid=0,
+                  trusted=True, executors=(), privilege='User', exe_name='unknown', contact='unknown', paw=None,
+-                 proxy_receivers=None, proxy_chain=None):
++                 proxy_receivers=None, proxy_chain=None, origin_link_id=0):
+         super().__init__()
+         self.paw = paw if paw else self.generate_name(size=6)
+         self.host = host
+@@ -96,6 +97,7 @@ class Agent(FirstClassObjectInterface, BaseObject):
+         self.access = self.Access.BLUE if group == 'blue' else self.Access.RED
+         self.proxy_receivers = proxy_receivers if proxy_receivers else dict()
+         self.proxy_chain = proxy_chain if proxy_chain else []
++        self.origin_link_id = origin_link_id
+ 
+     def store(self, ram):
+         existing = self.retrieve(ram['agents'], self.unique)
+
+
+
+
+@@ -60,6 +60,8 @@ class Link(BaseObject):
+     load_schema = LinkSchema(exclude=['decide', 'pid', 'facts', 'unique', 'collect', 'finish', 'visibility',
+                                       'output'])
+ 
++    RESERVED = dict(origin_link_id='#{origin_link_id}')
++
+     @property
+     def unique(self):
+         return self.hash('%s' % self.id)
+@@ -107,6 +109,12 @@ class Link(BaseObject):
+         self._pin = pin
+         self.output = False
+ 
++    def __eq__(self, other):
++        if isinstance(other, Link):
++            return other.paw == self.paw and other.ability.ability_id == self.ability.ability_id \
++                   and other.used == self.used
++        return False
++
+     async def parse(self, operation, result):
+         try:
+             if self.status != 0:
+@@ -122,10 +130,15 @@ class Link(BaseObject):
+     def apply_id(self, host):
+         self.id = self.generate_number()
+         self.host = host
++        self.replace_origin_link_id()
+ 
+     def can_ignore(self):
+         return self.status in [self.states['DISCARD'], self.states['HIGH_VIZ']]
+ 
++    def replace_origin_link_id(self):
++        decoded_cmd = self.decode_bytes(self.command)
++        self.command = self.encode_string(decoded_cmd.replace(self.RESERVED['origin_link_id'], str(self.id)))
++
+     """ PRIVATE """
+ 
+     async def _parse_link_result(self, result, parser, source_facts):
+
+
+
+
+@@ -44,6 +44,7 @@ class BasePlanningService(BaseService):
+         :param rules:
+         :return: updated list of links
+         """
++        link_variants = []
+         for link in links:
+             decoded_test = agent.replace(link.command, file_svc=self.get_service('file_svc'))
+             variables = re.findall(self.re_variable, decoded_test)
+@@ -60,13 +61,13 @@ class BasePlanningService(BaseService):
+                         copy_link.score = score
+                         copy_link.used.extend(used)
+                         copy_link.apply_id(agent.host)
+-                        links.append(copy_link)
++                        link_variants.append(copy_link)

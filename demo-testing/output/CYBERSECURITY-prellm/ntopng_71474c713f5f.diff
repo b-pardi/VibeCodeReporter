@@ -1,0 +1,125 @@
+@@ -96,6 +96,7 @@ class NetworkInterface : public Checkpointable {
+   AggregatedFlowHash *aggregated_flows_hash; /**< Hash used to store aggregated flows information. */
+ #endif
+   EthStats ethStats;
++  std::map<u_int32_t, u_int64_t> ip_mac; /* IP (network byte order) <-> MAC association [2 bytes are unused] */
+   u_int32_t arp_requests, arp_replies;
+   ICMPstats icmp_v4, icmp_v6;
+   LocalTrafficStats localStats;
+@@ -227,6 +228,7 @@ class NetworkInterface : public Checkpointable {
+ 		PacketStats *_pktStats, TcpPacketStats *_tcpPacketStats);
+ 
+   void topItemsCommit(const struct timeval *when);
++  void checkMacIPAssociation(bool triggerEvent, u_char *_mac, u_int32_t ipv4);
+   
+  public:
+   /**
+
+
+
+
+@@ -120,6 +120,8 @@ class Utils {
+   static int bindSockToDevice(int sock, int family, const char* devicename);
+   static void maximizeSocketBuffer(int sock_fd, bool rx_buffer, u_int max_buf_mb);
+   static u_int32_t parsetime(char *str);
++  static u_int64_t mac2int(u_int8_t *mac);
++  static u_int8_t* int2mac(u_int64_t mac, u_int8_t *buf);
+   
+   /* System Host Montoring and Diagnose Functions */
+   static void luaCpuLoad(lua_State* vm);
+
+
+
+
+@@ -374,6 +374,26 @@ struct arp_packet {
+   u_int32_t arp_tpa;/* target protocol address */
+ } PACK_OFF;
+ 
++PACK_ON
++struct dhcp_packet {
++  u_int8_t	msgType;
++  u_int8_t	htype;
++  u_int8_t	hlen;
++  u_int8_t	hops;
++  u_int32_t	xid;/* 4 */
++  u_int16_t	secs;/* 8 */
++  u_int16_t	flags;
++  u_int32_t	ciaddr;/* 12 */
++  u_int32_t	yiaddr;/* 16 */
++  u_int32_t	siaddr;/* 20 */
++  u_int32_t	giaddr;/* 24 */
++  u_int8_t	chaddr[16]; /* 28 */
++  u_int8_t	sname[64]; /* 44 */
++  u_int8_t	file[128]; /* 108 */
++  u_int32_t	magic; /* 236 */
++  u_int8_t	options[308];
++} PACK_OFF;
++
+ #ifdef NTOPNG_PRO
+ 
+ typedef struct {
+
+
+
+
+@@ -1686,13 +1686,18 @@ bool NetworkInterface::processPacket(u_int32_t bridge_iface_idx,
+       Mac *mac = (*srcHost)->getMac();
+ 
+       if(payload_len > 240) {
+-	if(mac && (payload[0] == 0x01)) /* Request */
++	struct dhcp_packet *dhcpp = (struct dhcp_packet*)payload;
++
++	if(dhcpp->msgType == 0x01) /* Request */
+ 	  mac->setDhcpHost();
++	else if(dhcpp->msgType == 0x02) /* Reply */
++	  checkMacIPAssociation(false, dhcpp->chaddr, dhcpp->yiaddr);
+ 
+ 	for(int i = 240; i<payload_len; ) {
+ 	  u_int8_t id  = payload[i], len = payload[i+1];
+ 
+-	  if(len == 0) break;
++	  if(len == 0)
++	    break;
+ 
+ #ifdef DHCP_DEBUG
+ 	  ntop->getTrace()->traceEvent(TRACE_WARNING, "[DHCP] [id=%u][len=%u]", id, len);
+@@ -1972,7 +1977,7 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+ 
+   time = ((uint64_t) h->ts.tv_sec) * 1000 + h->ts.tv_usec / 1000;
+ 
+- datalink_check:
++datalink_check:
+   if(pcap_datalink_type == DLT_NULL) {
+     memcpy(&null_type, &packet[eth_offset], sizeof(u_int32_t));
+ 
+@@ -2054,7 +2059,7 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+       break;
+   }
+ 
+- decode_packet_eth:
++decode_packet_eth:
+   switch(eth_type) {
+   case ETHERTYPE_PPOE:
+     eth_type = ETHERTYPE_IP;
+@@ -2065,7 +2070,7 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+   case ETHERTYPE_IP:
+     if(h->caplen >= ip_offset + sizeof(struct ndpi_iphdr)) {
+       u_int16_t frag_off;
+-      struct ndpi_iphdr *iph = (struct ndpi_iphdr *) &packet[ip_offset];
++      struct ndpi_iphdr *iph = (struct ndpi_iphdr *)&packet[ip_offset];
+       u_short ip_len = ((u_short)iph->ihl * 4);
+       struct ndpi_ipv6hdr *ip6 = NULL;
+ 
+@@ -2120,7 +2125,7 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+ 	}
+ 
+       } else if(ntop->getGlobals()->decode_tunnels() && (iph->protocol == IPPROTO_UDP)
+-	 && ((frag_off & 0x3FFF /* IP_MF | IP_OFFSET */ ) == 0)) {
++		&& ((frag_off & 0x3FFF /* IP_MF | IP_OFFSET */ ) == 0)) {
+ 	struct ndpi_udphdr *udp = (struct ndpi_udphdr *)&packet[ip_offset+ip_len];
+ 	u_int16_t sport = ntohs(udp->source), dport = ntohs(udp->dest);
+ 
+@@ -2393,20 +2398,22 @@ bool NetworkInterface::dissectPacket(u_int32_t bridge_iface_idx,
+ #endif
+ 
+     if(srcMac && dstMac) {

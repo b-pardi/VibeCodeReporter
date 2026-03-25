@@ -1,0 +1,99 @@
+@@ -23,6 +23,7 @@ SEC_ASN1_MKSUB(CERT_SetOfSignedCrlTemplate)
+ SEC_ASN1_MKSUB(SECOID_AlgorithmIDTemplate)
+ SEC_ASN1_MKSUB(SEC_BitStringTemplate)
+ SEC_ASN1_MKSUB(SEC_OctetStringTemplate)
++SEC_ASN1_MKSUB(SEC_GeneralizedTimeTemplate)
+ SEC_ASN1_MKSUB(SEC_PointerToOctetStringTemplate)
+ SEC_ASN1_MKSUB(SEC_SetOfAnyTemplate)
+ 
+
+
+
+
+@@ -175,13 +175,14 @@ NSS_CMSUtil_DecryptSymKey_ESDH(SECKEYPrivateKey *privkey, SECItem *encKey,
+ 
+ extern SECStatus
+ NSS_CMSUtil_EncryptSymKey_ESECDH(PLArenaPool *poolp, CERTCertificate *cert, PK11SymKey *key,
+-                                 SECItem *encKey, SECItem *ukm, SECAlgorithmID *keyEncAlg,
+-                                 SECItem *originatorPubKey);
++                                 SECItem *encKey, PRBool genUkm, SECItem *ukm,
++                                 SECAlgorithmID *keyEncAlg, SECItem *originatorPubKey, void *wincx);
+ 
+ PK11SymKey *
+ NSS_CMSUtil_DecryptSymKey_ECDH(SECKEYPrivateKey *privkey, SECItem *encKey,
+                                SECAlgorithmID *keyEncAlg, SECOidTag bulkalgtag,
+-                               SECItem *ukm, NSSCMSOriginatorIdentifierOrKey *oiok);
++                               SECItem *ukm, NSSCMSOriginatorIdentifierOrKey *oiok,
++                               void *wincx);
+ 
+ /************************************************************************
+  * cmsreclist.c - recipient list stuff
+
+
+
+
+@@ -16,6 +16,7 @@
+ #include "pk11func.h"
+ #include "secerr.h"
+ #include "secder.h"
++#include "prerr.h"
+ 
+ /* ====== RSA ======================================================================= */
+ 
+@@ -122,7 +123,7 @@ SEC_ASN1_MKSUB(SEC_OctetStringTemplate)
+ static const SEC_ASN1Template ECC_CMS_SharedInfoTemplate[] = {
+     { SEC_ASN1_SEQUENCE,
+       0, NULL, sizeof(ECC_CMS_SharedInfo) },
+-    { SEC_ASN1_INLINE | SEC_ASN1_POINTER,
++    { SEC_ASN1_XTRN | SEC_ASN1_POINTER,
+       offsetof(ECC_CMS_SharedInfo, keyInfo),
+       SEC_ASN1_SUB(SECOID_AlgorithmIDTemplate) },
+     { SEC_ASN1_OPTIONAL | SEC_ASN1_EXPLICIT | SEC_ASN1_CONSTRUCTED |
+@@ -148,33 +149,48 @@ Create_ECC_CMS_SharedInfo(PLArenaPool *poolp,
+                           SECAlgorithmID *keyInfo, SECItem *ukm, unsigned int KEKsize)
+ {
+     ECC_CMS_SharedInfo SI;
+-    unsigned char suppPubInfo[4];
++    const unsigned int suppPubInfoSize = 4;
++    unsigned char suppPubInfo[suppPubInfoSize];
++    SECItem encodedKEK;
++    unsigned int skipBytes;
+ 
+     SI.keyInfo = keyInfo;
+     SI.entityUInfo.type = ukm->type;
+     SI.entityUInfo.data = ukm->data;
+     SI.entityUInfo.len = ukm->len;
+ 
+-    KEKsize = KEKsize * 8;
+-    suppPubInfo[0] = (KEKsize & 0xFF000000) >> 24;
+-    suppPubInfo[1] = (KEKsize & 0xFF0000) >> 16;
+-    suppPubInfo[2] = (KEKsize & 0xFF00) >> 8;
+-    suppPubInfo[3] = KEKsize & 0xFF;
+-
+     SI.suppPubInfo.type = siBuffer;
+     SI.suppPubInfo.data = suppPubInfo;
+-    SI.suppPubInfo.len = 4;
++    SI.suppPubInfo.len = suppPubInfoSize;
++
++    SEC_ASN1EncodeInteger(poolp, &encodedKEK, (KEKsize * 8));
++    if (encodedKEK.len > suppPubInfoSize) {
++        return NULL;
++    }
++
++    /* The output of SEC_ASN1EncodeInteger is a variable number of
++     * bytes. We pad the output with additional zero bytes, because
++     * RFC 5753 requires that suppPubInfo uses exactly 4 bytes. */
++    memset(suppPubInfo, 0, suppPubInfoSize);
++    skipBytes = suppPubInfoSize - encodedKEK.len;
++    memcpy(suppPubInfo + skipBytes, encodedKEK.data, encodedKEK.len);
+ 
+     return SEC_ASN1EncodeItem(poolp, NULL, &SI, ECC_CMS_SharedInfoTemplate);
+ }
+ 
+ /* this will generate a key pair, compute the shared secret, */
+ /* derive a key and ukm for the keyEncAlg out of it, encrypt the bulk key with */
+-/* the keyEncAlg, set encKey, keyEncAlg, publicKey etc. */
++/* the keyEncAlg, set encKey, keyEncAlg, publicKey etc.
++ * The ukm is optional per RFC 5753. Pass a NULL value to request an empty ukm.
++ * Pass a SECItem with the size set to zero, to request allocating a random
++ * ukm of a default size. Or provide an explicit ukm that was defined b

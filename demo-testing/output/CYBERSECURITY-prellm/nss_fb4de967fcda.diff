@@ -1,0 +1,131 @@
+@@ -56,18 +56,26 @@ class Pkcs11AesGcmTest : public ::testing::TestWithParam<gcm_kat_value> {
+         slot.get(), mech, PK11_OriginUnwrap, CKA_ENCRYPT, &keyItem, nullptr));
+     ASSERT_TRUE(!!symKey) << msg;
+ 
+-    // Encrypt.
++    // Encrypt with bogus parameters.
+     unsigned int outputLen = 0;
+     std::vector<uint8_t> output(plaintext.size() + gcmParams.ulTagBits / 8);
++    gcmParams.ulTagBits = 159082344;
+     SECStatus rv =
+         PK11_Encrypt(symKey.get(), mech, &params, output.data(), &outputLen,
+                      output.size(), plaintext.data(), plaintext.size());
++    EXPECT_EQ(SECFailure, rv);
++    EXPECT_EQ(0U, outputLen);
++    gcmParams.ulTagBits = 128;
++
++    // Encrypt.
++    rv = PK11_Encrypt(symKey.get(), mech, &params, output.data(), &outputLen,
++                      output.size(), plaintext.data(), plaintext.size());
+     if (invalid_iv) {
+       EXPECT_EQ(rv, SECFailure) << msg;
++      EXPECT_EQ(0U, outputLen);
+       return;
+-    } else {
+-      EXPECT_EQ(rv, SECSuccess) << msg;
+     }
++    EXPECT_EQ(rv, SECSuccess) << msg;
+ 
+     ASSERT_EQ(outputLen, output.size()) << msg;
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,274 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include <memory>
++#include "nss.h"
++#include "pk11pub.h"
++#include "secerr.h"
++
++#include "nss_scoped_ptrs.h"
++#include "gtest/gtest.h"
++
++namespace nss_test {
++
++static const uint8_t kInput[99] = {1, 2, 3};
++static const uint8_t kKeyData[24] = {'K', 'E', 'Y'};
++
++static SECItem* GetIv() {
++  static const uint8_t kIvData[16] = {'I', 'V'};
++  static const SECItem kIv = {siBuffer, const_cast<uint8_t*>(kIvData),
++                              static_cast<unsigned int>(sizeof(kIvData))};
++  return const_cast<SECItem*>(&kIv);
++}
++
++class Pkcs11CbcPadTest : public ::testing::TestWithParam<CK_MECHANISM_TYPE> {
++ protected:
++  bool is_padded() const {
++    switch (GetParam()) {
++      case CKM_AES_CBC_PAD:
++      case CKM_DES3_CBC_PAD:
++        return true;
++
++      case CKM_AES_CBC:
++      case CKM_DES3_CBC:
++        return false;
++
++      default:
++        ADD_FAILURE() << "Unknown mechanism " << GetParam();
++    }
++    return false;
++  }
++
++  size_t block_size() const {
++    return static_cast<size_t>(PK11_GetBlockSize(GetParam(), nullptr));
++  }
++
++  size_t GetInputLen(CK_ATTRIBUTE_TYPE op) const {
++    if (is_padded() && op == CKA_ENCRYPT) {
++      // Anything goes for encryption when padded.
++      return sizeof(kInput);
++    }
++
++    // Otherwise, use a strict multiple of the block size.
++    size_t block_count = sizeof(kInput) / block_size();
++    EXPECT_LT(1U, block_count) << "need 2 blocks for tests";
++    return block_count * block_size();
++  }
++
++  ScopedPK11SymKey MakeKey(CK_ATTRIBUTE_TYPE op) {
++    ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
++    EXPECT_NE(nullptr, slot);
++    if (!slot) {
++      return nullptr;
++    }
++
++    unsigned int key_len = 0;
++    switch (GetParam()) {
++      case CKM_AES_CBC_PAD:
++      case CKM_AES_CBC:
++        key_len = 16;  // This doesn't do AES-256 to keep it simple.
++        break;
++
++      case CKM_DES3_CBC_PAD:
++      case CKM_DES3_CBC:
++        key_len = 24;
++        break;
++
++      default:
++        ADD_FAILURE() << "Unknown mechanism " << GetParam();
++        return nullptr;
++    }
++
++    SECItem key_item = {siBuffer, const_cast<uint8_t*>(kKeyData), key_len};
++    PK11SymKey* p = PK11_ImportSymKey(slot.get(), GetParam(), PK11_OriginUnwrap,
++                                      op, &key_item, nullptr);
++    EXPECT_NE(nullptr, p);
++    return ScopedPK11SymKey(p);
++  }
++
++  ScopedPK11Context MakeContext(CK_ATTRIBUTE_TYPE op) {
++    ScopedPK11SymKey k = MakeKey(op);
++    PK11Context* ctx =
++        PK11_CreateConte

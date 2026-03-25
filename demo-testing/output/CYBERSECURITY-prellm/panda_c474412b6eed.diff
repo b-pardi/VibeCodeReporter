@@ -1,0 +1,115 @@
+@@ -664,22 +664,30 @@ static int gdb_read_register(CPUState *cpu, uint8_t *mem_buf, int reg)
+     return 0;
+ }
+ 
+-static int gdb_write_register(CPUState *cpu, uint8_t *mem_buf, int reg)
++int gdb_write_register(CPUState *cpu, uint8_t *mem_buf, int reg)
+ {
+     CPUClass *cc = CPU_GET_CLASS(cpu);
+     CPUArchState *env = cpu->env_ptr;
+     GDBRegisterState *r;
++    int ret = 0;
++
+ 
+     if (reg < cc->gdb_num_core_regs) {
+-        return cc->gdb_write_register(cpu, mem_buf, reg);
++        ret = cc->gdb_write_register(cpu, mem_buf, reg);
+     }
+ 
+     for (r = cpu->gdb_regs; r; r = r->next) {
+         if (r->base_reg <= reg && reg < r->base_reg + r->num_regs) {
+-            return r->set_reg(env, mem_buf, reg - r->base_reg);
++            ret = r->set_reg(env, mem_buf, reg - r->base_reg);
+         }
+     }
+-    return 0;
++    if (rr_in_record()) {
++        /* mm: to play along with the gdb rsp, the return value of 
++         * gdb_write_register *should* return the size of the register, which
++         * give us insight about the expected size of mem_buf */
++        rr_cpu_reg_write_call_record(cpu->cpu_index, mem_buf, reg, ret);
++    }
++    return ret;
+ }
+ 
+ /* Register a supplemental set of CPU registers.  If g_pos is nonzero it
+
+
+
+
+@@ -54,6 +54,7 @@ void gdbserver_fork(CPUState *);
+ #endif
+ /* Get or set a register.  Returns the size of the register.  */
+ typedef int (*gdb_reg_cb)(CPUArchState *env, uint8_t *buf, int reg);
++int gdb_write_register(CPUState *cpu, uint8_t *mem_buf, int reg);
+ void gdb_register_coprocessor(CPUState *cpu,
+                               gdb_reg_cb get_reg, gdb_reg_cb set_reg,
+                               int num_regs, const char *xml, int g_pos);
+
+
+
+
+@@ -43,6 +43,14 @@ typedef struct {
+     hwaddr len;
+ } RR_cpu_mem_unmap;
+ 
++// structure for arguments to gdb_write_register
++typedef struct {
++    int cpu_index;
++    uint8_t* buf;
++    int reg;
++    int len;
++} RR_cpu_reg_write_args;
++
+ typedef struct RR_MapList {
+     void *ptr;
+     hwaddr addr;
+@@ -53,6 +61,8 @@ typedef struct RR_MapList {
+ 
+ void rr_cpu_physical_memory_unmap_record(hwaddr addr, uint8_t* buf,
+                                          hwaddr len, int is_write);
++void rr_cpu_reg_write_call_record(int cpu_index, const uint8_t* buf,
++                                  int reg, int len);
+ void rr_device_mem_rw_call_record(hwaddr addr, const uint8_t* buf,
+                                   int len, int is_write);
+ void rr_device_mem_unmap_call_record(hwaddr addr, const uint8_t* buf,
+@@ -86,6 +96,7 @@ typedef struct {
+         RR_serial_read_args serial_read_args;
+         RR_serial_send_args serial_send_args;
+         RR_serial_write_args serial_write_args;
++        RR_cpu_reg_write_args cpu_reg_write_args;
+     } variant;
+     // mz XXX HACK
+     uint64_t old_buf_addr;
+
+
+
+
+@@ -121,6 +121,7 @@ extern void rr_signal_disagreement(RR_prog_point current,
+         ACTION(RR_CALL_SERIAL_READ),    /* read byte from serial rx fifo */    \
+         ACTION(RR_CALL_SERIAL_SEND),    /* send byte on serial port */         \
+         ACTION(RR_CALL_SERIAL_WRITE),   /* write byte to serial tx fifo */     \
++        ACTION(RR_CALL_CPU_REG_WRITE),   /* */     \
+         ACTION(RR_CALL_LAST)
+ 
+ typedef enum {
+
+
+
+
+@@ -52,6 +52,8 @@
+ #include "io/channel-file.h"
+ #include "sysemu/sysemu.h"
+ #include "panda/callback_support.h"
++#include "exec/gdbstub.h"
++
+ /******************************************************************************************/
+ /* GLOBALS */
+ /******************************************************************************************/
+@@ -321,6 +323,11 @@ static inline void rr_write_item(RR_log_entry item)
+                     rr_fwrite(args->variant.cpu_mem_unmap.buf, 1,
+                                 args->variant.cpu_mem_unmap.len);
+                     break;
++                case RR_CALL_CPU_REG_WRITE:
++                    RR_WRITE_ITEM(args->variant.cpu_reg_write_args);
++                    rr_fwrite(args->variant.cpu_reg_write_arg

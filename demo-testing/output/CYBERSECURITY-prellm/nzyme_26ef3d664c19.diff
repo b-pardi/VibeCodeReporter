@@ -1,0 +1,112 @@
+@@ -38,6 +38,7 @@ import horse.wtf.nzyme.database.Database;
+ import horse.wtf.nzyme.dot11.Dot11MetaInformation;
+ import horse.wtf.nzyme.dot11.anonymization.Anonymizer;
+ import horse.wtf.nzyme.dot11.clients.Clients;
++import horse.wtf.nzyme.dot11.deauth.DeauthenticationMonitor;
+ import horse.wtf.nzyme.dot11.deception.traps.BeaconTrap;
+ import horse.wtf.nzyme.dot11.deception.traps.ProbeRequestTrap;
+ import horse.wtf.nzyme.dot11.deception.traps.Trap;
+@@ -125,6 +126,7 @@ public class NzymeLeaderImpl implements NzymeLeader {
+     private final Networks networks;
+     private final Sentry sentry;
+     private final Clients clients;
++    private final DeauthenticationMonitor deauthenticationMonitor;
+ 
+     private final ObjectMapper objectMapper;
+ 
+@@ -163,6 +165,8 @@ public class NzymeLeaderImpl implements NzymeLeader {
+         this.clients = new Clients(this);
+         this.objectMapper = new ObjectMapper();
+ 
++        this.deauthenticationMonitor = new DeauthenticationMonitor(this);
++
+         this.anonymizer = new Anonymizer(baseConfiguration.anonymize(), baseConfiguration.dataDirectory());
+ 
+         // Register JVM metrics.
+@@ -402,6 +406,9 @@ public class NzymeLeaderImpl implements NzymeLeader {
+         // Sentry interceptors.
+         frameProcessor.registerDot11Interceptors(new SentryInterceptorSet(sentry, alerts).getInterceptors());
+ 
++        // Deauth counter.
++        frameProcessor.registerDot11Interceptor(new DeauthFrameCounterInterceptor(deauthenticationMonitor));
++
+         // Dot11 alerting interceptors.
+         if (configuration.dot11Alerts().contains(Alert.TYPE_WIDE.UNEXPECTED_BSSID)) {
+             frameProcessor.registerDot11Interceptors(new UnexpectedBSSIDInterceptorSet(getAlertsService(), configuration.dot11Networks()).getInterceptors());
+
+
+
+
+@@ -54,7 +54,8 @@ public abstract class Alert {
+         PWNAGOTCHI_ADVERTISEMENT,
+         BANDIT_CONTACT,
+         BEACON_TRAP_1,
+-        UNKNOWN_SSID
++        UNKNOWN_SSID,
++        DEAUTH_FLOOD
+     }
+ 
+     public enum TYPE {
+@@ -74,7 +75,8 @@ public abstract class Alert {
+         PWNAGOTCHI_ADVERTISEMENT,
+         BANDIT_CONTACT,
+         BEACON_TRAP_1,
+-        UNKNOWN_SSID
++        UNKNOWN_SSID,
++        DEAUTH_FLOOD
+     }
+ 
+     public static final List<TYPE_WIDE> HIDDEN_IN_UI = ImmutableList.of(
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,80 @@
++/*
++ * This file is part of nzyme.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the Server Side Public License, version 1,
++ * as published by MongoDB, Inc.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * Server Side Public License for more details.
++ *
++ * You should have received a copy of the Server Side Public License
++ * along with this program. If not, see
++ * <http://www.mongodb.com/licensing/server-side-public-license>.
++ */
++
++package horse.wtf.nzyme.dot11.deauth;
++
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++import horse.wtf.nzyme.NzymeLeader;
++import horse.wtf.nzyme.dot11.frames.Dot11DeauthenticationFrame;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.joda.time.DateTime;
++
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++
++public class DeauthenticationMonitor {
++
++    private static final Logger LOG = LogManager.getLogger(DeauthenticationMonitor.class);
++
++    private final NzymeLeader nzyme;
++
++    private final AtomicLong counter;
++
++    public DeauthenticationMonitor(NzymeLeader nzyme) {
++        this(nzyme, 60);
++    }
++
++    public DeauthenticationMonitor(NzymeLeader nzyme, int syncIntervalSeconds) {
++        this.nzyme = nzyme;
++        this.counter = new AtomicLong(0);
++
++        // Regularly delete networks that have not been seen for a while

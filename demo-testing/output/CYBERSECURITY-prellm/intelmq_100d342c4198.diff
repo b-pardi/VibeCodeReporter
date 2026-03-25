@@ -1,0 +1,108 @@
+@@ -498,6 +498,7 @@ class Bot(object):
+                                                             queues=self.__source_queues,
+                                                             bot=self)
+             self.__source_pipeline.connect()
++            self.__current_message = None
+             self.logger.debug("Connected to source queue.")
+ 
+         if self.__destination_queues:
+@@ -556,6 +557,10 @@ class Bot(object):
+                                              path_permissive=path_permissive)
+ 
+     def receive_message(self):
++        if self.__current_message:
++            self.logger.debug("Reusing existing current message as incoming.")
++            return self.__current_message
++
+         self.logger.debug('Waiting for incoming message.')
+         message = None
+         while not message:
+
+
+
+
+@@ -60,6 +60,8 @@ class PipelineFactory(object):
+ 
+ class Pipeline(object):
+     has_internal_queues = False
++    # If the class currently holds a message, restricts the actions
++    _has_message = False
+ 
+     def __init__(self, parameters, logger, bot):
+         self.parameters = parameters
+@@ -114,9 +116,24 @@ class Pipeline(object):
+         raise NotImplementedError
+ 
+     def receive(self) -> str:
++        if self._has_message:
++            raise exceptions.PipelineError("There's already a message, first "
++                                           "acknowledge the existing one.")
++
++        retval = self._receive()
++        self._has_message = True
++        return retval
++
++    def _receive(self) -> str:
+         raise NotImplementedError
+ 
+     def acknowledge(self):
++        if not self._has_message:
++            raise exceptions.PipelineError("No message to acknowledge.")
++        self._acknowledge()
++        self._has_message = False
++
++    def _acknowledge(self):
+         raise NotImplementedError
+ 
+     def clear_queue(self, queue):
+@@ -205,7 +222,7 @@ class Redis(Pipeline):
+                                       'Look at redis\'s logs.')
+                 raise exceptions.PipelineError(exc)
+ 
+-    def receive(self) -> str:
++    def _receive(self) -> str:
+         if self.source_queue is None:
+             raise exceptions.ConfigurationError('pipeline', 'No source queue given.')
+         try:
+@@ -223,11 +240,16 @@ class Redis(Pipeline):
+         except Exception as exc:
+             raise exceptions.PipelineError(exc)
+ 
+-    def acknowledge(self):
++    def _acknowledge(self):
+         try:
+-            return self.pipe.rpop(self.internal_queue)
++            retval = self.pipe.rpop(self.internal_queue)
+         except Exception as e:
+             raise exceptions.PipelineError(e)
++        else:
++            if not retval:
++                raise exceptions.PipelineError("Could not pop message from internal queue"
++                                               "for acknowledgement. Return value was %r."
++                                               "" % retval)
+ 
+     def count_queued_messages(self, *queues) -> dict:
+         queue_dict = {}
+@@ -243,11 +265,12 @@ class Redis(Pipeline):
+         which is the same as an empty list in Redis"""
+         try:
+             retval = self.pipe.delete(queue)
+-            if retval not in (0, 1):
+-                raise ValueError("Error on redis queue deletion: Return value was not 0 "
+-                                 "or 1 but %s." % retval)
+         except Exception as exc:
+             raise exceptions.PipelineError(exc)
++        else:
++            if retval not in (0, 1):
++                raise exceptions.PipelineError("Error on redis queue deletion: Return value"
++                                               " was not 0 or 1 but %r." % retval)
+ 
+     def nonempty_queues(self) -> set:
+         """ Returns a list of all currently non-empty queues. """
+@@ -302,7 +325,7 @@ class Pythonlist(Pipeline):
+             else:
+                 self.state[destination_queue] = [utils.encode(message)]
+ 
+-    def receive(self) -> str:
++    def _receive(self) -> str:
+         "

@@ -1,0 +1,105 @@
+@@ -221,18 +221,18 @@ static bool ConsolidateJobs(JobControlRecord* jcr)
+         std::string oldestjobid = jobids_ctx.front();
+ 
+         // Get db record of oldest jobid and check its age
+-        jcr->dir_impl->previous_jr = JobDbRecord{};
+-        jcr->dir_impl->previous_jr.JobId = std::stoul(oldestjobid);
++        auto prev_jr = JobDbRecord{};
++        prev_jr.JobId = std::stoul(oldestjobid);
+         Dmsg1(10, "Previous JobId=%s\n", oldestjobid.c_str());
+ 
+-        if (!jcr->db->GetJobRecord(jcr, &jcr->dir_impl->previous_jr)) {
++        if (!jcr->db->GetJobRecord(jcr, &prev_jr)) {
+           Jmsg(jcr, M_FATAL, 0,
+                T_("Error getting Job record for first Job: ERR=%s\n"),
+                jcr->db->strerror());
+           return true;
+         }
+ 
+-        starttime = jcr->dir_impl->previous_jr.JobTDate;
++        starttime = prev_jr.JobTDate;
+         oldest_allowed_starttime = now - job->AlwaysIncrementalMaxFullAge;
+         bstrftimes(sdt_allowed, sizeof(sdt_allowed), oldest_allowed_starttime);
+         bstrftimes(sdt_starttime, sizeof(sdt_starttime), starttime);
+@@ -266,6 +266,8 @@ static bool ConsolidateJobs(JobControlRecord* jcr)
+         }
+         Jmsg(jcr, M_INFO, 0, T_("after ConsolidateFull: jobids: %s\n"),
+              jobids_ctx.GetAsString().c_str());
++
++        jcr->dir_impl->previous_jr.emplace(std::move(prev_jr));
+       }
+ 
+       // Set the virtualfull jobids to be consolidated
+
+
+
+
+@@ -3141,8 +3141,8 @@ std::optional<std::string> job_code_callback_director(JobControlRecord* jcr,
+       }
+       break;
+     case 'O': /* Migration/copy job prev jobid */
+-      if (jcr && jcr->dir_impl && jcr->dir_impl->previous_jr.JobId) {
+-        return std::to_string(jcr->dir_impl->previous_jr.JobId);
++      if (jcr && jcr->dir_impl && jcr->dir_impl->previous_jr) {
++        return std::to_string(jcr->dir_impl->previous_jr->JobId);
+       } else {
+         return none;
+       }
+
+
+
+
+@@ -24,6 +24,8 @@
+ #ifndef BAREOS_DIRD_DIRECTOR_JCR_IMPL_H_
+ #define BAREOS_DIRD_DIRECTOR_JCR_IMPL_H_
+ 
++#include <optional>
++
+ #include "cats/cats.h"
+ #include "lib/mem_pool.h"
+ #include "dird/client_connection_handshake_mode.h"
+@@ -126,7 +128,7 @@ struct DirectorJcrImpl {
+   uint32_t FileIndex{};           /**< Last FileIndex processed */
+   utime_t MaxRunSchedTime{};      /**< Max run time in seconds from Initial Scheduled time */
+   JobDbRecord jr;                 /**< Job DB record for current job */
+-  JobDbRecord previous_jr;        /**< Previous job database record */
++  std::optional<JobDbRecord> previous_jr;        /**< Previous job database record */
+   JobControlRecord* mig_jcr{};    /**< JobControlRecord for migration/copy job */
+   char FSCreateTime[MAX_TIME_LENGTH]{}; /**< FileSet CreateTime as returned from DB */
+   char since[MAX_TIME_LENGTH]{};        /**< Since time */
+
+
+
+
+@@ -421,8 +421,9 @@ bool SendPreviousRestoreObjects(JobControlRecord* jcr)
+   switch (JobLevel) {
+     case L_DIFFERENTIAL:
+     case L_INCREMENTAL:
+-      if (jcr->dir_impl->previous_jr.JobId > 0) {
+-        if (!SendRestoreObjects(jcr, jcr->dir_impl->previous_jr.JobId, false)) {
++      if (jcr->dir_impl->previous_jr) {
++        if (!SendRestoreObjects(jcr, jcr->dir_impl->previous_jr->JobId,
++                                false)) {
+           return false;
+         }
+       }
+
+
+
+
+@@ -41,7 +41,8 @@ bool SendBwlimitToFd(JobControlRecord* jcr, const char* Job);
+ bool SendSecureEraseReqToFd(JobControlRecord* jcr);
+ bool SendPreviousRestoreObjects(JobControlRecord* jcr);
+ int GetAttributesAndPutInCatalog(JobControlRecord* jcr);
+-void GetAttributesAndCompareToCatalog(JobControlRecord* jcr, JobId_t JobId);
++void GetAttributesAndCompareToCatalog(JobControlRecord* jcr,
++                                      JobDbRecord* prev_jr);
+ int put_file_into_catalog(JobControlRecord* jcr,
+                           long file_index,
+                           char* fname,
+
+
+
+
+@@ -1156,12 +1156,14 @@ bool GetLevelSinceTime(JobControlRecord* jcr)
+       /* Lookup

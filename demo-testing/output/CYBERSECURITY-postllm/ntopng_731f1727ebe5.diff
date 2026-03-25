@@ -1,0 +1,133 @@
+@@ -602,10 +602,10 @@ public:
+     return (Utils::maskHost(get_cli_ip_addr()->isLocalHost())
+             || Utils::maskHost(get_srv_ip_addr()->isLocalHost()));
+   };
+-  char *serialize(bool use_labels = false);
++  char *serialize(ExportFormat format = export_format_GENERIC);
+   /* Prepares an alert JSON and puts int in the resulting `serializer`. */
+   void alert2JSON(FlowAlert *alert, ndpi_serializer *serializer);
+-  json_object *flow2JSON();
++  json_object *flow2JSON(ExportFormat format);
+   json_object *flow2es(json_object *flow_object);
+   void formatECSInterface(json_object *my_object);
+   void formatECSNetwork(json_object *my_object, const IpAddress *addr);
+
+
+
+
+@@ -150,12 +150,6 @@ protected:
+   SPSCQueue<FlowAlert *> *flowAlertsQueue;
+   SPSCQueue<HostAlertReleasedPair> *hostAlertsQueue;
+ 
+-  /*
+-    Flag to indicate whether a flow JSON should be dumped along with the flow.
+-    Flow JSON contain additional fields not placed inside database columns.
+-  */
+-  bool flows_dump_json;
+-
+   /* External alerts contain alertable entities other than
+    * host/interface/network which are dynamically allocated when an alert for
+    * them occurs. A lock is necessary to guard the insert/delete operations from
+
+
+
+
+@@ -934,6 +934,12 @@ typedef enum {
+   interface_type_DB_VIEW
+ } InterfaceType;
+ 
++typedef enum {
++  export_format_GENERIC = 0,
++  export_format_SYSLOG,
++  export_format_ECS
++} ExportFormat;
++
+ typedef enum {
+   os_learning_unknown = 0,
+   os_learning_tcp_fingerprint,
+
+
+
+
+@@ -3560,29 +3560,25 @@ void Flow::sumStats(nDPIStats *ndpi_stats, FlowStats *status_stats) {
+ 
+ /* *************************************** */
+ 
+-char* Flow::serialize(bool use_labels) {
++char* Flow::serialize(ExportFormat format) {
+   json_object *my_object;
++  const char *json;
+   char *rsp = NULL;
+ 
+-  ntop->getPrefs()->set_json_symbolic_labels_format(use_labels);
++  my_object = flow2JSON(format);
++  if (my_object == NULL)
++    return NULL;
+ 
+-  my_object = flow2JSON();
+-  // ntop->getTrace()->traceEvent(TRACE_WARNING, "Flow Length: %d",
+-  // json_object_object_length(my_object));
++  /* JSON string */
++  json = json_object_to_json_string(my_object);
+ 
+-  if(my_object != NULL) {
+-    /* JSON string */
+-    const char *json = json_object_to_json_string(my_object);
++  // ntop->getTrace()->traceEvent(TRACE_WARNING, "Emitting Flow: %s", json);
+ 
+-    // ntop->getTrace()->traceEvent(TRACE_WARNING, "Emitting Flow: %s", json);
++  if (json)
++    rsp = strdup(json);
+ 
+-    if(json) {
+-      rsp = json ? strdup(json) : NULL;
+-
+-      /* Free memory */
+-      json_object_put(my_object);
+-    }
+-  }
++  /* Free memory */
++  json_object_put(my_object);
+ 
+   return (rsp);
+ }
+@@ -4455,16 +4451,21 @@ void Flow::formatGenericFlow(json_object *my_object) {
+ 
+ /* *************************************** */
+ 
+-json_object *Flow::flow2JSON() {
++json_object *Flow::flow2JSON(ExportFormat format) {
+   json_object *my_object;
+ 
+-  if((my_object = json_object_new_object()) == NULL) return (NULL);
++  my_object = json_object_new_object();
++  if (my_object == NULL)
++    return NULL;
+ 
+-  if(ntop->getPrefs()->do_dump_flows_on_es()) {
++  if (format == export_format_ECS) {
++    /* Format for ElasticSearch */
+     formatECSFlow(my_object);
+-  } else if(ntop->getPrefs()->do_dump_flows_on_syslog()) {
++  } else if (format == export_format_SYSLOG) {
++    /* Format for Syslog */
+     formatSyslogFlow(my_object);
+   } else {
++    /* Format for DB */
+     formatGenericFlow(my_object);
+   }
+ 
+
+
+
+
+@@ -97,7 +97,6 @@ NetworkInterface::NetworkInterface(const char *name,
+   influxdb_ts_exporter = rrd_ts_exporter = NULL;
+   flow_checks_executor = prev_flow_checks_executor = NULL;
+   host_checks_executor = prev_host_checks_executor = NULL;
+-  flows_dump_json = true; /* Too early will be set by NetworkInterface::startFlowDumping() */
+   memset(ifMac, 0, sizeof(ifMac));
+ 
+ #ifdef WIN32
+@@ -3464,15 +3463,15 @@ void NetworkInterface::incNumQueueDroppedFlows(u_int32_t num) {
+     For viewed interface, th

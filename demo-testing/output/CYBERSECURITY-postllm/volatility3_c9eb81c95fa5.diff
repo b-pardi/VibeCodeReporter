@@ -1,0 +1,105 @@
+@@ -1,12 +1,10 @@
+ # This file is Copyright 2024 Volatility Foundation and licensed under the Volatility Software License 1.0
+ # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
+ #
+-import binascii
+ import logging
+ from typing import List
+ 
+ from volatility3.framework import renderers, interfaces, exceptions
+-from volatility3.framework.objects import utility
+ from volatility3.framework.renderers import format_hints
+ from volatility3.framework.interfaces import plugins
+ from volatility3.framework.configuration import requirements
+@@ -53,18 +51,11 @@ class EBPF(plugins.PluginInterface):
+ 
+     def _generator(self):
+         vmlinux = self.context.modules[self.config["kernel"]]
+-        vmlinux_layer = vmlinux.context.layers[vmlinux.layer_name]
+-        bpf_prog_types = vmlinux.get_enumeration("bpf_prog_type")
+         for prog in self.get_ebpf_programs(vmlinux):
+             prog_addr = prog.vol.offset
+-            prog_type = bpf_prog_types.lookup(prog.type)
+-            prog_tag_addr = prog.tag.vol.offset
+-            prog_tag_size = prog.tag.count
+-            prog_tag_bytes = vmlinux_layer.read(prog_tag_addr, prog_tag_size)
+-            prog_tag = binascii.hexlify(prog_tag_bytes).decode()
+-            prog_name = (
+-                utility.array_to_string(prog.aux.name) or renderers.NotAvailableValue()
+-            )
++            prog_type = prog.get_type() or renderers.NotAvailableValue()
++            prog_tag = prog.get_tag() or renderers.NotAvailableValue()
++            prog_name = prog.get_name() or renderers.NotAvailableValue()
+             fields = (format_hints.Hex(prog_addr), prog_name, prog_tag, prog_type)
+             yield (0, fields)
+ 
+
+
+
+
+@@ -151,17 +151,15 @@ class SockHandlers(interfaces.configuration.VersionableInterface):
+ 
+         bpfprog = sock_filter.prog
+ 
+-        BPF_PROG_TYPE_UNSPEC = 0  # cBPF filter
+-        try:
+-            bpfprog_type = bpfprog.get_type()
+-            if bpfprog_type == BPF_PROG_TYPE_UNSPEC:
+-                return  # cBPF filter
+-        except AttributeError:
++        bpfprog_type = bpfprog.get_type()
++        if not bpfprog_type:
+             # kernel < 3.18.140, it's a cBPF filter
+             return None
+ 
+-        BPF_PROG_TYPE_SOCKET_FILTER = 1  # eBPF filter
+-        if bpfprog_type != BPF_PROG_TYPE_SOCKET_FILTER:
++        if bpfprog_type == "BPF_PROG_TYPE_UNSPEC":
++            return None  # cBPF filter
++
++        if bpfprog_type != "BPF_PROG_TYPE_SOCKET_FILTER":
+             socket_filter["bpf_filter_type"] = f"UNK({bpfprog_type})"
+             vollog.warning(f"Unexpected BPF type {bpfprog_type} for a socket")
+             return None
+
+
+
+
+@@ -38,6 +38,7 @@ class LinuxKernelIntermedSymbols(intermed.IntermediateSymbolTable):
+         # Might not exist in the current symbols
+         self.optional_set_type_class("module", extensions.module)
+         self.optional_set_type_class("bpf_prog", extensions.bpf_prog)
++        self.optional_set_type_class("bpf_prog_aux", extensions.bpf_prog_aux)
+         self.optional_set_type_class("kernel_cap_struct", extensions.kernel_cap_struct)
+         self.optional_set_type_class("kernel_cap_t", extensions.kernel_cap_t)
+ 
+
+
+
+
+@@ -5,6 +5,7 @@
+ import collections.abc
+ import logging
+ import functools
++import binascii
+ import stat
+ from datetime import datetime
+ import socket as socket_module
+@@ -1607,20 +1608,59 @@ class xdp_sock(objects.StructType):
+ 
+ 
+ class bpf_prog(objects.StructType):
+-    def get_type(self):
++    def get_type(self) -> Union[str, None]:
++        """Returns a string with the eBPF program type"""
++
+         # The program type was in `bpf_prog_aux::prog_type` from 3.18.140 to
+         # 4.1.52 before it was moved to `bpf_prog::type`
+         if self.has_member("type"):
+             # kernel >= 4.1.52
+-            return self.type
++            return self.type.description
+ 
+         if self.has_member("aux") and self.aux:
+             if self.aux.has_member("prog_type"):
+                 # 3.18.

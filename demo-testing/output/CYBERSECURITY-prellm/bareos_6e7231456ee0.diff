@@ -1,0 +1,112 @@
+@@ -32,44 +32,165 @@
+ #include "lib/qualified_resource_name_type_converter.h"
+ #include "lib/bstringlist.h"
+ #include "lib/jcr.h"
++#include "include/version_numbers.h"
+ 
+ namespace directordaemon {
+ 
+-static bool NumberOfConsoleConnectionsExceeded()
++enum class OptionResult {
++  Completed,
++  Skipped
++};
++
++class ConsoleAuthenticator
+ {
+-  JobControlRecord *jcr;
+-  unsigned int cnt = 0;
++  public:
++    ConsoleAuthenticator(UaContext *ua, const std::string &console_name);
++    virtual ~ConsoleAuthenticator() = default;
+ 
+-  foreach_jcr(jcr)
+-  {
+-    if (jcr->is_JobType(JT_CONSOLE)) { cnt++; }
++    ConsoleAuthenticator (const ConsoleAuthenticator &other) = delete;
++    virtual OptionResult AuthenticateDefaultConsole() = 0;
++    virtual void AuthenticateNamedConsole() = 0;
++    virtual OptionResult AuthenticatePamUser() = 0;
++    virtual bool SendInfoMessage() { return false; }
++
++    bool auth_success_;
++    std::string console_name_;
++
++  protected:
++    OptionResult DoDefaultAuthentication();
++    void DoNamedAuthentication();
++
++    UaContext *ua_;
++    ConsoleResource *optional_console_resource_;
++};
++
++ConsoleAuthenticator::ConsoleAuthenticator(UaContext *ua, const std::string &console_name)
++  : auth_success_(false)
++  , console_name_(console_name)
++  , ua_(ua)
++{
++  optional_console_resource_ = (ConsoleResource *)my_config->GetResWithName(R_CONSOLE, console_name_.c_str());
++}
++
++OptionResult ConsoleAuthenticator::DoDefaultAuthentication()
++{
++  const std::string default_console_name { "*UserAgent*" };
++
++  if (console_name_ != default_console_name) {
++    return OptionResult::Skipped;
+   }
+-  endeach_jcr(jcr);
+ 
+-  return (cnt >= me->MaxConsoleConnections) ? true : false;
++  auth_success_ = ua_->UA_sock->AuthenticateInboundConnection(NULL, "Console",
++                                                              default_console_name.c_str(),
++                                                              me->password_,
++                                                              me);
++  ua_->cons = nullptr;
++  return OptionResult::Completed;
+ }
+ 
+-static bool GetConsoleName(BareosSocket *ua_sock, std::string &name)
++void ConsoleAuthenticator::DoNamedAuthentication()
+ {
+-  char buffer[MAX_NAME_LENGTH]; /* zero terminated C-string */
++  if (!optional_console_resource_) {
++    Dmsg1(200, "Could not find resource for console %s\n", console_name_.c_str());
++    auth_success_ = false;
++    return;
++  }
+ 
+-  if (sscanf(ua_sock->msg, "Hello %127s calling\n", buffer) != 1) {
+-    Emsg4(M_ERROR, 0, _("UA Hello from %s:%s:%d is invalid. Got: %s\n"), ua_sock->who(), ua_sock->host(), ua_sock->port(),
+-          ua_sock->msg);
+-    return false;
++  auth_success_ = ua_->UA_sock->AuthenticateInboundConnection(NULL, "Console",
++                                                              console_name_.c_str(),
++                                                              optional_console_resource_->password_,
++                                                              optional_console_resource_);
++  if (auth_success_) {
++    ua_->cons = optional_console_resource_;
++  } else {
++    ua_->cons = nullptr;
++    Dmsg1(200, "Could not authenticate console %s\n", console_name_.c_str());
+   }
+-  UnbashSpaces(buffer);
+-  name = buffer;
+-  return true;
+ }
+ 
+-static void LogErrorMessage(std::string console_name, UaContext *ua)
++class ConsoleAuthenticatorBefore_18_2 : public ConsoleAuthenticator
+ {
+-  Emsg4(M_ERROR, 0, _("Unable to authenticate console \"%s\" at %s:%s:%d.\n"), console_name.c_str(),
+-                      ua->UA_sock->who(), ua->UA_sock->host(), ua->UA_sock->port());
++  public:
++    ConsoleAuthenticatorBefore_18_2(UaContext *ua, const std::string &console_name)
++     : ConsoleAuthenticator(ua, console_name) {}
++    OptionResult AuthenticateDefaultConsole() override;
++    void AuthenticateNamedConsole() override;
++    OptionResult AuthenticatePamUser() override;
++
++  private:
++    bool SendOkMessageWithSpaceSeparators() {
++      

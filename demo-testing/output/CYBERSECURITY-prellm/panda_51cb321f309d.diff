@@ -1,0 +1,142 @@
+@@ -96,6 +96,8 @@ typedef enum panda_cb_type {
+                                       // or squash exceptions
+ 
+     PANDA_CB_BEFORE_HANDLE_INTERRUPT, // ditto, for interrupts
++    PANDA_CB_START_BLOCK_EXEC,
++    PANDA_CB_END_BLOCK_EXEC,
+ 
+     PANDA_CB_LAST
+ } panda_cb_type;
+@@ -998,6 +1000,38 @@ typedef union panda_cb {
+ 
+ 
+     int32_t (*before_handle_interrupt)(CPUState *cpu, int32_t interrupt_request);
++    
++    /* Callback ID: PANDA_CB_START_BLOCK_EXEC
++
++       start_block_exec:
++        This is like before_block_exec except its part of the TCG stream.
++
++       Arguments:
++        CPUState *env:        the current CPU state
++        TranslationBlock *tb: the TB we are executing
++
++       Helper call location: cpu-exec.c
++
++       Return value:
++        none
++    */
++
++    void (*start_block_exec)(CPUState *cpu, TranslationBlock* tb);
++    /* Callback ID: PANDA_CB_START_BLOCK_EXEC
++
++       end_block_exec:
++        This is like after_block_exec except its part of the TCG stream.
++
++       Arguments:
++        CPUState *env:        the current CPU state
++        TranslationBlock *tb: the TB we are executing
++
++       Helper call location: cpu-exec.c
++
++       Return value:
++        none
++    */
++    void (*end_block_exec)(CPUState *cpu, TranslationBlock* tb);
+ 
+     void (*cbaddr)(void);
+ } panda_cb;
+
+
+
+
+@@ -135,3 +135,7 @@ void panda_callbacks_cpu_restore_state(CPUState *env, TranslationBlock *tb);
+ 
+ 
+ void panda_callbacks_before_tcg_codegen(CPUState *env, TranslationBlock *tb);
++void panda_callbacks_start_block_exec(CPUState *env, TranslationBlock *tb);
++void panda_callbacks_end_block_exec(CPUState *env, TranslationBlock *tb);
++
++void panda_install_block_callbacks(CPUState* cpu, TranslationBlock* tb);
+\ No newline at end of file
+
+
+
+
+@@ -150,6 +150,13 @@ TCGOp *find_first_guest_insn(void);
+  */
+ TCGOp *find_guest_insn_by_addr(target_ulong addr);
+ 
++
++/* 
++*  Search the TCG context for the last guest instruction marker and return
++*  a pointer to it.
++*/
++TCGOp *find_last_guest_insn(void);
++
+ void insert_call_1p(TCGOp **after_op, void(*func)(void*), void *val);
+ 
+ #ifdef __cplusplus
+
+
+
+
+@@ -2494,7 +2494,7 @@ class Panda():
+         if not enabled: # Note the registered_callbacks dict starts with enabled true and then we update it to false as necessary here
+             self.disable_callback(name)
+ 
+-        if "block" in cb.name:
++        if "block" in cb.name and "start" not in cb.name and "end" not in cb.name:
+             if not self.disabled_tb_chaining:
+                 print("Warning: disabling TB chaining to support {} callback".format(cb.name))
+                 self.disable_tb_chaining()
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,30 @@
++#include "panda/tcg-utils.h"
++
++extern "C"{
++    #include "panda/callbacks/cb-support.h"
++}
++
++
++void panda_install_block_callbacks(CPUState* cpu, TranslationBlock *tb){
++    TCGOp* start = find_first_guest_insn();
++    if (start != NULL){
++        insert_call(&start, panda_callbacks_start_block_exec, first_cpu, tb);
++    }else{
++        printf("error on start\n");
++    }
++    
++    bool found_exit = false;
++    TCGOp *last_op = NULL;
++    TCGOp *op = NULL;
++    for (int oi = tcg_ctx.gen_op_buf[0].next; oi != 0; oi = op->next) {
++        op = &tcg_ctx.gen_op_buf[oi];
++        if (INDEX_op_exit_tb == op->opc) {
++            insert_call(&last_op, panda_callbacks_end_block_exec, first_cpu, tb);
++            found_exit = true;
++        }
++        last_op = op;
++    }
++    if (!found_exit) {
++        printf("error on end %d\n", tb->size);
++    }
++}
+\ No newline at end of file
+
+
+
+
+@@ -74,6 +74,12 @@ MAKE_CALLBACK(bool, INSN_TRANSLATE, insn_translate,
+ MAKE_CALLBACK(bool, AFTER_INSN_TRANSLATE, after_insn_translate,
+                     CPUState*, env, target_ptr_t, pc)
+ 
++MAKE_CALLBACK(void, START_BLOCK_EXEC, start_block_exec,
++                    CPUState*, env, TranslationBlock*, tb)
++
++MAKE_CALLBACK(void, END_BLOCK_EXEC, end_block_exec,
++                    CPUState*, env, TranslationBlock*

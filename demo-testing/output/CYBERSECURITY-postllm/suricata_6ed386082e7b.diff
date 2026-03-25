@@ -1,0 +1,149 @@
+@@ -222,6 +222,7 @@
+ 
+ #include "detect-transform-pcrexform.h"
+ #include "detect-transform-base64.h"
++#include "detect-transform-luaxform.h"
+ 
+ #include "util-rule-vars.h"
+ 
+@@ -749,6 +750,7 @@ void SigTableSetup(void)
+     DetectTransformHeaderLowercaseRegister();
+     DetectTransformFromBase64DecodeRegister();
+     SCDetectTransformDomainRegister();
++    DetectTransformLuaxformRegister();
+ 
+     DetectFileHandlerRegister();
+ 
+
+
+
+
+@@ -315,6 +315,7 @@ enum DetectKeywordId {
+     DETECT_TRANSFORM_TOUPPER,
+     DETECT_TRANSFORM_HEADER_LOWERCASE,
+     DETECT_TRANSFORM_FROM_BASE64,
++    DETECT_TRANSFORM_LUAXFORM,
+ 
+     DETECT_IKE_EXCH_TYPE,
+     DETECT_IKE_SPI_INITIATOR,
+
+
+
+
+@@ -60,6 +60,7 @@
+ 
+ #include "util-lua.h"
+ #include "util-lua-builtins.h"
++#include "util-lua-common.h"
+ #include "util-lua-sandbox.h"
+ 
+ static int DetectLuaMatch (DetectEngineThreadCtx *,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,382 @@
++/* Copyright (C) 2024 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Jeff Lucovsky <jlucovsky@oisf.net>
++ *
++ * Implements the luxaform transform keyword
++ */
++
++#include "suricata-common.h"
++
++#include "detect.h"
++#include "detect-engine.h"
++#include "detect-engine-buffer.h"
++#include "detect-parse.h"
++#include "detect-lua.h"
++#include "detect-transform-luaxform.h"
++#include "detect-lua-extensions.h"
++
++#include "util-lua.h"
++#include "util-lua-common.h"
++#include "util-lua-builtins.h"
++
++static int DetectTransformLuaxformSetup(DetectEngineCtx *, Signature *, const char *);
++static void DetectTransformLuaxformFree(DetectEngineCtx *de_ctx, void *ptr);
++static void TransformLuaxform(
++        DetectEngineThreadCtx *det_ctx, InspectionBuffer *buffer, void *options);
++
++#define LUAXFORM_MAX_ARGS 10
++
++typedef struct DetectLuaxformData {
++    int thread_ctx_id;
++    int allow_restricted_functions;
++    int arg_count;
++    uint64_t alloc_limit;
++    uint64_t instruction_limit;
++    const char *filename;
++    char *copystr;
++    const char *id_data;
++    uint32_t id_data_len;
++    const char *args[LUAXFORM_MAX_ARGS];
++} DetectLuaxformData;
++
++typedef struct DetectLuaxformThreadData {
++    lua_State *luastate;
++} DetectLuaxformThreadData;
++
++static void DetectTransformLuaxformId(const uint8_t **data, uint32_t *length, void *context)
++{
++    if (context) {
++        DetectLuaxformData *lua = (DetectLuaxformData *)context;
++        *data = (uint8_t *)lua->id_data;
++        *length = lua->id_data_len;
++    }
++}
++
++static void DetectTransformLuaxformFree(DetectEngineCtx *de_ctx, void *ptr)
++{
++    if (ptr != NULL) {
++        DetectLuaxformData *lua = (DetectLuaxformData *)ptr;
++
++        if (lua->filename)
++            SCFree((void *)lua->filename);
++
++        if (lua->copystr)
++            SCFree((void *)lua->copystr);
++
++        if (lua->id_data)
++            SCFree((void *)lua->id_data);
++
++        if (de_ctx) {
++            DetectUnregisterThreadCtxFuncs(de_ctx, lua, "luaxform");
++        }
++
++        SCFree(lua);
++    }
++}
++
++static int DetectTransformLuaxformSetupPrime(
++        DetectEngineCtx *de_ctx, DetectLuaxformData *ld, const Signature *s)
++{
++    lua_State *luastate = SCLuaSbStateNew(ld->alloc_limit, ld->instruction_limit);
++    if (luastate == NULL)
++        return -1;
++    if (ld->allow_restricted_functions) {
++        luaL_openlibs(luastate);
++    

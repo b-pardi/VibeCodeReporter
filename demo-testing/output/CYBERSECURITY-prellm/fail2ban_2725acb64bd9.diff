@@ -1,0 +1,119 @@
+@@ -81,8 +81,10 @@ class Actions(JailThread, Mapping):
+ 		self._actions = OrderedDict()
+ 		## The ban manager.
+ 		self.__banManager = BanManager()
+-		## precedence of ban (over unban), so max number of tickets banned (to call an unban check):
++		## Precedence of ban (over unban), so max number of tickets banned (to call an unban check):
+ 		self.banPrecedence = 10
++		## Max count of outdated tickets to unban per each __checkUnBan operation:
++		self.unbanMaxCount = self.banPrecedence * 2
+ 
+ 	@staticmethod
+ 	def _load_python_module(pythonModule):
+@@ -319,7 +321,9 @@ class Actions(JailThread, Mapping):
+ 			# unban if nothing is banned not later than banned tickets >= banPrecedence
+ 			if not bancnt or cnt >= self.banPrecedence:
+ 				if self.active:
+-					self.__checkUnBan()
++					# let shrink the ban list faster
++					bancnt *= 2
++					self.__checkUnBan(bancnt if bancnt and bancnt < self.unbanMaxCount else self.unbanMaxCount)
+ 				cnt = 0
+ 		
+ 		self.__flushBan()
+@@ -476,12 +480,12 @@ class Actions(JailThread, Mapping):
+ 				self.__banManager.getBanTotal(), self.__banManager.size(), self._jail.name)
+ 		return cnt
+ 
+-	def __checkUnBan(self):
++	def __checkUnBan(self, maxCount=None):
+ 		"""Check for IP address to unban.
+ 
+ 		Unban IP addresses which are outdated.
+ 		"""
+-		lst = self.__banManager.unBanList(MyTime.time())
++		lst = self.__banManager.unBanList(MyTime.time(), maxCount)
+ 		for ticket in lst:
+ 			self.__unBan(ticket)
+ 		cnt = len(lst)
+
+
+
+
+@@ -325,27 +325,32 @@ class BanManager:
+ 	# @param time the time
+ 	# @return the list of ticket to unban
+ 	
+-	def unBanList(self, time):
++	def unBanList(self, time, maxCount=0x7fffffff):
+ 		with self.__lock:
+ 			# Permanent banning
+ 			if self.__banTime < 0:
+ 				return list()
+ 
+ 			# Check next unban time:
+-			if self.__nextUnbanTime > time:
++			nextUnbanTime = self.__nextUnbanTime
++			if nextUnbanTime > time:
+ 				return list()
+ 
+ 			# Gets the list of ticket to remove (thereby correct next unban time).
+ 			unBanList = {}
+-			self.__nextUnbanTime = BanTicket.MAX_TIME
++			nextUnbanTime = BanTicket.MAX_TIME
+ 			for fid,ticket in self.__banList.iteritems():
+ 				# current time greater as end of ban - timed out:
+ 				eob = ticket.getEndOfBanTime(self.__banTime)
+ 				if time > eob:
+ 					unBanList[fid] = ticket
+-				elif self.__nextUnbanTime > eob:
+-					self.__nextUnbanTime = eob
++					if len(unBanList) >= maxCount: # stop search cycle, so reset back the next check time
++						nextUnbanTime = self.__nextUnbanTime
++						break
++				elif nextUnbanTime > eob:
++					nextUnbanTime = eob
+ 
++			self.__nextUnbanTime = nextUnbanTime
+ 			# Removes tickets.
+ 			if len(unBanList):
+ 				if len(unBanList) / 2.0 <= len(self.__banList) / 3.0:
+
+
+
+
+@@ -177,25 +177,27 @@ class ExecuteActions(LogCaptureTestCase):
+ 	@with_alt_time
+ 	def testUnbanOnBusyBanBombing(self):
+ 		# check unban happens in-between of "ban bombing" despite lower precedence,
+-		# if it is not work, we'll see "Unbanned 25" earliest at flushing (after stop)
++		# if it is not work, we'll not see "Unbanned 30" (rather "Unbanned 50")
++		# because then all the unbans occur earliest at flushing (after stop)
+ 
+-		# each 3rd ban we should see an unban check (and tickets gets unbanned):
++		# each 3rd ban we should see an unban check (and up to 5 tickets gets unbanned):
+ 		self.__actions.banPrecedence = 3
++		self.__actions.unbanMaxCount = 5
+ 		self.__actions.setBanTime(100)
+ 
+ 		self.__actions.start()
+ 
+ 		MyTime.setTime(0); # avoid "expired bantime" (in 0.11)
+ 		i = 0
+-		while i < 25:
++		while i < 20:
+ 			ip = "192.0.2.%d" % i
+ 			self.__jail.putFailTicket(FailTicket(ip, 0))
+ 			i += 1
+ 
+-		# wait for last ban (all 25 tickets gets banned):
+-		self.assertLogged(' / 25,', wait=True)
++		# wait for last ban (all 20 tickets gets banned):
++		self.assertLogged(' / 20,', wait=True)
+ 
+-		MyTime.setTime(200); # unban time for 25 tickets reached
++		MyTime.setTime(200); # unban time for 20 tickets reached
+ 
+ 		while i < 50:
+ 			ip = "192.0.2.%d" % i
+@@ -207,5 +

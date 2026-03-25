@@ -1,0 +1,134 @@
+@@ -2719,6 +2719,7 @@ static void __foreach(RCore *core, const char **cmds, int type) {
+ }
+ 
+ static void __init_autocomplete_default(RCore* core) {
++	// TODO: if we sort those strings alphabetically we can probably break earlier
+ 	const char *fcns[] = {
+ 		"afi", "afcf", "afn", "afm", NULL
+ 	};
+
+
+
+
+@@ -26,6 +26,18 @@ typedef struct r_lang_t {
+ 
+ typedef struct r_lang_session_t _RLangSession;
+ 
++#if R2_590
++typedef bool (*RLangPluginInit)(_RLangSession *s);
++#else
++typedef void *(*RLangPluginInit)(_RLangSession *s);
++#endif
++typedef bool (*RLangPluginSetup)(_RLangSession *s);
++typedef bool (*RLangPluginFini)(_RLangSession *s);
++typedef bool (*RLangPluginPrompt)(_RLangSession *s);
++typedef bool (*RLangPluginRun)(_RLangSession *s, const char *code, int len);
++typedef bool (*RLangPluginRunFile)(_RLangSession *s, const char *file);
++typedef int (*RLangPluginSetArgv)(_RLangSession *s, int argc, char **argv);
++
+ typedef struct r_lang_plugin_t {
+ 	const char *name;
+ 	const char *alias;
+@@ -35,13 +47,13 @@ typedef struct r_lang_plugin_t {
+ 	const char *license;
+ 	const char **help;
+ 	const char *ext;
+-	void *(*init)(_RLangSession *s);
+-	bool (*setup)(_RLangSession *s);
+-	bool (*fini)(_RLangSession *s);
+-	bool (*prompt)(_RLangSession *s);
+-	bool (*run)(_RLangSession *s, const char *code, int len);
+-	bool (*run_file)(_RLangSession *s, const char *file);
+-	int (*set_argv)(_RLangSession *s, int argc, char **argv);
++	RLangPluginInit init;
++	RLangPluginSetup setup;
++	RLangPluginFini fini;
++	RLangPluginPrompt prompt;
++	RLangPluginRun run;
++	RLangPluginRunFile run_file;
++	RLangPluginSetArgv set_argv;
+ } RLangPlugin;
+ 
+ typedef struct r_lang_def_t {
+
+
+
+
+@@ -151,14 +151,18 @@ R_API bool r_lang_setup(RLang *lang) {
+ 
+ R_API bool r_lang_add(RLang *lang, RLangPlugin *foo) {
+ 	if (foo && (!r_lang_get_by_name (lang, foo->name))) {
+-#if 0
+-		// we want an init when adding the plugin
++		bool supported = true;
+ 		if (foo->init) {
+-			foo->init (lang);
++			// when init takes null, we just check if
++			// the system is capable to use the plugin
++			// otherwise we can use the session info
++			// to initialize the internal plugin state
++			supported = foo->init (NULL);
++		}
++		if (supported) {
++			r_list_append (lang->langs, foo);
++			return true;
+ 		}
+-#endif
+-		r_list_append (lang->langs, foo);
+-		return true;
+ 	}
+ 	return false;
+ }
+@@ -252,7 +256,12 @@ R_API RLangSession *r_lang_session(RLang *lang, RLangPlugin *h) {
+ 		session->lang = lang;
+ 		session->plugin = h;
+ 		if (h->init) {
+-			session->plugin_data = h->init (session);
++			// session->plugin_data = h->init (session);
++			if (!h->init (session)) {
++				R_LOG_ERROR ("Cannot initialize plugin for this rlang session");
++				free (session);
++				return NULL;
++			}
+ 		}
+ 	}
+ 	return session;
+@@ -277,7 +286,7 @@ R_API bool r_lang_unuse(RLang *lang) {
+ R_API bool r_lang_use_plugin(RLang *lang, RLangPlugin *h) {
+ 	r_return_val_if_fail (lang && h, false);
+ 	RListIter *iter;
+-	RLangSession *s;
++	RLangSession *s = NULL;
+ 	r_list_foreach (lang->sessions, iter, s) {
+ 		if (h == s->plugin) {
+ 			lang->session = s;
+
+
+
+
+@@ -54,9 +54,15 @@ static int lang_c_file(RLangSession *s, const char *file) {
+ 	char *file_esc = r_str_escape_sh (file);
+ 	char *libpath_esc = r_str_escape_sh (libpath);
+ 	char *libname_esc = r_str_escape_sh (libname);
++#if 0
++	char *buf = r_str_newf ("%s -fPIC -g -shared \"%s\" -o \"%s/lib%s." R_LIB_EXT "\""
++		" $(PKG_CONFIG_PATH=%s pkg-config --cflags --libs r_core)",
++		cc, file_esc, libpath_esc, libname_esc, R2_LIBDIR "/pkgconfig");
++#else
+ 	char *buf = r_str_newf ("%s -fPIC -shared \"%s\" -o \"%s/lib%s." R_LIB_EXT "\""
+ 		" $(PKG_CONFIG_PATH=%s pkg-config --cflags --libs r_core)",
+ 		cc, file_esc, libpath_esc, libname_esc, R2_LIBDIR "/pkgconfig");
++#endif
+ 	free (libname_esc);
+ 	free (libpath_esc);
+ 	free (file_esc);
+
+
+
+
+@@ -47,11 +47,19 @@ static bool lang_nim_run(RLangSession *s, const char *code, int len) {
+ 	return rv;
+ }
+ 
++static void *lang_nim_init(RLangSession *s) {
++	char *nim =

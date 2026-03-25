@@ -1,0 +1,100 @@
+@@ -41,6 +41,7 @@ from vulnerabilities.pipelines import npm_importer
+ from vulnerabilities.pipelines import nvd_importer
+ from vulnerabilities.pipelines import pypa_importer
+ from vulnerabilities.pipelines import pysec_importer
++from vulnerabilities.pipelines.v2_importers import alpine_linux_importer as alpine_linux_importer_v2
+ from vulnerabilities.pipelines.v2_importers import aosp_importer as aosp_importer_v2
+ from vulnerabilities.pipelines.v2_importers import apache_httpd_importer as apache_httpd_v2
+ from vulnerabilities.pipelines.v2_importers import apache_kafka_importer as apache_kafka_importer_v2
+@@ -109,6 +110,7 @@ IMPORTERS_REGISTRY = create_registry(
+         mattermost_importer_v2.MattermostImporterPipeline,
+         apache_tomcat_v2.ApacheTomcatImporterPipeline,
+         ubuntu_osv_importer_v2.UbuntuOSVImporterPipeline,
++        alpine_linux_importer_v2.AlpineLinuxImporterPipeline,
+         nvd_importer.NVDImporterPipeline,
+         github_importer.GitHubAPIImporterPipeline,
+         gitlab_importer.GitLabImporterPipeline,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,296 @@
++#
++# Copyright (c) nexB Inc. and others. All rights reserved.
++# VulnerableCode is a trademark of nexB Inc.
++# SPDX-License-Identifier: Apache-2.0
++# See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
++# See https://github.com/aboutcode-org/vulnerablecode for support or download.
++# See https://aboutcode.org for more information about nexB OSS projects.
++#
++
++import logging
++from typing import Any
++from typing import Iterable
++from typing import List
++from typing import Mapping
++from urllib.parse import urljoin
++
++from bs4 import BeautifulSoup
++from packageurl import PackageURL
++from univers.version_range import AlpineLinuxVersionRange
++from univers.versions import InvalidVersion
++
++from vulnerabilities.importer import AdvisoryData
++from vulnerabilities.importer import AffectedPackageV2
++from vulnerabilities.importer import ReferenceV2
++from vulnerabilities.pipelines import VulnerableCodeBaseImporterPipeline
++from vulnerabilities.references import WireSharkReferenceV2
++from vulnerabilities.references import XsaReferenceV2
++from vulnerabilities.references import ZbxReferenceV2
++from vulnerabilities.utils import fetch_response
++
++
++class AlpineLinuxImporterPipeline(VulnerableCodeBaseImporterPipeline):
++    """Collect Alpine Linux advisories."""
++
++    pipeline_id = "alpine_linux_importer_v2"
++
++    spdx_license_expression = "CC-BY-SA-4.0"
++    license_url = "https://secdb.alpinelinux.org/license.txt"
++    url = "https://secdb.alpinelinux.org/"
++    importer_name = "Alpine Linux Importer"
++
++    @classmethod
++    def steps(cls):
++        return (cls.collect_and_store_advisories,)
++
++    def advisories_count(self) -> int:
++        return 0
++
++    def collect_advisories(self) -> Iterable[AdvisoryData]:
++        page_response_content = fetch_response(self.url).content
++        advisory_directory_links = fetch_advisory_directory_links(
++            page_response_content, self.url, self.log
++        )
++        advisory_links = []
++        for advisory_directory_link in advisory_directory_links:
++            advisory_directory_page = fetch_response(advisory_directory_link).content
++            advisory_links.extend(
++                fetch_advisory_links(advisory_directory_page, advisory_directory_link, self.log)
++            )
++        for link in advisory_links:
++            record = fetch_response(link).json()
++            if not record["packages"]:
++                self.log(
++                    f'"packages" not found in {link!r}',
++                    level=logging.DEBUG,
++                )
++                continue
++            yield from process_record(record=record, url=link, logger=self.log)
++
++
++def fetch_advisory_directory_links(
++    page_response_content: str,
++    base_url: str,
++    logger: callable = None,
++) -> List[str]:
++    """
++    Return a list of advisory directory links present in `page_response_content` html string
++    

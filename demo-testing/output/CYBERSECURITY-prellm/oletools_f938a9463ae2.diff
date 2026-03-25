@@ -1,0 +1,116 @@
+@@ -51,6 +51,7 @@ import re
+ import sys
+ import io
+ from zipfile import is_zipfile
++import random
+ 
+ import olefile
+ 
+@@ -230,6 +231,12 @@ BLACKLISTED_RELATIONSHIP_TYPES = [
+     'worksheet'
+ ]
+ 
++# Save maximum length of a filename
++MAX_FILENAME_LENGTH = 255
++
++# Max attempts at generating a non-existent random file name
++MAX_FILENAME_ATTEMPTS = 100
++
+ # === FUNCTIONS ===============================================================
+ 
+ 
+@@ -494,11 +501,40 @@ class OleObject(object):
+             self.extra_data = data[index+self.data_size:]
+ 
+ 
+-def sanitize_filename(filename, replacement='_', max_length=200):
+-    """compute basename of filename. Replaces all non-whitelisted characters.
+-       The returned filename is always a ascii basename of the file."""
++def shorten_filename(fname, max_len):
++    """Create filename shorter than max_len, trying to preserve suffix."""
++    # simple cases:
++    if not max_len:
++        return fname
++    name_len = len(fname)
++    if name_len < max_len:
++        return fname
++
++    idx = fname.rfind('.')
++    if idx == -1:
++        return fname[:max_len]
++
++    suffix_len = name_len - idx  # length of suffix including '.'
++    if suffix_len > max_len:
++        return fname[:max_len]
++
++    # great, can preserve suffix
++    return fname[:max_len-suffix_len] + fname[idx:]
++
++
++def sanitize_filename(filename, replacement='_',
++                      max_len=MAX_FILENAME_LENGTH):
++    """
++    Return filename that is save to work with.
++
++    Removes path components, replaces all non-whitelisted characters (so output
++    is always a pure-ascii string), replaces '..' and '  ' and shortens to
++    given max length, trying to preserve suffix.
++
++    Might return empty string
++    """
+     basepath = os.path.basename(filename).strip()
+-    sane_fname = re.sub(u'[^a-zA-Z0-9.\\-_ ]', replacement, basepath)
++    sane_fname = re.sub(u'[^a-zA-Z0-9.\-_ ]', replacement, basepath)
+     sane_fname = str(sane_fname)    # py3: does nothing;   py2: unicode --> str
+ 
+     while ".." in sane_fname:
+@@ -507,14 +543,71 @@ def sanitize_filename(filename, replacement='_', max_length=200):
+     while "  " in sane_fname:
+         sane_fname = sane_fname.replace('  ', ' ')
+ 
+-    if not filename:
+-        sane_fname = 'NONAME'
++    # limit filename length, try to preserve suffix
++    return shorten_filename(sane_fname, max_len)
++
+ 
+-    # limit filename length
+-    if max_length:
+-        sane_fname = sane_fname[:max_length]
++def get_sane_embedded_filenames(filename, src_path, tmp_path, max_len,
++                                noname_index):
++    """
++    Get some sane filenames out of path information, preserving file suffix.
++
++    Returns several canddiates, first with suffix, then without, then random
++    with suffix and finally one last attempt ignoring max_len using arg
++    `noname_index`.
++
++    In some malware examples, filename (on which we relied sofar exclusively
++    for this) is empty or " ", but src_path and tmp_path contain paths with
++    proper file names. Try to extract filename from any of those.
++
++    Preservation of suffix is especially important since that controls how
++    windoze treats the file.
++    """
++    suffixes = []
++    candidates_without_suffix = []  # remember these as fallback
++    for candidate in (filename, src_path, tmp_path):
++        # remove path component. Could be from linux, mac or windows
++        idx = max(candidate.rfind('/'), candidate.rfind('\\'))
++        candidate = candidate[idx+1:].strip()
++
++        # sanitize
++        candidate = sanitize_filename(candidate, max_len=max_len)
++
++        if not candidate:
++            continue    # skip whitespace-only
++
++        # identify suffix. Dangerous suffixes are all short
++        idx = candidate.rfind('.')
++        if idx is -1:
++            candidates_without_suffix.append(candidate)
++            continue
++        elif idx < len(candidate)-5:
++            candidates_without_suffix.append(candidate)
++            continue

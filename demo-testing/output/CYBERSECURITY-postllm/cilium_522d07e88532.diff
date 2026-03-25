@@ -1,0 +1,133 @@
+@@ -1156,8 +1156,10 @@ do_netdev(struct __ctx_buff *ctx, __u16 proto, __u32 __maybe_unused identity,
+ 			next_proto = ip6->nexthdr;
+ 			hdrlen = ipv6_hdrlen(ctx, &next_proto);
+ 			if (likely(hdrlen > 0) &&
+-			    ctx_is_wireguard(ctx, ETH_HLEN + hdrlen, next_proto, ipcache_srcid))
++			    ctx_is_wireguard(ctx, ETH_HLEN + hdrlen, next_proto, ipcache_srcid)) {
+ 				trace.reason = TRACE_REASON_ENCRYPTED;
++				set_decrypt_mark(ctx, 0);
++			}
+ 		}
+ # endif /* ENABLE_WIREGUARD */
+ 
+@@ -1199,8 +1201,10 @@ do_netdev(struct __ctx_buff *ctx, __u16 proto, __u32 __maybe_unused identity,
+ 		if (!from_host) {
+ 			next_proto = ip4->protocol;
+ 			hdrlen = ipv4_hdrlen(ip4);
+-			if (ctx_is_wireguard(ctx, ETH_HLEN + hdrlen, next_proto, ipcache_srcid))
++			if (ctx_is_wireguard(ctx, ETH_HLEN + hdrlen, next_proto, ipcache_srcid)) {
+ 				trace.reason = TRACE_REASON_ENCRYPTED;
++				set_decrypt_mark(ctx, 0);
++			}
+ 		}
+ #endif /* ENABLE_WIREGUARD */
+ 
+
+
+
+
+@@ -56,6 +56,15 @@ static __always_inline __u8 get_min_encrypt_key(__u8 peer_key __maybe_unused)
+ #endif /* ENABLE_IPSEC */
+ }
+ 
++#if defined(ENABLE_IPSEC) || defined(ENABLE_WIREGUARD)
++static __always_inline void
++set_decrypt_mark(struct __ctx_buff *ctx, __u16 node_id)
++{
++	/* Decrypt "key" is determined by SPI and originating node */
++	ctx->mark = MARK_MAGIC_DECRYPT | node_id << 16;
++}
++#endif /* defined(ENABLE_IPSEC) || defined(ENABLE_WIREGUARD) */
++
+ #ifdef ENABLE_IPSEC
+ /**
+  * or_encrypt_key - mask and shift key into encryption format
+@@ -71,13 +80,6 @@ ipsec_encode_encryption_mark(__u8 key, __u32 node_id)
+ 	return or_encrypt_key(key) | node_id << 16;
+ }
+ 
+-static __always_inline void
+-set_ipsec_decrypt_mark(struct __ctx_buff *ctx, __u16 node_id)
+-{
+-	/* Decrypt "key" is determined by SPI and originating node */
+-	ctx->mark = MARK_MAGIC_DECRYPT | node_id << 16;
+-}
+-
+ static __always_inline int
+ set_ipsec_encrypt(struct __ctx_buff *ctx, struct remote_endpoint_info *info,
+ 		  __u32 seclabel, bool use_meta)
+@@ -159,7 +161,7 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
+ 		if (!node_id)
+ 			return send_drop_notify_error(ctx, UNKNOWN_ID, DROP_NO_NODE_ID,
+ 						      METRIC_INGRESS);
+-		set_ipsec_decrypt_mark(ctx, node_id);
++		set_decrypt_mark(ctx, node_id);
+ 
+ 		/* We are going to pass this up the stack for IPsec decryption
+ 		 * but eth_type_trans may already have labeled this as an
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,550 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#define NODE_ID 7
++#define ENABLE_IPV4
++#define ENABLE_IPV6
++#define ENABLE_WIREGUARD
++#define CLUSTER_IDENTITY 0x5555
++#define ENABLE_NODE_ENCRYPTION
++
++#include <bpf/ctx/skb.h>
++#include "common.h"
++#include "pktgen.h"
++
++#include "lib/bpf_host.h"
++
++#include "lib/node.h"
++
++ASSIGN_CONFIG(__u16, wg_port, 51871)
++
++/* these tests validate that a real wireguard packet is handled properly
++ * we expect the packet to not be modified, and to be passed up the stack with
++ * the MARK_MAGIC_DECRYPT mark in skb->mark.
++ * conditions:
++ *  - udp packet
++ *  - source and dest ports == $wg_port
++ *  - source node with a valid identity in the cluster
++ */
++PKTGEN("tc", "ipv4_not_decrypted_wireguard_from_netdev")
++int ipv4_not_decrypted_wireguard_from_netdev_pktgen(struct __ctx_buff *ctx)
++{
++	struct pktgen builder;
++	struct udphdr *l4;
++
++	pktgen__init(&builder, ctx);
++
++	l4 = pktgen__push_ipv4_udp_packet(&builder,
++					  (__u8 *)mac_one,
++					       (__u8 *)mac_two,
++					       v4_node_one,
++					       v4_node_two,
++					       bpf_htons(CONFIG(wg_port)),
++					       bpf_htons(CONFIG(wg_port)));
++
++	if (!l4)
++		return TEST_ERROR;
++
++	pktgen__finish(&builder);
++	return 0;
++}
++
++SETUP("tc", "ipv4_not_decrypted_wireguard_from_netdev")
++int ipv4_not_decrypted_wireguard_from_netdev_setup(struct __ctx_buff *ctx)
++{
++	/* We need to populate the node ID map because we'll lookup into it on
++	 * ingress to validate the source
++	 */
++	node_v4_add_entry(v4_node_one, NODE_ID, 1);
++
++	return 

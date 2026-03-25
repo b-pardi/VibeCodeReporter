@@ -1,0 +1,157 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,23 @@
++/*
++ * altivec-types.h - shorter vector typedefs
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef _ALTIVEC_TYPES_H_
++#define _ALTIVEC_TYPES_H_ 1
++
++#include <altivec.h>
++
++typedef __vector unsigned char vec_u8;
++typedef __vector signed char vec_s8;
++typedef __vector unsigned short vec_u16;
++typedef __vector signed short vec_s16;
++typedef __vector unsigned int vec_u32;
++typedef __vector signed int vec_s32;
++typedef __vector unsigned long long vec_u64;
++typedef __vector signed long long vec_s64;
++typedef __vector float vec_f;
++
++#endif
+
+
+
+
+@@ -86,5 +86,6 @@ PRBool arm_aes_support();
+ PRBool arm_pmull_support();
+ PRBool arm_sha1_support();
+ PRBool arm_sha2_support();
++PRBool ppc_crypto_support();
+ 
+ #endif /* _BLAPII_H_ */
+
+
+
+
+@@ -29,6 +29,7 @@ static PRBool arm_aes_support_ = PR_FALSE;
+ static PRBool arm_sha1_support_ = PR_FALSE;
+ static PRBool arm_sha2_support_ = PR_FALSE;
+ static PRBool arm_pmull_support_ = PR_FALSE;
++static PRBool ppc_crypto_support_ = PR_FALSE;
+ 
+ #ifdef NSS_X86_OR_X64
+ /*
+@@ -348,6 +349,32 @@ arm_sha2_support()
+ {
+     return arm_sha2_support_;
+ }
++PRBool
++ppc_crypto_support()
++{
++    return ppc_crypto_support_;
++}
++
++#if defined(__powerpc__)
++
++#include <sys/auxv.h>
++
++// Defines from cputable.h in Linux kernel - PPC, letting us build on older kernels
++#ifndef PPC_FEATURE2_VEC_CRYPTO
++#define PPC_FEATURE2_VEC_CRYPTO         0x02000000
++#endif
++
++static void
++CheckPPCSupport()
++{
++    char *disable_hw_crypto = PR_GetEnvSecure("NSS_DISABLE_PPC_GHASH");
++
++    long hwcaps = getauxval(AT_HWCAP2);
++
++    ppc_crypto_support_ = hwcaps & PPC_FEATURE2_VEC_CRYPTO && disable_hw_crypto == NULL;
++}
++
++#endif /* __powerpc__ */
+ 
+ static PRStatus
+ FreeblInit(void)
+@@ -356,6 +383,8 @@ FreeblInit(void)
+     CheckX86CPUSupport();
+ #elif (defined(__aarch64__) || defined(__arm__))
+     CheckARMSupport();
++#elif (defined(__powerpc__))
++    CheckPPCSupport();
+ #endif
+     return PR_SUCCESS;
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,106 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifdef FREEBL_NO_DEPEND
++#include "stubs.h"
++#endif
++#include "gcm.h"
++#include "secerr.h"
++
++#if defined(USE_PPC_CRYPTO)
++
++SECStatus
++gcm_HashWrite_hw(gcmHashContext *ghash, unsigned char *outbuf)
++{
++    vec_xst_be((vec_u8) ghash->x, 0, outbuf);
++    return SECSuccess;
++}
++
++static vec_u64 vpmsumd(const vec_u64 a, const vec_u64 b)
++{
++#if defined(__clang__)
++    /* Clang uses a different name */
++    return __builtin_altivec_crypto_vpmsumd(a, b);
++#elif (__GNUC__ >= 10) || (__GNUC__ == 9 && __GNUC_MINOR__ >= 3) || \
++      (__GNUC__ == 8 && __GNUC_MINOR__ >= 4) || \
++      (__GNUC__ == 7 && __GNUC_MINOR__ >= 5)
++   /* GCC versions not affected by https://gcc.gnu.org/bugzilla/show_bug.cgi?id=91275 */
++   return __builtin_crypto_vpmsumd(a, b);
++#else
++   /* GCC versions where this builtin is buggy */
++   vec_u64 vr;
++   __asm("vpmsumd %0, %1, %2" : "=v"(vr) : "v"(a), "v"(b));
++   return vr;
++#endif
++}
++
++SECStatus
++gcm_HashMult_hw(gcmHashContext *ghash, const unsigned char *buf,
++                unsigned int count)
++{
++    const vec_u8 leftshift = vec_splat_u8(1);
++    const vec_u64 onebit = (vec_u64) {1, 0};
++    const unsigned long long pd = 0xc2LLU << 56;
++
++    vec_u64 ci, v, r0, r1;
++    vec_u64 hibit;
++    unsigned i;
++
++    ci = ghash->x;
++
++    for (i = 0; i < count; i++, buf += 16) {
++        /* clang needs the following cast away from const; maybe a bug in 7.0.0 */
++        v = (vec_u64) vec_xl_be(0, (unsigned char *) buf);
++        ci ^= v;
++
++        /* Do binary mult ghash->X = C * ghash->H (Karatsuba). */
++        r0 = vpmsumd((vec_u64) {ci[0], 0}, (vec_u64) {gha

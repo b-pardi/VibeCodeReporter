@@ -1,0 +1,134 @@
+@@ -89,6 +89,7 @@ class Pk11KeyImportTestBase : public ::testing::Test {
+         return pub_key->u.dh.publicValue;
+       case ecKey:
+       case edKey:
++      case ecMontKey:
+         return pub_key->u.ec.publicValue;
+       case kyberKey:
+         return pub_key->u.kyber.publicValue;
+
+
+
+
+@@ -149,6 +149,10 @@ std::unique_ptr<ParamHolder> Pkcs11KeyPairGenerator::MakeParams() const {
+       return std::unique_ptr<ParamHolder>(
+           new EcParamHolder(SEC_OID_ED25519_PUBLIC_KEY));
+ 
++    case CKM_EC_MONTGOMERY_KEY_PAIR_GEN:
++      std::cerr << "Generate X25519 pair on " << curve_ << std::endl;
++      return std::unique_ptr<ParamHolder>(new EcParamHolder(SEC_OID_X25519));
++
+     case CKM_EC_KEY_PAIR_GEN:
+       std::cerr << "Generate EC pair on " << curve_ << std::endl;
+       return std::unique_ptr<ParamHolder>(new EcParamHolder(curve_));
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,345 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include <memory>
++#include "nss.h"
++
++#include "json_reader.h"
++#include "nss_scoped_ptrs.h"
++
++#include "cpputil.h"
++#include "pk11_x25519_vectors.h"
++#include "pk11_signature_test.h"
++#include "pk11_keygen.h"
++
++namespace nss_test {
++
++// For test vectors.
++struct Pkcs11X25519ImportParams {
++  const DataBuffer pkcs8_;
++  const DataBuffer spki_;
++};
++
++static const Pkcs11X25519ImportParams kX25519Vectors[] = {
++    {
++        DataBuffer(kX25519Pkcs8_1, sizeof(kX25519Pkcs8_1)),
++        DataBuffer(kX25519Spki_1, sizeof(kX25519Spki_1)),
++    },
++};
++
++class Pkcs11X25519Test
++    : public ::testing::Test,
++      public ::testing::WithParamInterface<Pkcs11X25519ImportParams> {
++ protected:
++  ScopedSECKEYPrivateKey ImportPrivateKey(const DataBuffer& pkcs8) {
++    ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
++    if (!slot) {
++      ADD_FAILURE() << "No slot";
++      return nullptr;
++    }
++
++    SECItem pkcs8Item = {siBuffer, toUcharPtr(pkcs8.data()),
++                         static_cast<unsigned int>(pkcs8.len())};
++
++    SECKEYPrivateKey* key = nullptr;
++    SECStatus rv = PK11_ImportDERPrivateKeyInfoAndReturnKey(
++        slot.get(), &pkcs8Item, nullptr, nullptr, false, false, KU_ALL, &key,
++        nullptr);
++
++    if (rv != SECSuccess) {
++      return nullptr;
++    }
++
++    return ScopedSECKEYPrivateKey(key);
++  }
++
++  bool ExportPrivateKey(ScopedSECKEYPrivateKey* key, DataBuffer& pkcs8) {
++    ScopedSECItem pkcs8Item(PK11_ExportDERPrivateKeyInfo(key->get(), nullptr));
++    if (!pkcs8Item) {
++      return false;
++    }
++    pkcs8.Assign(pkcs8Item->data, pkcs8Item->len);
++    return true;
++  }
++
++  ScopedSECKEYPublicKey ImportPublicKey(const DataBuffer& spki) {
++    SECItem spkiItem = {siBuffer, toUcharPtr(spki.data()),
++                        static_cast<unsigned int>(spki.len())};
++
++    ScopedCERTSubjectPublicKeyInfo certSpki(
++        SECKEY_DecodeDERSubjectPublicKeyInfo(&spkiItem));
++    if (!certSpki) {
++      return nullptr;
++    }
++
++    return ScopedSECKEYPublicKey(SECKEY_ExtractPublicKey(certSpki.get()));
++  }
++
++  bool CheckAlgIsX25519(SECItem* algorithm) {
++    SECOidTag tag = SECOID_FindOIDTag(algorithm);
++    if (tag != SEC_OID_X25519) {
++      return false;
++    }
++
++    return true;
++  }
++};
++
++TEST_P(Pkcs11X25519Test, ImportExportPkcs8) {
++  DataBuffer exported;
++  ScopedSECKEYPrivateKey key = ImportPrivateKey(GetParam().pkcs8_);
++  EXPECT_EQ(key.get()->keyType, ecMontKey);
++
++  SECKEYPrivateKeyInfo* pkInfo = PK11_ExportPrivKeyInfo(key.get(), nullptr);
++  ASSERT_TRUE(pkInfo);
++  /* empty parameters for X25519*/
++  ASSERT_EQ(pkInfo->algorithm.parameters.len, (unsigned int)0);
++  ASSERT_TRUE(CheckAlgIsX25519(&pkInfo->algorithm.algorithm));
++  ExportPrivateKey(&key, exported);
++  EXPECT_EQ(GetParam().pkcs8_, exported);
++
++  SECKEY_DestroyPrivateKeyInfo(pkInfo, PR_TRUE);
++}
++
++TEST_P(Pkcs11X25519Test, ImportExportSpki)

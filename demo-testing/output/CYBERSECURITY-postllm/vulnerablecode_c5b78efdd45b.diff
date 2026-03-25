@@ -1,0 +1,96 @@
+@@ -31,6 +31,7 @@ from vulnerabilities.models import AdvisoryV2
+ from vulnerabilities.models import AdvisoryWeakness
+ from vulnerabilities.models import CodeFix
+ from vulnerabilities.models import CodeFixV2
++from vulnerabilities.models import ImpactedPackage
+ from vulnerabilities.models import Package
+ from vulnerabilities.models import PackageV2
+ from vulnerabilities.models import PipelineRun
+@@ -320,36 +321,28 @@ class AdvisoryPackageV2Serializer(serializers.ModelSerializer):
+             "risk_score",
+         ]
+ 
+-    def get_affected_by_vulnerabilities(self, obj):
+-        """
+-        Return a dictionary with vulnerabilities as keys and their details, including fixed_by_packages.
+-        """
++    def get_affected_by_vulnerabilities(self, package):
++        """Return a dictionary with advisory as keys and their details, including fixed_by_packages."""
+         result = {}
+         request = self.context.get("request")
+-        for adv in getattr(obj, "prefetched_affected_advisories", []):
+-            fixed_by_package = adv.fixed_by_packages.first()
+-            purl = None
+-            if fixed_by_package:
+-                purl = fixed_by_package.package_url
+-            # Get code fixed for a vulnerability
+-            code_fixes = CodeFixV2.objects.filter(advisory=adv).distinct()
++        for impact in package.affected_in_impacts.all():
++            advisory = impact.advisory
++            fixed_by_packages = [pkg.purl for pkg in impact.fixed_by_packages.all()]
++            code_fixes = CodeFixV2.objects.filter(advisory=advisory).distinct()
+             code_fix_urls = [
+                 reverse("advisory-codefix-detail", args=[code_fix.id], request=request)
+                 for code_fix in code_fixes
+             ]
+-
+-            result[adv.avid] = {
+-                "advisory_id": adv.avid,
+-                "fixed_by_packages": purl,
++            result[advisory.avid] = {
++                "advisory_id": advisory.avid,
++                "fixed_by_packages": fixed_by_packages,
+                 "code_fixes": code_fix_urls,
+             }
++
+         return result
+ 
+-    def get_fixing_vulnerabilities(self, obj):
+-        # Ghost package should not fix any vulnerability.
+-        if obj.is_ghost:
+-            return []
+-        return [adv.avid for adv in obj.fixing_advisories.all()]
++    def get_fixing_vulnerabilities(self, package):
++        return [impact.advisory.avid for impact in package.fixed_in_impacts.all()]
+ 
+ 
+ class PackageurlListSerializer(serializers.Serializer):
+@@ -968,12 +961,21 @@ class PipelineScheduleV2ViewSet(CreateListRetrieveUpdateViewSet):
+ 
+ 
+ class AdvisoriesPackageV2ViewSet(viewsets.ReadOnlyModelViewSet):
+-    queryset = PackageV2.objects.all().prefetch_related(
+-        Prefetch(
+-            "affected_by_advisories",
+-            queryset=AdvisoryV2.objects.prefetch_related("fixed_by_packages"),
+-            to_attr="prefetched_affected_advisories",
++    queryset = (
++        PackageV2.objects.all()
++        .prefetch_related(
++            Prefetch(
++                "affected_in_impacts",
++                queryset=ImpactedPackage.objects.select_related("advisory").prefetch_related(
++                    "fixed_by_packages",
++                ),
++            ),
++            Prefetch(
++                "fixed_in_impacts",
++                queryset=ImpactedPackage.objects.select_related("advisory"),
++            ),
+         )
++        .with_is_vulnerable()
+     )
+     serializer_class = AdvisoryPackageV2Serializer
+     filter_backends = (filters.DjangoFilterBackend,)
+@@ -994,14 +996,13 @@ class AdvisoriesPackageV2ViewSet(viewsets.ReadOnlyModelViewSet):
+ 
+     def list(self, request, *args, **kwargs):
+         queryset = self.get_queryset()
+-        # Apply pagination
+         page = self.paginate_queryset(queryset)
++
++        advisories = set()
+         if page is not None:
+-            # Collect only vulnerabilities for packages in the current page
+-            advisories = set()
+             for pa

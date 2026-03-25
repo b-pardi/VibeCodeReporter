@@ -1,0 +1,127 @@
+@@ -71,7 +71,6 @@ typedef dpl_status_t (*dpl_buffer_func_t)(void *cb_arg, char *buf, unsigned int
+ 
+ /* PROTO httpreply.c */
+ /* src/httpreply.c */
+-dpl_status_t dpl_read_http_reply_buffered(dpl_conn_t *conn, int expect_data, int *http_statusp, dpl_header_func_t header_func, dpl_buffer_func_t buffer_func, void *cb_arg);
+ int dpl_connection_close(dpl_dict_t *headers_returned);
+ char *dpl_location(dpl_dict_t *headers_returned);
+ dpl_status_t dpl_map_http_status(int http_status);
+
+
+
+
+@@ -112,6 +112,12 @@ read_line_init(dpl_conn_t *conn)
+   conn->read_buf_pos = 1;
+   conn->cc = 1;
+   conn->eof = 0;
++
++  struct timeval tv;
++  tv.tv_sec = conn->ctx->read_timeout;
++  tv.tv_usec = 0;
++
++  setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+ }
+ 
+ /**
+@@ -126,7 +132,7 @@ read_line_init(dpl_conn_t *conn)
+ static char *
+ read_line(dpl_conn_t *conn)
+ {
+-  int		size, line_pos, found_nl, ret;
++  int		size, line_pos, found_nl;
+   char		*line, *tmp;
+ 
+   DPRINTF("read_line cc=%ld read_buf_pos=%d\n", conn->cc, conn->read_buf_pos);
+@@ -167,8 +173,8 @@ read_line(dpl_conn_t *conn)
+        * or we found a newline
+        */
+       while (conn->read_buf_pos < conn->cc &&
+-	     line_pos < conn->block_size * size &&
+-	     conn->read_buf[conn->read_buf_pos] != '\n')
++	           line_pos < conn->block_size * size &&
++	           conn->read_buf[conn->read_buf_pos] != '\n')
+         {
+           //DPRINTF("%c\n", conn->read_buf[conn->read_buf_pos]);
+ 
+@@ -176,80 +182,100 @@ read_line(dpl_conn_t *conn)
+         }
+ 
+       if (conn->read_buf_pos == conn->cc)
+-	{
+-	  /*
+-	   * current buf is totally read: read a new buf
+-	   */
++        {
++           // current buf is totally read: read a new buf
+ 
+           DPL_TRACE(conn->ctx, DPL_TRACE_IO, "read conn=%p https=%d size=%ld", conn, conn->ctx->use_https, conn->read_buf_size);
+ 
+-            {
+-              struct pollfd fds;
+-              int tries = 0;
+-
+-            retry:
+-              memset(&fds, 0, sizeof (fds));
+-              fds.fd = conn->fd;
+-              fds.events = POLLIN;
+-
+-              ++tries;
+-              ret = poll(&fds, 1, conn->ctx->read_timeout*1000);
+-              if (-1 == ret)
+-                {
+-                  if (tries < 3 && errno == EINTR)
+-                    goto retry;
+-                  free(line);
+-                  conn->status = DPL_ESYS;
+-                  return NULL;
+-                }
++          int ready = 0;
++          int error = 0;
++          int tries = 0;
+ 
+-              if (0 == ret)
++          while (!ready && !error)
++            {
++              if(++tries > 3)
+                 {
+-                  if (tries < 3)
+-                    goto retry;
+-                  free(line);
+                   conn->status = DPL_ETIMEOUT;
+-                  return NULL;
+-                }
+-              else if (!(fds.revents & POLLIN))
+-                {
+-                  free(line);
+-                  conn->status = DPL_ESYS;
+-                  return NULL;
++                  DPL_LOG(conn->ctx, DPL_ERROR,
++                    "Timed out waiting to read from server %s:%s",
++                    conn->host, conn->port);
++                  error = 1;
++                  continue;
+                 }
+ 
++              int ret;
++
+               if (0 == conn->ctx->use_https)
+                 {
+-                  conn->cc = read(conn->fd, conn->read_buf, conn->read_buf_size);
+-                  if (conn->cc == -1)
++                  errno = 0;
++
++                  ret = read(conn->fd, conn->read_buf, conn->read_buf_size);
++                  if (ret >= 0)
+                     {
+-                      free(line);
+-                      conn->status = DPL_EIO;
+-                      return NULL;
++                      conn->cc = ret;
++                      ready = 1;
++                    }
++                  else
++                    {
++                      switch(errno)
++                        {
++                          case EAGAIN:
++     

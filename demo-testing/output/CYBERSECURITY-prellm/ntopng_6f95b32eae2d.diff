@@ -1,0 +1,124 @@
+@@ -44,14 +44,14 @@ protected:
+   /* Read-only and shadow copy of the triggered alerts (that as usually empty/NULL) */
+     *rx_triggered_alerts[MAX_NUM_PERIODIC_SCRIPTS], *shadow_rx_triggered_alerts[MAX_NUM_PERIODIC_SCRIPTS];
+   u_int num_triggered_alerts;
+-  
++  bool force_shadow_refresh;
+   
+   void syncReadonlyTriggeredAlerts();
+   void updateNumTriggeredAlerts();
+   
+ public:
+   AlertableEntity(AlertEntity entity) {
+-    entity_type = entity, num_triggered_alerts = 0;
++    entity_type = entity, num_triggered_alerts = 0, force_shadow_refresh = false;
+ 
+     for(u_int i=0; i<MAX_NUM_PERIODIC_SCRIPTS; i++)
+       rx_triggered_alerts[i] = NULL, shadow_rx_triggered_alerts[i] = NULL;
+@@ -101,6 +101,13 @@ public:
+   void countAlerts(grouped_alerts_counters *counters);
+   void getAlerts(lua_State* vm, AlertType type_filter,
+ 		 AlertLevel severity_filter, u_int *idx);
++
++  inline void refreshAlerts() {
++    if(force_shadow_refresh) {
++      syncReadonlyTriggeredAlerts();
++      force_shadow_refresh = false;
++    }
++  }
+ };
+ 
+ #endif
+
+
+
+
+@@ -57,11 +57,12 @@ class LuaEngine {
+    */
+   ~LuaEngine();
+ 
+-
+   /* Set Hosts and Networks into the Lua context */
+   void setHost(Host* h);
+   void setNetwork(NetworkStats* ns);
+-  
++
++  inline Host* getHost()     { return(getLuaVMContext(L)->host); }
++  NetworkStats* getNetwork() { return(getLuaVMContext(L)->network); }
+   /**
+    * @brief Run a Lua script.
+    * @details Run a script from within ntopng. No HTTP GUI.
+
+
+
+
+@@ -83,5 +83,14 @@ bool AlertCheckLuaEngine::pcall(int num_args, int num_results) {
+     return(false);
+   }
+ 
++  /*
++    Refresh entity (if necessary): this guarantees that we do at most one
++    refresh per entity, regardless of the number of triggered alerts
++   */
++  if(getHost())
++    getHost()->refreshAlerts();
++  else if(getNetwork())
++    getNetwork()->refreshAlerts();
++  
+   return(true);
+ }
+
+
+
+
+@@ -28,7 +28,6 @@ void AlertableEntity::getExpiredAlerts(ScriptPeriodicity p, lua_State* vm, time_
+   std::map<std::string, Alert>::iterator it;
+   int seconds = Utils::periodicityToSeconds(p);
+   u_int idx = 0;
+-  bool modified = false;
+ 
+   for(it = triggered_alerts[(u_int)p].begin(); it != triggered_alerts[(u_int)p].end();) {
+     Alert *alert = &it->second;
+@@ -37,7 +36,7 @@ void AlertableEntity::getExpiredAlerts(ScriptPeriodicity p, lua_State* vm, time_
+       if(alert->is_disabled) {
+         /* The alert is disabled, remove it now.
+          * NOTE: do not increment again iterator after this assignment. */
+-        triggered_alerts[(u_int)p].erase(it++), modified = true;	
++        triggered_alerts[(u_int)p].erase(it++), force_shadow_refresh = true;	
+       } else {
+         lua_newtable(vm);
+ 
+@@ -51,8 +50,6 @@ void AlertableEntity::getExpiredAlerts(ScriptPeriodicity p, lua_State* vm, time_
+     } else
+       ++it;
+   }
+-
+-  if(modified) syncReadonlyTriggeredAlerts();
+ }
+ 
+ /* ****************************************** */
+@@ -81,7 +78,6 @@ bool AlertableEntity::triggerAlert(lua_State* vm, std::string key,
+ 				   bool alert_disabled) {
+   bool rv = false;
+   std::map<std::string, Alert>::iterator it = triggered_alerts[(u_int)p].find(key);
+-  bool modified = false;
+   
+   if(entity_val.empty()) {
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "setEntityValue() not called or empty entity_val");
+@@ -92,12 +88,12 @@ bool AlertableEntity::triggerAlert(lua_State* vm, std::string key,
+       /* Alert was not accounted but now enabled, so increase count */
+       it->second.is_disabled = false;
+       iface->incNumAlertsEngaged(p);
+-      modified = true;
++      force_shadow_refresh = true;
+     } else if(!it->second.is_disabled && alert_disabled) {
+-      /* Alert was accounted but and now disabled, so decresase count */
++      /* Alert was accounted but is now disabled, so decresase count */
+       it->second.is_disabled = true;
+       iface->decNumAlertsEngaged(p);
+-      modified = true;
++      force_shadow_refresh = true;
+     }
+ 
+     /* already present */
+@@ -118,7 +11

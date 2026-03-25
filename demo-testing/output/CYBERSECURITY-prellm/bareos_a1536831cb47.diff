@@ -1,0 +1,146 @@
+@@ -49,6 +49,8 @@
+ #include "lib/watchdog.h"
+ #include "lib/cli.h"
+ 
++#include "dird/reload.h"
++
+ #ifndef HAVE_REGEX_H
+ #  include "lib/bregex.h"
+ #else
+@@ -72,8 +74,6 @@ static
+     TerminateDird(int sig);
+ }  // namespace directordaemon
+ 
+-static bool CheckResources();
+-static bool InitializeSqlPooling(void);
+ static void CleanUpOldFiles();
+ static bool InitSighandlerSighup();
+ 
+@@ -484,296 +484,6 @@ static bool InitSighandlerSighup()
+   return retval;
+ }
+ 
+-namespace directordaemon {
+-bool DoReloadConfig()
+-{
+-  static bool is_reloading = false;
+-  bool reloaded = false;
+-
+-
+-  if (is_reloading) {
+-    /*
+-     * Note: don't use Jmsg here, as it could produce a race condition
+-     * on multiple parallel reloads
+-     */
+-    Qmsg(nullptr, M_ERROR, 0, _("Already reloading. Request ignored.\n"));
+-    return false;
+-  }
+-  is_reloading = true;
+-
+-  StopStatisticsThread();
+-
+-  LockJobs();
+-  LockRes(my_config);
+-
+-  DbSqlPoolFlush();
+-
+-  auto backup_table = my_config->BackupResourceTable();
+-  Dmsg0(100, "Reloading config file\n");
+-
+-
+-  my_config->err_type_ = M_ERROR;
+-  my_config->ClearWarnings();
+-  bool ok = my_config->ParseConfig();
+-
+-  // parse config successful
+-  if (ok && CheckResources() && CheckCatalog(UPDATE_CATALOG)
+-      && InitializeSqlPooling()) {
+-    Scheduler::GetMainScheduler().ClearQueue();
+-
+-    reloaded = true;
+-
+-    SetWorkingDirectory(me->working_directory);
+-    Dmsg0(10, "Director's configuration file reread successfully.\n");
+-    Dmsg0(10, "Releasing previous configuration resource table.\n");
+-
+-    StartStatisticsThread();
+-
+-  } else {  // parse config failed
+-    Jmsg(nullptr, M_ERROR, 0, _("Please correct the configuration in %s\n"),
+-         my_config->get_base_config_path().c_str());
+-
+-    Jmsg(nullptr, M_ERROR, 0, _("Resetting to previous configuration.\n"));
+-    my_config->RestoreResourceTable(std::move(backup_table));
+-    // me is changed above by CheckResources()
+-    me = (DirectorResource*)my_config->GetNextRes(R_DIRECTOR, nullptr);
+-    assert(me);
+-    my_config->own_resource_ = me;
+-
+-    StartStatisticsThread();
+-  }
+-
+-  UnlockRes(my_config);
+-  UnlockJobs();
+-  is_reloading = false;
+-  return reloaded;
+-}
+-
+-} /* namespace directordaemon */
+-
+-/*
+- * See if two storage definitions point to the same Storage Daemon.
+- *
+- * We compare:
+- *  - address
+- *  - SDport
+- *  - password
+- */
+-static inline bool IsSameStorageDaemon(StorageResource* store1,
+-                                       StorageResource* store2)
+-{
+-  return store1->SDport == store2->SDport
+-         && Bstrcasecmp(store1->address, store2->address)
+-         && Bstrcasecmp(store1->password_.value, store2->password_.value);
+-}
+-
+-/**
+- * Make a quick check to see that we have all the
+- * resources needed.
+- *
+- *  **** FIXME **** this routine could be a lot more
+- *   intelligent and comprehensive.
+- */
+-static bool CheckResources()
+-{
+-  bool OK = true;
+-  JobResource* job;
+-  const std::string& configfile = my_config->get_base_config_path();
+-
+-  LockRes(my_config);
+-
+-  job = (JobResource*)my_config->GetNextRes(R_JOB, nullptr);
+-  me = (DirectorResource*)my_config->GetNextRes(R_DIRECTOR, nullptr);
+-  my_config->own_resource_ = me;
+-  if (!me) {
+-    Jmsg(nullptr, M_FATAL, 0,
+-         _("No Director resource defined in %s\n"
+-           "Without that I don't know who I am :-(\n"),
+-         configfile.c_str());
+-    OK = false;
+-    goto bail_out;
+-  } else {
+-    // Sanity check.
+-    if (me->MaxConsoleConnections > me->MaxConnections) {
+-      me->MaxConnections = me->MaxConsoleConnections + 10;
+-    }
+-
+-    my_config->omit_defaults_ = true;
+-    SetWorkingDirectory(me->working_directory);
+-
+-    // See if message resource is specified.
+-    if (!me->messages) {
+-      me->messages = (MessagesResource*)my_config->GetNextRes(R_MSGS, nullptr);
+-      if (!me->messages) {
+-        Jmsg(nullptr, M_FATAL, 0, _("No Messages resource defined in %s\n"),
+-             configfile.c_str());
+-        OK = fals

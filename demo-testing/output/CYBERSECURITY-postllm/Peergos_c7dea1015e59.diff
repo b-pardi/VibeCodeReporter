@@ -1,0 +1,80 @@
+@@ -133,9 +133,17 @@ public class ServerIdentity extends Builder {
+                 }
+                 PeerId nextPeerId = PeerId.fromPubKey(nextPriv.publicKey());
+                 PrivKey currentPrivate = KeyKt.unmarshalPrivateKey(idstore.getPrivateKey(current));
++                idstore.setPrivateKey(currentPrivate);
++                // update peergos config with new private key
++                String encodedPrivate = Base64.getEncoder().encodeToString(nextPriv.bytes());
++                a.with("ipfs.identity.priv-key", encodedPrivate)
++                        .with("ipfs.identity.peerid", nextPeerId.toBase58())
++                        .saveToFile();
++
+                 idstore.setRecord(current, generateSignedIpnsRecord(currentPrivate, Optional.of(Multihash.decode(nextPeerId.getBytes())), true, res.sequence + 1));
+-                idstore.addIdentity(nextPriv, generateSignedIpnsRecord(nextPriv, Optional.empty(), false, 1));
++                idstore.addIdentity(nextPeerId, generateSignedIpnsRecord(nextPriv, Optional.empty(), false, 1));
+                 System.out.println("Successfully rotated server identity from " + current + " to " + nextPeerId);
++                System.out.println("If running a multi-server instance, copy the new identity to the ipfs server.");
+ 
+                 return true;
+             },
+
+
+
+
+@@ -74,7 +74,7 @@ public interface SqlSupplier {
+         return "CREATE TABLE IF NOT EXISTS serverids (" +
+                 "id " + getSerialIdType() + " primary key not null," +
+                 "peerid " + getByteArrayType() + " not null, " +
+-                "private " + getByteArrayType() + " not null, " +
++                "private " + getByteArrayType() + ", " +
+                 "record " + getByteArrayType() + " not null);";
+     }
+ 
+
+
+
+
+@@ -40,7 +40,7 @@ public class SqliteCommands implements SqlSupplier {
+ 
+     @Override
+     public String insertServerIdCommand() {
+-        return "INSERT OR IGNORE INTO serverids (peerid, private, record) VALUES (?, ?, ?);";
++        return "INSERT OR IGNORE INTO serverids (peerid, record) VALUES (?, ?);";
+     }
+ 
+     @Override
+
+
+
+
+@@ -344,17 +344,15 @@ public class IpfsWrapper implements AutoCloseable {
+         // use identity from db if present, otherwise move to db
+         List<PeerId> ourIds = ids.getIdentities();
+         if (ourIds.isEmpty()) {
+-            // initialise id db with our current peer id and sign an ipns record
++            // initialise id db with our current peerid and sign an ipns record
+             PrivKey peerPrivate = KeyKt.unmarshalPrivateKey(config.identity.privKeyProtobuf);
+             byte[] signedRecord = ServerIdentity.generateSignedIpnsRecord(peerPrivate, Optional.empty(), false, 1);
+-            ids.addIdentity(peerPrivate, signedRecord);
++            ids.addIdentity(PeerId.fromPubKey(peerPrivate.publicKey()), signedRecord);
+         } else {
+-            // make sure we use the latest peerid from the db as the source of truth
++            // make sure we are using the latest identity
+             PeerId current = ourIds.get(ourIds.size() - 1);
+-            byte[] privateKeyProto = ids.getPrivateKey(current);
+-            ipfsConfigParams = ipfsConfigParams.withIdentity(Optional.of(new IdentitySection(privateKeyProto, current)));
+-            ipfsWrapper = new IpfsWrapper(ipfsDir, ipfsConfigParams);
+-            config = ipfsWrapper.configure();
++            if (! current.equals(config.identity.peerId))
++                throw new IllegalStateException("Supplied peerid doesn't match latest in server identity db!");
+         }
+ 
+         LOG.info("Starting Nabu version: " + APIHandler.CURRENT_VERSION + ", peerid: " + config.identity.peerId);
+
+
+
+
+@@ -24,6 +24,7 @@ public class JdbcServerIdentityStore implements ServerIdentityStore {
+     private static final String SELECT_PRIVATE = "SELECT private FROM serverids WHERE peerid=?;";
+     private static final String GET_RECORD = "SELECT record FROM serverids WHERE peerid=?;";
+     priva

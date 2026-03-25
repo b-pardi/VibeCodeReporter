@@ -1,0 +1,123 @@
+@@ -21,6 +21,7 @@
+ 
+ #include "include/bareos.h"
+ #include "include/filetypes.h"
++#include "include/job_status.h"
+ #include "fd_plugins.h"
+ #include "plugins/include/common.h"
+ #include <jansson.h>
+@@ -1973,6 +1974,7 @@ static WMI::String extract_disk_path(const WMI::ClassObject& vhd_setting)
+ }
+ 
+ struct analyzed_ref_point {
++  WMI::ReferencePoint source;
+   struct disk {
+     GUID virt_disk_id;
+     WMI::String rct_id;
+@@ -2037,7 +2039,7 @@ GUID get_id_of_disk(PluginContext* ctx, const wchar_t* path)
+ 
+ analyzed_ref_point analyze_ref_point(PluginContext* ctx,
+                                      const WMI::Service& srvc,
+-                                     const WMI::ReferencePoint& refpoint)
++                                     WMI::ReferencePoint refpoint)
+ {
+   auto rct_ids = refpoint.get_array<WMI::cim_type::string>(
+       L"ResilientChangeTrackingIdentifiers");
+@@ -2057,7 +2059,7 @@ analyzed_ref_point analyze_ref_point(PluginContext* ctx,
+         rct_ids.size(), disk_ids.size()));
+   }
+ 
+-  analyzed_ref_point analyzed;
++  analyzed_ref_point analyzed{std::move(refpoint)};
+ 
+   for (size_t i = 0; i < rct_ids.size(); ++i) {
+     constexpr auto fixup_instance_id
+@@ -2268,6 +2270,7 @@ struct plugin_ctx {
+       WMI::ComputerSystem current_vm;
+       std::wstring vm_name;
+       std::optional<analyzed_ref_point> refpoint;
++      std::optional<WMI::ReferencePoint> created_ref_point;
+       std::wstring tmp_dir;
+       WMI::Snapshot vm_snapshot;
+       uint32_t delta_seq;
+@@ -2347,8 +2350,22 @@ struct plugin_ctx {
+   config cfg;
+ 
+   bool is_full() const { return job_level == JobLevel::Full; }
++  bool is_diff() const { return job_level == JobLevel::Differential; }
+ };
+ 
++static bool is_canceled(PluginContext* ctx)
++{
++  int job_status = 0;
++  if (bRC_Error
++      == bareos_core_functions->getBareosValue(ctx, filedaemon::bVarJobStatus,
++                                               &job_status)) {
++    return true;
++  } else {
++    return job_status == JS_Canceled || job_status == JS_ErrorTerminated
++           || job_status == JS_FatalError;
++  }
++}
++
+ 
+ extern "C" {
+ /**
+@@ -2566,72 +2583,151 @@ static bRC newPlugin(PluginContext* ctx)
+   }
+ }
+ 
+-static bRC free_current_state(PluginContext* ctx)
++static bRC destroy_all_other_reference_points(
++    PluginContext* ctx,
++    const WMI::VirtualSystemReferencePointService& ref_point_srvc,
++    const WMI::ComputerSystem& system,
++    const WMI::ReferencePoint& ref_point)
+ {
+   auto* p_ctx = plugin_ctx::get(ctx);
+   if (!p_ctx) { return bRC_Error; }
+ 
+-  std::visit(
+-      [&](auto&& val) {
+-        using T = std::decay_t<decltype(val)>;
++  auto& srvc = p_ctx->virt_service;
+ 
+-        if constexpr (std::is_same_v<T, plugin_ctx::restore>) {
+-          // maybe this should only happen if the restore was successful?
+-          for (auto& path : val.temporary_files) {
+-            if (!DeleteFileW(path.c_str())) {
+-              JWARN(ctx, L"could not delete file '{}': {}", path,
+-                    format_win32_error());
++  auto ref_points = srvc.get_related_of_class(
++      system.path().as_view(), WMI::ReferencePoint::class_name,
++      L"Msvm_ReferencePointOfVirtualSystem");
++
++  auto reference_path = ref_point.path();
++
++  for (auto& rp : ref_points) {
++    WMI::ReferencePoint other_rp{std::move(rp)};
++
++    auto other_path = other_rp.path();
++    if (other_path.as_view() != reference_path.as_view()) {
++      JINFO(ctx, L"Deleting unnecessary reference point {}",
++            other_path.as_view());
++      ref_point_srvc.destroy_reference_point(srvc, std::move(other_rp));
++    }
++  }
++
++  return bRC_OK;
++}
++
++static bRC free_current_state(PluginContext* ctx)
++{
++  auto* p_ctx = plugin_ctx::get(ctx);
++  if (!p_ctx) { return bRC_Error; }
++
++  bRC result = bRC_OK;
++  try {
++    std::visit(
++        [&](auto&& val) {
++          using T = std::decay_t<decltype(val)>;
++
++          if constexpr (std::is_same_v<T, plugin_ctx::restore>) {
++            // maybe this should only happen 

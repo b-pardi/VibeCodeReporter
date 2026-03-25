@@ -1,0 +1,76 @@
+@@ -110,7 +110,7 @@ final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute
+   /* State we need to maintain between iterations */
+ 
+   /** Delta that captures process initialization (creating intra-area routes based on interfaces) */
+-  @Nonnull private RibDelta<OspfIntraAreaRoute> _initializationDelta;
++  @Nonnull private InternalDelta _initializationDelta;
+   /** Delta to pass to the main RIB */
+   @Nonnull private RibDelta.Builder<OspfRoute> _changeset;
+   /** Delta of routes we have locally queued for re-distribution */
+@@ -159,7 +159,7 @@ final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute
+     }
+ 
+     _changeset = RibDelta.builder();
+-    _initializationDelta = RibDelta.empty();
++    _initializationDelta = new InternalDelta(RibDelta.empty(), RibDelta.empty());
+     _queuedForRedistribution = new ExternalDelta();
+     _activatedGeneratedRoutes = RibDelta.empty();
+     _neighborsWhereDefaultIARouteWasInjected = new HashSet<>(0);
+@@ -175,9 +175,8 @@ final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute
+     if (!_initializationDelta.isEmpty()) {
+       // If we haven't sent out the first round of updates after initialization, do so now. Then
+       // clear the initialization delta
+-      sendOutInternalRoutes(
+-          new InternalDelta(_initializationDelta, RibDelta.empty()), allNodes, _topology);
+-      _initializationDelta = RibDelta.empty();
++      sendOutInternalRoutes(_initializationDelta, allNodes, _topology);
++      _initializationDelta = new InternalDelta(RibDelta.empty(), RibDelta.empty());
+     }
+ 
+     // Process internal routes
+@@ -316,10 +315,23 @@ final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute
+ 
+   /** Initialize intra-area routes based on available interfaces. */
+   private void initializeIntraAreaRoutes() {
+-    RibDelta.Builder<OspfIntraAreaRoute> deltaBuilder = RibDelta.builder();
+-    _process.getAreas().values().forEach(area -> deltaBuilder.from(initializeRoutesByArea(area)));
+-    _initializationDelta = deltaBuilder.build();
+-    _changeset.from(RibDelta.importRibDelta(_ospfRib, _initializationDelta));
++    RibDelta.Builder<OspfIntraAreaRoute> intraAreaBuilder = RibDelta.builder();
++    _process
++        .getAreas()
++        .values()
++        .forEach(area -> intraAreaBuilder.from(initializeRoutesByArea(area)));
++    RibDelta<OspfIntraAreaRoute> intraAreaDelta = intraAreaBuilder.build();
++    RibDelta.Builder<OspfInterAreaRoute> interAreaBuilder = RibDelta.builder();
++    if (isABR()) {
++      // If we are an ABR, also do conversion to IA routes here.
++      intraAreaDelta
++          .getRoutesStream()
++          .forEach(
++              r -> interAreaBuilder.add(OspfInterAreaRoute.builder(r).setNonRouting(true).build()));
++    }
++
++    _initializationDelta = new InternalDelta(intraAreaDelta, interAreaBuilder.build());
++    _changeset.from(RibDelta.importRibDelta(_ospfRib, intraAreaDelta));
+   }
+ 
+   /**
+@@ -447,10 +459,13 @@ final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute
+   /** Process all OSPF internal messages from all the message queues */
+   @Nonnull
+   private InternalDelta processInternalRoutes() {
+-    RibDelta<OspfIntraAreaRoute> intraAreaDelta = processIntraAreaRoutes();
++    InternalDelta intraProcessingDelta = processIntraAreaRoutes();
+     RibDelta.Builder<OspfInterAreaRoute> interAreaDelta = processInterAreaRoutes();
+     RibDelta<OspfInterAreaRoute> deltaOfSummaries = computeInterAreaSummaries();
+-    return new InternalDelta(intraAreaDelta, interAreaDelta.from(deltaOfSummaries).build());
++    // Merge inter-area deltas
++    return new InternalDelta(
++        intraProcessingDelta._intraArea,
++        interAreaDelta.from(intraProcessingDelta._interArea).from(deltaOfSummaries).build());
+   }
+ 
+   /**
+@@ -549,26 +564,62 @@ final class OspfRoutingProcess implements RoutingProcess<OspfTopology, OspfRoute
+    * @return the resulting intra-are

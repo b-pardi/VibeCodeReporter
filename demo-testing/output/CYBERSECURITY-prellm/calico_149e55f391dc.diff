@@ -1,0 +1,107 @@
+@@ -1,6 +1,6 @@
+ # Copyright 2012 OpenStack Foundation
+ # Copyright 2015 Metaswitch Networks
+-# Copyright 2016, 2018 Tigera, Inc.
++# Copyright 2016, 2018, 2022 Tigera, Inc.
+ # All Rights Reserved.
+ #
+ #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+@@ -18,8 +18,11 @@
+ import logging
+ import netaddr
+ import os
++import re
+ import socket
++import subprocess
+ import sys
++import time
+ 
+ import eventlet
+ eventlet.monkey_patch()
+@@ -151,6 +154,82 @@ def split_endpoint_name(name):
+     return tuple([p.replace('#', '-') for p in parts])
+ 
+ 
++class MTUWatcher(object):
++
++    # -----------------------------------------------------------------
++    # Methods called from DHCP agent's main thread.
++    # -----------------------------------------------------------------
++
++    def __init__(self, agent, port_handler):
++        self.agent = agent
++        self.port_handler = port_handler
++        self.mtu_by_if_name = {}
++        self.port_id_by_if_name = {}
++        self.rx_up = re.compile('[0-9]+: ([a-z0-9-]+).* mtu ([0-9]+) .* state UP')
++        self.rx_del = re.compile('Deleted [0-9]+: ([a-z0-9-]+)')
++
++    def get_mtu(self, if_name):
++        # Note, returns None if we haven't yet seen an MTU for the given
++        # interface name.
++        return self.mtu_by_if_name.get(if_name)
++
++    def watch_port(self, id, if_name):
++        self.port_id_by_if_name[if_name] = id
++
++    def unwatch_port(self, id, if_name):
++        if if_name in self.port_id_by_if_name:
++            del self.port_id_by_if_name[if_name]
++
++    def start_up(self):
++        # Start 'ip monitor link' running on a separate thread.
++        self.ip_monitor_running = False
++        eventlet.spawn(self.process_command, ['ip', 'monitor', 'link'])
++
++        # Wait until we can be sure that 'ip monitor link' is really
++        # running, and hence that we will see all further link
++        # transitions.
++        while not self.ip_monitor_running:
++            # Create and delete a dummy interface.
++            os.system("ip link add calico-dhcp-dummy type dummy")
++            os.system("ip link del calico-dhcp-dummy type dummy")
++            time.sleep(0.5)
++
++        # Now run 'ip link', to find MTU of all pre-existing interfaces.
++        self.process_command(['ip', 'link'])
++
++    # -----------------------------------------------------------------
++    # Methods called from MTU watcher's own thread, or from agent thread.
++    # -----------------------------------------------------------------
++
++    def process_command(self, command):
++        process = subprocess.Popen(command, stdout=subprocess.PIPE)
++        while True:
++            line = process.stdout.readline()
++            if not line:
++                LOG.info("command %r exited", command)
++                break
++            self.ip_monitor_running = True
++            match_data = self.rx_up.match(line.decode('utf-8'))
++            if match_data:
++                self.record_mtu(match_data.group(1), int(match_data.group(2)))
++                continue
++            match_data = self.rx_del.match(line.decode('utf-8'))
++            if match_data:
++                self.if_deleted(match_data.group(1))
++
++    def record_mtu(self, if_name, mtu):
++        LOG.debug("MTU for %s is now %d", if_name, mtu)
++        if if_name in self.port_id_by_if_name and mtu != self.mtu_by_if_name.get(if_name):
++            # MTU changing for a watched port.
++            self.port_handler.on_mtu_change(self.port_id_by_if_name[if_name], mtu)
++        self.mtu_by_if_name[if_name] = mtu
++
++    def if_deleted(self, if_name):
++        LOG.debug("Interface %s deleted", if_name)
++        if if_name in self.mtu_by_if_name:
++            del self.mtu_by_if_name[if_name]
++
++
+ class DnsmasqUpdater(object):
+     def __init__(self, agent):
+         self.agent = agent
+@@ -188,9 +267,18 @@ class DnsmasqUpdater(object):
+             port for port in net.ports if port.device_id.startswith('tap')
+         ]
+         ports_needed.so

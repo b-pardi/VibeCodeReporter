@@ -1,0 +1,87 @@
+@@ -90,7 +90,7 @@ class AgentService(BaseService):
+         """
+         commands = await self.get_service('data_svc').explode_chain(criteria=dict(paw=paw))
+         instructions = []
+-        for link in [c for c in commands if not c['collect']]:
++        for link in [c for c in commands if not c['collect'] and c['status'] == self.LinkState.EXECUTE.value]:
+             await self.get_service('data_svc').update('core_chain', key='id', value=link['id'],
+                                                       data=dict(collect=datetime.now()))
+             payload = await self._gather_payload(link['ability'])
+
+
+
+
+@@ -1,4 +1,5 @@
+ from base64 import b64encode, b64decode
++from enum import Enum
+ from random import randint
+ from datetime import datetime
+ 
+@@ -65,3 +66,8 @@ class BaseService:
+     @staticmethod
+     def get_current_timestamp(date_format='%Y-%m-%d %H:%M:%S'):
+         return datetime.now().strftime(date_format)
++
++    class LinkState(Enum):
++        EXECUTE = -3
++        DISCARD = -2
++        PAUSE = -1
+
+
+
+
+@@ -169,7 +169,7 @@ class DataService(BaseService):
+         return identifier
+ 
+     async def create_operation(self, name, group, adversary_id, jitter='2/8', stealth=False, sources=[],
+-                               planner=None, state=None, allow_untrusted=False):
++                               planner=None, state=None, allow_untrusted=False, autonomous=True):
+         """
+         Save a new operation to the database
+         :param name:
+@@ -181,12 +181,13 @@ class DataService(BaseService):
+         :param planner:
+         :param state:
+         :param allow_untrusted:
++        :param autonomous
+         :return: the database id
+         """
+         op_id = await self.dao.create('core_operation', dict(
+             name=name, host_group=group, adversary_id=adversary_id, finish=None, phase=0, jitter=jitter,
+             start=self.get_current_timestamp(), stealth=stealth, planner=planner, state=state,
+-            allow_untrusted=allow_untrusted))
++            allow_untrusted=allow_untrusted, autonomous=autonomous))
+         source_id = await self.dao.create('core_source', dict(name=name))
+         await self.dao.create('core_source_map', dict(op_id=op_id, source_id=source_id))
+         for s_id in [s for s in sources if s]:
+
+
+
+
+@@ -28,11 +28,14 @@ class PlanningService(BaseService):
+             self.log.debug('Agent %s untrusted: no link created' % agent['paw'])
+             return []
+         phase_abilities = [i for p, v in operation['adversary']['phases'].items() if p <= phase for i in v]
++        link_status = await self._default_link_status(operation)
++
+         links = []
+         for a in await self.capable_agent_abilities(phase_abilities, agent):
+             links.append(
+                 dict(op_id=operation['id'], paw=agent['paw'], ability=a['id'], command=a['test'], score=0,
+-                     decide=datetime.now(), executor=a['executor'], jitter=self.jitter(operation['jitter'])))
++                     status=link_status, decide=datetime.now(), executor=a['executor'],
++                     jitter=self.jitter(operation['jitter'])))
+         links[:] = await self._trim_links(operation, links, agent)
+         return [link for link in list(reversed(sorted(links, key=lambda k: k['score'])))]
+ 
+@@ -43,6 +46,7 @@ class PlanningService(BaseService):
+         :return: None
+         """
+         op = await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id']))
++        link_status = await self._default_link_status(operation)
+         for member in op[0]['host_group']:
+             if (not member['trusted']) and (not op[0]['allow_untrusted']):
+                 self.log.debug('Agent %s untrusted: no cleanup-link created' % member['paw'])
+@@ -51,10 +55,10 @@ class PlanningService(BaseService):
+             for link in await self.get_service('data_svc').explode_chain(criteria=dict(paw=member['paw'],
+                                                                                

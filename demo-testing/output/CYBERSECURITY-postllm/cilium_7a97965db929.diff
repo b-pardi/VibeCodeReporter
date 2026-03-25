@@ -1,0 +1,125 @@
+@@ -1588,7 +1588,7 @@ skip_egress_gateway:
+ 		 * handle_nat_fwd tail calls in the majority of cases,
+ 		 * so control might never return to this program.
+ 		 */
+-		ret = handle_nat_fwd(ctx, 0, proto, &trace, &ext_err);
++		ret = handle_nat_fwd(ctx, 0, proto, false, &trace, &ext_err);
+ 		if (ret == CTX_ACT_REDIRECT)
+ 			return ret;
+ 	}
+
+
+
+
+@@ -795,7 +795,7 @@ int cil_to_overlay(struct __ctx_buff *ctx)
+ 		goto out;
+ 	}
+ 
+-	ret = handle_nat_fwd(ctx, cluster_id, proto, &trace, &ext_err);
++	ret = handle_nat_fwd(ctx, cluster_id, proto, false, &trace, &ext_err);
+ out:
+ #endif
+ 	if (IS_ERR(ret))
+
+
+
+
+@@ -39,7 +39,7 @@ int cil_to_wireguard(struct __ctx_buff *ctx)
+ 	if (magic == MARK_MAGIC_OVERLAY)
+ 		goto out;
+ 
+-	ret = handle_nat_fwd(ctx, 0, proto, &trace, &ext_err);
++	ret = handle_nat_fwd(ctx, 0, proto, true, &trace, &ext_err);
+ 	if (IS_ERR(ret))
+ 		return send_drop_notify_error_ext(ctx, src_sec_identity, ret, ext_err,
+ 						  CTX_ACT_DROP, METRIC_EGRESS);
+
+
+
+
+@@ -801,6 +801,8 @@ static __always_inline __u32 or_encrypt_key(__u8 key)
+ #define TC_INDEX_F_UNUSED		8
+ #define TC_INDEX_F_SKIP_HOST_FIREWALL	16
+ 
++#define CB_NAT_FLAGS_REVDNAT_ONLY	(1 << 0)
++
+ /*
+  * For use in ctx_{load,store}_meta(), which operates on sk_buff->cb or
+  * the cilium_xdp_scratch pad.
+@@ -834,6 +836,7 @@ enum {
+ #define	CB_CLUSTER_ID_INGRESS	CB_POLICY	/* Alias, non-overlapping */
+ #define CB_HSIPC_PORT		CB_POLICY	/* Alias, non-overlapping */
+ #define CB_DSR_SRC_LABEL	CB_POLICY	/* Alias, non-overlapping */
++#define CB_NAT_FLAGS		CB_POLICY	/* Alias, non-overlapping */
+ 	CB_3,
+ #define	CB_ADDR_V6_3		CB_3		/* Alias, non-overlapping */
+ #define	CB_FROM_HOST		CB_3		/* Alias, non-overlapping */
+
+
+
+
+@@ -1471,6 +1471,7 @@ skip_service_lookup:
+ 
+ static __always_inline int
+ nodeport_rev_dnat_fwd_ipv6(struct __ctx_buff *ctx, bool *snat_done,
++			   bool revdnat_only __maybe_unused,
+ 			   struct trace_ctx *trace, __s8 *ext_err __maybe_unused)
+ {
+ 	struct bpf_fib_lookup_padded fib_params __maybe_unused = {};
+@@ -1495,6 +1496,9 @@ nodeport_rev_dnat_fwd_ipv6(struct __ctx_buff *ctx, bool *snat_done,
+ 		return CTX_ACT_OK;
+ 
+ #if defined(IS_BPF_HOST) && !defined(ENABLE_SKIP_FIB)
++	if (revdnat_only)
++		goto skip_fib;
++
+ 	fib_params.l.family = AF_INET6;
+ 	fib_params.l.ifindex = ctx_get_ifindex(ctx);
+ 	ipv6_addr_copy((union v6addr *)fib_params.l.ipv6_src,
+@@ -1505,6 +1509,8 @@ nodeport_rev_dnat_fwd_ipv6(struct __ctx_buff *ctx, bool *snat_done,
+ 	ret = nodeport_fib_lookup_and_redirect(ctx, &fib_params, ext_err);
+ 	if (ret != CTX_ACT_OK)
+ 		return ret;
++
++skip_fib:
+ #endif
+ 
+ 	ret = ct_lazy_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off, CT_INGRESS,
+@@ -1562,16 +1568,14 @@ int tail_handle_snat_fwd_ipv6(struct __ctx_buff *ctx)
+ }
+ 
+ static __always_inline int
+-__handle_nat_fwd_ipv6(struct __ctx_buff *ctx, struct trace_ctx *trace,
++__handle_nat_fwd_ipv6(struct __ctx_buff *ctx, bool revdnat_only, struct trace_ctx *trace,
+ 		      __s8 *ext_err)
+ {
+ 	bool snat_done = false;
+ 	int ret;
+ 
+-	ret = nodeport_rev_dnat_fwd_ipv6(ctx, &snat_done, trace, ext_err);
+-#if !defined(IS_BPF_WIREGUARD)
+-	if (ret != CTX_ACT_OK)
+-#endif /* !IS_BPF_WIREGUARD */
++	ret = nodeport_rev_dnat_fwd_ipv6(ctx, &snat_done, revdnat_only, trace, ext_err);
++	if (ret != CTX_ACT_OK || revdnat_only)
+ 		return ret;
+ 
+ #if !defined(ENABLE_DSR) ||						\
+@@ -1592,7 +1596,10 @@ static __always_inline int
+ handle_nat_fwd_ipv6(struct __ctx_buff *ctx, struct trace_ctx *trace,
+ 		    __s8 *ext_err)
+ {
+-	return __handle_nat_fwd_ipv6(ctx, trace, ext_err);
++	__u32 cb_nat_flags = ctx_load_and_clear_meta(ctx, CB_NAT_FLAGS);
++	bool revdnat_only = cb_nat_flags & CB_NAT_FLAGS_REVDNAT_ONLY;
++
++	return __handle_nat_fwd_ipv6(ctx, revdnat_only, trace, ext_err);
+ }
+ 
+ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT_FWD)
+@@ -3057,6 +3064,7 @@ skip_service_lookup:
+ 
+ static __always_inline int
+ nodeport_rev_dnat_fwd_ipv4(struct __ctx_buff *ctx, bool *snat_done,
++			   bool revdnat_only __maybe_unused,
+ 			   struct trace_ctx *tra

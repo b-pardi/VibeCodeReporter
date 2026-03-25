@@ -1,0 +1,133 @@
+@@ -2251,6 +2251,12 @@ lg_PutMetaData(SDB *sdb, const char *id,
+     return CKR_OK;
+ }
+ 
++CK_RV
++lg_DestroyMetaData(SDB *db, const char *id)
++{
++    return CKR_GENERAL_ERROR; /* no extra data stored */
++}
++
+ CK_RV
+ lg_Reset(SDB *sdb)
+ {
+
+
+
+
+@@ -960,6 +960,22 @@ lg_createKeyObject(SDB *sdb, CK_OBJECT_CLASS objclass,
+     return CKR_ATTRIBUTE_VALUE_INVALID;
+ }
+ 
++/*
++ * return the 'next' key handle
++ */
++CK_RV
++lg_GetNewObjectID(SDB *sdb, CK_OBJECT_HANDLE *handle)
++{
++    /* the upper level needs the Object ID early to populate any
++     * signature attributes. The legacy can't really return a new
++     * handle without the full object template (chicken and egg issue).
++     * Fortunately we can just return a bogus handle because the legacy
++     * database doesn't support meta data and can't store any of the signed
++     * attributes anyway */
++    *handle = CK_INVALID_HANDLE;
++    return CKR_OK;
++}
++
+ /*
+  * Parse the template and create an object stored in the DB that reflects.
+  * the object specified in the database.
+
+
+
+
+@@ -150,6 +150,8 @@ CK_RV lg_Abort(SDB *sdb);
+ CK_RV lg_GetMetaData(SDB *sdb, const char *id, SECItem *item1, SECItem *item2);
+ CK_RV lg_PutMetaData(SDB *sdb, const char *id,
+                      const SECItem *item1, const SECItem *item2);
++CK_RV lg_DestroyMetaData(SDB *sdb, const char *id);
++CK_RV lg_GetNewObjectID(SDB *sdb, CK_OBJECT_HANDLE *object_id);
+ 
+ SEC_END_PROTOS
+ 
+
+
+
+
+@@ -519,7 +519,7 @@ lg_init(SDB **pSdb, int flags, NSSLOWCERTCertDBHandle *certdbPtr,
+     }
+ 
+     sdb->private = lgdb_p;
+-    sdb->version = 0;
++    sdb->version = 1;
+     sdb->sdb_flags = flags;
+     sdb->app_private = NULL;
+     sdb->sdb_FindObjectsInit = lg_FindObjectsInit;
+@@ -531,12 +531,14 @@ lg_init(SDB **pSdb, int flags, NSSLOWCERTCertDBHandle *certdbPtr,
+     sdb->sdb_DestroyObject = lg_DestroyObject;
+     sdb->sdb_GetMetaData = lg_GetMetaData;
+     sdb->sdb_PutMetaData = lg_PutMetaData;
++    sdb->sdb_DestroyMetaData = lg_DestroyMetaData;
+     sdb->sdb_Begin = lg_Begin;
+     sdb->sdb_Commit = lg_Commit;
+     sdb->sdb_Abort = lg_Abort;
+     sdb->sdb_Reset = lg_Reset;
+     sdb->sdb_Close = lg_Close;
+     sdb->sdb_SetForkState = lg_SetForkState;
++    sdb->sdb_GetNewObjectID = lg_GetNewObjectID;
+ 
+     *pSdb = sdb;
+     return CKR_OK;
+
+
+
+
+@@ -205,7 +205,8 @@ sftkdb_encrypt_stub(PLArenaPool *arena, SDB *sdb, SECItem *plainText,
+         iterationCount = 1;
+     }
+ 
+-    rv = sftkdb_EncryptAttribute(arena, key, iterationCount,
++    rv = sftkdb_EncryptAttribute(arena, handle, sdb, key, iterationCount,
++                                 CK_INVALID_HANDLE, CKT_INVALID_TYPE,
+                                  plainText, cipherText);
+     PZ_Unlock(handle->passwordLock);
+ 
+@@ -227,7 +228,7 @@ sftkdb_decrypt_stub(SDB *sdb, SECItem *cipherText, SECItem **plainText)
+         return SECFailure;
+     }
+ 
+-    /* if we aren't th handle, try the other handle */
++    /* if we aren't the key handle, try the other handle */
+     oldKey = handle->oldKey;
+     if (handle->type != SFTK_KEYDB_TYPE) {
+         handle = handle->peerDB;
+@@ -244,7 +245,9 @@ sftkdb_decrypt_stub(SDB *sdb, SECItem *cipherText, SECItem **plainText)
+         /* PORT_SetError */
+         return SECFailure;
+     }
+-    rv = sftkdb_DecryptAttribute(oldKey ? oldKey : &handle->passwordKey,
++    rv = sftkdb_DecryptAttribute(NULL, oldKey ? oldKey : &handle->passwordKey,
++                                 CK_INVALID_HANDLE,
++                                 CKT_INVALID_TYPE,
+                                  cipherText, plainText);
+     PZ_Unlock(handle->passwordLock);
+ 
+
+
+
+
+@@ -18,9 +18,13 @@
+ #include "alghmac.h"
+ #include "softoken.h"
+ #include "secerr.h"
++#include "pkcs11i.h"
+ 
+ SEC_ASN1_MKSUB(SECOID_AlgorithmIDTemplate)
+ 
++/* how much a crypto encrypt/decryption may expand a buffer */
++#define MAX_CRYPTO_EXPANSION 64
++
+ /* template for PKCS 5 PBE Parameter.  This template has been expanded
+  * based upon the additions in PKCS 12.  This should eventually be moved
+  * if RSA up

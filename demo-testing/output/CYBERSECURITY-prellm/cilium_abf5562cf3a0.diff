@@ -1,0 +1,163 @@
+@@ -205,7 +205,7 @@ static inline int handle_ipv6(struct __sk_buff *skb, __u32 src_identity)
+ 			return TC_ACT_OK;
+ 		else
+ 			return ret;
+-	} else if (likely(ipv6_match_prefix_96(dst, &node_ip))) {
++	} else {
+ 		struct endpoint_key key = {};
+ 		int ret;
+ 
+
+
+
+
+@@ -25,6 +25,7 @@
+ 
+ #include <linux/if_packet.h>
+ 
++#include "lib/tailcall.h"
+ #include "lib/utils.h"
+ #include "lib/common.h"
+ #include "lib/maps.h"
+@@ -40,11 +41,11 @@
+ #ifdef ENABLE_IPV6
+ static inline int handle_ipv6(struct __sk_buff *skb, __u32 *identity)
+ {
++	int ret, l4_off, l3_off = ETH_HLEN, hdrlen;
+ 	void *data_end, *data;
+ 	struct ipv6hdr *ip6;
+ 	struct bpf_tunnel_key key = {};
+ 	struct endpoint_info *ep;
+-	int l4_off, l3_off = ETH_HLEN, hdrlen;
+ 	bool decrypted;
+ 
+ 	/* verifier workaround (dereference of modified ctx ptr) */
+@@ -57,6 +58,10 @@ static inline int handle_ipv6(struct __sk_buff *skb, __u32 *identity)
+ 			return ret;
+ 	}
+ #endif
++	ret = encap_remap_v6_host_address(skb, false);
++	if (unlikely(ret < 0))
++		return ret;
++
+ 	if (!revalidate_data(skb, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+ 
+@@ -312,20 +317,34 @@ out:
+ 	return ret;
+ }
+ 
+-__section("to-overlay")
+-int to_overlay(struct __sk_buff *skb)
+-{
+-	/* Cannot compile the section out entriely, test/bpf/verifier-test.sh
+-	 * workaround.
+-	 */
+-	int ret = TC_ACT_OK;
+ #ifdef ENABLE_NODEPORT
++declare_tailcall_if(is_defined(ENABLE_IPV6), CILIUM_CALL_ENCAP_NODEPORT_NAT)
++int tail_handle_nat_fwd(struct __sk_buff *skb)
++{
++	int ret;
++
+ 	if ((skb->mark & MARK_MAGIC_SNAT_DONE) == MARK_MAGIC_SNAT_DONE)
+ 		return TC_ACT_OK;
+ 	ret = nodeport_nat_fwd(skb, true);
+ 	if (IS_ERR(ret))
+ 		return send_drop_notify_error(skb, 0, ret, TC_ACT_SHOT, METRIC_EGRESS);
++	return ret;
++}
+ #endif
++
++__section("to-overlay")
++int to_overlay(struct __sk_buff *skb)
++{
++	int ret = encap_remap_v6_host_address(skb, true);
++	if (unlikely(ret < 0))
++		goto out;
++#ifdef ENABLE_NODEPORT
++	invoke_tailcall_if(is_defined(ENABLE_IPV6),
++			   CILIUM_CALL_ENCAP_NODEPORT_NAT, tail_handle_nat_fwd);
++#endif
++out:
++	if (IS_ERR(ret))
++		return send_drop_notify_error(skb, 0, ret, TC_ACT_SHOT, METRIC_EGRESS);
+ 	return ret;
+ }
+ 
+
+
+
+
+@@ -54,6 +54,13 @@
+ #define CONDITIONAL_PREALLOC BPF_F_NO_PREALLOC
+ #endif
+ 
++/* TODO: ipsec v6 tunnel datapath still needs separate fixing */
++#ifndef ENABLE_IPSEC
++# ifdef ENABLE_IPV6
++#  define ENABLE_ENCAP_HOST_REMAP 1
++# endif
++#endif
++
+ #define __inline__ __attribute__((always_inline))
+ #ifndef __always_inline
+ #define __always_inline inline __inline__
+@@ -81,7 +88,8 @@
+ #define CILIUM_CALL_IPV6_NODEPORT_NAT		16
+ #define CILIUM_CALL_IPV4_NODEPORT_REVNAT	17
+ #define CILIUM_CALL_IPV6_NODEPORT_REVNAT	18
+-#define CILIUM_CALL_SIZE			19
++#define CILIUM_CALL_ENCAP_NODEPORT_NAT		19
++#define CILIUM_CALL_SIZE			20
+ 
+ typedef __u64 mac_t;
+ 
+
+
+
+
+@@ -64,6 +64,63 @@ encap_and_redirect_ipsec(struct __sk_buff *skb, __u32 tunnel_endpoint, __u8 key,
+ }
+ #endif
+ 
++static inline int __inline__
++encap_remap_v6_host_address(struct __sk_buff *skb, const bool egress)
++{
++#ifdef ENABLE_ENCAP_HOST_REMAP
++	struct csum_offset csum = {};
++	union v6addr host_ip;
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++	union v6addr *which;
++	__u32 off, noff;
++	__u8 nexthdr;
++	__u16 proto;
++	__be32 sum;
++	int ret;
++
++	validate_ethertype(skb, &proto);
++	if (proto != bpf_htons(ETH_P_IPV6))
++		return 0;
++	if (!revalidate_data(skb, &data, &data_end, &ip6))
++		return DROP_INVALID;
++	/* For requests routed via tunnel with external v6 node IP
++	 * we need to remap their source address to the router address
++	 * as otherwise replies are not routed via tunnel but public
++	 * address instead.
++	 */
++	if (egress) {
++		BPF_V6(host_ip, HOST_IP);
++		which = (union v6addr *)&ip6->saddr;
++	} else {
++		BPF_V6(host_ip, ROUTER_IP);
++		which = (union v6addr *)&ip6->daddr;
++	}
++	if (ipv6_addrcmp(which, &host_ip))
++		return 0;
++	nexthdr = ip6->nexthdr;
++	ret = ipv6_hdrlen(skb, ETH_HLEN, &nexthdr);
++	if (ret < 0)
++		return ret;
++	off = ((void *)ip6 - data) + ret;
++	if (e

@@ -1,0 +1,117 @@
+@@ -6,11 +6,18 @@ https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng
+ from __future__ import annotations
+ 
+ from typing import List
++from typing import Optional
++from typing import Tuple
++
++from typing_extensions import override
+ 
+ import pwndbg
+ import pwndbg.aglib.arch
++import pwndbg.aglib.heap.heap
+ import pwndbg.aglib.memory as memory
++import pwndbg.aglib.stack
+ import pwndbg.aglib.typeinfo
++import pwndbg.color.message as message
+ 
+ # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L14
+ # Slot granularity.
+@@ -109,6 +116,21 @@ class Group:
+         # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L234
+         return self.meta.stride * self.meta.cnt + UNIT
+ 
++    def set_meta(self, meta: Meta) -> None:
++        """
++        Sets the meta object for this group.
++
++        If the meta for this group is already calculated by the callee,
++        use this to prevent it from being wastefully recalculated.
++        """
++        self._meta = meta
++
++    def at_index(self, idx: int) -> int:
++        """
++        Get the address of the slot at index idx.
++        """
++        return self.storage + idx * self.meta.stride
++
+ 
+ class Slot:
+     """
+@@ -303,6 +325,37 @@ class Slot:
+         # We can calculate it more easily than musl does:
+         return (self.p - self.start) // UNIT
+ 
++    def contains_group(self) -> bool:
++        """
++        Does this slot nest a group?
++        """
++        # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L269
++        return self.reserved == 6
++
++    @classmethod
++    def from_p(cls, p: int) -> "Slot":
++        return cls(p)
++
++    @classmethod
++    def from_start(cls, start: int) -> "Slot":
++        idx_or_marker = memory.u8(start - 3)
++        if idx_or_marker == 224:
++            # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L217
++            # p is at an offset from start
++            # Read the cyclic offset to calculate it.
++            off = memory.u16(start - 2)
++            p = start + off * UNIT
++            obj = cls(p)
++        else:
++            p = start
++            obj = cls(p)
++
++        # FIXME: Not good if the slot is corrupted and we can't
++        # access the meta.
++        assert obj.start == start
++
++        return obj
++
+ 
+ class Meta:
+     """
+@@ -352,32 +405,32 @@ class Meta:
+         endian = pwndbg.aglib.arch.endian
+ 
+         # Read the whole struct.
+-        data = memory.read(self.addr, ptrsize * 3 + 2 * int_size() + 8 * ptrsize)
++        data = memory.read(self.addr, Meta.sizeof())
+ 
+         cur_offset = 0
+-        self._prev = pwndbg.aglib.arch.unpack(data[cur_offset:ptrsize])
+-        cur_offset += ptrsize
+-        self._next = pwndbg.aglib.arch.unpack(data[cur_offset : (cur_offset + ptrsize)])
+-        cur_offset += ptrsize
+-        self._mem = pwndbg.aglib.arch.unpack(data[cur_offset : (cur_offset + ptrsize)])
+-        cur_offset += ptrsize
+-        self._avail_mask = int.from_bytes(
+-            data[cur_offset : (cur_offset + int_size())], endian, signed=False
+-        )
+-        cur_offset += int_size()
+-        self._freed_mask = int.from_bytes(
+-            data[cur_offset : (cur_offset + int_size())], endian, signed=False
+-        )
+-        cur_offset += int_size()
++
++        def next_int(size: int, signed: bool = False) -> int:
++            nonlocal cur_offset
++            val = int.from_bytes(data[cur_offset : (cur_offset + size)], endian, signed=signed)
++            cur_offset += size
++            return val
++
++        self._prev = next_int(ptrsize)
++        self._next = next_int(ptrsize)
++        self._mem = next_int(ptrsize)
++        self._avail_mask = next_int(int_size())
++        self._freed_mask = next_int(int_size())
+         # I think this is how I should read a bitfield.
+         # http://mjfrazer.org/mjfrazer/bitfields/
+-        flags = int.from_bytes(data[cur_offset : (cur_offset + ptrsize)], endian, signed=False)
++ 

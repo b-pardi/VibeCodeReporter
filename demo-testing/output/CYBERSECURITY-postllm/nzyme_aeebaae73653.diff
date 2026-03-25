@@ -1,0 +1,133 @@
+@@ -276,6 +276,12 @@ public class NzymeLeaderImpl implements NzymeLeader {
+ 
+         eventService.recordEvent(new StartupEvent());
+ 
++        try {
++            this.crypto.initialize();
++        } catch (Crypto.CryptoInitializationException e) {
++            throw new RuntimeException("Could not load cryptographic subsystem.", e);
++        }
++
+         LOG.info("Reading configuration from database.");
+         this.configurationService.initialize();
+ 
+@@ -392,6 +398,7 @@ public class NzymeLeaderImpl implements NzymeLeader {
+         resourceConfig.register(DNSResource.class);
+         resourceConfig.register(PluginResource.class);
+         resourceConfig.register(PrometheusResource.class);
++        resourceConfig.register(CryptoResource.class);
+ 
+         // Plugin-supplied REST resources.
+         for (Object resource : pluginRestResources) {
+
+
+
+
+@@ -17,6 +17,8 @@ import java.nio.file.Paths;
+ import java.security.*;
+ import java.util.Date;
+ import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
+ 
+ public class Crypto {
+ 
+@@ -142,6 +144,15 @@ public class Crypto {
+         }
+     }
+ 
++    public List<PGPKeyFingerprint> getPGPKeysByNode() {
++        return database.withHandle(handle ->
++                handle.createQuery("SELECT node, key_signature, created_at " +
++                        "FROM crypto_keys WHERE key_type = :key_type")
++                        .bind("key_type", KeyType.PGP)
++                        .mapTo(PGPKeyFingerprint.class)
++                        .list()
++        );
++    }
+ 
+     /*
+      * The readPublicKey methods are Copyright (c) 2000-2021 The Legion of the Bouncy Castle Inc. (https://www.bouncycastle.org)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,36 @@
++package horse.wtf.nzyme.crypto;
++
++import com.google.auto.value.AutoValue;
++import org.joda.time.DateTime;
++
++@AutoValue
++public abstract class PGPKeyFingerprint {
++
++    public abstract String node();
++    public abstract String fingerprint();
++    public abstract DateTime createdAt();
++
++    public static PGPKeyFingerprint create(String node, String fingerprint, DateTime createdAt) {
++        return builder()
++                .node(node)
++                .fingerprint(fingerprint)
++                .createdAt(createdAt)
++                .build();
++    }
++
++    public static Builder builder() {
++        return new AutoValue_PGPKeyFingerprint.Builder();
++    }
++
++    @AutoValue.Builder
++    public abstract static class Builder {
++        public abstract Builder node(String node);
++
++        public abstract Builder fingerprint(String fingerprint);
++
++        public abstract Builder createdAt(DateTime createdAt);
++
++        public abstract PGPKeyFingerprint build();
++    }
++
++}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,22 @@
++package horse.wtf.nzyme.crypto.database;
++
++import horse.wtf.nzyme.crypto.PGPKeyFingerprint;
++import org.jdbi.v3.core.mapper.RowMapper;
++import org.jdbi.v3.core.statement.StatementContext;
++import org.joda.time.DateTime;
++
++import java.sql.ResultSet;
++import java.sql.SQLException;
++
++public class PGPKeyFingerprintMapper implements RowMapper<PGPKeyFingerprint> {
++
++    @Override
++    public PGPKeyFingerprint map(ResultSet rs, StatementContext ctx) throws SQLException {
++        return PGPKeyFingerprint.create(
++                rs.getString("node"),
++                rs.getString("key_signature"),
++                new DateTime(rs.getTimestamp("created_at"))
++        );
++    }
++
++}
+
+
+
+
+@@ -5,6 +5,7 @@ import horse.wtf.nzyme.alerts.service.AlertDatabaseEntryMapper;
+ import horse.wtf.nzyme.bandits.database.*;
+ import horse.wtf.nzyme.configuration.db.BaseConfigurationMapper;
+ import horse.wtf.nzyme.configuration.leader.LeaderConfiguration;
++import horse.wtf.nzyme.crypto.database.PGPKeyFingerprintMapper;
+ import horse.wtf.nzyme.dot11.deauth.db.DeauthenticationMonitorRecordingMapper;
+ import horse.wtf.nzyme.dot11.networks.beaconrate.BeaconRateMapper;
+ import horse.wtf.nzyme.dot11.networks.sentry.db.SentrySSIDMapper;
+@@ -90,7 +91,8 @

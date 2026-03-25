@@ -1,0 +1,96 @@
+@@ -64,8 +64,12 @@ def put(resource_kind, namespace, name, spec, annotations={}, labels=None,
+       unchanged, and existing annotations with the same keys are overwritten by
+       these new values.
+ 
+-    - mod_revision (string): If specified, indicates that the write should only
+-      proceed if replacing an existing value with that mod_revision.
++    - mod_revision: If 0 (a number), indicates that the write should only
++      proceed if it _creates_ the resource.  Else, if etcdv3.MUST_UPDATE,
++      indicates that the write should only proceed if it _does not create_ the
++      resource.  Else, if not None, must be a number encoded as a string,
++      e.g. "12345", and indicates that the write should only proceed if
++      replacing an existing value with that mod_revision.
+ 
+     Returns True if the write happened successfully; False if not.
+     """
+
+
+
+
+@@ -35,6 +35,10 @@ LOG = log.getLogger(__name__)
+ # we leave plenty of headroom.
+ CHUNK_SIZE_LIMIT = 200
+ 
++# Indicates that a put operation must update an existing resource and not create
++# a new resource.
++MUST_UPDATE = "MUST_UPDATE"
++
+ 
+ class ForceClosingWatcher(watch.Watcher):
+     def stop(self):
+@@ -124,6 +128,7 @@ def put(key, value, mod_revision=None, lease=None, existing_value=None):
+               key, value, mod_revision)
+     txn = {}
+     if mod_revision == 0:
++        # Write operation must _create_ the KV entry.
+         base64_key = _encode(key)
+         txn['compare'] = [{
+             'key': base64_key,
+@@ -131,7 +136,17 @@ def put(key, value, mod_revision=None, lease=None, existing_value=None):
+             'target': 'VERSION',
+             'version': 0,
+         }]
++    elif mod_revision == MUST_UPDATE:
++        # Write operation must update and _not_ create the KV entry.
++        base64_key = _encode(key)
++        txn['compare'] = [{
++            'key': base64_key,
++            'result': 'NOT_EQUAL',
++            'target': 'VERSION',
++            'version': 0,
++        }]
+     elif mod_revision is not None:
++        # Write operation must _replace_ an KV entry with the specified revision.
+         base64_key = _encode(key)
+         txn['compare'] = [{
+             'key': base64_key,
+@@ -140,6 +155,7 @@ def put(key, value, mod_revision=None, lease=None, existing_value=None):
+             'mod_revision': mod_revision,
+         }]
+     elif existing_value is not None:
++        # Write operation must _replace_ an KV entry with the specified value.
+         base64_key = _encode(key)
+         base64_existing = _encode(existing_value)
+         txn['compare'] = [{
+
+
+
+
+@@ -25,6 +25,7 @@ from networking_calico.compat import cfg
+ from networking_calico.compat import log
+ from networking_calico.compat import n_exc
+ from networking_calico import datamodel_v3
++from networking_calico import etcdv3
+ from networking_calico.plugins.ml2.drivers.calico.policy import \
+     SG_LABEL_PREFIX
+ from networking_calico.plugins.ml2.drivers.calico.policy import \
+@@ -107,7 +108,7 @@ class WorkloadEndpointSyncer(ResourceSyncer):
+                                 annotations=annotations,
+                                 mod_revision=0)
+ 
+-    def update_in_etcd(self, name, write_data, mod_revision=None):
++    def update_in_etcd(self, name, write_data, mod_revision=etcdv3.MUST_UPDATE):
+         spec, labels, annotations = write_data
+         return datamodel_v3.put(self.resource_kind,
+                                 self.namespace,
+@@ -141,7 +142,7 @@ class WorkloadEndpointSyncer(ResourceSyncer):
+                 endpoint_labels(port, self.namespace),
+                 endpoint_annotations(port))
+ 
+-    def write_endpoint(self, port, context):
++    def write_endpoint(self, port, context, must_update=False):
+         # Reread the current port. This protects against concurrent writes
+         # breaking our state.
+         port = self.db.get_port(context, port['id'])
+@@ -157,17 +158,19 @@ class WorkloadEndpointSyncer(ResourceSyncer):
+         # problem there is that we potentially h

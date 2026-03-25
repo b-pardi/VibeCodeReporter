@@ -1,0 +1,103 @@
+@@ -657,7 +657,8 @@ static void printOperand(MCInst *MI, unsigned OpNo, SStream *O)
+ 	} else if (MCOperand_isImm(Op)) {
+ 		// Print X86 immediates as signed values.
+ 		int64_t imm = MCOperand_getImm(Op);
+-		int opsize = X86_immediate_size(MCInst_getOpcode(MI));
++		uint8_t encsize;
++		int opsize = X86_immediate_size(MCInst_getOpcode(MI), &encsize);
+ 		if (opsize == 1)    // print 1 byte immediate in positive form
+ 			imm = imm & 0xff;
+ 
+@@ -738,7 +739,10 @@ static void printOperand(MCInst *MI, unsigned OpNo, SStream *O)
+ 				MI->flat_insn->detail->x86.operands[MI->flat_insn->detail->x86.op_count].imm = imm;
+ 
+ 				if (opsize > 0)
++				{
+ 					MI->flat_insn->detail->x86.operands[MI->flat_insn->detail->x86.op_count].size = (uint8_t)opsize;
++					MI->flat_insn->detail->x86.encoding.imm_size = encsize;
++				}
+ 				else if (MI->op1_size > 0)
+ 					MI->flat_insn->detail->x86.operands[MI->flat_insn->detail->x86.op_count].size = MI->op1_size;
+ 				else
+
+
+
+
+@@ -883,12 +883,23 @@ static void update_pub_insn(cs_insn *pub, InternalInstruction *inter, uint8_t *p
+ 	pub->detail->x86.addr_size = inter->addressSize;
+ 
+ 	pub->detail->x86.modrm = inter->orgModRM;
+-	pub->detail->x86.sib = inter->sib;
+-	pub->detail->x86.disp = inter->displacement;
++	pub->detail->x86.encoding.modrm_offset = inter->modRMOffset;
+ 
++	pub->detail->x86.sib = inter->sib;
+ 	pub->detail->x86.sib_index = x86_map_sib_index(inter->sibIndex);
+ 	pub->detail->x86.sib_scale = inter->sibScale;
+ 	pub->detail->x86.sib_base = x86_map_sib_base(inter->sibBase);
++
++	pub->detail->x86.disp = inter->displacement;
++	if (inter->consumedDisplacement)
++	{
++		pub->detail->x86.encoding.disp_offset = inter->displacementOffset;
++		pub->detail->x86.encoding.disp_size = inter->displacementSize;
++	}
++
++	pub->detail->x86.encoding.imm_offset = inter->immediateOffset;
++	if (pub->detail->x86.encoding.imm_size == 0 && inter->immediateOffset != 0)
++		pub->detail->x86.encoding.imm_size = inter->immediateSize;
+ }
+ 
+ void X86_init(MCRegisterInfo *MRI)
+
+
+
+
+@@ -1584,6 +1584,8 @@ static int readModRM(struct InternalInstruction *insn)
+ 	if (insn->consumedModRM)
+ 		return 0;
+ 
++	insn->modRMOffset = (uint8_t)(insn->readerCursor - insn->startLocation);
++
+ 	if (consumeByte(insn, &insn->modRM))
+ 		return -1;
+ 
+@@ -2043,7 +2045,7 @@ static int readOperands(struct InternalInstruction *insn)
+ 					return -1;
+ 				// Apply the AVX512 compressed displacement scaling factor.
+ 				if (x86OperandSets[insn->spec->operands][index].encoding != ENCODING_REG && insn->eaDisplacement == EA_DISP_8)
+-					insn->displacement *= 1 << (x86OperandSets[insn->spec->operands][index].encoding - ENCODING_RM);
++					insn->displacement *= (int64_t)1 << (x86OperandSets[insn->spec->operands][index].encoding - ENCODING_RM);
+ 				break;
+ 			case ENCODING_CB:
+ 			case ENCODING_CW:
+@@ -2087,6 +2089,15 @@ static int readOperands(struct InternalInstruction *insn)
+ 			case ENCODING_Ia:
+ 				if (readImmediate(insn, insn->addressSize))
+ 					return -1;
++				/* Direct memory-offset (moffset) immediate will get mapped
++				   to memory operand later. We want the encoding info to
++				   reflect that as well. */
++				insn->displacementOffset = insn->immediateOffset;
++				insn->consumedDisplacement = true;
++				insn->displacementSize = insn->immediateSize;
++				insn->displacement = insn->immediates[insn->numImmediatesConsumed - 1];
++				insn->immediateOffset = 0;
++				insn->immediateSize = 0;
+ 				break;
+ 			case ENCODING_RB:
+ 				if (readOpcodeRegister(insn, 1))
+
+
+
+
+@@ -594,7 +594,7 @@ typedef struct InternalInstruction {
+   uint8_t                       sib;
+   /* The displacement, used for memory operands */
+   bool                          consumedDisplacement;
+-  int32_t                       displacement;
++  int64_t                       displacement;
+   /* The value of the two-byte escape prefix (usually 0x0f) */
+   uint8_t twoByteEscape;
+   /* The value of the three-byte escape prefix (usually 0x38 or 0x3a) */
+@@ -614,6 +614,8 @@ typedef struct Internal

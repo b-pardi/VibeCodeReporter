@@ -1,0 +1,133 @@
+@@ -28,7 +28,8 @@ class PeriodicActivities {
+  private:
+   ThreadedActivity *activities[CONST_MAX_NUM_THREADED_ACTIVITIES];
+   u_int16_t num_activities;
+-
++  ThreadPool *high_priority_pool, *standard_priority_pool, *no_priority_pool;
++  
+  public:
+   PeriodicActivities();
+   ~PeriodicActivities();
+
+
+
+
+@@ -29,7 +29,8 @@ class QueuedThreadData {
+   ThreadedActivity *j;
+   char *script_path;
+   NetworkInterface *iface;
+-
++  bool high_priority;
++  
+   QueuedThreadData(ThreadedActivity *_j, char *_path, NetworkInterface *_iface) {
+     j = _j, script_path = strdup(_path), iface = _iface;
+   }
+@@ -39,25 +40,24 @@ class QueuedThreadData {
+ 	
+ class ThreadPool {
+  private:
+-  bool terminating;
++  bool terminating, high_priority;
+   u_int8_t pool_size;
+-  u_int16_t queue_len;
+   pthread_cond_t condvar;
+   Mutex *m;
+   pthread_t *threadsState;
+-  std::queue <QueuedThreadData*> high_priority_threads, standard_priority_threads;
++  std::queue <QueuedThreadData*> threads;
+ 
+   QueuedThreadData* dequeueJob(bool waitIfEmpty);
+   
+  public:
+-  ThreadPool(u_int8_t _pool_size);
++  ThreadPool(bool _high_priority, u_int8_t _pool_size);
+   virtual ~ThreadPool();
+ 
+   void shutdown();
+   inline bool isTerminating() { return terminating; };
+ 
+   void run();
+-  bool queueJob(ThreadedActivity *j, bool _high_priority, char *path, NetworkInterface *iface);
++  bool queueJob(ThreadedActivity *j, char *path, NetworkInterface *iface);
+ };
+ 
+ 
+
+
+
+
+@@ -32,7 +32,6 @@ class ThreadedActivity {
+   pthread_t pthreadLoop;
+   char *path;
+   u_int32_t periodicity;
+-  bool high_priority;
+   bool align_to_localtime;
+   bool exclude_viewed_interfaces;
+   bool thread_started;
+@@ -51,12 +50,11 @@ class ThreadedActivity {
+   void updateThreadedActivityStats(NetworkInterface *iface, u_long latest_duration);
+   
+  public:
+-  ThreadedActivity(const char* _path,
+-		   bool high_priority = false,
++  ThreadedActivity(const char* _path,		   
+ 		   u_int32_t _periodicity_seconds = 0,
+ 		   bool _align_to_localtime = false,
+ 		   bool _exclude_viewed_interfaces = false,
+-		   u_int8_t thread_pool_size = 1);
++		   ThreadPool* _pool = NULL);
+   ~ThreadedActivity();
+ 
+   const char *activityPath() { return path; };
+
+
+
+
+@@ -24,10 +24,9 @@
+ typedef struct _activity_descr {
+   const char *path;
+   u_int32_t periodicity;
+-  bool high_priority;
++  ThreadPool *pool;
+   bool align_to_localtime;  
+   bool exclude_viewed_interfaces;
+-  u_int8_t thread_pool_size;
+ } activity_descr;
+ 
+ /* ******************************************* */
+@@ -49,6 +48,10 @@ PeriodicActivities::~PeriodicActivities() {
+       num_activities--;
+     }
+   }
++
++  delete high_priority_pool;
++  delete standard_priority_pool;
++  delete no_priority_pool;
+ }
+ 
+ /* ******************************************* */
+@@ -77,7 +80,7 @@ void PeriodicActivities::startPeriodicActivitiesLoop() {
+   struct stat buf;
+ #endif
+   ThreadedActivity *startup_activity;
+-  static u_int8_t num_threads = DEFAULT_THREAD_POOL_SIZE;
++  u_int8_t num_threads = DEFAULT_THREAD_POOL_SIZE;
+     
+   ntop->getTrace()->traceEvent(TRACE_NORMAL, "Started periodic activities loop...");
+ 
+@@ -105,22 +108,26 @@ void PeriodicActivities::startPeriodicActivitiesLoop() {
+ 
+   if(num_threads > MAX_THREAD_POOL_SIZE)
+     num_threads = MAX_THREAD_POOL_SIZE;
++
++  high_priority_pool     = new ThreadPool(true,  ntop->get_num_interfaces());
++  standard_priority_pool = new ThreadPool(false, ntop->get_num_interfaces());
++  no_priority_pool       = new ThreadPool(false, num_threads);
+   
+   static activity_descr ad[] = {
+-				{ SECOND_SCRIPT_PATH,             1, false, false, false, 1           },
+-				{ HT_STATE_UPDATE_SCRIPT_PATH,    5, true /* high priority */, false, true,  num_threads },
+-				{ STATS_UPDATE_SCRIPT_PATH,       5, false, false, false, num_threads },
+-				{ MINUTE_SCRIPT_PATH,            60, false, false, false, num_threads },
+-				{ FIVE_MINUTES_SCRIPT_PATH,     300, false, false, false, num_threads },
+-				{ HOURLY_SCRIPT_PATH,          3600, false, false, fa

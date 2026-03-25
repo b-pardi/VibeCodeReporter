@@ -1,0 +1,126 @@
+@@ -189,3 +189,23 @@ def callstack() -> List[int]:
+         frame = frame.parent()
+ 
+     return addresses
++
++
++@pwndbg.lib.cache.cache_until("stop", "start")
++def get_stack_var_name(address: int) -> str | None:
++    """
++    Get the name of the stack variable covering the given address.
++
++    Returns the variable name with optional offset (e.g., "buf+0x8") if the address
++    is within a variable but not at its start. Returns None if no variable is found.
++    """
++    frame = pwndbg.dbg.selected_frame()
++    if frame is None:
++        return None
++
++    for start, end, name in frame.stack_variables():
++        if start <= address < end:
++            offset = address - start
++            return name if offset == 0 else f"{name}+{offset:#x}"
++
++    return None
+
+
+
+
+@@ -35,7 +35,9 @@ def get_address_and_symbol(address: int) -> str:
+     else:
+         page = pwndbg.aglib.vmmap.find(address)
+         if page and "[stack" in page.objfile:
+-            var = pwndbg.integration.provider.get_stack_var_name(address)
++            var = pwndbg.aglib.stack.get_stack_var_name(address)
++            if not var:
++                var = pwndbg.integration.provider.get_stack_var_name(address)
+             if var:
+                 symbol = f"{address:#x} {{{var}}}"
+     return get(address, symbol)
+@@ -58,7 +60,9 @@ def attempt_colorized_symbol(address: int) -> str | None:
+     else:
+         page = pwndbg.aglib.vmmap.find(address)
+         if page and "[stack" in page.objfile:
+-            var = pwndbg.integration.provider.get_stack_var_name(address)
++            var = pwndbg.aglib.stack.get_stack_var_name(address)
++            if not var:
++                var = pwndbg.integration.provider.get_stack_var_name(address)
+             if var:
+                 return get(address, f"{{{var}}}")
+     return None
+@@ -108,7 +112,7 @@ def get(
+     if text is None:
+         text = pwndbg.lib.pretty_print.int_to_string(address)
+ 
+-    if prefix:
++    if prefix is not None:
+         # Prepend the prefix and a space before the existing text
+         text = f"{prefix} {text}"
+ 
+
+
+
+
+@@ -253,6 +253,15 @@ class Frame:
+         """
+         raise NotImplementedError()
+ 
++    def stack_variables(self) -> Tuple[Tuple[int, int, str], ...]:
++        """
++        Get all stack variables (local variables and arguments) in current frame.
++
++        Returns a tuple of (start_address, end_address, name) for each variable.
++        Returns an empty tuple if no debug information is available or on error.
++        """
++        raise NotImplementedError()
++
+     def __eq__(self, rhs: object) -> bool:
+         """
+         Whether this frame is the same as the given frame. Two frames are the
+
+
+
+
+@@ -92,6 +92,37 @@ def parse_and_eval(expression: str, global_context: bool) -> gdb.Value:
+         return gdb.parse_and_eval(expression)
+ 
+ 
++def _get_frame_stack_variables(frame: gdb.Frame) -> Tuple[Tuple[int, int, str], ...]:
++    try:
++        block = frame.block()
++    except (gdb.error, RuntimeError):
++        # gdb.error: No frame selected (no active inferior)
++        # RuntimeError: Frame exists and selected,
++        # But no DWARF info, such as in the case of stripped binaries
++        return ()
++
++    if not block:
++        return ()
++
++    variables = []
++    while block:
++        for sym in block:
++            if not (sym.is_variable or sym.is_argument):
++                continue
++
++            try:
++                value = sym.value(frame)
++                addr = int(value.address)
++                size = value.type.sizeof
++                variables.append((addr, addr + size, sym.name))
++            except (gdb.error, AttributeError, TypeError):
++                continue
++
++        block = block.superblock
++
++    return tuple(variables)
++
++
+ class GDBRegisters(pwndbg.dbg_mod.Registers):
+     def __init__(self, frame: GDBFrame):
+         self.frame = frame
+@@ -204,6 +235,10 @@ class GDBFrame(pwndbg.dbg_mod.Frame):
+ 
+         return sal.symtab.fullname(), sal.line
+ 
++    @

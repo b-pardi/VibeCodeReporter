@@ -1,0 +1,111 @@
+@@ -144,6 +144,10 @@ public class RAMStorage implements ContentAddressedStorage {
+         return result;
+     }
+ 
++    public int totalSize() {
++        return storage.values().stream().mapToInt(a -> a.length).sum();
++    }
++
+     private static RAMStorage singleton = new RAMStorage();
+     public static RAMStorage getSingleton() {
+         return singleton;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,335 @@
++package peergos.shared.hamt;
++
++import peergos.server.storage.*;
++import peergos.shared.*;
++import peergos.shared.cbor.*;
++import peergos.shared.crypto.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.merklebtree.*;
++import peergos.shared.storage.*;
++import peergos.shared.util.*;
++
++import java.util.*;
++import java.util.concurrent.*;
++import java.util.function.*;
++import java.util.stream.*;
++
++/**
++ * A Compressed Hash-Array Mapped Prefix-tree (CHAMP), a refinement of a Hash Array Mapped Trie (HAMT)
++ */
++public class Champ implements Cborable {
++
++    private static final int HASH_CODE_LENGTH = 32;
++
++    private static class KeyElement implements Cborable {
++        public final ByteArrayWrapper key;
++        public final MaybeMultihash valueHash;
++
++        public KeyElement(ByteArrayWrapper key, MaybeMultihash valueHash) {
++            this.key = key;
++            this.valueHash = valueHash;
++        }
++
++        @Override
++        public CborObject toCbor() {
++            return new CborObject.CborList(Arrays.asList(
++                    key == null ? new CborObject.CborNull() : new CborObject.CborByteArray(key.data),
++                    valueHash.isPresent() ? new CborObject.CborMerkleLink(valueHash.get()) : new CborObject.CborNull()));
++        }
++
++        public static KeyElement fromCbor(Cborable cbor) {
++            if (! (cbor instanceof CborObject.CborList))
++                throw new IllegalStateException("Invalid cbor for KeyElement! " + cbor);
++            List<? extends Cborable> list = ((CborObject.CborList) cbor).value;
++            ByteArrayWrapper key = list.get(0) instanceof CborObject.CborNull ?
++                    null :
++                    new ByteArrayWrapper(((CborObject.CborByteArray) list.get(0)).value);
++            Cborable rawValue = list.get(1);
++            MaybeMultihash value = rawValue instanceof CborObject.CborNull ?
++                    MaybeMultihash.empty() :
++                    MaybeMultihash.of(((CborObject.CborMerkleLink)rawValue).target);
++            return new KeyElement(key, value);
++        }
++    }
++
++    private static final Champ EMPTY = new Champ(new BitSet(), new BitSet(), new KeyElement[0]);
++    private final BitSet dataMap, nodeMap;
++    private final KeyElement[] contents;
++
++    public Champ(BitSet dataMap, BitSet nodeMap, KeyElement[] contents) {
++        this.dataMap = dataMap;
++        this.nodeMap = nodeMap;
++        this.contents = contents;
++        for (int i=0; i< contents.length; i++)
++            if (contents[i] == null)
++                throw new IllegalStateException();
++    }
++
++    private static int mask(ByteArrayWrapper key, int depth) {
++        return key.data[depth] & 0xff;
++    }
++
++    private static int index(BitSet bitmap, int bitpos) {
++        int total = 0;
++        for (int i = 0; i < bitpos;) {
++            int next = bitmap.nextSetBit(i);
++            if (next == -1 || next >= bitpos)
++                return total;
++            total++;
++            i = next + 1;
++        }
++        return total;
++    }
++
++    MaybeMultihash getValue(ByteArrayWrapper key, int depth) {
++        int bitpos = mask(key, depth);
++        int index = index(this.dataMap, bitpos);
++        return contents[index].valueHash;
++    }
++
++    CompletableFuture<Optional<Champ>> getChild(ByteArrayWrapper key, int depth, ContentAddressedStorage storage) {
++        int bitpos = mask(key, depth);
++        int index = contents.length - 1 - index(this.nodeMap, bitpos);
++        return storage.get(contents[index].value

@@ -1,0 +1,135 @@
+@@ -876,6 +876,20 @@ do_netdev(struct __ctx_buff *ctx, __u16 proto, const bool from_host)
+ 	__u32 __maybe_unused ipcache_srcid = 0;
+ 	int ret;
+ 
++#if defined(ENABLE_L7_LB)
++	if (from_host) {
++		__u32 magic = ctx->mark & MARK_MAGIC_HOST_MASK;
++
++		if (magic == MARK_MAGIC_PROXY_EGRESS_EPID) {
++			__u32 lxc_id = get_epid(ctx);
++
++			ctx->mark = 0;
++			tail_call_dynamic(ctx, &POLICY_EGRESSCALL_MAP, lxc_id);
++			return DROP_MISSED_TAIL_CALL;
++		}
++	}
++#endif
++
+ #ifdef ENABLE_IPSEC
+ 	if (!from_host && !do_decrypt(ctx, proto))
+ 		return CTX_ACT_OK;
+@@ -1068,6 +1082,20 @@ int to_netdev(struct __ctx_buff *ctx __maybe_unused)
+ 		}
+ 	}
+ 
++#if defined(ENABLE_L7_LB)
++	{
++		__u32 magic = ctx->mark & MARK_MAGIC_HOST_MASK;
++
++		if (magic == MARK_MAGIC_PROXY_EGRESS_EPID) {
++			__u32 lxc_id = get_epid(ctx);
++
++			ctx->mark = 0;
++			tail_call_dynamic(ctx, &POLICY_EGRESSCALL_MAP, lxc_id);
++			return DROP_MISSED_TAIL_CALL;
++		}
++	}
++#endif
++
+ #ifdef ENABLE_HOST_FIREWALL
+ 	if (!proto && !validate_ethertype(ctx, &proto)) {
+ 		ret = DROP_UNSUPPORTED_L2;
+
+
+
+
+@@ -131,6 +131,7 @@ static __always_inline int handle_ipv6_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	__u8 audited = 0;
+ 	bool __maybe_unused dst_remote_ep = false;
+ 	__u16 proxy_port = 0;
++	bool from_l7lb = false;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+@@ -235,6 +236,9 @@ static __always_inline int handle_ipv6_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	}
+ 
+ skip_policy_enforcement:
++#if defined(ENABLE_L7_LB)
++	from_l7lb = ctx_load_meta(ctx, CB_FROM_HOST) == FROM_HOST_L7_LB;
++#endif
+ 	switch (ct_status) {
+ 	case CT_NEW:
+ 		if (!hairpin_flow)
+@@ -249,7 +253,7 @@ ct_recreate6:
+ 		 */
+ 		ct_state_new.src_sec_id = SECLABEL;
+ 		ret = ct_create6(get_ct_map6(&tuple), &CT_MAP_ANY6, &tuple, ctx,
+-				 CT_EGRESS, &ct_state_new, verdict > 0);
++				 CT_EGRESS, &ct_state_new, verdict > 0, from_l7lb);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 		trace.monitor = TRACE_PAYLOAD_LEN;
+@@ -312,7 +316,10 @@ ct_recreate6:
+ 
+ 	hairpin_flow |= ct_state.loopback;
+ 
+-	if (redirect_to_proxy(verdict, ct_status)) {
++	/* L7 LB does L7 policy enforcement, so we only redirect packets
++	 * NOT from L7 LB.
++	 */
++	if (!from_l7lb && redirect_to_proxy(verdict, ct_status)) {
+ 		proxy_port = (__u16)verdict;
+ 		/* Trace the packet before it is forwarded to proxy */
+ 		send_trace_notify(ctx, TRACE_TO_PROXY, SECLABEL, 0,
+@@ -346,8 +353,9 @@ ct_recreate6:
+ 			}
+ #endif /* ENABLE_ROUTING */
+ 			policy_clear_mark(ctx);
++			/* If the packet is from L7 LB it is coming from the host */
+ 			return ipv6_local_delivery(ctx, l3_off, SECLABEL, ep,
+-						   METRIC_EGRESS, false);
++						   METRIC_EGRESS, from_l7lb);
+ 		}
+ 	}
+ 
+@@ -601,6 +609,7 @@ static __always_inline int handle_ipv4_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	bool __maybe_unused dst_remote_ep = false;
+ 	enum ct_status ct_status;
+ 	__u16 proxy_port = 0;
++	bool from_l7lb = false;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+ 		return DROP_INVALID;
+@@ -699,6 +708,9 @@ static __always_inline int handle_ipv4_from_lxc(struct __ctx_buff *ctx, __u32 *d
+ 	}
+ 
+ skip_policy_enforcement:
++#if defined(ENABLE_L7_LB)
++	from_l7lb = ctx_load_meta(ctx, CB_FROM_HOST) == FROM_HOST_L7_LB;
++#endif
+ 	switch (ct_status) {
+ 	case CT_NEW:
+ 		if (!hairpin_flow)
+@@ -716,7 +728,7 @@ ct_recreate4:
+ 		 * handling here, but turns out that verifier cannot handle it.
+ 		 */
+ 		ret = ct_create4(get_ct_map4(&tuple), &CT_MAP_ANY4, &tuple, ctx,
+-				 CT_EGRESS, &ct_state_new, verdict > 0);
++				 CT_EGRESS, &ct_state_new, verdict > 0, from_l7lb);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 		break;
+@@ -776,7 +788,10 @@ ct_recreate4:
+ 
+ 	hairpin_flow |= ct_state.loopback;
+ 
+-	if (redirect_to_proxy(verdict, ct_status)) {
++	/* L7 LB does L7 policy enforcement, so we only redirect packets
++	 * NOT from L7 LB.
++	 */
++	if (!from_l7lb && redirect_to_proxy(verdict, ct_status)) {
+ 		proxy_port = (__u16)verdict;
+ 		/* Trace the packet before it is forwarded to proxy */
+ 		send_trace_notify

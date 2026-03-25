@@ -1,0 +1,112 @@
+@@ -16,12 +16,15 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.NavigableMap;
++import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.SortedMap;
+ import java.util.SortedSet;
++import java.util.Stack;
+ import java.util.TreeMap;
+ import java.util.concurrent.ConcurrentHashMap;
++import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import org.batfish.common.BatfishException;
+ import org.batfish.common.util.CommonUtil;
+@@ -64,6 +67,38 @@ import org.batfish.datamodel.pojo.Node;
+  * context (data) needed for it
+  */
+ public class TracerouteEngineImplContext {
++  /** Used for loop detection */
++  private static class Breadcrumb {
++    private final @Nonnull String _node;
++    private final @Nonnull String _vrf;
++    private final @Nonnull Flow _flow;
++
++    Breadcrumb(@Nonnull String node, @Nonnull String vrf, @Nonnull Flow flow) {
++      _node = node;
++      _vrf = vrf;
++      _flow = flow;
++    }
++
++    @Override
++    public boolean equals(Object obj) {
++      if (this == obj) {
++        return true;
++      }
++
++      if (!(obj instanceof Breadcrumb)) {
++        return false;
++      }
++
++      Breadcrumb other = (Breadcrumb) obj;
++
++      return _node.equals(other._node) && _vrf.equals(other._vrf) && _flow.equals(other._flow);
++    }
++
++    @Override
++    public int hashCode() {
++      return Objects.hash(_node, _vrf, _flow);
++    }
++  }
+ 
+   private static class TransmissionContext {
+     private final Map<String, IpAccessList> _aclDefinitions;
+@@ -113,6 +148,7 @@ public class TracerouteEngineImplContext {
+   private final Set<Flow> _flows;
+   private final ForwardingAnalysis _forwardingAnalysis;
+   private final boolean _ignoreAcls;
++  private final Stack<Breadcrumb> _breadcrumbs;
+ 
+   public TracerouteEngineImplContext(
+       DataPlane dataPlane,
+@@ -125,6 +161,7 @@ public class TracerouteEngineImplContext {
+     _fibs = fibs;
+     _ignoreAcls = ignoreAcls;
+     _forwardingAnalysis = _dataPlane.getForwardingAnalysis();
++    _breadcrumbs = new Stack<>();
+   }
+ 
+   /**
+@@ -394,6 +431,7 @@ public class TracerouteEngineImplContext {
+               aclDefinitions,
+               namedIpSpaces);
+       steps.add(enterIfaceStep);
++
+       if (enterIfaceStep.getAction() == StepAction.DENIED) {
+         Hop deniedHop = new Hop(new Node(currentNodeName), ImmutableList.copyOf(steps));
+         transmissionContext._hopsSoFar.add(deniedHop);
+@@ -421,168 +459,185 @@ public class TracerouteEngineImplContext {
+       vrfName = currentConfiguration.getAllInterfaces().get(inputIfaceName).getVrfName();
+     }
+ 
+-    // Accept if the flow is destined for this vrf on this host.
+-    if (_dataPlane
+-        .getIpVrfOwners()
+-        .getOrDefault(currentFlow.getDstIp(), ImmutableMap.of())
+-        .getOrDefault(currentConfiguration.getHostname(), ImmutableSet.of())
+-        .contains(vrfName)) {
+-      InboundStep inboundStep =
+-          InboundStep.builder()
+-              .setAction(StepAction.ACCEPTED)
+-              .setDetail(new InboundStepDetail())
+-              .build();
+-      steps.add(inboundStep);
+-
+-      Hop acceptedHop = new Hop(new Node(currentNodeName), ImmutableList.copyOf(steps));
+-      transmissionContext._hopsSoFar.add(acceptedHop);
+-      Trace trace = new Trace(FlowDisposition.ACCEPTED, transmissionContext._hopsSoFar);
++    // Loop detection
++    Breadcrumb breadcrumb = new Breadcrumb(currentNodeName, vrfName, currentFlow);
++    if (_breadcrumbs.contains(breadcrumb)) {
++      Hop loopHop = new Hop(new Node(currentNodeName), ImmutableList.copyOf(steps));
++      transmissionContext._hopsSoFar.add(loopHop);
++      Trace trace = new Trace(FlowDisposition.LOOP, transmissionContext._hopsSoFar);
+       transmissionContext._flowTraces.add(trace);
+       return;
+     }
+ 
+-    // .. and what the next hops are based on the FIB.
+-    Fib currentFib = _fibs.get(currentNodeName).get(vrfName);
+-    Set<String> nextHopInterfaces = current

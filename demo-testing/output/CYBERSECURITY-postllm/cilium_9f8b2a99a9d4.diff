@@ -1,0 +1,139 @@
+@@ -149,12 +149,8 @@ static __always_inline int __per_packet_lb_svc_xlate_6(void *ctx, struct ipv6hdr
+ 	int l4_off;
+ 	int ret;
+ 
+-	fraginfo = ipv6_get_fraginfo(ctx, ip6);
+-	if (fraginfo < 0)
+-		return (int)fraginfo;
+-
+ 	tuple.nexthdr = ip6->nexthdr;
+-	ret = ipv6_hdrlen(ctx, &tuple.nexthdr);
++	ret = ipv6_hdrlen_with_fraginfo(ctx, &tuple.nexthdr, &fraginfo);
+ 	if (ret < 0)
+ 		return ret;
+ 
+
+
+
+
+@@ -431,15 +431,11 @@ ipv6_extract_tuple(struct __ctx_buff *ctx, struct ipv6_ct_tuple *tuple)
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+ 
+-	fraginfo = ipv6_get_fraginfo(ctx, ip6);
+-	if (fraginfo < 0)
+-		return (int)fraginfo;
+-
+ 	tuple->nexthdr = ip6->nexthdr;
+ 	ipv6_addr_copy(&tuple->daddr, (union v6addr *)&ip6->daddr);
+ 	ipv6_addr_copy(&tuple->saddr, (union v6addr *)&ip6->saddr);
+ 
+-	ret = ipv6_hdrlen(ctx, &tuple->nexthdr);
++	ret = ipv6_hdrlen_with_fraginfo(ctx, &tuple->nexthdr, &fraginfo);
+ 	if (ret < 0)
+ 		return ret;
+ 
+
+
+
+
+@@ -112,14 +112,24 @@ static __always_inline int ipv6_skip_exthdr(struct __ctx_buff *ctx, __u8 *nexthd
+ 	}
+ }
+ 
+-static __always_inline int ipv6_hdrlen_offset(struct __ctx_buff *ctx, __u8 *nexthdr, int l3_off)
++static __always_inline int ipv6_hdrlen_offset(struct __ctx_buff *ctx, int l3_off,
++					      __u8 *nexthdr, fraginfo_t *fraginfo)
+ {
+ 	int i, len = sizeof(struct ipv6hdr);
+ 	__u8 nh = *nexthdr;
+ 
++	/* 0 is a valid fraginfo that encodes:
++	 * - is_fragment = false
++	 * - has_l4_header = true
++	 * - protocol = 0 (unused when !is_fragment)
++	 * This is the default in case no NEXTHDR_FRAGMENT is found.
++	 */
++	*fraginfo = 0;
++
+ #pragma unroll
+ 	for (i = 0; i < IPV6_MAX_HEADERS; i++) {
+-		int hdrlen = ipv6_skip_exthdr(ctx, &nh, l3_off + len);
++		__u8 newnh = nh;
++		int hdrlen = ipv6_skip_exthdr(ctx, &newnh, l3_off + len);
+ 
+ 		if (hdrlen < 0)
+ 			return hdrlen;
+@@ -129,16 +139,35 @@ static __always_inline int ipv6_hdrlen_offset(struct __ctx_buff *ctx, __u8 *next
+ 			return len;
+ 		}
+ 
++		if (nh == NEXTHDR_FRAGMENT) {
++			struct ipv6_frag_hdr frag;
++
++			if (ctx_load_bytes(ctx, l3_off + len, &frag, sizeof(frag)) < 0)
++				return DROP_INVALID;
++
++			*fraginfo = ipfrag_encode_ipv6(&frag);
++		}
++
+ 		len += hdrlen;
++		nh = newnh;
+ 	}
+ 
+ 	/* Reached limit of supported extension headers */
+ 	return DROP_INVALID_EXTHDR;
+ }
+ 
++static __always_inline int ipv6_hdrlen_with_fraginfo(struct __ctx_buff *ctx,
++						     __u8 *nexthdr,
++						     fraginfo_t *fraginfo)
++{
++	return ipv6_hdrlen_offset(ctx, ETH_HLEN, nexthdr, fraginfo);
++}
++
+ static __always_inline int ipv6_hdrlen(struct __ctx_buff *ctx, __u8 *nexthdr)
+ {
+-	return ipv6_hdrlen_offset(ctx, nexthdr, ETH_HLEN);
++	fraginfo_t fraginfo;
++
++	return ipv6_hdrlen_offset(ctx, ETH_HLEN, nexthdr, &fraginfo);
+ }
+ 
+ static __always_inline void ipv6_addr_copy(union v6addr *dst,
+
+
+
+
+@@ -1707,6 +1707,7 @@ snat_v6_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off, bool has_l4_hea
+ 	struct ipv6_ct_tuple tuple = {};
+ 	struct ipv6_nat_entry *state;
+ 	struct ipv6hdr ip6;
++	fraginfo_t fraginfo;
+ 	__u16 port_off;
+ 	__u32 icmpoff;
+ 	int hdrlen;
+@@ -1728,7 +1729,7 @@ snat_v6_nat_handle_icmp_error(struct __ctx_buff *ctx, __u64 off, bool has_l4_hea
+ 	ipv6_addr_copy(&tuple.daddr, (union v6addr *)&ip6.saddr);
+ 	tuple.flags = NAT_DIR_EGRESS;
+ 
+-	hdrlen = ipv6_hdrlen_offset(ctx, &tuple.nexthdr, inner_l3_off);
++	hdrlen = ipv6_hdrlen_offset(ctx, inner_l3_off, &tuple.nexthdr, &fraginfo);
+ 	if (hdrlen < 0)
+ 		return hdrlen;
+ 
+@@ -1875,6 +1876,7 @@ snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
+ {
+ 	struct ipv6_ct_tuple tuple = {};
+ 	struct ipv6hdr iphdr;
++	fraginfo_t fraginfo;
+ 	__u16 port_off;
+ 	__u32 icmpoff;
+ 	__u8 type;
+@@ -1899,7 +1901,7 @@ snat_v6_rev_nat_handle_icmp_pkt_toobig(struct __ctx_buff *ctx,
+ 	ipv6_addr_copy(&tuple.daddr, (union v6addr *)&iphdr.saddr);
+ 	tuple.flags = NAT_DIR_INGRESS;
+ 
+-	hdrlen = ipv6_hdrlen_offset(ctx, &tuple.nexthdr, inner_l3_off);
++	hdrlen = ipv6_hdrlen_offset(ctx, inner_l3_off, &tuple.nexthdr, &fraginfo);
+ 	if

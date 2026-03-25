@@ -1,0 +1,117 @@
+@@ -1402,7 +1402,7 @@
+ #define FLAG_SYS_TV_HOME                            (SYSTEM_FLAGS + 0x30)
+ #define FLAG_SYS_TV_WATCH                           (SYSTEM_FLAGS + 0x31)
+ #define FLAG_SYS_TV_START                           (SYSTEM_FLAGS + 0x32)
+-#define FLAG_SYS_POPWORD_INPUT                      (SYSTEM_FLAGS + 0x33)
++#define FLAG_SYS_CHANGED_DEWFORD_TREND              (SYSTEM_FLAGS + 0x33)
+ #define FLAG_SYS_MIX_RECORD                         (SYSTEM_FLAGS + 0x34)
+ #define FLAG_SYS_CLOCK_SET                          (SYSTEM_FLAGS + 0x35)
+ #define FLAG_SYS_NATIONAL_DEX                       (SYSTEM_FLAGS + 0x36)
+
+
+
+
+@@ -52,6 +52,7 @@
+ #define NUM_CONTEST_WINNERS 13
+ #define UNION_ROOM_KB_ROW_COUNT 10
+ #define GIFT_RIBBONS_COUNT 11
++#define SAVED_TRENDS_COUNT 5
+ 
+ #define PYRAMID_BAG_ITEMS_COUNT 10
+ #define HALL_FACILITIES_COUNT 9 // 7 facilities for single mode + tower double mode + tower multi mode.
+
+
+
+
+@@ -2,10 +2,9 @@
+ #define GUARD_DEWFORDTREND_H
+ 
+ void InitDewfordTrend(void);
+-void UpdateDewfordTrendPerDay(u16);
+ void UpdateDewfordTrendPerDay(u16 days);
+-bool8 IsPhraseTrendy(u16 *a);
+-void ReceiveEasyChatPairsData(struct EasyChatPair *a, size_t b, u8 unused);
++bool8 TrySetTrendyPhrase(u16 *phrase);
++void ReceiveDewfordTrendData(struct DewfordTrend *linkedTrends, size_t size, u8 unused);
+ 
+ 
+ #endif // GUARD_DEWFORDTREND_H
+
+
+
+
+@@ -587,12 +587,13 @@ struct RamScript
+     struct RamScriptData data;
+ };
+ 
+-struct EasyChatPair
++// See dewford_trend.c
++struct DewfordTrend
+ {
+-    u16 unk0_0:7;
+-    u16 unk0_7:7;
+-    u16 unk1_6:1;
+-    u16 unk2;
++    u16 trendiness:7;
++    u16 maxTrendiness:7;
++    u16 gainingTrendiness:1;
++    u16 rand;
+     u16 words[2];
+ }; /*size = 0x8*/
+ 
+@@ -1021,7 +1022,7 @@ struct SaveBlock1
+     /*0x2BE0*/ struct MailStruct mail[MAIL_COUNT];
+     /*0x2E20*/ u8 additionalPhrases[8]; // bitfield for 33 additional phrases in easy chat system
+     /*0x2E28*/ OldMan oldMan;
+-    /*0x2e64*/ struct EasyChatPair easyChatPairs[5]; //Dewford trend [0] and some other stuff
++    /*0x2e64*/ struct DewfordTrend dewfordTrends[SAVED_TRENDS_COUNT];
+     /*0x2e90*/ struct ContestWinner contestWinners[NUM_CONTEST_WINNERS]; // see CONTEST_WINNER_*
+     /*0x3030*/ struct DayCare daycare;
+     /*0x3150*/ struct LinkBattleRecords linkBattleRecords;
+
+
+
+
+@@ -31,7 +31,7 @@ void AlertTVThatPlayerPlayedRoulette(u16 nCoinsSpent);
+ void AlertTVOfNewCoinTotal(u16 nCoinsPaidOut);
+ void TryPutSecretBaseSecretsOnAir(void);
+ void TryPutTodaysRivalTrainerOnAir(void);
+-void sub_80EDC60(const u16 *words);
++void TryPutTrendWatcherOnAir(const u16 *words);
+ void sub_80EDA80(void);
+ void ReceivePokeNewsData(void *src, u32 size, u8 masterIdx);
+ void sub_80F0BB8(void);
+
+
+
+
+@@ -10,311 +10,383 @@
+ #include "string_util.h"
+ #include "constants/easy_chat.h"
+ 
+-// static functions
+-static void sub_8122804(struct EasyChatPair *s, u16 b, u8 c);
+-static bool8 sub_8122A58(struct EasyChatPair *a, struct EasyChatPair *b, u8 c);
+-static void sub_8122B28(struct EasyChatPair *s);
+-static bool8 SB1ContainsWords(u16 *a);
+-static bool8 IsEasyChatPairEqual(u16 *words1, u16 *words2);
+-static s16 GetEqualEasyChatPairIndex(struct EasyChatPair *s, struct EasyChatPair *a, u16 b);
+-
+-// text
++/*
++    ## Overview ##
++    This file handles the "Dewford Trend", a pair of Easy Chat words
++    repeated by NPCs around Dewford Hall.
++
++    The NPC outside Dewford Hall will ask what the player thinks of the
++    current trendy phrase, and the player may submit a new pair of words.
++    If the NPC thinks the submitted phrase is "trendier" than the
++    current one (see TrySetTrendyPhrase), it becomes the new phrase.
++
++    ## struct DewfordTrend ##
++    Information about a Dewford trend is stored in a struct DewfordTrend.
++    In addition to the two easy chat words that make up the trend's phrase,
++    each trend has a few randomly generated values associated with it.
++    - rand: 
++        This is a 16 bit value generated once when the phrase is created.
++        It's used 

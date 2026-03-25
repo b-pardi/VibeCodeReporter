@@ -1,0 +1,110 @@
+@@ -8,7 +8,6 @@ import datetime
+ import logging
+ import os
+ import re
+-
+ import string
+ import sys
+ from configparser import (
+@@ -50,8 +49,9 @@ from sqlalchemy.pool import QueuePool
+ 
+ # Local application imports
+ import faraday.server.config
+-from faraday.server.config import faraday_server
+ import faraday.server.events
++from faraday.server.api.modules.swagger import swagger_api
++from faraday.server.config import faraday_server
+ from faraday.server.config import (
+     CONST_FARADAY_HOME_PATH,
+     LOCAL_CONFIG_FILE,
+@@ -65,7 +65,7 @@ from faraday.server.models import (
+ from faraday.server.utils.ping import ping_home_background_task
+ 
+ from faraday.server.utils.reports_processor import reports_manager_background_task
+-from faraday.server.api.modules.swagger import swagger_api
++from faraday.server.utils.command import schedule_update_failed_command_stats
+ from faraday.server.utils.invalid_chars import remove_null_characters
+ from faraday.server.utils.logger import LOGGING_HANDLERS
+ from faraday.server.websockets.dispatcher import remove_sid
+@@ -577,6 +577,8 @@ def create_app(db_connection_string=None, testing=None, register_extensions_flag
+         from faraday.server.threads.crontab import CronTab  # pylint: disable=import-outside-toplevel
+         agents_crontab = CronTab(app=app)
+         agents_crontab.start()
++
++        schedule_update_failed_command_stats()
+     return app
+ 
+ 
+
+
+
+
+@@ -253,47 +253,49 @@ def update_failed_command_stats(debouncer=None):
+         now = datetime.utcnow()
+         seven_days_ago = now - timedelta(days=7)
+ 
+-        failed_command_ids = db.session.query(Command.id).filter(Command.end_date.is_(None), Command.create_date > seven_days_ago).all()
++        failed_commands_ids = [
++            command for (command,) in db.session.query(Command.id)
++            .filter(Command.end_date.is_(None), Command.create_date > seven_days_ago)
++            .all()
++        ]
+ 
+-        failed_command_ids = [c[0] for c in failed_command_ids]
++        if not failed_commands_ids:
++            logger.info("No failed commands found, skipping stats update")
++            return
+ 
+-        host_ids = (
+-            db.session.query(CommandObject.object_id)
+-            .filter(
+-                CommandObject.command_id.in_(failed_command_ids),
+-                CommandObject.object_type == 'host',
+-                CommandObject.created_persistent.is_(True),
+-            )
++        hosts_ids = [
++            host for (host,) in db.session.query(CommandObject.object_id)
++            .filter(CommandObject.command_id.in_(failed_commands_ids),
++                    CommandObject.object_type == 'host',
++                    CommandObject.created_persistent.is_(True))
+             .distinct()
+             .all()
+-        )
+-        host_ids = [h[0] for h in host_ids]
++        ]
+ 
+-        workspace_ids = (
+-            db.session.query(Host.workspace_id)
+-            .filter(Host.id.in_(host_ids))
++        if not hosts_ids:
++            logger.info("No hosts created by failed commands, skipping stats update")
++            return
++
++        workspaces_ids = [
++            workspace for (workspace,) in db.session.query(Host.workspace_id)
++            .filter(Host.id.in_(hosts_ids))
+             .distinct()
+             .all()
+-        )
+-        workspace_ids = [w[0] for w in workspace_ids]
+-
+-        logger.info(f"Found {len(host_ids)} hosts created by failed commands")
+-        if host_ids:
+-            if faraday_server.celery_enabled:
+-                update_host_stats.delay(
+-                    hosts=host_ids,
+-                    services=[],
+-                    workspace_ids=workspace_ids,
+-                    sync=True,
+-                )
+-            else:
+-                update_host_stats(
+-                    hosts=host_ids,
+-                    services=[],
+-                    workspace_ids=workspace_ids,
+-                    sync=True,
+-                    debouncer=debouncer
+-                )
++        ]
++
++    

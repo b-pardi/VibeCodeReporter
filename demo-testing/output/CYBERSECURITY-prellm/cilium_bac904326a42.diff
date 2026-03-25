@@ -1,0 +1,127 @@
+@@ -30,13 +30,17 @@ static __always_inline __wsum csum_diff(const void *from, __u32 size_from,
+ 					__u32 seed)
+ {
+ 	if (__builtin_constant_p(size_from) &&
+-	    __builtin_constant_p(size_to) &&
+-	    __builtin_constant_p(seed) && seed == 0) {
++	    __builtin_constant_p(size_to)) {
+ 		/* Optimizations for frequent hot-path cases that are tiny to just
+ 		 * inline into the code instead of calling more expensive helper.
+ 		 */
+-		if (size_from == 4 && size_to == 4)
++		if (size_from == 4 && size_to == 4 &&
++		    __builtin_constant_p(seed) && seed == 0)
+ 			return csum_add(~(*(__u32*)from), *(__u32*)to);
++		if (size_from == 4 && size_to == 4)
++			return csum_add(seed,
++					csum_add(~(*(__u32*)from),
++						 *(__u32*)to));
+ 	}
+ 
+ 	return csum_diff_external(from, size_from, to, size_to, seed);
+
+
+
+
+@@ -970,49 +970,52 @@ struct lb4_service *lb4_lookup_slave(struct __ctx_buff *ctx __maybe_unused,
+ }
+ 
+ static __always_inline int
+-lb4_xlate(struct __ctx_buff *ctx, __be32 *new_daddr, __be32 *new_saddr,
+-	     __be32 *old_saddr, __u8 nexthdr __maybe_unused,
+-	     int l3_off, int l4_off,
+-	     struct csum_offset *csum_off, struct lb4_key *key,
+-	     const struct lb4_backend *backend __maybe_unused)
++lb4_xlate(struct __ctx_buff *ctx, __be32 *new_daddr, __be32 *new_saddr __maybe_unused,
++	  __be32 *old_saddr __maybe_unused, __u8 nexthdr __maybe_unused, int l3_off,
++	  int l4_off, struct csum_offset *csum_off, struct lb4_key *key,
++	  const struct lb4_backend *backend __maybe_unused)
+ {
+-	int ret;
+ 	__be32 sum;
++	int ret;
+ 
+-	ret = ctx_store_bytes(ctx, l3_off + offsetof(struct iphdr, daddr), new_daddr, 4, 0);
++	ret = ctx_store_bytes(ctx, l3_off + offsetof(struct iphdr, daddr),
++			      new_daddr, 4, 0);
+ 	if (ret < 0)
+ 		return DROP_WRITE_ERROR;
+ 
+ 	sum = csum_diff(&key->address, 4, new_daddr, 4, 0);
+-
++#ifndef DISABLE_LOOPBACK_LB
+ 	if (new_saddr && *new_saddr) {
+ 		cilium_dbg_lb(ctx, DBG_LB4_LOOPBACK_SNAT, *old_saddr, *new_saddr);
+-		ret = ctx_store_bytes(ctx, l3_off + offsetof(struct iphdr, saddr), new_saddr, 4, 0);
++
++		ret = ctx_store_bytes(ctx, l3_off + offsetof(struct iphdr, saddr),
++				      new_saddr, 4, 0);
+ 		if (ret < 0)
+ 			return DROP_WRITE_ERROR;
+ 
+ 		sum = csum_diff(old_saddr, 4, new_saddr, 4, sum);
+ 	}
+-
+-	if (l3_csum_replace(ctx, l3_off + offsetof(struct iphdr, check), 0, sum, 0) < 0)
++#endif /* DISABLE_LOOPBACK_LB */
++	if (l3_csum_replace(ctx, l3_off + offsetof(struct iphdr, check),
++			    0, sum, 0) < 0)
+ 		return DROP_CSUM_L3;
+-
+ 	if (csum_off->offset) {
+-		if (csum_l4_replace(ctx, l4_off, csum_off, 0, sum, BPF_F_PSEUDO_HDR) < 0)
++		if (csum_l4_replace(ctx, l4_off, csum_off, 0, sum,
++				    BPF_F_PSEUDO_HDR) < 0)
+ 			return DROP_CSUM_L4;
+ 	}
+-
+ #ifdef LB_L4
+ 	if (backend->port && key->dport != backend->port &&
+ 	    (nexthdr == IPPROTO_TCP || nexthdr == IPPROTO_UDP)) {
+ 		__be16 tmp = backend->port;
++
+ 		/* Port offsets for UDP and TCP are the same */
+-		ret = l4_modify_port(ctx, l4_off, TCP_DPORT_OFF, csum_off, tmp, key->dport);
++		ret = l4_modify_port(ctx, l4_off, TCP_DPORT_OFF, csum_off,
++				     tmp, key->dport);
+ 		if (IS_ERR(ret))
+ 			return ret;
+ 	}
+-#endif
+-
++#endif /* LB_L4 */
+ 	return CTX_ACT_OK;
+ }
+ 
+@@ -1299,8 +1302,9 @@ update_state:
+ 		state->addr = new_saddr;
+ 		state->svc_addr = saddr;
+ 	}
+-#endif
++
+ 	if (!state->loopback)
++#endif
+ 		tuple->daddr = backend->address;
+ 
+ 	return lb4_xlate(ctx, &new_daddr, &new_saddr, &saddr,
+
+
+
+
+@@ -550,8 +550,8 @@ static __always_inline int nodeport_lb6(struct __ctx_buff *ctx,
+ 			return ret;
+ 	}
+ 
+-	if (!svc || (!lb6_svc_is_external_ip(svc) &&
+-		     !lb6_svc_is_nodeport(svc) &&
++	if (!svc || (!lb6_svc_is_nodeport(svc) &&
++		     !lb6_svc_is_external_ip(svc) &&
+ 		     !lb6_svc_is_hostport(svc))) {
+ 		if (svc)
+ 			return DROP_IS_CLUSTER_IP;
+@@ -888,11 +888,12 @@ static __always_inline int set_dsr_opt4(struct __ctx_buff *ctx,
+ 					struct iphdr *ip4,
+ 					__be32 svc_addr, __be32 svc_port)
+ {
+-	union tcp_flags tcp_flags = { .value = 0 };
+ 	__u32 iph_old, iph_new,

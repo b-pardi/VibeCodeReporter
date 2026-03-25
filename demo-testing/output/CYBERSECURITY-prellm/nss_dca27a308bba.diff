@@ -1,0 +1,139 @@
+@@ -1014,4 +1014,25 @@ TEST_P(TlsConnectTls13ResumptionToken, ConnectResumeGetInfoZeroRtt) {
+   SendReceive();
+ }
+ 
++// Resumption on sessions with client authentication only works with internal
++// caching.
++TEST_P(TlsConnectGenericResumption, ConnectResumeClientAuth) {
++  ConfigureSessionCache(RESUME_BOTH, RESUME_BOTH);
++  client_->SetupClientAuth();
++  server_->RequestClientAuth(true);
++  Connect();
++  SendReceive();
++  EXPECT_FALSE(client_->resumption_callback_called());
++
++  Reset();
++  ConfigureSessionCache(RESUME_BOTH, RESUME_BOTH);
++  if (use_external_cache()) {
++    ExpectResumption(RESUME_NONE);
++  } else {
++    ExpectResumption(RESUME_TICKET);
++  }
++  Connect();
++  SendReceive();
++}
++
+ }  // namespace nss_test
+
+
+
+
+@@ -66,6 +66,7 @@ TlsAgent::TlsAgent(const std::string& name, Role role,
+       expected_sent_alert_(kTlsAlertCloseNotify),
+       expected_sent_alert_level_(kTlsAlertWarning),
+       handshake_callback_called_(false),
++      resumption_callback_called_(false),
+       error_code_(0),
+       send_ctr_(0),
+       recv_ctr_(0),
+@@ -424,6 +425,7 @@ SECStatus ResumptionTokenCallback(PRFileDesc* fd,
+ 
+   std::vector<uint8_t> new_token(resumptionToken, resumptionToken + len);
+   reinterpret_cast<TlsAgent*>(ctx)->SetResumptionToken(new_token);
++  reinterpret_cast<TlsAgent*>(ctx)->SetResumptionCallbackCalled();
+   return SECSuccess;
+ }
+ 
+
+
+
+
+@@ -179,6 +179,12 @@ class TlsAgent : public PollTarget {
+         sizeof(SSLResumptionTokenInfo));
+     ASSERT_EQ(SECSuccess, rv);
+   }
++  void SetResumptionCallbackCalled() {
++    resumption_callback_called_ = true;
++  }
++  bool resumption_callback_called() const {
++    return resumption_callback_called_;
++  }
+ 
+   const std::string& name() const { return name_; }
+ 
+@@ -396,6 +402,7 @@ class TlsAgent : public PollTarget {
+   uint8_t expected_sent_alert_;
+   uint8_t expected_sent_alert_level_;
+   bool handshake_callback_called_;
++  bool resumption_callback_called_;
+   SSLChannelInfo info_;
+   SSLCipherSuiteInfo csinfo_;
+   SSLVersionRange vrange_;
+
+
+
+
+@@ -225,6 +225,8 @@ class TlsConnectGenericResumption
+       client_->SetResumptionTokenCallback();
+     }
+   }
++
++  bool use_external_cache() const { return external_cache_; }
+ };
+ 
+ class TlsConnectTls13ResumptionToken
+
+
+
+
+@@ -1701,7 +1701,7 @@ SECStatus SSLExp_GetResumptionTokenInfo(const PRUint8 *tokenData, unsigned int t
+ 
+ SECStatus SSLExp_DestroyResumptionTokenInfo(SSLResumptionTokenInfo *token);
+ 
+-#define SSLResumptionTokenVersion 1
++#define SSLResumptionTokenVersion 2
+ 
+ SEC_END_PROTOS
+ 
+
+
+
+
+@@ -667,27 +667,10 @@ ssl_DecodeResumptionToken(sslSessionID *sid, const PRUint8 *encodedToken,
+     }
+     sid->u.ssl3.masterWrapSeries = (PRUint16)tmpInt;
+ 
+-    if (sslRead_ReadNumber(&reader, 8, &tmpInt) != SECSuccess) {
+-        return SECFailure;
+-    }
+-    sid->u.ssl3.clAuthModuleID = (unsigned long)tmpInt;
+-    if (sslRead_ReadNumber(&reader, 8, &tmpInt) != SECSuccess) {
+-        return SECFailure;
+-    }
+-    sid->u.ssl3.clAuthSlotID = (unsigned long)tmpInt;
+-    if (sslRead_ReadNumber(&reader, 2, &tmpInt) != SECSuccess) {
+-        return SECFailure;
+-    }
+-    sid->u.ssl3.clAuthSeries = (PRUint16)tmpInt;
+-
+     if (sslRead_ReadNumber(&reader, 1, &tmpInt) != SECSuccess) {
+         return SECFailure;
+     }
+     sid->u.ssl3.masterValid = (char)tmpInt;
+-    if (sslRead_ReadNumber(&reader, 1, &tmpInt) != SECSuccess) {
+-        return SECFailure;
+-    }
+-    sid->u.ssl3.clAuthValid = (char)tmpInt;
+ 
+     if (ReadVariableFromBuffer(&reader, &readerBuffer, 1,
+                                &sid->u.ssl3.srvName) != SECSuccess) {
+@@ -1029,32 +1012,11 @@ ssl_EncodeResumptionToken(sslSessionID *sid, sslBuffer *encodedTokenBuf)
+         return SECFailure;
+     }
+ 
+-    rv = sslBuffer_AppendNumber(encodedTokenBuf, sid->u.ssl3.clAuthModuleID, 8);
+-    if (rv != SECSuccess) {
+-        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+-        return SECFailure;
+-    }
+-    rv = sslBuffer_AppendNumber(encodedTokenBuf, sid->u.ssl3.clAuthSlotID, 8)

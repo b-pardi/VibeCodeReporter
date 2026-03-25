@@ -1,0 +1,130 @@
+@@ -19,6 +19,7 @@ try:
+     import pwndbg.disasm.jump
+     import pwndbg.disasm.mips
+     import pwndbg.disasm.ppc
++    import pwndbg.disasm.riscv
+     import pwndbg.disasm.sparc
+     import pwndbg.disasm.x86
+     import pwndbg.heap
+
+
+
+
+@@ -105,6 +105,10 @@ def get(instruction):
+         if not target:
+             return []
+ 
++        if pwndbg.gdblib.arch.current in ["rv32", "rv64"]:
++            target += instruction.address
++            target &= pwndbg.gdblib.arch.ptrmask
++
+         name = pwndbg.gdblib.symbol.get(target)
+         if not name:
+             return []
+
+
+
+
+@@ -15,7 +15,8 @@ arches = {
+     "mips": mips,
+     "x86-64": amd64,
+     "aarch64": aarch64,
+-    "riscv:rv64": riscv64,
++    "rv32": riscv64,
++    "rv64": riscv64,
+ }
+ 
+ 
+
+
+
+
+@@ -35,6 +35,8 @@ CapstoneArch = {
+     "powerpc": CS_ARCH_PPC,
+     "mips": CS_ARCH_MIPS,
+     "sparc": CS_ARCH_SPARC,
++    "rv32": CS_ARCH_RISCV,
++    "rv64": CS_ARCH_RISCV,
+ }
+ 
+ CapstoneEndian = {
+@@ -56,6 +58,8 @@ VariableInstructionSizeMax = {
+     "x86-64": 16,
+     "i8086": 16,
+     "mips": 8,
++    "rv32": 22,
++    "rv64": 22,
+ }
+ 
+ backward_cache: DefaultDict = collections.defaultdict(lambda: None)
+@@ -117,6 +121,11 @@ def get_disassembler(pc):
+     ):
+         extra = CS_MODE_MIPS32R6
+ 
++    elif pwndbg.gdblib.arch.current == "rv32":
++        extra = CS_MODE_RISCV32 | CS_MODE_RISCVC  # novermin
++    elif pwndbg.gdblib.arch.current == "rv64":
++        extra = CS_MODE_RISCV64 | CS_MODE_RISCVC  # novermin
++
+     else:
+         extra = None
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,95 @@
++from capstone import *  # noqa: F403
++from capstone.riscv import *  # noqa: F403
++
++import pwndbg.gdblib.arch
++import pwndbg.gdblib.regs
++
++
++class DisassemblyAssistant(pwndbg.disasm.arch.DisassemblyAssistant):
++    def __init__(self, architecture):
++        super(DisassemblyAssistant, self).__init__(architecture)
++        self.architecture = architecture
++
++    def _is_condition_taken(self, instruction):
++        # B-type instructions have two source registers that are compared
++        src1_unsigned = self.register(instruction, instruction.op_find(CS_OP_REG, 1))
++        # compressed instructions c.beqz and c.bnez only use one register operand.
++        if instruction.op_count(CS_OP_REG) > 1:
++            src2_unsigned = self.register(instruction, instruction.op_find(CS_OP_REG, 2))
++        else:
++            src2_unsigned = 0
++
++        if self.architecture == "rv32":
++            src1_signed = src1_unsigned - ((src1_unsigned & 0x80000000) << 1)
++            src2_signed = src2_unsigned - ((src2_unsigned & 0x80000000) << 1)
++        elif self.architecture == "rv64":
++            src1_signed = src1_unsigned - ((src1_unsigned & 0x80000000_00000000) << 1)
++            src2_signed = src2_unsigned - ((src2_unsigned & 0x80000000_00000000) << 1)
++        else:
++            raise NotImplementedError("architecture '{}' not implemented".format(self.architecture))
++
++        return {
++            RISCV_INS_BEQ: src1_signed == src2_signed,
++            RISCV_INS_BNE: src1_signed != src2_signed,
++            RISCV_INS_BLT: src1_signed < src2_signed,
++            RISCV_INS_BGE: src1_signed >= src2_signed,
++            RISCV_INS_BLTU: src1_unsigned < src2_unsigned,
++            RISCV_INS_BGEU: src1_unsigned >= src2_unsigned,
++            RISCV_INS_C_BEQZ: src1_signed == 0,
++            RISCV_INS_C_BNEZ: src1_signed != 0,
++        }.get(instruction.id, None)
++
++    def condition(self, instruction):
++        """Checks if the current instruction is a jump that is taken.
++        Returns None if the instruction is executed unconditionally,
++        True if the instruction is executed for sure, False otherwise.
++        """
++        # JAL / JALR is unconditional
++        if RISCV_GRP_CALL in instruction.groups:
++            return None
++
++        # We can't reason about anything except the current instruction
++        # as the comparison result is dependent on the register state.
++        if instruction.address !

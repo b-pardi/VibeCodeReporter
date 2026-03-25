@@ -1,0 +1,94 @@
+@@ -863,6 +863,34 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+         }
+     }
+ 
++    @Override
++    public List<BlockMetadata> bulkGetLinks(List<Multihash> peerIds,
++                                            Cid ourId,
++                                            List<Cid> blocks,
++                                            Optional<BatWithId> mirrorBat,
++                                            Hasher h) {
++        List<Optional<byte[]>> rawOpts = blocks.stream()
++                .parallel()
++                .map(b -> p2pFallback.getRaw(peerIds, b, mirrorBat, ourId, h, false, true).join())
++                .toList();
++        if (rawOpts.size() != blocks.size())
++            throw new IllegalStateException("Incorrect number of blocks returned!");
++        List<byte[]> raw = rawOpts.stream().map(Optional::get).toList();
++        List<Pair<Cid, byte[]>> hashed = new ArrayList<>();
++        for (int i=0; i < blocks.size(); i++) {
++            Cid c = blocks.get(i);
++            byte[] bytes = raw.get(i);
++            Cid res = h.hash(bytes, c.isRaw()).join();
++            if (! res.equals(c))
++                throw new IllegalStateException("Received block with incorrect hash!");
++            hashed.add(new Pair<>(c, bytes));
++        }
++        List<Cid> added = hashed.stream().map(p -> put(p.left, p.right)).toList();
++        return hashed.stream()
++                .map(p -> blockMetadata.get(p.left).get())
++                .toList();
++    }
++
+     @Override
+     public List<BlockMetadata> bulkGetLinks(List<Multihash> peerIds, List<Want> wants) {
+         List<BlockMetadata> meta = p2pFallback.bulkGetLinks(peerIds, wants);
+
+
+
+
+@@ -726,12 +726,20 @@ public interface ContentAddressedStorage {
+ 
+         @Override
+         public CompletableFuture<Optional<CborObject>> get(PublicKeyHash owner, Cid object, Optional<BatWithId> bat) {
+-            return local.get(owner, object, bat);
++            return Proxy.redirectCall(core,
++                    ourNodeIds,
++                    owner,
++                    () -> local.get(owner, object, bat),
++                    target -> p2p.get(target, owner, object, bat));
+         }
+ 
+         @Override
+         public CompletableFuture<Optional<byte[]>> getRaw(PublicKeyHash owner, Cid object, Optional<BatWithId> bat) {
+-            return local.getRaw(owner, object, bat);
++            return Proxy.redirectCall(core,
++                    ourNodeIds,
++                    owner,
++                    () -> local.getRaw(owner, object, bat),
++                    target -> p2p.getRaw(target, owner, object, bat));
+         }
+ 
+         @Override
+
+
+
+
+@@ -18,6 +18,8 @@ import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.stream.*;
+ 
++import static peergos.shared.storage.ContentAddressedStorage.HTTP.BLOCK_GET;
++
+ public interface ContentAddressedStorageProxy {
+ 
+     CompletableFuture<String> linkHost(Multihash targetServerId, PublicKeyHash owner);
+@@ -32,6 +34,10 @@ public interface ContentAddressedStorageProxy {
+ 
+     CompletableFuture<LinkCounts> getLinkCounts(Multihash targetServerId, String owner, LocalDateTime after, BatWithId mirrorBat);
+ 
++    CompletableFuture<Optional<CborObject>> get(Multihash targetServerId, PublicKeyHash owner, Cid hash, Optional<BatWithId> bat);
++
++    CompletableFuture<Optional<byte[]>> getRaw(Multihash targetServerId, PublicKeyHash owner, Cid hash, Optional<BatWithId> bat);
++
+     CompletableFuture<List<Cid>> put(Multihash targetServerId,
+                                      PublicKeyHash owner,
+                                      PublicKeyHash writer,
+@@ -142,6 +148,31 @@ public interface ContentAddressedStorageProxy {
+                     .thenApply(LinkCounts::fromCbor);
+         }
+ 
++        @Override
++        public CompletableFuture<Optional<CborObject>> get(Multihash targetServerId,
++                                                           PublicKeyHash owner,
++                                      

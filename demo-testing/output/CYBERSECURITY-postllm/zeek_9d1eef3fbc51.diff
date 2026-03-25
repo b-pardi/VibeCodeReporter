@@ -1,0 +1,132 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,22 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/plugin/Plugin.h"
++
++#include "zeek/storage/Component.h"
++#include "zeek/storage/backend/sqlite/SQLite.h"
++
++namespace zeek::storage::backend::sqlite {
++
++class Plugin : public plugin::Plugin {
++public:
++    plugin::Configuration Configure() override {
++        AddComponent(new storage::Component("SQLITE", backend::sqlite::SQLite::Instantiate));
++
++        plugin::Configuration config;
++        config.name = "Zeek::Storage_Backend_SQLite";
++        config.description = "SQLite backend for storage framework";
++        return config;
++    }
++} plugin;
++
++} // namespace zeek::storage::backend::sqlite
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,176 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/storage/backend/sqlite/SQLite.h"
++
++#include "zeek/3rdparty/sqlite3.h"
++#include "zeek/Func.h"
++#include "zeek/Val.h"
++
++namespace zeek::storage::backend::sqlite {
++
++storage::BackendPtr SQLite::Instantiate(std::string_view tag) { return make_intrusive<SQLite>(tag); }
++
++/**
++ * Called by the manager system to open the backend.
++ */
++ErrorResult SQLite::DoOpen(RecordValPtr options) {
++    if ( sqlite3_threadsafe() == 0 ) {
++        std::string res =
++            "SQLite reports that it is not threadsafe. Zeek needs a threadsafe version of "
++            "SQLite. Aborting";
++        Error(res.c_str());
++        return res;
++    }
++
++    // Allow connections to same DB to use single data/schema cache. Also
++    // allows simultaneous writes to one file.
++#ifndef ZEEK_TSAN
++    sqlite3_enable_shared_cache(1);
++#endif
++
++    StringValPtr path = options->GetField<StringVal>("database_path");
++    full_path = zeek::filesystem::path(path->ToStdString()).string();
++    table_name = options->GetField<StringVal>("table_name")->ToStdString();
++
++    auto open_res =
++        checkError(sqlite3_open_v2(full_path.c_str(), &db,
++                                   SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL));
++    if ( open_res.has_value() ) {
++        sqlite3_close_v2(db);
++        db = nullptr;
++        return open_res;
++    }
++
++    std::string create = "create table if not exists " + table_name + " (";
++    create.append("key_str text primary key, value_str text not null);");
++
++    char* errorMsg = nullptr;
++    int res = sqlite3_exec(db, create.c_str(), NULL, NULL, &errorMsg);
++    if ( res != SQLITE_OK ) {
++        std::string err = util::fmt("Error executing table creation statement: %s", errorMsg);
++        Error(err.c_str());
++        sqlite3_free(errorMsg);
++        sqlite3_close(db);
++        db = nullptr;
++        return err;
++    }
++
++    return std::nullopt;
++}
++
++/**
++ * Finalizes the backend when it's being closed.
++ */
++void SQLite::Close() {
++    if ( db ) {
++        if ( int res = sqlite3_close_v2(db); res != SQLITE_OK )
++            Error("Sqlite could not close connection");
++
++        db = nullptr;
++    }
++}
++
++/**
++ * The workhorse method for Put(). This must be implemented by plugins.
++ */
++ErrorResult SQLite::DoPut(ValPtr key, ValPtr value, bool overwrite, double expiration_time, ErrorResultCallback* cb) {
++    if ( ! db )
++        return "Database was not open";
++
++    auto json_key = key->ToJSON();
++    auto json_value = value->ToJSON();
++
++    std::string stmt = "INSERT INTO ";
++    stmt.append(table_name);
++    stmt.append("(key_str, value_str) VALUES('");
++    stmt.append(json_key->ToStdStringView());
++    stmt.append("', '");
++    stmt.append(json_value->ToStdStringView());
++    if ( ! overwrite )
++        stmt.append("');");
++    else {
++        // if overwriting, add an UPSERT conflict resolution block
++        stmt.append("') ON CONFLICT(key_str) DO UPDATE SET value_str='");
++        stmt.append(json_value->ToStdStringView());
++        stmt.append("';");
++    }
++
++    char* errorMsg = nullptr;
++    int res = sqlite3_e

@@ -1,0 +1,120 @@
+@@ -32,6 +32,7 @@
+ #include <signal.h>
+ #include <vector>
+ #include <cerrno>
++#include <algorithm>
+ 
+ #include "copy_thread.h"
+ 
+@@ -48,7 +49,9 @@
+          index++)
+ #endif
+ 
++extern "C" {
+ #include <vixDiskLib.h>
++}
+ 
+ /* This is the minimum version we require, i.e. vSphere 6.5 or later */
+ #define VIXDISKLIB_VERSION_MAJOR 6
+@@ -97,7 +100,7 @@ struct disk_type {
+   VixDiskLibDiskType vadp_type;
+ };
+ 
+-static struct disk_type disk_types[]
++static disk_type disk_types[]
+     = {{"monolithic_sparse", VIXDISKLIB_DISK_MONOLITHIC_SPARSE},
+        {"monolithic_flat", VIXDISKLIB_DISK_MONOLITHIC_FLAT},
+        {"split_sparse", VIXDISKLIB_DISK_SPLIT_SPARSE},
+@@ -163,6 +166,8 @@ static bool verbose = false;
+ static bool check_size = true;
+ static bool create_disk = false;
+ static bool local_vmdk = false;
++static bool do_query_allocated = true;
++static uint64 ChunkSize = VIXDISKLIB_MIN_CHUNK_SIZE;
+ static bool multi_threaded = false;
+ static bool restore_meta_data = false;
+ static uint64_t sectors_per_call = DEFAULT_SECTORS_PER_CALL;
+@@ -1171,21 +1176,179 @@ bail_out:
+   return false;
+ }
+ 
++/* Process a single cbt record. */
++static bool process_single_cbt(std::vector<uint8>& buffer,
++                               uint64 start_offset,
++                               uint64 offset_length)
++{
++  struct runtime_cbt_encoding rce;
++  rce.start_magic = BAREOSMAGIC;
++  rce.end_magic = BAREOSMAGIC;
++  rce.start_offset = start_offset;
++  rce.offset_length = offset_length;
++
++  if (verbose) {
++    fprintf(stderr, "start = %lu\n", start_offset);
++    fprintf(stderr, "length = %lu\n", offset_length);
++    fprintf(stderr, "nr length = %lu\n", offset_length / DEFAULT_SECTOR_SIZE);
++    fflush(stderr);
++  }
++
++
++  // Write the CBT info into the output stream.
++  if (robust_writer(STDOUT_FILENO, (char*)&rce, rce_size) != rce_size) {
++    fprintf(stderr,
++            "Failed to write runtime_cbt_encoding structure to output "
++            "datastream\n");
++    return false;
++  }
++
++  if (raw_disk_fd != -1) {
++    lseek(raw_disk_fd, start_offset, SEEK_SET);
++    if (verbose) {
++      fprintf(stderr, "Log: RAWFILE: Adusting seek position in file\n");
++    }
++  }
++
++  bool retval = true;
++  /* Calculate the start offset and read as many sectors as defined by the
++   * length element of the JSON structure. */
++  uint64 current_offset = absolute_start_offset + start_offset;
++  uint64 max_offset = current_offset + offset_length;
++  uint64 sector_offset = current_offset / DEFAULT_SECTOR_SIZE;
++  while (current_offset < max_offset) {
++    /* The number of sectors to read is the minimum of either the total number
++     * of sectors still available in this CBT range or the upper setting
++     * specified in the sectors_per_call variable. */
++    uint64 sectors_to_read
++        = MIN(sectors_per_call, (offset_length / DEFAULT_SECTOR_SIZE));
++
++    if (multi_threaded) {
++      if (!send_to_copy_thread(sector_offset,
++                               sectors_to_read * DEFAULT_SECTOR_SIZE)) {
++        retval = false;
++        break;
++      }
++    } else {
++      if (read_from_vmdk(sector_offset, sectors_to_read * DEFAULT_SECTOR_SIZE,
++                         buffer.data())
++          != sectors_to_read * DEFAULT_SECTOR_SIZE) {
++        fprintf(stderr, "Read error on VMDK\n");
++        retval = false;
++        break;
++      }
++
++      if (write_to_stream(sector_offset, sectors_to_read * DEFAULT_SECTOR_SIZE,
++                          buffer.data())
++          != sectors_to_read * DEFAULT_SECTOR_SIZE) {
++        fprintf(stderr, "Failed to write data to output datastream\n");
++        retval = false;
++        break;
++      }
++    }
++
++    // Calculate the new offsets for a next run.
++    current_offset += (sectors_to_read * DEFAULT_SECTOR_SIZE);
++    sector_offset += sectors_to_read;
++    offset_length -= sectors_to_read * DEFAULT_SECTOR_SIZE;
++  }
++
++  if (multi_threaded) {
++    /* we need to wait until the thread has finished writing
++     * all data that we have give

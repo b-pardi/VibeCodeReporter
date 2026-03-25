@@ -1,0 +1,126 @@
+@@ -1,5 +1,5 @@
+ /*
+- *  Copyright (C) 2016-2017 Authors of Cilium
++ *  Copyright (C) 2016-2018 Authors of Cilium
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -389,6 +389,12 @@ struct ct_entry {
+ 	      reserve:11;
+ 	__u16 rev_nat_index;
+ 	__u16 slave;
++
++	/* *x_flags_seen represents the OR of all TCP flags seen for the
++	 * transmit/receive direction of this entry. */
++	__u8  tx_flags_seen;
++	__u8  rx_flags_seen;
++
+ 	__u32 src_sec_id;
+ };
+ 
+
+
+
+
+@@ -1,5 +1,5 @@
+ /*
+- *  Copyright (C) 2016-2017 Authors of Cilium
++ *  Copyright (C) 2016-2018 Authors of Cilium
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -62,17 +62,54 @@ enum {
+ 	ACTION_CLOSE,
+ };
+ 
++union tcp_flags {
++#if defined(__LITTLE_ENDIAN_BITFIELD)
++	__u16	res1:4, doff:4, fin:1, syn:1, rst:1, psh:1, ack:1, urg:1, ece:1, cwr:1;
++#elif defined(__BIG_ENDIAN_BITFIELD)
++	__u16	doff:4, res1:4, cwr:1, ece:1, urg:1, ack:1, psh:1, rst:1, syn:1, fin:1;
++#else
++#error	"Adjust your <asm/byteorder.h> defines"
++#endif
++	struct {
++		__u8 upper_bits;
++		__u8 lower_bits;
++	};
++};
++
+ static inline void __inline__ __ct_update_timeout(struct ct_entry *entry,
+-						  __u32 lifetime)
++						  __u32 lifetime, int dir,
++						  union tcp_flags flags)
+ {
++	__u32 now = bpf_ktime_get_sec();
++	__u8 *accumulated_flags;
++	__u8 seen_flags = flags.lower_bits;
++
+ #ifdef NEEDS_TIMEOUT
+-	entry->lifetime = bpf_ktime_get_sec() + lifetime;
++	entry->lifetime = now + lifetime;
+ #endif
++	if (dir == CT_INGRESS) {
++		accumulated_flags = &entry->rx_flags_seen;
++	} else {
++		accumulated_flags = &entry->tx_flags_seen;
++	}
++	seen_flags |= *accumulated_flags;
++	if (*accumulated_flags != seen_flags) {
++		*accumulated_flags = seen_flags;
++	}
+ }
+ 
+-static inline void __inline__ ct_update_timeout(struct ct_entry *entry, bool syn, bool tcp)
++/**
++ * Update the CT timeouts for the specified entry.
++ *
++ * If CT_REPORT_INTERVAL has elapsed since the last update, updates the
++ * last_updated timestamp and returns true. Otherwise returns false.
++ */
++static inline void __inline__ ct_update_timeout(struct ct_entry *entry,
++						bool tcp, int dir,
++						union tcp_flags seen_flags)
+ {
+ 	__u32 lifetime = CT_LIFETIME_NONTCP;
++	bool syn = seen_flags.syn;
+ 
+ 	if (tcp) {
+ 		entry->seen_non_syn |= !syn;
+@@ -83,7 +120,7 @@ static inline void __inline__ ct_update_timeout(struct ct_entry *entry, bool syn
+ 			lifetime = CT_SYN_TIMEOUT;
+ 	}
+ 
+-	__ct_update_timeout(entry, lifetime);
++	__ct_update_timeout(entry, lifetime, dir, seen_flags);
+ }
+ 
+ static inline void __inline__ ct_reset_closing(struct ct_entry *entry)
+@@ -100,7 +137,7 @@ static inline bool __inline__ ct_entry_alive(const struct ct_entry *entry)
+ static inline int __inline__ __ct_lookup(void *map, struct __sk_buff *skb,
+ 					 void *tuple, int action, int dir,
+ 					 struct ct_state *ct_state,
+-					 bool pkt_is_syn, bool is_tcp)
++					 bool is_tcp, union tcp_flags seen_flags)
+ {
+ 	struct ct_entry *entry;
+ 	int ret;
+@@ -108,7 +145,7 @@ static inline int __inline__ __ct_lookup(void *map, struct __sk_buff *skb,
+ 	if ((entry = map_lookup_elem(map, tuple))) {
+ 		cilium_dbg(skb, DBG_CT_MATCH, entry->lifetime, entry->rev_nat_index);
+ 		if (ct_entry_alive(entry)) {
+-			ct_update_timeout(entry, pkt_is_syn, is_tcp);
++			ct_update_timeout(entry, is_tcp, dir, seen_flags);
+ 		}
+ 		if (ct_state) {
+ 			ct_state->rev_nat_index = entry->rev_nat_index;
+@@ -138,7 +175,7 @@ static inline int __inline__ __ct_lookup(void *map, struct __sk_buff *skb,
+ 			ret = entry->rx_closing + entry->tx_closing;
+ 			if (unlikely(ret >= 1)) {
+ 				ct_reset_closing(entry);
+-				ct_update_timeout(entry, pkt_is_syn, is_tcp);
++				ct_update_timeout(entry, is_tcp, dir, seen_flags);
+ 			}
+ 			break;
+ 		case ACTION_CLOSE:
+@@ -150,7 +187,7 @@ static inline int __inline__ __ct_lookup(void *map, struct __sk_

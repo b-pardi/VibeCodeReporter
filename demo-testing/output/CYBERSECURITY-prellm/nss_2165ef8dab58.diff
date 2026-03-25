@@ -1,0 +1,105 @@
+@@ -12,6 +12,33 @@
+ #include "seccomon.h"
+ #include "selfencrypt.h"
+ 
++SECStatus SSLInt_SetDCAdvertisedSigSchemes(PRFileDesc *fd,
++                                           const SSLSignatureScheme *schemes,
++                                           uint32_t num_sig_schemes) {
++  if (!fd) {
++    return SECFailure;
++  }
++  sslSocket *ss = ssl_FindSocket(fd);
++  if (!ss) {
++    return SECFailure;
++  }
++
++  // Alloc and copy, libssl will free.
++  SSLSignatureScheme *dc_schemes =
++      PORT_ZNewArray(SSLSignatureScheme, num_sig_schemes);
++  if (!dc_schemes) {
++    return SECFailure;
++  }
++  memcpy(dc_schemes, schemes, sizeof(SSLSignatureScheme) * num_sig_schemes);
++
++  if (ss->xtnData.delegCredSigSchemesAdvertised) {
++    PORT_Free(ss->xtnData.delegCredSigSchemesAdvertised);
++  }
++  ss->xtnData.delegCredSigSchemesAdvertised = dc_schemes;
++  ss->xtnData.numDelegCredSigSchemesAdvertised = num_sig_schemes;
++  return SECSuccess;
++}
++
+ SECStatus SSLInt_TweakChannelInfoForDC(PRFileDesc *fd, PRBool changeAuthKeyBits,
+                                        PRBool changeScheme) {
+   if (!fd) {
+
+
+
+
+@@ -44,5 +44,8 @@ SECStatus SSLInt_HasPendingHandshakeData(PRFileDesc *fd, PRBool *pending);
+ SECStatus SSLInt_SetSocketMaxEarlyDataSize(PRFileDesc *fd, uint32_t size);
+ SECStatus SSLInt_TweakChannelInfoForDC(PRFileDesc *fd, PRBool changeAuthKeyBits,
+                                        PRBool changeScheme);
++SECStatus SSLInt_SetDCAdvertisedSigSchemes(PRFileDesc *fd,
++                                           const SSLSignatureScheme *schemes,
++                                           uint32_t num_sig_schemes);
+ 
+ #endif  // ndef libssl_internals_h_
+
+
+
+
+@@ -49,6 +49,7 @@ const std::string TlsAgent::kServerEcdhEcdsa = "ecdh_ecdsa";
+ const std::string TlsAgent::kServerDsa = "dsa";
+ const std::string TlsAgent::kDelegatorEcdsa256 = "delegator_ecdsa256";
+ const std::string TlsAgent::kDelegatorRsae2048 = "delegator_rsae2048";
++const std::string TlsAgent::kDelegatorRsaPss2048 = "delegator_rsa_pss2048";
+ 
+ static const uint8_t kCannedTls13ServerHello[] = {
+     0x03, 0x03, 0x9c, 0xbc, 0x14, 0x9b, 0x0e, 0x2e, 0xfa, 0x0d, 0xf3,
+
+
+
+
+@@ -76,8 +76,9 @@ class TlsAgent : public PollTarget {
+   static const std::string kServerEcdhEcdsa;
+   static const std::string kServerEcdhRsa;
+   static const std::string kServerDsa;
+-  static const std::string kDelegatorEcdsa256;  // draft-ietf-tls-subcerts
+-  static const std::string kDelegatorRsae2048;  // draft-ietf-tls-subcerts
++  static const std::string kDelegatorEcdsa256;    // draft-ietf-tls-subcerts
++  static const std::string kDelegatorRsae2048;    // draft-ietf-tls-subcerts
++  static const std::string kDelegatorRsaPss2048;  // draft-ietf-tls-subcerts
+ 
+   TlsAgent(const std::string& name, Role role, SSLProtocolVariant variant);
+   virtual ~TlsAgent();
+
+
+
+
+@@ -18,9 +18,10 @@ namespace nss_test {
+ 
+ const std::string kEcdsaDelegatorId = TlsAgent::kDelegatorEcdsa256;
+ const std::string kRsaeDelegatorId = TlsAgent::kDelegatorRsae2048;
++const std::string kPssDelegatorId = TlsAgent::kDelegatorRsaPss2048;
+ const std::string kDCId = TlsAgent::kServerEcdsa256;
+ const SSLSignatureScheme kDCScheme = ssl_sig_ecdsa_secp256r1_sha256;
+-const PRUint32 kDCValidFor = 60 * 60 * 24 * 7 /* 1 week (seconds */;
++const PRUint32 kDCValidFor = 60 * 60 * 24 * 7 /* 1 week (seconds) */;
+ 
+ static void CheckPreliminaryPeerDelegCred(
+     const std::shared_ptr<TlsAgent>& client, bool expected,
+@@ -122,6 +123,23 @@ TEST_P(TlsConnectTls13, DCConnectEcdsaP256) {
+   EXPECT_EQ(ssl_sig_ecdsa_secp256r1_sha256, client_->info().signatureScheme);
+ }
+ 
++// Connected with ECDSA-P384.
++TEST_P(TlsConnectTls13, DCConnectEcdsaP483) {
++  Reset(kEcdsaDelegatorId);
++  client_->EnableDelegatedCredentials();
++  server_->AddDelegatedCredential(TlsAgent::kServerEcdsa384,
++                                  ssl_sig_ecdsa_secp384r1_sha384, kDCValidFor,
++                                  now());
++
++  auto cfilter = MakeTlsFilter<TlsExtensionCapture>(
++      cli

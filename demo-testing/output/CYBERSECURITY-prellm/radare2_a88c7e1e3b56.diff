@@ -1,0 +1,146 @@
+@@ -796,7 +796,6 @@ R_API RList *r_bin_get_sections(RBin *bin) {
+ 	return o ? o->sections : NULL;
+ }
+ 
+-// TODO: Move into section.c and rename it to r_io_section_get_at ()
+ R_API RBinSection *r_bin_get_section_at(RBinObject *o, ut64 off, int va) {
+ 	RBinSection *section;
+ 	RListIter *iter;
+
+
+
+
+@@ -3360,7 +3360,6 @@ static struct r_bin_pe_section_t* PE_(r_bin_pe_get_sections)(struct PE_(r_bin_pe
+ 		return NULL;
+ 	}
+ 	for (i = 0, j = 0; i < bin->num_sections; i++) {
+-		//if sz = 0 r_io_section_add will not add it so just skeep
+ 		if (!shdr[i].SizeOfRawData && !shdr[i].Misc.VirtualSize) {
+ 			continue;
+ 		}
+
+
+
+
+@@ -232,21 +232,21 @@ R_API ut64 r_core_anal_address(RCore *core, ut64 addr) {
+ 		}
+ 	} else {
+ 		int _perm = -1;
+-		RBinSection *s;
++		RIOMap *s;
+ 		SdbListIter *iter;
+ 		if (core->io) {
+ 			// sections
+-			ls_foreach (core->io->sections, iter, s) {
+-				if (addr >= s->vaddr && addr < (s->vaddr + s->vsize)) {
++			ls_foreach (core->io->maps, iter, s) {
++				if (addr >= s->itv.addr && addr < (s->itv.addr + s->itv.size)) {
+ 					// sections overlap, so we want to get the one with lower perms
+ 					_perm = (_perm != -1) ? R_MIN (_perm, s->perm) : s->perm;
+ 					// TODO: we should identify which maps come from the program or other
+ 					//types |= R_ANAL_ADDR_TYPE_PROGRAM;
+ 					// find function those sections should be created by hand or esil init
+-					if (strstr (s->name, "heap")) {
++					if (s->name && strstr (s->name, "heap")) {
+ 						types |= R_ANAL_ADDR_TYPE_HEAP;
+ 					}
+-					if (strstr (s->name, "stack")) {
++					if (s->name && strstr (s->name, "stack")) {
+ 						types |= R_ANAL_ADDR_TYPE_STACK;
+ 					}
+ 				}
+
+
+
+
+@@ -2271,6 +2271,111 @@ static void list_section_visual(RIO *io, RList *sections, ut64 seek, ut64 len, i
+ 	}
+ }
+ 
++typedef struct {
++	const char *uri;
++	int perm;
++	RIODesc *desc;
++} FindFile;
++
++static bool findFile(void *user, void *data, ut32 id) {
++	FindFile *res = (FindFile*)user;
++	RIODesc *desc = (RIODesc*)data;
++	if (desc->perm && res->perm && !strcmp (desc->uri, res->uri)) {
++		res->desc = desc;
++		return false;
++	}
++	return true;
++}
++
++static RIODesc *findReusableFile(RIO *io, const char *uri, int perm) {
++	FindFile arg = {
++		.uri = uri,
++		.perm = perm,
++		.desc = NULL,
++	};
++	r_id_storage_foreach (io->files, findFile, &arg);
++	return arg.desc;
++}
++
++static bool io_create_mem_map(RIO *io, RBinSection *sec, ut64 at) {
++	r_return_val_if_fail (io && sec, false);
++
++	bool reused = false;
++	ut64 gap = sec->vsize - sec->size;
++	char *uri = r_str_newf ("null://%"PFMT64u, gap);
++	RIODesc *desc = findReusableFile (io, uri, sec->perm);
++	if (desc) {
++		RIOMap *map = r_io_map_get (io, at);
++		if (!map) {
++			r_io_map_add_batch (io, desc->fd, desc->perm, 0LL, at, gap);
++		}
++		reused = true;
++	}
++	if (!desc) {
++		desc = r_io_open_at (io, uri, sec->perm, 0664, at);
++	}
++	free (uri);
++	if (!desc) {
++		return false;
++	}
++	// this works, because new maps are always born on the top
++	RIOMap *map = r_io_map_get (io, at);
++	// check if the mapping failed
++	if (!map) {
++		if (!reused) {
++			r_io_desc_close (desc);
++		}
++		return false;
++	}
++	// let the section refere to the map as a memory-map
++	map->name = r_str_newf ("mmap.%s", sec->name);
++	return true;
++}
++
++static void add_section(RCore *core, RBinSection *sec, ut64 addr, int fd) {
++	if (!r_io_desc_get (core->io, fd) || UT64_ADD_OVFCHK (sec->size, sec->paddr) ||
++	    UT64_ADD_OVFCHK (sec->size, addr) || !sec->vsize) {
++		return;
++	}
++
++	ut64 size = sec->vsize;
++	// if there is some part of the section that needs to be zeroed by the loader
++	// we add a null map that takes care of it
++	if (sec->vsize > sec->size) {
++		if (!io_create_mem_map (core->io, sec, addr + sec->size)) {
++			return;
++		}
++
++		size = sec->size;
++	}
++
++	// then we map the part of the section that comes from the physical file
++	char *map_name = r_str_newf ("fmap.%s", sec->name);
++	if (!map_name) {
++		return;
++	}
++
++	int perm = sec->perm;
++	// workaround to force exec bit in text section
++

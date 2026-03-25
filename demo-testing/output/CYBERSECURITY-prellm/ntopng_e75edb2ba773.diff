@@ -1,0 +1,156 @@
+@@ -64,11 +64,12 @@ class ContinuousPingStats {
+ class ContinuousPing {
+  private:
+   std::map<std::string /* IP */, ContinuousPingStats* /* stats */> v4_results, v6_results;
++  Ping *pinger;
+   pthread_t poller;
+   Mutex m;
+ 
+-  void pingAll(Ping *pinger);
+-  void readPingResults(Ping *pinger);
++  void pingAll();
++  void readPingResults();
+   
+  public:
+   ContinuousPing();
+
+
+
+
+@@ -47,6 +47,7 @@ class Ping {
+   void pollResults(bool wait_forever);
+   void collectResponses(lua_State* vm);
+   float getRTT(std::string who);
++  void cleanup();
+ };
+ 
+ #endif /* WIN32    */
+
+
+
+
+@@ -53,7 +53,15 @@ static void* pollerFctn(void* ptr) {
+ /* ***************************************** */
+ 
+ ContinuousPing::ContinuousPing() {
+-  pthread_create(&poller, NULL, pollerFctn, (void*)this);
++  try {
++    pinger = new Ping();
++
++    if(pinger)
++      pthread_create(&poller, NULL, pollerFctn, (void*)this);
++  } catch(...) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to crete continuous pinger");
++    pinger = NULL;
++  }
+ }
+ 
+ /* ***************************************** */
+@@ -64,6 +72,8 @@ ContinuousPing::~ContinuousPing() {
+ 
+   for(std::map<std::string,ContinuousPingStats*>::iterator it=v6_results.begin(); it!=v6_results.end(); ++it)
+     delete it->second;
++
++  delete pinger;
+ }
+ 
+ /* ***************************************** */
+@@ -98,7 +108,7 @@ void ContinuousPing::ping(char *_addr, bool use_v6) {
+ 
+ /* ***************************************** */
+ 
+-void ContinuousPing::pingAll(Ping *pinger) {
++void ContinuousPing::pingAll() {
+   m.lock(__FILE__, __LINE__);
+ 
+   for(std::map<std::string,ContinuousPingStats*>::iterator it=v4_results.begin(); it!=v4_results.end(); ++it)
+@@ -112,7 +122,7 @@ void ContinuousPing::pingAll(Ping *pinger) {
+ 
+ /* ***************************************** */
+ 
+-void ContinuousPing::readPingResults(Ping *pinger) {
++void ContinuousPing::readPingResults() {
+   m.lock(__FILE__, __LINE__);
+ 
+   for(std::map<std::string,ContinuousPingStats*>::iterator it=v4_results.begin(); it!=v4_results.end(); ++it) {
+@@ -182,28 +192,19 @@ void ContinuousPing::collectResponses(lua_State* vm) {
+ /* ***************************************** */
+ 
+ void ContinuousPing::runPingCampaign() {
+-  if(!ntop->isStarted()) {
+-    sleep(1);
+-    return;
+-  }
+-  
+-  try {
+-    Ping *pinger = new Ping();
+-
++  if(ntop->isStarted() && (v4_results.size() || v6_results.size())) {
+ #ifdef TRACE_PING
+     ntop->getTrace()->traceEvent(TRACE_NORMAL, "Starting ping campaign");
+ #endif
+ 
+-    pingAll(pinger);
++    pinger->cleanup();
++    pingAll();
+     sleep(1);
+     pinger->pollResults(false);
+-    readPingResults(pinger);
+-
+-    delete pinger;
+-    sleep(1);
+-  } catch(std::bad_alloc& ba) {
+-    sleep(1);
++    readPingResults();
+   }
++
++  sleep(1);
+ }
+ 
+ #endif /* WIN32 */
+
+
+
+
+@@ -77,7 +77,11 @@ Ntop::Ntop(char *appName) {
+   malicious_ja3 = malicious_ja3_shadow = NULL;
+   new_malicious_ja3 = new std::set<std::string>();
+   system_interface = NULL;
++#if 1
+   cping = NULL;
++#else
++  cping = new ContinuousPing();
++#endif
+   
+   /* nDPI handling */
+   last_ndpi_reload = 0;
+
+
+
+
+@@ -60,6 +60,11 @@ Ping::Ping() {
+   ping_id = rand(), cnt = 0;
+   running = true;
+ 
++#if !defined(__APPLE__) && !defined(WIN32) && !defined(HAVE_NEDGE)
++  if(Utils::gainWriteCapabilities() == -1)
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to enable capabilities");
++#endif
++
+ #if defined(__APPLE__)
+   sd  = socket(AF_INET,  SOCK_DGRAM, IPPROTO_ICMP);
+   sd6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+@@ -67,6 +72,10 @@ Ping::Ping() {
+   sd  = socket(PF_INET, SOCK_RAW, IPPROTO_ICMP);
+   sd6 = socket(PF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+ #endif
++  
++#if !defined(__APPLE__) && !defined(WIN32) && !defined(HAVE_NEDGE)
++  Utils::dropWriteCapabilities();
++#endif
+ 
+   if(sd == -1)
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "Ping IPv4 socket creation error: %s",
+@@ -329,4 +338,12 @@ float Ping::getRTT(std::string who) {
+ 
+ /* ******************************************

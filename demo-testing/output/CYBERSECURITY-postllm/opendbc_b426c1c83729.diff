@@ -1,0 +1,113 @@
+@@ -1,7 +1,7 @@
+ from opendbc.can.packer import CANPacker
+ from opendbc.car import Bus, apply_driver_steer_torque_limits
+ from opendbc.car.interfaces import CarControllerBase
+-from opendbc.car.rivian.riviancan import create_lka_steering, create_longitudinal, create_wheel_touch
++from opendbc.car.rivian.riviancan import create_lka_steering, create_longitudinal, create_wheel_touch, create_adas_status
+ from opendbc.car.rivian.values import CarControllerParams
+ 
+ 
+@@ -11,6 +11,8 @@ class CarController(CarControllerBase):
+     self.apply_torque_last = 0
+     self.packer = CANPacker(dbc_names[Bus.pt])
+ 
++    self.cancel_frames = 0
++
+   def update(self, CC, CS, now_nanos):
+     actuators = CC.actuators
+     can_sends = []
+@@ -31,6 +33,17 @@ class CarController(CarControllerBase):
+     # Longitudinal control
+     if self.CP.openpilotLongitudinalControl:
+       can_sends.append(create_longitudinal(self.packer, self.frame % 15, actuators.accel, CC.enabled))
++    else:
++      interface_status = None
++      if CC.cruiseControl.cancel:
++        # if there is a noEntry, we need to send a status of "available" before the ACM will accept "unavailable"
++        # send "available" right away as the VDM itself takes a few frames to acknowledge
++        interface_status = 1 if self.cancel_frames < 5 else 0
++        self.cancel_frames += 1
++      else:
++        self.cancel_frames = 0
++
++      can_sends.append(create_adas_status(self.packer, CS.vdm_adas_status, interface_status))
+ 
+     new_actuators = actuators.as_builder()
+     new_actuators.torque = apply_torque / CarControllerParams.STEER_MAX
+
+
+
+
+@@ -13,6 +13,7 @@ class CarState(CarStateBase):
+ 
+     self.acm_lka_hba_cmd = None
+     self.sccm_wheel_touch = None
++    self.vdm_adas_status = None
+ 
+   def update(self, can_parsers) -> structs.CarState:
+     cp = can_parsers[Bus.pt]
+@@ -86,6 +87,7 @@ class CarState(CarStateBase):
+     # Messages needed by carcontroller
+     self.acm_lka_hba_cmd = copy.copy(cp_cam.vl["ACM_lkaHbaCmd"])
+     self.sccm_wheel_touch = copy.copy(cp.vl["SCCM_WheelTouch"])
++    self.vdm_adas_status = copy.copy(cp.vl["VDM_AdasSts"])
+ 
+     return ret
+ 
+
+
+
+
+@@ -83,3 +83,26 @@ def create_longitudinal(packer, frame, accel, enabled):
+   data = packer.make_can_msg("ACM_longitudinalRequest", 0, values)[1]
+   values["ACM_longitudinalRequest_Checksum"] = checksum(data[1:], 0x1D, 0x12)
+   return packer.make_can_msg("ACM_longitudinalRequest", 0, values)
++
++
++def create_adas_status(packer, vdm_adas_status, interface_status):
++  values = {s: vdm_adas_status[s] for s in (
++    "VDM_AdasStatus_Checksum",
++    "VDM_AdasStatus_Counter",
++    "VDM_AdasDecelLimit",
++    "VDM_AdasDriverAccelPriorityStatus",
++    "VDM_AdasFaultStatus",
++    "VDM_AdasAccelLimit",
++    "VDM_AdasDriverModeStatus",
++    "VDM_AdasAccelRequest",
++    "VDM_AdasInterfaceStatus",
++    "VDM_AdasAccelRequestAcknowledged",
++    "VDM_AdasVehicleHoldStatus",
++  )}
++
++  if interface_status is not None:
++    values["VDM_AdasInterfaceStatus"] = interface_status
++
++  data = packer.make_can_msg("VDM_AdasSts", 2, values)[1]
++  values["VDM_AdasStatus_Checksum"] = checksum(data[1:], 0x1D, 0xD1)
++  return packer.make_can_msg("VDM_AdasSts", 2, values)
+
+
+
+
+@@ -100,6 +100,11 @@ static int rivian_fwd_hook(int bus, int addr) {
+       block_msg = true;
+     }
+ 
++    // VDM_AdasSts: for canceling stock ACC
++    if ((addr == 0x162) && !rivian_longitudinal) {
++      block_msg = true;
++    }
++
+     if (!block_msg) {
+       bus_fwd = 2;
+     }
+@@ -125,8 +130,8 @@ static int rivian_fwd_hook(int bus, int addr) {
+ }
+ 
+ static safety_config rivian_init(uint16_t param) {
+-  // 0x120 = ACM_lkaHbaCmd, 0x321 = SCCM_WheelTouch
+-  static const CanMsg RIVIAN_TX_MSGS[] = {{0x120, 0, 8}, {0x321, 2, 7}};
++  // 0x120 = ACM_lkaHbaCmd, 0x321 = SCCM_WheelTouch, 0x162 = VDM_AdasSts
++  static const CanMsg RIVIAN_TX_MSGS[] = {{0x120, 0, 8}, {0x321, 2, 7}, {0x162, 2, 8}};
+   // 0x160 = ACM_longitudinalRequest
+   static const CanMsg RIVIAN_LONG_TX_MSGS[] = {{0x120, 0, 

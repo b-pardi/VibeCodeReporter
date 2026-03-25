@@ -1,0 +1,147 @@
+@@ -73,6 +73,40 @@ R_API char *r_parse_c_string(RAnal *anal, const char *code, char **error_msg);
+ R_API char *r_parse_c_file(RAnal *anal, const char *path, const char *dir, char **error_msg);
+ R_API void r_parse_c_reset(RParse *p);
+ 
++/* ctype */
++// Parses strings like "const char * [0x42] const * [23]" to RParseCTypeType
++
++typedef struct r_parse_ctype_t RParseCType;
++
++typedef struct r_parse_ctype_type_t RParseCTypeType;
++struct r_parse_ctype_type_t {
++	enum {
++		R_PARSE_CTYPE_TYPE_KIND_IDENTIFIER,
++		R_PARSE_CTYPE_TYPE_KIND_POINTER,
++		R_PARSE_CTYPE_TYPE_KIND_ARRAY
++	} kind;
++
++	union {
++		struct {
++			char *name;
++			bool is_const;
++		} identifier;
++		struct {
++			RParseCTypeType *type;
++			bool is_const;
++		} pointer;
++		struct {
++			RParseCTypeType *type;
++			ut64 count;
++		} array;
++	};
++};
++
++R_API RParseCType *r_parse_ctype_new();
++R_API void r_parse_ctype_free(RParseCType *ctype);
++R_API RParseCTypeType *r_parse_ctype_parse(RParseCType *ctype, const char *str, char **error);
++R_API void r_parse_ctype_type_free(RParseCTypeType *type);
++
+ /* plugin pointers */
+ extern RParsePlugin r_parse_plugin_6502_pseudo;
+ extern RParsePlugin r_parse_plugin_arm_pseudo;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,211 @@
++/* radare - LGPL - Copyright 2019 - thestr4ng3r */
++
++#include <r_parse.h>
++
++#include <mpc.h>
++
++typedef struct r_parse_ctype_t {
++	mpc_parser_t *integerlit;
++	mpc_parser_t *identifier;
++	mpc_parser_t *qualifier;
++	mpc_parser_t *pointer;
++	mpc_parser_t *array;
++	mpc_parser_t *type;
++} RParseCType;
++
++#define ALL_PARSERS(ctype) ctype->integerlit, ctype->identifier, ctype->qualifier, ctype->pointer, ctype->array, ctype->type
++#define ALL_PARSERS_COUNT 6
++
++static const char *lang =
++	"integerlit : /0x[0-9A-Fa-f]+/ | /[0-9]+/;"
++	"identifier : /[a-zA-Z_][0-9a-zA-Z_]+/;"
++	"qualifier  : \"const\";"
++	"pointer    : <qualifier>? '*';"
++	"array      : '[' <integerlit> ']';"
++	"type       : <qualifier>? <identifier> (<pointer> | <array>)*;";
++
++
++R_API RParseCType *r_parse_ctype_new() {
++	RParseCType *ctype = R_NEW (RParseCType);
++	if (!ctype) {
++		return NULL;
++	}
++
++	ctype->integerlit = mpc_new ("integerlit");
++	ctype->identifier = mpc_new ("identifier");
++	ctype->qualifier = mpc_new ("qualifier");
++	ctype->pointer = mpc_new ("pointer");
++	ctype->array = mpc_new ("array");
++	ctype->type = mpc_new ("type");
++
++	mpc_err_t *err = mpca_lang (MPCA_LANG_DEFAULT, lang, ALL_PARSERS (ctype), NULL);
++	if (err) {
++		mpc_err_print (err);
++		mpc_err_delete (err);
++		r_parse_ctype_free (ctype);
++		return NULL;
++	}
++
++	return ctype;
++}
++
++R_API void r_parse_ctype_free(RParseCType *ctype) {
++	if (!ctype) {
++		return;
++	}
++	mpc_cleanup (ALL_PARSERS_COUNT, ALL_PARSERS (ctype));
++	free (ctype);
++}
++
++static bool is_qualifier_const(mpc_ast_t *a) {
++	return strcmp (a->tag, "qualifier|string") == 0
++		&& a->contents
++		&& strcmp (a->contents, "const") == 0;
++}
++
++static bool is_identifier_string(mpc_ast_t *a) {
++	return strcmp (a->tag, "identifier|regex") == 0
++		&& a->contents;
++}
++
++static bool is_non_const_pointer(mpc_ast_t *a) {
++	return strcmp (a->tag, "pointer|char") == 0
++		&& a->contents
++		&& strcmp (a->contents, "*") == 0;
++}
++
++static bool is_const_pointer(mpc_ast_t *a) {
++	return strcmp (a->tag, "pointer|>") == 0
++		&& a->children_num == 2
++		&& is_qualifier_const (a->children[0])
++		&& strcmp (a->children[1]->tag, "char") == 0
++		&& a->children[1]->contents
++		&& strcmp (a->children[1]->contents, "*") == 0;
++}
++
++static bool is_array(mpc_ast_t *a) {
++	return strcmp (a->tag, "array|>") == 0
++		&& a->children_num == 3
++		&& strcmp (a->children[0]->tag, "char") == 0
++		&& a->children[0]->contents
++		&& strcmp (a->children[0]->contents, "[") == 0
++		&& strcmp (a->children[1]->tag, "integerlit|regex") == 0
++		&& a->children[1]->contents
++		&& strcmp (a->children[2]->tag, "char") == 0
++		&& a->children[2]->contents
++		&& strcmp (a->children[2]->contents, "]") == 0;
++}
++
++static RParseCTypeType *ctype_convert_ast(mpc_ast_t *a) {
++	bool is_cons

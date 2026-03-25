@@ -1,0 +1,129 @@
+@@ -26,9 +26,14 @@
+ 
+ class IEC104Stats {
+  private:
++  RwLock lock;
+   struct {
+     u_int32_t tx, rx;
+   } pkt_lost; /* Counter for packet loss sequences */
++  struct {
++    u_int32_t type_i, type_s, type_u, type_other;
++    u_int32_t forward_msgs, reverse_msgs, retransmitted_msgs;
++  } stats;
+   std::unordered_map<u_int16_t, u_int32_t> type_i_transitions;
+   std::unordered_map<u_int16_t, u_int32_t> typeid_uses;
+   u_int16_t last_type_i;
+
+
+
+
+@@ -22,7 +22,7 @@
+ #include "ntop_includes.h"
+ 
+ // #define DEBUG_IEC60870
+-//#define IEC60870_TRACE
++// #define IEC60870_TRACE
+ 
+ /* *************************************** */
+ 
+@@ -30,6 +30,7 @@ IEC104Stats::IEC104Stats() {
+   memset(&pkt_lost, 0, sizeof(pkt_lost));
+   last_type_i = 0;
+   memset(&last_i_apdu, 0, sizeof(last_i_apdu));
++  memset(&stats, 0, sizeof(stats));
+   i_s_apdu = ndpi_alloc_data_analysis(32 /* sliding window side */);
+   tx_seq_num = rx_seq_num = 0;
+ }
+@@ -50,6 +51,10 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+     u_int64_t *allowedTypeIDs = ntop->getPrefs()->getIEC104AllowedTypeIDs();
+     std::unordered_map<u_int16_t, u_int32_t>::iterator it;
+ 
++    lock.wrlock(__FILE__, __LINE__);
++
++    if(tx_direction) stats.forward_msgs++; else stats.reverse_msgs++;
++    
+     while(offset /* Skip START byte */ < payload_len) {
+       /* https://infosys.beckhoff.com/english.php?content=../content/1033/tcplclibiec870_5_104/html/tcplclibiec870_5_104_objref_overview.htm&id */
+       u_int8_t len = payload[offset], pdu_type = ((payload[offset+1] & 0x01) == 0) ? 0 : (payload[offset+1] & 0x03);
+@@ -64,7 +69,7 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+       ntop->getTrace()->traceEvent(TRACE_WARNING, "[%s] A-PDU Len %u/%u [pdu_type: %u][magic: %02X]",
+ 				   __FUNCTION__, len, payload_len, pdu_type, payload[offset-1]);
+ #endif
+-
++      
+       if(len == 0) break; /* Something went wrong */
+ 
+       switch(pdu_type) {
+@@ -73,12 +78,15 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+ 	ntop->getTrace()->traceEvent(TRACE_NORMAL, "A-PDU U-%u", (payload[offset+1] & 0xFC) >> 2);
+ #endif
+ 	/* No rx and tx to be updated */
++	stats.type_u++;
+ 	break;
+ 
+       case 0x01: /* S */
+ 	if(len >= 4) {
+-	  // u_int16_t rx = ((((u_int16_t)payload[offset+4]) << 8) + payload[offset+3]) >> 1;
+-	  
++#ifdef IEC60870_TRACE
++	  u_int16_t rx = ((((u_int16_t)payload[offset+4]) << 8) + payload[offset+3]) >> 1;
++#endif
++
+ 	  if(last_i_apdu.tv_sec != 0) {
+ 	    float     ms =  Utils::msTimevalDiff(packet_time, &last_i_apdu);
+ 
+@@ -96,30 +104,68 @@ void IEC104Stats::processPacket(Flow *f, bool tx_direction,
+ 
+ 	  /* No rx and tx to be updated */
+ 	}
++
++	stats.type_s++;
+ 	break;
+       }
+ 
+       if(pdu_type != 0x0 /* Type I */) {
+ 	offset += len + 2;
++	stats.type_other++;
+ 	continue;
+       }
+ 
+       /* From now on, only Type I packets are processed */
+       memcpy(&last_i_apdu, packet_time, sizeof(struct timeval));
++      stats.type_i++;
+ 
+       if(len >= 6 /* Ignore 4 bytes APDUs */) {
+-	u_int16_t value;
++	u_int16_t rx_value, tx_value;
+ 	bool initial_run = ((rx_seq_num == 0) && (tx_seq_num == 0)) ? true : false;
+ 
+-	value = ((((u_int16_t)payload[offset+2]) << 8) + payload[offset+1]) >> 1;
+-	if(tx_direction && (!initial_run))
+-	  pkt_lost.tx += abs(value-(tx_seq_num+1));
+-	tx_seq_num = value;
++	tx_value = ((((u_int16_t)payload[offset+2]) << 8) + payload[offset+1]) >> 1;
++	rx_value = ((((u_int16_t)payload[offset+4]) << 8) + payload[offset+3]) >> 1;
++
++	if(!tx_direction) {
++	  /* Counters are swapped */
++	  u_int16_t v = rx_value;
++	  
++	  rx_value = tx_value;
++	  tx_value = v;
++	}
++
++	if((tx_value == tx_seq_num) && (rx_value == rx_seq_num)) {
++	  stats.retransmitted_msgs++;
++	  lock.unlock(__FILE__, __LINE__);
++	  return;
++	}
++	
++	if(!initial_run) {
++	  u_int32_t diff = abs(tx_value-(tx_seq_num+1));
++
++	  /* Check for id reset (16 bit only) */
++	  if(diff != 32768) pkt_lost.tx += diff;
++	}
++	tx_seq_num = tx_value;
++
++	if(!tx_direction) {
++	  if(!initial

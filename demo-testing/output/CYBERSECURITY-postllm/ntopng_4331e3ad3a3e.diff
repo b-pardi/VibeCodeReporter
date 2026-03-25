@@ -1,0 +1,142 @@
+@@ -83,7 +83,7 @@ class DB {
+   virtual void shutdown();
+   virtual void flush(){};
+   virtual void lua(lua_State *vm, bool since_last_checkpoint);
+-  virtual int select_database(char *dbname) { return (-1); }
++  virtual bool select_database(char *dbname) { return false; }
+   virtual void checkIdle(time_t when) { ; }
+   virtual void getStats(u_int64_t *flow_export_count, u_int64_t *flow_export_drops,
+ 			u_int64_t *flow_export_rate, bool since_last_checkpoint);  
+
+
+
+
+@@ -27,27 +27,30 @@
+ #ifdef HAVE_MYSQL
+ 
+ class MySQLDB : public DB {
+- protected:
++ private:
+   MYSQL mysql;
+-  bool db_operational;
+-  FILE *log_fd;
+-  u_int32_t mysqlEnqueuedFlows;
+-  Mutex m;
+-
+-  volatile bool db_created;
+   pthread_t queryThreadLoop;
++  u_int32_t mysqlEnqueuedFlows;
++  FILE *log_fd;
+ 
+   bool connectToDB(MYSQL *conn, bool select_db);
+   void open_log();
+   char *get_last_db_error(MYSQL *conn) { return ((char *)mysql_error(conn)); }
+   void try_exec_sql_query(char *sql);
+-  virtual bool createDBSchema();
+-  bool createNprobeDBView();
+   MYSQL *mysql_try_connect(MYSQL *conn, const char *dbname);
+-  void mysql_result_to_lua(lua_State *vm, MYSQL_RES *result, int num_fields,
+-                           bool limitRows);
++  void mysql_result_to_lua(lua_State *vm, MYSQL_RES *result, int num_fields, bool limitRows);
++
+   void printFailure(const char *query, int status);
+ 
++ protected:
++  bool db_operational;
++  volatile bool db_created;
++  time_t last_message;
++  Mutex m;
++
++  virtual bool createDBSchema();
++  bool suppressMessage();
++
+  public:
+   MySQLDB(NetworkInterface *_iface);
+   virtual ~MySQLDB();
+@@ -79,7 +82,7 @@ class MySQLDB : public DB {
+ 
+   virtual bool startQueryLoop();
+   void shutdown();
+-  int select_database(char *dbname);
++  bool select_database(char *dbname);
+ };
+ 
+ #endif
+
+
+
+
+@@ -987,8 +987,8 @@ public:
+   void addInterfaceAddress(char *const addr);
+   void addInterfaceNetwork(char *const net, char *addr);
+   bool isInterfaceNetwork(IpAddress *ipa, int network_bits);
+-  inline int select_database(char *dbname) {
+-    return (db ? db->select_database(dbname) : -1);
++  inline bool select_database(char *dbname) {
++    return (db ? db->select_database(dbname) : false);
+   };
+   inline int exec_sql_query(lua_State *vm, char *sql, bool limit_rows,
+                             bool wait_for_db_created = false) {
+
+
+
+
+@@ -38,9 +38,48 @@ const char *MySQLDB::getEngineName() {
+   return "MySQL";
+ }
+ 
++/* ******************************************* */
++
++MySQLDB::MySQLDB(NetworkInterface *_iface) : DB(_iface) {
++  if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[new] %s", __FILE__);
++  mysqlEnqueuedFlows = 0;
++  log_fd = NULL;
++  open_log();
++  db_created = false;
++  last_message = 0;
++
++  connectToDB(&mysql, false);
++}
++
++/* ******************************************* */
++
++MySQLDB::~MySQLDB() {
++  if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[delete] %s", __FILE__);
++  
++  shutdown();
++  disconnectFromDB(&mysql);
++
++  if (log_fd) fclose(log_fd);
++}
++
++/* **************************************************** */
++
++/* Used to rate-limit failure messages */
++bool MySQLDB::suppressMessage() {
++  time_t now = time(NULL);
++  if (last_message < now) {
++    last_message = now;
++    return false;
++  } else {
++    return true;
++  }
++}
++
+ /* **************************************************** */
+ 
+ void MySQLDB::printFailure(const char *query, int status) {
++  if (suppressMessage()) return;
++
+   ntop->getTrace()->traceEvent(TRACE_ERROR, "SQL query: %s", query);
+   ntop->getTrace()->traceEvent(TRACE_ERROR, "SQL error (%d): %s", status,
+                                get_last_db_error(&mysql));
+@@ -505,29 +544,6 @@ bool MySQLDB::createDBSchema() {
+ 
+ /* ******************************************* */
+ 
+-MySQLDB::MySQLDB(NetworkInterface *_iface) : DB(_iface) {
+-  if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[new] %s", __FILE__);
+-  mysqlEnqueuedFlows = 0;
+-  log_fd = NULL;
+-  open_log();
+-  db_

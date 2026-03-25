@@ -1,0 +1,119 @@
+@@ -29,7 +29,6 @@
+ #include "lib/tailcall.h"
+ #include "lib/common.h"
+ #include "lib/edt.h"
+-#include "lib/encrypt.h"
+ #include "lib/eps.h"
+ #include "lib/ipv6.h"
+ #include "lib/eth.h"
+@@ -39,7 +38,6 @@
+ #include "lib/local_delivery.h"
+ #include "lib/drop.h"
+ #include "lib/identity.h"
+-#include "lib/node.h"
+ #include "lib/nodeport.h"
+ #include "lib/nodeport_egress.h"
+ #include "lib/clustermesh.h"
+@@ -63,7 +61,6 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
+ 	void *data_end, *data;
+ 	struct ipv6hdr *ip6;
+ 	struct endpoint_info *ep;
+-	bool decrypted = false;
+ 	bool __maybe_unused is_dsr = false;
+ 	fraginfo_t fraginfo __maybe_unused;
+ 
+@@ -101,68 +98,22 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+ 		return DROP_INVALID;
+ 
+-	/* Lookup the source in the ipcache. Before decryption this will be the
+-	 * outer source IP to get the source node ID. After decryption this
+-	 * will be the inner source IP to get the source security identity.
+-	 */
+ 	info = lookup_ip6_remote_endpoint((union v6addr *)&ip6->saddr, 0);
++	/* Maybe overwrite the REMOTE_NODE_ID with
++	 * KUBE_APISERVER_NODE_ID to support upgrade. After v1.12,
++	 * identity_is_remote_node() should be removed.
++	 *
++	 * A packet that has DSR info and comes from `world` may have specific identity when
++	 * a CNP that is using CIDR rules is applied.
++	 */
++	if (info && (identity_is_remote_node(*identity) ||
++		     (is_dsr && identity_is_world_ipv6(*identity))))
++		*identity = info->sec_identity;
+ 
+ #ifdef ENABLE_IPSEC
+-	decrypted = ((ctx->mark & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_DECRYPT);
+-#endif
+-	if (decrypted) {
+-		if (info)
+-			*identity = info->sec_identity;
+-
+-		cilium_dbg(ctx, info ? DBG_IP_ID_MAP_SUCCEED6 : DBG_IP_ID_MAP_FAILED6,
+-			   ((__u32 *)&ip6->saddr)[3], *identity);
+-	} else {
+-		/* Maybe overwrite the REMOTE_NODE_ID with
+-		 * KUBE_APISERVER_NODE_ID to support upgrade. After v1.12,
+-		 * identity_is_remote_node() should be removed.
+-		 *
+-		 * A packet that has DSR info and comes from `world` may have specific identity when
+-		 * a CNP that is using CIDR rules is applied.
+-		 */
+-		if (info && (identity_is_remote_node(*identity) ||
+-			     (is_dsr && identity_is_world_ipv6(*identity))))
+-			*identity = info->sec_identity;
+-	}
+-
+-#ifdef ENABLE_IPSEC
+-	if (!decrypted) {
+-		__u16 node_id;
+-
+-		/* IPSec is not currently enforce (feature coming soon)
+-		 * so for now just handle normally
+-		 */
+-		if (ip6->nexthdr != IPPROTO_ESP) {
+-			update_metrics(ctx_full_len(ctx), METRIC_INGRESS,
+-				       REASON_PLAINTEXT);
+-			goto not_esp;
+-		}
+-
+-		node_id = lookup_ip6_node_id((union v6addr *)&ip6->saddr);
+-		if (!node_id)
+-			return DROP_NO_NODE_ID;
+-		set_ipsec_decrypt_mark(ctx, node_id);
+-
+-		/* To IPSec stack on cilium_vxlan we are going to pass
+-		 * this up the stack but eth_type_trans has already labeled
+-		 * this as an OTHERHOST type packet. To avoid being dropped
+-		 * by IP stack before IPSec can be processed mark as a HOST
+-		 * packet.
+-		 */
+-		ctx_change_type(ctx, PACKET_HOST);
+-
+-		send_trace_notify(ctx, TRACE_TO_STACK, *identity, UNKNOWN_ID,
+-				  TRACE_EP_ID_UNKNOWN, ctx->ingress_ifindex,
+-				  TRACE_REASON_ENCRYPTED, 0, bpf_htons(ETH_P_IPV6));
+-
+-		return CTX_ACT_OK;
+-	}
+-	ctx->mark = 0;
+-not_esp:
++	if (ip6->nexthdr != IPPROTO_ESP)
++		update_metrics(ctx_full_len(ctx), METRIC_INGRESS,
++			       REASON_PLAINTEXT);
+ #endif
+ 
+ #if defined(ENABLE_EGRESS_GATEWAY_COMMON)
+@@ -340,7 +291,6 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
+ 	void *data_end, *data;
+ 	struct iphdr *ip4;
+ 	struct endpoint_info *ep;
+-	bool decrypted = false;
+ 	bool __maybe_unused is_dsr = false;
+ 	fraginfo_t fraginfo __maybe_unused;
+ 	int ret;
+@@ -389,101 +339,56 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
+ 		return DROP_INVALID;
+ 
+-	/* Lookup the source in the ipcache. Before decryption this will b

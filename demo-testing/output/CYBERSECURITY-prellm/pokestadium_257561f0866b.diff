@@ -1,0 +1,138 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,43 @@
++#ifndef _CONTROLLER_H_
++#define _CONTROLLER_H_
++
++struct Controller {
++    /* 0x00 */ s16 contId;
++    /* 0x02 */ s16 rawStickX;
++    /* 0x04 */ s16 rawStickY;
++    /* 0x06 */ u16 buttonDown;
++    /* 0x08 */ u16 buttonPressed;
++    /* 0x0A */ u16 unkA;
++    char fillerC[2];
++    /* 0x0E */ u16 unkE;
++    /* 0x10 */ float stickMag;
++    /* 0x14 */ float stickX;
++    /* 0x18 */ float stickY;
++    /* 0x1C */ OSContStatus *statusData;
++    /* 0x20 */ OSContPad *controllerData;
++};
++
++extern struct Controller gControllers[4];
++extern OSMesgQueue gSIEventMesgQueue;
++extern u8 gControllerBits;
++extern u8 gEepromProbe;
++extern OSContStatus gControllerStatuses[4];
++extern OSContPad gControllerPads[4];
++extern OSMesg gSIEventMesgBuf[1];
++extern OSMesg gEepromMesgBuf[1];
++extern OSMesgQueue gEepromMesgQueue;
++
++void Cont_InitControllers(void);
++void Cont_AdjustAnalogStick(struct Controller *controller);
++void Cont_StartReadInputs(void);
++void Cont_ReadInputs(void);
++u8 Cont_GetControllerBits(void);
++s32 Cont_IsEepromPresent(void);
++s32 Cont_AttemptReadEeprom(u8* buffer, u32 size, s32 inaddr);
++s32 Cont_AttemptWriteEeprom(u8* buffer, u32 size, s32 inaddr);
++void Cont_BlockEepromQueue(void);
++void Cont_NoBlockEepromQueue(void);
++void Cont_InitEepromQueue(void);
++u8 Cont_SetupControllers(void);
++
++#endif // _CONTROLLER_H_
+
+
+
+
+@@ -25,4 +25,8 @@ typedef unsigned long uintptr_t;
+ #define SCREEN_WIDTH 320
+ #define SCREEN_HEIGHT 240
+ 
++#define ALIGN4(val) (((val) + 0x3) & ~0x3)
++#define ALIGN8(val) (((val) + 0x7) & ~0x7)
++#define ALIGN16(val) (((val) + 0xF) & ~0xF)
++
+ #endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,230 @@
++#include <ultra64.h>
++#include "controller.h"
++
++// TODO: Identify/move to header
++extern s16 func_8000A360(float, float);
++
++struct Controller gControllers[4];
++OSMesgQueue gSIEventMesgQueue;
++u8 gControllerBits;
++u8 gEepromProbe;
++OSContStatus gControllerStatuses[4];
++OSContPad gControllerPads[4];
++OSMesg gSIEventMesgBuf[1];
++OSMesg gEepromMesgBuf[1];
++OSMesgQueue gEepromMesgQueue;
++
++/*
++ * Initialize the gControllers structs. Clear each member, then set their cont
++ * id and set the status and pads pointers.
++ */
++void Cont_InitControllers(void) {
++    int i;
++
++    // clear each gControllers member.
++    for(i = 0; i < MAXCONTROLLERS; i++) {
++        bzero((void*)&gControllers[i], sizeof(struct Controller));
++    }
++
++    // Initialize each connected controller.
++    for(i = 0; i < MAXCONTROLLERS; i++) {
++        // If the bit is set in this bitfield for each iteration, it means
++        // the controller is connected. Set the ID and pointers respectively.
++        if(gControllerBits & (1 << i)) {
++            gControllers[i].contId = (i+1); // indexed by 1. (cont 1, cont 2, etc)
++            gControllers[i].statusData     = &gControllerStatuses[i];
++            gControllers[i].controllerData = &gControllerPads[i];
++        }
++    }
++}
++
++/*
++ * Take the updated controller struct and calculate
++ * the new x, y, and distance floats.
++ */
++void Cont_AdjustAnalogStick(struct Controller *controller) {
++    // reset the controller's x and y floats.
++    controller->stickX = 0.0f;
++    controller->stickY = 0.0f;
++
++    // modulate the rawStickX and rawStickY to be the new f32 values by adding/subtracting 6.
++    if (controller->rawStickX <= -8) {
++        controller->stickX = controller->rawStickX + 6;
++    }
++
++    if (controller->rawStickX >= 8) {
++        controller->stickX = controller->rawStickX - 6;
++    }
++
++    if (controller->rawStickY <= -8) {
++        controller->stickY = controller->rawStickY + 6;
++    }
++
++    if (controller->rawStickY >= 8) {
++        controller->stickY = controller->rawStickY - 6;
++    }
++
++    // calculate f32 magnitude from the center by vector length.
++    controller->stickMag =
++        sqrtf(controller->stickX * controller->stickX + controller->stickY * controller->stickY);
++
++    // magnitude cannot exceed 64.0f: if it does, modify the values appropriate
