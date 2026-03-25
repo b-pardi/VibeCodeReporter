@@ -1,0 +1,115 @@
+@@ -691,6 +691,12 @@ public class CumulusFrrConfigurationBuilder extends CumulusFrrParserBaseListener
+       return;
+     }
+     _currentBgpNeighborIpv4UnicastAddressFamily.setNextHopSelf(true);
++    // "force" and "all" are aliases. See https://github.com/FRRouting/frr/pull/4200.
++    // The functionality is described at
++    // http://docs.frrouting.org/en/latest/bgp.html#clicmd-[no]neighborPEERnext-hop-self[all].
++    if (ctx.FORCE() != null || ctx.ALL() != null) {
++      _currentBgpNeighborIpv4UnicastAddressFamily.setNextHopSelfAll(true);
++    }
+   }
+ 
+   @Override
+
+
+
+
+@@ -11,6 +11,7 @@ public class BgpNeighborIpv4UnicastAddressFamily implements Serializable {
+   @Nullable private Boolean _defaultOriginate;
+   @Nullable private Boolean _routeReflectorClient;
+   @Nullable private Boolean _nextHopSelf;
++  @Nullable private Boolean _nextHopSelfAll;
+   @Nullable private String _routeMapIn;
+   @Nullable private String _routeMapOut;
+ 
+@@ -44,6 +45,15 @@ public class BgpNeighborIpv4UnicastAddressFamily implements Serializable {
+     _nextHopSelf = nextHopSelf;
+   }
+ 
++  @Nullable
++  public Boolean getNextHopSelfAll() {
++    return _nextHopSelfAll;
++  }
++
++  public void setNextHopSelfAll(boolean nextHopSelfAll) {
++    _nextHopSelfAll = nextHopSelfAll;
++  }
++
+   void inheritFrom(@Nonnull BgpNeighborIpv4UnicastAddressFamily other) {
+     if (_activated == null) {
+       _activated = other.getActivated();
+
+
+
+
+@@ -771,17 +771,29 @@ public final class CumulusConversions {
+ 
+   @VisibleForTesting
+   static @Nullable SetNextHop getSetNextHop(BgpNeighbor neighbor, BgpVrf bgpVrf) {
+-    if (neighbor.getRemoteAs() == null
+-        || bgpVrf.getAutonomousSystem() == null
+-        || !neighbor.getRemoteAs().equals(bgpVrf.getAutonomousSystem())) {
++    if (neighbor.getRemoteAs() == null || bgpVrf.getAutonomousSystem() == null) {
+       return null;
+     }
+ 
++    boolean isIBgp = neighbor.getRemoteAs().equals(bgpVrf.getAutonomousSystem());
++    // TODO: Need to handle dynamic neighbors.
+     boolean nextHopSelf =
+         Optional.ofNullable(neighbor.getIpv4UnicastAddressFamily())
+             .map(BgpNeighborIpv4UnicastAddressFamily::getNextHopSelf)
+             .orElse(false);
+ 
++    if (isIBgp) {
++      // Check for "force".
++      // TODO: Handle v6 AFI.
++      BgpNeighborIpv4UnicastAddressFamily ipv4af = neighbor.getIpv4UnicastAddressFamily();
++      if (ipv4af != null) {
++        Boolean nextHopSelfAll = ipv4af.getNextHopSelfAll();
++        if (nextHopSelfAll == null || !nextHopSelfAll) {
++          nextHopSelf = false;
++        }
++      }
++    }
++
+     return nextHopSelf ? new SetNextHop(SelfNextHop.getInstance()) : null;
+   }
+ 
+
+
+
+
+@@ -384,16 +384,14 @@ public final class CumulusConversionsTest {
+     }
+ 
+     {
+-      // if is ibgp and neighbor configuration set next-hop-self set, then set
+-      // next-hop-self
++      // if is ibgp and neighbor configuration has next-hop-self set, then getSetNextHop should
++      // return null.
+       bgpNeighbor.setRemoteAs(10000L);
+       bgpVrf.setAutonomousSystem(10000L);
+       BgpNeighborIpv4UnicastAddressFamily ipv4af = new BgpNeighborIpv4UnicastAddressFamily();
+       bgpNeighbor.setIpv4UnicastAddressFamily(ipv4af);
+       ipv4af.setNextHopSelf(true);
+-
+-      assertThat(
+-          getSetNextHop(bgpNeighbor, bgpVrf), equalTo(new SetNextHop(SelfNextHop.getInstance())));
++      assertNull(getSetNextHop(bgpNeighbor, bgpVrf));
+     }
+   }
+ 
+@@ -1696,4 +1694,88 @@ public final class CumulusConversionsTest {
+         c, vsConfig, ImmutableMap.of(1001, vrf.getName()), null, loopbackTunnelIp, new Warnings());
+     assertThat(vrf.getLayer3Vnis().get(1001).getSourceAddress(), equalTo(loopbackTunnelIp));
+   }
++
++  @Test
++  public void testNextHopSelfAll() {
++    BgpNeighbor bgpNeighbor = new BgpIpNeighbor("10.0.0.1");
++    BgpVrf bgpVrf = new BgpVrf("bgpVrf");
++    {
++      // If eBGP and next-hop-self is NOT set, then next-hop should not be self.
++      bgpNeighbor.setRemoteAs(10000L);
++      bgpVrf.

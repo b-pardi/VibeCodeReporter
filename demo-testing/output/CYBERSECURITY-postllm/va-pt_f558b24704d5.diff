@@ -1,0 +1,88 @@
+@@ -175,18 +175,31 @@ class mDNSEnumerator:
+                     priority, weight, port = struct.unpack('!HHH', rdata[:6])
+                     target, _ = self.parse_dns_name(rdata, 6)
+ 
++                    # Extract service type from SRV name (e.g., "hostname._webdav._tcp.local" -> "_webdav._tcp.local")
++                    service_type = None
++                    name_parts = name.split('.')
++                    for i, part in enumerate(name_parts):
++                        if part.startswith('_') and i + 1 < len(name_parts):
++                            service_type = '.'.join(name_parts[i:])
++                            break
++
+                     # Find or update existing service entry
+                     found = False
+-                    for svc in results['services']:
+-                        if svc.get('name', '').startswith(name.split('.')[0]):
+-                            svc['port'] = port
+-                            svc['target'] = target
+-                            found = True
+-                            break
++                    if service_type:
++                        for svc in results['services']:
++                            svc_name = svc.get('name', '')
++                            # Match against service type pattern
++                            if service_type in svc_name or svc_name in service_type:
++                                svc['port'] = port
++                                svc['target'] = target
++                                svc['full_name'] = name
++                                found = True
++                                break
+ 
+                     if not found:
+                         results['services'].append({
+-                            'name': name,
++                            'name': service_type if service_type else name,
++                            'full_name': name,
+                             'port': port,
+                             'target': target,
+                             'type': 'SRV'
+@@ -226,20 +239,22 @@ class mDNSEnumerator:
+             'addresses': []
+         }
+ 
+-        # Common mDNS query types
+-        queries = [
++        # Phase 1: Discover services via PTR queries
++        ptr_queries = [
+             ('_services._dns-sd._udp.local', 12),  # Service enumeration
+             ('*.local', 12),  # All local services
+         ]
+ 
+-        for qname, qtype in queries:
++        discovered_services = set()
++
++        for qname, qtype in ptr_queries:
+             try:
+                 query = self.create_mdns_query(qname, qtype)
+                 sock.sendto(query, (target_ip, self.mdns_port))
+ 
+-                # Collect responses
++                # Collect PTR responses
+                 start_time = time.time()
+-                while time.time() - start_time < self.timeout:
++                while time.time() - start_time < self.timeout / 2:
+                     ready = select.select([sock], [], [], 0.5)
+                     if ready[0]:
+                         try:
+@@ -251,13 +266,59 @@ class mDNSEnumerator:
+                                     all_results['hostname'] = results['hostname']
+                                 all_results['services'].extend(results['services'])
+                                 all_results['addresses'].extend(results['addresses'])
++
++                                # Track discovered service types
++                                for svc in results['services']:
++                                    svc_name = svc.get('name', '')
++                                    if '_tcp.local' in svc_name or '_udp.local' in svc_name:
++                                        discovered_services.add(svc_name)
++
+                         except socket.timeout:
+                             break
+                     else:
+                         break
+ 
+             except Exception as e:
+-                self.log(f"Query error: {e}", "DEBUG")
++                self.log(f"PTR query error: {e}", "DEBUG")
++
++        # Phase 2: Send SRV 

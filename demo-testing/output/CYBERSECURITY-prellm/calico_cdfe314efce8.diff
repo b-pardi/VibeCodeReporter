@@ -1,0 +1,118 @@
+@@ -275,40 +275,40 @@ static CALI_BPF_INLINE int calico_ct_v4_create_nat(struct ct_ctx *ctx, int nat)
+  * cxt->skb or ctx->tun_ip. It returns true if the original packet is an icmp error and all
+  * checks went well.
+  */
+-static CALI_BPF_INLINE bool skb_icmp_err_unpack(struct cali_tc_ctx *ctx2, struct ct_ctx *ctx)
++static CALI_BPF_INLINE bool skb_icmp_err_unpack(struct cali_tc_ctx *ctx, struct ct_ctx *ct_ctx)
+ {
+ 	/* ICMP packet is an error, its payload should contain the full IP header and
+ 	 * at least the first 8 bytes of the next header. */
+ 
+-	if (skb_refresh_validate_ptrs(ctx2, ICMP_SIZE + sizeof(struct iphdr) + 8)) {
+-		ctx2->fwd.reason = CALI_REASON_SHORT;
+-		ctx2->fwd.res = TC_ACT_SHOT;
++	if (skb_refresh_validate_ptrs(ctx, ICMP_SIZE + sizeof(struct iphdr) + 8)) {
++		ctx->fwd.reason = CALI_REASON_SHORT;
++		ctx->fwd.res = TC_ACT_SHOT;
+ 		CALI_DEBUG("ICMP v4 reply: too short getting hdr\n");
+ 		return false;
+ 	}
+ 
+ 	struct iphdr *ip_inner;
+-	ip_inner = (struct iphdr *)(ctx2->icmp_header + 1); /* skip to inner ip */
++	ip_inner = (struct iphdr *)(ctx->icmp_header + 1); /* skip to inner ip */
+ 	CALI_DEBUG("CT-ICMP: proto %d\n", ip_inner->protocol);
+ 
+-	ctx->proto = ip_inner->protocol;
+-	ctx->src = ip_inner->saddr;
+-	ctx->dst = ip_inner->daddr;
++	ct_ctx->proto = ip_inner->protocol;
++	ct_ctx->src = ip_inner->saddr;
++	ct_ctx->dst = ip_inner->daddr;
+ 
+ 	switch (ip_inner->protocol) {
+ 	case IPPROTO_TCP:
+ 		{
+ 			struct tcphdr *tcp = (struct tcphdr *)(ip_inner + 1);
+-			ctx->sport = bpf_ntohs(tcp->source);
+-			ctx->dport = bpf_ntohs(tcp->dest);
+-			ctx->tcp = tcp;
++			ct_ctx->sport = bpf_ntohs(tcp->source);
++			ct_ctx->dport = bpf_ntohs(tcp->dest);
++			ct_ctx->tcp = tcp;
+ 		}
+ 		break;
+ 	case IPPROTO_UDP:
+ 		{
+ 			struct udphdr *udp = (struct udphdr *)(ip_inner + 1);
+-			ctx->sport = bpf_ntohs(udp->source);
+-			ctx->dport = bpf_ntohs(udp->dest);
++			ct_ctx->sport = bpf_ntohs(udp->source);
++			ct_ctx->dport = bpf_ntohs(udp->dest);
+ 		}
+ 		break;
+ 	};
+
+
+
+
+@@ -181,25 +181,4 @@ static CALI_BPF_INLINE bool icmp_type_is_err(__u8 type)
+ 	return false;
+ }
+ 
+-static CALI_BPF_INLINE bool icmp_skb_get_hdr(struct cali_tc_ctx *ctx, struct icmphdr **icmp)
+-{
+-	if (skb_refresh_validate_ptrs(ctx, ICMP_SIZE + sizeof(struct iphdr) + 8)) {
+-		ctx->fwd.reason = CALI_REASON_SHORT;
+-		ctx->fwd.res = TC_ACT_SHOT;
+-		CALI_DEBUG("ICMP v4 reply: too short getting hdr\n");
+-		return false;
+-	}
+-
+-	if (ctx->ip_header->ihl != 5) {
+-		CALI_INFO("ICMP: ip options unsupported\n");
+-		ctx->fwd.reason = CALI_REASON_IP_OPTIONS;
+-		ctx->fwd.res = TC_ACT_SHOT;
+-		return false;
+-	}
+-
+-	*icmp = ctx->icmp_header;
+-
+-	return true;
+-}
+-
+ #endif /* __CALI_ICMP_H__ */
+
+
+
+
+@@ -488,7 +488,6 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 
+ 	if (ct_related) {
+ 		if (ctx->ip_header->protocol == IPPROTO_ICMP) {
+-			struct icmphdr *icmp;
+ 			bool outer_ip_snat;
+ 
+ 			/* if we do SNAT ... */
+@@ -515,16 +514,25 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 						bpf_ntohl(state->ct_result.nat_ip));
+ 			}
+ 
+-			if (!icmp_skb_get_hdr(ctx, &icmp)) {
+-				CALI_DEBUG("Ooops, we already passed one such a check!!!\n");
++			/* Related ICMP traffic must be an error response so it should include inner IP
++			 * and 8 bytes as payload. */
++			if (skb_refresh_validate_ptrs(ctx, ICMP_SIZE + sizeof(struct iphdr) + 8)) {
++				CALI_DEBUG("Failed to revalidate packet size\n");
+ 				goto deny;
+ 			}
+ 
+-			l3_csum_off += sizeof(*ctx->ip_header) + sizeof(*icmp);
+-			ctx->ip_header = (struct iphdr *)(icmp + 1); /* skip to inner ip */
++			/* Skip past the ICMP header and check the inner IP header. */
++			l3_csum_off += sizeof(*ctx->ip_header) + sizeof(struct icmphdr);
++			ctx->ip_header = (struct iphdr *)(ctx->icmp_header + 1); /* skip to inner ip */
++			if (ctx->ip_header->ihl != 5) {
++				CALI_INFO("ICMP inner IP header has options; unsupported\n");
++				ctx->fwd.reason = CALI_REASON_IP_OPTIONS;
++				ctx->fwd.res = TC_ACT_SH

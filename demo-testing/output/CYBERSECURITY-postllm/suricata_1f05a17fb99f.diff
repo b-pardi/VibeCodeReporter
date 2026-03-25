@@ -1,0 +1,128 @@
+@@ -150,7 +150,6 @@ void DetectLuaRegister(void)
+ #define FLAG_DATATYPE_BUFFER                    BIT_U32(22)
+ #define FLAG_ERROR_LOGGED                       BIT_U32(23)
+ 
+-// TODO: move to config
+ #define DEFAULT_LUA_ALLOC_LIMIT       500000
+ #define DEFAULT_LUA_INSTRUCTION_LIMIT 500000
+ 
+@@ -484,7 +483,7 @@ static void *DetectLuaThreadInit(void *data)
+     t->alproto = lua->alproto;
+     t->flags = lua->flags;
+ 
+-    t->luastate = sb_newstate(lua->alloc_limit, lua->instruction_limit);
++    t->luastate = SCLuaSbStateNew(lua->alloc_limit, lua->instruction_limit);
+     if (t->luastate == NULL) {
+         SCLogError("luastate pool depleted");
+         goto error;
+@@ -493,7 +492,7 @@ static void *DetectLuaThreadInit(void *data)
+     if (lua->allow_restricted_functions) {
+         luaL_openlibs(t->luastate);
+     } else {
+-        sb_loadrestricted(t->luastate);
++        SCLuaSbLoadRestricted(t->luastate);
+     }
+ 
+     LuaRegisterExtensions(t->luastate);
+@@ -534,7 +533,7 @@ static void *DetectLuaThreadInit(void *data)
+ 
+ error:
+     if (t->luastate != NULL)
+-        sb_close(t->luastate);
++        SCLuaSbStateClose(t->luastate);
+     SCFree(t);
+     return NULL;
+ }
+@@ -544,7 +543,7 @@ static void DetectLuaThreadFree(void *ctx)
+     if (ctx != NULL) {
+         DetectLuaThreadData *t = (DetectLuaThreadData *)ctx;
+         if (t->luastate != NULL)
+-            sb_close(t->luastate);
++            SCLuaSbStateClose(t->luastate);
+         SCFree(t);
+     }
+ }
+@@ -590,13 +589,13 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
+ {
+     int status;
+ 
+-    lua_State *luastate = sb_newstate(ld->alloc_limit, ld->instruction_limit);
++    lua_State *luastate = SCLuaSbStateNew(ld->alloc_limit, ld->instruction_limit);
+     if (luastate == NULL)
+         return -1;
+     if (ld->allow_restricted_functions) {
+         luaL_openlibs(luastate);
+     } else {
+-        sb_loadrestricted(luastate);
++        SCLuaSbLoadRestricted(luastate);
+     }
+ 
+     /* hackish, needed to allow unittests to pass buffers as scripts instead of files */
+@@ -876,10 +875,10 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
+ 
+     /* pop the table */
+     lua_pop(luastate, 1);
+-    sb_close(luastate);
++    SCLuaSbStateClose(luastate);
+     return 0;
+ error:
+-    sb_close(luastate);
++    SCLuaSbStateClose(luastate);
+     return -1;
+ }
+ 
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2014-2023 Open Information Security Foundation
++/* Copyright (C) 2023-2024 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -36,19 +36,33 @@
+ 
+ #include "util-lua-sandbox.h"
+ 
+-typedef struct sb_block_function {
++#if !defined(SANDBOX_ALLOC_CTX)
++#define SANDBOX_CTX "SANDBOX_CTX"
++#endif
++
++typedef struct BlockedFunction {
+     const char *module;
+     const char *name;
+-} sb_block_function;
++} BlockedFunction;
+ 
+-static void sb_hook(lua_State *L, lua_Debug *ar);
+-LUAMOD_API int luaopen_sandbox(lua_State *L);
++static void HookFunc(lua_State *L, lua_Debug *ar);
++static int OpenSandbox(lua_State *L);
+ 
+-static void *sb_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
++/**
++ * Lua allocator function provided to lua_newstate.
++ *
++ * \param ud The pointer passed to lua_newstate
++ * \param ptr Pointer to data being allocated/reallocated/freed
++ * \param osize Original size of the block
++ * \param nsize Size of the new block
++ *
++ * See: https://www.lua.org/manual/5.4/manual.html#lua_Alloc
++ */
++static void *LuaAlloc(void *ud, void *ptr, size_t osize, size_t nsize)
+ {
+     (void)ud;
+     (void)osize; /* not used */
+-    sb_lua_state *ctx = (sb_lua_state *)ud;
++    SCLuaSbState *ctx = (SCLuaSbState *)ud;
+     if (nsize == 0) {
+         if (ptr != NULL) {
+             // ASSERT: alloc_bytes > osize
+@@ -71,32 +85,53 @@ static void *sb_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
+     }
+ }
+ 
+-/*

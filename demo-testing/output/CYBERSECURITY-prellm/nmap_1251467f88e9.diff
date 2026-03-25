@@ -1,0 +1,111 @@
+@@ -298,8 +298,8 @@ int fdinfo_close(struct fdinfo *fdn)
+ /* Do a recv on an fdinfo, without other side effects. */
+ int fdinfo_recv(struct fdinfo *fdn, char *buf, size_t size)
+ {
+-#ifdef HAVE_OPENSSL
+     int n;
++#ifdef HAVE_OPENSSL
+     int err = SSL_ERROR_NONE;
+     if (o.ssl && fdn->ssl)
+     {
+@@ -311,12 +311,18 @@ int fdinfo_recv(struct fdinfo *fdn, char *buf, size_t size)
+             err = (n < 0) ? SSL_get_error(fdn->ssl, n) : SSL_ERROR_NONE;
+         } while (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE);
+         if (err != SSL_ERROR_NONE) {
++            fdn->lasterr = err;
+             logdebug("SSL_read error on %d: %s\n", fdn->fd, ERR_error_string(err, NULL));
+         }
+         return n;
+     }
+ #endif
+-    return recv(fdn->fd, buf, size, 0);
++    n = recv(fdn->fd, buf, size, 0);
++    if (n == 0)
++        fdn->lasterr = EOF;
++    else if (n < 0)
++        fdn->lasterr = socket_errno();
++    return n;
+ }
+ 
+ int fdinfo_pending(struct fdinfo *fdn)
+@@ -366,8 +372,8 @@ int ncat_recv(struct fdinfo *fdn, char *buf, size_t size, int *pending)
+ /* Do a send on an fdinfo, without any logging or other side effects. */
+ int fdinfo_send(struct fdinfo *fdn, const char *buf, size_t size)
+ {
+-#ifdef HAVE_OPENSSL
+     int n;
++#ifdef HAVE_OPENSSL
+     int err = SSL_ERROR_NONE;
+     if (o.ssl && fdn->ssl != NULL)
+     {
+@@ -379,12 +385,16 @@ int fdinfo_send(struct fdinfo *fdn, const char *buf, size_t size)
+             err = (n < 0) ? SSL_get_error(fdn->ssl, n) : SSL_ERROR_NONE;
+         } while (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE);
+         if (err != SSL_ERROR_NONE) {
++            fdn->lasterr = err;
+             logdebug("SSL_write error on %d: %s\n", fdn->fd, ERR_error_string(err, NULL));
+         }
+         return n;
+     }
+ #endif
+-    return send(fdn->fd, buf, size, 0);
++    n = send(fdn->fd, buf, size, 0);
++    if (n <= 0)
++        fdn->lasterr = socket_errno();
++    return n;
+ }
+ 
+ /* If we are sending a large amount of data, we might momentarily run out of send
+@@ -430,15 +440,14 @@ int ncat_broadcast(fd_set *fds, const fd_list_t *fdlist, const char *msg, size_t
+         return size;
+ 
+     ret = 0;
+-    for (i = 0; i <= fdlist->fdmax; i++) {
+-        if (!checked_fd_isset(i, fds))
++    for (i = 0; i < fdlist->nfds; i++) {
++        fdn = &fdlist->fds[i];
++        if (!checked_fd_isset(fdn->fd, fds))
+             continue;
+ 
+-        fdn = get_fdinfo(fdlist, i);
+-        ncat_assert(fdn != NULL);
+         if (blocking_fdinfo_send(fdn, msg, size) <= 0) {
+             if (o.debug > 1)
+-                logdebug("Error sending to fd %d: %s.\n", i, socket_strerror(socket_errno()));
++                logdebug("Error sending to fd %d: %s.\n", fdn->fd, socket_strerror(fdn->lasterr));
+             ret = -1;
+         }
+     }
+
+
+
+
+@@ -121,6 +121,7 @@ static void handle_connection(int socket_accept, int type, fd_set *listen_fds);
+ static int read_stdin(void);
+ static int read_socket(int recv_fd);
+ static void post_handle_connection(struct fdinfo *sinfo);
++static void close_fd(struct fdinfo *fdn, int eof);
+ static void read_and_broadcast(int recv_socket);
+ static void shutdown_sockets(int how);
+ static int chat_announce_connect(const struct fdinfo *fdi);
+@@ -167,7 +168,7 @@ static void sigchld_handler(int signum)
+ 
+ int new_listen_socket(int type, int proto, const union sockaddr_u *addr, fd_set *listen_fds)
+ {
+-  struct fdinfo fdi;
++  struct fdinfo fdi = {0};
+   fdi.fd = do_listen(type, proto, addr);
+   if (fdi.fd < 0) {
+     return -1;
+@@ -289,7 +290,7 @@ int ncat_listen()
+     if (o.idletimeout > 0)
+         tvp = &tv;
+ 
+-    while (1) {
++    while (client_fdlist.nfds > 1 || get_conn_count() > 0) {
+         /* We pass these temporary descriptor sets to fselect, since fselect
+            modifies the sets it receives. */
+         fd_set readfds = master_readfds, writefds = master_writefds;
+@@ -316,9 +317,18 @@ int ncat_listen()
+         if (fds_ready == 0)
+             bye("Idle timeout expired (%d 

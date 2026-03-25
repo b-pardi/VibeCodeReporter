@@ -1,0 +1,107 @@
+@@ -66,6 +66,9 @@ def process_advisories(advisory_datas: Iterable[AdvisoryData], importer_name: st
+     """
+     count = 0
+     for data in advisory_datas:
++        # https://nvd.nist.gov/vuln/detail/CVE-2013-4314
++        # https://github.com/cms-dev/cms/issues/888#issuecomment-516977572
++        data.summary = data.summary.replace("\x00", "\uFFFD")
+         obj, created = Advisory.objects.get_or_create(
+             aliases=data.aliases,
+             summary=data.summary,
+
+
+
+
+@@ -30,7 +30,7 @@ from typing import Mapping
+ from typing import Optional
+ 
+ import pytz
+-import yaml
++import saneyaml
+ from dateutil import parser as dateparser
+ from django.db.models.query import QuerySet
+ from fetchcode.vcs import fetch_via_vcs
+@@ -41,6 +41,7 @@ from univers.version_range import from_gitlab_native
+ from univers.versions import Version
+ 
+ from vulnerabilities.helpers import AffectedPackage as LegacyAffectedPackage
++from vulnerabilities.helpers import get_affected_packages_by_patched_package
+ from vulnerabilities.helpers import nearest_patched_package
+ from vulnerabilities.helpers import resolve_version_range
+ from vulnerabilities.importer import AdvisoryData
+@@ -67,6 +68,7 @@ PURL_TYPE_BY_GITLAB_SCHEME = {
+     "nuget": "nuget",
+     "pypi": "pypi",
+     "packagist": "composer",
++    # "conan": "conan",
+ }
+ 
+ 
+@@ -91,32 +93,27 @@ class GitLabAPIImporter(Importer):
+ 
+     def advisory_data(self) -> Iterable[AdvisoryData]:
+         try:
+-            fork_directory = fork_and_get_dir(self.gitlab_url)
++            fork_directory = fork_and_get_dir(url=self.gitlab_url)
+         except Exception as e:
+             logger.error(f"Can't clone url {self.gitlab_url}")
+             raise ForkError(self.gitlab_url) from e
+-        ecosystems = ["nuget", "maven", "gem", "npm", "go", "packagist", "pypi"]
+-        for ecosystem in ecosystems:
+-            for file in get_files(os.path.join(fork_directory, ecosystem)):
+-                yield parse_yaml_file(file)
+-
+-
+-def get_files(dir):
+-    for root, _, files in os.walk(dir):
+-        for file in files:
+-            yield os.path.join(root, file)
+-
+-
+-def not_empty(value):
+-    return value is not None and value != ""
++        for root_dir in os.listdir(fork_directory):
++            # skip well known files and directories that contain no advisory data
++            if root_dir in ("ci", "CODEOWNERS", "README.md", "LICENSE", ".git"):
++                continue
++            if root_dir not in PURL_TYPE_BY_GITLAB_SCHEME:
++                logger.error(f"Unknown package type: {root_dir}")
++                continue
++            for root, _, files in os.walk(os.path.join(fork_directory, root_dir)):
++                for file in files:
++                    yield parse_gitlab_advisory(file=os.path.join(root, file))
+ 
+ 
+ def get_purl(package_slug):
+     """
+     Return a PackageURL object from a package slug
+     """
+-    parts = package_slug.split("/")
+-    parts = list(filter(not_empty, parts))
++    parts = [p for p in package_slug.strip("/").split("/") if p]
+     gitlab_scheme = parts[0]
+     purl_type = PURL_TYPE_BY_GITLAB_SCHEME[gitlab_scheme]
+     if gitlab_scheme == "go":
+@@ -130,12 +127,11 @@ def get_purl(package_slug):
+     # if package slug is of the form:
+     # "nuget/github/user/abc/NuGet.Core"
+     if len(parts) >= 3:
+-        gitlab_scheme = parts[0]
+         name = parts[-1]
+         namespace = "/".join(parts[1:-1])
+         return PackageURL(type=purl_type, namespace=namespace, name=name)
+     logger.error(f"get_purl: package_slug can not be parsed: {package_slug!r}")
+-    return None
++    return
+ 
+ 
+ def extract_affected_packages(
+@@ -144,7 +140,12 @@ def extract_affected_packages(
+     purl: PackageURL,
+ ) -> Iterable[AffectedPackage]:
+     """
+-    Yield a list of AffectedPackage objects
++    Yield AffectedPackage objects, one for each fixed_version
++
++    In case of gitlab advisory data we get a list of fixed_versions and a affected_version_range.
++    Since we can not determine which pack

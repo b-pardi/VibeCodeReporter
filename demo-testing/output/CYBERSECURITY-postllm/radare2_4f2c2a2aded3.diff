@@ -1,0 +1,105 @@
+@@ -33,8 +33,8 @@ static int get_capstone_mode(RArchSession *as) {
+ #define IMM(n) (insn->detail->bpf.operands[n].imm & UT32_MAX)
+ #define OPCOUNT insn->detail->bpf.op_count
+ 
+-// calculate jump address from immediate
+-#define JUMP(n) (op->addr + insn->size * (1 + IMM (n)))
++// calculate jump address from immediate (sBPF uses 16-bit signed offsets in instruction units)
++#define JUMP(n) (op->addr + insn->size + ((st16)(IMM(n) & 0xffff)) * 8)
+ 
+ // Solana syscall name mapping (retrieved from firedancer validator)
+ static struct {
+@@ -82,7 +82,6 @@ static const char *get_syscall_name(ut32 hash) {
+ 	return NULL;
+ }
+ 
+-
+ static void analop_esil(RArchSession *a, RAnalOp *op, cs_insn *insn, ut64 addr);
+ static void check_and_create_string_flag(RArchSession *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len);
+ 
+@@ -118,7 +117,6 @@ static bool decode(RArchSession *a, RAnalOp *op, RArchDecodeMask mask) {
+ 					st64 target_pc = current_pc + imm + 1;  	// Target PC in instruction units
+ 					st64 target_addr = target_pc * 8;  			// Target address in bytes
+ 					op->mnemonic = r_str_newf ("call 0x%"PFMT64x, (ut64)target_addr);
+-
+ 					// Set jump target for call instruction
+ 					op->jump = target_addr;
+ 
+@@ -130,7 +128,6 @@ static bool decode(RArchSession *a, RAnalOp *op, RArchDecodeMask mask) {
+ 					op->type = R_ANAL_OP_TYPE_CALL;
+ 					op->family = R_ANAL_OP_FAMILY_CPU;
+ 					op->size = insn->size;
+-
+ 				}
+ 			} else {
+ 				op->mnemonic = r_str_newf ("%s%s%s",
+@@ -171,12 +168,10 @@ static bool decode(RArchSession *a, RAnalOp *op, RArchDecodeMask mask) {
+ 				break;
+ 			case BPF_INS_CALL: ///< eBPF only
+ 				op->type = R_ANAL_OP_TYPE_CALL;
+-
+ 				// Enhanced call analysis for function detection
+ 				if (OPCOUNT > 0 && OP(0).type == BPF_OP_IMM) {
+ 					st32 imm = IMM(0);
+ 					const char *syscall_name = get_syscall_name (imm);
+-
+ 					if (!syscall_name) {
+ 						// PC-relative call - calculate target and force function creation
+ 						st64 current_pc = op->addr / 8;
+@@ -318,7 +313,6 @@ static ut32 detect_string_size_from_next_insn(RArchSession *a, RAnalOp *op, cons
+ 	if (!a || !a->data || !buf || len < 8) {
+ 		return default_size;
+ 	}
+-
+ 	CapstonePluginData *cpd = (CapstonePluginData*)a->data;
+ 	if (!cpd || !cpd->cs_handle) {
+ 		return default_size;
+@@ -326,7 +320,7 @@ static ut32 detect_string_size_from_next_insn(RArchSession *a, RAnalOp *op, cons
+ 
+ 	cs_insn *next_insn = NULL;
+ 	ut64 next_addr = op->addr + op->size;
+-	int n = cs_disasm(cpd->cs_handle, buf, 8, next_addr, 1, &next_insn);
++	int n = cs_disasm (cpd->cs_handle, buf, 8, next_addr, 1, &next_insn);
+ 
+ 	if (n <= 0 || !next_insn) {
+ 		return default_size;
+@@ -341,7 +335,6 @@ static ut32 detect_string_size_from_next_insn(RArchSession *a, RAnalOp *op, cons
+ 	if (is_mov_insn && has_detail) {
+ 		bool is_reg_dest = next_insn->detail->bpf.operands[0].type == BPF_OP_REG;
+ 		bool is_imm_src = next_insn->detail->bpf.operands[1].type == BPF_OP_IMM;
+-
+ 		if (is_reg_dest && is_imm_src) {
+ 			ut32 imm_size = next_insn->detail->bpf.operands[1].imm;
+ 			// Use the immediate value as string size if it's reasonable
+@@ -350,8 +343,7 @@ static ut32 detect_string_size_from_next_insn(RArchSession *a, RAnalOp *op, cons
+ 			}
+ 		}
+ 	}
+-
+-	cs_free(next_insn, n);
++	cs_free (next_insn, n);
+ 	return string_size;
+ }
+ 
+@@ -359,14 +351,11 @@ static void check_and_create_string_flag(RArchSession *a, RAnalOp *op, ut64 addr
+ 	if (!a || !a->arch) {
+ 		return;
+ 	}
+-
+ 	bool is_valid_program_range = false;
+-
+ 	// Check if it's in the main program range
+ 	if (addr >= SBPF_PROGRAM_ADDR && addr < SBPF_STACK_ADDR) {
+ 		is_valid_program_range = true;
+ 	}
+-
+ 	if (!is_valid_program_range) {
+ 		return;
+ 	}
+@@ -467,9 +456,10 @@ void sbpf_alu(RArchSession *a, RAnalOp *op, cs_insn *insn, const char* operation
+ }
+ 
+ void sbpf_load(RArchSession *a, RAnalOp *op, cs_insn *insn, char* reg, int size) {
+-	if (OPCOUNT > 1 && OP (0).type == BPF_OP_REG) {
++	// For eBPF (64-bit mode), use proper register operands
++	if (a->config->bits 

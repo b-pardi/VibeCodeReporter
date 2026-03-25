@@ -1,0 +1,83 @@
+@@ -65,6 +65,9 @@ class AlertsManager : protected StoreManager {
+ 			     const char *alert_origin, const char *alert_target,
+ 			     bool engage, bool ignore_disabled=false);
+ 
++  /* Compute a unique hash used to group alerts together */
++  static u_int32_t alertHash(const char * const alert_json);
++
+   /* methods used to retrieve alerts and counters with possible sql clause to filter */
+   int queryAlertsRaw(lua_State *vm, const char *selection, const char *clauses, const char *table_name, bool ignore_disabled);
+   int getNumAlerts(bool engaged, const char *sql_where_clause, bool ignore_disabled=false);
+
+
+
+
+@@ -832,7 +832,7 @@
+ #define ALERTS_MANAGER_TABLE_NAME            "closed_alerts"
+ #define ALERTS_MANAGER_FLOWS_TABLE_NAME      "flows_alerts"
+ #define ALERTS_MANAGER_ENGAGED_TABLE_NAME    "engaged_alerts"
+-#define ALERTS_MANAGER_STORE_NAME            "alerts_v7.db"
++#define ALERTS_MANAGER_STORE_NAME            "alerts_v8.db"
+ #define ALERTS_MANAGER_QUEUE_NAME            "ntopng.alerts.ifid_%i.queue"
+ #define ALERTS_MANAGER_MAKE_ROOM_ALERTS      "ntopng.cache.alerts.ifid_%i.make_room_closed_alerts"
+ #define ALERTS_MANAGER_MAKE_ROOM_FLOW_ALERTS "ntopng.cache.alerts.ifid_%i.make_room_flow_alerts"
+
+
+
+
+@@ -52,6 +52,8 @@ AlertsManager::AlertsManager(int interface_id, const char *filename) : StoreMana
+   */
+   sprintf(&filePath[base_offset], "%s", "alerts_v6.db");
+   unlink(filePath);
++  sprintf(&filePath[base_offset], "%s", "alerts_v7.db");
++  unlink(filePath);
+   filePath[base_offset] = 0;
+ 
+   /* open the newest */
+@@ -106,18 +108,21 @@ int AlertsManager::openStore() {
+ 	   "alert_entity_val TEXT NOT NULL,    "
+ 	   "alert_origin     TEXT DEFAULT NULL,"
+ 	   "alert_target     TEXT DEFAULT NULL,"
+-	   "alert_json       TEXT DEFAULT NULL "
+-	   "); "  // no need to create a primary key, sqlite has the rowid
++	   "alert_counter    INTEGER NOT NULL DEFAULT 1, "
++	   "alert_json       TEXT DEFAULT NULL,"
++	   "alert_hash       INTEGER DEFAULT NULL "
++	   "); " // no need to create a primary key, sqlite has the rowid
+ 	   "CREATE INDEX IF NOT EXISTS t1i_tstamp   ON %s(alert_tstamp); "
+ 	   "CREATE INDEX IF NOT EXISTS t1i_tstamp_e ON %s(alert_tstamp_end); "
+ 	   "CREATE INDEX IF NOT EXISTS t1i_type     ON %s(alert_type); "
+ 	   "CREATE INDEX IF NOT EXISTS t1i_severity ON %s(alert_severity); "
+ 	   "CREATE INDEX IF NOT EXISTS t1i_origin   ON %s(alert_origin); "
+ 	   "CREATE INDEX IF NOT EXISTS t1i_target   ON %s(alert_target); "
++	   "CREATE INDEX IF NOT EXISTS t1i_hash     ON %s(alert_type, alert_severity, alert_entity, alert_entity_val, alert_hash); "
+ 	   "CREATE INDEX IF NOT EXISTS t1i_entity   ON %s(alert_entity, alert_entity_val); ",
+ 	   ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME,
+ 	   ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME,
+-	   ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME);
++	   ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME, ALERTS_MANAGER_TABLE_NAME);
+   m.lock(__FILE__, __LINE__);
+   rc = exec_query(create_query, NULL, NULL);
+   m.unlock(__FILE__, __LINE__);
+@@ -611,6 +616,8 @@ int AlertsManager::storeAlert(AlertEntity alert_entity, const char *alert_entity
+     char query[STORE_MANAGER_MAX_QUERY];
+     sqlite3_stmt *stmt = NULL;
+     int rc = 0;
++    u_int32_t alert_hash = alertHash(alert_json);
++    u_int64_t cur_rowid = (u_int64_t)-1, cur_counter;
+ 
+     if(!store_initialized || !store_opened)
+       return(-1);
+@@ -620,40 +627,100 @@ int AlertsManager::storeAlert(AlertEntity alert_entity, const char *alert_entity
+       markForMakeRoom(false);
+ 
+     notifyAlert(alert_entity, alert_entity_value, NULL,
+-	  alert_type, alert_severity, alert_json,
+-	  NULL, NULL, false, when, NULL);
++		alert_type, alert_severity, alert_json,
++		NULL, NULL, false, when, NULL);
+ 
+-    /* This alert is being engaged */
+-    snprintf(query, sizeof(query),
+-	     "INSERT INTO %s "
+-	     "(alert_tstamp, alert_type, alert_severity, alert_entity, alert

@@ -1,0 +1,101 @@
+@@ -1723,7 +1723,8 @@ class _KRBERROR_data_Field(_ASN1FString_PacketField):
+             # 24: KDC_ERR_PREAUTH_FAILED
+             # 25: KDC_ERR_PREAUTH_REQUIRED
+             return MethodData(val[0].val, _underlayer=pkt), val[1]
+-        elif pkt.errorCode.val in [41, 60]:
++        elif pkt.errorCode.val in [18, 41, 60]:
++            # 18: KDC_ERR_CLIENT_REVOKED
+             # 41: KRB_AP_ERR_MODIFIED
+             # 60: KRB_ERR_GENERIC
+             return KERB_ERROR_DATA(val[0].val, _underlayer=pkt), val[1]
+@@ -2716,7 +2717,8 @@ class KerberosClient(Automaton):
+                 if padata.padataType == 0x13:  # PA-ETYPE-INFO2
+                     elt = padata.padataValue.seq[0]
+                     etype = elt.etype.val
+-                    salt = elt.salt.val
++                    if etype != EncryptionType.RC4_HMAC:
++                        salt = elt.salt.val
+                 elif padata.padataType == 133:  # PA-FX-COOKIE
+                     self.fxcookie = padata.padataValue
+         # Compute key if not already provided
+
+
+
+
+@@ -16,6 +16,7 @@ Note: to mimic Microsoft Windows LDAP packets, you must set::
+ 
+ import collections
+ import socket
++import struct
+ import uuid
+ 
+ from scapy.ansmachine import AnsweringMachine
+@@ -51,6 +52,7 @@ from scapy.layers.inet6 import IPv6
+ from scapy.layers.gssapi import GSSAPI_BLOB
+ from scapy.layers.kerberos import _ASN1FString_PacketField
+ from scapy.layers.smb import (
++    NETLOGON,
+     NETLOGON_SAM_LOGON_RESPONSE_EX,
+ )
+ 
+@@ -648,7 +650,9 @@ _dclocatorcache = conf.netcache.new_cache("dclocator", 600)
+ 
+ 
+ @conf.commands.register
+-def dclocator(realm, qtype="A", mode="ldap", port=None, timeout=1, debug=0):
++def dclocator(
++    realm, qtype="A", mode="ldap", port=None, timeout=1, NtVersion=None, debug=0
++):
+     """
+     Perform a DC Locator as per [MS-ADTS] sect 6.3.6 or RFC4120.
+ 
+@@ -665,8 +669,17 @@ def dclocator(realm, qtype="A", mode="ldap", port=None, timeout=1, debug=0):
+ 
+     This is cached in conf.netcache.dclocator.
+     """
++    if NtVersion is None:
++        # Windows' default
++        NtVersion = (
++            0x00000002  # V5
++            | 0x00000004  # V5EX
++            | 0x00000010  # V5EX_WITH_CLOSEST_SITE
++            | 0x01000000  # AVOID_NT4EMUL
++            | 0x20000000  # IP
++        )
+     # Check cache
+-    cache_ident = ";".join([realm, qtype, mode]).lower()
++    cache_ident = ";".join([realm, qtype, mode, str(NtVersion)]).lower()
+     if cache_ident in _dclocatorcache:
+         return _dclocatorcache[cache_ident]
+     # Perform DNS-Based discovery (6.3.6.1)
+@@ -758,7 +771,7 @@ def dclocator(realm, qtype="A", mode="ldap", port=None, timeout=1, debug=0):
+                                             filter=LDAP_FilterEqual(
+                                                 attributeType=ASN1_STRING(b"NtVer"),
+                                                 attributeValue=ASN1_STRING(
+-                                                    b"\x16\x00\x00!"
++                                                    struct.pack("<I", NtVersion)
+                                                 ),
+                                             )
+                                         ),
+@@ -782,7 +795,7 @@ def dclocator(realm, qtype="A", mode="ldap", port=None, timeout=1, debug=0):
+                     if isinstance(pkt.protocolOp, LDAP_SearchResponseEntry):
+                         try:
+                             response = next(
+-                                NETLOGON_SAM_LOGON_RESPONSE_EX(x.values[0].value.val)
++                                NETLOGON(x.values[0].value.val)
+                                 for x in pkt.protocolOp.attributes
+                                 if x.type.val == b"Netlogon"
+                             )
+
+
+
+
+@@ -19,17 +19,19 @@ from scapy.packet import Packet, bind_layers, bind_top_down
+ from scapy.fields import (
+     ByteEnumField,
+     ByteField,
++    ConditionalField,
+     FieldLenField,
+-    FlagsField,
+     FieldListField,
++    FlagsFi

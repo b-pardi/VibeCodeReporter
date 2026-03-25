@@ -1,0 +1,84 @@
+@@ -786,8 +786,10 @@ class VulnerabilityView(PaginatedMixin,
+ 
+     def _filter(self, filters, workspace_name, confirmed=False):
+         try:
+-            filters = FlaskRestlessSchema().load(json.loads(filters))
+-            _, hostname_filters = self._hostname_filters(filters.get('filters', []))
++            filters = FlaskRestlessSchema().load(json.loads(filters)) or {}
++            hostname_filters = []
++            if filters:
++                _, hostname_filters = self._hostname_filters(filters.get('filters', []))
+         except (ValidationError, JSONDecodeError) as ex:
+             logger.exception(ex)
+             flask.abort(400, "Invalid filters")
+
+
+
+
+@@ -14,7 +14,7 @@ from dateutil.parser import parse
+ from sqlalchemy import inspect
+ from collections.abc import Iterable
+ from dateutil.parser._parser import ParserError
+-from marshmallow import Schema, fields, ValidationError, types, validate
++from marshmallow import Schema, fields, ValidationError, types, validate, post_load
+ from marshmallow_sqlalchemy.convert import ModelConverter
+ 
+ from faraday.server.models import VulnerabilityWeb, Host, Service
+@@ -228,6 +228,25 @@ class FilterSchema(Schema):
+     limit = fields.Integer()
+     offset = fields.Integer()
+ 
++    @post_load
++    def validate_order_and_group_by(self, data, **kwargs):
++        """
++            We need to validate that if group_by is used, all the field
++            in the order_by are the same.
++            When using different order_by fields with group, it will cause
++            an error on PostgreSQL
++        """
++        if 'group_by' in data and 'order_by' in data:
++            group_by_fields = set()
++            order_by_fields = set()
++            for group_field in data['group_by']:
++                group_by_fields.add(group_field['field'])
++            for order_field in data['order_by']:
++                order_by_fields.add(order_field['field'])
++
++            if order_by_fields != group_by_fields:
++                raise ValidationError('Can\'t group and order by with different fields. ')
++
+ 
+ class FlaskRestlessSchema(Schema):
+     valid_schemas = [
+
+
+
+
+@@ -3314,6 +3314,27 @@ class TestVulnerabilitySearch():
+         assert res.status_code == 200
+         assert res.json['count'] == 20
+ 
++    @pytest.mark.usefixtures('ignore_nplusone')
++    def test_filter_group_and_sort(self, test_client, session, workspace):
++        vulns_web = VulnerabilityWebFactory.create_batch(10, workspace=workspace, severity='high')
++        vulns = VulnerabilityFactory.create_batch(10, workspace=workspace, severity='high')
++        another_workspace = WorkspaceFactory.create()
++        more_vulns = VulnerabilityFactory.create_batch(10, workspace=another_workspace, severity='high')
++        session.add_all(more_vulns)
++        session.add_all(vulns_web)
++        session.add_all(vulns)
++        session.commit()
++        query_filter = {
++            "group_by":
++                [{"field":"severity"}],
++            "order_by":
++                [{"field":"name","direction":"asc"}]
++        }
++
++        res = test_client.get(
++            '/v2/ws/{}/vulns/filter?q={}'.format(workspace.name, json.dumps(query_filter)))
++        assert res.status_code == 400
++
+     def test_filter_by_creator_command_id(self,
+             test_client,
+             session,

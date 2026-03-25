@@ -1,0 +1,133 @@
+@@ -25,6 +25,8 @@
+ 
+ #define bprintf if(bin->verbose) R_LOG_WARN
+ 
++#define MAX_REL_RELA_SZ (sizeof (Elf_(Rel)) > sizeof (Elf_(Rela))? sizeof (Elf_(Rel)): sizeof (Elf_(Rela)))
++
+ #define READ8(x, i) r_read_ble8((x) + (i)); (i) += 1
+ #define READ16(x, i) r_read_ble16((x) + (i), bin->endian); (i) += 2
+ #define READ32(x, i) r_read_ble32((x) + (i), bin->endian); (i) += 4
+@@ -1236,314 +1238,348 @@ ut64 Elf_(r_bin_elf_get_section_addr_end)(ELFOBJ *bin, const char *section_name)
+ 	RBinElfSection *section = get_section_by_name (bin, section_name);
+ 	return section? section->rva + section->size: UT64_MAX;
+ }
+-#define REL (is_rela ? (void*)rela : (void*)rel)
+-#define REL_BUF is_rela ? (ut8*)(&rela[k]) : (ut8*)(&rel[k])
+-#define REL_OFFSET is_rela ? rela[k].r_offset : rel[k].r_offset
+-#define REL_TYPE is_rela ? rela[k].r_info  : rel[k].r_info
+ 
+-static ut64 get_import_addr(ELFOBJ *bin, int sym) {
+-	Elf_(Rel) *rel = NULL;
+-	Elf_(Rela) *rela = NULL;
+-	ut8 rl[sizeof (Elf_(Rel))] = {0};
+-	ut8 rla[sizeof (Elf_(Rela))] = {0};
++#define REL_OFFSET (rel->is_rela? rel->r.rela.r_offset: rel->r.rel.r_offset)
++#define REL_INFO (rel->is_rela? rel->r.rela.r_info: rel->r.rel.r_info)
++#define REL_SYM (ELF_R_SYM (REL_INFO))
++#define REL_TYPE (ELF_R_TYPE (REL_INFO))
++
++struct ht_rel_t {
++	union {
++		Elf_(Rel) rel;
++		Elf_(Rela) rela;
++	} r;
++	bool is_rela;
++	int k;
++};
++
++static RBinElfSection *get_rel_sec(ELFOBJ *bin, const char **sects) {
+ 	RBinElfSection *rel_sec = NULL;
+-	ut64 plt_sym_addr = -1;
+-	ut64 got_addr, got_offset;
+-	ut64 plt_addr;
+-	int j, k, tsize, len, nrel;
+-	bool is_rela = false;
++	int j = 0;
++	while (!rel_sec && sects[j]) {
++		rel_sec = get_section_by_name (bin, sects[j++]);
++	}
++	return rel_sec;
++}
++
++static void read_rel(ELFOBJ *bin, Elf_(Rel) *rel, ut8 *rl) {
++	int l = 0;
++	rel->r_offset = READWORD (rl, l);
++	rel->r_info = READWORD (rl, l);
++}
++
++static void read_rela(ELFOBJ *bin, Elf_(Rela) *rela, ut8 *rl) {
++	int l = 0;
++	rela->r_offset = READWORD (rl, l);
++	rela->r_info = READWORD (rl, l);
++	rela->r_addend = READWORD (rl, l);
++}
++
++static struct ht_rel_t *read_ht_rel(ELFOBJ *bin, ut8 *rl, int k) {
++	struct ht_rel_t *rel = R_NEW0 (struct ht_rel_t);
++	if (!rel) {
++		return NULL;
++	}
++
++	rel->is_rela = bin->is_rela == DT_RELA;
++	rel->k = k;
++	if (rel->is_rela) {
++		read_rela (bin, &rel->r.rela, rl);
++	} else {
++		read_rel (bin, &rel->r.rel, rl);
++	}
++	return rel;
++}
++
++static void rel_cache_free(HtUPKv *kv) {
++	free (kv->value);
++}
++
++static HtUP *rel_cache_new(ELFOBJ *bin) {
++	ut8 rl[MAX_REL_RELA_SZ] = { 0 };
++	RBinElfSection *rel_sec = NULL;
++	int j, k, tsize, nrel;
+ 	const char *rel_sect[] = { ".rel.plt", ".rela.plt", ".rel.dyn", ".rela.dyn", NULL };
+ 	const char *rela_sect[] = { ".rela.plt", ".rel.plt", ".rela.dyn", ".rel.dyn", NULL };
++	HtUP *rel_cache;
++
+ 	if ((!bin->shdr || !bin->strtab) && !bin->phdr) {
+-		return -1;
+-	}
+-	if ((got_offset = Elf_(r_bin_elf_get_section_offset) (bin, ".got")) == -1 &&
+-		(got_offset = Elf_(r_bin_elf_get_section_offset) (bin, ".got.plt")) == -1) {
+-		return -1;
+-	}
+-	if ((got_addr = Elf_(r_bin_elf_get_section_addr) (bin, ".got")) == -1 &&
+-		(got_addr = Elf_(r_bin_elf_get_section_addr) (bin, ".got.plt")) == -1) {
+-		return -1;
++		return NULL;
+ 	}
+-	RBinElfSection *plt_section = get_section_by_name (bin, ".plt");
++
+ 	if (bin->is_rela == DT_REL) {
+-		j = 0;
+-		while (!rel_sec && rel_sect[j]) {
+-			rel_sec = get_section_by_name (bin, rel_sect[j++]);
+-		}
++		rel_sec = get_rel_sec (bin, rel_sect);
+ 		tsize = sizeof (Elf_(Rel));
+ 	} else if (bin->is_rela == DT_RELA) {
+-		j = 0;
+-		while (!rel_sec && rela_sect[j]) {
+-			rel_sec = get_section_by_name (bin, rela_sect[j++]);
+-		}
+-		is_rela = true;
++		rel_sec = get_rel_sec (bin, rela_sect);
+ 		tsize = sizeof (Elf_(Rela));
+ 	}
+-	if (!rel_sec) {
+-		return -1;
+-	}
+-	if (rel_sec->size < 1) {
+-		return -1;
++	if (!rel_sec || rel_sec->size < 1) {
++		return NULL;
+ 	}
+-	nrel = (ut32)((int)rel_sec->size / (int)tsize);
++
++	nrel = (ut32) ((int)rel_sec->size / (int)tsiz

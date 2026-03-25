@@ -1,0 +1,110 @@
+@@ -58,6 +58,7 @@ static bool fs_apfs_mount(RFSRoot *root) {
+ 		return false;
+ 	}
+ 	// Scan for container superblock
++	// The NXSB magic is at offset 0x20 within the container superblock (after ApfsObjPhys header)
+ 	ut64 nx_off = 0;
+ 	ut64 off;
+ 	for (off = 0; off < APFS_NX_SEARCH_RANGE; off += 0x20) {
+@@ -65,12 +66,13 @@ static bool fs_apfs_mount(RFSRoot *root) {
+ 		if (apfs_read_at (ctx, off, buf, 4)) {
+ 			ut32 magic = r_read_be32 (buf);
+ 			if (magic == APFS_NX_MAGIC) {
+-				nx_off = off;
++				// Magic found at off, but superblock starts 0x20 bytes earlier
++				nx_off = off - sizeof (ApfsObjPhys);
+ 				break;
+ 			}
+ 		}
+ 	}
+-	if (!nx_off) {
++	if (!nx_off && off >= APFS_NX_SEARCH_RANGE) {
+ 		R_LOG_ERROR ("APFS container superblock not found");
+ 		apfs_cleanup_ctx (ctx);
+ 		return false;
+@@ -93,7 +95,7 @@ static bool fs_apfs_mount(RFSRoot *root) {
+ 	}
+ 
+ 	// Check magic
+-	ut32 magic = r_read_be32 ((ut8 *)&nx_sb->nx_magic);
++	ut32 magic = apfs_read32 (ctx, (ut8 *)&nx_sb->nx_magic);
+ 	if (magic != APFS_NX_MAGIC) {
+ 		R_LOG_ERROR ("Invalid APFS container magic: 0x%x", magic);
+ 		free (nx_sb);
+@@ -114,22 +116,59 @@ static bool fs_apfs_mount(RFSRoot *root) {
+ 		ctx->block_shift++;
+ 	}
+ 
+-	// Get the first volume superblock
+-	ut64 first_vol_oid;
+-	if (!apfs_read_at (ctx, 0x50, (ut8 *)&first_vol_oid, sizeof (ut64))) {
+-		R_LOG_ERROR ("Failed to read volume OID");
++	// Get the first volume OID from the container superblock
++	ut64 first_vol_oid = apfs_read64 (ctx, (ut8 *)&nx_sb->nx_fs_oid[0]);
++	if (first_vol_oid == 0) {
++		R_LOG_ERROR ("No APFS volumes found");
+ 		ctx->nx_sb = nx_sb;
+ 		apfs_cleanup_ctx (ctx);
+ 		return false;
+ 	}
+-	first_vol_oid = apfs_read64 (ctx, (ut8 *)&first_vol_oid);
+-	if (first_vol_oid == 0) {
+-		R_LOG_ERROR ("No APFS volumes found");
++	R_LOG_INFO ("First volume OID: %" PFMT64u " (0x%" PFMT64x ")", first_vol_oid, first_vol_oid);
++
++	// Scan for the most recent volume superblock (APSB magic)
++	// The volume OID from container is virtual and needs omap resolution,
++	// but we can find the volume superblock by scanning for APSB magic
++	ut64 vol_paddr = 0;
++	ut64 vol_xid = 0;
++	ut64 block_count = apfs_read64 (ctx, (ut8 *)&nx_sb->nx_block_count);
++	R_LOG_INFO ("Container has %" PFMT64u " blocks, delta=0x%" PFMT64x ", block_size=%u", block_count, ctx->delta, ctx->block_size);
++
++	ut64 block;
++	for (block = 0; block < block_count && block < 512; block++) {
++		ut8 header[64];
++		ut64 offset = apfs_block_to_offset (ctx, block);
++		if (offset == UT64_MAX) {
++			continue;
++		}
++		if (!apfs_read_at (ctx, offset, header, sizeof (header))) {
++			continue;
++		}
++		// Check for APSB magic at offset 0x20 (after ApfsObjPhys header)
++		ut32 magic = r_read_le32 (header + 0x20);
++		if (magic == APFS_MAGIC) {
++			// Check object type
++			ut32 o_type = apfs_read32 (ctx, header + 24);
++			R_LOG_INFO ("Block %" PFMT64u ": APSB magic found, o_type=0x%x", block, o_type);
++			if ((o_type & APFS_OBJECT_TYPE_MASK) == APFS_OBJECT_TYPE_FS) {
++				ut64 xid = apfs_read64 (ctx, header + 16);
++				R_LOG_INFO ("Found volume superblock at block %" PFMT64u " with xid %" PFMT64u, block, xid);
++				if (xid > vol_xid) {
++					vol_xid = xid;
++					vol_paddr = block;
++				}
++			}
++		}
++	}
++
++	if (vol_paddr == 0) {
++		R_LOG_ERROR ("Could not find APFS volume superblock");
+ 		ctx->nx_sb = nx_sb;
+ 		apfs_cleanup_ctx (ctx);
+ 		return false;
+ 	}
+-	ctx->vol_sb_block = first_vol_oid;
++	R_LOG_DEBUG ("Using volume superblock at block %" PFMT64u " (xid %" PFMT64u ")", vol_paddr, vol_xid);
++	ctx->vol_sb_block = vol_paddr;
+ 
+ 	ApfsSuperblock *vol_sb = malloc (sizeof (ApfsSuperblock));
+ 	if (!vol_sb) {
+@@ -148,7 +187,7 @@ static bool fs_apfs_mount(RFSRoot *root) {
+ 	}
+ 
+ 	// Check volume magic (skip for test images)
+-	ut32 vol_magic = r_read_be32 ((ut8 *)&vol_sb->apfs_magic);
++	ut32 vol_magic = apfs_read32 (ctx, (ut8 *)&vol_sb->apfs_magic);
+ 	if (vol_magic != APFS_MAGIC) {
+ 		R_LOG_DEBUG ("Invalid APFS volume magic (0x%x), assuming test image", vol_magic);
+ 		// Fo

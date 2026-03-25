@@ -1,0 +1,135 @@
+@@ -129,6 +129,8 @@ void UpdateObjectEventSpriteVisibility(struct Sprite *sprite, bool8 invisible);
+ u8 ZCoordToPriority(u8 z);
+ void SetObjectSubpriorityByZCoord(u8 z, struct Sprite * sprite, u8 offset);
+ void MakeObjectTemplateFromObjectEventGraphicsInfo(u16 graphicsId, void (*callback)(struct Sprite *), struct SpriteTemplate *spriteTemplate, const struct SubspriteTable **subspriteTables);
++u8 AddCameraObject(u8 trackedSpriteId);
++void UpdateObjectEventsForCameraUpdate(s16 x, s16 y);
+ 
+ // Exported data declarations
+ 
+
+
+
+
+@@ -8,9 +8,9 @@
+ struct CameraObject
+ {
+     void (*callback)(struct CameraObject *);
+-    u32 unk4;
+-    s32 unk8;
+-    s32 unkC;
++    u32 spriteId;
++    s32 movementSpeedX;
++    s32 movementSpeedY;
+     s32 x;
+     s32 y;
+ };
+
+
+
+
+@@ -33,5 +33,6 @@ void save_serialize_map(void);
+ u32 GetMetatileAttributeFromRawMetatileBehavior(u32 original, u8 bit);
+ u32 MapGridGetMetatileAttributeAt(s16 x, s16 y, u8 attr);
+ void MapGridSetMetatileImpassabilityAt(s32 x, s32 y, bool32 arg2);
++bool8 CameraMove(s32 x, s32 y);
+ 
+ #endif //GUARD_FIELDMAP_H
+
+
+
+
+@@ -194,6 +194,9 @@ void CB1_Overworld(void);
+ void sub_80568C4(void);
+ u8 GetLastUsedWarpMapSectionId(void);
+ 
++extern u16 *gBGTilemapBuffers1;
++extern u16 *gBGTilemapBuffers2;
++extern u16 *gBGTilemapBuffers3;
+ extern u16 gHeldKeyCodeToSend;
+ 
+ #endif //GUARD_OVERWORLD_H
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,572 @@
++#include "global.h"
++#include "gflib.h"
++#include "field_camera.h"
++#include "field_player_avatar.h"
++#include "fieldmap.h"
++#include "event_object_movement.h"
++#include "new_menu_helpers.h"
++#include "overworld.h"
++
++EWRAM_DATA bool8 gUnusedBikeCameraAheadPanback = FALSE;
++
++// Static type declarations
++struct FieldCameraOffset
++{
++    u8 xPixelOffset;
++    u8 yPixelOffset;
++    u8 xTileOffset;
++    u8 yTileOffset;
++    bool8 copyBGToVRAM;
++};
++
++// static functions
++static void RedrawMapSliceNorth(struct FieldCameraOffset *cameraOffset, const struct MapLayout *mapLayout);
++static void RedrawMapSliceSouth(struct FieldCameraOffset *cameraOffset, const struct MapLayout *mapLayout);
++static void RedrawMapSliceEast(struct FieldCameraOffset *cameraOffset, const struct MapLayout *mapLayout);
++static void RedrawMapSliceWest(struct FieldCameraOffset *cameraOffset, const struct MapLayout *mapLayout);
++static s32 MapPosToBgTilemapOffset(struct FieldCameraOffset *a, s32 x, s32 y);
++static void DrawWholeMapViewInternal(int x, int y, const struct MapLayout *mapLayout);
++static void DrawMetatileAt(const struct MapLayout *mapLayout, u16, int, int);
++static void DrawMetatile(s32 a, const u16 *b, u16 c);
++static void CameraPanningCB_PanAhead(void);
++
++// IWRAM bss vars
++static struct FieldCameraOffset sFieldCameraOffset;
++static s16 sHorizontalCameraPan;
++static s16 sVerticalCameraPan;
++static u8 gUnknown_3000E9C;
++static void (*sFieldCameraPanningCallback)(void);
++
++struct CameraObject gFieldCamera;
++u16 gTotalCameraPixelOffsetY;
++u16 gTotalCameraPixelOffsetX;
++
++// text
++static void move_tilemap_camera_to_upper_left_corner_(struct FieldCameraOffset *cameraOffset)
++{
++    cameraOffset->xTileOffset = 0;
++    cameraOffset->yTileOffset = 0;
++    cameraOffset->xPixelOffset = 0;
++    cameraOffset->yPixelOffset = 0;
++    cameraOffset->copyBGToVRAM = TRUE;
++}
++
++static void tilemap_move_something(struct FieldCameraOffset *cameraOffset, u32 b, u32 c)
++{
++    cameraOffset->xTileOffset += b;
++    cameraOffset->xTileOffset %= 32;
++    cameraOffset->yTileOffset += c;
++    cameraOffset->yTileOffset %= 32;
++}
++
++static void coords8_add(struct FieldCameraOffset *cameraOffset, u32 b, u32 c)
++{
++    cameraOffset->xPixelOffset += b;
++    cameraOffset->yPixelOffset += c;
++}
++
++void move_tilemap_camera_to_upper_left_corner(void)
++{
++    move_tilemap_camera_to_upper_left_corner_(&sFieldCameraOffset);
++}
++
++void FieldUpdateBgTilemapScroll(void)
++{
++    u32 r4, r5;
++    r5 = sFieldCameraOffset.xPixelOffset + sHorizontalCameraPan;
++    r4 = sVerticalCameraPan + sFieldCameraOffset.yPixelOffset + 8;
++

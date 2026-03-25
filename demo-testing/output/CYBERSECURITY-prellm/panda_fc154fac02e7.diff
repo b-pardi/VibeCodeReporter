@@ -1,0 +1,116 @@
+@@ -17,8 +17,9 @@ class Expect(object):
+ 
+         self.name = name
+ 
+-        if logfile is None: logfile = os.devnull
+-        self.logfile = open(logfile, "wb")
++        self.logfile = None
++        if logfile:
++            self.logfile = open(logfile, "wb")
+ 
+         if filelike is None: # Must later use connect(filelike)
+             self.fd = None
+@@ -26,10 +27,11 @@ class Expect(object):
+             self.connect(filelike)
+ 
+         self.quiet = quiet
+-        self.sofar = ''
++        self.prior_lines = []
++        self.current_line = bytearray()
+         self.last_msg = None
+-        self.bytessofar = bytearray()
+         self.running = True
++        self.cleared = False
+         self.update_expectation(expectation)
+ 
+         # If consumed_first is false, we'll consume a message before anything else. Requires self.expectation to be set
+@@ -56,13 +58,35 @@ class Expect(object):
+         return self.fd != None
+ 
+     def __del__(self):
+-        self.logfile.close()
++        if self.logfile:
++            self.logfile.close()
+ 
+     def abort(self):
+         self.running = False
+ 
+-    def unansi(self, msg):
++
++    def consume_partial(self):
++        '''
++        Get the message so far and reset.
++        To ensure that we're not consuming the final line at we just don't clear
++        '''
++        result = self.get_partial()
++        self.prior_lines = []
++        return result
++
++    def get_partial(self):
++        '''
++        Get the message
+         '''
++        if len(self.prior_lines):
++            return "\n".join(self.prior_lines)
++        return ""
++
++    def unansi(self):
++        '''
++        Take the string in self.current_line and any prior lines in self.prior_lines and render ANSI.
++        prior lines should be plain strings while current_line may contain escapes
++
+         Given a string with ansi control codes, emulate behavior to generate the resulting string. 
+ 
+         First we split input into a list of ('fn', [args]) / ('text', ['foo']) ansi commands then
+@@ -72,15 +96,28 @@ class Expect(object):
+         http://ascii-table.com/ansi-escape-sequences-vt-100.php for ansi escape code details
+         '''
+ 
++        # Join prior lines into a single text element in our reformatted list
++        reformatted = []
++        if len(self.prior_lines):
++            reformatted = [('text', '\n'.join(self.prior_lines))]
++
++        # Then split current line into the tuple format describe above
++        msg = self.current_line
++
++        if isinstance(msg, str):
++            msg = msg.encode()
++
++        # Check for simple case where no ansi is in line - if so just copy into prior_lines
+         if b'\x1b' not in msg:
+-            text = "".join([chr(x) for x in msg])
+-            return text
++            text = "".join([chr(x) for x in msg]).strip()
++            self.prior_lines.append(text)
++            self.current_line = bytearray()
++            return
+ 
+         start_args = re.compile(br"^(\d+);")
+         last_arg = re.compile(rb"^(\d+)")
+ 
+         last_text = ""
+-        reformatted = []
+         idx = 0 # XXX: mutates during loop
+         while idx < len(msg):
+             if msg[idx] != 0x1b:
+@@ -277,14 +314,23 @@ class Expect(object):
+                     raise ValueError(f"Unsupporte ANSI command {typ}")
+             #_dump(lines_out, cur_line, line_pos)
+ 
+-        return "\n".join(lines_out)
++        # Done processing - update variables
++        self.prior_lines = lines_out[:-1] # Strings
++        self.current_line = bytearray() # Bytearray
++        if len(lines_out[-1].strip()):
++            self.current_line.append(lines_out[-1])
+ 
+     def expect(self, expectation=None, timeout=30):
+         '''
+         Assumptions: as you send a command, the guest may send back
+             The same command + ansi control codes.
+             The epxectation value will show up on the start of a line.
+-            The command you send should not be returned
++
++
++        We add characters into current_line as we 

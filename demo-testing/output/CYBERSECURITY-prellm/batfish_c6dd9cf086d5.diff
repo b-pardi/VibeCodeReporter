@@ -1,0 +1,115 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,16 @@
++package org.batfish.datamodel.interface_dependency;
++
++import org.batfish.datamodel.Interface;
++import org.jgrapht.graph.DefaultEdge;
++
++final class DependencyEdge extends DefaultEdge {
++  private final Interface.DependencyType _dependencyType;
++
++  DependencyEdge(Interface.DependencyType dependencyType) {
++    _dependencyType = dependencyType;
++  }
++
++  public Interface.DependencyType getDependencyType() {
++    return _dependencyType;
++  }
++}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,222 @@
++package org.batfish.datamodel.interface_dependency;
++
++import static org.batfish.datamodel.Interface.DependencyType.AGGREGATE;
++import static org.batfish.datamodel.Interface.DependencyType.BIND;
++
++import com.google.common.collect.Iterables;
++import com.google.common.graph.Network;
++import java.util.HashSet;
++import java.util.LinkedList;
++import java.util.Map;
++import java.util.Optional;
++import java.util.Queue;
++import java.util.Set;
++import java.util.function.Consumer;
++import java.util.stream.Stream;
++import javax.annotation.Nullable;
++import org.batfish.common.topology.Layer1Edge;
++import org.batfish.common.topology.Layer1Node;
++import org.batfish.common.topology.Layer1Topologies;
++import org.batfish.common.topology.Layer1Topology;
++import org.batfish.datamodel.Configuration;
++import org.batfish.datamodel.Interface;
++import org.batfish.datamodel.collections.NodeInterfacePair;
++import org.jgrapht.Graph;
++import org.jgrapht.graph.SimpleDirectedGraph;
++
++public class InterfaceDependencies {
++  private static final NodeInterfacePair NON_EXISTENT_INTERFACE =
++      NodeInterfacePair.of("non existent device", "non existent interface");
++
++  /**
++   * Compute the interfaces that should be deactivated because they depend on one or more missing or
++   * inactive interfaces.
++   */
++  public static Set<NodeInterfacePair> getInterfacesToDeactivate(
++      Map<String, Configuration> configs, Layer1Topologies layer1Topologies) {
++    InterfaceDependencies deps = new InterfaceDependencies(configs, layer1Topologies);
++    deps.initialize();
++    deps.run();
++    return deps._interfacesToDeactivate;
++  }
++
++  private final Map<String, Configuration> _configs;
++  private final Layer1Topologies _layer1Topologies;
++  private final Graph<NodeInterfacePair, DependencyEdge> _depGraph;
++  private final Set<NodeInterfacePair> _inactiveInterfaces = new HashSet<>();
++  private final Set<NodeInterfacePair> _interfacesToDeactivate = new HashSet<>();
++
++  private InterfaceDependencies(
++      Map<String, Configuration> configs, Layer1Topologies layer1Topologies) {
++    _configs = configs;
++    _layer1Topologies = layer1Topologies;
++
++    _depGraph = new SimpleDirectedGraph<>(DependencyEdge.class);
++    _depGraph.addVertex(NON_EXISTENT_INTERFACE);
++  }
++
++  private void initialize() {
++    for (Configuration config : _configs.values()) {
++      Map<String, Interface> allIfaces = config.getAllInterfaces();
++      for (Interface iface : allIfaces.values()) {
++        if (!iface.getActive()) {
++          _inactiveInterfaces.add(NodeInterfacePair.of(iface));
++          continue;
++        }
++
++        // add edges for local dependencies
++        addDependencyEdges(iface);
++
++        // add edges for type-specific dependencies
++        switch (iface.getInterfaceType()) {
++          case PHYSICAL:
++            {
++              // non-local dependencies
++              @Nullable NodeInterfacePair neighbor = getL1Neighbor(iface);
++              if (neighbor != null) {
++                addDependencyEdge(neighbor, NodeInterfacePair.of(iface), BIND);
++              }
++              break;
++            }
++          case AGGREGATED:
++          case REDUNDANT:
++            {
++              // if the aggregate has no AGGREGATE dependencies, deactivate it.
++              if (iface.getDependencies().stream().noneMatch(dep -> dep.getType() == AGGREGATE)) {
++                _interfacesToDeactivate.add(NodeInterfacePair.of(iface));
++              }
++

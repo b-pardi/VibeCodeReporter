@@ -1,0 +1,120 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,266 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/script_opt/CSE.h"
++
++namespace zeek::detail {
++
++CSE_ValidityChecker::CSE_ValidityChecker(ProfileFuncs& _pfs, const std::vector<const ID*>& _ids,
++                                         const Expr* _start_e, const Expr* _end_e)
++    : pfs(_pfs), ids(_ids) {
++    start_e = _start_e;
++    end_e = _end_e;
++
++    // Track whether this is a record assignment, in which case
++    // we're attuned to assignments to the same field for the
++    // same type of record.
++    if ( start_e->Tag() == EXPR_FIELD ) {
++        field = start_e->AsFieldExpr()->Field();
++
++        // Track the type of the record, too, so we don't confuse
++        // field references to different records that happen to
++        // have the same offset as potential aliases.
++        field_type = start_e->GetOp1()->GetType();
++    }
++
++    else
++        field = -1; // flags that there's no relevant field
++}
++
++TraversalCode CSE_ValidityChecker::PreStmt(const Stmt* s) {
++    auto t = s->Tag();
++
++    if ( t == STMT_WHEN ) {
++        // These are too hard to analyze - they result in lambda calls
++        // that can affect aggregates, etc.
++        is_valid = false;
++        return TC_ABORTALL;
++    }
++
++    if ( t == STMT_ADD || t == STMT_DELETE )
++        in_aggr_mod_stmt = true;
++
++    return TC_CONTINUE;
++}
++
++TraversalCode CSE_ValidityChecker::PostStmt(const Stmt* s) {
++    if ( s->Tag() == STMT_ADD || s->Tag() == STMT_DELETE )
++        in_aggr_mod_stmt = false;
++
++    return TC_CONTINUE;
++}
++
++TraversalCode CSE_ValidityChecker::PreExpr(const Expr* e) {
++    if ( e == start_e ) {
++        ASSERT(! have_start_e);
++        have_start_e = true;
++
++        // Don't analyze the expression, as it's our starting
++        // point and we don't want to conflate its properties
++        // with those of any intervening expressions.
++        return TC_CONTINUE;
++    }
++
++    if ( e == end_e ) {
++        if ( ! have_start_e )
++            reporter->InternalError("CSE_ValidityChecker: saw end but not start");
++
++        ASSERT(! have_end_e);
++        have_end_e = true;
++
++        // ... and we're now done.
++        return TC_ABORTALL;
++    }
++
++    if ( ! have_start_e )
++        // We don't yet have a starting point.
++        return TC_CONTINUE;
++
++    // We have a starting point, and not yet an ending point.
++    auto t = e->Tag();
++
++    switch ( t ) {
++        case EXPR_ASSIGN: {
++            auto lhs_ref = e->GetOp1()->AsRefExprPtr();
++            auto lhs = lhs_ref->GetOp1()->AsNameExpr();
++
++            if ( CheckID(lhs->Id(), false) )
++                return TC_ABORTALL;
++
++            // Note, we don't use CheckAggrMod() because this is a plain
++            // assignment.  It might be changing a variable's binding to
++            // an aggregate ("aggr_var = new_aggr_val"), but we don't
++            // introduce temporaries that are simply aliases of existing
++            // variables (e.g., we don't have "<internal>::#8 = aggr_var"),
++            // and so there's no concern that the temporary could now be
++            // referring to the wrong aggregate.  If instead we have
++            // "<internal>::#8 = aggr_var$foo", then a reassignment here
++            // to "aggr_var" will already be caught by CheckID().
++        } break;
++
++        case EXPR_INDEX_ASSIGN: {
++            auto lhs_aggr = e->GetOp1();
++            auto lhs_aggr_id = lhs_aggr->AsNameExpr()->Id();
++
++            if ( CheckID(lhs_aggr_id, true) || CheckTableMod(lhs_aggr->GetType()) )
++                return TC_ABORTALL;
++        } break;
++
++        case EXPR_FIELD_LHS_ASSIGN: {
++            auto lhs = e->GetOp1();
++            auto lhs_aggr_id = lhs->AsNameExpr()->Id();
++            auto lhs_field = e->AsFieldLHSAssignExpr()->Field();
++
++            if ( CheckID(lhs_aggr_id, true) )
++                return TC_ABORTALL;
++            if ( lhs_field == field && sam

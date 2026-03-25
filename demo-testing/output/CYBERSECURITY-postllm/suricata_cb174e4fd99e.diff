@@ -1,0 +1,102 @@
+@@ -1017,7 +1017,7 @@ static int LogFileTypePrepare(
+     else if (log_filetype == LOGFILE_TYPE_PLUGIN) {
+         if (json_ctx->file_ctx->threaded) {
+             /* Prepare for threaded log output. */
+-            if (!SCLogOpenThreadedFile(NULL, NULL, json_ctx->file_ctx, 1)) {
++            if (!SCLogOpenThreadedFile(NULL, NULL, json_ctx->file_ctx)) {
+                 return -1;
+             }
+         }
+
+
+
+
+@@ -47,7 +47,8 @@
+ 
+ #define LOGFILE_NAME_MAX 255
+ 
+-static bool LogFileNewThreadedCtx(LogFileCtx *parent_ctx, const char *log_path, const char *append, int i);
++static bool LogFileNewThreadedCtx(LogFileCtx *parent_ctx, const char *log_path, const char *append,
++        ThreadLogFileHashEntry *entry);
+ 
+ // Threaded eve.json identifier
+ static SC_ATOMIC_DECL_AND_INIT_WITH_VAL(uint32_t, eve_file_id, 1);
+@@ -323,35 +324,40 @@ static void SCLogFileClose(LogFileCtx *log_ctx)
+     SCMutexUnlock(&log_ctx->fp_mutex);
+ }
+ 
+-static char ThreadSlotHashCompareFunc(
++static char ThreadLogFileHashCompareFunc(
+         void *data1, uint16_t datalen1, void *data2, uint16_t datalen2)
+ {
+-    ThreadSlotHashEntry *p1 = (ThreadSlotHashEntry *)data1;
+-    ThreadSlotHashEntry *p2 = (ThreadSlotHashEntry *)data2;
++    ThreadLogFileHashEntry *p1 = (ThreadLogFileHashEntry *)data1;
++    ThreadLogFileHashEntry *p2 = (ThreadLogFileHashEntry *)data2;
+ 
+     if (p1 == NULL || p2 == NULL)
+         return 0;
+ 
+     return p1->thread_id == p2->thread_id;
+ }
+-static uint32_t ThreadSlotHashFunc(HashTable *ht, void *data, uint16_t datalen)
++static uint32_t ThreadLogFileHashFunc(HashTable *ht, void *data, uint16_t datalen)
+ {
+-    const ThreadSlotHashEntry *ent = (ThreadSlotHashEntry *)data;
++    const ThreadLogFileHashEntry *ent = (ThreadLogFileHashEntry *)data;
+ 
+     return ent->thread_id % ht->array_size;
+ }
+ 
+-static void ThreadSlotHashFreeFunc(void *data)
++static void ThreadLogFileHashFreeFunc(void *data)
+ {
+-    ThreadSlotHashEntry *thread_ent = (ThreadSlotHashEntry *)data;
++    BUG_ON(data == NULL);
++    ThreadLogFileHashEntry *thread_ent = (ThreadLogFileHashEntry *)data;
+ 
+     if (thread_ent) {
++        LogFileCtx *lf_ctx = thread_ent->ctx;
++        /* Free the leaf log file entries */
++        if (!lf_ctx->threaded) {
++            LogFileFreeCtx(lf_ctx);
++        }
+         SCFree(thread_ent);
+     }
+ }
+ 
+-bool SCLogOpenThreadedFile(
+-        const char *log_path, const char *append, LogFileCtx *parent_ctx, int slot_count)
++bool SCLogOpenThreadedFile(const char *log_path, const char *append, LogFileCtx *parent_ctx)
+ {
+         parent_ctx->threads = SCCalloc(1, sizeof(LogThreadedFileCtx));
+         if (!parent_ctx->threads) {
+@@ -359,10 +365,10 @@ bool SCLogOpenThreadedFile(
+             return false;
+         }
+ 
+-        parent_ctx->threads->ht = HashTableInit(
+-                255, ThreadSlotHashFunc, ThreadSlotHashCompareFunc, ThreadSlotHashFreeFunc);
++        parent_ctx->threads->ht = HashTableInit(255, ThreadLogFileHashFunc,
++                ThreadLogFileHashCompareFunc, ThreadLogFileHashFreeFunc);
+         if (!parent_ctx->threads->ht) {
+-            FatalError("Unable to initialize thread/slot table");
++            FatalError("Unable to initialize thread/entry hash table");
+         }
+ 
+         parent_ctx->threads->append = SCStrdup(append == NULL ? DEFAULT_LOG_MODE_APPEND : append);
+@@ -371,29 +377,11 @@ bool SCLogOpenThreadedFile(
+             goto error_exit;
+         }
+ 
+-        parent_ctx->threads->slot_count = slot_count;
+-        parent_ctx->threads->last_slot = 0;
+-        parent_ctx->threads->lf_slots = SCCalloc(slot_count, sizeof(LogFileCtx *));
+-        if (!parent_ctx->threads->lf_slots) {
+-            SCLogError("Unable to allocate thread slots");
+-            goto error_exit;
+-        }
+-        SCLogDebug("Allocated %d file context pointers for threaded array",
+-                    parent_ctx->threads->slot_count);
+-        for (int slot = 1; slot < parent_ctx->threads->slot_count; slot++) {
+-            if (!LogFileNewThr

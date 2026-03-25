@@ -1,0 +1,121 @@
+@@ -5,6 +5,7 @@ https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng
+ 
+ from __future__ import annotations
+ 
++from enum import Enum
+ from typing import List
+ from typing import Optional
+ from typing import Tuple
+@@ -38,6 +39,13 @@ size_classes: List[int] = [
+ # fmt: on
+ 
+ 
++class SlotState(Enum):
++    ALLOCATED = "allocated"
++    FREED = "freed"
++    # Available - this slot has not yet been allocated.
++    AVAIL = "available"
++
++
+ # Shorthand
+ def int_size():
+     return pwndbg.aglib.typeinfo.sint.sizeof
+@@ -167,6 +175,7 @@ class Slot:
+         self._reserved: int = None
+         self._group: Group = None
+         self._meta: Meta = None
++        self._slot_state: SlotState = None
+ 
+     def preload(self) -> None:
+         """
+@@ -195,12 +204,10 @@ class Slot:
+         self._pn3 = pheader[5]
+         # ==
+ 
+-        # Read the group's meta pointer.
+-        _ = self.meta
+-
+-        # To calculate footer and p header fields
++        # To calculate footer and start header fields
+         # we need self.meta.stride. However we want to be able to
+-        # return some information even if the meta is corrupt, so
++        # return some information even if the meta is corrupt or
++        # unreachable (e.g. this slot is freed or avail), so
+         # we won't load that here.
+ 
+         # Other fields are calculated without memory reads.
+@@ -445,7 +452,7 @@ class Slot:
+         # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L199
+         return (self.meta.stride - self.nominal_size - IB) // UNIT
+ 
+-    # non-local..
++    # custom..
+ 
+     @property
+     def group(self) -> Group:
+@@ -467,6 +474,37 @@ class Slot:
+ 
+         return self._meta
+ 
++    @property
++    def slot_state(self) -> SlotState:
++        if self._slot_state is None:
++            # The actual "source of truth" for slot allocation state is
++            # self.meta.slotstate_at_index() however we can only resolve
++            # the meta if the state is ALLOCATED.
++            # We will do a heuristic check that should be good in most cases.
++
++            meta_says: SlotState = None
++            try:
++                meta_says = self.meta.slotstate_at_index(self.idx)
++            except pwndbg.dbg_mod.Error:
++                # We can't reach the meta. Either the slot is not allocated
++                # or it is allocated but the meta pointer is corrupted.
++                meta_says = None
++
++            if meta_says is not None:
++                self._slot_state = meta_says
++            else:
++                # When a slot is freed, its p[-3] gets set to 0xFF so the
++                # offset to group start (and by extension, meta) is unrecoverable.
++                # We will check for this, although musl only ever sets this
++                # and never uses this as a source of truth.
++                if self.pn3 == 0xFF:
++                    # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/free.c#L112
++                    self._slot_state = SlotState.FREED
++                else:
++                    self._slot_state = SlotState.AVAIL
++
++        return self._slot_state
++
+     # checks..
+ 
+     def is_cyclic(self) -> int:
+@@ -486,6 +524,17 @@ class Slot:
+         # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L269
+         return self.reserved_in_header == 6
+ 
++    # external setters..
++
++    def set_group(self, group: Group) -> None:
++        """
++        If the slot is FREED or AVAIL, it is impossible for it to
++        recover the start of its group, and ergo its meta.
++
++        You can thus use this to set it externally.
++        """
++        self._group = group
++
+     # constructors..
+ 
+     @classmethod
+@@ -503,19 +552,51 @@ class Slot:
+             obj = cls(p)
+             obj._sn3 = sn3
+         else:
++            # freed / avail slots will also go into this branch.
+             p = start
+             obj = cls(p)
+             obj._sn3 = obj._pn3 = sn3
+ 
+-        # FIXME: N

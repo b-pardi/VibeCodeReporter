@@ -1,0 +1,160 @@
+@@ -40,6 +40,9 @@ static void break_stack_free(void *ptr) {
+ static void cons_stack_free(void *ptr) {
+ 	RConsStack *s = (RConsStack *)ptr;
+ 	free (s->buf);
++	if (s->grep) {
++		free (s->grep->str);
++	}
+ 	free (s->grep);
+ 	free (s);
+ }
+
+
+
+
+@@ -1284,13 +1284,13 @@ static int cmd_thread(void *data, const char *input) {
+ 		int tid = r_num_math (core->num, input + 1);
+ 		if (tid) {
+ 			RCoreTask *task = r_core_task_get (core, tid);
+-			if (task) {
++			if (task && task != core->main_task) {
+ 				r_core_task_join (core, task);
+ 			} else {
+ 				eprintf ("Cannot find task\n");
+ 			}
+ 		} else {
+-			//r_core_task_run (core, NULL);
++			r_core_task_join (core, NULL);
+ 		}
+ 		break;
+ 	}
+@@ -1300,26 +1300,22 @@ static int cmd_thread(void *data, const char *input) {
+ 		if (tid) {
+ 			RCoreTask *task = r_core_task_get (core, tid);
+ 			if (task) {
+-				r_core_task_print (core, task, 0);
+-				r_cons_printf ("%2d %s %s\n",
+-					task->id, r_core_task_status (task), task->cmd);
+ 				if (task->res) {
+ 					r_cons_println (task->res);
+ 				}
+ 			} else {
+ 				eprintf ("Cannot find task\n");
+ 			}
+-		} else {
+-			r_core_task_list (core, 1);
+-		}}
++		}
+ 		break;
++	}
+ 	case '-':
+ 		if (r_sandbox_enable (0)) {
+ 			eprintf ("This command is disabled in sandbox mode\n");
+ 			return 0;
+ 		}
+ 		if (input[1] == '*') {
+-			r_core_task_del (core, -1);
++			r_core_task_del_all_done (core);
+ 		} else {
+ 			r_core_task_del (core, r_num_math (core->num, input + 1));
+ 		}
+
+
+
+
+@@ -17,7 +17,6 @@ static const char *help_msg_amper[] = {
+ 	"&", "", "list all tasks",
+ 	"&j", "", "list all tasks (in JSON)",
+ 	"&=", " 3", "show output of task 3",
+-	"&=", "", "show output of all tasks",
+ 	"&-", " 1", "delete task #1",
+ 	"&", "-*", "delete all done tasks",
+ 	"&?", "", "show this help",
+
+
+
+
+@@ -1836,7 +1836,7 @@ R_API bool r_core_init(RCore *core) {
+ 	core->rtr_n = 0;
+ 	core->blocksize_max = R_CORE_BLOCKSIZE_MAX;
+ 	core->task_id_next = 0;
+-	core->tasks = r_list_newf (free); // TODO: free tasks properly
++	core->tasks = r_list_newf ((RListFree)r_core_task_free);
+ 	core->tasks_queue = r_list_new ();
+ 	core->tasks_lock = r_th_lock_new (false);
+ 	core->main_task = r_core_task_new (core, NULL, NULL, NULL);
+
+
+
+
+@@ -96,13 +96,23 @@ R_API RCoreTask *r_core_task_new (RCore *core, const char *cmd, RCoreTaskCallbac
+ 	return task;
+ 
+ hell:
+-	if (task) {
+-		free (task->cmd);
+-		free (task);
+-	}
++	r_core_task_free (task);
+ 	return NULL;
+ }
+ 
++R_API void r_core_task_free (RCoreTask *task) {
++	if (!task) {
++		return;
++	}
++	free (task->cmd);
++	free (task->res);
++	r_th_free (task->thread);
++	r_th_cond_free (task->dispatch_cond);
++	r_th_lock_free (task->dispatch_lock);
++	r_cons_dump_free (task->cons);
++	free (task);
++}
++
+ R_API void r_core_task_schedule(RCoreTask *current, RTaskState next_state) {
+ 	RCore *core = current->core;
+ 	bool stop = next_state != R_CORE_TASK_STATE_RUNNING;
+@@ -296,23 +306,15 @@ R_API RCoreTask *r_core_task_self (RCore *core) {
+ 	return core->current_task ? core->current_task : core->main_task;
+ }
+ 
+-R_API int r_core_task_cat (RCore *core, int id) {
+-	RCoreTask *task = r_core_task_get (core, id);
+-	r_cons_println (task->res);
+-	r_core_task_del (core, id);
+-	return true;
+-}
+-
+ R_API int r_core_task_del (RCore *core, int id) {
+ 	RCoreTask *task;
+ 	RListIter *iter;
+-	if (id == -1) {
+-		r_list_free (core->tasks);
+-		core->tasks = r_list_new ();
+-		return true;
+-	}
+ 	r_list_foreach (core->tasks, iter, task) {
+ 		if (task->id == id) {
++			if (task == core->main_task
++				|| task->state != R_CORE_TASK_STATE_DONE) {
++				return false;
++			}
+ 			r_list_delete (core->tasks, iter);
+ 			return true;
+ 		}
+@@ -320,6 +322,16 @@ R_API int r_core_task_del (RCore *core, int id) {
+ 	return false;
+ }
+ 
++R_API void r_core_task_del_all_done (RCore *core) {
++	RCoreTask *task;
++	RListIter *iter, *iter2;
++	r_list_foreach_safe (core->tasks, iter, iter2, task) {
++		if (task != core->main_task && task->state == R_CORE_TASK_STATE_DONE) {
++			r_list_delete (core->tasks, iter);
++		}
++	}
++}
++
+ R_API RC

@@ -1,0 +1,79 @@
+@@ -5,11 +5,12 @@ instance and get information about all events, where IP address occurred. All th
+ 'misp_events'
+ """
+ import logging
+-import datetime
++from datetime import datetime, timedelta
+ import argparse
+ import os
+ import re
+ import sys
++from ipaddress import IPv4Address, AddressValueError
+ 
+ from pymisp import ExpandedPyMISP, MISPAttribute
+ 
+@@ -37,6 +38,16 @@ parser.add_argument("--cert", metavar='CA_FILE',
+                     help="Use this server certificate (or CA bundle) to check the certificate of MISP instance, useful when the server uses self-signed cert.")
+ parser.add_argument("--insecure", action="store_true",
+                     help="Don't check the server certificate of MISP instance.")
++parser.add_argument("--since", action="store",
++                    help="Specifies date from which should misp_updater query IP addresses from MISP. "
++                    "Expected format: YYYY-MM-DD. Default is taken from MISP ip lifetime stored in /etc/nerd.yml "
++                    "(180 days by default).")
++parser.add_argument("--to", action="store",
++                    help="Specifies date to which should misp_updater query IP addresses from MISP. "
++                    "Expected format: YYYY-MM-DD. Default is today's date.")
++parser.add_argument("--events", action="store_true", default=False,
++                    help="Download info about IP addresses event by event. This may be useful, when even smaller time "
++                         "interval cannot be properly handled by MISP server.")
+ args = parser.parse_args()
+ 
+ LOGFORMAT = "%(asctime)-15s,%(name)s [%(levelname)s] %(message)s"
+@@ -57,10 +68,14 @@ common_cfg_file = os.path.join(config_base_path, config.get('common_config'))
+ logger.info("Loading config file {}".format(common_cfg_file))
+ config.update(read_config(common_cfg_file))
+ 
++inactive_ip_lifetime = config.get('record_life_length.misp', 180)
++
+ db = mongodb.MongoEntityDatabase(config)
+ 
+-# task queue init
+-tq = TaskQueueWriter(config.get('worker_processes'), config.get('rabbitmq', {}))
++rabbit_config = config.get("rabbitmq")
++num_processes = config.get('worker_processes')
++tq = TaskQueueWriter(num_processes, rabbit_config)
++tq.connect()
+ 
+ # load MISP instance configuration
+ try:
+@@ -83,99 +98,159 @@ error_ip = {}
+ 
+ SIGHTING_DICT = {'0': "positive", '1': "false positive", '2': "expired attribute"}
+ THREAT_LEVEL_DICT = {'1': "High", '2': "Medium", '3': "Low", '4': "Undefined"}
++KEYS_TO_SAFE_FROM_ATTRIB = ('info', 'Orgc', 'id', 'Tag', 'date', 'threat_level_id', 'timestamp')
+ 
+ 
+ def get_ip_from_attrib(attrib):
+     """
+     Get ip address from MISP attribute and check its distribution level
+     :param attrib: MISP attribute with ip address
+-    :return:
++    :return: double empty strings, if distribution level is not met. If distribution is ok, then return 2 values: IP,
++                                                                                                        role (src|dst)
+     """
+     # First check distribution level of attributes, 2 = Connected Communities, 3 = All Communities, 5 can have only
+     # attributes and it means inherit event's distribution
+     if int(attrib.get('distribution', 0)) in (2, 3, 5) and int(attrib.get('Event', {}).get('distribution')) in (2, 3):
+         if attrib['type'] in ("ip-src", "ip-dst"):
+-            return attrib['value']
++            return attrib['value'], "src" if "src" in attrib['type'] else "dst"
+         elif attrib['type'] == "domain|ip":
+-            return attrib['value'].split("|")[1]
++            return attrib['value'].split("|")[1], "src" if "src" in attrib['type'] else "dst"
+         elif attrib['type'] in ("ip-src|port", "ip-dst|port"):
+             ip_split = attrib['value'].split("|")
+             if len(ip_split) == 1:
+                 # ip-scr|port can use ':' as delimeter, so if after split it did not split anything, it probably uses
+                 # ':' as delimeter
+                 ip_split = attrib['value'].split(":")
+- 

@@ -1,0 +1,137 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,5160 @@
++/*
++   BAREOS® - Backup Archiving REcovery Open Sourced
++
++   Copyright (C) 2025-2025 Bareos GmbH & Co. KG
++
++   This program is Free Software; you can redistribute it and/or
++   modify it under the terms of version three of the GNU Affero General Public
++   License as published by the Free Software Foundation, which is
++   listed in the file LICENSE.
++
++   This program is distributed in the hope that it will be useful, but
++   WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++   Affero General Public License for more details.
++
++   You should have received a copy of the GNU Affero General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++   02110-1301, USA.
++*/
++
++#include "include/bareos.h"
++#include "include/filetypes.h"
++#include "fd_plugins.h"
++#include "plugins/include/common.h"
++#include <jansson.h>
++
++#include <format>
++#include <source_location>
++#include <stdexcept>
++#include <string_view>
++#include <variant>
++#include <exception>
++#include <algorithm>
++#include <span>
++
++#include <shlobj_core.h>
++#include <comdef.h>
++#include <Wbemidl.h>
++#include <atlsafe.h>
++#include <initguid.h>  // ask virtdisk.h to include guid definitions
++#include <virtdisk.h>
++
++#include <filesystem>
++
++// polyfill for C++23
++template <class Enum>
++constexpr std::underlying_type_t<Enum> to_underlying(Enum e) noexcept
++{
++  return static_cast<std::underlying_type_t<Enum>>(e);
++}
++
++
++static const int debuglevel = 150;
++
++#define PLUGIN_LICENSE "Bareos AGPLv3"
++#define PLUGIN_AUTHOR "Sebastian Sura"
++#define PLUGIN_DATE "April 2025"
++#define PLUGIN_VERSION "1.0.1"
++#define PLUGIN_DESCRIPTION "Bareos Hyper-V Windows File Daemon Plugin"
++#define PLUGIN_USAGE                               \
++  "\n  hyper-v:config_file=<path>:vmname=<name>\n" \
++  ""
++
++using filedaemon::bEvent;
++using filedaemon::CoreFunctions;
++using filedaemon::io_pkt;
++using filedaemon::PluginApiDefinition;
++using filedaemon::PluginFunctions;
++using filedaemon::pVariable;
++using filedaemon::restore_pkt;
++using filedaemon::save_pkt;
++
++struct json_deleter {
++  void operator()(json_t* ptr) const
++  {
++    if (ptr) { json_decref(ptr); }
++  }
++};
++using json_ptr = std::unique_ptr<json_t, json_deleter>;
++
++std::string format_win32_error_2(DWORD error = GetLastError())
++{
++  char* buffer = nullptr;
++  // take note: buffer is allocated via LocalAlloc ~> use LocalFree to dealloc
++  auto format_success = FormatMessageA(
++      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS
++          | FORMAT_MESSAGE_FROM_SYSTEM,
++      NULL, error, 0, reinterpret_cast<char*>(&buffer), 0, 0);
++
++  auto result = [&] {
++    if (format_success == 0) {
++      return std::format("non formatable error {:X} (reason = {:X})", error,
++                         GetLastError());
++    } else {
++      return std::format("{} ({:X})", buffer, error);
++    }
++  }();
++
++  LocalFree(buffer);
++
++  return result;
++}
++
++std::wstring format_win32_error(DWORD error = GetLastError())
++{
++  wchar_t* buffer = nullptr;
++  // take note: buffer is allocated via LocalAlloc ~> use LocalFree to dealloc
++  auto format_success = FormatMessageW(
++      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS
++          | FORMAT_MESSAGE_FROM_SYSTEM,
++      NULL, error, 0, reinterpret_cast<wchar_t*>(&buffer), 0, 0);
++
++  auto result = [&] {
++    if (format_success == 0) {
++      return std::format(L"non formatable error {:X} (reason = {:X})", error,
++                         GetLastError());
++    } else {
++      return std::format(L"{} ({:X})", buffer, error);
++    }
++  }();
++
++  LocalFree(buffer);
++
++  return result;
++}
++
++struct werror : std::exception {
++  werror(std::string_view where, DWORD err_num = GetLastError())
++  {
++    err_msg = std::format("caught error {} while trying to {}",
++            

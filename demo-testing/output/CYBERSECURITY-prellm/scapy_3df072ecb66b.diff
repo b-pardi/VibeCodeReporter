@@ -1,0 +1,113 @@
+@@ -1701,7 +1701,7 @@ class PcapNgReader(RawPcapNgReader, PcapReader, _SuperSocket):
+         return self.read_packet()
+ 
+ 
+-class RawPcapWriter:
++class RawPcapWriter(object):
+     """A stream PCAP writer with more control than wrpcap()"""
+ 
+     def __init__(self,
+@@ -1978,6 +1978,219 @@ class PcapWriter(RawPcapWriter):
+         )
+ 
+ 
++@conf.commands.register
++def rderf(filename, count=-1):
++    # type: (Union[IO[bytes], str], int) -> PacketList
++    """Read a ERF file and return a packet list
++
++    :param count: read only <count> packets
++    """
++    with ERFEthernetReader(filename) as fdesc:
++        return fdesc.read_all(count=count)
++
++
++class ERFEthernetReader_metaclass(PcapReader_metaclass):
++    def __call__(cls, filename):  # type: ignore
++        # type: (Union[IO[bytes], str]) -> Any
++        i = cls.__new__(cls, cls.__name__, cls.__bases__, cls.__dict__)
++        filename, fdesc = cls.open(filename)
++        try:
++            i.__init__(filename, fdesc)
++            return i
++        except (Scapy_Exception, EOFError):
++            pass
++
++        if "alternative" in cls.__dict__:
++            cls = cls.__dict__["alternative"]
++            i = cls.__new__(cls, cls.__name__, cls.__bases__, cls.__dict__)
++            try:
++                i.__init__(filename, fdesc)
++                return i
++            except (Scapy_Exception, EOFError):
++                pass
++
++        raise Scapy_Exception("Not a supported capture file")
++
++    @staticmethod
++    def open(fname  # type: ignore
++             ):
++        # type: (...) -> Tuple[str, _ByteStream]
++        """Open (if necessary) filename"""
++        if isinstance(fname, str):
++            filename = fname
++            try:
++                with gzip.open(filename, "rb") as tmp:
++                    tmp.read(1)
++                fdesc = gzip.open(filename, "rb")  # type: _ByteStream
++            except IOError:
++                fdesc = open(filename, "rb")
++
++        else:
++            fdesc = fname
++            filename = getattr(fdesc, "name", "No name")
++        return filename, fdesc
++
++
++@six.add_metaclass(ERFEthernetReader_metaclass)
++class ERFEthernetReader(PcapReader):
++
++    def __init__(self, filename, fdesc=None):  # type: ignore
++        # type: (Union[IO[bytes], str], IO[bytes]) -> None
++        self.filename = filename  # type: ignore
++        self.f = fdesc
++        self.power = Decimal(10) ** Decimal(-9)
++
++    # time is in 64-bits Endace's format which can be see here:
++    # https://www.endace.com/erf-extensible-record-format-types.pdf
++    def _convert_erf_timestamp(self, t):
++        # type: (int) -> EDecimal
++        sec = t >> 32
++        frac_sec = t & 0xffffffff
++        frac_sec *= 10**9
++        frac_sec += (frac_sec & 0x80000000) << 1
++        frac_sec >>= 32
++        return EDecimal(sec + self.power * frac_sec)
++
++    # The details of ERF Packet format can be see here:
++    # https://www.endace.com/erf-extensible-record-format-types.pdf
++    def read_packet(self, size=MTU):
++        # type: (int) -> Packet
++
++        # General ERF Header have exactly 16 bytes
++        hdr = self.f.read(16)
++        if len(hdr) < 16:
++            raise EOFError
++
++        # The timestamp is in little-endian byte-order.
++        time = struct.unpack('<Q', hdr[:8])[0]
++        # The rest is in big-endian byte-order.
++        # Ignoring flags and lctr (loss counter) since they are ERF specific
++        # header fields which Packet object does not support.
++        type, _, rlen, _, wlen = struct.unpack('>BBHHH', hdr[8:])
++        # Check if the type != 0x02, type Ethernet
++        if type & 0x02 == 0:
++            raise Scapy_Exception("Invalid ERF Type (Not TYPE_ETH)")
++
++        # If there are extended headers, ignore it because Packet object does
++        # not support it. Extended headers size is 8 bytes before the payload.
++        if type & 0x80:
++            _ = self.f.read(8)
++            s = self.f.read(rlen - 24)
++        else:
++            s = self.f

@@ -1,0 +1,101 @@
+@@ -4,7 +4,8 @@ Configuration loader
+ """
+ import copy
+ import os
+-from typing import List, Optional, Tuple
++from dataclasses import dataclass
++from typing import Any, List, Optional, Tuple
+ 
+ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+ from omegaconf.errors import OmegaConfBaseException
+@@ -19,6 +20,14 @@ from hydra.errors import MissingConfigException
+ from hydra.plugins.config_source import ConfigLoadError, ConfigSource
+ 
+ 
++@dataclass
++class DefaultElement:
++    config_group: Optional[str]
++    config_name: str
++    optional: bool = False
++    package: Optional[str] = None
++
++
+ class ConfigLoaderImpl(ConfigLoader):
+     """
+     Configuration loader
+@@ -42,13 +51,9 @@ class ConfigLoaderImpl(ConfigLoader):
+         overrides: List[str],
+         strict: Optional[bool] = None,
+     ) -> DictConfig:
+-        assert config_name is None or isinstance(config_name, str)
+-        assert strict is None or isinstance(strict, bool)
+-        assert isinstance(overrides, list)
+         if strict is None:
+             strict = self.default_strict
+ 
+-        assert overrides is None or isinstance(overrides, list)
+         overrides = copy.deepcopy(overrides) or []
+ 
+         if config_name is not None and not self.exists_in_search_path(config_name):
+@@ -71,8 +76,8 @@ class ConfigLoaderImpl(ConfigLoader):
+             cfg_filename=config_name, record_load=False
+         )
+ 
+-        job_defaults = ConfigLoaderImpl._get_defaults(job_cfg)
+-        defaults = ConfigLoaderImpl._get_defaults(hydra_cfg)
++        job_defaults = self._parse_defaults(job_cfg)
++        defaults = self._parse_defaults(hydra_cfg)
+ 
+         job_cfg_type = OmegaConf.get_type(job_cfg)
+         if job_cfg_type is not None and not issubclass(job_cfg_type, dict):
+@@ -86,15 +91,15 @@ class ConfigLoaderImpl(ConfigLoader):
+                 del hydra_cfg["defaults"]
+ 
+         if config_name is not None:
+-            defaults.append("__SELF__")
++            defaults.append(DefaultElement(config_group=None, config_name="__SELF__"))
+         split_at = len(defaults)
+ 
+-        ConfigLoaderImpl._merge_default_lists(defaults, job_defaults)
+-        consumed = self._apply_defaults_overrides(overrides, defaults)
++        self._merge_default_lists(defaults, job_defaults)
++        consumed = self._apply_overrides_to_defaults(overrides, defaults)
+ 
+-        consumed_free_job_defaults = self._apply_free_defaults(defaults, overrides)
+-
+-        ConfigLoaderImpl._validate_defaults(defaults)
++        consumed_free_job_defaults = self._append_free_config_group_overrides_to_defaults(
++            defaults, overrides
++        )
+ 
+         # Load and defaults and merge them into cfg
+         cfg = self._merge_defaults(
+@@ -172,72 +177,106 @@ class ConfigLoaderImpl(ConfigLoader):
+         return copy.deepcopy(self.all_config_checked)
+ 
+     @staticmethod
+-    def _apply_defaults_overrides(
+-        overrides: List[str], defaults: ListConfig
++    def _apply_overrides_to_defaults(
++        overrides: List[str], defaults: List[DefaultElement]
+     ) -> List[str]:
+         consumed = []
+         key_to_idx = {}
+         for idx, d in enumerate(defaults):
+-            if isinstance(d, DictConfig):
+-                key = next(iter(d.keys()))
+-                key_to_idx[key] = idx
++            if d.config_group is not None:
++                key_to_idx[d.config_group] = idx
+         for override in copy.deepcopy(overrides):
+-            key, value = split_key_val(override)
+-            if key in key_to_idx:
++            group, package, value = ConfigLoaderImpl._split_override(override)
++            if group in key_to_idx:
+                 if "," in value:
+                     # If this is a multirun config (comma separated list), flag the default to prevent it from being
+                     # loaded until we are constructing the config for individual jobs.
+                     value = "_SKIP_"
+ 
+                 if value == "null":
+-                    del defaults[key_to_idx[

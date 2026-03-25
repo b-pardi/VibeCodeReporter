@@ -1,0 +1,103 @@
+@@ -10,11 +10,13 @@
+ #
+ 
+ import argparse
++import collections
+ import datetime
++import json
+ import logging
+ import fnmatch
+ import re
+-from typing import Dict, Any
++from typing import Dict, Any, List
+ 
+ from .base import dump_report_data, user_choice, Command, GroupCommand
+ from .. import api, display, crypto, utils, vault, vault_extensions
+@@ -22,6 +24,8 @@ from ..team import Team
+ 
+ from ..params import KeeperParams
+ from ..subfolder import try_resolve_path
++from ..error import CommandError
++from ..record_management import update_record
+ 
+ 
+ def register_commands(commands):
+@@ -30,6 +34,7 @@ def register_commands(commands):
+     commands['list'] = RecordListCommand()
+     commands['list-sf'] = RecordListSfCommand()
+     commands['list-team'] = RecordListTeamCommand()
++    commands['record-history'] = RecordHistoryCommand()
+ 
+ 
+ def register_command_info(aliases, command_info):
+@@ -37,8 +42,9 @@ def register_command_info(aliases, command_info):
+     aliases['l'] = 'list'
+     aliases['lsf'] = 'list-sf'
+     aliases['lt'] = 'list-team'
++    aliases['rh'] = 'record-history'
+ 
+-    for p in [search_parser, list_parser, list_sf_parser, list_team_parser]:
++    for p in [search_parser, list_parser, list_sf_parser, list_team_parser, record_history_parser]:
+         command_info[p.prog] = p.description
+     command_info['trash'] = 'Manage deleted items'
+ 
+@@ -77,6 +83,19 @@ list_team_parser.add_argument('--output', dest='output', action='store',
+                               help='output file name. (ignored for table format)')
+ 
+ 
++record_history_parser = argparse.ArgumentParser(
++    prog='history|rh', description='Show the history of a record modifications.')
++record_history_parser.add_argument(
++    '-a', '--action', dest='action', choices=['list', 'diff', 'view', 'restore'], action='store',
++    help="filter by record history type. (default: 'list'). --revision required with 'restore' action.",
++)
++record_history_parser.add_argument(
++    '-r', '--revision', dest='revision', type=int, action='store',
++    help='only show the details for a specific revision')
++record_history_parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', help="verbose output")
++record_history_parser.add_argument('record', nargs='?', type=str, action='store', help='record path or UID')
++
++
+ def find_record(params, record_name):  # type: (KeeperParams, str) -> vault.KeeperRecord
+     record_uid = None
+     if record_name in params.record_cache:
+@@ -451,3 +470,196 @@ class TrashPurgeCommand(Command, TrashMixin):
+         }
+         api.communicate(params, rq)
+         TrashMixin.last_revision = 0
++
++
++class RecordHistoryCommand(Command):
++    def get_parser(self):
++        return record_history_parser
++
++    def execute(self, params, **kwargs):
++        record_name = kwargs['record'] if 'record' in kwargs else None
++        if not record_name:
++            self.get_parser().print_help()
++            return
++
++        verbose = kwargs.get('verbose') or False
++
++        record_uid = None
++        if record_name in params.record_cache:
++            record_uid = record_name
++        else:
++            rs = try_resolve_path(params, record_name)
++            if rs is not None:
++                folder, record_name = rs
++                if folder is not None and record_name is not None:
++                    folder_uid = folder.uid or ''
++                    if folder_uid in params.subfolder_record_cache:
++                        for uid in params.subfolder_record_cache[folder_uid]:
++                            r = api.get_record(params, uid)
++                            if r.title.lower() == record_name.lower():
++                                record_uid = uid
++                                break
++
++        if record_uid is None:
++            raise CommandError('history', 'Enter name of existing record')
++
++        current_rec = params.record_cache[record_uid]
++        if record_uid in params.record_history:
++            history = params.rec

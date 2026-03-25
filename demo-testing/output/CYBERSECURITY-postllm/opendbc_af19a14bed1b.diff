@@ -1,0 +1,83 @@
+@@ -21,6 +21,8 @@ DT_CTRL = 0.01  # car state and control loop timestep (s)
+ # kg of standard extra cargo to count for drive, gas, etc...
+ STD_CARGO_KG = 136.
+ 
++ACCELERATION_DUE_TO_GRAVITY = 9.81  # m/s^2
++
+ ButtonType = structs.CarState.ButtonEvent.Type
+ AngleRateLimit = namedtuple('AngleRateLimit', ['speed_bp', 'angle_v'])
+ 
+
+
+
+
+@@ -1,5 +1,6 @@
++import math
+ from opendbc.can.packer import CANPacker
+-from opendbc.car import apply_std_steer_angle_limits, structs
++from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, apply_std_steer_angle_limits, structs
+ from opendbc.car.ford import fordcan
+ from opendbc.car.ford.values import CarControllerParams, FordFlags
+ from opendbc.car.common.numpy_fast import clip, interp
+@@ -36,6 +37,7 @@ class CarController(CarControllerBase):
+ 
+     self.apply_curvature_last = 0
+     self.accel = 0.0
++    self.brake_request = False
+     self.main_on_last = False
+     self.lkas_enabled_last = False
+     self.steer_alert_last = False
+@@ -108,9 +110,22 @@ class CarController(CarControllerBase):
+       gas = self.accel
+       if not CC.longActive or gas < CarControllerParams.MIN_GAS:
+         gas = CarControllerParams.INACTIVE_GAS
++
++      # PCM applies pitch compensation to gas/accel, but we need to compensate for the brake/pre-charge bits
++      if len(CC.orientationNED) == 3:
++        accel_due_to_pitch = math.sin(CC.orientationNED[1]) * ACCELERATION_DUE_TO_GRAVITY
++      else:
++        accel_due_to_pitch = 0.0
++
++      accel_pitch_compensated = self.accel + accel_due_to_pitch
++      if accel_pitch_compensated > 0.3 or not CC.longActive:
++        self.brake_request = False
++      elif accel_pitch_compensated < 0.0:
++        self.brake_request = True
++
+       stopping = CC.actuators.longControlState == LongCtrlState.stopping
+       # TODO: look into using the actuators packet to send the desired speed
+-      can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, self.accel, stopping, v_ego_kph=V_CRUISE_MAX))
++      can_sends.append(fordcan.create_acc_msg(self.packer, self.CAN, CC.longActive, gas, self.accel, stopping, self.brake_request, v_ego_kph=V_CRUISE_MAX))
+ 
+     ### ui ###
+     send_ui = (self.main_on_last != main_on) or (self.lkas_enabled_last != CC.latActive) or (self.steer_alert_last != steer_alert)
+
+
+
+
+@@ -117,7 +117,7 @@ def create_lat_ctl2_msg(packer, CAN: CanBus, mode: int, path_offset: float, path
+   return packer.make_can_msg("LateralMotionControl2", CAN.main, values)
+ 
+ 
+-def create_acc_msg(packer, CAN: CanBus, long_active: bool, gas: float, accel: float, stopping: bool, v_ego_kph: float):
++def create_acc_msg(packer, CAN: CanBus, long_active: bool, gas: float, accel: float, stopping: bool, brake_request, v_ego_kph: float):
+   """
+   Creates a CAN message for the Ford ACC Command.
+ 
+@@ -126,7 +126,6 @@ def create_acc_msg(packer, CAN: CanBus, long_active: bool, gas: float, accel: fl
+ 
+   Frequency is 50Hz.
+   """
+-  decel = accel < 0 and long_active
+   values = {
+     "AccBrkTot_A_Rq": accel,                          # Brake total accel request: [-20|11.9449] m/s^2
+     "Cmbb_B_Enbl": 1 if long_active else 0,           # Enabled: 0=No, 1=Yes
+@@ -139,8 +138,8 @@ def create_acc_msg(packer, CAN: CanBus, long_active: bool, gas: float, accel: fl
+     "AccVeh_V_Trg": v_ego_kph,                        # Target speed: [0|255] km/h
+     # TODO: we may be able to improve braking response by utilizing pre-charging better
+     # When setting these two bits without AccBrkTot_A_Rq, an initial jerk is observed and car may be able to brake temporarily with AccPrpl_A_Rq
+-    "AccBrkPrchg_B_Rq": 1 if decel else 0,            # Pre-charge brake request: 0=No, 1=Yes
+-    "AccBrkDecel_B_Rq": 1 if decel else 0,            # Deceleration request: 0=Inactive, 1=Active
++    "AccBrkPrchg_B_Rq": 1 if brake_request else 0,            # Pre-charge brake request: 0=No, 1=Yes
++    "AccBrkDecel_B_Rq": 1 if brake_request else 0,            # Deceleration request: 0=Inactive, 1=Active
+     "Ac

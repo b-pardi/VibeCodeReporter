@@ -1,0 +1,134 @@
+@@ -1,357 +1,6 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+ /* Copyright Authors of Cilium */
+ 
+-/* We gently borrow these tests to additionally check that, when used
+- * from the Wireguard device, we correctly update bpf metrics.
+- * This is not needed anymore and will be moved in wireguard_metrics.c
+- * once addressed https://github.com/cilium/cilium/issues/33676.
+- */
+-#define IS_BPF_WIREGUARD 1
+-#define ENABLE_WIREGUARD
++#define IS_BPF_HOST
+ 
+-#include "common.h"
+-
+-#include <bpf/ctx/skb.h>
+-#include <bpf/helpers_skb.h>
+-#include "pktgen.h"
+-
+-#define ETH_HLEN 0
+-#define ENABLE_HOST_ROUTING
+-#define ENABLE_IPV4
+-#define ENABLE_IPV6
+-
+-#define TEST_IP_LOCAL		v4_pod_one
+-#define TEST_IP_REMOTE		v4_pod_two
+-#define TEST_IPV6_LOCAL		v6_pod_one
+-#define TEST_IPV6_REMOTE	v6_pod_two
+-#define TEST_LXC_ID_LOCAL	233
+-
+-/* We wanted to tail call handle_policy from bpf_lxc, but at present it's
+- * impossible to #include both bpf_host.c and bpf_lxc.c at the same time.
+- * Therefore, we created a stud, mock_hanle_policy, to simply check if the
+- * our skb reaches there.
+- */
+-__section("mock-handle-policy")
+-int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
+-{
+-	return TC_ACT_REDIRECT;
+-}
+-
+-struct {
+-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+-	__uint(key_size, sizeof(__u32));
+-	__uint(max_entries, 256);
+-	__array(values, int());
+-} mock_policy_call_map __section(".maps") = {
+-	.values = {
+-		[TEST_LXC_ID_LOCAL] = &mock_handle_policy,
+-	},
+-};
+-
+-#define tail_call_dynamic mock_tail_call_dynamic
+-static __always_inline __maybe_unused void
+-mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
+-		       const void *map __maybe_unused, __u32 slot __maybe_unused)
+-{
+-	tail_call(ctx, &mock_policy_call_map, slot);
+-}
+-
+-static volatile const __u8 *ep_mac = mac_one;
+-static volatile const __u8 *node_mac = mac_two;
+-
+-#include "bpf_host.c"
+-
+-ASSIGN_CONFIG(__u32, interface_ifindex, WG_IFINDEX)
+-
+-#include "lib/endpoint.h"
+-
+-struct {
+-	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+-	__uint(key_size, sizeof(__u32));
+-	__uint(max_entries, 2);
+-	__array(values, int());
+-} entry_call_map __section(".maps") = {
+-	.values = {
+-		[0] = &cil_from_netdev,
+-	},
+-};
+-
+-PKTGEN("tc", "ipv4_l3_to_l2_fast_redirect")
+-int ipv4_l3_to_l2_fast_redirect_pktgen(struct __ctx_buff *ctx)
+-{
+-	struct pktgen builder;
+-	struct tcphdr *l4;
+-	void *data;
+-
+-	/* Init packet builder */
+-	pktgen__init(&builder, ctx);
+-
+-	/* We are building an L3 skb which doesn't have L2 header, so in theory
+-	 * we need to skip L2 header and set ctx->protocol = bpf_ntohs(ETH_P_IP),
+-	 * but bpf verifier doesn't allow us to do so, and kernel also doesn't
+-	 * handle an L3 skb properly (see https://elixir.bootlin.com/linux/v6.2.1/source/net/bpf/test_run.c#L1156).
+-	 * Therefore we workaround the issue by pushing L2 header in the PKTGEN
+-	 * and stripping it in the SETUP.
+-	 */
+-
+-	l4 = pktgen__push_ipv4_tcp_packet(&builder,
+-					  (__u8 *)node_mac, (__u8 *)ep_mac,
+-					  TEST_IP_REMOTE, TEST_IP_LOCAL,
+-					  tcp_src_one, tcp_svc_one);
+-	if (!l4)
+-		return TEST_ERROR;
+-
+-	data = pktgen__push_data(&builder, default_data, sizeof(default_data));
+-
+-	if (!data)
+-		return TEST_ERROR;
+-
+-	pktgen__finish(&builder);
+-
+-	return 0;
+-}
+-
+-SETUP("tc", "ipv4_l3_to_l2_fast_redirect")
+-int ipv4_l3_to_l2_fast_redirect_setup(struct __ctx_buff *ctx)
+-{
+-	void *data = (void *)(long)ctx->data;
+-	void *data_end = (void *)(long)ctx->data_end;
+-	__u64 flags = BPF_F_ADJ_ROOM_FIXED_GSO;
+-
+-	endpoint_v4_add_entry(TEST_IP_LOCAL, 0, TEST_LXC_ID_LOCAL, 0, 0,
+-			      0, (__u8 *)ep_mac, (__u8 *)node_mac);
+-
+-	/* As commented in PKTGEN, now we strip the L2 header. Bpf helper
+-	 * skb_adjust_room will use L2 header to overwrite L3 header, so we play
+-	 * a trick to memcpy(ethhdr, iphdr, ETH_HLEN) ahead of skb_adjust_room
+-	 * so as to guarantee L3 header keeps intact.
+-	 */
+-	if ((void *)data + __ETH_HLEN + __ETH_HLEN <= data_end)
+-		memcpy(data, data + __ETH_HLEN, __ETH_HLEN);
+-
+-	skb_adjust

@@ -1,0 +1,166 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,24 @@
++#ifndef binpac_an_h
++#define binpac_an_h
++
++namespace binpac {
++
++// TODO: Add the Done() function
++
++// The interface for a connection analyzer
++class ConnectionAnalyzer {
++public:
++    virtual ~ConnectionAnalyzer() = default;
++    virtual void NewData(bool is_orig, const unsigned char* begin_of_data, const unsigned char* end_of_data) = 0;
++};
++
++// The interface for a flow analyzer
++class FlowAnalyzer {
++public:
++    virtual ~FlowAnalyzer() = default;
++    virtual void NewData(const unsigned char* begin_of_data, const unsigned char* end_of_data) = 0;
++};
++
++} // namespace binpac
++
++#endif // binpac_an_h
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,457 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h> // for memcpy
++
++#define binpac_regex_h
++
++#include "binpac.h"
++#include "binpac_buffer.h"
++
++namespace binpac {
++
++extern double network_time();
++
++namespace {
++const unsigned char CR = '\r';
++const unsigned char LF = '\n';
++} // namespace
++
++binpac::FlowBuffer::Policy binpac::FlowBuffer::policy = {
++    // max_capacity
++    10 * 1024 * 1024,
++    // min_capacity
++    512,
++    // contract_threshold
++    2 * 1024 * 1024,
++};
++
++FlowBuffer::FlowBuffer(LineBreakStyle linebreak_style) {
++    buffer_length_ = 0;
++    buffer_ = nullptr;
++
++    orig_data_begin_ = nullptr;
++    orig_data_end_ = nullptr;
++
++    linebreak_style_ = linebreak_style;
++    linebreak_style_default = linebreak_style;
++    linebreaker_ = 0;
++    ResetLineState();
++
++    mode_ = UNKNOWN_MODE;
++    frame_length_ = 0;
++    chunked_ = false;
++
++    data_seq_at_orig_data_end_ = 0;
++    eof_ = false;
++    have_pending_request_ = false;
++
++    buffer_n_ = 0;
++
++    NewMessage();
++}
++
++FlowBuffer::~FlowBuffer() {
++    if ( buffer_ )
++        free(buffer_);
++}
++
++void FlowBuffer::NewMessage() {
++    BINPAC_ASSERT(frame_length_ >= 0);
++
++    int bytes_to_advance = 0;
++    if ( buffer_n_ == 0 ) {
++        switch ( mode_ ) {
++            case LINE_MODE: bytes_to_advance = (frame_length_ + (linebreak_style_ == STRICT_CRLF ? 2 : 1)); break;
++            case FRAME_MODE: bytes_to_advance = frame_length_; break;
++            case UNKNOWN_MODE: break;
++        }
++    }
++
++    orig_data_begin_ += bytes_to_advance;
++    BINPAC_ASSERT(orig_data_begin_ <= orig_data_end_);
++
++    buffer_n_ = 0;
++    message_complete_ = false;
++    ContractBuffer();
++}
++
++void FlowBuffer::ResetLineState() {
++    switch ( linebreak_style_ ) {
++        case CR_OR_LF: state_ = CR_OR_LF_0; break;
++        case STRICT_CRLF: state_ = STRICT_CRLF_0; break;
++        case LINE_BREAKER: break; // Nothing to reset
++        default: BINPAC_ASSERT(0); break;
++    }
++}
++
++void FlowBuffer::ExpandBuffer(int length) {
++    if ( buffer_length_ >= length )
++        return;
++
++    if ( length < policy.min_capacity )
++        length = policy.min_capacity;
++
++    if ( length < buffer_length_ * 2 )
++        length = buffer_length_ * 2;
++
++    if ( length > policy.max_capacity ) {
++        std::string reason = strfmt("expand past max capacity %d/%d", length, policy.max_capacity);
++        throw ExceptionFlowBufferAlloc(reason.c_str());
++    }
++
++    // Allocate a new buffer and copy the existing contents
++    buffer_length_ = length;
++    unsigned char* new_buf = (unsigned char*)realloc(buffer_, buffer_length_);
++
++    if ( ! new_buf )
++        throw ExceptionFlowBufferAlloc("expand realloc OOM");
++
++    buffer_ = new_buf;
++}
++
++void FlowBuffer::ContractBuffer() {
++    if ( buffer_length_ < policy.contract_threshold )
++        return;
++
++    buffer_length_ = policy.min_capacity;
++    unsigned char* new_buf = (unsigned char*)realloc(buffer_, buffer_length_);
++
++    if ( ! new_buf )
++        throw ExceptionFlowBufferAlloc("contract realloc OOM");
++
++    buffer_ = new_buf;
++}
++
++void FlowBuffer::SetLineBreaker(unsigned char* lbreaker) {
++    linebreaker_ = *lbreaker;
++    linebreak_style_default = linebreak_style_;
++    linebreak_style_ = LINE_BREAKER;
++}
++
++void FlowBuffer::Uns

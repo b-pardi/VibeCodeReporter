@@ -1,0 +1,65 @@
+@@ -269,6 +269,27 @@ public class RamUserTests extends UserTests {
+         Assert.assertTrue(usageAfterCleanup < usageAfterDelete);
+     }
+ 
++    @Test
++    public void moveToDescendant() throws Exception {
++        String username = generateUsername();
++        String password = "terriblepassword";
++        UserContext context = PeergosNetworkUtils.ensureSignedUp(username, password, network, crypto);
++        FileWrapper userRoot = context.getUserRoot().join();
++        String parentName = "parent";
++        userRoot.mkdir(parentName, network, false, context.mirrorBatId(), crypto).join();
++        Path parentPath = Paths.get(username, parentName);
++        FileWrapper parent = context.getByPath(parentPath).join().get();
++        String childName = "child";
++        parent.mkdir(childName, network, false, context.mirrorBatId(), crypto).join();
++        parent = context.getByPath(parentPath).join().get();
++        FileWrapper child = context.getByPath(parentPath.resolve(childName)).join().get();
++        try {
++            parent.moveTo(child, parent, parentPath, context, () -> Futures.of(true)).join();
++            throw new RuntimeException("Should fail before here");
++        } catch (CompletionException e) {}
++        context.getByPath(parentPath.resolve(childName)).join().get();
++    }
++
+     private static byte[] get(URL target) throws IOException {
+         HttpURLConnection conn = (HttpURLConnection) target.openConnection();
+         conn.setRequestMethod("GET");
+
+
+
+
+@@ -1928,68 +1928,74 @@ public class FileWrapper {
+         if (! target.isDirectory()) {
+             return Futures.errored(new IllegalStateException("CopyTo target " + target + " must be a directory"));
+         }
++        // ensure we aren't trying to move a folder to a descendant folder, which will result in data loss!
++        return target.getPath(context.network).thenCompose(targetPath -> {
++            Path targetP = PathUtil.get(targetPath);
++            if (targetP.startsWith(ourPath))
++                throw new IllegalStateException("You cannot move a folder to a descendant folder");
++
++            Optional<BatId> targetMirrorBatId = target.mirrorBatId()
++                    .or(() -> target.owner().equals(context.signer.publicKeyHash) ?
++                            context.mirrorBatId() :
++                            Optional.empty());
++
++            NetworkAccess net = context.network;
++            Hasher hasher = context.crypto.hasher;
++
++            return net.synchronizer.applyComplexUpdate(owner(), signingPair(),
++                    (v, c) -> context.getPublicFile(ourPath).thenApply(opt ->  opt.isPresent())
++                            .thenCompose(isPublic -> context.sharedWithCache.getAllDescendantShares(ourPath, v)
++                                    .thenCompose(shared -> {
++                                        return (isPublic || ! owner().equals(target.owner()) ?
++                                                Futures.of(false) :
++                                                shared.isEmpty() // fast path
++                                                        ? Futures.of(true) : preserveAccess.get())
++                                                .thenCompose(keepAccess -> {
++                                                    boolean differentParentWriter = !target.writer().equals(parent.writer());
++                                                    // TODO optimise different parent writer case by correcting owned keys
++                                                    if (keepAccess && ! differentParentWriter) {
++                                                        // just update parent and child pointers, no need to re-upload, rotate keys etc.
++                                                        boolean differentWriter = ! target.writer().equals(writer());
++                                                        boolean ourFile = context.signer != null && target.owner().equals(context.signer.publicKeyHash);

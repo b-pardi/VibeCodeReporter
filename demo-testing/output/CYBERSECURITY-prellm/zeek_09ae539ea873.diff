@@ -1,0 +1,148 @@
+@@ -88,13 +88,20 @@ public:
+ 			return false;
+ 
+ 		if ( ec1.type == BifEnum::Tunnel::IP ||
+-				 ec1.type == BifEnum::Tunnel::VXLAN ||
+ 		     ec1.type == BifEnum::Tunnel::GRE )
+ 			// Reversing endpoints is still same tunnel.
+ 			return ec1.uid == ec2.uid && ec1.proto == ec2.proto &&
+ 			  ((ec1.src_addr == ec2.src_addr && ec1.dst_addr == ec2.dst_addr) ||
+ 			   (ec1.src_addr == ec2.dst_addr && ec1.dst_addr == ec2.src_addr));
+ 
++		if ( ec1.type == BifEnum::Tunnel::VXLAN )
++			// Reversing endpoints is still same tunnel, destination port is
++			// always the same.
++			return ec1.dst_port == ec2.dst_port &&
++			       ec1.uid == ec2.uid && ec1.proto == ec2.proto &&
++			  ((ec1.src_addr == ec2.src_addr && ec1.dst_addr == ec2.dst_addr) ||
++			   (ec1.src_addr == ec2.dst_addr && ec1.dst_addr == ec2.src_addr));
++
+ 		return ec1.src_addr == ec2.src_addr && ec1.dst_addr == ec2.dst_addr &&
+ 		       ec1.src_port == ec2.src_port && ec1.dst_port == ec2.dst_port &&
+ 		       ec1.uid == ec2.uid && ec1.proto == ec2.proto;
+
+
+
+
+@@ -96,6 +96,18 @@ void Manager::InitPreScript()
+ 
+ void Manager::InitPostScript()
+ 	{
++	auto id = global_scope()->Lookup("Tunnel::vxlan_ports");
++
++	if ( ! (id && id->ID_Val()) )
++		reporter->FatalError("Tunnel::vxlan_ports not defined");
++
++	auto table_val = id->ID_Val()->AsTableVal();
++	auto port_list = table_val->ConvertToPureList();
++
++	for ( auto i = 0; i < port_list->Length(); ++i )
++		vxlan_ports.emplace_back(port_list->Index(i)->AsPortVal()->Port());
++
++	Unref(port_list);
+ 	}
+ 
+ void Manager::DumpDebug()
+
+
+
+
+@@ -22,6 +22,7 @@
+ #define ANALYZER_MANAGER_H
+ 
+ #include <queue>
++#include <vector>
+ 
+ #include "Analyzer.h"
+ #include "Component.h"
+@@ -335,6 +336,13 @@ public:
+ 	void ScheduleAnalyzer(const IPAddr& orig, const IPAddr& resp, PortVal* resp_p,
+ 			      Val* analyzer, double timeout);
+ 
++
++	/**
++	 * @return the UDP port numbers to be associated with VXLAN traffic.
++	 */
++	const std::vector<uint16>& GetVxlanPorts() const
++		{ return vxlan_ports; }
++
+ private:
+ 	typedef set<Tag> tag_set;
+ 	typedef map<uint32, tag_set*> analyzer_map_by_port;
+@@ -390,6 +398,7 @@ private:
+ 
+ 	conns_map conns;
+ 	conns_queue conns_by_timeout;
++	std::vector<uint16> vxlan_ports;
+ };
+ 
+ }
+
+
+
+
+@@ -7,6 +7,7 @@
+ #include "Net.h"
+ #include "NetVar.h"
+ #include "analyzer/protocol/udp/UDP.h"
++#include "analyzer/Manager.h"
+ #include "Reporter.h"
+ #include "Conn.h"
+ 
+@@ -61,7 +62,30 @@ void UDP_Analyzer::DeliverPacket(int len, const u_char* data, bool is_orig,
+ 
+ 	int chksum = up->uh_sum;
+ 
+-	if ( ! ignore_checksums && caplen >= len )
++	auto validate_checksum = ! ignore_checksums && caplen >=len;
++	constexpr auto vxlan_len = 8;
++	constexpr auto eth_len = 14;
++
++	if ( validate_checksum &&
++	     len > (sizeof(struct udphdr) + vxlan_len + eth_len) &&
++	     (data[0] & 0x08) == 0x08 )
++		{
++		auto& vxlan_ports = analyzer_mgr->GetVxlanPorts();
++
++		if ( std::find(vxlan_ports.begin(), vxlan_ports.end(),
++		               ntohs(up->uh_dport)) != vxlan_ports.end() )
++			{
++			// Looks like VXLAN on a well-known port, so the checksum should be
++			// transmitted as zero, and we should accept that.  If not
++			// transmitted as zero, then validating the checksum is optional.
++			if ( chksum == 0 )
++				validate_checksum = false;
++			else
++				validate_checksum = BifConst::Tunnel::validate_vxlan_checksums;
++			}
++		}
++
++	if ( validate_checksum )
+ 		{
+ 		bool bad = false;
+ 
+
+
+
+
+@@ -3,7 +3,6 @@
+ #include "TunnelEncapsulation.h"
+ #include "Conn.h"
+ #include "IP.h"
+-#include "../arp/ARP.h"
+ #include "Reporter.h"
+ 
+ #include "events.bif.h"
+@@ -16,154 +15,86 @@ void VXLAN_Analyzer::Done()
+ 	Event(udp_session_done);
+ 	}
+ 
+-bool VXLANEncapsulation::DoParse(const u_char* data, int& len)
++void VXLAN_Analyzer::DeliverPacket(int len, const u_char* data, bool orig,
++                                   uint64 seq, const IP_Hdr* ip, int caplen)
+ 	{
+-		int eth_len = 14;
+-		int vxlan_len = 8;
+-		int eth_mac = 6;
+-		int proto = 0;
+-		reporter->Error("VXLANEncapsulation

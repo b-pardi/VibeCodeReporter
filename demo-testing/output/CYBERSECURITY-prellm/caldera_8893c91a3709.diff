@@ -1,0 +1,126 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,32 @@
++from importlib import import_module
++
++from app.utility.base_object import BaseObject
++
++
++class Plugin(BaseObject):
++
++    @property
++    def unique(self):
++        return self.hash(self.name)
++
++    @property
++    def display(self):
++        return dict(name=self.name, enabled=self.enabled)
++
++    def __init__(self, name):
++        self.name = name
++        module = import_module('plugins.%s.hook' % self.name)
++        self.address = module.address
++        self.enabled = module.enabled
++
++    def store(self, ram):
++        existing = self.retrieve(ram['plugins'], self.unique)
++        if not existing:
++            ram['plugins'].append(self)
++            return self.retrieve(ram['plugins'], self.unique)
++        return existing
++
++    async def enable(self, application, services):
++        plugin = getattr(import_module('plugins.%s.hook' % self.name), 'initialize')
++        await plugin(application, services)
++        self.enabled = True
+
+
+
+
+@@ -1,18 +1,24 @@
+ import ast
+ import asyncio
+ import copy
++import os
+ import traceback
+ from datetime import datetime, date
+ from importlib import import_module
++from subprocess import Popen, DEVNULL
+ 
++import aiohttp_jinja2
++import jinja2
++
++from app.objects.c_plugin import Plugin
+ from app.utility.base_service import BaseService
+ 
+ 
+ class AppService(BaseService):
+ 
+-    def __init__(self, config, plugins):
++    def __init__(self, application, config):
++        self.application = application
+         self.config = config
+-        self.plugins = plugins
+         self.log = self.add_service('app_svc', self)
+         self.loop = asyncio.get_event_loop()
+ 
+@@ -92,12 +98,25 @@ class AppService(BaseService):
+         except Exception:
+             traceback.print_exc()
+ 
+-    def get_plugins(self):
++    async def load_plugins(self):
+         """
+-        Get a list of all plugins
+-        :return: a list of plugins
++        Store all plugins in the data store, enabling those which are auto-enabled
++        :return:
+         """
+-        return self.plugins
++        for plug in os.listdir('plugins'):
++            if not os.path.isdir('plugins/%s' % plug) or not os.path.isfile('plugins/%s/hook.py' % plug):
++                self.log.error('Problem validating the "%s" plugin. Ensure CALDERA was cloned recursively.' % plug)
++                exit(0)
++            self.log.debug('Loading plugin: %s' % plug)
++            if os.path.isfile('plugins/%s/requirements.txt' % plug):
++                self.log.warning('Ensure you have installed the PIP requirements for plugin=%s' % plug)
++            plugin = Plugin(name=plug)
++            await self.get_service('data_svc').store(plugin)
++            if plugin.enabled:
++                await plugin.enable(self.application, self.get_services())
++        templates = ['plugins/%s/templates' % p.name.lower()
++                     for p in await self.get_service('data_svc').locate('plugins')]
++        aiohttp_jinja2.setup(self.application, loader=jinja2.FileSystemLoader(templates))
+ 
+     """ PRIVATE """
+ 
+
+
+
+
+@@ -24,7 +24,7 @@ class DataService(BaseService):
+         self.log = self.add_service('data_svc', self)
+         self.data_dirs = set()
+         self.ram = dict(agents=[], planners=[], adversaries=[], abilities=[], sources=[], operations=[], schedules=[],
+-                        c2=[])
++                        c2=[], plugins=[])
+ 
+     async def reset(self):
+         """
+@@ -81,7 +81,6 @@ class DataService(BaseService):
+         """
+         Read all the data sources to populate the object store
+         :param directory:
+-        :param schema:
+         :return: None
+         """
+         self.log.debug('Loading data from %s...' % directory)
+@@ -145,7 +144,8 @@ class DataService(BaseService):
+                 for p in adv.get('packs', []):
+                     ps.append(await self._add_adversary_packs(p))
+                 for pack in ps:
+-                    phases += pack
++                    if pack:
++       

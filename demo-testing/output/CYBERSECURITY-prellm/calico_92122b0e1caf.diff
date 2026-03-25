@@ -1,0 +1,111 @@
+@@ -46,11 +46,27 @@ struct bpf_map_def_extended {
+ };
+ 
+ /* These constants must be kept in sync with the calculate-flags script. */
++
++// CALI_TC_HOST_EP is set for all host interfaces including tunnels.
+ #define CALI_TC_HOST_EP		(1<<0)
++// CALI_TC_INGRESS is set when compiling a program in the "ingress" direction as defined by
++// policy.  For host endpoints, ingress has its natural meaning (towards the host namespace)
++// and it agrees with TC's definition of ingress. For workload endpoint programs, ingress is
++// relative to the workload so the ingress program is applied at egress from the host namespace
++// and vice-versa.
+ #define CALI_TC_INGRESS		(1<<1)
++// CALI_TC_TUNNEL is set when compiling the program for the IPIP tunnel. It is *not* set
++// when compiling the wireguard or tunnel program (or VXLAN).  IPIP is a special case because
++// it is a layer 3 device, so we don't see an ethernet header on packets arriving from the IPIP
++// device.
+ #define CALI_TC_TUNNEL		(1<<2)
++// CALI_CGROUP is set when compiling the cgroup connect-time load balancer programs.
+ #define CALI_CGROUP		(1<<3)
++// CALI_TC_DSR is set when compiling programs for DSR mode.  In DSR mode, traffic to node
++// ports is encapped on the "request" leg but the response is returned directly from the
++// node with the backing workload.
+ #define CALI_TC_DSR		(1<<4)
++// CALI_TC_WIREGUARD is set for the programs attached to the wireguard interface.
+ #define CALI_TC_WIREGUARD	(1<<5)
+ 
+ #ifndef CALI_DROP_WORKLOAD_TO_HOST
+
+
+
+
+@@ -1,5 +1,5 @@
+ // Project Calico BPF dataplane programs.
+-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
++// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+ //
+ // This program is free software; you can redistribute it and/or modify
+ // it under the terms of the GNU General Public License as published by
+@@ -59,7 +59,31 @@ static CALI_BPF_INLINE void do_nat_common(struct bpf_sock_addr *ctx, __u8 proto)
+ 
+ 	__u32 dport_be = host_to_ctx_port(nat_dest->port);
+ 
++	__u64 cookie = bpf_get_socket_cookie(ctx);
++	CALI_DEBUG("Store: ip=%x port=%d cookie=%x\n",
++			bpf_ntohl(nat_dest->addr), bpf_ntohs((__u16)dport_be), cookie);
++
++	/* For all protocols, record recent NAT operations in an LRU map; other BPF programs use this
++	 * cache to reverse our DNAT so they can do pre-DNAT policy. */
++	struct ct_nats_key natk = {
++		.cookie = cookie,
++		.ip = nat_dest->addr,
++		.port = dport_be,
++		.proto = proto,
++	};
++	struct sendrecv4_val val = {
++		.ip	= ctx->user_ip4,
++		.port	= ctx->user_port,
++	};
++	int rc = cali_v4_ct_nats_update_elem(&natk, &val, 0);
++	if (rc) {
++		/* if this happens things are really bad! report */
++		CALI_INFO("Failed to update ct_nats map rc=%d\n", rc);
++	}
++
+ 	if (proto != IPPROTO_TCP) {
++		/* For UDP, store a long-lived reverse mapping, which we use to reverse the DNAT for programs that
++		 * check the source on the return packets. */
+ 		__u64 cookie = bpf_get_socket_cookie(ctx);
+ 		CALI_DEBUG("Store: ip=%x port=%d cookie=%x\n",
+ 				bpf_ntohl(nat_dest->addr), bpf_ntohs((__u16)dport_be), cookie);
+@@ -68,13 +92,6 @@ static CALI_BPF_INLINE void do_nat_common(struct bpf_sock_addr *ctx, __u8 proto)
+ 			.port	= dport_be,
+ 			.cookie	= cookie,
+ 		};
+-		struct sendrecv4_val val = {
+-			.ip	= ctx->user_ip4,
+-			.port	= ctx->user_port,
+-			/* XXX we should also store the backend key to verify that it is
+-			 * XXX still ok upon recvmsg.
+-			 */
+-		};
+ 
+ 		if (cali_v4_srmsg_update_elem(&key, &val, 0)) {
+ 			/* if this happens things are really bad! report */
+
+
+
+
+@@ -21,12 +21,7 @@
+ #include "conntrack.h"
+ #include "policy.h"
+ 
+-enum cali_state_flags {
+-	CALI_ST_NAT_OUTGOING	= (1 << 0),
+-	CALI_ST_SKIP_FIB	= (1 << 1),
+-};
+-
+-CALI_MAP_V1(cali_v4_state,
++CALI_MAP(cali_v4_state, 2,
+ 		BPF_MAP_TYPE_PERCPU_ARRAY,
+ 		__u32, struct cali_tc_state,
+ 		1, 0, MAP_PIN_GLOBAL)
+
+
+
+
+@@ -1,5 +1,5 @@
+ // Project Calico BPF dataplane programs.
+-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
++// Copyright (c) 2020-2021 Tigera, Inc. A

@@ -1,0 +1,139 @@
+@@ -20,6 +20,7 @@ typedef struct {
+ // XXX remove globals
+ static R_TH_LOCAL RList *Glist = NULL;
+ 
++#include "qjs/loader.c"
+ #include "qjs/arch.c"
+ #include "qjs/core.c"
+ 
+@@ -27,13 +28,13 @@ static R_TH_LOCAL RList *Glist = NULL;
+ 
+ static bool eval(JSContext *ctx, const char *code);
+ 
+-static void js_dump_obj(JSContext *ctx, FILE *f, JSValueConst val) {
++static void r2qjs_dump_obj(JSContext *ctx, JSValueConst val) {
+ 	const char *str = JS_ToCString (ctx, val);
+ 	if (str) {
+-		fprintf (f, "%s\n", str);
++		R_LOG_ERROR ("%s", str);
+ 		JS_FreeCString (ctx, str);
+ 	} else {
+-		fprintf (f, "[exception]\n");
++		R_LOG_ERROR ("[exception]");
+ 	}
+ }
+ 
+@@ -42,11 +43,11 @@ static void js_std_dump_error1(JSContext *ctx, JSValueConst exception_val) {
+ 	bool is_error;
+ 
+ 	is_error = JS_IsError (ctx, exception_val);
+-	js_dump_obj (ctx, stderr, exception_val);
++	r2qjs_dump_obj (ctx, exception_val);
+ 	if (is_error) {
+ 		val = JS_GetPropertyStr (ctx, exception_val, "stack");
+ 		if (!JS_IsUndefined (val)) {
+-			js_dump_obj (ctx, stderr, val);
++			r2qjs_dump_obj (ctx, val);
+ 		}
+ 		JS_FreeValue (ctx, val);
+ 	}
+@@ -385,7 +386,7 @@ static bool eval(JSContext *ctx, const char *code) {
+ 	if (JS_IsException (v)) {
+ 		js_std_dump_error (ctx);
+ 		JSValue e = JS_GetException (ctx);
+-		js_dump_obj (ctx, stderr, e);
++		r2qjs_dump_obj (ctx, e);
+ 	}
+ 	eval_jobs (ctx);
+ 	if (wantRaw) {
+@@ -407,9 +408,18 @@ static bool lang_quickjs_file(RLangSession *s, const char *file) {
+ 	bool rc = false;
+ 	char *code = r_file_slurp (file, NULL);
+ 	if (code) {
+-		rc = eval (k->ctx, code) == 0;
+-		free (code);
+-		rc = true;
++		int loaded = r2qjs_loader (k->ctx, code);
++		if (loaded == 1) {
++			rc = true;
++		} else if (loaded == -1) {
++			// Error loading the file
++			return false;
++		} else {
++			// not a package
++			rc = eval (k->ctx, code) == 0;
++			free (code);
++			rc = true;
++		}
+ 	}
+ 	return rc;
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,84 @@
++// https://github.com/frida/frida-gum/blob/bd6f95d391b198d7d87264ba56f2972efc7298ec/bindings/gumjs/gumquickscriptbackend.c#L259
++
++const char * const package_marker = "📦\n";
++const char * const delimiter_marker = "\n✄\n";
++const char * const alias_marker = "\n↻ ";
++
++static void r2qjs_dump_obj(JSContext *ctx, JSValueConst val);
++
++static char *r2qjs_normalize_module_name(void* self, JSContext * ctx, const char * base_name, const char * name) {
++	// R_LOG_INFO ("normalize (%s) (%s)", base_name, name);
++	return strdup (base_name + 1);
++}
++
++static JSModuleDef *r2qjs_load_module(JSContext *ctx, const char *module_name, void *opaque) {
++	HtPP *ht = opaque;
++	char *data = ht_pp_find (ht, module_name, NULL);
++	if (data) {
++		JSValue val = JS_Eval (ctx, data, strlen (data), module_name,
++				JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_STRICT | JS_EVAL_FLAG_COMPILE_ONLY);
++		if (JS_IsException (val)) {
++			JSValue e = JS_GetException (ctx);
++			r2qjs_dump_obj (ctx, e);
++			return NULL;
++		}
++		// R_LOG_INFO ("loaded (%s)", module_name);
++		JS_FreeValue (ctx, val);
++		return JS_VALUE_GET_PTR (val);
++	}
++	R_LOG_ERROR ("Cannot find module (%s)", module_name);
++	return NULL;
++}
++
++static int r2qjs_loader(JSContext *ctx, const char *const buffer) {
++	JSRuntime *rt = JS_GetRuntime (ctx);
++	if (!r_str_startswith (buffer, package_marker)) {
++		return 0;
++	}
++	const char *ptr = buffer + strlen (package_marker);
++	const char *ptr_end = buffer + strlen (buffer);
++	const char *assets = strstr (ptr, delimiter_marker);
++	if (!assets) {
++		return -1;
++	}
++
++	HtPP *ht = ht_pp_new0 ();
++	JS_SetModuleLoaderFunc (rt, (JSModuleNormalizeFunc*)r2qjs_normalize_module_name, r2qjs_load_module, ht);
++	char *entry = NULL;
++
++	assets += strlen (delimiter_marker);
++	while (ptr < ptr_end && assets < ptr_end) {
++		const char * nl = strchr (ptr, '\n');
++		if (!nl) {
++			break;
++		}
++		int size = atoi (ptr);
++		if (size < 1) {
++			break;
++		}
++		const char *const space = strchr (ptr, ' ');
++		if (!space) {
++			break;
++		}
++		char *filename = r_str_ndup (space + 1, nl - space - 1);

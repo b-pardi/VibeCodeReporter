@@ -1,0 +1,141 @@
+@@ -478,8 +478,16 @@ handle_ipv4(struct __ctx_buff *ctx, __u32 secctx,
+ 		if (ctx_get_xfer(ctx) != XFER_PKT_NO_SVC &&
+ 		    !bpf_skip_nodeport(ctx)) {
+ 			ret = nodeport_lb4(ctx, secctx);
+-			if (ret < 0)
++			if (ret == NAT_46X64_RECIRC) {
++				ctx_store_meta(ctx, CB_SRC_IDENTITY, secctx);
++				ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_LXC);
++				return send_drop_notify_error(ctx, secctx,
++							      DROP_MISSED_TAIL_CALL,
++							      CTX_ACT_DROP,
++							      METRIC_INGRESS);
++			} else if (ret < 0) {
+ 				return ret;
++			}
+ 		}
+ 		/* Verifier workaround: modified ctx access. */
+ 		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+
+
+
+
+@@ -121,9 +121,15 @@ int tail_lb_ipv4(struct __ctx_buff *ctx)
+ 
+ 	if (!bpf_skip_nodeport(ctx)) {
+ 		ret = nodeport_lb4(ctx, 0);
+-		if (IS_ERR(ret))
++		if (ret == NAT_46X64_RECIRC) {
++			ep_tail_call(ctx, CILIUM_CALL_IPV6_FROM_LXC);
++			return send_drop_notify_error(ctx, 0, DROP_MISSED_TAIL_CALL,
++						      CTX_ACT_DROP,
++						      METRIC_INGRESS);
++		} else if (IS_ERR(ret)) {
+ 			return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
+ 						      METRIC_INGRESS);
++		}
+ 	}
+ 
+ 	return bpf_xdp_exit(ctx, ret);
+
+
+
+
+@@ -413,7 +413,7 @@ enum {
+ #define DROP_NO_SERVICE		-158
+ #define DROP_UNUSED8		-159 /* unused */
+ #define DROP_NO_TUNNEL_ENDPOINT -160
+-#define DROP_UNUSED9		-161 /* unused */
++#define DROP_NAT_46X64_DISABLED	-161
+ #define DROP_EDT_HORIZON	-162
+ #define DROP_UNKNOWN_CT		-163
+ #define DROP_HOST_UNREACHABLE	-164
+@@ -438,6 +438,7 @@ enum {
+ #define DROP_INVALID_VNI	-183
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
++#define NAT_46X64_RECIRC	100
+ 
+ /* Cilium metrics reasons for forwarding packets and other stats.
+  * If reason is larger than below then this is a drop reason and
+@@ -641,6 +642,7 @@ enum {
+ /* Service flags (lb{4,6}_service->flags2) */
+ enum {
+ 	SVC_FLAG_LOCALREDIRECT = (1 << 0),  /* local redirect */
++	SVC_FLAG_NAT_46X64     = (1 << 1),  /* NAT-46/64 entry */
+ };
+ 
+ struct ipv6_ct_tuple {
+
+
+
+
+@@ -9,6 +9,7 @@
+ #include "ipv4.h"
+ #include "hash.h"
+ #include "ids.h"
++#include "nat_46x64.h"
+ 
+ #ifdef ENABLE_IPV6
+ struct {
+@@ -750,6 +751,17 @@ lb6_update_affinity_by_netns(const struct lb6_service *svc __maybe_unused,
+ #endif
+ }
+ 
++static __always_inline int
++lb6_to_lb4(struct __ctx_buff *ctx, const struct ipv6hdr *ip6)
++{
++	__be32 src4, dst4;
++
++	build_v4_from_v6((const union v6addr *)&ip6->saddr, &src4);
++	build_v4_from_v6((const union v6addr *)&ip6->daddr, &dst4);
++
++	return ipv6_to_ipv4(ctx, src4, dst4);
++}
++
+ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
+ 				     int l3_off, int l4_off,
+ 				     struct csum_offset *csum_off,
+@@ -1082,6 +1094,16 @@ bool lb4_src_range_ok(const struct lb4_service *svc __maybe_unused,
+ #endif /* ENABLE_SRC_RANGE_CHECK */
+ }
+ 
++static __always_inline bool
++lb4_to_lb6_service(const struct lb4_service *svc __maybe_unused)
++{
++#ifdef ENABLE_NAT_46X64
++	return svc->flags2 & SVC_FLAG_NAT_46X64;
++#else
++	return false;
++#endif
++}
++
+ static __always_inline
+ struct lb4_service *lb4_lookup_service(struct lb4_key *key,
+ 				       const bool scope_switch)
+@@ -1093,7 +1115,7 @@ struct lb4_service *lb4_lookup_service(struct lb4_key *key,
+ 	svc = map_lookup_elem(&LB4_SERVICES_MAP_V2, key);
+ 	if (svc) {
+ 		if (!scope_switch || !lb4_svc_is_local_scope(svc))
+-			return svc->count ? svc : NULL;
++			return svc->count || lb4_to_lb6_service(svc) ? svc : NULL;
+ 		key->scope = LB_LOOKUP_SCOPE_INT;
+ 		svc = map_lookup_elem(&LB4_SERVICES_MAP_V2, key);
+ 		if (svc && svc->count)
+@@ -1336,6 +1358,17 @@ lb4_update_affinity_by_netns(const struct lb4_service *svc __maybe_unused,
+ #endif
+ }
+ 
++static __always_inline int
++lb4_to_lb6(struct __ctx_buff *ctx, const struct iphdr *ip4, int l3_off)
++{
++	union v6addr src6, dst6;
++
++	build_v4_in_v6(&src6, ip4->saddr);
++	build_v4_in_v6(&dst6, ip4->daddr);
++
++	return ipv4_to_ipv6(ctx, l3_off, &src6, &dst6);
++}
++
+ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
+ 	

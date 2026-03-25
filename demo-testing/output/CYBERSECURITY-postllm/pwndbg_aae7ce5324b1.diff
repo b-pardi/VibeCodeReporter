@@ -1,0 +1,109 @@
+@@ -29,6 +29,7 @@ import pwndbg.aglib.disasm.x86
+ import pwndbg.aglib.memory
+ import pwndbg.emu.emulator
+ import pwndbg.lib.cache
++import pwndbg.lib.config
+ from pwndbg.aglib.disasm.arch import DEBUG_ENHANCEMENT
+ from pwndbg.aglib.disasm.arch import DisassemblyAssistant
+ from pwndbg.aglib.disasm.instruction import ManualPwndbgInstruction
+@@ -76,7 +77,7 @@ next_addresses_cache: Set[int] = set()
+ @pwndbg.dbg.event_handler(EventType.STOP)
+ def enhance_cache_listener() -> None:
+     # Clear the register value cache to ensure we get the correct program counter value
+-    pwndbg.aglib.regs.read_reg.cache.clear()  # type: ignore[attr-defined]
++    pwndbg.aglib.regs.read_reg.cache.clear()
+ 
+     if pwndbg.aglib.regs.pc not in next_addresses_cache:
+         # Clear the enhanced instruction cache to ensure we don't use stale values
+
+
+
+
+@@ -139,8 +139,11 @@ class Bins:
+         if self.bin_type == BinType.UNSORTED:
+             # The unsorted bin only has one bin called 'all'
+ 
+-            # TODO: We shouldn't be mixing int and str types like this
+-            size = "all"  # type: ignore[assignment]
++            # Handle this case here, so we don't assign a str to an int-type variable
++            if "all" in self.bins:
++                return self.bins["all"].contains_chunk(chunk)
++            else:
++                return False
+         elif self.bin_type == BinType.LARGE:
+             # All the other bins (other than unsorted) store chunks of the same
+             # size in a bin, so we can use the size directly. But the largebin
+
+
+
+
+@@ -6,6 +6,7 @@ from typing import Dict
+ from typing import List
+ from typing import Tuple
+ from typing import Type
++from typing import cast
+ 
+ import pwndbg.aglib.arch
+ import pwndbg.aglib.memory
+@@ -174,9 +175,10 @@ class CStruct2GDB:
+         field_address = self.get_field_address(field)
+         field_type = next(f for f in self._c_struct._fields_ if f[0] == field)[1]
+         if hasattr(field_type, "_length_"):  # f is a ctypes Array
+-            t = C2GDB_MAPPING[field_type._type_]
++            array_type = cast(ctypes.Array[Any], field_type)
++            t = C2GDB_MAPPING[array_type._type_]
+             return pwndbg.aglib.memory.get_typed_pointer_value(
+-                t.array(field_type._length_), field_address
++                t.array(array_type._length_), field_address
+             )
+         return pwndbg.aglib.memory.get_typed_pointer_value(C2GDB_MAPPING[field_type], field_address)
+ 
+@@ -205,8 +207,9 @@ class CStruct2GDB:
+             field_type = f[1]
+             bitpos = getattr(cls._c_struct, field_name).offset * 8
+             if hasattr(field_type, "_length_"):  # f is a ctypes Array
+-                t = C2GDB_MAPPING[field_type._type_]
+-                _type = t.array(field_type._length_)
++                arr_type = cast(ctypes.Array[Any], field_type)
++                t = C2GDB_MAPPING[arr_type._type_]
++                _type = t.array(arr_type._length_)
+             else:
+                 _type = C2GDB_MAPPING[field_type]
+             fake_gdb_fields.append(FakeGDBField(bitpos, field_name, _type, cls))
+
+
+
+
+@@ -7,10 +7,15 @@ from typing import Dict
+ from typing import Tuple
+ 
+ import pwndbg
++import pwndbg.aglib.kernel
++import pwndbg.aglib.memory
++import pwndbg.aglib.symbol
++import pwndbg.aglib.typeinfo
+ import pwndbg.aglib.vmmap_custom
+ import pwndbg.color.message as M
+ import pwndbg.lib.cache
+ import pwndbg.lib.memory
++import pwndbg.lib.regs
+ from pwndbg.aglib.kernel.vmmap import kernel_vmmap_pages
+ from pwndbg.lib.regs import BitFlags
+ 
+@@ -46,10 +51,6 @@ class ArchPagingInfo:
+     VMALLOC = "vmalloc"
+     VMEMMAP = "vmemmap"
+ 
+-    physmap: int
+-    vmalloc: int
+-    vmemmap: int
+-    kbase: int
+     addr_marker_sz: int
+     va_bits: int
+     pagetable_cache: Dict[pwndbg.dbg_mod.Value, Dict[int, int]] = {}
+@@ -72,6 +73,22 @@ class ArchPagingInfo:
+     def STRUCT_PAGE_SHIFT(self):
+         return int(math.log2(self.STRUCT_PAGE_SIZE))
+ 
++    @property
++    def physmap(self) -> int:

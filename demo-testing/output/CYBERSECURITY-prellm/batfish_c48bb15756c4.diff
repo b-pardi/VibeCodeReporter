@@ -1,0 +1,131 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,63 @@
++package org.batfish.dataplane.ibdp;
++
++import com.google.common.base.MoreObjects;
++import java.util.Comparator;
++import java.util.Objects;
++import javax.annotation.Nullable;
++import javax.annotation.ParametersAreNonnullByDefault;
++
++/**
++ * Represents an edge across two Virtual routers. Routes can be leaked across the edge, going from
++ * {@link #_fromVrf} to another VRF's {@link #_toRib}.
++ */
++@ParametersAreNonnullByDefault
++public final class CrossVrfEdgeId implements Comparable<CrossVrfEdgeId> {
++
++  private final String _fromVrf;
++  private final String _toRib;
++
++  CrossVrfEdgeId(String fromVrf, String toRib) {
++    _fromVrf = fromVrf;
++    _toRib = toRib;
++  }
++
++  String getFromVrf() {
++    return _fromVrf;
++  }
++
++  String getToRib() {
++    return _toRib;
++  }
++
++  @Override
++  public boolean equals(@Nullable Object o) {
++    if (this == o) {
++      return true;
++    }
++    if (!(o instanceof CrossVrfEdgeId)) {
++      return false;
++    }
++    CrossVrfEdgeId that = (CrossVrfEdgeId) o;
++    return Objects.equals(_fromVrf, that._fromVrf) && Objects.equals(_toRib, that._toRib);
++  }
++
++  @Override
++  public int hashCode() {
++    return Objects.hash(_fromVrf, _toRib);
++  }
++
++  @Override
++  public int compareTo(CrossVrfEdgeId o) {
++    return Comparator.comparing(CrossVrfEdgeId::getFromVrf)
++        .thenComparing(CrossVrfEdgeId::getToRib)
++        .compare(this, o);
++  }
++
++  @Override
++  public String toString() {
++    return MoreObjects.toStringHelper(this)
++        .add("fromVrf", _fromVrf)
++        .add("toRib", _toRib)
++        .toString();
++  }
++}
+
+
+
+
+@@ -463,6 +463,8 @@ class IncrementalBdpEngine {
+ 
+       computeIterationOfBgpRoutes(
+           nodes, iterationLabel, allNodes, bgpTopology, networkConfigurations);
++
++      leakAcrossVrfs(nodes, iterationLabel);
+     }
+   }
+ 
+@@ -497,7 +499,7 @@ class IncrementalBdpEngine {
+               n -> {
+                 for (VirtualRouter vr : n.getVirtualRouters().values()) {
+                   Map<BgpRib, RibDelta<BgpRoute>> deltas =
+-                      vr.processBgpMessages(bgpTopology, networkConfigurations);
++                      vr.processBgpMessages(bgpTopology, networkConfigurations, nodes);
+                   vr.finalizeBgpRoutesAndQueueOutgoingMessages(
+                       deltas, allNodes, bgpTopology, networkConfigurations);
+                 }
+@@ -506,6 +508,26 @@ class IncrementalBdpEngine {
+     }
+   }
+ 
++  private void leakAcrossVrfs(Map<String, Node> nodes, String iterationLabel) {
++    try (ActiveSpan span =
++        GlobalTracer.get()
++            .buildSpan(iterationLabel + ": Leaking routes across VRFs")
++            .startActive()) {
++      assert span != null; // avoid unused warning
++
++      AtomicInteger propagateCrossVRF =
++          _newBatch.apply(iterationLabel + ": Leaking routes across VRFs", nodes.size());
++      nodes
++          .values()
++          .parallelStream()
++          .forEach(
++              n -> {
++                n.getVirtualRouters().values().forEach(VirtualRouter::processCrossVrfRoutes);
++                propagateCrossVRF.incrementAndGet();
++              });
++    }
++  }
++
+   /**
+    * Run {@link VirtualRouter#computeFib} on all of the given nodes (and their virtual routers)
+    *
+
+
+
+
+@@ -5,6 +5,7 @@ import static com.google.common.base.Preconditions.checkState;
+ import static java.util.Objects.requireNonNull;
+ import static org.batfish.common.util.CommonUtil.toImmutableSortedMap;
+ import static org.batfish.datamodel.MultipathEquivalentAsPathMatchMode.EXACT_PATH;
++import static org.batfish.datamodel.routing_policy.Environment.Direction.IN;
+ import static org.batfish.dataplane.protocols.IsisProtocolHelper.convertRouteLevel1ToLevel2;
+ import static org.batfish.dataplane.protocols.IsisProtocolHelper.setOverloadOnAllRoutes;
+ import static org.batfish.dataplane.protocols.StaticRouteHelper.isInterfaceRoute;
+@@ -18,10 +19,12 @@ import com.google.common.collect.ImmutableMap;
+ import co

@@ -1,0 +1,149 @@
+@@ -184,13 +184,9 @@ static bool r_bin_coff_init_symtable(struct r_bin_coff_obj *obj) {
+ }
+ 
+ static int r_bin_coff_init(struct r_bin_coff_obj *obj, RBuffer *buf, bool verbose) {
+-	obj->b = r_buf_new ();
++	obj->b = r_buf_ref (buf);
+ 	obj->size = buf->length;
+ 	obj->verbose = verbose;
+-	if (!r_buf_set_bytes (obj->b, buf->buf, obj->size)){
+-		r_buf_free (obj->b);
+-		return false;
+-	}
+ 	if (!r_bin_coff_init_hdr (obj)) {
+ 		bprintf ("Warning: failed to init hdr\n");
+ 		return false;
+@@ -210,6 +206,7 @@ static int r_bin_coff_init(struct r_bin_coff_obj *obj, RBuffer *buf, bool verbos
+ void r_bin_coff_free(struct r_bin_coff_obj *obj) {
+ 	free (obj->scn_hdrs);
+ 	free (obj->symbols);
++	r_buf_free (obj->b);
+ 	R_FREE (obj);
+ }
+ 
+
+
+
+
+@@ -26,10 +26,7 @@ RBinDexObj *r_bin_dex_new_buf(RBuffer *buf) {
+ 		goto fail;
+ 	}
+ 	bin->size = buf->length;
+-	bin->b = r_buf_new ();
+-	if (!r_buf_set_bytes (bin->b, buf->buf, bin->size)) {
+-		goto fail;
+-	}
++	bin->b = r_buf_ref (buf);
+ 	/* header */
+ 	if (bin->size < sizeof (struct dex_header_t)) {
+ 		goto fail;
+
+
+
+
+@@ -3628,12 +3628,9 @@ ELFOBJ* Elf_(r_bin_elf_new)(const char* file, bool verbose) {
+ ELFOBJ* Elf_(r_bin_elf_new_buf)(RBuffer *buf, bool verbose) {
+ 	ELFOBJ *bin = R_NEW0 (ELFOBJ);
+ 	bin->kv = sdb_new0 ();
+-	bin->b = r_buf_new ();
+ 	bin->size = (ut32)buf->length;
+ 	bin->verbose = verbose;
+-	if (!r_buf_set_bytes (bin->b, buf->buf, buf->length)) {
+-		return Elf_(r_bin_elf_free) (bin);
+-	}
++	bin->b = r_buf_ref (buf);
+ 	if (!elf_init (bin)) {
+ 		return Elf_(r_bin_elf_free) (bin);
+ 	}
+
+
+
+
+@@ -44,16 +44,18 @@ struct boot_img_hdr {
+ typedef struct {
+ 	Sdb *kv;
+ 	BootImage bi;
++	RBuffer *buf;
+ } BootImageObj;
+ 
+-static int bootimg_header_load(BootImage *bi, RBuffer *buf, Sdb *db) {
++static int bootimg_header_load(BootImageObj *obj, Sdb *db) {
+ 	char *n;
+ 	int i;
+-	if (r_buf_size (buf) < sizeof (BootImage)) {
++	if (r_buf_size (obj->buf) < sizeof (BootImage)) {
+ 		return false;
+ 	}
+ 	// TODO make it endian-safe (void)r_buf_fread_at (buf, 0, (ut8*)bi, "IIiiiiiiiiiiii", 1);
+-	(void) r_buf_read_at (buf, 0, (ut8 *) bi, sizeof (BootImage));
++	BootImage *bi = &obj->bi;
++	(void) r_buf_read_at (obj->buf, 0, (ut8 *)bi, sizeof (BootImage));
+ 	if ((n = r_str_ndup ((char *) bi->name, BOOT_NAME_SIZE))) {
+ 		sdb_set (db, "name", n, 0);
+ 		free (n);
+@@ -82,30 +84,29 @@ static Sdb *get_sdb(RBinFile *bf) {
+ 	return ao? ao->kv: NULL;
+ }
+ 
+-static bool load_bytes(RBinFile *bf, void **bin_obj, const ut8 *buf, ut64 sz, ut64 la, Sdb *sdb) {
++static void *load_buffer(RBinFile *bf, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+ 	BootImageObj *bio = R_NEW0 (BootImageObj);
+ 	if (!bio) {
+-		return false;
++		return NULL;
+ 	}
+ 	bio->kv = sdb_new0 ();
+ 	if (!bio->kv) {
+ 		free (bio);
+ 		return false;
+ 	}
+-	if (!bootimg_header_load (&bio->bi, bf->buf, bio->kv)) {
+-		free(bio);
++	bio->buf = r_buf_ref (buf);
++	if (!bootimg_header_load (bio, bio->kv)) {
++		free (bio);
+ 		return false;
+ 	}
+ 	sdb_ns_set (sdb, "info", bio->kv);
+-	*bin_obj = bio;
+-	return true;
+-}
+-
+-static bool load(RBinFile *bf) {
+-	return true;
++	return bio;
+ }
+ 
+ static int destroy(RBinFile *bf) {
++	BootImageObj *bio = bf->o->bin_obj;
++	r_buf_free (bio->buf);
++	R_FREE (bf->o->bin_obj);
+ 	return true;
+ }
+ 
+@@ -144,8 +145,17 @@ static RBinInfo *info(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool check_bytes(const ut8 *buf, ut64 length) {
+-	return (buf && length > 12 && !strncmp ((const char *) buf, "ANDROID!", 8));
++static bool check_buffer(RBuffer *buf) {
++	ut8 tmp[13];
++	int r = r_buf_read_at (buf, 0, tmp, sizeof (tmp));
++	return r > 12 && !strncmp ((const char *)tmp, "ANDROID!", 8);
++}
++
++static bool check_bytes(const ut8 *b, ut64 length) {
++	RBuffer *buf = r_buf_new_with_bytes (b, length);
++	bool res = check_buffer (buf);
++	r_buf_free (buf);
++	return res;
+ }
+ 
+ static RList *entries(RBinFile *bf) {
+@@ -245,10 +255,10 @@ RBinPlugin r_bin_plugin_bootimg = {
+ 	.desc = "Android Boot Image",
+ 	.license = "LGPL3",
+ 	.get_sdb = &get_sdb,
+-	.load = &load,
+-	.load_bytes = &load_byte

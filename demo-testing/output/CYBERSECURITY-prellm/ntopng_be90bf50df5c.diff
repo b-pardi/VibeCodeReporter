@@ -1,0 +1,122 @@
+@@ -43,7 +43,8 @@ class Mutex {
+   Mutex();
+   ~Mutex() { pthread_mutex_destroy(&the_mutex); };
+ 
+-  void lock(const char *filename, const int line, bool trace_errors = true);
++  bool lock(const char *filename, const int line, bool trace_errors = true);
++  bool lockTimeout(const char *filename, const int line, struct timespec *wait, bool trace_errors = true);
+   void unlock(const char *filename, const int line, bool trace_errors = true);
+   inline bool is_locked() { return(locked); };
+ 
+
+
+
+
+@@ -63,7 +63,7 @@ class Ntop {
+   NtopGlobals *globals; /**< Pointer of Ntop globals info and variables. */
+   u_int num_cpus; /**< Number of physical CPU cores. */
+   Redis *redis; /**< Pointer to the Redis server. */
+-  Mutex m, users_m, speedtest_m;
++  Mutex m, users_m, speedtest_m, pools_lock;
+   std::map<std::string, bool> cachedCustomLists; /* Cache of lists filenames */
+ #ifndef HAVE_NEDGE
+   ElasticSearch *elastic_search; /**< Pointer of Elastic Search. */
+@@ -627,7 +627,7 @@ public:
+ #ifdef NTOPNG_PRO
+   inline AssetManagement* get_am()                          { return(&am);              }
+ #endif
+-
++  inline Mutex* get_pools_lock()                            { return(&pools_lock);      }
+ };
+ 
+ extern Ntop *ntop;
+
+
+
+
+@@ -6357,6 +6357,31 @@ static int ntop_check_nprobe_ips_configured(lua_State* vm) {
+ 
+ /* **************************************************************** */
+ 
++static int ntop_pools_lock(lua_State* vm) {
++  u_int max_lock_duration;
++  struct timespec wait;
++  
++  if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TNUMBER) != CONST_LUA_OK) return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
++  max_lock_duration = lua_tonumber(vm, 1);
++
++  if(max_lock_duration > 10) max_lock_duration = 10;
++
++  wait.tv_sec = max_lock_duration, wait.tv_nsec = 0;
++  lua_pushboolean(vm, ntop->get_pools_lock()->lockTimeout(__FILE__, __LINE__, &wait));
++  return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_OK));
++}
++
++/* **************************************************************** */
++
++static int ntop_pools_unlock(lua_State* vm) {
++  ntop->get_pools_lock()->unlock(__FILE__, __LINE__);
++  lua_pushboolean(vm, true);
++  
++  return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_OK));
++}
++
++/* **************************************************************** */
++
+ static luaL_Reg _ntop_reg[] = {
+   { "getDirs",           ntop_get_dirs },
+   { "getInfo",           ntop_get_info },
+@@ -6732,6 +6757,10 @@ static luaL_Reg _ntop_reg[] = {
+   { "addBin",                    ntop_add_bin                        },
+   { "findSimilarities",          ntop_find_bin_similarities          },
+ 
++  /* Pools Lock/Unlock */
++  { "poolsLock",                 ntop_pools_lock                     },
++  { "poolsUnlock",               ntop_pools_unlock                   },
++  
+   { NULL,          NULL}
+ };
+ 
+
+
+
+
+@@ -36,7 +36,7 @@ Mutex::Mutex() {
+ 
+ /* ******************************* */
+ 
+-void Mutex::lock(const char *filename, const int line, bool trace_errors) {
++bool Mutex::lock(const char *filename, const int line, bool trace_errors) {
+   int rc;
+ 
+   errno = 0;
+@@ -56,6 +56,78 @@ void Mutex::lock(const char *filename, const int line, bool trace_errors) {
+   last_lock_line = line, num_locks++;
+   // ntop->getTrace()->traceEvent(TRACE_NORMAL, "%s(%p)", __FUNCTION__, this);
+ #endif
++
++  return(locked);
++}
++
++/* ******************************* */
++
++#ifdef __APPLE__
++/*
++ *
++ * https://www.mail-archive.com/dev@apr.apache.org/msg26846.html
++ *
++ * A pthread_mutex_timedlock() impl for OSX/macOS, which lacks the
++ * real thing.
++ * NOTE: Unlike the real McCoy, won't return EOWNERDEAD, EDEADLK
++ *       or EOWNERDEAD
++ */
++static int pthread_mutex_timedlock(pthread_mutex_t *mutex, struct timespec *abs_timeout) {
++  int rv;
++  struct timespec remaining, slept, ts;
++
++  remaining = *abs_timeout;
++
++  while((rv = pthread_mutex_trylock(mutex)) == EBUSY) {
++    ts.tv_sec = 0;
++    ts.tv_nsec = (remaining.tv_sec > 0 ? 10000000 :
++		  (remaining.tv_nsec < 10000

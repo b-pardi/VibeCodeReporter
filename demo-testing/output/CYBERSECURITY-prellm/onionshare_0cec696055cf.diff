@@ -1,0 +1,130 @@
+@@ -20,7 +20,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ import os, sys, time, argparse, threading
+ 
+-from . import strings, common, web
++from . import strings, common
++from .web import Web
+ from .onion import *
+ from .onionshare import OnionShare
+ from .settings import Settings
+@@ -67,14 +68,9 @@ def main(cwd=None):
+         print(strings._('no_filenames'))
+         sys.exit()
+ 
+-    # Tell web if receive mode is enabled
+-    if receive:
+-        web.set_receive_mode()
+-
+     # Debug mode?
+     if debug:
+         common.set_debug(debug)
+-        web.debug_mode()
+ 
+     # Validation
+     valid = True
+@@ -88,10 +84,13 @@ def main(cwd=None):
+     if not valid:
+         sys.exit()
+ 
+-
++    # Load settings
+     settings = Settings(config)
+     settings.load()
+ 
++    # Create the Web object
++    web = Web(debug, stay_open, False, receive)
++
+     # Start the Onion object
+     onion = Onion()
+     try:
+
+
+
+
+@@ -37,424 +37,378 @@ from flask import (
+ 
+ from . import strings, common
+ 
+-
+-def _safe_select_jinja_autoescape(self, filename):
+-    if filename is None:
+-        return True
+-    return filename.endswith(('.html', '.htm', '.xml', '.xhtml'))
+-
+-# Starting in Flask 0.11, render_template_string autoescapes template variables
+-# by default. To prevent content injection through template variables in
+-# earlier versions of Flask, we force autoescaping in the Jinja2 template
+-# engine if we detect a Flask version with insecure default behavior.
+-if Version(flask_version) < Version('0.11'):
+-    # Monkey-patch in the fix from https://github.com/pallets/flask/commit/99c99c4c16b1327288fd76c44bc8635a1de452bc
+-    Flask.select_jinja_autoescape = _safe_select_jinja_autoescape
+-
+-app = Flask(__name__)
+-
+-# information about the file
+-file_info = []
+-zip_filename = None
+-zip_filesize = None
+-
+-security_headers = [
+-    ('Content-Security-Policy', 'default-src \'self\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; img-src \'self\' data:;'),
+-    ('X-Frame-Options', 'DENY'),
+-    ('X-Xss-Protection', '1; mode=block'),
+-    ('X-Content-Type-Options', 'nosniff'),
+-    ('Referrer-Policy', 'no-referrer'),
+-    ('Server', 'OnionShare')
+-]
+-
+-
+-def set_file_info(filenames, processed_size_callback=None):
+-    """
+-    Using the list of filenames being shared, fill in details that the web
+-    page will need to display. This includes zipping up the file in order to
+-    get the zip file's name and size.
+-    """
+-    global file_info, zip_filename, zip_filesize
+-
+-    # build file info list
+-    file_info = {'files': [], 'dirs': []}
+-    for filename in filenames:
+-        info = {
+-            'filename': filename,
+-            'basename': os.path.basename(filename.rstrip('/'))
+-        }
+-        if os.path.isfile(filename):
+-            info['size'] = os.path.getsize(filename)
+-            info['size_human'] = common.human_readable_filesize(info['size'])
+-            file_info['files'].append(info)
+-        if os.path.isdir(filename):
+-            info['size'] = common.dir_size(filename)
+-            info['size_human'] = common.human_readable_filesize(info['size'])
+-            file_info['dirs'].append(info)
+-    file_info['files'] = sorted(file_info['files'], key=lambda k: k['basename'])
+-    file_info['dirs'] = sorted(file_info['dirs'], key=lambda k: k['basename'])
+-
+-    # zip up the files and folders
+-    z = common.ZipWriter(processed_size_callback=processed_size_callback)
+-    for info in file_info['files']:
+-        z.add_file(info['filename'])
+-    for info in file_info['dirs']:
+-        z.add_dir(info['filename'])
+-    z.close()
+-    zip_filename = z.zip_filename
+-    zip_filesize = os.path.getsize(zip_filename)
+-
+-
+-REQUEST_LOAD = 0
+-REQUEST_DOWNLOAD = 1
+-REQUEST_PROGRESS = 2
+-REQUEST_OTHER = 3
+-REQUEST_CANCELED = 4
+-REQUEST_RATE_LIMIT = 5
+-q = queue.Queue()
+-
+-
+-def add_request(request_type, path, data=None):
+-    """
+-    Add a request to the queue, to communicate with the GUI.
+-    """
+-  

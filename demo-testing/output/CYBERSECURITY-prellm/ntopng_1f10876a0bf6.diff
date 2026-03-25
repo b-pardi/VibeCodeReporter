@@ -1,0 +1,124 @@
+@@ -54,8 +54,7 @@ class Flow : public GenericHashEntry {
+   Host *cli_host, *srv_host;
+   IpAddress *cli_ip_addr, *srv_ip_addr;
+   ICMPinfo *icmp_info;
+-  u_int16_t cli_port, srv_port;
+-  u_int16_t vlanId;
++  u_int16_t cli_port, srv_port, vlanId;
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   struct ndpi_flow_struct *ndpiFlow;
+@@ -155,10 +154,9 @@ class Flow : public GenericHashEntry {
+   u_int16_t cli2srv_window, srv2cli_window;
+ 
+   time_t doNotExpireBefore; /*
+-			       Used for collected flows via ZMQ to make sure that they are not immediately
+-			       expired if their last seen time is back in time with respect to ntopng
++			      Used for collected flows via ZMQ to make sure that they are not immediately
++			      expired if their last seen time is back in time with respect to ntopng
+ 			    */
+-
+   struct timeval synTime, synAckTime, ackTime; /* network Latency (3-way handshake) */
+   struct timeval clientNwLatency; /* The RTT/2 between the client and nprobe */
+   struct timeval serverNwLatency; /* The RTT/2 between nprobe and the server */
+
+
+
+
+@@ -36,7 +36,8 @@ class Host : public GenericHashEntry, public AlertableEntity {
+   u_int16_t vlan_id, host_pool_id;
+   HostStats *stats, *stats_shadow;
+   time_t last_stats_reset;
+-
++  u_int32_t disabled_flow_status;
++  
+   /* Marked when visited by the periodic activities */
+   bool idle_mark;
+ 
+@@ -313,5 +314,18 @@ class Host : public GenericHashEntry, public AlertableEntity {
+   inline Fingerprint* getSSLFingerprint() { return(&fingerprints.ssl); }
+   virtual void setFlowPort(bool as_server, u_int8_t proto, u_int16_t port, u_int16_t l7_proto) { ; }
+   virtual void luaPortsDump(lua_State* vm) { lua_pushnil(vm); }    
++  
++  inline bool isDisabledFlowAlertType(u_int32_t v) {
++    return(((disabled_flow_status >> v) & 1U) ? true : false);
++  }
++  
++  inline void toggleDisabledFlowAlertType(u_int32_t v, bool disable_alert) {
++    if(disable_alert)
++      disabled_flow_status &= ~(1UL << v);
++    else
++      disabled_flow_status |= 1UL << v;
++  }
++
++
+ };
+ #endif /* _HOST_H_ */
+
+
+
+
+@@ -347,6 +347,10 @@ typedef enum {
+   status_data_exfiltration /* 24 */,
+   status_ssl_old_protocol_version /* 25 */,
+   num_flow_status,
++  /* 
++     IMPORTANT IMPORTANT IMPORTANT
++     If # status >= 32 then change to 64 bit disabled_flow_status in Host.h 
++  */
+ } FlowStatus;
+ 
+ typedef enum {
+
+
+
+
+@@ -44,8 +44,8 @@ Flow::Flow(NetworkInterface *_iface,
+     cli2srv_last_packets = 0, cli2srv_last_bytes = 0, srv2cli_last_packets = 0, srv2cli_last_bytes = 0,
+     cli_host = srv_host = NULL, good_low_flow_detected = false,
+     srv2cli_last_goodput_bytes = cli2srv_last_goodput_bytes = 0, good_ssl_hs = true,
+-    flow_alerted = flow_dropped_counts_increased = false, vrfId = 0;
+-
++    flow_alerted = flow_dropped_counts_increased = false, vrfId = 0;   
++    
+   idle_mark = purge_acknowledged_mark = false;
+ 
+   detection_completed = false;
+@@ -277,12 +277,13 @@ bool Flow::triggerAlerts() const {
+ /* *************************************** */
+ 
+ void Flow::dumpFlowAlert() {
+-  time_t when = time(0);
+-
++  time_t when;
++  FlowStatus status;
++  
+   if(!triggerAlerts())
+     return;
+ 
+-  FlowStatus status = getFlowStatus();
++  status = getFlowStatus();
+ 
+   if(!isFlowAlerted()) {
+     bool do_dump = true;
+@@ -383,14 +384,24 @@ void Flow::dumpFlowAlert() {
+       do_dump = ntop->getPrefs()->are_dropped_flows_alerts_enabled();
+ #endif
+ 
+-    /* Check per-host thresholds */
+-    if((cli_host && cli_host->incFlowAlertHits(when))
+-         ||(srv_host && srv_host->incFlowAlertHits(when)))
+-      do_dump = false;
++    if(!do_dump)
++      return; /* Nothing to do */
+ 
+-    if(do_dump) {
+-      iface->getAlertsManager()->storeFlowAlert(this);
++    when = time(0);
++
++    if(cli_host && srv_host) {
++      if(cli_host->isDisabledFlowAlertType(status) || srv_host->isDisabledFlowAlertType(status)) {
++	/* TODO: eventually increment a counter of untriggered alerts */
++	return;
++      }
++   

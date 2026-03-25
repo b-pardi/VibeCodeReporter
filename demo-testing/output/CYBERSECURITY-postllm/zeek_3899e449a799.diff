@@ -1,0 +1,120 @@
+@@ -15,8 +15,12 @@ public:
+ // Returns the associated initialization info.  In addition, consts_offset
+ // returns an offset into an initialization-time global that tracks all
+ // constructed globals, providing general access to them for aggregate
+-// constants.
++// constants. The second form is for when this isn't needed.
+ std::shared_ptr<CPP_InitInfo> RegisterConstant(const ValPtr& vp, int& consts_offset);
++std::shared_ptr<CPP_InitInfo> RegisterConstant(const ValPtr& vp) {
++    [[maybe_unused]] int consts_offset; // ignored
++    return RegisterConstant(vp, consts_offset);
++}
+ 
+ private:
+ // Maps (non-native) constants to associated C++ globals.
+
+
+
+
+@@ -125,8 +125,16 @@ void CPPCompile::Compile(bool report_uncompilable) {
+ 
+     NL();
+ 
++    IDSet globals_to_initialize;
+     for ( auto& g : all_accessed_globals )
+-        CreateGlobal(g);
++        if ( CreateGlobal(g) )
++            globals_to_initialize.insert(g);
++
++    for ( auto& g : globals_to_initialize ) {
++        auto gi = GenerateGlobalInit(g);
++        global_id_info->AddInstance(gi);
++        global_gis[g] = std::move(gi);
++    }
+ 
+     for ( const auto& e : accessed_events )
+         if ( AddGlobal(e, "gl") )
+@@ -407,11 +415,6 @@ void CPPCompile::RegisterCompiledBody(const string& f) {
+ }
+ 
+ void CPPCompile::GenEpilog() {
+-    if ( standalone ) {
+-        NL();
+-        InitializeGlobals();
+-    }
+-
+     NL();
+     for ( const auto& ii : init_infos )
+         GenInitExpr(ii.second);
+@@ -533,6 +536,7 @@ void CPPCompile::GenFinishInit() {
+     Emit("generate_indices_set(CPP__Indices__init, InitIndices);");
+ 
+     Emit("std::map<TypeTag, std::shared_ptr<CPP_AbstractInitAccessor>> InitConsts;");
++    Emit("Frame* f__CPP = nullptr;");
+ 
+     NL();
+     for ( const auto& ci : const_info ) {
+@@ -551,9 +555,17 @@ void CPPCompile::GenFinishInit() {
+         max_cohort = std::max(max_cohort, gi->MaxCohort());
+ 
+     for ( auto c = 0; c <= max_cohort; ++c )
+-        for ( const auto& gi : all_global_info )
+-            if ( gi->CohortSize(c) > 0 )
+-                Emit("%s.InitializeCohort(&im, %s);", gi->InitializersName(), Fmt(c));
++        for ( const auto& gi : all_global_info ) {
++            if ( gi->CohortSize(c) == 0 )
++                continue;
++
++            Emit("%s.InitializeCohort(&im, %s);", gi->InitializersName(), Fmt(c));
++            vector<IDPtr> init_ids;
++            gi->GetCohortIDs(c, init_ids);
++
++            for ( auto& ii : init_ids )
++                InitializeGlobal(ii);
++        }
+ 
+     // Populate mappings for dynamic offsets.
+     NL();
+@@ -567,13 +579,6 @@ void CPPCompile::GenFinishInit() {
+ 
+     Emit("load_BiFs__CPP();");
+ 
+-    if ( standalone )
+-        // Note, BiFs will also be loaded again later, because the
+-        // main initialization finishes upon loading of the activation
+-        // script, rather than after all scripts have been parsed
+-        // and plugins (with BiFs) have been loaded.
+-        Emit("init_globals__CPP();");
+-
+     EndBlock();
+ }
+ 
+
+
+
+
+@@ -176,8 +176,7 @@ string CPPCompile::GenConstExpr(const ConstExpr* c, GenType gt) {
+ 
+     if ( ! IsNativeType(t) ) {
+         auto v = c->ValuePtr();
+-        int consts_offset; // ignored
+-        (void)RegisterConstant(v, consts_offset);
++        (void)RegisterConstant(v);
+         return NativeToGT(const_vals[v.get()]->Name(), t, gt);
+     }
+ 
+@@ -1296,4 +1295,27 @@ string CPPCompile::GenEnum(const TypePtr& t, const ValPtr& ev) {
+     return string("enum_mapping[") + Fmt(mapping_slot) + "]";
+ }
+ 
++int CPPCompile::ReadyExpr(const ExprPtr& e) {
++    auto pf = make_unique<ProfileFunc>(e.get());
++    int max_cohort = 0;
++
++    for ( const auto& g : pf->AllGlobals() )
++        max_cohort = max(max_cohort, GenerateGlobalInit(g)->FinalInitCohort() + 1);
++    for ( const auto& c : pf->Constants() )
++        max_cohort = max(max_cohort, RegisterConstant(c->ValuePtr())->FinalInitCohort() + 1);
++
++    for ( const auto& t : pf->OrderedTypes() ) {
++        TypePtr tp{NewRef{}, const_

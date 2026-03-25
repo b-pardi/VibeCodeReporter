@@ -1,0 +1,85 @@
+@@ -323,7 +323,7 @@ void TlsConnectTestBase::SetupEch(std::shared_ptr<TlsAgent>& client,
+       {HpkeKdfHkdfSha256, HpkeAeadAes128Gcm}};
+ 
+   GenerateEchConfig(kem_id, kDefaultSuites, "public.name", maxConfigSize,
+-                    record, priv);
++                    record, pub, priv);
+   ASSERT_NE(0U, record.len());
+   SECStatus rv;
+   if (set_server_config) {
+
+
+
+
+@@ -1249,13 +1249,6 @@ tls13_WriteDupXtnsToChInner(PRBool compressing, sslBuffer *dupXtns, sslBuffer *c
+  * If the value is to be compressed, it is written to |dupXtns|.
+  * Otherwise, a full extension is written to |chInnerXtns|.
+  *
+- * This is a little complicated because we need to comply with ECH
+- * extension construction rules.  These require that compressed
+- * extensions are contiguous.
+- * |compressing| is true if compression is occurring.
+- * |canCompress| is true if compression hasn't stopped.
+- * Outparam |compressed| indicates whether the value was compressed.
+- *
+  * This function is always called twice:
+  * once without compression and once with compression if possible.
+  *
+@@ -1267,12 +1260,13 @@ static SECStatus
+ tls13_ChInnerAppendExtension(sslSocket *ss, PRUint16 extensionType,
+                              const sslReadBuffer *extensionData,
+                              sslBuffer *dupXtns, sslBuffer *chInnerXtns,
+-                             PRBool compressing, PRBool canCompress, PRBool *compressed,
++                             PRBool compressing,
+                              PRUint16 *called, unsigned int *nCalled)
+ {
+     PRUint8 buf[1024] = { 0 };
+     const PRUint8 *p;
+     unsigned int len = 0;
++    PRBool willCompress;
+ 
+     PORT_Assert(extensionType != ssl_tls13_encrypted_client_hello_xtn);
+     sslCustomExtensionHooks *hook = ss->opt.callExtensionWriterOnEchInner
+@@ -1294,28 +1288,26 @@ tls13_ChInnerAppendExtension(sslSocket *ss, PRUint16 extensionType,
+              * if the server accepts ECH and then includes this extension.
+              * The cost is a complete reworking of ss->xtnData.advertised.
+              */
+-            *compressed = PR_FALSE;
+             return SECSuccess;
+         }
+-        /* It can be compressed if it is the same as the outer value.
+-         * But only if compression hasn't stopped. */
+-        *compressed = (canCompress && len == extensionData->len &&
+-                       PORT_Memcmp(buf, extensionData->buf, len) == 0);
++        /* It can be compressed if it is the same as the outer value. */
++        willCompress = (len == extensionData->len &&
++                        NSS_SecureMemcmp(buf, extensionData->buf, len) == 0);
+         p = buf;
+     } else {
+         /* Non-custom extensions are duplicated when compressing. */
+-        *compressed = canCompress;
++        willCompress = PR_TRUE;
+         p = extensionData->buf;
+         len = extensionData->len;
+     }
+ 
+     /* Duplicated extensions all need to go together. */
+-    sslBuffer *dst = *compressed ? dupXtns : chInnerXtns;
++    sslBuffer *dst = willCompress ? dupXtns : chInnerXtns;
+     SECStatus rv = sslBuffer_AppendNumber(dst, extensionType, 2);
+     if (rv != SECSuccess) {
+         return SECFailure;
+     }
+-    if (!compressing || !*compressed) {
++    if (!willCompress || !compressing) {
+         rv = sslBuffer_AppendVariable(dst, p, len, 2);
+         if (rv != SECSuccess) {
+             return SECFailure;
+@@ -1430,18 +1422,27 @@ tls13_RandomizePsk(PRUint8 *buf, unsigned int len)
+ /* Given a buffer of extensions prepared for CHOuter, translate those extensions to a
+  * buffer suitable for CHInner. This is intended to be called twice: once without
+  * compression for the transcript hash and binders, and once with compression for
+- * encoding the actual CHInner value. On the first run, if |inOutPskXtn| and
+- * chOuterXtnsBuf contains a PSK extension, remove it and return in the outparam.
+- * The caller will compute the binder value based on the uncompressed output. Next,
+- * if |compress|, consolidate duplicated extensions (that

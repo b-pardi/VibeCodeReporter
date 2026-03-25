@@ -1,0 +1,120 @@
+@@ -145,6 +145,35 @@ TEST_F(TlsAgentDgramTestClient, EncryptedExtensionsInClearTwoPieces) {
+                  SSL_ERROR_RX_UNEXPECTED_HANDSHAKE);
+ }
+ 
++TEST_F(TlsAgentDgramTestClient, AckWithBogusLengthField) {
++  EnsureInit();
++  // Length doesn't match
++  const uint8_t ackBuf[] = {0x00, 0x08, 0x00};
++  DataBuffer record;
++  MakeRecord(variant_, kTlsAckType, SSL_LIBRARY_VERSION_TLS_1_2, ackBuf,
++             sizeof(ackBuf), &record, 0);
++  agent_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_3,
++                          SSL_LIBRARY_VERSION_TLS_1_3);
++  ExpectAlert(kTlsAlertDecodeError);
++  ProcessMessage(record, TlsAgent::STATE_ERROR,
++                 SSL_ERROR_RX_MALFORMED_DTLS_ACK);
++}
++
++TEST_F(TlsAgentDgramTestClient, AckWithNonEvenLength) {
++  EnsureInit();
++  // Length isn't a multiple of 8
++  const uint8_t ackBuf[] = {0x00, 0x01, 0x00};
++  DataBuffer record;
++  MakeRecord(variant_, kTlsAckType, SSL_LIBRARY_VERSION_TLS_1_2, ackBuf,
++             sizeof(ackBuf), &record, 0);
++  agent_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_3,
++                          SSL_LIBRARY_VERSION_TLS_1_3);
++  // Because we haven't negotiated the version,
++  // ssl3_DecodeError() sends an older (pre-TLS error).
++  ExpectAlert(kTlsAlertIllegalParameter);
++  ProcessMessage(record, TlsAgent::STATE_ERROR, SSL_ERROR_BAD_SERVER);
++}
++
+ TEST_F(TlsAgentStreamTestClient, Set0RttOptionThenWrite) {
+   EnsureInit();
+   agent_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_1,
+
+
+
+
+@@ -142,10 +142,13 @@ class TlsDropDatagram13 : public TlsConnectDatagram13,
+   void CheckAcks(const DropAckChain& chain, size_t index,
+                  std::vector<uint64_t> acks) {
+     const DataBuffer& buf = chain.ack_->record(index).buffer;
+-    size_t offset = 0;
++    size_t offset = 2;
++    uint64_t len;
+ 
+-    EXPECT_EQ(acks.size() * 8, buf.len());
+-    if ((acks.size() * 8) != buf.len()) {
++    EXPECT_EQ(2 + acks.size() * 8, buf.len());
++    ASSERT_TRUE(buf.Read(0, 2, &len));
++    ASSERT_EQ(static_cast<size_t>(len + 2), buf.len());
++    if ((2 + acks.size() * 8) != buf.len()) {
+       while (offset < buf.len()) {
+         uint64_t ack;
+         ASSERT_TRUE(buf.Read(offset, 8, &ack));
+
+
+
+
+@@ -543,3 +543,9 @@ ER3(SSL_ERROR_TOO_MANY_KEY_UPDATES, (SSL_ERROR_BASE + 171),
+ 
+ ER3(SSL_ERROR_HANDSHAKE_FAILED, (SSL_ERROR_BASE + 172),
+     "SSL handshake has already failed. No more operations possible.")
++
++ER3(SSL_ERROR_BAD_RESUMPTION_TOKEN_ERROR, (SSL_ERROR_BASE + 173),
++    "SSL received an invalid resumption token.")
++
++ER3(SSL_ERROR_RX_MALFORMED_DTLS_ACK, (SSL_ERROR_BASE + 174),
++    "SSL received a malformed DTLS ACK")
+
+
+
+
+@@ -119,10 +119,15 @@ dtls13_SendAck(sslSocket *ss)
+     SECStatus rv = SECSuccess;
+     PRCList *cursor;
+     PRInt32 sent;
++    unsigned int offset;
+ 
+     SSL_TRC(10, ("%d: SSL3[%d]: Sending ACK",
+                  SSL_GETPID(), ss->fd));
+ 
++    rv = sslBuffer_Skip(&buf, 2, &offset);
++    if (rv != SECSuccess) {
++        goto loser;
++    }
+     for (cursor = PR_LIST_HEAD(&ss->ssl3.hs.dtlsRcvdHandshake);
+          cursor != &ss->ssl3.hs.dtlsRcvdHandshake;
+          cursor = PR_NEXT_LINK(cursor)) {
+@@ -136,6 +141,11 @@ dtls13_SendAck(sslSocket *ss)
+         }
+     }
+ 
++    rv = sslBuffer_InsertLength(&buf, offset, 2);
++    if (rv != SECSuccess) {
++        goto loser;
++    }
++
+     ssl_GetXmitBufLock(ss);
+     sent = ssl3_SendRecord(ss, NULL, content_ack,
+                            buf.buf, buf.len, 0);
+@@ -401,6 +411,7 @@ dtls13_HandleAck(sslSocket *ss, sslBuffer *databuf)
+ {
+     PRUint8 *b = databuf->buf;
+     PRUint32 l = databuf->len;
++    unsigned int length;
+     SECStatus rv;
+ 
+     /* Ensure we don't loop. */
+@@ -409,10 +420,19 @@ dtls13_HandleAck(sslSocket *ss, sslBuffer *databuf)
+     PORT_Assert(IS_DTLS(ss));
+     if (!tls13_MaybeTls13(ss)) {
+         tls13_FatalError(ss, SSL_ERROR_RX_UNKNOWN_RECORD_TYPE, illegal_parameter);
+-        return SECSuccess;
++        return SECFailure;
+     }
+ 
+     SSL_TRC(10, ("%d: SSL3[%d]: Handling ACK", SSL_GETPID()

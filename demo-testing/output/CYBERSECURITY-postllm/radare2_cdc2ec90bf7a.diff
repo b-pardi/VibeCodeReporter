@@ -1,0 +1,143 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,320 @@
++/* radare - LGPL - Copyright 2020-2025 - pancake, thestr4ng3r */
++
++#include "r2r.h"
++
++// After editing a test, fix the line numbers previously saved for all the other tests
++static void fixup_tests(RVecR2RTestResultInfoPtr *results, const char *edited_file, ut64 start_line, st64 delta) {
++	R2RTestResultInfo **it;
++	R_VEC_FOREACH (results, it) {
++		R2RTestResultInfo *result = *it;
++		if (result->test->type != R2R_TEST_TYPE_CMD) {
++			continue;
++		}
++		if (result->test->path != edited_file) { // this works because all the paths come from the string pool
++			continue;
++		}
++		R2RCmdTest *test = result->test->cmd_test;
++		test->run_line += delta;
++
++#define DO_KEY_STR(key, field) \
++	if (test->field.value) { \
++		if (test->field.line_begin >= start_line) { \
++			test->field.line_begin += delta; \
++		} \
++		if (test->field.line_end >= start_line) { \
++			test->field.line_end += delta; \
++		} \
++	}
++
++#define DO_KEY_BOOL(key, field) \
++	if (test->field.set && test->field.line >= start_line) { \
++		test->field.line += delta; \
++	}
++
++#define DO_KEY_NUM(key, field) \
++	if (test->field.set && test->field.line >= start_line) { \
++		test->field.line += delta; \
++	}
++
++		R2R_CMD_TEST_FOREACH_RECORD (DO_KEY_STR, DO_KEY_BOOL, DO_KEY_NUM)
++#undef DO_KEY_STR
++#undef DO_KEY_BOOL
++#undef DO_KEY_NUM
++	}
++}
++
++
++static char *format_cmd_kv(const char *key, const char *val) {
++	if (strchr (val, '\n')) {
++		if (strstr (val, "EOF")) {
++			R_LOG_TODO ("Value cannot contain multiline text with 'EOF'");
++		}
++		return r_str_newf ("%s=<<EOF\n%sEOF", key, val);
++	}
++	return r_str_newf ("%s=%s", key, val);
++}
++static char *replace_lines(const char *src, size_t from, size_t to, const char *news) {
++	const char *begin = src;
++	size_t line = 1;
++	while (line < from) {
++		begin = strchr (begin, '\n');
++		if (!begin) {
++			return NULL;
++		}
++		begin++;
++		line++;
++	}
++
++	const char *end = begin;
++	while (line < to) {
++		end = strchr (end, '\n');
++		if (!end) {
++			break;
++		}
++		end++;
++		line++;
++	}
++
++	char *data = r_str_ndup (src, begin - src);
++	char *res = r_str_newf ("%s%s\n%s", data, news, end? end: "");
++	free (data);
++	return res;
++}
++
++static char *replace_cmd_kv(const char *path, const char *content, size_t line_begin, size_t line_end, const char *key, const char *value, RVecR2RTestResultInfoPtr *fixup_results) {
++	char *kv = format_cmd_kv (key, value);
++	if (!kv) {
++		return NULL;
++	}
++	size_t kv_lines = r_str_char_count (kv, '\n') + 1;
++	char *newc = replace_lines (content, line_begin, line_end, kv);
++	free (kv);
++	if (!newc) {
++		return NULL;
++	}
++	size_t lines_before = line_end - line_begin;
++	st64 delta = (st64)kv_lines - (st64)lines_before;
++	if (line_end == line_begin) {
++		delta++;
++	}
++	fixup_tests (fixup_results, path, line_end, delta);
++	return newc;
++}
++
++static void replace_cmd_kv_file(const char *path, ut64 line_begin, ut64 line_end, const char *key, const char *value, RVecR2RTestResultInfoPtr *fixup_results) {
++	char *content = r_file_slurp (path, NULL);
++	if (!content) {
++		R_LOG_ERROR ("Failed to read file \"%s\"", path);
++		return;
++	}
++	char *newc = replace_cmd_kv (path, content, line_begin, line_end, key, value, fixup_results);
++	free (content);
++	if (!newc) {
++		return;
++	}
++	if (r_file_dump (path, (const ut8 *)newc, -1, false)) {
++#if R2__UNIX__ && !(__wasi__ || __EMSCRIPTEN__)
++		sync ();
++#endif
++	} else {
++		R_LOG_ERROR ("Failed to write file \"%s\"", path);
++	}
++	free (newc);
++}
++
++static void interact_break(R2RTestResultInfo *result, RVecR2RTestResultInfoPtr *fixup_results) {
++	R_RETURN_IF_FAIL (result->test->type == R2R_TEST_TYPE_CMD);
++	R2RCmdTest *test = result->test->cmd_test;
++	ut64 line_begin, line_end;
++	if (test->broken.set) {
++		line_begin = test->broken.set;
++		line_end = line_begin + 1;
++	} else {
++		line_begin = line_end = test->run_line;
++	}
++	replace_cmd_kv_file (result->test->path, line_begin, line_end, "BROKEN", "1", fixup_results);
++}
++
++static void interact_comm

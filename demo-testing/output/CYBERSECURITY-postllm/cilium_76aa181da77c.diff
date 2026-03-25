@@ -1,0 +1,146 @@
+@@ -304,13 +304,6 @@ encode_custom_prog_meta(struct __ctx_buff *ctx, int ret, __u32 identity)
+ #endif
+ 
+ #ifdef ENABLE_IPV6
+-struct ct_buffer6 {
+-	struct ipv6_ct_tuple tuple;
+-	struct ct_state ct_state;
+-	__u32 monitor;
+-	int ret;
+-};
+-
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+ 	__type(key, __u32);
+@@ -748,13 +741,6 @@ int tail_handle_ipv6(struct __ctx_buff *ctx)
+ #endif /* ENABLE_IPV6 */
+ 
+ #ifdef ENABLE_IPV4
+-struct ct_buffer4 {
+-	struct ipv4_ct_tuple tuple;
+-	struct ct_state ct_state;
+-	__u32 monitor;
+-	int ret;
+-};
+-
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+ 	__type(key, __u32);
+
+
+
+
+@@ -23,6 +23,24 @@ enum {
+ 	ACTION_CLOSE,
+ };
+ 
++#ifdef ENABLE_IPV4
++struct ct_buffer4 {
++	struct ipv4_ct_tuple tuple;
++	struct ct_state ct_state;
++	__u32 monitor;
++	int ret;
++};
++#endif
++
++#ifdef ENABLE_IPV6
++struct ct_buffer6 {
++	struct ipv6_ct_tuple tuple;
++	struct ct_state ct_state;
++	__u32 monitor;
++	int ret;
++};
++#endif
++
+ static __always_inline bool ct_entry_seen_both_syns(const struct ct_entry *entry)
+ {
+ 	bool rx_syn = entry->rx_flags_seen & TCP_FLAG_SYN;
+
+
+
+
+@@ -96,49 +96,59 @@ ipv6_host_policy_egress(struct __ctx_buff *ctx, __u32 src_sec_identity,
+ 	return verdict;
+ }
+ 
+-static __always_inline int
+-ipv6_host_policy_ingress(struct __ctx_buff *ctx, __u32 *src_sec_identity,
+-			 struct trace_ctx *trace, __s8 *ext_err)
++static __always_inline bool
++ipv6_host_policy_ingress_lookup(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
++				struct ct_buffer6 *ct_buffer)
+ {
+-	struct ct_state ct_state_new = {}, ct_state = {};
+-	__u8 policy_match_type = POLICY_MATCH_NONE;
+-	__u8 audited = 0;
++	int l4_off, hdrlen;
+ 	__u32 dst_sec_identity = WORLD_ID;
+-	__u16 node_id = 0;
+ 	struct remote_endpoint_info *info;
+-	int ret, verdict = CTX_ACT_OK, l4_off, hdrlen;
+-	struct ipv6_ct_tuple tuple = {};
+-	void *data, *data_end;
+-	struct ipv6hdr *ip6;
+-	__u16 proxy_port = 0;
+-
+-	if (!revalidate_data(ctx, &data, &data_end, &ip6))
+-		return DROP_INVALID;
++	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
+ 
+ 	/* Retrieve destination identity. */
+-	ipv6_addr_copy(&tuple.daddr, (union v6addr *)&ip6->daddr);
+-	info = lookup_ip6_remote_endpoint(&tuple.daddr, 0);
++	ipv6_addr_copy(&tuple->daddr, (union v6addr *)&ip6->daddr);
++	info = lookup_ip6_remote_endpoint(&tuple->daddr, 0);
+ 	if (info && info->sec_identity)
+ 		dst_sec_identity = info->sec_identity;
+ 	cilium_dbg(ctx, info ? DBG_IP_ID_MAP_SUCCEED6 : DBG_IP_ID_MAP_FAILED6,
+-		   tuple.daddr.p4, dst_sec_identity);
++		   tuple->daddr.p4, dst_sec_identity);
+ 
+ 	/* Only enforce host policies for packets to host IPs. */
+ 	if (dst_sec_identity != HOST_ID)
+-		return CTX_ACT_OK;
++		return false;
+ 
+ 	/* Lookup connection in conntrack map. */
+-	tuple.nexthdr = ip6->nexthdr;
+-	ipv6_addr_copy(&tuple.saddr, (union v6addr *)&ip6->saddr);
+-	hdrlen = ipv6_hdrlen(ctx, &tuple.nexthdr);
+-	if (hdrlen < 0)
+-		return hdrlen;
++	tuple->nexthdr = ip6->nexthdr;
++	ipv6_addr_copy(&tuple->saddr, (union v6addr *)&ip6->saddr);
++	hdrlen = ipv6_hdrlen(ctx, &tuple->nexthdr);
++	if (hdrlen < 0) {
++		ct_buffer->ret = hdrlen;
++		return true;
++	}
+ 	l4_off = ETH_HLEN + hdrlen;
+-	ret = ct_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off, CT_INGRESS,
+-			 &ct_state, &trace->monitor);
+-	if (ret < 0)
+-		return ret;
++	ct_buffer->ret = ct_lookup6(get_ct_map6(tuple), tuple, ctx, l4_off, CT_INGRESS,
++				    &ct_buffer->ct_state, &ct_buffer->monitor);
+ 
++	return true;
++}
++
++static __always_inline int
++__ipv6_host_policy_ingress(struct __ctx_buff *ctx, struct ipv6hdr *ip6,
++			   struct ct_buffer6 *ct_buffer, __u32 *src_sec_identity,
++			   struct trace_ctx *trace, __s8 *ext_err)
++{
++	struct ct_state ct_state_new = {};
++	struct ct_state *ct_state = &ct_buffer->ct_state;
++	struct ipv6_ct_tuple *tuple = &ct_buffer->tuple;
++	__u16 node_id = 0;
++	int ret = ct_buffer->ret;
++	int verdict = CTX_ACT_OK;
++	__u8 policy_match_type = POLICY_MATCH_NONE;
++	__u8 audited = 0;
++	struct remote_endpoint_info *info;
++	__u16 proxy_port = 0;
++
++	trace->monitor = ct_buffe

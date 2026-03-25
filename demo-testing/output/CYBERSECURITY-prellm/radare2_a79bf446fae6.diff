@@ -1,0 +1,161 @@
+@@ -4148,7 +4148,10 @@ static void r_core_debug_kill (RCore *core, const char *input) {
+ 				}
+ 		}
+ 	} else if (*input == 'j') {
++		core->dbg->pj = r_core_pj_new (core);
+ 		r_debug_signal_list (core->dbg, 2);
++		pj_free (core->dbg->pj);
++		core->dbg->pj = NULL;
+ 	} else if (!*input) {
+ 		r_debug_signal_list (core->dbg, 0);
+ #if 0
+@@ -5094,9 +5097,14 @@ static int cmd_debug(void *data, const char *input) {
+ 	case 'L': // "dL"
+ 		switch (input[1]) {
+ 		case 'q':
+-		case 'j':
+ 			r_debug_plugin_list (core->dbg, input[1]);
+ 			break;
++		case 'j':
++			core->dbg->pj = r_core_pj_new (core);
++			r_debug_plugin_list (core->dbg, 'j');
++			pj_free (core->dbg->pj);
++			core->dbg->pj = NULL;
++			break;
+ 		case '?':
+ 			r_core_cmd_help (core, help_msg_dL);
+ 			break;
+
+
+
+
+@@ -85,28 +85,25 @@ static bool siglistcb (void *p, const char *k, const char *v) {
+ 	return true;
+ }
+ 
+-static bool siglistjsoncb (void *p, const char *k, const char *v) {
++static bool siglistjsoncb(void *p, const char *k, const char *v) {
+ 	static char key[32] = "cfg.";
+ 	RDebug *dbg = (RDebug *)p;
+ 	int opt;
+-	if (atoi (k)>0) {
++	if (atoi (k) > 0) {
+ 		strncpy (key + 4, k, 20);
+ 		opt = (int)sdb_num_get (DB, key, 0);
+-		if (dbg->_mode == 2) {
+-			dbg->_mode = 0;
+-		} else {
+-			r_cons_strcat (",");
+-		}
+-		//TODO PJ
+-		r_cons_printf ("{\"signum\":\"%s\",\"name\":\"%s\",\"option\":", k, v);
++		pj_o (dbg->pj);
++		pj_ks (dbg->pj, "signum", k);
++		pj_ks (dbg->pj, "name", v);
++		pj_k (dbg->pj, "option");
+ 		if (opt & R_DBG_SIGNAL_CONT) {
+-			r_cons_strcat ("\"cont\"");
++			pj_s (dbg->pj, "cont");
+ 		} else if (opt & R_DBG_SIGNAL_SKIP) {
+-			r_cons_strcat ("\"skip\"");
++			pj_s (dbg->pj, "skip");
+ 		} else {
+-			r_cons_strcat ("null");
++			pj_null (dbg->pj);
+ 		}
+-		r_cons_strcat ("}");
++		pj_end (dbg->pj);
+ 	}
+ 	return true;
+ }
+@@ -119,10 +116,13 @@ R_API void r_debug_signal_list(RDebug *dbg, int mode) {
+ 		sdb_foreach (DB, siglistcb, dbg);
+ 		break;
+ 	case 2:
+-		r_cons_strcat ("[");
++		if (!dbg->pj) {
++			return;
++		}
++		pj_a (dbg->pj);
+ 		sdb_foreach (DB, siglistjsoncb, dbg);
+-		r_cons_strcat ("]");
+-		r_cons_newline();
++		pj_end (dbg->pj);
++		r_cons_println (pj_string (dbg->pj));
+ 		break;
+ 	}
+ 	dbg->_mode = 0;
+
+
+
+
+@@ -50,15 +50,20 @@ R_API bool r_debug_use(RDebug *dbg, const char *str) {
+ 	return (dbg && dbg->h);
+ }
+ 
+-R_API int r_debug_plugin_list(RDebug *dbg, int mode) {
++R_API bool r_debug_plugin_list(RDebug *dbg, int mode) {
+ 	char spaces[16];
+ 	int count = 0;
+ 	memset (spaces, ' ', 15);
+ 	spaces[15] = 0;
+ 	RDebugPlugin *h;
+ 	RListIter *iter;
++	PJ *pj = NULL;
+ 	if (mode == 'j') {
+-		dbg->cb_printf ("[");
++		pj = dbg->pj;
++		if (!pj) {
++			return false;
++		}
++		pj_a (pj);
+ 	}
+ 	r_list_foreach (dbg->plugins, iter, h) {
+ 		int sp = 8-strlen (h->name);
+@@ -66,11 +71,10 @@ R_API int r_debug_plugin_list(RDebug *dbg, int mode) {
+ 		if (mode == 'q') {
+ 			dbg->cb_printf ("%s\n", h->name);
+ 		} else if (mode == 'j') {
+-			//TODO PJ
+-			dbg->cb_printf ("%s{\"name\":\"%s\",\"license\":\"%s\"}",
+-							(count ? "," : ""),
+-							h->name,
+-							h->license);
++			pj_o (pj);
++			pj_ks (pj, "name", h->name);
++			pj_ks (pj, "license", h->license);
++			pj_end (pj);
+ 		} else {
+ 			dbg->cb_printf ("%d  %s  %s %s%s\n",
+ 					count, (h == dbg->h)? "dbg": "---",
+@@ -80,9 +84,10 @@ R_API int r_debug_plugin_list(RDebug *dbg, int mode) {
+ 		count++;
+ 	}
+ 	if (mode == 'j') {
+-		dbg->cb_printf ("]");
++		pj_end (pj);
++		dbg->cb_printf ("%s\n", pj_string (pj));
+ 	}
+-	return false;
++	return true;
+ }
+ 
+ R_API bool r_debug_plugin_add(RDebug *dbg, RDebugPlugin *foo) {
+
+
+
+
+@@ -314,6 +314,7 @@ typedef struct r_debug_t {
+ 
+ 	Sdb *sgnls;
+ 	RCoreBind corebind;
++	PJ *pj;
+ 	// internal use only
+ 	int _mode;
+ 	RNum *num;
+@@ -490,7 +491,7 @@ R_API int r_debug_kill_setup(RDebug *dbg, int sig, int action);
+ /* handle.c */
+ R_API void r_debug_plugin_init(RDebug *dbg);
+ R_API int r_debug_plugin_set(RDebug *dbg, const char *str);
+-R_API int r_debug_plugin_list(RDebug *dbg, int mode);
++R_API bool r_debug_plugin

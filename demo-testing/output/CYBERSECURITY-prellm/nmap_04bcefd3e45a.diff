@@ -1,0 +1,125 @@
+@@ -1254,13 +1254,12 @@ LUA_API const char *lua_setupvalue (lua_State *L, int funcindex, int n) {
+ }
+ 
+ 
+-static UpVal **getupvalref (lua_State *L, int fidx, int n, LClosure **pf) {
++static UpVal **getupvalref (lua_State *L, int fidx, int n) {
+   LClosure *f;
+   StkId fi = index2addr(L, fidx);
+   api_check(L, ttisLclosure(fi), "Lua function expected");
+   f = clLvalue(fi);
+   api_check(L, (1 <= n && n <= f->p->sizeupvalues), "invalid upvalue index");
+-  if (pf) *pf = f;
+   return &f->upvals[n - 1];  /* get its upvalue pointer */
+ }
+ 
+@@ -1269,7 +1268,7 @@ LUA_API void *lua_upvalueid (lua_State *L, int fidx, int n) {
+   StkId fi = index2addr(L, fidx);
+   switch (ttype(fi)) {
+     case LUA_TLCL: {  /* lua closure */
+-      return *getupvalref(L, fidx, n, NULL);
++      return *getupvalref(L, fidx, n);
+     }
+     case LUA_TCCL: {  /* C closure */
+       CClosure *f = clCvalue(fi);
+@@ -1286,9 +1285,10 @@ LUA_API void *lua_upvalueid (lua_State *L, int fidx, int n) {
+ 
+ LUA_API void lua_upvaluejoin (lua_State *L, int fidx1, int n1,
+                                             int fidx2, int n2) {
+-  LClosure *f1;
+-  UpVal **up1 = getupvalref(L, fidx1, n1, &f1);
+-  UpVal **up2 = getupvalref(L, fidx2, n2, NULL);
++  UpVal **up1 = getupvalref(L, fidx1, n1);
++  UpVal **up2 = getupvalref(L, fidx2, n2);
++  if (*up1 == *up2)
++    return;
+   luaC_upvdeccount(L, *up1);
+   *up1 = *up2;
+   (*up1)->refcount++;
+
+
+
+
+@@ -1011,8 +1011,13 @@ static void *l_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
+     free(ptr);
+     return NULL;
+   }
+-  else
+-    return realloc(ptr, nsize);
++  else {  /* cannot fail when shrinking a block */
++    void *newptr = realloc(ptr, nsize);
++    if (newptr == NULL && ptr != NULL && nsize <= osize)
++      return ptr;  /* keep the original block */
++    else  /* no fail or not shrinking */
++     return newptr;  /* use the new block */
++  }
+ }
+ 
+ 
+
+
+
+
+@@ -1061,7 +1061,7 @@ static void codecomp (FuncState *fs, BinOpr opr, expdesc *e1, expdesc *e2) {
+ 
+ 
+ /*
+-** Aplly prefix operation 'op' to expression 'e'.
++** Apply prefix operation 'op' to expression 'e'.
+ */
+ void luaK_prefix (FuncState *fs, UnOpr op, expdesc *e, int line) {
+   static const expdesc ef = {VKINT, {0}, NO_JUMP, NO_JUMP};
+
+
+
+
+@@ -133,10 +133,11 @@ static const char *upvalname (Proto *p, int uv) {
+ 
+ static const char *findvararg (CallInfo *ci, int n, StkId *pos) {
+   int nparams = clLvalue(ci->func)->p->numparams;
+-  if (n >= cast_int(ci->u.l.base - ci->func) - nparams)
++  int nvararg = cast_int(ci->u.l.base - ci->func) - nparams;
++  if (n <= -nvararg)
+     return NULL;  /* no such vararg */
+   else {
+-    *pos = ci->func + nparams + n;
++    *pos = ci->func + nparams - n;
+     return "(*vararg)";  /* generic name for any vararg */
+   }
+ }
+@@ -148,7 +149,7 @@ static const char *findlocal (lua_State *L, CallInfo *ci, int n,
+   StkId base;
+   if (isLua(ci)) {
+     if (n < 0)  /* access to vararg values? */
+-      return findvararg(ci, -n, pos);
++      return findvararg(ci, n, pos);
+     else {
+       base = ci->u.l.base;
+       name = luaF_getlocalname(ci_func(ci)->p, n, currentpc(ci));
+
+
+
+
+@@ -277,6 +277,8 @@ static int io_popen (lua_State *L) {
+   const char *filename = luaL_checkstring(L, 1);
+   const char *mode = luaL_optstring(L, 2, "r");
+   LStream *p = newprefile(L);
++  luaL_argcheck(L, ((mode[0] == 'r' || mode[0] == 'w') && mode[1] == '\0'),
++                   2, "invalid mode");
+   p->f = l_popen(L, filename, mode);
+   p->closef = &io_pclose;
+   return (p->f == NULL) ? luaL_fileresult(L, 0, filename) : 1;
+
+
+
+
+@@ -244,12 +244,12 @@ static int read_numeral (LexState *ls, SemInfo *seminfo) {
+ 
+ 
+ /*
+-** skip a sequence '[=*[' or ']=*]'; if sequence is well formed, return
+-** its number of '='s; otherwise, return a negative number (-1 iff there
+-** are no '='s after initial bracket)
++** reads a sequence '[=*[' or ']=*]', leaving the last bracket.
++** If sequence is well formed, return its number of '='s + 2; otherwise,
++** return 1 if there is

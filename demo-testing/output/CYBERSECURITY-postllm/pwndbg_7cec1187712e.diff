@@ -1,0 +1,114 @@
+@@ -564,6 +564,14 @@ def kbase() -> int | None:
+         raise NotImplementedError()
+ 
+ 
++def pagewalk(addr, entry=None):
++    pi = arch_paginginfo()
++    if pi:
++        return pi.pagewalk(addr, entry)
++    else:
++        raise NotImplementedError()
++
++
+ def paging_enabled() -> bool:
+     arch_name = pwndbg.aglib.arch.name
+     if arch_name == "i386":
+
+
+
+
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import math
++from typing import Dict
+ from typing import List
+ from typing import Tuple
+ 
+@@ -9,8 +10,8 @@ import pwndbg.aglib.vmmap_custom
+ import pwndbg.color.message as M
+ import pwndbg.lib.cache
+ import pwndbg.lib.memory
++from pwndbg.lib.regs import BitFlags
+ 
+-ENTRYMASK = ~((1 << 12) - 1) & ((1 << 51) - 1)
+ # don't return None but rather an invalid value for address markers
+ # this way arithmetic ops do not panic if physmap is not found
+ INVALID_ADDR = 1 << 64
+@@ -46,6 +47,9 @@ class ArchPagingInfo:
+     vmemmap: int
+     kbase: int
+     addr_marker_sz: int
++    va_bits: int
++    pagetable_cache: Dict[pwndbg.dbg_mod.Value, Dict[int, int]] = {}
++    pagetableptr_cache: Dict[int, pwndbg.dbg_mod.Value] = {}
+ 
+     @property
+     @pwndbg.lib.cache.cache_until("start")
+@@ -93,8 +97,86 @@ class ArchPagingInfo:
+ 
+         return None
+ 
++    def pagewalk(
++        self, target, entry
++    ) -> Tuple[Tuple[str, ...], List[Tuple[int | None, int | None]]]:
++        raise NotImplementedError()
++
++    def pagewalk_helper(
++        self, target, entry, kernel_phys_base=0
++    ) -> List[Tuple[int | None, int | None]]:
++        base = self.physmap
++        if entry > base:
++            # user inputted a physmap address as pointer to pgd
++            entry -= base
++        level = self.paging_level
++        result: List[Tuple[int | None, int | None]] = [(None, None)] * (level + 1)
++        page_shift = self.page_shift
++        ENTRYMASK = ~((1 << page_shift) - 1) & ((1 << self.va_bits) - 1)
++        for i in range(level, 0, -1):
++            vaddr = (entry & ENTRYMASK) + base - kernel_phys_base
++            if self.should_stop_pagewalk(entry):
++                break
++            shift = (i - 1) * (page_shift - 3) + page_shift
++            offset = target & ((1 << shift) - 1)
++            idx = (target & (0x1FF << shift)) >> shift
++            entry = 0
++            try:
++                # with this optimization, roughly x2 as fast on average
++                # especially useful when parsing a large number of pages, e.g. set kernel-vmmap monitor
++                if vaddr not in self.pagetableptr_cache:
++                    self.pagetableptr_cache[vaddr] = pwndbg.aglib.memory.get_typed_pointer(
++                        "unsigned long", vaddr
++                    )
++                table = self.pagetableptr_cache[vaddr]
++                if table not in self.pagetable_cache:
++                    self.pagetable_cache[table] = {}
++                table_cache = self.pagetable_cache[table]
++                if idx not in table_cache:
++                    table_cache[idx] = int(table[idx])
++                entry = table_cache[idx]
++                # Prior to optimization:
++                # table = pwndbg.aglib.memory.get_typed_pointer("unsigned long", vaddr)
++                # entry = int(table[idx])
++            except Exception as e:
++                print(M.warn(f"Exception while page walking: {e}"))
++                entry = 0
++            if entry == 0:
++                return result
++            result[i] = (entry, vaddr)
++        result[0] = (entry, (entry & ENTRYMASK) + base + offset - kernel_phys_base)
++        return result
++
++    def pageentry_flags(self, level) -> BitFlags:
++        raise NotImplementedError()
++
++    def should_stop_pagewalk(self, is_last):
++        raise NotImplementedError()
++
+ 
+ class x86_64PagingInfo(ArchPagingInfo):
++    def __init__(self):
++        self.va_bits = 48 if self.paging_level == 4 else 51
++        # https://blog.zolutal.io/understanding-paging/
++        self.pagetable_level_names = (
++            

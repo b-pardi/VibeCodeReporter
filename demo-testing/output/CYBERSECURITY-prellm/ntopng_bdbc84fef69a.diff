@@ -1,0 +1,122 @@
+@@ -871,7 +871,7 @@ class Flow : public GenericHashEntry {
+   inline u_int32_t getTLSNotAfter()  { return(isTLS() ? protos.tls.notAfter    : 0); };
+   inline char* getTLSCertificateIssuerDN()  { return(isTLS() ? protos.tls.issuerDN  : NULL); }
+   inline char* getTLSCertificateSubjectDN() { return(isTLS() ? protos.tls.subjectDN : NULL); }
+-
++  inline void  setTLSCertificateIssuerDN(char *issuer)  { if(protos.tls.issuerDN) free(protos.tls.issuerDN); protos.tls.issuerDN = strdup(issuer); }
+   inline void setTOS(u_int8_t tos, bool is_cli_tos) { if(is_cli_tos) cli2srv_tos = tos; srv2cli_tos = tos; }
+   inline u_int8_t getTOS(bool is_cli_tos) const { return (is_cli_tos ? cli2srv_tos : srv2cli_tos); }
+ 
+
+
+
+
+@@ -28,6 +28,8 @@ class FlowRisk : public FlowCheck {
+  private:
+   virtual FlowAlertType getAlertType() const = 0;
+ 
++  bool ignoreRisk(Flow *f, ndpi_risk_enum r);
++  
+  public:
+   FlowRisk() : FlowCheck(ntopng_edition_community,
+ 			 false /* All interfaces */, false /* Don't exclude for nEdge */, false /* NOT only for nEdge */,
+
+
+
+
+@@ -356,7 +356,7 @@ void Ntop::registerPrefs(Prefs *_prefs, bool quick_registration) {
+ 
+   prefs = _prefs;
+ 
+-  if(!quick_registration) {
++  if(!quick_registration) {   
+     if(stat(prefs->get_data_dir(), &buf)
+        || (!(buf.st_mode & S_IFDIR))  /* It's not a directory */
+        // || (!(buf.st_mode & S_IWRITE)) /* It's not writable    */
+@@ -396,7 +396,7 @@ void Ntop::registerPrefs(Prefs *_prefs, bool quick_registration) {
+     if(ntop->getRedis() == NULL) {
+       ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to initialize redis. Quitting...");
+       exit(-1);
+-    }
++    }    
+   }
+ 
+ #ifdef NTOPNG_PRO
+@@ -408,6 +408,8 @@ void Ntop::registerPrefs(Prefs *_prefs, bool quick_registration) {
+ 
+   if(quick_registration) return;
+ 
++  checkReloadAlertExclusions();
++  
+   system_interface = new (std::nothrow) NetworkInterface(SYSTEM_INTERFACE_NAME, SYSTEM_INTERFACE_NAME);
+ 
+   /* License check could have increased the number of interfaces available */
+@@ -551,7 +553,6 @@ void Ntop::start() {
+ #endif
+ 
+   checkReloadHostPools();
+-  checkReloadAlertExclusions();
+   checkReloadFlowChecks();
+   checkReloadHostChecks();
+ 
+
+
+
+
+@@ -468,7 +468,29 @@ bool ParserInterface::processFlow(ParsedFlow *zflow) {
+   if(zflow->ja3c_hash) flow->updateJA3C(zflow->ja3c_hash);
+   if(zflow->ja3s_hash) flow->updateJA3S(zflow->ja3s_hash);
+ 
+-  if(zflow->flow_risk_info) flow->setJSONRiskInfo(zflow->flow_risk_info);
++  if(zflow->flow_risk_info) {
++    json_object *o, *obj;
++    enum json_tokener_error jerr = json_tokener_success;
++    
++    flow->setJSONRiskInfo(zflow->flow_risk_info);
++
++    /*
++      We use riskInfo to grab some flow attributes
++      to enrich the memory flor representation
++    */
++    if((o = json_tokener_parse_verbose(zflow->flow_risk_info, &jerr)) != NULL) {
++      /* NOTE: keep in sync with  FlowRisk::ignoreRisk() */
++      if(json_object_object_get_ex(o, "6" /* NDPI_TLS_SELFSIGNED_CERTIFICATE */, &obj)) {
++	const char *issuerDN = json_object_get_string(obj);
++
++	// ntop->getTrace()->traceEvent(TRACE_NORMAL, "[%s]", issuerDN);
++	
++	flow->setTLSCertificateIssuerDN((char*)issuerDN);
++      }
++
++      json_object_put(o);
++    }    
++  }
+   
+ #ifdef NTOPNG_PRO
+   if(zflow->custom_app.pen) {
+@@ -484,6 +506,7 @@ bool ParserInterface::processFlow(ParsedFlow *zflow) {
+   if(zflow->external_alert) {
+     enum json_tokener_error jerr = json_tokener_success;
+     json_object *o = json_tokener_parse_verbose(zflow->external_alert, &jerr);
++    
+     if(o) flow->setExternalAlert(o);
+   }
+ 
+
+
+
+
+@@ -24,12 +24,44 @@
+ 
+ /* ***************************************************** */
+ 
++/* NOTE: keep in sync with ParserInterface::processFlow() */
++bool FlowRisk::ignoreRisk(Flow *f, ndpi_risk_enum r) {
++  switch(r) {
++  case NDPI_TLS_SELFSIGNED_CERTIFICATE:
++    {
++      ndpi_risk_params params[] = {
++	{ NDPI_PARAM_ISSUER_DN, f->getTLSCertificateIssuerDN() }
++      };
++      
++      if(ndpi_check_flow_risk_exceptions(f-

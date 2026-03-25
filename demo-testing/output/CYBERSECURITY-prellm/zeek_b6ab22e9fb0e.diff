@@ -1,0 +1,141 @@
+@@ -12,8 +12,6 @@ using namespace zeek;
+ using namespace zeek::packet_analysis::TCP;
+ using namespace zeek::packet_analysis::IP;
+ 
+-constexpr int32_t TOO_LARGE_SEQ_DELTA = 1048576;
+-
+ TCPAnalyzer::TCPAnalyzer() : IPBasedAnalyzer("TCP", TRANSPORT_TCP, TCP_PORT_MASK, false)
+ 	{
+ 	}
+@@ -100,452 +98,6 @@ bool TCPAnalyzer::WantConnection(uint16_t src_port, uint16_t dst_port,
+ 	return true;
+ 	}
+ 
+-static int get_segment_len(int payload_len, analyzer::tcp::TCP_Flags flags)
+-	{
+-	int seg_len = payload_len;
+-
+-	if ( flags.SYN() )
+-		// SYN consumes a byte of sequence space.
+-		++seg_len;
+-
+-	if ( flags.FIN() )
+-		// FIN consumes a bytes of sequence space.
+-		++seg_len;
+-
+-	if ( flags.RST() )
+-		// Don't include the data in the computation of
+-		// the sequence space for this connection, as
+-		// it's not in fact part of the TCP stream.
+-		seg_len -= payload_len;
+-
+-	return seg_len;
+-	}
+-
+-static void init_endpoint(analyzer::tcp::TCP_Endpoint* endpoint, analyzer::tcp::TCP_Flags flags,
+-                          uint32_t first_seg_seq, uint32_t last_seq, double t)
+-	{
+-	switch ( endpoint->state ) {
+-	case analyzer::tcp::TCP_ENDPOINT_INACTIVE:
+-		if ( flags.SYN() )
+-			{
+-			endpoint->InitAckSeq(first_seg_seq);
+-			endpoint->InitStartSeq(first_seg_seq);
+-			}
+-		else
+-			{
+-			// This is a partial connection - set up the initial sequence
+-			// numbers as though we saw a SYN, to keep the relative byte
+-			// numbering consistent.
+-			endpoint->InitAckSeq(first_seg_seq - 1);
+-			endpoint->InitStartSeq(first_seg_seq - 1);
+-			// But ensure first packet is not marked duplicate
+-			last_seq = first_seg_seq;
+-			}
+-
+-		endpoint->InitLastSeq(last_seq);
+-		endpoint->start_time = t;
+-		break;
+-
+-	case analyzer::tcp::TCP_ENDPOINT_SYN_SENT:
+-	case analyzer::tcp::TCP_ENDPOINT_SYN_ACK_SENT:
+-		if ( flags.SYN() && first_seg_seq != endpoint->StartSeq() )
+-			{
+-			endpoint->Conn()->Weird("SYN_seq_jump");
+-			endpoint->InitStartSeq(first_seg_seq);
+-			endpoint->InitAckSeq(first_seg_seq);
+-			endpoint->InitLastSeq(last_seq);
+-			}
+-		break;
+-
+-	case analyzer::tcp::TCP_ENDPOINT_ESTABLISHED:
+-	case analyzer::tcp::TCP_ENDPOINT_PARTIAL:
+-		if ( flags.SYN() )
+-			{
+-			if ( endpoint->Size() > 0 )
+-				endpoint->Conn()->Weird("SYN_inside_connection");
+-
+-			if ( first_seg_seq != endpoint->StartSeq() )
+-				endpoint->Conn()->Weird("SYN_seq_jump");
+-
+-			// Make a guess that somehow the connection didn't get established,
+-			// and this SYN will be the one that actually sets it up.
+-			endpoint->InitStartSeq(first_seg_seq);
+-			endpoint->InitAckSeq(first_seg_seq);
+-			endpoint->InitLastSeq(last_seq);
+-			}
+-		break;
+-
+-	case analyzer::tcp::TCP_ENDPOINT_RESET:
+-		if ( flags.SYN() )
+-			{
+-			if ( endpoint->prev_state == analyzer::tcp::TCP_ENDPOINT_INACTIVE )
+-				{
+-				// Seq. numbers were initialized by a RST packet from this
+-				// endpoint, but now that a SYN is seen from it, that could mean
+-				// the earlier RST was spoofed/injected, so re-initialize.  This
+-				// mostly just helps prevent misrepresentations of payload sizes
+-				// that are based on bad initial sequence values.
+-				endpoint->InitStartSeq(first_seg_seq);
+-				endpoint->InitAckSeq(first_seg_seq);
+-				endpoint->InitLastSeq(last_seq);
+-				}
+-			}
+-		break;
+-
+-	default:
+-		break;
+-	}
+-	}
+-
+-static uint64_t get_relative_seq(const analyzer::tcp::TCP_Endpoint* endpoint,
+-                                 uint32_t cur_base, uint32_t last,
+-                                 uint32_t wraps, bool* underflow)
+-	{
+-	int32_t delta = seq_delta(cur_base, last);
+-
+-	if ( delta < 0 )
+-		{
+-		if ( wraps && cur_base > last )
+-			// Seems to be a part of a previous 32-bit sequence space.
+-			--wraps;
+-		}
+-
+-	else if ( delta > 0 )
+-		{
+-		if ( cur_base < last )
+-			// The sequence space wrapped around.
+-			++wraps;
+-		}
+-
+-	if ( wraps == 0 )
+-		{
+-		delta = seq_delta(cur_base, endpoint->StartSeq());
+-
+-		if ( underflow && delta < 0 )
+-			*underflow = true;
+-
+-		return delta;
+-		}
+-
+-	return endpoint->ToRela

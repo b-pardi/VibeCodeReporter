@@ -1,0 +1,88 @@
+@@ -16,6 +16,8 @@
+ // Anonymous callback handler methods for the hiredis async API.
+ namespace {
+ 
++bool during_expire = false;
++
+ class Tracer {
+ public:
+     Tracer(const std::string& where) : where(where) {} // DBG_LOG(zeek::DBG_STORAGE, "%s", where.c_str()); }
+@@ -56,17 +58,21 @@ void redisErase(redisAsyncContext* ctx, void* reply, void* privdata) {
+     backend->HandleEraseResult(static_cast<redisReply*>(reply), callback);
+ }
+ 
+-void redisZRANGEBYSCORE(redisAsyncContext* ctx, void* reply, void* privdata) {
+-    auto t = Tracer("zrangebyscore");
++void redisZADD(redisAsyncContext* ctx, void* reply, void* privdata) {
++    auto t = Tracer("generic");
+     auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
+-    backend->HandleZRANGEBYSCORE(static_cast<redisReply*>(reply));
++
++    // We don't care about the reply from the ZADD, m1ostly because blocking to poll
++    // for it adds a bunch of complication to DoPut() with having to handle the
++    // reply from SET first.
++    backend->HandleGeneric(nullptr);
++    freeReplyObject(reply);
+ }
+ 
+ void redisGeneric(redisAsyncContext* ctx, void* reply, void* privdata) {
+     auto t = Tracer("generic");
+     auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
+-    backend->HandleGeneric();
+-    freeReplyObject(reply);
++    backend->HandleGeneric(static_cast<redisReply*>(reply));
+ }
+ 
+ // Because we called redisPollAttach in DoOpen(), privdata here is a
+@@ -74,12 +80,17 @@ void redisGeneric(redisAsyncContext* ctx, void* reply, void* privdata) {
+ // data, which contains the backend. Because we overrode these callbacks in
+ // DoOpen, we still want to mimic their callbacks to redisPollTick functions
+ // correctly.
++//
++// Additionally, if we're in the middle of running a manual Expire() because
++// we're reading a pcap, don't add the file descriptor into iosource_mgr. Manual
++// calls to Poll() during that will handle reading/writing any data, and we
++// don't want the contention with the main loop.
+ void redisAddRead(void* privdata) {
+     auto t = Tracer("addread");
+     auto rpe = static_cast<redisPollEvents*>(privdata);
+     auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
+ 
+-    if ( rpe->reading == 0 )
++    if ( rpe->reading == 0 && ! during_expire )
+         zeek::iosource_mgr->RegisterFd(rpe->fd, backend, zeek::iosource::IOSource::READ);
+     rpe->reading = 1;
+ }
+@@ -89,7 +100,7 @@ void redisDelRead(void* privdata) {
+     auto rpe = static_cast<redisPollEvents*>(privdata);
+     auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
+ 
+-    if ( rpe->reading == 1 )
++    if ( rpe->reading == 1 && ! during_expire )
+         zeek::iosource_mgr->UnregisterFd(rpe->fd, backend, zeek::iosource::IOSource::READ);
+     rpe->reading = 0;
+ }
+@@ -99,7 +110,7 @@ void redisAddWrite(void* privdata) {
+     auto rpe = static_cast<redisPollEvents*>(privdata);
+     auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
+ 
+-    if ( rpe->writing == 0 )
++    if ( rpe->writing == 0 && ! during_expire )
+         zeek::iosource_mgr->RegisterFd(rpe->fd, backend, zeek::iosource::IOSource::WRITE);
+     rpe->writing = 1;
+ }
+@@ -109,11 +120,21 @@ void redisDelWrite(void* privdata) {
+     auto t = Tracer("delwrite");
+     auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
+ 
+-    if ( rpe->writing == 1 )
++    if ( rpe->writing == 1 && ! during_expire )
+         zeek::iosource_mgr->UnregisterFd(rpe->fd, backend, zeek::iosource::IOSource::WRITE);
+     rpe->writing = 0;
+ }
+ 
++// Creates a unique_lock based on a condition against a mutex. This is used to
++// conditionally lock the expire_mutex. We only need to do it while reading
++// pcaps. The only thread contention happens during Expire(), which only happens
++// when reading pcaps. It's not worth the cycles to lock the mutex otherwise,
++// and hiredis will deal with other cross-com

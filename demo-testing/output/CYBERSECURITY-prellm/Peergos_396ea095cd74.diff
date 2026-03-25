@@ -1,0 +1,101 @@
+@@ -380,6 +380,12 @@ public class Main extends Builder {
+             Collections.emptyList()
+     );
+ 
++    public static final Command<Boolean> MIGRATE = new Command<>("migrate",
++            "Move a Peergos account to this server.",
++            Main::migrate,
++            Collections.emptyList()
++    );
++
+     public static UserService startPeergos(Args a) {
+         try {
+             Crypto crypto = initCrypto();
+@@ -645,6 +651,36 @@ public class Main extends Builder {
+         return true;
+     }
+ 
++    /** This should be run on a Peergos server to which a user will be migrated
++     *
++     * @param a
++     * @return
++     */
++    public static boolean migrate(Args a) {
++        Crypto crypto = initCrypto();
++        String peergosUrl = a.getArg("peergos-url");
++        try {
++            URL api = new URL(peergosUrl);
++            NetworkAccess network = Builder.buildJavaNetworkAccess(api, ! peergosUrl.startsWith("http://localhost")).join();
++            Console console = System.console();
++            String username = console.readLine("Enter username to migrate to this server:");
++            String password = new String(console.readPassword("Enter password for " + username + ":"));
++
++            TransactionStore transactions = buildTransactionStore(a);
++            DeletableContentAddressedStorage localStorage = buildLocalStorage(a, transactions);
++            JdbcIpnsAndSocial rawPointers = buildRawPointers(a);
++            QuotaAdmin userQuotas = buildSpaceQuotas(a, localStorage, null);
++            JdbcIpnsAndSocial rawSocial = new JdbcIpnsAndSocial(getDBConnector(a, "social-sql-file"), getSqlCommands(a));
++
++            UserContext user = UserContext.signIn(username, password, network, crypto).join();
++
++            Migrate.migrateToLocal(user, localStorage, rawPointers, rawSocial, userQuotas, crypto, network);
++            return true;
++        } catch (Exception ex) {
++            throw new RuntimeException(ex);
++        }
++    }
++
+     public static final Command<Void> MAIN = new Command<>("Main",
+             "Run a Peergos command",
+             args -> {
+@@ -659,6 +695,7 @@ public class Main extends Builder {
+                     QuotaCLI.QUOTA,
+                     ServerMessages.SERVER_MESSAGES,
+                     GATEWAY,
++                    MIGRATE,
+                     INSTALL_AND_RUN_IPFS,
+                     PKI,
+                     PKI_INIT
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,106 @@
++package peergos.server;
++
++import peergos.server.corenode.*;
++import peergos.server.storage.*;
++import peergos.server.storage.admin.*;
++import peergos.shared.*;
++import peergos.shared.cbor.*;
++import peergos.shared.corenode.*;
++import peergos.shared.crypto.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.social.*;
++import peergos.shared.user.*;
++
++import java.time.*;
++import java.util.*;
++import java.util.stream.*;
++
++public class Migrate {
++
++    public static boolean migrateToLocal(String username,
++                                         List<UserPublicKeyLink> updatedChain,
++                                         long localQuota,
++                                         List<BlindFollowRequest> pending,
++                                         DeletableContentAddressedStorage localStorage,
++                                         JdbcIpnsAndSocial rawPointers,
++                                         JdbcIpnsAndSocial rawSocial,
++                                         QuotaAdmin userQuotas,
++                                         Crypto crypto,
++                                         NetworkAccess network) {
++        try {
++            PublicKeyHash owner = updatedChain.get(updatedChain.size() - 1).owner;
++            // Ensure user has enough local space quota
++            if (userQuotas.getQuota(username) < localQuota)
++                throw new IllegalStateException("Not enough space quota to migrate user!");
++
++            // Mirror all the data to local
++            Mirror.mi

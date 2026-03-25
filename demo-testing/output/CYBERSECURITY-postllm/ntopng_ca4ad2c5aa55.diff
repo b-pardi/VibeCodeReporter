@@ -1,0 +1,147 @@
+@@ -44,8 +44,9 @@ class LuaEngine {
+   lua_State *L; /**< The LuaEngine state. */
+   char *loaded_script_path;
+   bool is_system_vm; /* Executed by callbacks */
++  std::string cloud_string;
+ 
+-  void lua_register_classes(lua_State *L, bool http_mode);
++  void lua_register_classes(lua_State *L, LuaEngineMode mode);
+ 
+  public:
+   /**
+@@ -80,7 +81,7 @@ class LuaEngine {
+   }
+   NetworkStats *getNetwork() { return (getLuaVMContext(L)->network); }
+ 
+-  int load_script(char *script_path, NetworkInterface *iface);
++  int load_script(char *script_path, LuaEngineMode mode, NetworkInterface *iface);
+   int run_loaded_script();
+ 
+   /**
+@@ -117,6 +118,10 @@ class LuaEngine {
+ 
+   inline void setAsSystemVM() { is_system_vm = true; }
+   inline bool isSystemVM() { return (is_system_vm); }
++
++  void pushResultString(char *str);
++  void pushResultNumber(float f);
++  const char* getCloudString() { return(cloud_string.c_str()); }
+ };
+ 
+ /**
+
+
+
+
+@@ -120,6 +120,12 @@ typedef enum {
+ 
+ #define MAX_NUM_PERIODIC_SCRIPTS 6
+ 
++typedef enum {
++  lua_engine_mode_http = 1,
++  lua_engine_mode_callback,
++  lua_engine_mode_cloud
++} LuaEngineMode;
++
+ typedef enum {
+   trend_unknown = 0,
+   trend_up = 1,
+@@ -889,6 +895,7 @@ class Host;
+ class Flow;
+ class ThreadedActivity;
+ class ThreadedActivityStats;
++class LuaEngine;
+ 
+ struct ntopngLuaContext {
+   char *allowed_ifname, *user, *group, *csrf;
+@@ -905,7 +912,8 @@ struct ntopngLuaContext {
+   Flow *flow;
+   bool localuser;
+   u_int16_t observationPointId;
+-
++  LuaEngine *engine;
++  
+   /* Capabilities bitmap */
+   u_int64_t capabilities;
+ 
+
+
+
+
+@@ -151,10 +151,8 @@ LuaEngine::~LuaEngine() {
+       if ((ctx->iface != NULL) && ctx->live_capture.pcaphdr_sent)
+         ctx->iface->deregisterLiveCapture(ctx);
+ 
+-      if (ctx->addr_tree != NULL) delete ctx->addr_tree;
+-
++      if (ctx->addr_tree != NULL)   delete ctx->addr_tree;
+       if (ctx->sqlite_hosts_filter) free(ctx->sqlite_hosts_filter);
+-
+       if (ctx->sqlite_flows_filter) free(ctx->sqlite_flows_filter);
+ 
+ #if defined(NTOPNG_PRO)
+@@ -222,8 +220,7 @@ int ntop_lua_return_value(lua_State *vm, const char *function_name, int val) {
+                                    "https://github.com/ntop/ntopng/issues");
+     }
+ 
+-    lua_pushnil(
+-        vm); /* Add dummy push to make sure the stack has a return value */
++    lua_pushnil(vm); /* Add dummy push to make sure the stack has a return value */
+   }
+ 
+   return (val);
+@@ -299,6 +296,7 @@ static int ntop_lua_http_print(lua_State *vm) {
+           mg_printf(conn, "%s", key);
+           // PrintTable(vm);
+         }
++	
+         lua_pop(vm, 1);
+       }
+     } break;
+@@ -344,6 +342,35 @@ int ntop_lua_cli_print(lua_State *vm) {
+ 
+ /* ****************************************** */
+ 
++int ntop_lua_cloud_print(lua_State *vm) {
++  int t;
++  LuaEngine *engine = getLuaVMUserdata(vm, engine);
++  
++  ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
++
++  switch (t = lua_type(vm, 1)) {
++    case LUA_TSTRING: {
++      char *str = (char *)lua_tostring(vm, 1);
++
++      if (str && (strlen(str) > 0))
++        engine->pushResultString(str);
++    } break;
++
++    case LUA_TNUMBER:
++      engine->pushResultNumber((float)lua_tonumber(vm, 1));
++      break;
++
++    default:
++      ntop->getTrace()->traceEvent(TRACE_WARNING, "%s(): Lua type %d is not handled", __FUNCTION__, t);
++      return (CONST_LUA_ERROR);
++  }
++
++  lua_pushnil(vm);
++  return (CONST_LUA_OK);
++}
++
++/* ****************************************** */
++
+ #if defined(NTOPNG_PRO) || defined(HAVE_NEDGE)
+ 
+ static int __ntop_lua_handlefile(lua_State *L, char *script_path, bool ex) {
+@@ -455,9 +482,11 @@ static int ntop_lua_loadfile(lua_State *L) { return ntop_lua_xfile(L, false); }
+ 
+ /* ****************************************** */
+ 
+-void LuaEngine::lua_register_classes(lua_State *L, bool http_mode) {
++void LuaEngine::lua_register_classes(lua_State *L, LuaEngineMode mode) {
+   if (!L) return;
+ 
++  getLuaVMContext(L)->engine = this;
++    
+   /* ntop a

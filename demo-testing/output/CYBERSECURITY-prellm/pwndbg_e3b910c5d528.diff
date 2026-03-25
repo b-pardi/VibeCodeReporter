@@ -1,0 +1,123 @@
+@@ -6,6 +6,7 @@ from __future__ import print_function
+ from __future__ import unicode_literals
+ 
+ import argparse
++import ctypes
+ import struct
+ 
+ import gdb
+@@ -123,6 +124,11 @@ def heap(addr=None, verbose=False):
+             # in GLIBC versions >= 2.27.
+             cursor += (allocator.malloc_state.sizeof + ptr_size) & ~allocator.malloc_align_mask
+ 
++    # i686 alignment heuristic
++    first_chunk_size = pwndbg.arch.unpack(pwndbg.memory.read(cursor + ptr_size, ptr_size))
++    if first_chunk_size == 0:
++        cursor += ptr_size * 2
++
+     while cursor in heap_region:
+         old_cursor = cursor
+         size_field = pwndbg.memory.u(cursor + allocator.chunk_key_offset('size'))
+@@ -285,6 +291,9 @@ def malloc_chunk(addr,fake=False):
+         arena = allocator.get_heap(addr)['ar_ptr']
+ 
+     fastbins = [] if fake else allocator.fastbins(arena)
++    if not fastbins:
++        fastbins = []
++
+     header = M.get(addr)
+     if fake:
+         header += message.prompt(' FAKE')
+@@ -648,3 +657,326 @@ def bin_addrs(b, bins_type):
+     else:  # normal bin
+         addrs, _, _ = b
+     return addrs
++
++
++try_free_parser = argparse.ArgumentParser(description='Check what would happen if free was called with given address')
++try_free_parser.add_argument('addr', nargs='?', help='Address passed to free')
++@pwndbg.commands.ArgparsedCommand(try_free_parser)
++@pwndbg.commands.OnlyWhenRunning
++@pwndbg.commands.OnlyWhenHeapIsInitialized
++def try_free(addr):
++    addr = int(addr)
++
++    # check hook
++    free_hook = pwndbg.symbol.address('__free_hook')
++    if free_hook is not None:
++        if pwndbg.memory.pvoid(free_hook) != 0:
++            message.success('__libc_free: will execute __free_hook')
++
++    # free(0) has no effect
++    if addr == 0:
++        message.success('__libc_free: addr is 0, nothing to do')
++        return
++
++    # constants
++    allocator = pwndbg.heap.current
++    arena = allocator.get_arena()
++
++    aligned_lsb = allocator.malloc_align_mask.bit_length()
++    size_sz = allocator.size_sz
++    malloc_alignment = allocator.malloc_alignment
++    malloc_align_mask = allocator.malloc_align_mask
++    chunk_minsize = allocator.minsize
++
++    ptr_size = pwndbg.arch.ptrsize
++
++    def unsigned_size(size):
++        # read_chunk()['size'] is signed in pwndbg ;/
++        # there may be better way to handle that
++        if ptr_size < 8:
++            return ctypes.c_uint32(size).value
++        x = ctypes.c_uint64(size).value
++        return x
++
++    def chunksize(chunk_size):
++        # maybe move this to ptmalloc.py
++        return chunk_size & (~7)
++
++    def finalize(errors_found, returned_before_error):
++        print('-'*10)
++        if returned_before_error:
++            print(message.success('Free should succeed!'))
++        elif errors_found > 0:
++            print(message.error('Errors found!'))
++        else:
++            print(message.success('All checks passed!'))
++
++
++    # mem2chunk
++    addr -= 2 * size_sz
++
++    # try to get the chunk
++    try:
++        chunk = read_chunk(addr)
++    except gdb.MemoryError as e:
++        print(message.error('Can\'t read chunk at address 0x{:x}, memory error'.format(addr)))
++        return
++
++    chunk_size = unsigned_size(chunk['size'])
++    chunk_size_unmasked = chunksize(chunk_size)
++    _, is_mmapped, _ = allocator.chunk_flags(chunk_size)
++
++    if is_mmapped:
++        print(message.notice('__libc_free: Doing munmap_chunk'))
++        return
++
++    errors_found = False
++    returned_before_error = False
++
++    # chunk doesn't overlap memory
++    print(message.notice('General checks'))
++    max_mem = (1 << (ptr_size*8)) - 1
++    if addr + chunk_size >= max_mem:
++        err = 'free(): invalid pointer -> &chunk + chunk->size > max memory\n'
++        err += '    0x{:x} + 0x{:x} > 0x{:x}'
++        err = err.format(addr, chunk_size, max_mem)
++        print(message.error(err))
++        errors_found += 1
++
++    # chunk address is aligned
++    addr_tmp = addr
++    if malloc_alignment != 2 * siz

@@ -1,0 +1,90 @@
+@@ -148,4 +148,41 @@ TEST_P(TlsConnectTls13, EarlyExporter) {
+   SendReceive();
+ }
+ 
++TEST_P(TlsConnectTls13, EarlyExporterExternalPsk) {
++  RolloverAntiReplay();
++  ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
++  ASSERT_TRUE(!!slot);
++  ScopedPK11SymKey scoped_psk(
++      PK11_KeyGen(slot.get(), CKM_HKDF_KEY_GEN, nullptr, 16, nullptr));
++  AddPsk(scoped_psk, std::string("foo"), ssl_hash_sha256,
++         TLS_CHACHA20_POLY1305_SHA256);
++  StartConnect();
++  client_->Set0RttEnabled(true);
++  server_->Set0RttEnabled(true);
++  client_->Handshake();  // Send ClientHello.
++  uint8_t client_value[10] = {0};
++  RegularExporterShouldFail(client_.get(), nullptr, 0);
++
++  EXPECT_EQ(SECSuccess,
++            SSL_ExportEarlyKeyingMaterial(
++                client_->ssl_fd(), kExporterLabel, strlen(kExporterLabel),
++                kExporterContext, sizeof(kExporterContext), client_value,
++                sizeof(client_value)));
++
++  server_->SetSniCallback(RegularExporterShouldFail);
++  server_->Handshake();  // Handle ClientHello.
++  uint8_t server_value[10] = {0};
++  EXPECT_EQ(SECSuccess,
++            SSL_ExportEarlyKeyingMaterial(
++                server_->ssl_fd(), kExporterLabel, strlen(kExporterLabel),
++                kExporterContext, sizeof(kExporterContext), server_value,
++                sizeof(server_value)));
++  EXPECT_EQ(0, memcmp(client_value, server_value, sizeof(client_value)));
++
++  Handshake();
++  ExpectEarlyDataAccepted(true);
++  CheckConnected();
++  SendReceive();
++}
++
+ }  // namespace nss_test
+
+
+
+
+@@ -429,8 +429,20 @@ tls13_Exporter(sslSocket *ss, PK11SymKey *secret,
+         return SECFailure;
+     }
+ 
++    SSLHashType hashAlg;
++    /* Early export requires a PSK. As in 0-RTT, default
++     * to the first PSK if no suite is negotiated yet. */
++    if (secret == ss->ssl3.hs.earlyExporterSecret && !ss->ssl3.hs.suite_def) {
++        if (PR_CLIST_IS_EMPTY(&ss->ssl3.hs.psks)) {
++            PORT_SetError(SEC_ERROR_INVALID_ARGS);
++            return SECFailure;
++        }
++        hashAlg = ((sslPsk *)PR_LIST_HEAD(&ss->ssl3.hs.psks))->hash;
++    } else {
++        hashAlg = tls13_GetHash(ss);
++    }
++
+     /* Pre-hash the context. */
+-    SSLHashType hashAlg = tls13_GetHash(ss);
+     rv = tls13_ComputeHash(ss, &contextHash, context, contextLen, hashAlg);
+     if (rv != SECSuccess) {
+         return rv;
+
+
+
+
+@@ -269,9 +269,15 @@ SSLHashType
+ tls13_GetHash(const sslSocket *ss)
+ {
+     /* suite_def may not be set yet when doing EPSK 0-Rtt. */
+-    if (!ss->ssl3.hs.suite_def && ss->xtnData.selectedPsk) {
+-        return ss->xtnData.selectedPsk->hash;
++    if (!ss->ssl3.hs.suite_def) {
++        if (ss->xtnData.selectedPsk) {
++            return ss->xtnData.selectedPsk->hash;
++        }
++        /* This should never happen. */
++        PORT_Assert(0);
++        return ssl_hash_none;
+     }
++
+     /* All TLS 1.3 cipher suites must have an explict PRF hash. */
+     PORT_Assert(ss->ssl3.hs.suite_def->prf_hash != ssl_hash_none);
+     return ss->ssl3.hs.suite_def->prf_hash;

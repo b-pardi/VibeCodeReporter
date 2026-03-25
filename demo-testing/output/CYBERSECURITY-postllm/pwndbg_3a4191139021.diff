@@ -1,0 +1,122 @@
+@@ -13,7 +13,9 @@ from typing import Any
+ from typing import Callable
+ from typing import Dict
+ from typing import Generator
++from typing import Iterator
+ from typing import List
++from typing import Set
+ from typing import Tuple
+ from typing import cast
+ 
+@@ -127,7 +129,8 @@ class module(ModuleType):
+         if attr in ("last", "previous"):
+             super().__setattr__(attr, val)
+         else:
+-            pwndbg.dbg.selected_frame().reg_write(attr, int(val))
++            if not pwndbg.dbg.selected_frame().reg_write(attr, int(val)):
++                raise RuntimeError(f"Attempted to write to a non-existent register '{attr}'")
+ 
+     @pwndbg.lib.cache.cache_until("stop", "prompt")
+     def __getitem__(self, item: Any) -> int | None:
+@@ -138,12 +141,10 @@ class module(ModuleType):
+         return self.read_reg(item)
+ 
+     def __contains__(self, reg: str) -> bool:
+-        regs = set(reg_sets[pwndbg.aglib.arch.name]) | {"pc", "sp"}
+-        return reg in regs
++        return reg_sets[pwndbg.aglib.arch.name].__contains__(reg)
+ 
+-    def __iter__(self) -> Generator[str, None, None]:
+-        regs = set(reg_sets[pwndbg.aglib.arch.name]) | {"pc", "sp"}
+-        yield from regs
++    def __iter__(self) -> Iterator[str]:
++        return reg_sets[pwndbg.aglib.arch.name].__iter__()
+ 
+     @property
+     def current(self) -> RegisterSet:
+@@ -183,31 +184,11 @@ class module(ModuleType):
+         return reg_sets[pwndbg.aglib.arch.name].retval
+ 
+     @property
+-    def all(self) -> List[str]:
+-        regs = reg_sets[pwndbg.aglib.arch.name]
+-        retval: List[str] = []
+-        for regset in (
+-            regs.pc,
+-            regs.stack,
+-            regs.frame,
+-            regs.retaddr,
+-            regs.flags,
+-            regs.gpr,
+-            regs.misc,
+-        ):
+-            if regset is None:
+-                continue
+-
+-            if isinstance(regset, (list, tuple)):  # regs.retaddr
+-                retval.extend(regset)
+-            elif isinstance(regset, dict):  # regs.flags
+-                retval.extend(regset.keys())
+-            else:
+-                retval.append(regset)
+-        return retval
++    def all(self) -> Set[str]:
++        return reg_sets[pwndbg.aglib.arch.name].all
+ 
+     def fix(self, expression: str) -> str:
+-        for regname in set(self.all + ["sp", "pc"]):
++        for regname in self.all:
+             expression = re.sub(rf"\$?\b{regname}\b", r"$" + regname, expression)
+         return expression
+ 
+
+
+
+
+@@ -163,7 +163,7 @@ class GDBFrame(pwndbg.dbg_mod.Frame):
+ 
+     @override
+     def reg_write(self, name: str, val: int) -> bool:
+-        if name not in pwndbg.aglib.regs.all:
++        if name not in pwndbg.aglib.regs:
+             return False
+ 
+         with selection(self.inner, lambda: gdb.selected_frame(), lambda f: f.select()):
+
+
+
+
+@@ -156,11 +156,16 @@ class LLDBFrame(pwndbg.dbg_mod.Frame):
+         if val < 0:
+             raise RuntimeError("Tried to write a register with a negative value")
+ 
++        if name not in pwndbg.aglib.regs:
++            return False
++
+         # Writing to the PC using the normal register write flow causes the
+         # inner object to be automatically invalidated by LLDB, so we have to
+         # handle jumps manually using SBFrame::SetPC.
+-        if name.lower() == reg_sets[pwndbg.aglib.arch.name].pc:
+-            return self.inner.SetPC(val)
++        if name in (reg_sets[pwndbg.aglib.arch.name].pc, "pc"):
++            ret = self.inner.SetPC(val)
++            self.proc.dbg._trigger_event(pwndbg.dbg_mod.EventType.REGISTER_CHANGED)
++            return ret
+ 
+         name = rename_register(name, self.proc)
+ 
+
+
+
+
+@@ -95,6 +95,10 @@ class RegisterSet:
+ 
+         self.all = set(misc) | set(flags) | set(extra_flags) | set(self.retaddr) | set(self.common)
+         self.all -= {None}
++        self.all |= {"pc", "sp"}
++
++    def __contains__(self, reg: str) -> bool:
++        return reg in self.all
+ 
+     def __iter__(self) -> Iterator[str]:
+         yield from 

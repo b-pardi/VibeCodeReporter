@@ -1,0 +1,127 @@
+@@ -1,17 +1,23 @@
+ # Standard library imports
+ import logging
++import re
+ import string
+ import random
+ import json
+-import time
+ from copy import deepcopy
+-from datetime import datetime, timedelta
+-from typing import Type, Optional
++import time
++from datetime import datetime, timedelta, date
++from typing import Type
+ 
+ # Related third party imports
+ import flask_login
+ import flask
+ import sqlalchemy
++import cvss
++
++from flask import abort
++from sqlalchemy import func, text
++from sqlalchemy.dialects.postgresql import insert
+ from sqlalchemy.orm.exc import NoResultFound
+ from marshmallow import (
+     Schema,
+@@ -24,7 +30,15 @@ from marshmallow import (
+ from marshmallow.validate import Range
+ 
+ # Local application imports
+-from faraday.server.config import faraday_server
++from faraday.server.utils.cvss import (
++    get_base_score,
++    get_severity,
++    get_temporal_score,
++    get_environmental_score,
++    get_propper_value,
++    get_exploitability_score,
++    get_impact_score
++)
+ from faraday.server.models import (
+     db,
+     Command,
+@@ -34,12 +48,18 @@ from faraday.server.models import (
+     Hostname,
+     Service,
+     Vulnerability,
+-    VulnerabilityWeb,
+     AgentExecution,
+     Workspace,
+-    Metadata
++    Metadata,
++    CVE,
++    VulnerabilityReference,
++    owasp_vulnerability_association,
++    cwe_vulnerability_association,
++    PolicyViolationVulnerabilityAssociation,
++    SeveritiesHistogram,
++    cve_vulnerability_association,
+ )
+-from faraday.server.utils.cwe import create_cwe
++from faraday.server.utils.cwe import get_or_create_cwe
+ from faraday.server.utils.database import (
+     get_conflict_object,
+     is_unique_constraint_violation,
+@@ -56,9 +76,14 @@ from faraday.server.api.modules import (
+     vulns,
+ )
+ from faraday.server.api.modules.websocket_auth import require_agent_token
++from faraday.server.utils.vulns import (
++    get_or_create_owasp,
++    create_cve_obj,
++    create_policy_violation_obj
++)
+ from faraday.server.config import CONST_FARADAY_HOME_PATH
++from faraday.server.config import faraday_server
+ from faraday.server.tasks import process_report_task
+-from faraday.server.utils.vulns import parse_cve_references_and_policyviolations
+ 
+ 
+ bulk_create_api = flask.Blueprint('bulk_create_api', __name__)
+@@ -236,28 +261,43 @@ def get_or_create(ws: Workspace, model_class: Type[Metadata], data: dict):
+ 
+ 
+ def bulk_create(ws: Workspace,
+-                command: Optional[Command],
++                command: [Command],
+                 data: dict,
+                 data_already_deserialized: bool = False,
+                 set_end_date: bool = True):
+ 
+     logger.info("Init bulk create process")
+ 
++    start_time_before_process = time.time()
++
+     if data_already_deserialized is False:
+         schema = BulkCreateSchema()
+         data = schema.load(data)
+ 
+-    if 'command' in data:
+-        command = _update_command(command, data['command'])
++    # if 'command' in data:
++    #     command = _update_command(command, data['command'])
++    _update_command(command.id, data['command'])
+ 
+     command_dict = {'id': command.id, 'tool': command.tool, 'user': command.user}
++    workspace_id = ws.id
+ 
+     hosts_to_create = len(data['hosts'])
+     if hosts_to_create > 0:
+         logger.debug(f"Needs to create {hosts_to_create} hosts...")
+ 
+         if faraday_server.celery_enabled:
+-            return process_report_task.delay(ws.id, command_dict, data['hosts'])
++            # This will fix redis broken pipe
++            # loops = ceil(len(all_hosts) / 100)
++            # tasks = []
++            # from_host = 0
++            # to_host = 0
++            # for loop in range(loops):
++            #     to_host += 300
++            #     task = process_report_task.delay(workspace_id, command_dict, all_hosts[from_host:to_host])
++            #     from_host = loop * 300
++            #     tasks.append(task)
++            # return tasks
++            return process_report_task.delay(workspace_id, command_dict, data['

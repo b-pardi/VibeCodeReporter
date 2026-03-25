@@ -1,0 +1,93 @@
+@@ -213,6 +213,23 @@ public class JdbcIpnsAndSocial {
+         }
+     }
+ 
++    public Map<PublicKeyHash, byte[]> getAllEntries() {
++        try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM metadatablobs")) {
++            ResultSet rs = stmt.executeQuery();
++            Map<PublicKeyHash, byte[]> results = new HashMap<>();
++            while (rs.next()) {
++                PublicKeyHash writerHash = PublicKeyHash.fromCbor(CborObject.fromByteArray(Base64.getDecoder().decode(rs.getString("writingKey"))));
++                byte[] signedRawCas = Base64.getDecoder().decode(rs.getString(IPNS_TARGET_NAME));
++                results.put(writerHash, signedRawCas);
++            }
++
++            return results;
++        } catch (SQLException sqe) {
++            LOG.log(Level.WARNING, sqe.getMessage(), sqe);
++            return Collections.emptyMap();
++        }
++    }
++
+     public synchronized void close() {
+         if (isClosed)
+             return;
+
+
+
+
+@@ -8,17 +8,24 @@ import com.amazonaws.services.s3.model.*;
+ import peergos.server.corenode.*;
+ import peergos.server.sql.*;
+ import peergos.server.util.*;
++import peergos.shared.*;
+ import peergos.shared.cbor.*;
++import peergos.shared.crypto.asymmetric.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.cid.*;
+ import peergos.shared.io.ipfs.multibase.binary.*;
++import peergos.shared.mutable.*;
+ import peergos.shared.storage.*;
+ import peergos.shared.io.ipfs.multihash.*;
+ import io.prometheus.client.Histogram;
+ import peergos.shared.util.*;
+ 
+ import java.io.*;
++import java.nio.file.*;
++import java.sql.*;
++import java.time.*;
+ import java.util.*;
++import java.util.Base64;
+ import java.util.concurrent.*;
+ import java.util.function.*;
+ import java.util.logging.Level;
+@@ -115,21 +122,39 @@ public class S3BlockStorage implements ContentAddressedStorage {
+         return Futures.errored(new IllegalStateException("S3 doesn't implement GC!"));
+     }
+ 
+-    private void collectGarbage(JdbcIpnsAndSocial pointers) {
++    /** The result of this method is a snapshot of the mutable pointers that is consistent with the blocks store
++     * after GC has completed (saved to a file which can be independently backed up).
++     *
++     * @param pointers
++     * @return
++     */
++    private void collectGarbage(JdbcIpnsAndSocial pointers) throws IOException {
+         // TODO: do this more efficiently with a bloom filter, and streaming
+         List<Multihash> present = getFiles(Integer.MAX_VALUE);
+         List<Multihash> pending = transactions.getOpenTransactionBlocks();
+         // This pointers call must happen AFTER the previous two for correctness
+-        List<Multihash> currentRoots = pointers.getAllTargets(this);
++        Map<PublicKeyHash, byte[]> allPointers = pointers.getAllEntries();
+         BitSet reachable = new BitSet(present.size());
+-        for (Multihash root : currentRoots) {
+-            markReachable(root, present, reachable);
++        for (PublicKeyHash writerHash : allPointers.keySet()) {
++            byte[] signedRawCas = allPointers.get(writerHash);
++            PublicSigningKey writer = getSigningKey(writerHash).join().get();
++            byte[] bothHashes = writer.unsignMessage(signedRawCas);
++            HashCasPair cas = HashCasPair.fromCbor(CborObject.fromByteArray(bothHashes));
++            MaybeMultihash updated = cas.updated;
++            if (updated.isPresent())
++                markReachable(updated.get(), present, reachable);
+         }
+         for (Multihash additional : pending) {
+             int index = present.indexOf(additional);
+             if (index >= 0)
+                 reachable.set(index);
+         }
++        // Save pointers snapshot to file
++        Path pointerSnapshotFile = Paths.get("pointers-snapshot-" + LocalDateTime.now() + ".txt");
++        for (Map.Entry<PublicKeyHash, byte[]> entry : allPointers.entrySet()) {
++            Files.write(pointerSnapshotFile, (entry.getKey() + ":" +
++                    ArrayOp

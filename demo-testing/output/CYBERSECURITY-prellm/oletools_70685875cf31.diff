@@ -1,0 +1,81 @@
+@@ -217,8 +217,9 @@ from __future__ import print_function
+ # 2019-03-25       CH: - added decryption of password-protected files
+ # 2019-04-09       PL: - decompress_stream accepts bytes (issue #422)
+ # 2019-05-23 v0.55 PL: - added option --pcode to call pcodedmp and display P-code
++# 2019-06-05       PL: - added VBA stomping detection
+ 
+-__version__ = '0.55.dev1'
++__version__ = '0.55.dev2'
+ 
+ #------------------------------------------------------------------------------
+ # TODO:
+@@ -2587,6 +2588,10 @@ class VBA_Parser(object):
+         #: Encoding for VBA source code and strings returned by all methods
+         self.encoding = encoding
+         self.xlm_macros = []
++        #: Output from pcodedmp, disassembly of the VBA P-code
++        self.pcodedmp_output = None
++        #: Flag set to True/False if VBA stomping detected
++        self.vba_stomping_detected = None
+ 
+         # if filename is None:
+         #     if isinstance(_file, basestring):
+@@ -3202,6 +3207,15 @@ class VBA_Parser(object):
+                 for line in self.xlm_macros:
+                     vba_code += "' " + line + '\n'
+                 yield ('xlm_macro', 'xlm_macro', 'xlm_macro.txt', vba_code)
++            # Analyse the VBA P-code to detect VBA stomping:
++            # If stomping is detected, add a fake VBA module with the P-code as source comments
++            # so that VBA_Scanner can find keywords and IOCs in it
++            if self.detect_vba_stomping():
++                vba_code = ''
++                for line in self.pcodedmp_output.splitlines():
++                    vba_code += "' " + line + '\n'
++                yield ('VBA P-code', 'VBA P-code', 'VBA_P-code.txt', vba_code)
++
+ 
+     def extract_all_macros(self):
+         """
+@@ -3241,6 +3255,13 @@ class VBA_Parser(object):
+             # Analyze the whole code at once:
+             scanner = VBA_Scanner(self.vba_code_all_modules)
+             self.analysis_results = scanner.scan(show_decoded_strings, deobfuscate)
++            if self.detect_vba_stomping():
++                log.debug('adding VBA stomping to suspicious keywords')
++                keyword = 'VBA Stomping'
++                description = 'VBA Stomping was detected: the VBA source code and P-code are different, '\
++                    'this may have been used to hide malicious code'
++                scanner.suspicious_keywords.append((keyword, description))
++                scanner.results.append(('Suspicious', keyword, description))
+             autoexec, suspicious, iocs, hexstrings, base64strings, dridex, vbastrings = scanner.scan_summary()
+             self.nb_autoexec += autoexec
+             self.nb_suspicious += suspicious
+@@ -3407,6 +3428,114 @@ class VBA_Parser(object):
+                 for variable in oleform.extract_OleFormVariables(ole, form_storage):
+                     yield (self.filename, '/'.join(form_storage), variable)
+ 
++    def extract_pcode(self):
++        """
++        Extract and disassemble the VBA P-code, using pcodedmp
++
++        :return: VBA P-code disassembly
++        :rtype: str
++        """
++        # only run it once:
++        if self.pcodedmp_output is None:
++            log.debug('Calling pcodedmp to extract and disassemble the VBA P-code')
++            # import pcodedmp here to avoid circular imports:
++            from pcodedmp import pcodedmp
++            # logging is disabled after importing pcodedmp, need to re-enable it
++            # This is because pcodedmp imports olevba again :-/
++            # TODO: here it works only if logging was enabled, need to change pcodedmp!
++            enable_logging()
++            # pcodedmp prints all its output to sys.stdout, so we need to capture it so that
++            # we can process the results later on.
++            # save sys.stdout, then modify it to capture pcodedmp's output:
++            # stdout = sys.stdout
++            if PYTHON2:
++                # on Python 2, console output is bytes
++                output = BytesIO()
++            else:
++       

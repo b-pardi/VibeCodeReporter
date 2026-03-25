@@ -1,0 +1,100 @@
+@@ -4,8 +4,6 @@ NERD standalone script which will synchronize NERD with data from MISP instance.
+ instance and get information about all events, where IP address occurred. All these information are then stored as
+ 'misp_events'
+ """
+-
+-from pymisp import PyMISP
+ import logging
+ import datetime
+ import argparse
+@@ -13,6 +11,8 @@ import os
+ import re
+ import sys
+ 
++from pymisp import ExpandedPyMISP, MISPAttribute
++
+ # Add to path the "one directory above the current file location" to find modules from "common"
+ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
+ 
+@@ -70,14 +70,13 @@ except KeyError:
+     logging.error("Missing configuration of MISP instance in the configuration file!")
+     sys.exit(1)
+ 
+-
+ cert = True # set to check server certificate (default)
+ if args.insecure:
+     cert = False # don't check certificate
+ elif args.cert:
+     cert = args.cert # read the certificate (CA bundle) to check the cert
+ 
+-misp_inst = PyMISP(misp_url, misp_key, cert, 'json')
++misp_inst = ExpandedPyMISP(misp_url, misp_key, cert)
+ 
+ # if some error occures in ip processing, add it to list and try to process it again at the end of the script
+ error_ip = {}
+@@ -86,25 +85,41 @@ SIGHTING_DICT = {'0': "positive", '1': "false positive", '2': "expired attribute
+ THREAT_LEVEL_DICT = {'1': "High", '2': "Medium", '3': "Low", '4': "Undefined"}
+ 
+ 
+-def get_ip_from_rec(ip_str, position=None):
++def get_ip_from_attrib(attrib):
++    """
++    Get ip address from MISP attribute and check its distribution level
++    :param attrib: MISP attribute with ip address
++    :return:
++    """
++    # First check distribution level of attributes, 2 = Connected Communities, 3 = All Communities, 5 can have only
++    # attributes and it means inherit event's distribution
++    if int(attrib.get('distribution', 0)) in (2, 3, 5) and int(attrib.get('Event', {}).get('distribution')) in (2, 3):
++        if attrib['type'] in ("ip-src", "ip-dst"):
++            return attrib['value']
++        elif attrib['type'] == "domain|ip":
++            return attrib['value'].split("|")[1]
++        elif attrib['type'] in ("ip-src|port", "ip-dst|port"):
++            ip_split = attrib['value'].split("|")
++            if len(ip_split) == 1:
++                # ip-scr|port can use ':' as delimeter, so if after split it did not split anything, it probably uses
++                # ':' as delimeter
++                ip_split = attrib['value'].split(":")
++            return ip_split[0]
++
++
++def get_ip_from_query(query_result):
+     """
+-    Gets ip addresses from list of addresses in string, where records are splitted by new line
+-    :param ip_str: list of ip addresses in string
+-    :param position: position of ip_address in case of composite record ("domain|ip" --> 1)
+-    :return: List of ip addresses
++    Gets IP addresses from search query (controller='attributes'), which was run on MISP instance
++    :param query_result: result of query, where will IP addresses be parsed from
++    :param position: position of IP address in case of composite record ("domain|ip" --> 1)
++    :return: list of parsed IP addresses
+     """
+-    ip_list_raw = ip_str.text.splitlines()
+-    # if position, have to split record (domain|ip)
+-    if position is not None:
+-        ip_list = []
+-        for ip_addr in ip_list_raw:
+-            # delimeter can be | or :
+-            ip = ip_addr.split("|")
+-            if len(ip) == 1:
+-                ip = ip_addr.split(":")
+-            ip_list.append(ip[position])
+-        return ip_list
+-    return ip_list_raw
++    ip_list = []
++    for ip_attrib in query_result['Attribute']:
++        ip = get_ip_from_attrib(ip_attrib)
++        if ip:
++            ip_list.append(ip)
++    return ip_list
+ 
+ 
+ def get_all_ip():
+@@ -114,20 +129,25 @@ def get_all_ip():
+     """
+     # get all ip addresses from
+     try:
+-        ip_src = misp_inst.get_all_attributes_txt("ip-src")
+-        ip_dst = misp_inst.get_all_attributes_txt("ip-dst")
++    

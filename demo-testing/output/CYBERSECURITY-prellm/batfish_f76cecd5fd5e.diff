@@ -1,0 +1,84 @@
+@@ -139,6 +139,9 @@ public final class Region implements Serializable {
+ 
+   @Nonnull private final Map<String, VpnGateway> _vpnGateways;
+ 
++  private Map<String, IpAccessList> _sgIngressAcls;
++  private Map<String, IpAccessList> _sgEgressAcls;
++
+   public Region(String name) {
+     this(
+         name,
+@@ -831,6 +834,14 @@ public final class Region implements Serializable {
+           .forEach(awsConfiguration::addNode);
+     }
+ 
++    // Must happen after ESD and RDS are converted (for security groups to get all referrer IPs) but
++    // before subnets are converted (so that target instances' special interfaces can get the
++    // instance's security groups applied; these interfaces are not covered by applySecurityGroups).
++    // It's safe to evaluate security groups' IP spaces before converting subnets because all
++    // interfaces created during subnet conversion either use link local addresses or are on subnet
++    // nodes, whose interface addresses don't affect security group IP spaces.
++    convertSecurityGroups(awsConfiguration, warnings);
++
+     for (Subnet subnet : getSubnets().values()) {
+       Configuration cfgNode = subnet.toConfigurationNode(awsConfiguration, this, warnings);
+       awsConfiguration.addNode(cfgNode);
+@@ -839,7 +850,8 @@ public final class Region implements Serializable {
+     // VpcPeeringConnections and TransitGateways are processed in AwsConfiguration since they can be
+     // cross region (or cross-account)
+ 
+-    computeSecurityGroups(awsConfiguration, warnings);
++    // Should happen after all interfaces are created
++    applySecurityGroups(awsConfiguration, warnings);
+ 
+     // TODO: for now, set all interfaces to have the same bandwidth
+     for (Configuration cfgNode : awsConfiguration.getAllNodes()) {
+@@ -850,10 +862,7 @@ public final class Region implements Serializable {
+   }
+ 
+   /** Convert security groups of all nodes to IpAccessLists and apply to all interfaces */
+-  private void applyNetworkInterfaceAclsToInstances(
+-      ConvertedConfiguration cfg,
+-      Map<String, IpAccessList> sgIngressAcls,
+-      Map<String, IpAccessList> sgEgressAcls) {
++  private void applyNetworkInterfaceAclsToInstances(ConvertedConfiguration cfg) {
+     for (NetworkInterface ni : _networkInterfaces.values()) {
+       Optional<Configuration> configuration =
+           Optional.ofNullable(ni.getAttachmentInstanceId()).map(cfg::getNode);
+@@ -865,7 +874,7 @@ public final class Region implements Serializable {
+       if (i == null) {
+         continue;
+       }
+-      applyAclsToInterfaceBasedOnSecurityGroups(ni.getGroups(), c, i, sgIngressAcls, sgEgressAcls);
++      applyAclsToInterfaceBasedOnSecurityGroups(ni.getGroups(), c, i);
+     }
+   }
+ 
+@@ -873,10 +882,7 @@ public final class Region implements Serializable {
+    * For applications (e.g., RDS or ElasticSearch), applies their security groups to their
+    * interfaces.
+    */
+-  private void applyApplicationSecurityGroups(
+-      ConvertedConfiguration cfg,
+-      Map<String, IpAccessList> sgIngressAcls,
+-      Map<String, IpAccessList> sgEgressAcls) {
++  private void applyApplicationSecurityGroups(ConvertedConfiguration cfg) {
+     for (ElasticsearchDomain esd : _elasticsearchDomains.values()) {
+       IntStream.range(0, esd.getInstanceCount())
+           .forEach(
+@@ -887,8 +893,7 @@ public final class Region implements Serializable {
+                   return;
+                 }
+                 for (Interface i : c.getAllInterfaces().values()) {
+-                  applyAclsToInterfaceBasedOnSecurityGroups(
+-                      esd.getSecurityGroups(), c, i, sgIngressAcls, sgEgressAcls);
++                  applyAclsToInterfaceBasedOnSecurityGroups(esd.getSecurityGroups(), c, i);
+                 }
+               });
+     }
+@@ -898,35 +903,29 @@ public final class Region implements Serializable {
+         continue;
+       }
+       for (Interface i : c.getAllInterfaces().values()) {
+-        applyAclsToInterfaceBasedOnSecurityGroups(
+-           

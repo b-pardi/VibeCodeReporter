@@ -1,0 +1,178 @@
+@@ -15,6 +15,17 @@ Brofiler::Brofiler()
+ 
+ Brofiler::~Brofiler()
+ 	{
++	for ( auto& s : stmts )
++		Unref(s);
++	}
++
++void Brofiler::AddStmt(Stmt* s)
++	{
++	if ( ignoring != 0 )
++		return;
++
++	::Ref(s);
++	stmts.push_back(s);
+ 	}
+ 
+ bool Brofiler::ReadStats()
+@@ -109,7 +120,7 @@ bool Brofiler::WriteStats()
+ 		return false;
+ 		}
+ 
+-	for ( list<const Stmt*>::const_iterator it = stmts.begin();
++	for ( list<Stmt*>::const_iterator it = stmts.begin();
+ 	      it != stmts.end(); ++it )
+ 		{
+ 		ODesc location_info;
+
+
+
+
+@@ -38,13 +38,13 @@ public:
+ 	void IncIgnoreDepth() { ignoring++; }
+ 	void DecIgnoreDepth() { ignoring--; }
+ 
+-	void AddStmt(const Stmt* s) { if ( ignoring == 0 ) stmts.push_back(s); }
++	void AddStmt(Stmt* s);
+ 
+ private:
+ 	/**
+ 	 * The current, global Brofiler instance creates this list at parse-time.
+ 	 */
+-	list<const Stmt*> stmts;
++	list<Stmt*> stmts;
+ 
+ 	/**
+ 	 * Indicates whether new statments will not be considered as part of
+
+
+
+
+@@ -4339,6 +4339,7 @@ LambdaExpr::LambdaExpr(std::unique_ptr<function_ingredients> arg_ing,
+ 
+ 	// Install a dummy version of the function globally for use only
+ 	// when broker provides a closure.
++	::Ref(ingredients->body);
+ 	BroFunc* dummy_func = new BroFunc(
+ 		ingredients->id,
+ 		ingredients->body,
+@@ -4378,6 +4379,7 @@ LambdaExpr::LambdaExpr(std::unique_ptr<function_ingredients> arg_ing,
+ 	dummy_func->SetName(my_name.c_str());
+ 
+ 	Val* v = new Val(dummy_func);
++	Unref(dummy_func);
+ 	id->SetVal(v); // id will unref v when its done.
+ 	id->SetType(ingredients->id->Type()->Ref());
+ 	id->SetConst();
+@@ -4385,6 +4387,7 @@ LambdaExpr::LambdaExpr(std::unique_ptr<function_ingredients> arg_ing,
+ 
+ Val* LambdaExpr::Eval(Frame* f) const
+ 	{
++	::Ref(ingredients->body);
+ 	BroFunc* lamb = new BroFunc(
+ 		ingredients->id,
+ 		ingredients->body,
+@@ -4398,7 +4401,9 @@ Val* LambdaExpr::Eval(Frame* f) const
+ 	// Allows for lookups by the receiver.
+ 	lamb->SetName(my_name.c_str());
+ 
+-	return new Val(lamb);
++	auto rval = new Val(lamb);
++	Unref(lamb);
++	return rval;
+ 	}
+ 
+ void LambdaExpr::ExprDescribe(ODesc* d) const
+
+
+
+
+@@ -31,20 +31,54 @@ Frame::Frame(int arg_size, const BroFunc* func, const val_list* fn_args)
+ 
+ Frame::~Frame()
+ 	{
++	for ( auto& func : functions_with_closure_frame_reference )
++		{
++		func->StrengthenClosureReference(this);
++		Unref(func);
++		}
++
+ 	// Deleting a Frame that is a view is a no-op.
+ 	Unref(trigger);
+-	Unref(closure);
++
++	if ( ! weak_closure_ref )
++		Unref(closure);
+ 
+ 	for ( auto& i : outer_ids )
+ 		Unref(i);
+ 
+ 	Release();
++
++	delete [] weak_refs;
+ 	}
+ 
+-void Frame::SetElement(int n, Val* v)
++void Frame::AddFunctionWithClosureRef(BroFunc* func)
+ 	{
+-	Unref(frame[n]);
++	::Ref(func);
++	functions_with_closure_frame_reference.emplace_back(func);
++	}
++
++void Frame::SetElement(int n, Val* v, bool weak_ref)
++	{
++	UnrefElement(n);
+ 	frame[n] = v;
++
++	if ( weak_ref )
++		{
++		if ( ! weak_refs )
++			{
++			weak_refs = new bool[size];
++
++			for ( auto i = 0; i < size; ++i )
++				weak_refs[i] = false;
++			}
++
++		weak_refs[n] = true;
++		}
++	else
++		{
++		if ( weak_refs )
++			weak_refs[n] = false;
++		}
+ 	}
+ 
+ void Frame::SetElement(const ID* id, Val* v)
+@@ -62,8 +96,15 @@ void Frame::SetElement(const ID* id, Val* v)
+ 	if ( offset_map.size() )
+ 		{
+ 		auto where = offset_map.find(std::string(id->Name()));
++
+ 		if ( where != offset_map.end() )
+-			SetElement(where->second, v);
++			{
++			// Need to add a Ref to 'v' since the SetElement() for
++			// id->Offset() below is otherwise responsible for keeping track
++			// of the implied reference count of the passed-in 'v' argument.
++			// i.e. if we end up storing it twice, we need an addition Ref.
++			SetElement(where->second, v->Ref());
++			}
+ 		}
+ 
+ 	SetElement(id->Offset(), v);
+@@ -92,7 +133,7 @@ void Frame::Reset(int startIdx)
+ 	{
+ 	for ( int i = startIdx; i < size; ++i )
+ 		{
+-		Unref(frame[i]);
++		UnrefElement(i);
+ 		frame[i] = 0;
+ 		}
+ 	}
+@@ -100,7 +141,7 @@ void Frame::Reset(int startIdx)
+ void Frame::Release()
+ 	{
+ 	for ( int i = 0; i < siz

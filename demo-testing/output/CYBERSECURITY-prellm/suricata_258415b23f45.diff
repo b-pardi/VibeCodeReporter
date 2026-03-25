@@ -1,0 +1,95 @@
+@@ -322,6 +322,15 @@ void StreamTcpReturnStreamSegments (TcpStream *stream)
+     }
+ }
+ 
++static inline uint64_t GetAbsLastAck(const TcpStream *stream)
++{
++    if (STREAM_LASTACK_GT_BASESEQ(stream)) {
++        return STREAM_BASE_OFFSET(stream) + (stream->last_ack - stream->base_seq);
++    } else {
++        return STREAM_BASE_OFFSET(stream);
++    }
++}
++
+ #ifdef UNITTESTS
+ /** \internal
+  *  \brief check if segments falls before stream 'offset' */
+@@ -754,44 +763,21 @@ static int StreamTcpReassembleRawCheckLimit(const TcpSession *ssn,
+     if (p->flags & PKT_PSEUDO_STREAM_END)
+         SCReturnInt(1);
+ 
++    const uint64_t last_ack_abs = GetAbsLastAck(stream);
++    int64_t diff = last_ack_abs - STREAM_RAW_PROGRESS(stream);
++    int64_t chunk_size = PKT_IS_TOSERVER(p) ? (int64_t)stream_config.reassembly_toserver_chunk_size
++                                            : (int64_t)stream_config.reassembly_toclient_chunk_size;
++
+     /* check if we have enough data to do raw reassembly */
+-    if (PKT_IS_TOSERVER(p)) {
+-        if (STREAM_LASTACK_GT_BASESEQ(stream)) {
+-            uint32_t delta = stream->last_ack - stream->base_seq;
+-            /* get max absolute offset */
+-            uint64_t max_offset = STREAM_BASE_OFFSET(stream) + delta;
+-
+-            int64_t diff = max_offset - STREAM_RAW_PROGRESS(stream);
+-            if ((int64_t)stream_config.reassembly_toserver_chunk_size <= diff) {
+-                SCReturnInt(1);
+-            } else {
+-                SCLogDebug("toserver min chunk len not yet reached: "
+-                        "last_ack %"PRIu32", ra_raw_base_seq %"PRIu32", %"PRIu32" < "
+-                        "%"PRIu32"", stream->last_ack, stream->base_seq,
+-                        (stream->last_ack - stream->base_seq),
+-                        stream_config.reassembly_toserver_chunk_size);
+-                SCReturnInt(0);
+-            }
+-        }
++    if (chunk_size <= diff) {
++        SCReturnInt(1);
+     } else {
+-        if (STREAM_LASTACK_GT_BASESEQ(stream)) {
+-            uint32_t delta = stream->last_ack - stream->base_seq;
+-            /* get max absolute offset */
+-            uint64_t max_offset = STREAM_BASE_OFFSET(stream) + delta;
+-
+-            int64_t diff = max_offset - STREAM_RAW_PROGRESS(stream);
+-
+-            if ((int64_t)stream_config.reassembly_toclient_chunk_size <= diff) {
+-                SCReturnInt(1);
+-            } else {
+-                SCLogDebug("toclient min chunk len not yet reached: "
+-                        "last_ack %"PRIu32", base_seq %"PRIu32",  %"PRIu32" < "
+-                        "%"PRIu32"", stream->last_ack, stream->base_seq,
+-                        (stream->last_ack - stream->base_seq),
+-                        stream_config.reassembly_toclient_chunk_size);
+-                SCReturnInt(0);
+-            }
+-        }
++        SCLogDebug("%s min chunk len not yet reached: "
++                   "last_ack %" PRIu32 ", ra_raw_base_seq %" PRIu32 ", %" PRIu32 " < "
++                   "%" PRIi64,
++                PKT_IS_TOSERVER(p) ? "toserver" : "toclient", stream->last_ack, stream->base_seq,
++                (stream->last_ack - stream->base_seq), chunk_size);
++        SCReturnInt(0);
+     }
+ 
+     SCReturnInt(0);
+@@ -904,16 +890,6 @@ static StreamingBufferBlock *GetBlock(StreamingBuffer *sb, const uint64_t offset
+     return NULL;
+ }
+ 
+-static inline uint64_t GetAbsLastAck(const TcpStream *stream)
+-{
+-    if (STREAM_LASTACK_GT_BASESEQ(stream)) {
+-        return STREAM_BASE_OFFSET(stream) +
+-            (stream->last_ack - stream->base_seq);
+-    } else {
+-        return STREAM_BASE_OFFSET(stream);
+-    }
+-}
+-
+ static inline bool GapAhead(TcpStream *stream, StreamingBufferBlock *cur_blk)
+ {
+     StreamingBufferBlock *nblk = SBB_RB_NEXT(cur_blk);
+@@ -995,51 +971,43 @@ static bool GetAppBuffer(TcpStream *stream, const uint8_t **data, uint32_t *data
+ static inline bool CheckGap(TcpSession *ssn, TcpStream *stream, Packet *p)
+ {
+     const uint64_t app_progress = STREAM_APP_PRO

@@ -1,0 +1,127 @@
+@@ -2814,6 +2814,7 @@ R_API int r_core_config_init(RCore *core) {
+ 	SETPREF ("asm.var.sub", "true", "Substitute variables in disassembly");
+ 	SETI ("asm.var.summary", 0, "Show variables summary instead of full list in disasm (0, 1, 2)");
+ 	SETPREF ("asm.var.subonly", "true", "Substitute the entire variable expression with the local variable name (e.g. [local10h] instead of [ebp+local10h])");
++	SETPREF ("asm.regsub", "false", "Substitute register names with their associated role name (drp~=)");
+ 	SETPREF ("asm.relsub", "true", "Substitute pc relative expressions in disasm");
+ 	SETPREF ("asm.cmt.fold", "false", "Fold comments, toggle with Vz");
+ 	SETPREF ("asm.family", "false", "Show family name in disasm");
+
+
+
+
+@@ -595,6 +595,7 @@ static RDisasmState * ds_init(RCore *core) {
+ 	ds->jmpsub = r_config_get_i (core->config, "asm.jmpsub");
+ 	ds->varsub = r_config_get_i (core->config, "asm.var.sub");
+ 	core->parser->relsub = r_config_get_i (core->config, "asm.relsub");
++	core->parser->regsub = r_config_get_i (core->config, "asm.regsub");
+ 	core->parser->localvar_only = r_config_get_i (core->config, "asm.var.subonly");
+ 	core->parser->retleave_asm = NULL;
+ 	ds->show_vars = r_config_get_i (core->config, "asm.var");
+@@ -934,6 +935,7 @@ static void ds_build_op_str(RDisasmState *ds, bool print_color) {
+ 	/* initialize */
+ 	core->parser->hint = ds->hint;
+ 	core->parser->relsub = r_config_get_i (core->config, "asm.relsub");
++	core->parser->regsub = r_config_get_i (core->config, "asm.regsub");
+ 	core->parser->relsub_addr = 0;
+ 	if (ds->varsub && ds->opstr) {
+ 		ut64 at = ds->vat;
+
+
+
+
+@@ -23,6 +23,7 @@ typedef struct r_parse_t {
+ 	RSpace *flagspace;
+ 	RSpace *notin_flagspace;
+ 	bool pseudo;
++	bool regsub; // replace registers with their respective alias/role name (rdi=A0, ...)
+ 	bool relsub; // replace rip relative expressions in instruction
+ 	bool tailsub; // replace any immediate relative to current address with .. prefix syntax
+ 	bool localvar_only; // if true use only the local variable name (e.g. [local_10h] instead of [ebp + local10h])
+
+
+
+
+@@ -188,6 +188,43 @@ static void insert(char *dst, const char *src) {
+ 	free (endNum);
+ }
+ 
++// TODO: move into r_util/r_str
++static void replaceWords(char *s, const char *k, const char *v) {
++	for (;;) {
++		char *p = strstr (s, k);
++		if (!p) {
++			break;
++		}
++		char *s = p + strlen (k);
++		char *d = p + strlen (v);
++		memmove (d, s, strlen (s) + 1);
++		memmove (p, v, strlen (v));
++		s = p + strlen (v);
++	}
++}
++
++static void replaceRegisters (RReg *reg, char *s, bool x86) {
++	int i;
++	for (i = 0; i < 64; i++) {
++		const char *k = r_reg_get_name (reg, i);
++		if (!k || i == R_REG_NAME_PC) {
++			continue;
++		}
++		const char *v = r_reg_get_role (i);
++		if (!v) {
++			break;
++		}
++		if (x86 && *k == 'r') {
++			replaceWords (s, k, v);
++			char *reg32 = strdup (k);
++			*reg32 = 'e';
++			replaceWords (s, reg32, v);
++		} else {
++			replaceWords (s, k, v);
++		}
++	}
++}
++
+ static int filter(RParse *p, ut64 addr, RFlag *f, char *data, char *str, int len, bool big_endian) {
+ 	char *ptr = data, *ptr2, *ptr_backup;
+ 	RAnalFunction *fcn;
+@@ -211,17 +248,15 @@ static int filter(RParse *p, ut64 addr, RFlag *f, char *data, char *str, int len
+ 		return 0;
+ 	}
+ #if FILTER_DWORD
+-	ptr2 = strstr (ptr, "dword ");
+-	if (ptr2) {
+-		char *src = ptr2 + 6;
+-		memmove (ptr2, src, strlen (src) + 1);
+-	}
+-	ptr2 = strstr (ptr, "qword ");
+-	if (ptr2) {
+-		char *src = ptr2 + 6;
+-		memmove (ptr2, src, strlen (src) + 1);
+-	}
++	replaceWords (ptr, "dword ", src);
++	replaceWords (ptr, "qword ", src);
+ #endif
++	if (p->regsub) {
++		replaceRegisters (p->anal->reg, ptr, false);
++		if (x86) {
++			replaceRegisters (p->anal->reg, ptr, true);
++		}
++	}
+ 	ptr2 = NULL;
+ 	// remove "dword" 2
+ 	char *nptr;
+
+
+
+
+@@ -276,9 +276,7 @@ R_API RRegItem *r_reg_get(RReg *reg, const char *name, int type) {
+ 	RListIter *iter;
+ 	RRegItem *r;
+ 	int i, e;
+-	if (!reg || !name) {
+-		return NULL;
+-	}
++	r_return_val_if_fail (reg && name, NULL);
+ 	if (type == R_REG_TYPE_FLG

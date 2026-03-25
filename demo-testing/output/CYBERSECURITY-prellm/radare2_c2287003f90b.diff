@@ -1,0 +1,149 @@
+@@ -35,6 +35,9 @@ static const char *help_msg_d[] = {
+ 	"ds", "[?]", "Step, over, source line",
+ 	"dt", "[?]", "Display instruction traces",
+ 	"dw", " <pid>", "Block prompt until pid dies",
++#if __WINDOWS__
++	"dW", "", "List process windows",
++#endif
+ 	"dx", "[?]", "Inject and run code on target process (See gs)",
+ 	NULL
+ };
+@@ -77,6 +80,9 @@ static const char *help_msg_db[] = {
+ 	"dbt", "[?]", "Show backtrace. See dbt? for more details",
+ 	"dbx", " [expr]", "Set expression for bp in current offset",
+ 	"dbw", " <addr> <r/w/rw>", "Add watchpoint",
++#if __WINDOWS__
++	"dbW", " <WM_DEFINE> [?|handle|name]", "Set cond. breakpoint on a window message handler"
++#endif
+ 	"drx", " number addr len perm", "Modify hardware breakpoint",
+ 	"drx-", "number", "Clear hardware breakpoint",
+ 	NULL
+@@ -3140,6 +3146,10 @@ static void core_cmd_dbi (RCore *core, const char *input, ut64 addr) {
+ 	}
+ }
+ 
++#if __WINDOWS__
++#include "..\debug\p\native\windows\windows_message.h"
++#endif
++
+ static void r_core_cmd_bp(RCore *core, const char *input) {
+ 	RBreakpointItem *bpi;
+ 	int i, hwbp = r_config_get_i (core->config, "dbg.hwbp");
+@@ -3532,6 +3542,17 @@ static void r_core_cmd_bp(RCore *core, const char *input) {
+ 			break;
+ 		}
+ 		break;
++#if __WINDOWS__
++	case 'W': // "dbW"
++		if (input[2] == ' ') {
++			if (r_w32_add_winmsg_breakpoint (core->dbg, input + 3)) {
++				r_cons_print ("Breakpoint set.\n");
++			} else {
++				r_cons_print ("Breakpoint not set.\n");
++			}
++		}
++		break;
++#endif
+ 	case 'w': // "dbw"
+ 		input++; // skip 'w'
+ 		watch = true;
+@@ -5109,6 +5130,11 @@ static int cmd_debug(void *data, const char *input) {
+ 			break;
+ 		}
+ 		break;
++#if __WINDOWS__
++	case 'W': // "dW"
++		r_w32_print_windows (core->dbg);
++		break;
++#endif
+ 	case 'w': // "dw"
+ 		r_cons_break_push (static_debug_stop, core->dbg);
+ 		for (;!r_cons_is_breaked ();) {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,460 @@
++/* radare2 - LGPL - Copyright 2019 - GustavoLCR */
++#include <r_debug.h>
++#include "windows_message.h"
++
++static char *msg_types_arr[] = {
++	"WM_NULL=0x0000",
++	"WM_CREATE=0x0001",
++	"WM_DESTROY=0x0002",
++	"WM_MOVE=0x0003",
++	"WM_SIZE=0x0005",
++	"WM_ACTIVATE=0x0006",
++	"WM_SETFOCUS=0x0007",
++	"WM_KILLFOCUS=0x0008",
++	"WM_ENABLE=0x000A",
++	"WM_SETREDRAW=0x000B",
++	"WM_SETTEXT=0x000C",
++	"WM_GETTEXT=0x000D",
++	"WM_GETTEXTLENGTH=0x000E",
++	"WM_PAINT=0x000F",
++	"WM_CLOSE=0x0010",
++	"WM_QUERYENDSESSION=0x0011",
++	"WM_QUIT=0x0012",
++	"WM_QUERYOPEN=0x0013",
++	"WM_ERASEBKGND=0x0014",
++	"WM_SYSCOLORCHANGE=0x0015",
++	"WM_ENDSESSION=0x0016",
++	"WM_SHOWWINDOW=0x0018",
++	"WM_WININICHANGE=0x001A",
++	"WM_DEVMODECHANGE=0x001B",
++	"WM_ACTIVATEAPP=0x001C",
++	"WM_FONTCHANGE=0x001D",
++	"WM_TIMECHANGE=0x001E",
++	"WM_CANCELMODE=0x001F",
++	"WM_SETCURSOR=0x0020",
++	"WM_MOUSEACTIVATE=0x0021",
++	"WM_CHILDACTIVATE=0x0022",
++	"WM_QUEUESYNC=0x0023",
++	"WM_GETMINMAXINFO=0x0024",
++	"WM_PAINTICON=0x0026",
++	"WM_ICONERASEBKGND=0x0027",
++	"WM_NEXTDLGCTL=0x0028",
++	"WM_SPOOLERSTATUS=0x002A",
++	"WM_DRAWITEM=0x002B",
++	"WM_MEASUREITEM=0x002C",
++	"WM_DELETEITEM=0x002D",
++	"WM_VKEYTOITEM=0x002E",
++	"WM_CHARTOITEM=0x002F",
++	"WM_SETFONT=0x0030",
++	"WM_GETFONT=0x0031",
++	"WM_SETHOTKEY=0x0032",
++	"WM_GETHOTKEY=0x0033",
++	"WM_QUERYDRAGICON=0x0037",
++	"WM_COMPAREITEM=0x0039",
++	"WM_GETOBJECT=0x003D",
++	"WM_COMPACTING=0x0041",
++	"WM_COMMNOTIFY=0x0044",
++	"WM_WINDOWPOSCHANGING=0x0046",
++	"WM_WINDOWPOSCHANGED=0x0047",
++	"WM_POWER=0x0048",
++	"WM_COPYDATA=0x004A",
++	"WM_CANCELJOURNAL=0x004B",
++	"WM_NOTIFY=0x004E",
++	"WM_INPUTLANGCHANGEREQUEST=0x0050",
++	"WM_INPUTLANGCHANGE=0x0051",
++	"WM_TCARD=0x0052",
++	"WM_HELP=0x0053",
++	"WM_USERCHANGED=0x0054",
++	"WM_NOTIFYFORMAT=0x0055",
++	"WM_CONTEXTMENU=0x007B",
++	"WM_STYLECHANGING=0x007C",
++	"WM_STYLECHANGED=0x007D",
++	"WM_DISPLAYCHANGE=0x007E",
++	"WM_GETICON=0x007F",
++	"WM_SETICON=0x0080",
++	"WM_NCCREATE=0x0081",
++	"WM_NCDESTROY=0x0082",
++	"WM_NCCALCSIZE=0x0083",
++	"WM_NCHITTEST=0x0084",
++	"WM_NCPAINT=0x0085",
++	"WM_NCACTIVATE=0x0086",
++	"WM_GETDLGCODE=0x0087",
++	"WM_SYNCPAINT=0

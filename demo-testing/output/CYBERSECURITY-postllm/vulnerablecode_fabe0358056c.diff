@@ -1,0 +1,107 @@
+@@ -111,7 +111,7 @@ class Reference:
+     def from_dict(cls, ref: dict):
+         return cls(
+             reference_id=ref["reference_id"],
+-            reference_type=ref["reference_type"],
++            reference_type=ref.get("reference_type") or "",
+             url=ref["url"],
+             severities=[
+                 VulnerabilitySeverity.from_dict(severity) for severity in ref["severities"]
+
+
+
+
+@@ -7,14 +7,23 @@
+ # See https://aboutcode.org for more information about nexB OSS projects.
+ #
+ 
++import csv
+ import hashlib
+ import json
+ import logging
++import xml.etree.ElementTree as ET
+ from contextlib import suppress
+ from functools import cached_property
++from itertools import groupby
++from operator import attrgetter
+ from typing import Union
+ 
++from cvss.exceptions import CVSS2MalformedError
++from cvss.exceptions import CVSS3MalformedError
++from cvss.exceptions import CVSS4MalformedError
+ from cwe2.database import Database
++from cwe2.mappings import xml_database_path
++from cwe2.weakness import Weakness as DBWeakness
+ from django.contrib.auth import get_user_model
+ from django.contrib.auth.models import UserManager
+ from django.core import exceptions
+@@ -41,8 +50,8 @@ from univers.version_range import RANGE_CLASS_BY_SCHEMES
+ from univers.version_range import AlpineLinuxVersionRange
+ from univers.versions import Version
+ 
+-from aboutcode import hashid
+ from vulnerabilities import utils
++from vulnerabilities.severity_systems import EPSS
+ from vulnerabilities.severity_systems import SCORING_SYSTEMS
+ from vulnerabilities.utils import normalize_purl
+ from vulnerabilities.utils import purl_to_dict
+@@ -371,6 +380,127 @@ class Vulnerability(models.Model):
+         """
+         return [p.package_url for p in self.packages.distinct().all()]
+ 
++    def aggregate_fixed_and_affected_packages(self):
++        from vulnerabilities.utils import get_purl_version_class
++
++        sorted_fixed_by_packages = self.fixed_by_packages.filter(is_ghost=False).order_by(
++            "type", "namespace", "name", "qualifiers", "subpath"
++        )
++
++        if sorted_fixed_by_packages:
++            sorted_fixed_by_packages.first().calculate_version_rank
++
++        sorted_affected_packages = self.affected_packages.all()
++
++        if sorted_affected_packages:
++            sorted_affected_packages.first().calculate_version_rank
++
++        grouped_fixed_by_packages = {
++            key: list(group)
++            for key, group in groupby(
++                sorted_fixed_by_packages,
++                key=attrgetter("type", "namespace", "name", "qualifiers", "subpath"),
++            )
++        }
++
++        all_affected_fixed_by_matches = []
++
++        for sorted_affected_package in sorted_affected_packages:
++            affected_fixed_by_matches = {
++                "affected_package": sorted_affected_package,
++                "matched_fixed_by_packages": [],
++            }
++
++            # Build the key to find matching group
++            key = (
++                sorted_affected_package.type,
++                sorted_affected_package.namespace,
++                sorted_affected_package.name,
++                sorted_affected_package.qualifiers,
++                sorted_affected_package.subpath,
++            )
++
++            # Get matching group from pre-grouped fixed_by_packages
++            matching_fixed_packages = grouped_fixed_by_packages.get(key, [])
++
++            # Get version classes for comparison
++            affected_version_class = get_purl_version_class(sorted_affected_package)
++            affected_version = affected_version_class(sorted_affected_package.version)
++
++            # Compare versions and filter valid matches
++            matched_fixed_by_packages = [
++                fixed_by_package.purl
++                for fixed_by_package in matching_fixed_packages
++                if get_purl_version_class(fixed_by_package)(fixed_by_package.version)
++                > affected_version
++            ]
++
++            affected_fixed_by_matches["match

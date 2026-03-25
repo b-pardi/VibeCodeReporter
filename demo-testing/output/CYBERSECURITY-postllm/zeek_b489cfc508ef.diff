@@ -1,0 +1,103 @@
+@@ -1588,7 +1588,8 @@ private:
+ 
+ class InlineExpr : public Expr {
+ public:
+-    InlineExpr(ListExprPtr arg_args, std::vector<IDPtr> params, StmtPtr body, int frame_offset, TypePtr ret_type);
++    InlineExpr(ListExprPtr arg_args, std::vector<IDPtr> params, std::vector<bool> param_is_modified, StmtPtr body,
++               int frame_offset, TypePtr ret_type);
+ 
+     bool IsPure() const override;
+ 
+@@ -1610,6 +1611,7 @@ protected:
+     void ExprDescribe(ODesc* d) const override;
+ 
+     std::vector<IDPtr> params;
++    std::vector<bool> param_is_modified;
+     int frame_offset;
+     ListExprPtr args;
+     StmtPtr body;
+
+
+
+
+@@ -361,7 +361,7 @@ void do_print_stmt(const std::vector<ValPtr>& vals) {
+ }
+ 
+ ExprStmt::ExprStmt(ExprPtr arg_e) : Stmt(STMT_EXPR), e(std::move(arg_e)) {
+-    if ( e && e->Tag() != EXPR_CALL && e->IsPure() && e->GetType()->Tag() != TYPE_ERROR )
++    if ( e && e->Tag() != EXPR_CALL && e->Tag() != EXPR_INLINE && e->IsPure() && e->GetType()->Tag() != TYPE_ERROR )
+         Warn("expression value ignored");
+ 
+     SetLocationInfo(e->GetLocationInfo());
+
+
+
+
+@@ -2272,10 +2272,11 @@ ExprPtr CastExpr::Duplicate() { return SetSucc(new CastExpr(op->Duplicate(), typ
+ 
+ ExprPtr IsExpr::Duplicate() { return SetSucc(new IsExpr(op->Duplicate(), t)); }
+ 
+-InlineExpr::InlineExpr(ListExprPtr arg_args, std::vector<IDPtr> arg_params, StmtPtr arg_body, int _frame_offset,
+-                       TypePtr ret_type)
++InlineExpr::InlineExpr(ListExprPtr arg_args, std::vector<IDPtr> arg_params, std ::vector<bool> arg_param_is_modified,
++                       StmtPtr arg_body, int _frame_offset, TypePtr ret_type)
+     : Expr(EXPR_INLINE), args(std::move(arg_args)), body(std::move(arg_body)) {
+     params = std::move(arg_params);
++    param_is_modified = std::move(arg_param_is_modified);
+     frame_offset = _frame_offset;
+     type = std::move(ret_type);
+ }
+@@ -2316,7 +2317,7 @@ ValPtr InlineExpr::Eval(Frame* f) const {
+ ExprPtr InlineExpr::Duplicate() {
+     auto args_d = args->Duplicate()->AsListExprPtr();
+     auto body_d = body->Duplicate();
+-    return SetSucc(new InlineExpr(args_d, params, body_d, frame_offset, type));
++    return SetSucc(new InlineExpr(args_d, params, param_is_modified, body_d, frame_offset, type));
+ }
+ 
+ bool InlineExpr::IsReduced(Reducer* c) const { return NonReduced(this); }
+@@ -2334,11 +2335,7 @@ ExprPtr InlineExpr::Reduce(Reducer* c, StmtPtr& red_stmt) {
+     loop_over_list(args_list, i) {
+         StmtPtr arg_red_stmt;
+         auto red_i = args_list[i]->Reduce(c, arg_red_stmt);
+-
+-        auto param_i = c->GenInlineBlockName(params[i]);
+-        auto assign = make_intrusive<AssignExpr>(param_i, red_i, false, nullptr, nullptr, false);
+-        auto assign_stmt = make_intrusive<ExprStmt>(assign);
+-
++        auto assign_stmt = c->GenParam(params[i], red_i, param_is_modified[i]);
+         red_stmt = MergeStmts(red_stmt, arg_red_stmt, assign_stmt);
+     }
+ 
+
+
+
+
+@@ -20,9 +20,7 @@ GenIDDefs::GenIDDefs(std::shared_ptr<ProfileFunc> _pf, const Func* f, ScopePtr s
+ void GenIDDefs::TraverseFunction(const Func* f, ScopePtr scope, StmtPtr body) {
+     func_flavor = f->Flavor();
+ 
+-    // Establish the outermost barrier and associated set of
+-    // identifiers.
+-    barrier_blocks.push_back(0);
++    // Establish the outermost set of identifiers.
+     modified_IDs.emplace_back();
+ 
+     for ( const auto& g : pf->Globals() ) {
+@@ -63,9 +61,9 @@ TraversalCode GenIDDefs::PreStmt(const Stmt* s) {
+             auto cr = s->AsCatchReturnStmt();
+             auto block = cr->Block();
+ 
+-            StartConfluenceBlock(s);
++            cr_active.push_back(confluence_blocks.size());
+             block->Traverse(this);
+-            EndConfluenceBlock();
++            cr_active.pop_back();
+ 
+             auto retvar = cr->RetVar();
+             if ( retvar )
+@@ -381,9 +379,6 @@ void GenIDDefs::CheckVarUsage(const Expr* e, const ID* id) {
+ }
+ 
+ void GenIDDefs::StartConfluenceBlock(const Stmt* s) {
+-    if ( s->Tag() == STMT_CATCH_RETURN

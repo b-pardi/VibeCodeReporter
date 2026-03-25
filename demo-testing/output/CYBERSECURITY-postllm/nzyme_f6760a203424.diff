@@ -1,0 +1,81 @@
+@@ -26,6 +26,7 @@ import app.nzyme.core.events.EventEngine;
+ import app.nzyme.core.events.EventEngineImpl;
+ import app.nzyme.core.integrations.geoip.GeoIpService;
+ import app.nzyme.core.monitoring.health.HealthMonitor;
++import app.nzyme.core.periodicals.data.RetentionCleaner;
+ import app.nzyme.core.periodicals.distributed.NodeUpdater;
+ import app.nzyme.core.registry.RegistryChangeMonitorImpl;
+ import app.nzyme.core.rest.server.NzymeHttpServer;
+@@ -222,12 +223,14 @@ public class NzymeNodeImpl implements NzymeNode {
+         PeriodicalManager periodicalManager = new PeriodicalManager();
+         periodicalManager.scheduleAtFixedRate(new NodeUpdater(this), 0, 5, TimeUnit.SECONDS);
+         periodicalManager.scheduleAtFixedRate(new OUIUpdater(this), 12, 12, TimeUnit.HOURS);
++        periodicalManager.scheduleAtFixedRate(new RetentionCleaner(this), 0, 1, TimeUnit.HOURS);
+         if(configuration.versionchecksEnabled()) {
+             periodicalManager.scheduleAtFixedRate(new VersioncheckThread(version, this), 0, 60, TimeUnit.MINUTES);
+         } else {
+             LOG.info("Versionchecks are disabled.");
+         }
+ 
++
+         healthMonitor.initialize();
+ 
+         // Load plugins.
+
+
+
+
+@@ -96,7 +96,9 @@ public class DatabaseImpl implements Database {
+                 .registerRowMapper(new ActiveChannelMapper())
+                 .registerRowMapper(new ConnectedClientDetailsMapper())
+                 .registerRowMapper(new DisconnectedClientDetailsMapper())
+-                .registerRowMapper(new ClientHistogramEntryMapper());
++                .registerRowMapper(new ClientHistogramEntryMapper())
++                .registerRowMapper(new ClientActivityHistogramEntryMapper())
++                .registerRowMapper(new FirstLastSeenTupleMapper());
+ 
+         // Run migrations against underlying JDBC connection.
+         JdbcConnection connection = new JdbcConnection(jdbi.open().getConnection());
+
+
+
+
+@@ -378,19 +378,39 @@ public class Dot11 {
+     }
+ 
+     public Optional<ClientDetails> findMergedConnectedOrDisconnectedClient(String clientMac, List<UUID> taps) {
+-        Optional<DateTime> firstSeenConnected = nzyme.getDatabase().withHandle(handle ->
+-                handle.createQuery("SELECT MAX(b.created_at) " +
++        Optional<FirstLastSeenTuple> connected = nzyme.getDatabase().withHandle(handle ->
++                handle.createQuery("SELECT MAX(b.created_at) AS last_seen, MIN(b.created_at) AS first_seen " +
+                                 "FROM dot11_bssids AS b " +
+                                 "LEFT JOIN dot11_bssid_clients AS c on b.id = c.bssid_id " +
+                                 "WHERE c.client_mac = :client_mac AND b.tap_uuid IN (<taps>)")
+                         .bind("client_mac", clientMac)
+                         .bindList("taps", taps)
+-                        .mapTo(DateTime.class)
++                        .mapTo(FirstLastSeenTuple.class)
++                        .findOne()
++        );
++
++        // Aggregations might return NULL.
++        if (connected.isPresent()
++                && connected.get().firstSeen() == null && connected.get().lastSeen() == null) {
++            connected = Optional.empty();
++        }
++
++        Optional<String> currentlyConnectedBSSID = nzyme.getDatabase().withHandle(handle ->
++                handle.createQuery("SELECT b.bssid " +
++                                "FROM dot11_bssids AS b " +
++                                "LEFT JOIN dot11_bssid_clients AS c on b.id = c.bssid_id " +
++                                "WHERE c.client_mac = :client_mac AND b.tap_uuid IN (<taps>) " +
++                                "ORDER BY b.created_at DESC " +
++                                "LIMIT 1")
++                        .bind("client_mac", clientMac)
++                        .bindList("taps", taps)
++                        .mapTo(String.class)
+                         .findOne()
+         );
+ 
+         List<ConnectedBSSID> connectedBSSIDs = Lists.newArrayList();
+-        if (firstSeenConnec

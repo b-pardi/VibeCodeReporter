@@ -1,0 +1,107 @@
+@@ -183,7 +183,8 @@ static SCMutex afpacket_bpf_set_filter_lock = SCMUTEX_INITIALIZER;
+ enum {
+     AFP_READ_OK,
+     AFP_READ_FAILURE,
+-    AFP_FAILURE,
++    /** Error during treatment by other functions of Suricata */
++    AFP_SURI_FAILURE,
+     AFP_KERNEL_DROP,
+ };
+ 
+@@ -237,6 +238,7 @@ typedef struct AFPThreadVars_
+     /* references to packet and drop counters */
+     uint16_t capture_kernel_packets;
+     uint16_t capture_kernel_drops;
++    uint16_t capture_errors;
+ 
+     /* handle state */
+     uint8_t afp_state;
+@@ -628,7 +630,7 @@ static int AFPRead(AFPThreadVars *ptv)
+ 
+     p = PacketGetFromQueueOrAlloc();
+     if (p == NULL) {
+-        SCReturnInt(AFP_FAILURE);
++        SCReturnInt(AFP_SURI_FAILURE);
+     }
+     PKT_SET_SRC(p, PKT_SRC_WIRE);
+     if (ptv->flags & AFP_BYPASS) {
+@@ -668,7 +670,7 @@ static int AFPRead(AFPThreadVars *ptv)
+     SET_PKT_LEN(p, caplen + offset);
+     if (PacketCopyData(p, ptv->data, GET_PKT_LEN(p)) == -1) {
+         TmqhOutputPacketpool(ptv->tv, p);
+-        SCReturnInt(AFP_FAILURE);
++        SCReturnInt(AFP_SURI_FAILURE);
+     }
+     SCLogDebug("pktlen: %" PRIu32 " (pkt %p, pkt data %p)",
+                GET_PKT_LEN(p), p, GET_PKT_DATA(p));
+@@ -708,7 +710,7 @@ static int AFPRead(AFPThreadVars *ptv)
+ 
+     if (TmThreadsSlotProcessPkt(ptv->tv, ptv->slot, p) != TM_ECODE_OK) {
+         TmqhOutputPacketpool(ptv->tv, p);
+-        SCReturnInt(AFP_FAILURE);
++        SCReturnInt(AFP_SURI_FAILURE);
+     }
+     SCReturnInt(AFP_READ_OK);
+ }
+@@ -872,8 +874,10 @@ static int AFPReadFromRing(AFPThreadVars *ptv)
+ 
+         /* Read packet from ring */
+         h.raw = (((union thdr **)ptv->ring_v2)[ptv->frame_offset]);
+-        if (h.raw == NULL) {
+-            SCReturnInt(AFP_FAILURE);
++        if (unlikely(h.raw == NULL)) {
++            /* Impossible we reach this point in normal condition, so trigger
++             * a failure in reading */
++            SCReturnInt(AFP_READ_FAILURE);
+         }
+ 
+         if ((! h.h2->tp_status) || (h.h2->tp_status & TP_STATUS_USER_BUSY)) {
+@@ -911,7 +915,7 @@ static int AFPReadFromRing(AFPThreadVars *ptv)
+ 
+         p = PacketGetFromQueueOrAlloc();
+         if (p == NULL) {
+-            SCReturnInt(AFP_FAILURE);
++            SCReturnInt(AFP_SURI_FAILURE);
+         }
+         PKT_SET_SRC(p, PKT_SRC_WIRE);
+         if (ptv->flags & AFP_BYPASS) {
+@@ -954,7 +958,7 @@ static int AFPReadFromRing(AFPThreadVars *ptv)
+         if (ptv->flags & AFP_ZERO_COPY) {
+             if (PacketSetData(p, (unsigned char*)h.raw + h.h2->tp_mac, h.h2->tp_snaplen) == -1) {
+                 TmqhOutputPacketpool(ptv->tv, p);
+-                SCReturnInt(AFP_FAILURE);
++                SCReturnInt(AFP_SURI_FAILURE);
+             } else {
+                 p->afp_v.relptr = h.raw;
+                 p->ReleasePacket = AFPReleasePacket;
+@@ -970,8 +974,15 @@ static int AFPReadFromRing(AFPThreadVars *ptv)
+             }
+         } else {
+             if (PacketCopyData(p, (unsigned char*)h.raw + h.h2->tp_mac, h.h2->tp_snaplen) == -1) {
++                /* As we can possibly fail to copy the data due to invalid data, let's
++                 * skip this packet and switch to the next one.
++                 */
++                h.h2->tp_status = TP_STATUS_KERNEL;
++                if (++ptv->frame_offset >= ptv->req.tp_frame_nr) {
++                    ptv->frame_offset = 0;
++                }
+                 TmqhOutputPacketpool(ptv->tv, p);
+-                SCReturnInt(AFP_FAILURE);
++                SCReturnInt(AFP_SURI_FAILURE);
+             }
+         }
+ 
+@@ -1014,7 +1025,7 @@ static int AFPReadFromRing(AFPThreadVars *ptv)
+                 ptv->frame_offset = 0;
+             }
+             TmqhOutputPacketpool(ptv->tv, p);
+-            SCReturnInt(AFP_FAILURE);
++            SCReturnInt(AFP_SURI_FAILURE);
+         }
+ 
+ next_frame:
+@@ -1038,7 +1049,7 @@ static inline int AFPParsePacketV3(AFPThreadVars *ptv, struct tpacket_block_desc
+ {
+     Packet *p = PacketGetFromQueueOrAlloc();
+     if (p == NULL) {
+-     

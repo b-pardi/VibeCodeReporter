@@ -1,0 +1,142 @@
+@@ -20,6 +20,20 @@ R_API void r_core_task_scheduler_init(RCoreTaskScheduler *tasks, RCore *core) {
+ }
+ 
+ R_API void r_core_task_scheduler_fini(RCoreTaskScheduler *tasks) {
++	// Join all task threads before freeing lists to avoid races
++	RListIter *iter;
++	RCoreTask *t;
++	r_th_lock_enter (tasks->lock);
++	RList *snapshot = r_list_clone (tasks->tasks, NULL);
++	r_th_lock_leave (tasks->lock);
++	if (snapshot) {
++		r_list_foreach (snapshot, iter, t) {
++			if (t && t->thread) {
++				r_th_wait (t->thread);
++			}
++		}
++		r_list_free (snapshot);
++	}
+ 	r_list_free (tasks->tasks);
+ 	r_list_free (tasks->tasks_queue);
+ 	r_list_free (tasks->oneshot_queue);
+@@ -110,9 +124,25 @@ R_API void r_core_task_list(RCore *core, int mode) {
+ 		}
+ 		pj_a (pj);
+ 	}
++	// Snapshot tasks under lock to avoid printing while holding the lock
+ 	TASK_SIGSET_T old_sigset;
++	int running_count = 0;
++	RList *snapshot = r_list_new ();
++	if (!snapshot) {
++		if (mode == 'j') {
++			pj_free (pj);
++		}
++		return;
++	}
+ 	tasks_lock_enter (&core->tasks, &old_sigset);
++	running_count = core->tasks.tasks_running;
+ 	r_list_foreach (core->tasks.tasks, iter, task) {
++		r_core_task_incref (task);
++		r_list_append (snapshot, task);
++	}
++	tasks_lock_leave (&core->tasks, &old_sigset);
++
++	r_list_foreach (snapshot, iter, task) {
+ 		r_core_task_print (core, task, pj, mode);
+ 	}
+ 	if (mode == 'j') {
+@@ -120,9 +150,12 @@ R_API void r_core_task_list(RCore *core, int mode) {
+ 		r_cons_println (core->cons, pj_string (pj));
+ 		pj_free (pj);
+ 	} else {
+-		r_cons_printf (core->cons, "--\ntotal running: %d\n", core->tasks.tasks_running);
++		r_cons_printf (core->cons, "--\ntotal running: %d\n", running_count);
+ 	}
+-	tasks_lock_leave (&core->tasks, &old_sigset);
++	r_list_foreach (snapshot, iter, task) {
++		r_core_task_decref (task);
++	}
++	r_list_free (snapshot);
+ }
+ 
+ R_API int r_core_task_running_tasks_count(RCoreTaskScheduler *scheduler) {
+@@ -149,7 +182,6 @@ static void task_join(RCoreTask *task) {
+ }
+ 
+ R_API void r_core_task_join(RCoreTaskScheduler *scheduler, RCoreTask *current, int id) {
+-//	return;
+ 	if (current && id == current->id) {
+ 		return;
+ 	}
+@@ -206,15 +238,23 @@ static void task_free(RCoreTask *task) {
+ 
+ 	RThread *thread = task->thread;
+ 	RThreadLock *lock = task->dispatch_lock;
+-	r_th_lock_enter (lock);
++	if (lock) {
++		r_th_lock_enter (lock);
++	}
+ 	free (task->cmd);
+ 	free (task->res);
+-	r_th_free (thread);
++	if (thread) {
++		r_th_free (thread);
++	}
+ 	r_th_sem_free (task->running_sem);
+ 	r_th_cond_free (task->dispatch_cond);
+ 	r_cons_context_free (task->cons_context);
+-	r_th_lock_leave (lock);
+-	r_th_lock_free (lock); // task->dispatch_lock);
++	if (lock) {
++		r_th_lock_leave (lock);
++	}
++	if (lock) {
++		r_th_lock_free (lock); // task->dispatch_lock);
++	}
+ 	free (task);
+ 	//tasks_lock_leave (scheduler, &old_sigset);
+ }
+@@ -351,62 +391,15 @@ R_API void r_core_task_schedule(RCoreTask *current, RTaskState next_state) {
+ 		scheduler->current_task = current;
+ 		if (current->cons_context) {
+ 			r_cons_context_load (current->cons_context);
+-		} else {
+-			r_cons_context_reset (current->cons_context);
+ 		}
++		// else: no context to load/reset; keep current
+ 	}
+ 	R_CRITICAL_LEAVE (core);
+ }
+ 
+-static void task_wakeup(RCoreTask *current) {
+-	return;
+-#if 0
+-	if (!current) {
+-		return;
+-	}
+-	RCore *core = current->core;
+-	R_CRITICAL_ENTER (core);
+-	RCoreTaskScheduler *scheduler = &core->tasks;
+-
+-	TASK_SIGSET_T old_sigset;
+-	tasks_lock_enter (scheduler, &old_sigset);
+-
+-	scheduler->tasks_running++;
+-	current->state = R_CORE_TASK_STATE_RUNNING;
+-
+-	// check if there are other tasks running
+-	bool single = scheduler->tasks_running == 1 || scheduler->tasks_running == 0;
+-
+-	r_th_lock_enter (current->dispatch_lock);
+-
+-	// if we are not the only task, we must wait until another task signals us.
+-
+-	if (!single) {
+-		r_list_append (scheduler->tasks_queue, current);
+-	}
+-
+-	tasks_lock_leave (scheduler, &old_sigset);
+-
+-	if (!single) {
+-		while (!current->dispatched) {
+-			r_th_cond_wait (current

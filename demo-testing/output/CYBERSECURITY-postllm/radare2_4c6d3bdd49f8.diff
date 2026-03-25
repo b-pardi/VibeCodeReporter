@@ -1,0 +1,157 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,444 @@
++/* radare2 - LGPL - Copyright 2023 - pancake */
++
++#include <r_arch.h>
++#include <r_lib.h>
++#include <capstone/capstone.h>
++
++#if CS_VERSION_MAJOR >= 5
++#include <capstone/sh.h>
++
++#if CS_API_MAJOR < 2
++#error Old Capstone not supported
++#endif
++
++#define INSOP(n) insn->detail->sh.operands[n]
++
++#define CSINC SH
++#define CSINC_MODE 0
++	// CS_MODE_BIG_ENDIAN
++#include "../capstone.inc"
++
++static void opex(RStrBuf *buf, csh handle, cs_insn *insn) {
++	int i;
++	PJ *pj = pj_new ();
++	if (!pj) {
++		return;
++	}
++	pj_o (pj);
++	pj_ka (pj, "operands");
++	cs_sh *x = &insn->detail->sh;
++	for (i = 0; i < x->op_count; i++) {
++		cs_sh_op *op = x->operands + i;
++		pj_o (pj);
++		switch (op->type) {
++		case SH_OP_REG:
++			pj_ks (pj, "type", "reg");
++			pj_ks (pj, "value", cs_reg_name (handle, op->reg));
++			break;
++		case SH_OP_IMM:
++			pj_ks (pj, "type", "imm");
++			pj_ki (pj, "value", op->imm);
++			break;
++		case SH_OP_MEM:
++			pj_ks (pj, "type", "mem");
++			switch (op->mem.address) {
++			case SH_OP_MEM_INVALID:
++				pj_ks (pj, "addr", "invalid");
++				break;
++			case SH_OP_MEM_REG_IND:   /// <= Register indirect
++				pj_ks (pj, "addr", "reg.ind");
++				break;
++			case SH_OP_MEM_REG_POST:  /// <= Register post increment
++				pj_ks (pj, "addr", "reg.post");
++				break;
++			case SH_OP_MEM_REG_PRE:   /// <= Register pre decrement
++				pj_ks (pj, "addr", "reg.pre");
++				break;
++			case SH_OP_MEM_REG_DISP:  /// <= displacement
++				pj_ks (pj, "addr", "reg.disp");
++				break;
++			case SH_OP_MEM_REG_R0:    /// <= R0 indexed
++				pj_ks (pj, "addr", "gbr.r0");
++				break;
++			case SH_OP_MEM_GBR_DISP:  /// <= GBR based displacement
++				pj_ks (pj, "addr", "gbr.disp");
++				break;
++			case SH_OP_MEM_GBR_R0:    /// <= GBR based R0 indexed
++				pj_ks (pj, "addr", "gbr.r0");
++				break;
++			case SH_OP_MEM_PCR:       /// <= PC relative
++				pj_ks (pj, "addr", "pcr");
++				break;
++			case SH_OP_MEM_TBR_DISP:  /// <= TBR based displaysment
++				pj_ks (pj, "addr", "tbr.disp");
++				break;
++			}
++			if (op->mem.reg != SH_REG_INVALID) {
++				pj_ks (pj, "reg", cs_reg_name (handle, op->mem.reg));
++			}
++			pj_ki (pj, "disp", op->mem.disp);
++			break;
++		default:
++			pj_ks (pj, "type", "invalid");
++			break;
++		}
++		pj_end (pj); /* o operand */
++	}
++	pj_end (pj); /* a operands */
++	pj_end (pj);
++
++	r_strbuf_init (buf);
++	r_strbuf_append (buf, pj_string (pj));
++	pj_free (pj);
++}
++
++static csh cs_handle_for_session(RArchSession *as) {
++	r_return_val_if_fail (as && as->data, 0);
++	CapstonePluginData *pd = as->data;
++	return pd->cs_handle;
++}
++
++static bool decode(RArchSession *as, RAnalOp *op, RAnalOpMask mask) {
++	const ut64 addr = op->addr;
++	const ut8 *buf = op->bytes;
++	const int len = op->size;
++
++	csh handle = cs_handle_for_session (as);
++	if (handle == 0) {
++		return false;
++	}
++
++	op->size = 2;
++	cs_insn *insn;
++	int n = cs_disasm (handle, (const ut8*)buf, len, addr, 1, &insn);
++	if (n < 1) {
++		op->type = R_ANAL_OP_TYPE_ILL;
++	} else {
++		if (mask & R_ARCH_OP_MASK_OPEX) {
++			opex (&op->opex, handle, insn);
++		}
++		if (mask & R_ARCH_OP_MASK_DISASM) {
++			op->mnemonic = r_str_newf ("%s%s%s",
++				insn->mnemonic, insn->op_str[0]? " ": "",
++				insn->op_str);
++			op->mnemonic = r_str_replace (op->mnemonic, ",", ", ", true);
++			// op->mnemonic = r_str_replace (op->mnemonic, "@", "", true);
++			op->mnemonic = r_str_replace (op->mnemonic, "#", "", true);
++		}
++		op->size = insn->size;
++		op->id = insn->id;
++		switch (insn->id) {
++#if 0
++		case XCORE_INS_DRET:
++		case XCORE_INS_KRET:
++		case XCORE_INS_RETSP:
++			op->type = R_ANAL_OP_TYPE_RET;
++			break;
++		case XCORE_INS_DCALL:
++		case XCORE_INS_KCALL:
++		case XCORE_INS_ECALLF:
++		case XCORE_INS_ECALLT:
++			op->type = R_ANAL_OP_TYPE_CALL;
++			op->jump = INSOP(0).imm;
++			break;
++		/* ??? */
++		case XCORE_INS_BL:
++		case XCORE_INS_BLA:
++		case XCORE_INS_BLAT:
++		case XCORE_INS_BT:
++		case XCORE_INS_BF:
++		case XCORE_INS_BU:
++		case XCORE_INS_BRU:
++			op->type = R_ANAL_OP_T

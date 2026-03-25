@@ -1,0 +1,119 @@
+@@ -109,9 +109,8 @@ void process_iod_events(struct npool *nsp, struct niod *nsi, int ev);
+ void process_event(struct npool *nsp, gh_list_t *evlist, struct nevent *nse, int ev);
+ void process_expired_events(struct npool *nsp);
+ #if HAVE_PCAP
+-#ifndef PCAP_CAN_DO_SELECT
+ int pcap_read_on_nonselect(struct npool *nsp);
+-#endif
++void iterate_through_pcap_events(struct npool *nsp);
+ #endif
+ 
+ /* defined in nsock_event.c */
+@@ -131,6 +130,8 @@ struct epoll_engine_info {
+   int evlen;
+   /* list of epoll events, resized if necessary (when polling over large numbers of IODs) */
+   struct epoll_event *events;
++  /* Number of IODs incompatible with epoll */
++  int num_pcap_nonselect;
+ };
+ 
+ 
+@@ -142,6 +143,7 @@ int epoll_init(struct npool *nsp) {
+   einfo->epfd = epoll_create(10); /* argument is ignored */
+   einfo->evlen = INITIAL_EV_COUNT;
+   einfo->events = (struct epoll_event *)safe_malloc(einfo->evlen * sizeof(struct epoll_event));
++  einfo->num_pcap_nonselect = 0;
+ 
+   nsp->engine_data = (void *)einfo;
+ 
+@@ -166,18 +168,26 @@ int epoll_iod_register(struct npool *nsp, struct niod *iod, struct nevent *nse,
+ 
+   iod->watched_events = ev;
+ 
+-  memset(&epev, 0x00, sizeof(struct epoll_event));
+-  epev.events = EPOLLET;
+-  epev.data.ptr = (void *)iod;
+-
+-  if (ev & EV_READ)
+-    epev.events |= EPOLL_R_FLAGS;
+-  if (ev & EV_WRITE)
+-    epev.events |= EPOLL_W_FLAGS;
+-
+   sd = nsock_iod_get_sd(iod);
+-  if (epoll_ctl(einfo->epfd, EPOLL_CTL_ADD, sd, &epev) < 0)
+-    fatal("Unable to register IOD #%lu: %s", iod->id, strerror(errno));
++  if (sd == -1) {
++    if (iod->pcap)
++      einfo->num_pcap_nonselect++;
++    else
++      fatal("Unable to get descriptor for IOD #%lu", iod->id);
++  }
++  else {
++    memset(&epev, 0x00, sizeof(struct epoll_event));
++    epev.events = EPOLLET;
++    epev.data.ptr = (void *)iod;
++
++    if (ev & EV_READ)
++      epev.events |= EPOLL_R_FLAGS;
++    if (ev & EV_WRITE)
++      epev.events |= EPOLL_W_FLAGS;
++
++    if (epoll_ctl(einfo->epfd, EPOLL_CTL_ADD, sd, &epev) < 0)
++      fatal("Unable to register IOD #%lu: %s", iod->id, strerror(errno));
++  }
+ 
+   IOD_PROPSET(iod, IOD_REGISTERED);
+   return 1;
+@@ -193,7 +203,13 @@ int epoll_iod_unregister(struct npool *nsp, struct niod *iod) {
+     int sd;
+ 
+     sd = nsock_iod_get_sd(iod);
+-    epoll_ctl(einfo->epfd, EPOLL_CTL_DEL, sd, NULL);
++    if (sd == -1) {
++      assert(iod->pcap);
++      einfo->num_pcap_nonselect--;
++    }
++    else {
++      epoll_ctl(einfo->epfd, EPOLL_CTL_DEL, sd, NULL);
++    }
+ 
+     IOD_PROPCLR(iod, IOD_REGISTERED);
+   }
+@@ -222,16 +238,17 @@ int epoll_iod_modify(struct npool *nsp, struct niod *iod, struct nevent *nse, in
+ 
+   iod->watched_events = new_events;
+ 
+-  /* regenerate the current set of events for this IOD */
+-  if (iod->watched_events & EV_READ)
+-    epev.events |= EPOLL_R_FLAGS;
+-  if (iod->watched_events & EV_WRITE)
+-    epev.events |= EPOLL_W_FLAGS;
+-
+   sd = nsock_iod_get_sd(iod);
+-
+-  if (epoll_ctl(einfo->epfd, EPOLL_CTL_MOD, sd, &epev) < 0)
+-    fatal("Unable to update events for IOD #%lu: %s", iod->id, strerror(errno));
++  if (sd != -1) {
++    /* regenerate the current set of events for this IOD */
++    if (iod->watched_events & EV_READ)
++      epev.events |= EPOLL_R_FLAGS;
++    if (iod->watched_events & EV_WRITE)
++      epev.events |= EPOLL_W_FLAGS;
++
++    if (epoll_ctl(einfo->epfd, EPOLL_CTL_MOD, sd, &epev) < 0)
++      fatal("Unable to update events for IOD #%lu: %s", iod->id, strerror(errno));
++  }
+ 
+   return 1;
+ }
+@@ -250,7 +267,7 @@ int epoll_loop(struct npool *nsp, int msec_timeout) {
+     return 0; /* No need to wait on 0 events ... */
+ 
+ 
+-  iod_count = gh_list_count(&nsp->active_iods);
++  iod_count = gh_list_count(&nsp->active_iods) - einfo->num_pcap_nonselect;
+   if (iod_count > einfo->evlen) {
+     einfo->evlen = iod_count * 2;
+     einfo->events = (struct epoll_event *)safe_realloc(einfo->events, einfo->evlen * sizeof(struct epoll_event));
+@@ -260,6 +277,7 @@ int epoll_loop(struct npool *nsp, int msec_timeout) {
+     stru

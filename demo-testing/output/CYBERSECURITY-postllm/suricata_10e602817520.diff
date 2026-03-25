@@ -1,0 +1,107 @@
+@@ -3343,6 +3343,9 @@ TmEcode DetectEngineThreadCtxInit(ThreadVars *tv, void *initdata, void **data)
+     det_ctx->lua_instruction_limit_errors =
+             StatsRegisterCounter("detect.lua.instruction_limit_errors", tv);
+ 
++    /* Register a counter for Lua memory limit errors. */
++    det_ctx->lua_memory_limit_errors = StatsRegisterCounter("detect.lua.memory_limit_errors", tv);
++
+ #ifdef PROFILING
+     det_ctx->counter_mpm_list = StatsRegisterAvgCounter("detect.mpm_list", tv);
+     det_ctx->counter_nonmpm_list = StatsRegisterAvgCounter("detect.nonmpm_list", tv);
+
+
+
+
+@@ -125,6 +125,7 @@ void DetectLuaRegister(void)
+ #define FLAG_ERROR_LOGGED                       BIT_U32(23)
+ #define FLAG_BLOCKED_FUNCTION_LOGGED            BIT_U32(24)
+ #define FLAG_INSTRUCTION_LIMIT_LOGGED           BIT_U32(25)
++#define FLAG_MEMORY_LIMIT_LOGGED                BIT_U32(26)
+ 
+ #define DEFAULT_LUA_ALLOC_LIMIT       500000
+ #define DEFAULT_LUA_INSTRUCTION_LIMIT 500000
+@@ -177,6 +178,7 @@ static int DetectLuaRunMatch(
+     SCLuaSbResetInstructionCounter(tlua->luastate);
+ 
+     if (lua_pcall(tlua->luastate, 1, 1, 0) != 0) {
++        const char *reason = lua_tostring(tlua->luastate, -1);
+         SCLuaSbState *context = SCLuaSbGetContext(tlua->luastate);
+         uint32_t flag = 0;
+         if (context->blocked_function_error) {
+@@ -185,6 +187,10 @@ static int DetectLuaRunMatch(
+         } else if (context->instruction_count_error) {
+             StatsIncr(det_ctx->tv, det_ctx->lua_instruction_limit_errors);
+             flag = FLAG_INSTRUCTION_LIMIT_LOGGED;
++        } else if (context->memory_limit_error) {
++            StatsIncr(det_ctx->tv, det_ctx->lua_memory_limit_errors);
++            reason = "memory limit exceeded";
++            flag = FLAG_MEMORY_LIMIT_LOGGED;
+         } else {
+             flag = FLAG_ERROR_LOGGED;
+         }
+@@ -192,8 +198,7 @@ static int DetectLuaRunMatch(
+         /* Log once per thread per error type, the message from Lua
+          * will include the filename. */
+         if (!(tlua->flags & flag)) {
+-            SCLogWarning(
+-                    "Lua script failed to run successfully: %s", lua_tostring(tlua->luastate, -1));
++            SCLogWarning("Lua script failed to run successfully: %s", reason);
+             tlua->flags |= flag;
+         }
+ 
+
+
+
+
+@@ -1245,6 +1245,9 @@ typedef struct DetectEngineThreadCtx_ {
+     /** stats if for lua instruction limit errors */
+     uint16_t lua_instruction_limit_errors;
+ 
++    /** stat of lua memory limit errors. */
++    uint16_t lua_memory_limit_errors;
++
+ #ifdef DEBUG
+     uint64_t pkt_stream_add_cnt;
+     uint64_t payload_mpm_cnt;
+
+
+
+
+@@ -49,26 +49,41 @@ static void HookFunc(lua_State *L, lua_Debug *ar);
+ static void *LuaAlloc(void *ud, void *ptr, size_t osize, size_t nsize)
+ {
+     (void)ud;
+-    (void)osize; /* not used */
++    (void)osize;
+     SCLuaSbState *ctx = (SCLuaSbState *)ud;
++
+     if (nsize == 0) {
+-        if (ptr != NULL) {
+-            // ASSERT: alloc_bytes > osize
+-            DEBUG_VALIDATE_BUG_ON(ctx->alloc_bytes < osize);
+-            ctx->alloc_bytes -= osize;
++        if (ptr == NULL) {
++            /* This happens, ignore. */
++            return NULL;
+         }
++        BUG_ON(osize > ctx->alloc_bytes);
+         SCFree(ptr);
++        ctx->alloc_bytes -= osize;
+         return NULL;
++    } else if (ptr == NULL) {
++        /* Allocating new data. */
++        void *nptr = SCRealloc(ptr, nsize);
++        if (nptr != NULL) {
++            ctx->alloc_bytes += nsize;
++        }
++        return nptr;
+     } else {
+-        // We can be a bit sloppy on the alloc limit since it's not supposed to be hit.
+-        //  ASSERT: ctx->alloc_bytes + nsize > ctx->alloc_bytes
+-        if (ctx->alloc_bytes + nsize > ctx->alloc_limit) {
+-            // TODO: Trace in a better way
++        /* Resizing existing data. */
++        ssize_t diff = nsize - osize;
++
++        if (ctx->alloc_bytes + diff > ctx->alloc_limit) {
++            /* This request will exceed the allocation

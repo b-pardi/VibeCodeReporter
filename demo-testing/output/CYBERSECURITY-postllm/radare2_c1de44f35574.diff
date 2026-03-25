@@ -1,0 +1,139 @@
+@@ -718,6 +718,7 @@ static void addrline_store_fini(RBinAddrLineStore *als) {
+ 		r_bloom_free (store->bloomGet);
+ #endif
+ 		r_list_free (store->list);
++		r_strpool_free (store->pool);
+ 	}
+ 	free (als->storage);
+ }
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2015-2024 - pancake */
++/* radare - LGPL - Copyright 2015-2025 - pancake */
+ 
+ #include <r_bin.h>
+ #include <sdb/ht_su.h>
+@@ -119,6 +119,13 @@ R_API void r_bin_filter_symbols(RBinFile *bf, RList *list) {
+ 		r_list_foreach (list, iter, sym) {
+ 			r_bin_filter_sym (bf, ht, sym->vaddr, sym);
+ 		}
++		if (bf && bf->bo) {
++			if (bf->bo->filters) {
++				ht_pp_free ((HtPP *)bf->bo->filters);
++			}
++			bf->bo->filters = ht;
++			return;
++		}
+ 		ht_pp_free (ht);
+ 	}
+ }
+
+
+
+
+@@ -36,6 +36,7 @@ static void object_delete_items(RBinObject *o) {
+ 	ht_up_free (o->addr2klassmethod);
+ 	r_list_free (o->entries);
+ 	r_list_free (o->fields);
++	/* imports list elements may carry strdup'd names; ensure list has free cb or purge manually */
+ 	r_list_free (o->imports);
+ 	r_list_free (o->libs);
+ 	r_crbtree_free (o->relocs);
+@@ -44,9 +45,35 @@ static void object_delete_items(RBinObject *o) {
+ 	ht_up_free (o->strings_db);
+ 
+ 	if (!RVecRBinImport_empty (&o->imports_vec)) {
++		/* explicit deep cleanup for imports if vector fini doesn't free nested strings */
++		RBinImport *imp;
++		R_VEC_FOREACH (&o->imports_vec, imp) {
++			if (imp) {
++				if (imp->name) {
++					r_bin_name_free (imp->name);
++					imp->name = NULL;
++				}
++				free (imp->libname);
++				imp->libname = NULL;
++			}
++		}
+ 		RVecRBinImport_fini (&o->imports_vec);
+ 	}
+ 	if (!RVecRBinSymbol_empty (&o->symbols_vec)) {
++		/* explicit deep cleanup for symbols */
++		RBinSymbol *sym;
++		R_VEC_FOREACH (&o->symbols_vec, sym) {
++			if (sym) {
++				if (sym->name) {
++					r_bin_name_free (sym->name);
++					sym->name = NULL;
++				}
++				free (sym->libname);
++				sym->libname = NULL;
++				free (sym->classname);
++				sym->classname = NULL;
++			}
++		}
+ 		RVecRBinSymbol_fini (&o->symbols_vec);
+ 		if (o->symbols) {
+ 			o->symbols->free = NULL;
+@@ -63,6 +90,13 @@ static void object_delete_items(RBinObject *o) {
+ 	for (i = 0; i < R_BIN_SYM_LAST; i++) {
+ 		free (o->binsym[i]);
+ 	}
++	/* free optional filter hashtables if present */
++	if (o->filters) {
++		/* Attempt to free as HtPP first; if type mismatch, free as HtSU */
++		/* These tables are internal and optional; free whichever was used */
++		ht_pp_free ((HtPP *)o->filters);
++		o->filters = NULL;
++	}
+ }
+ 
+ R_IPI void r_bin_object_free(void /*RBinObject*/ *o_) {
+@@ -439,6 +473,9 @@ R_API int r_bin_object_set_items(RBinFile *bf, RBinObject *bo) {
+ 		if (!bo->sections) {
+ 			bo->sections = p->sections (bf);
+ 		}
++		if (bo->sections) {
++			bo->sections->free = (RListFree)r_bin_section_free;
++		}
+ 		REBASE_PADDR (bo, bo->sections, RBinSection);
+ 		if (bin->filter) {
+ 			r_bin_filter_sections (bf, bo->sections);
+
+
+
+
+@@ -2000,14 +2000,16 @@ static bool bin_relocs(RCore *core, PJ *pj, int mode, int va) {
+ 				}
+ 				int reloc_size = 4;
+ 				// char *n = r_name_filter_quoted_shell (name);
+-				char *n = strdup (name);
+-				r_name_filter (n, -1);
+-				r_cons_printf (core->cons, "'f %s%s%s %d 0x%08"PFMT64x"\n",
+-					r_str_get_fail (core->bin->prefix, "reloc."),
+-					core->bin->prefix ? "." : "", n, reloc_size, addr);
+-				add_metadata (core, reloc, addr, mode);
+-				free (n);
+-				free (name);
++				{
++					char *n = strdup (name);
++					r_name_filter (n, -1);
++					r_cons_printf (core->cons, "'f %s%s%s %d 0x%08"PFMT64x"\n",
++							r_str_get_fail (core->bin->prefix, "reloc."),
++							core->bin->prefix ? "." : "", n, reloc_size, addr);
++					add_metadata (core, reloc, addr, mode);
++					free (n);
++					free (name);
++				}
+ #if 0
+ 				if (reloc->symbol && reloc->symbol->vaddr != addr) {
+ 					// ut64 saddr = reloc->symbol->vaddr;
+@@ -2038,7 +2040,7 @@ static bool bin_relocs(RCore *core, PJ *pj, int mode, int va) {
+ 			}
+ 
+ 			// check if name is available
+-			if (relname && *relname) {
++			if (R_STR_ISNOTEMPTY (relname

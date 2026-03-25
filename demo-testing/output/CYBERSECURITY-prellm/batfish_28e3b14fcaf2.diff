@@ -1,0 +1,74 @@
+@@ -5,6 +5,7 @@ import static com.google.common.base.Preconditions.checkArgument;
+ import static org.batfish.common.util.CollectionUtil.toImmutableMap;
+ 
+ import com.google.common.annotations.VisibleForTesting;
++import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableMultimap;
+ import com.google.common.collect.ImmutableSet;
+@@ -56,6 +57,20 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+   // node -> vrf -> forwarding behavior for that VRF.
+   private final Map<String, Map<String, VrfForwardingBehavior>> _vrfForwardingBehavior;
+ 
++  /** Helper function to materialize in random order the list of keys in Map of Maps. */
++  @VisibleForTesting
++  static @Nonnull <T> List<Map.Entry<String, String>> sparseKeys(Map<String, Map<String, T>> map) {
++    List<Map.Entry<String, String>> sparseKeys =
++        map.entrySet().parallelStream()
++            .flatMap(
++                e ->
++                    e.getValue().entrySet().parallelStream()
++                        .map(v -> new SimpleImmutableEntry<>(e.getKey(), v.getKey())))
++            .collect(Collectors.toCollection(ArrayList::new));
++    Collections.shuffle(sparseKeys);
++    return ImmutableList.copyOf(sparseKeys);
++  }
++
+   public ForwardingAnalysisImpl(
+       Map<String, Configuration> configurations,
+       Map<String, Map<String, Fib>> fibs,
+@@ -66,6 +81,8 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+     try (Scope scope = GlobalTracer.get().scopeManager().activate(span)) {
+       assert scope != null; // avoid unused warning
+ 
++      List<Map.Entry<String, String>> allVrfs = sparseKeys(fibs);
++
+       // TODO accept IpSpaceToBDD as parameter
+       IpSpaceToBDD ipSpaceToBDD =
+           new MemoizedIpSpaceToBDD(new BDDPacket().getDstIp(), ImmutableMap.of());
+@@ -86,12 +103,13 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+       LOGGER.info("Aggregating information about routing entries");
+       // IpSpaces matched by each prefix
+       // -- only will have entries for active interfaces if FIB is correct
+-      Map<String, Map<String, Map<Prefix, IpSpace>>> matchingIps = computeMatchingIps(fibs);
++      Map<String, Map<String, Map<Prefix, IpSpace>>> matchingIps =
++          computeMatchingIps(fibs, allVrfs);
+       // Set of routes that forward out each interface
+       Map<String, Map<String, Map<String, Set<AbstractRoute>>>> routesWithNextHop =
+-          computeRoutesWithNextHop(fibs);
++          computeRoutesWithNextHop(fibs, allVrfs);
+       // Node -> vrf -> destination IPs that can be routed
+-      Map<String, Map<String, IpSpace>> routableIps = computeRoutableIps(fibs);
++      Map<String, Map<String, IpSpace>> routableIps = computeRoutableIps(fibs, allVrfs);
+ 
+       /* Compute _arpReplies: for each interface, the set of arp IPs for which that interface will
+        * respond.
+@@ -101,7 +119,7 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+         // interface. Should only include active interfaces.
+         LOGGER.info("Computing IPs routed out interfaces");
+         Map<String, Map<String, Map<String, IpSpace>>> ipsRoutedOutInterfaces =
+-            computeIpsRoutedOutInterfaces(matchingIps, routesWithNextHop);
++            computeIpsRoutedOutInterfaces(matchingIps, routesWithNextHop, allVrfs);
+         LOGGER.info("Computing ARP replies");
+         _arpReplies =
+             computeArpReplies(
+@@ -121,14 +139,6 @@ public final class ForwardingAnalysisImpl implements ForwardingAnalysis, Seriali
+       IpSpace externalIps = internalIps.complement();
+ 
+       // Compute VrfForwardingBehavior, parallelizing across all VRFs.
+-      List<Map.Entry<String, String>> allVrfs =
+-          configurations.values().stream()
+-              .flatMap(
+-                  c ->
+-                      c.getVrfs().values().stream()
+-                  

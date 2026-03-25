@@ -1,0 +1,93 @@
+@@ -19,7 +19,35 @@ extern "C" {
+ 
+ bool init_plugin(void *);
+ void uninit_plugin(void *);
++}
++
++int serial_receive_callback(CPUState *cpu, uint64_t fifo_addr, uint8_t value)
++{
++    fprintf(stderr, "Applying taint labels to incoming serial port data.\n");
++    fprintf(stderr, "  Address in IO Shadow = 0x%lX\n", fifo_addr);
++    fprintf(stderr, "  Label = 0x%X\n", value);
++
++    taint2_enable_taint();
++    taint2_label_io_additive(fifo_addr, 0xDEADFEED);
++    return 0;
++}
+ 
++int serial_read_callback(CPUState *cpu, uint64_t fifo_addr, uint32_t port_addr,
++                         uint8_t value)
++{
++    fprintf(stderr,
++            "serial read (fifo_addr=0x%lX, port_addr=0x%X, value=\'%c\')\n",
++            fifo_addr, port_addr, value);
++
++    // Iterate over the labels for the address in the FIFO and add them to the
++    // port shadow.
++    taint2_labelset_io_iter(fifo_addr,
++                            [](uint32_t elt, void *port_addr) {
++                                taint2_label_port(*(uint32_t *)port_addr, elt);
++                                return 0;
++                            },
++                            &port_addr);
++    return 0;
+ }
+ 
+ int serial_write(CPUState *cpu, uint64_t fifo_addr, uint32_t port_addr, uint8_t value)
+@@ -62,6 +90,12 @@ bool init_plugin(void *self)
+ 
+     panda_cb pcb;
+ 
++    pcb.replay_serial_receive = serial_receive_callback;
++    panda_register_callback(self, PANDA_CB_REPLAY_SERIAL_RECEIVE, pcb);
++
++    pcb.replay_serial_read = serial_read_callback;
++    panda_register_callback(self, PANDA_CB_REPLAY_SERIAL_READ, pcb);
++
+     pcb.replay_serial_write = serial_write;
+     panda_register_callback(self, PANDA_CB_REPLAY_SERIAL_WRITE, pcb);
+ 
+
+
+
+
+@@ -1305,16 +1305,33 @@ void PandaTaintVisitor::visitCallInst(CallInst &I) {
+             return;
+         } else if (inoutFuncs.count(calledName) > 0) {
+             if (calledName == "helper_outb") {
++                CastInst *port_addr_cast = CastInst::CreateIntegerCast(
++                    I.getArgOperand(1), Type::getInt64Ty(ctx), false);
++
+                 // Cast the port to a 64-bit unsigned int since that's what the
+                 // shadow memory accept as addresses.
+-                auto cast_inst = CastInst::CreateIntegerCast(I.getArgOperand(1),
+-                    Type::getInt64Ty(ctx), false);
+-                cast_inst->insertBefore(&I);
+-
+-                vector<Value *> copy_args { portConst, cast_inst, llvConst,
+-                    constSlot(I.getArgOperand(2)), const_uint64(ctx, 1), constInstr(&I) };
++                port_addr_cast->insertBefore(&I);
++
++                vector<Value *> copy_args{portConst,
++                                          port_addr_cast,
++                                          llvConst,
++                                          constSlot(I.getArgOperand(2)),
++                                          const_uint64(ctx, 1),
++                                          constInstr(&I)};
+                 auto call_inst = CallInst::Create(copyF, copy_args);
+                 call_inst->insertBefore(&I);
++            } else if (calledName == "helper_inb") {
++                CastInst *port_addr_cast = CastInst::CreateIntegerCast(
++                    I.getArgOperand(1), Type::getInt64Ty(ctx), false);
++                // Cast the port to a 64-bit unsigned int since that's what the
++                // shadow memory accept as addresses.
++                port_addr_cast->insertBefore(&I);
++
++                vector<Value *> copy_args{
++                    llvConst,       constSlot(&I),        portConst,
++                    port_addr_cast, const_uint64(ctx, 1), constInstr(&I)};
++                auto call_inst = CallInst::Create(copyF, copy_args);
++                call_inst->insertAfter(&I);
+             }
+             return;
+         }

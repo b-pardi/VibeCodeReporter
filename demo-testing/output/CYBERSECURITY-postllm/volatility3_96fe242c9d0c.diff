@@ -1,0 +1,88 @@
+@@ -38,13 +38,13 @@ class Malfind(interfaces.plugins.PluginInterface):
+                 optional=True,
+             ),
+             requirements.IntRequirement(
+-                name="dumpsize",
+-                description="Dump X bytes of each malicious region found",
++                name="dump_size",
++                description="Amount of bytes to dump for each dirty region/page found - Default 64 bytes",
+                 optional=True,
+             ),
+             requirements.BooleanRequirement(
+-                name="dumppage",
+-                description="Dump dirty page content (for each dirty page)",
++                name="dump_page",
++                description="Dump each dirty page and content - Default off",
+                 optional=True,
+             ),
+         ]
+@@ -60,22 +60,35 @@ class Malfind(interfaces.plugins.PluginInterface):
+             return None
+ 
+         proc_layer = self.context.layers[proc_layer_name]
+-        dumpsize = self.config.get("dumpsize") if self.config.get("dumpsize") is not None else 64
+-        dumppage = self.config.get("dumppage") or False
++
++        # Allowing a dump_size of 0 (no dump)
++        dump_size = self.config.get("dump_size") if self.config.get("dump_size") is not None else 64
++
++        # Dumping page defaults to off, as in case a whole r-xp region is dirty
++        # this would likely dump 1000's of pages which might not always be wise nor necessary
++
++        dump_page = self.config.get("dump_page") or False
+ 
+         for vma in task.mm.get_vma_iter():
+             vma_name = vma.get_name(self.context, task)
+             vollog.debug(
+                 f"Injections : processing PID {task.pid} : VMA {vma_name} : {hex(vma.vm_start)}-{hex(vma.vm_end)}"
+             )
++
++            # If is_suspicious returns true, this means at least one page
++            # in the region is dirty. If dump_page is true, then we dump
++            # all dirty pages
++
+             if vma.is_suspicious(proc_layer) and vma_name != "[vdso]":
+                 malicious_pages = vma.get_malicious_pages(proc_layer)
+-                if dumppage:
++                if dump_page:
++                    # Dumping each dirty page
+                     for page_addr in malicious_pages:
+-                        data = proc_layer.read(page_addr, dumpsize, pad=True)
+-                        yield vma, vma_name+f", page address: {page_addr:#x}, offset: {page_addr-vma.vm_start:#x}", data
++                        data = proc_layer.read(page_addr, dump_size, pad=True)
++                        yield vma, f"{vma_name}, page address: {page_addr:#x}, offset: {page_addr-vma.vm_start:#x}", data
+                 else:
+-                    data = proc_layer.read(vma.vm_start,dumpsize,pad=True)
++                    # Original behaviour - Dump the start of the region (not necessarily matching the dirty page)
++                    data = proc_layer.read(vma.vm_start,dump_size,pad=True)
+                     yield vma, vma_name, data
+ 
+     def _generator(self, tasks):
+
+
+
+
+@@ -1274,19 +1274,17 @@ class vm_area_struct(objects.StructType):
+             return None
+ 
+     def get_malicious_pages(self,proclayer=None):
++        """
++        This function will return a list of all malicious pages inside a given dirty region
++        """
+         malicious_pages = []
+-
+         flags_str = self.get_protection()
+ 
+-        if flags_str == "rwx":
+-            ret = True
+-        elif flags_str == "r-x" and self.vm_file.dereference().vol.offset == 0:
+-            ret = True
+-        elif proclayer and "x" in flags_str:
++        if proclayer and "r-x" in flags_str and self.vm_file.dereference().vol.offset !=0:
+             for i in range(self.vm_start, self.vm_end, proclayer.page_size):
+                 try:
+                     if proclayer.is_dirty(i):
+-                        vollog.debug(
++                        vollog.warning(
+                             f"Found malicious (dirty+exec) page at {hex(i)} !"
+                         

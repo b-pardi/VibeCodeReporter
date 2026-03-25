@@ -1,0 +1,133 @@
+@@ -18,6 +18,7 @@
+ #include "ssl3prot.h"
+ #include "sslerr.h"
+ #include "sslproto.h"
++#include "scoped_ptrs.h"
+ 
+ #include "nsskeys.h"
+ 
+@@ -33,30 +34,9 @@ std::string FormatError(PRErrorCode code) {
+ 
+ class TestAgent {
+  public:
+-  TestAgent(const Config& cfg)
+-      : cfg_(cfg),
+-        pr_fd_(nullptr),
+-        ssl_fd_(nullptr),
+-        cert_(nullptr),
+-        key_(nullptr) {}
++  TestAgent(const Config& cfg) : cfg_(cfg) {}
+ 
+-  ~TestAgent() {
+-    if (pr_fd_) {
+-      PR_Close(pr_fd_);
+-    }
+-
+-    if (ssl_fd_) {
+-      PR_Close(ssl_fd_);
+-    }
+-
+-    if (key_) {
+-      SECKEY_DestroyPrivateKey(key_);
+-    }
+-
+-    if (cert_) {
+-      CERT_DestroyCertificate(cert_);
+-    }
+-  }
++  ~TestAgent() {}
+ 
+   static std::unique_ptr<TestAgent> Create(const Config& cfg) {
+     std::unique_ptr<TestAgent> agent(new TestAgent(cfg));
+@@ -81,7 +61,7 @@ class TestAgent {
+       return false;
+     }
+ 
+-    SECStatus rv = SSL_ResetHandshake(ssl_fd_, cfg_.get<bool>("server"));
++    SECStatus rv = SSL_ResetHandshake(ssl_fd_.get(), cfg_.get<bool>("server"));
+     if (rv != SECSuccess) return false;
+ 
+     return true;
+@@ -93,11 +73,11 @@ class TestAgent {
+       return false;
+     }
+ 
+-    ssl_fd_ = SSL_ImportFD(NULL, pr_fd_);
++    ssl_fd_ = ScopedPRFileDesc(SSL_ImportFD(NULL, pr_fd_.get()));
+     if (!ssl_fd_) {
+       return false;
+     }
+-    pr_fd_ = nullptr;
++    pr_fd_.release();
+ 
+     return true;
+   }
+@@ -114,10 +94,10 @@ class TestAgent {
+ 
+     addr.inet.port = PR_htons(cfg_.get<int>("port"));
+ 
+-    pr_fd_ = PR_OpenTCPSocket(addr.raw.family);
++    pr_fd_ = ScopedPRFileDesc(PR_OpenTCPSocket(addr.raw.family));
+     if (!pr_fd_) return false;
+ 
+-    prv = PR_Connect(pr_fd_, &addr, PR_INTERVAL_NO_TIMEOUT);
++    prv = PR_Connect(pr_fd_.get(), &addr, PR_INTERVAL_NO_TIMEOUT);
+     if (prv != PR_SUCCESS) {
+       return false;
+     }
+@@ -128,21 +108,24 @@ class TestAgent {
+     SECStatus rv;
+ 
+     if (cfg_.get<std::string>("key-file") != "") {
+-      key_ = ReadPrivateKey(cfg_.get<std::string>("key-file"));
++      key_ = ScopedSECKEYPrivateKey(
++          ReadPrivateKey(cfg_.get<std::string>("key-file")));
+       if (!key_) return false;
+     }
+     if (cfg_.get<std::string>("cert-file") != "") {
+-      cert_ = ReadCertificate(cfg_.get<std::string>("cert-file"));
++      cert_ = ScopedCERTCertificate(
++          ReadCertificate(cfg_.get<std::string>("cert-file")));
+       if (!cert_) return false;
+     }
+ 
+     // Needed because certs are not entirely valid.
+-    rv = SSL_AuthCertificateHook(ssl_fd_, AuthCertificateHook, this);
++    rv = SSL_AuthCertificateHook(ssl_fd_.get(), AuthCertificateHook, this);
+     if (rv != SECSuccess) return false;
+ 
+     if (cfg_.get<bool>("server")) {
+       // Server
+-      rv = SSL_ConfigServerCert(ssl_fd_, cert_, key_, nullptr, 0);
++      rv = SSL_ConfigServerCert(ssl_fd_.get(), cert_.get(), key_.get(), nullptr,
++                                0);
+       if (rv != SECSuccess) {
+         std::cerr << "Couldn't configure server cert\n";
+         return false;
+@@ -150,7 +133,8 @@ class TestAgent {
+ 
+     } else if (key_ && cert_) {
+       // Client.
+-      rv = SSL_GetClientAuthDataHook(ssl_fd_, GetClientAuthDataHook, this);
++      rv =
++          SSL_GetClientAuthDataHook(ssl_fd_.get(), GetClientAuthDataHook, this);
+       if (rv != SECSuccess) return false;
+     }
+ 
+@@ -270,36 +254,36 @@ class TestAgent {
+ 
+   bool SetupOptions() {
+     SECStatus rv =
+-        SSL_OptionSet(ssl_fd_, SSL_ENABLE_TLS13_COMPAT_MODE, PR_TRUE);
++        SSL_OptionSet(ssl_fd_.get(), SSL_ENABLE_TLS13_COMPAT_MODE, PR_TRUE);
+     if (rv != SECSuccess) return false;
+ 
+-    rv = SSL_OptionSet(ssl_fd_, SSL_ENABLE_SESSION_TICKETS, PR_TRUE);
++    rv = SSL_OptionSet(ssl_fd_.get(), SSL_ENABLE_SESSION_TICKETS, PR_TRUE);
+     if (rv != SECSuccess) return false;
+ 
+     SSLVersionRange vrange;
+     if (!GetVersionRange(&vrange, ssl_variant_stream)) return false;
+ 
+-    rv = SSL_VersionRangeSet(ssl_fd_, &vrange);
++    rv = SSL_VersionRange

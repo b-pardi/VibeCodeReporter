@@ -1,0 +1,138 @@
+@@ -23,6 +23,8 @@
+ #include "detect-engine-buffer.h"
+ 
+ #include "detect-entropy.h"
++#include "util-var-name.h"
++#include "flow-var.h"
+ 
+ #include "rust.h"
+ 
+@@ -39,6 +41,8 @@ static int DetectEntropySetup(DetectEngineCtx *de_ctx, Signature *s, const char
+             goto error;
+ 
+         sm_list = s->init_data->list;
++        ded->fv_idx = VarNameStoreRegister(
++                DetectEngineBufferTypeGetNameById(de_ctx, sm_list), VAR_TYPE_FLOW_FLOAT);
+     }
+ 
+     if (SCSigMatchAppendSMToList(de_ctx, s, DETECT_ENTROPY, (SigMatchCtx *)ded, sm_list) != NULL) {
+@@ -57,13 +61,25 @@ error:
+ 
+ static void DetectEntropyFree(DetectEngineCtx *de_ctx, void *ptr)
+ {
+-    SCDetectEntropyFree(ptr);
++    if (ptr) {
++        DetectEntropyData *ded = (DetectEntropyData *)ptr;
++        VarNameStoreUnregister(ded->fv_idx, VAR_TYPE_FLOW_FLOAT);
++        SCDetectEntropyFree(ptr);
++    }
+ }
+ 
+ bool DetectEntropyDoMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+         const SigMatchCtx *ctx, const uint8_t *buffer, const uint32_t buffer_len)
+ {
+-    return SCDetectEntropyMatch(buffer, buffer_len, (const DetectEntropyData *)ctx);
++    double entropy = -1.0;
++    bool rc = SCDetectEntropyMatch(buffer, buffer_len, (const DetectEntropyData *)ctx, &entropy);
++
++    if (entropy != -1.0) {
++        DetectEntropyData *ded = (DetectEntropyData *)ctx;
++        FlowVarAddFloat(det_ctx->p->flow, ded->fv_idx, entropy);
++    }
++
++    return rc;
+ }
+ 
+ void DetectEntropyRegister(void)
+
+
+
+
+@@ -47,6 +47,12 @@ static void FlowVarUpdateInt(FlowVar *fv, uint32_t value)
+     fv->data.fv_int.value = value;
+ }
+ 
++/* puts a new value into a flowvar */
++static void FlowVarUpdateFloat(FlowVar *fv, double value)
++{
++    fv->data.fv_float.value = value;
++}
++
+ /** \brief get the flowvar with index 'idx' from the flow
+  *  \note flow is not locked by this function, caller is
+  *        responsible
+@@ -132,6 +138,26 @@ void FlowVarAddIdValue(Flow *f, uint32_t idx, uint8_t *value, uint16_t size)
+     }
+ }
+ 
++/* add a flowvar to the flow, or update it */
++void FlowVarAddFloat(Flow *f, uint32_t idx, double value)
++{
++    FlowVar *fv = FlowVarGet(f, idx);
++    if (fv == NULL) {
++        fv = SCMalloc(sizeof(FlowVar));
++        if (unlikely(fv == NULL))
++            return;
++
++        fv->type = DETECT_FLOWVAR;
++        fv->datatype = FLOWVAR_TYPE_FLOAT;
++        fv->idx = idx;
++        fv->data.fv_float.value = value;
++        fv->next = NULL;
++
++        GenericVarAppend(&f->flowvar, (GenericVar *)fv);
++    } else {
++        FlowVarUpdateFloat(fv, value);
++    }
++}
+ /* add a flowvar to the flow, or update it */
+ void FlowVarAddIntNoLock(Flow *f, uint32_t idx, uint32_t value)
+ {
+
+
+
+
+@@ -32,6 +32,7 @@
+ 
+ #define FLOWVAR_TYPE_STR 1
+ #define FLOWVAR_TYPE_INT 2
++#define FLOWVAR_TYPE_FLOAT 3
+ 
+ typedef uint8_t FlowVarKeyLenType;
+ /** Struct used to hold the string data type for flowvars */
+@@ -45,6 +46,11 @@ typedef struct FlowVarTypeInt_ {
+     uint32_t value;
+ } FlowVarTypeInt;
+ 
++/** Struct used to hold the integer data type for flowvars */
++typedef struct FlowVarTypeFloat_ {
++    double value;
++} FlowVarTypeFloat;
++
+ /** Generic Flowvar Structure */
+ typedef struct FlowVar_ {
+     uint16_t type; /* type, DETECT_FLOWVAR in this case */
+@@ -57,6 +63,7 @@ typedef struct FlowVar_ {
+     union {
+         FlowVarTypeStr fv_str;
+         FlowVarTypeInt fv_int;
++        FlowVarTypeFloat fv_float;
+     } data;
+     uint8_t *key;
+ } FlowVar;
+@@ -69,6 +76,7 @@ void FlowVarAddKeyValue(
+ 
+ void FlowVarAddIntNoLock(Flow *, uint32_t, uint32_t);
+ void FlowVarAddInt(Flow *, uint32_t, uint32_t);
++void FlowVarAddFloat(Flow *, uint32_t, double);
+ FlowVar *FlowVarGet(Flow *, uint32_t);
+ FlowVar *FlowVarGetByKey(Flow *f, const uint8_t *key, FlowVarKeyLenType keylen);
+ void FlowVarFree(FlowVar *);
+
+
+
+
+@@ -247,6 +247,7 @@ static void EveAddFlowVars(const Flow *f, SCJsonBuilder *js_root, SCJsonBuilder
+     SCJsonBuilder *js_traffic_id = NULL;
+     SCJsonBuilder *js_traffic_label = NULL;
+     SCJs

@@ -1,0 +1,129 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,380 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++/*
++WORK-IN-PROGRESS
++Initial working version of decrypting the INITIAL packets from
++both client & server to be used by the Spicy parser. Might need a few more
++refactors as C++ development is not our main profession.
++*/
++
++// Default imports
++#include <stdlib.h>
++#include <cstring>
++#include <vector>
++#include <iostream>
++#include <string>
++
++// OpenSSL imports
++#include <openssl/kdf.h>
++#include <openssl/evp.h>
++#include <openssl/sha.h>
++
++// Import HILTI
++#include <hilti/rt/libhilti.h>
++
++// Struct to store decryption info for this specific connection
++struct DecryptionInformation
++{
++    std::vector<uint8_t> unprotected_header;
++    std::vector<uint8_t> protected_header;
++    uint64_t packet_number;
++    std::vector<uint8_t> nonce;
++    uint8_t packet_number_length;
++};
++
++/*
++Constants used in the HKDF functions. HKDF-Expand-Label uses labels
++such as 'quic key' and 'quic hp'. These labels can obviously be
++calculated dynamically, but are incluced statically for now, as the
++goal of this analyser is only to analyze the INITIAL packets.
++*/
++
++std::vector<uint8_t> INITIAL_SALT_V1 = {
++    0x38, 0x76, 0x2c, 0xf7, 0xf5,
++    0x59, 0x34, 0xb3, 0x4d, 0x17,
++    0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
++    0xad, 0xcc, 0xbb, 0x7f, 0x0a};
++
++std::vector<uint8_t> CLIENT_INITIAL_INFO = {
++    0x00, 0x20, 0x0f, 0x74, 0x6c,
++    0x73, 0x31, 0x33, 0x20, 0x63,
++    0x6c, 0x69, 0x65, 0x6e, 0x74,
++    0x20, 0x69, 0x6e, 0x00};
++
++std::vector<uint8_t> SERVER_INITIAL_INFO = {
++    0x00, 0x20, 0x0f, 0x74, 0x6c,
++    0x73, 0x31, 0x33, 0x20, 0x73,
++    0x65, 0x72, 0x76, 0x65, 0x72,
++    0x20, 0x69, 0x6e, 0x00};
++
++std::vector<uint8_t> KEY_INFO = {
++    0x00, 0x10, 0x0e, 0x74, 0x6c,
++    0x73, 0x31, 0x33, 0x20, 0x71,
++    0x75, 0x69, 0x63, 0x20, 0x6b,
++    0x65, 0x79, 0x00};
++
++std::vector<uint8_t> IV_INFO = {
++    0x00, 0x0c, 0x0d, 0x74, 0x6c,
++    0x73, 0x31, 0x33, 0x20, 0x71,
++    0x75, 0x69, 0x63, 0x20, 0x69,
++    0x76, 0x00};
++
++std::vector<uint8_t> HP_INFO = {
++    0x00, 0x10, 0x0d, 0x74, 0x6c,
++    0x73, 0x31, 0x33, 0x20, 0x71,
++    0x75, 0x69, 0x63, 0x20, 0x68,
++    0x70, 0x00};
++
++/*
++Constants used by the different functions
++*/
++const size_t INITIAL_SECRET_LEN = 32;
++const size_t AEAD_KEY_LEN = 16;
++const size_t AEAD_IV_LEN = 12;
++const size_t AEAD_HP_LEN = 16;
++const size_t AEAD_SAMPLE_LENGTH = 16;
++const size_t AEAD_TAG_LENGTH = 16;
++const size_t MAXIMUM_PACKET_LENGTH = 1500;
++const size_t MAXIMUM_PACKET_NUMBER_LENGTH = 4;
++
++/*
++HKDF-Extract as decribed in https://www.rfc-editor.org/rfc/rfc8446.html#section-7.1
++*/
++std::vector<uint8_t> hkdf_extract(std::vector<uint8_t> connection_id)
++{
++    std::vector<uint8_t> out_temp(INITIAL_SECRET_LEN);
++    size_t initial_secret_len = out_temp.size();
++    const EVP_MD *digest = EVP_sha256();
++    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
++    EVP_PKEY_derive_init(pctx);
++    EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXTRACT_ONLY);
++    EVP_PKEY_CTX_set_hkdf_md(pctx, digest);
++    EVP_PKEY_CTX_set1_hkdf_key(pctx,
++                               connection_id.data(),
++                               connection_id.size());
++    EVP_PKEY_CTX_set1_hkdf_salt(pctx,
++                                INITIAL_SALT_V1.data(),
++                                INITIAL_SALT_V1.size());
++    EVP_PKEY_derive(pctx,
++                    out_temp.data(),
++                    reinterpret_cast<size_t *>(&initial_secret_len));
++    EVP_PKEY_CTX_free(pctx);
++    return out_temp;
++}
++
++/*
++HKDF-Expand-Label as decribed in https://www.rfc-editor.org/rfc/rfc8446.html#section-7.1
++that uses the global constant labels such as 'quic hp'.
++*/
++std::vector<uint8_t> hkdf_expand(size_t out_len,
++                                 std::vector<uint8_t> key,
++                                 std::vector<uint8_t> info)
++{
++    std::vector<uint8_t> out_temp(out_len);
++    const EVP_MD *diges

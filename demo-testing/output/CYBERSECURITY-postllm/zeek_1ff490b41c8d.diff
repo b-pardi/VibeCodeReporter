@@ -1,0 +1,144 @@
+@@ -4825,10 +4825,19 @@ ScopePtr LambdaExpr::GetScope() const
+ 	return ingredients->Scope();
+ 	}
+ 
++void LambdaExpr::ReplaceBody(StmtPtr new_body)
++	{
++	ingredients->ReplaceBody(std::move(new_body));
++	}
++
+ ValPtr LambdaExpr::Eval(Frame* f) const
+ 	{
+ 	auto lamb = make_intrusive<ScriptFunc>(ingredients->GetID());
+ 
++	// Use the primary function as the source of the frame size
++	// and function body, rather than the ingredients, since script
++	// optimization might have changed the former but not the latter.
++	lamb->SetFrameSize(primary_func->FrameSize());
+ 	StmtPtr body = primary_func->GetBodies()[0].stmts;
+ 
+ 	if ( run_state::is_parsing )
+
+
+
+
+@@ -1482,6 +1482,8 @@ public:
+ 
+ 	const FunctionIngredientsPtr& Ingredients() const { return ingredients; }
+ 
++	void ReplaceBody(StmtPtr new_body);
++
+ 	bool IsReduced(Reducer* c) const override;
+ 	bool HasReducedOps(Reducer* c) const override;
+ 	ExprPtr Reduce(Reducer* c, StmtPtr& red_stmt) override;
+
+
+
+
+@@ -375,6 +375,7 @@ public:
+ 	const IDPtr& GetID() const { return id; }
+ 
+ 	const StmtPtr& Body() const { return body; }
++	void ReplaceBody(StmtPtr new_body) { body = std::move(new_body); }
+ 
+ 	const auto& Inits() const { return inits; }
+ 	void ClearInits() { inits.clear(); }
+
+
+
+
+@@ -2717,6 +2717,7 @@ ExprPtr InlineExpr::Reduce(Reducer* c, StmtPtr& red_stmt)
+ 	red_stmt = nullptr;
+ 
+ 	auto args_list = args->Exprs();
++	auto ret_val = c->PushInlineBlock(type);
+ 
+ 	loop_over_list(args_list, i)
+ 		{
+@@ -2730,7 +2731,6 @@ ExprPtr InlineExpr::Reduce(Reducer* c, StmtPtr& red_stmt)
+ 		red_stmt = MergeStmts(red_stmt, arg_red_stmt, assign_stmt);
+ 		}
+ 
+-	auto ret_val = c->PushInlineBlock(type);
+ 	body = body->Reduce(c);
+ 	c->PopInlineBlock();
+ 
+
+
+
+
+@@ -170,11 +170,6 @@ ExprPtr Inliner::CheckForInlining(CallExprPtr c)
+ 		// We don't inline indirect calls.
+ 		return c;
+ 
+-	if ( c->IsInWhen() )
+-		// Don't inline these, as doing so requires propagating
+-		// the in-when attribute to the inlined function body.
+-		return c;
+-
+ 	auto n = f->AsNameExpr();
+ 	auto func = n->Id();
+ 
+@@ -190,22 +185,38 @@ ExprPtr Inliner::CheckForInlining(CallExprPtr c)
+ 	if ( function->GetKind() != Func::SCRIPT_FUNC )
+ 		return c;
+ 
+-	// Check for mismatches in argument count due to single-arg-of-type-any
+-	// loophole used for variadic BiFs.
+-	if ( function->GetType()->Params()->NumFields() == 1 && c->Args()->Exprs().size() != 1 )
+-		return c;
+-
+ 	auto func_vf = static_cast<ScriptFunc*>(function);
+ 
+ 	if ( inline_ables.count(func_vf) == 0 )
+ 		return c;
+ 
++	if ( c->IsInWhen() )
++		{
++		// Don't inline these, as doing so requires propagating
++		// the in-when attribute to the inlined function body.
++		skipped_inlining.insert(func_vf);
++		return c;
++		}
++
++	// Check for mismatches in argument count due to single-arg-of-type-any
++	// loophole used for variadic BiFs.  (The issue isn't calls to the
++	// BiFs, which won't happen here, but instead to script functions that
++	// are misusing/abusing the loophole.)
++	if ( function->GetType()->Params()->NumFields() == 1 && c->Args()->Exprs().size() != 1 )
++		{
++		skipped_inlining.insert(func_vf);
++		return c;
++		}
++
+ 	// We're going to inline the body, unless it's too large.
+ 	auto body = func_vf->GetBodies()[0].stmts; // there's only 1 body
+ 	auto oi = body->GetOptInfo();
+ 
+ 	if ( num_stmts + oi->num_stmts + num_exprs + oi->num_exprs > MAX_INLINE_SIZE )
+-		return nullptr;
++		{
++		skipped_inlining.insert(func_vf);
++		return nullptr; // signals "stop inlining"
++		}
+ 
+ 	num_stmts += oi->num_stmts;
+ 	num_exprs += oi->num_exprs;
+
+
+
+
+@@ -32,7 +32,10 @@ public:
+ 	ExprPtr CheckForInlining(CallExprPtr c);
+ 
+ 	// True if the given function has been inlined.
+-	bool WasInlined(const Func* f) { return inline_ables.count(f) > 0; }
++	bool WasInlined(const Func* f)
++		{
++		return inline_ables.count(f) > 0 && skipped_inlining.count(f) == 0;
++		}
+ 
+ protected:
+ 	// Driver routine that analyzes all of the script functions and
+@@ -49,6 +52,10 @@ protected:
+ 	// Functions that we've determined to be suit

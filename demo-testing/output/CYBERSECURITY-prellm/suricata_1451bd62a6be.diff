@@ -1,0 +1,93 @@
+@@ -113,6 +113,18 @@
+ /* Limit till the data would be buffered in current line */
+ #define SMTP_LINE_BUFFER_LIMIT 4096
+ 
++typedef struct SMTPInput_ {
++    /* current input that is being parsed */
++    const uint8_t *buf;
++    int32_t len;
++
++    /* original length of an input */
++    int32_t orig_len;
++
++    /* Consumed bytes till current line */
++    int32_t consumed;
++} SMTPInput;
++
+ SCEnumCharMap smtp_decoder_event_table[] = {
+     { "INVALID_REPLY", SMTP_DECODER_EVENT_INVALID_REPLY },
+     { "UNABLE_TO_MATCH_REPLY_WITH_REQUEST", SMTP_DECODER_EVENT_UNABLE_TO_MATCH_REPLY_WITH_REQUEST },
+@@ -224,7 +236,6 @@ SMTPConfig smtp_config = { false, { false, false, false, NULL, false, false, 0 }
+     STREAMING_BUFFER_CONFIG_INITIALIZER };
+ 
+ static SMTPString *SMTPStringAlloc(void);
+-static int SMTPPreProcessCommands(SMTPState *state, Flow *f, AppLayerParserState *pstate);
+ 
+ /**
+  * \brief Configure SMTP Mime Decoder by parsing out mime section of YAML
+@@ -618,38 +629,38 @@ int SMTPProcessDataChunk(const uint8_t *chunk, uint32_t len,
+  * \retval -1 Either when we don't have any new lines to supply anymore or
+  *            on failure.
+  */
+-static AppLayerResult SMTPGetLine(SMTPState *state)
++static AppLayerResult SMTPGetLine(SMTPState *state, SMTPInput *input)
+ {
+     SCEnter();
+ 
+     /* we have run out of input */
+-    if (state->input_len <= 0)
++    if (input->len <= 0)
+         return APP_LAYER_ERROR;
+ 
+-    uint8_t *lf_idx = memchr(state->input + state->consumed, 0x0a, state->input_len);
++    uint8_t *lf_idx = memchr(input->buf + input->consumed, 0x0a, input->len);
+ 
+     if (lf_idx == NULL) {
+-        if (!state->discard_till_lf && state->input_len >= SMTP_LINE_BUFFER_LIMIT) {
+-            state->current_line = state->input;
++        if (!state->discard_till_lf && input->len >= SMTP_LINE_BUFFER_LIMIT) {
++            state->current_line = input->buf;
+             state->current_line_len = SMTP_LINE_BUFFER_LIMIT;
+             state->current_line_delimiter_len = 0;
+             SCReturnStruct(APP_LAYER_OK);
+         }
+-        SCReturnStruct(APP_LAYER_INCOMPLETE(state->consumed, state->input_len + 1));
++        SCReturnStruct(APP_LAYER_INCOMPLETE(input->consumed, input->len + 1));
+     } else {
+-        uint32_t o_consumed = state->consumed;
+-        state->consumed = lf_idx - state->input + 1;
+-        state->current_line_len = state->consumed - o_consumed;
+-        state->input_len -= state->current_line_len;
+-        DEBUG_VALIDATE_BUG_ON((state->consumed + state->input_len) != state->orig_input_len);
++        uint32_t o_consumed = input->consumed;
++        input->consumed = lf_idx - input->buf + 1;
++        state->current_line_len = input->consumed - o_consumed;
++        input->len -= state->current_line_len;
++        DEBUG_VALIDATE_BUG_ON((input->consumed + input->len) != input->orig_len);
+         if (state->discard_till_lf) {
+             // Whatever came in with first LF should also get discarded
+             state->discard_till_lf = false;
+             state->current_line_len = 0;
+             SCReturnStruct(APP_LAYER_OK);
+         }
+-        state->current_line = state->input + o_consumed;
+-        if (state->consumed >= 2 && state->input[state->consumed - 2] == 0x0D) {
++        state->current_line = input->buf + o_consumed;
++        if (input->consumed >= 2 && input->buf[input->consumed - 2] == 0x0D) {
+             state->current_line_delimiter_len = 2;
+             state->current_line_len -= 2;
+         } else {
+@@ -849,14 +860,13 @@ static inline bool IsReplyToCommand(const SMTPState *state, const uint8_t cmd)
+             state->cmds[state->cmds_idx] == cmd);
+ }
+ 
+-static int SMTPProcessReply(SMTPState *state, Flow *f,
+-                            AppLayerParserState *pstate,
+-                            SMTPThreadCtx *td)
++static int SMTPProcessReply(
++        SMTPState *state, Flow *f, AppLayerParserState *pstate, SMTPThreadCtx *td, SMTPInput *input)
+ {
+     SCEnter();
+ 
+     /* Line with just LF */
+-    if (state

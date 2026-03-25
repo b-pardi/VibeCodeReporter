@@ -1,0 +1,121 @@
+@@ -550,6 +550,7 @@ R_API bool r_bin_file_object_new_from_xtr_data(RBin *bin, RBinFile *bf, ut64 bas
+ 
+ 	RBinPlugin *plugin = get_plugin_from_buffer (bin, bf, NULL, data->buf);
+ 	bf->buf = r_buf_ref (data->buf);
++	bf->user_baddr = baseaddr;
+ 
+ 	RBinObject *o = r_bin_object_new (bf, plugin, baseaddr, loadaddr, offset, sz);
+ 	if (!o) {
+@@ -602,6 +603,7 @@ R_IPI RBinFile *r_bin_file_new_from_buffer(RBin *bin, const char *file, RBuffer
+ 	if (bf) {
+ 		RListIter *item = r_list_append (bin->binfiles, bf);
+ 		bf->buf = r_buf_ref (buf);
++		bf->user_baddr = baseaddr;
+ 		RBinPlugin *plugin = get_plugin_from_buffer (bin, bf, pluginname, bf->buf);
+ 		RBinObject *o = r_bin_object_new (bf, plugin, baseaddr, loadaddr, 0, r_buf_size (bf->buf));
+ 		if (!o) {
+
+
+
+
+@@ -1310,7 +1310,7 @@ R_API ut64 r_bin_get_vaddr(RBin *bin, ut64 paddr, ut64 vaddr) {
+ 	return r_bin_file_get_vaddr (bin->cur, paddr, vaddr);
+ }
+ 
+-// XXX remove this public api
++// XXX R2_590 remove this public api
+ R_API ut64 r_bin_a2b(RBin *bin, ut64 addr) {
+ 	r_return_val_if_fail (bin, UT64_MAX);
+ 	RBinObject *o = r_bin_cur_object (bin);
+
+
+
+
+@@ -1640,7 +1640,7 @@ static ut64 get_import_addr_arm(ELFOBJ *eo, RBinElfReloc *rel) {
+ 		return UT64_MAX;
+ 	}
+ 
+-	ut64 pos = COMPUTE_PLTGOT_POSITION (rel, got_addr, 0x3);
++	const ut64 pos = COMPUTE_PLTGOT_POSITION (rel, got_addr, 0x3);
+ 
+ 	switch (rel->type) {
+ 	case R_ARM_JUMP_SLOT:
+@@ -4326,7 +4326,7 @@ static RVector* parse_gnu_debugdata(ELFOBJ *eo, size_t *ret_size) {
+ 			ut8 *odata = r_sys_unxz (data, size, &osize);
+ 			if (odata) {
+ 				RBuffer *newelf = r_buf_new_with_pointers (odata, osize, false);
+-				ELFOBJ* newobj = Elf_(new_buf) (newelf, false);
++				ELFOBJ* newobj = Elf_(new_buf) (newelf, eo->user_baddr, false);
+ 				RVector *symbols = NULL;
+ 				if (newobj) {
+ 					symbols = Elf_(load_symbols) (newobj);
+@@ -4839,13 +4839,14 @@ void Elf_(free)(ELFOBJ* eo) {
+ 	free (eo);
+ }
+ 
+-ELFOBJ* Elf_(new_buf)(RBuffer *buf, bool verbose) {
++ELFOBJ* Elf_(new_buf)(RBuffer *buf, ut64 baddr, bool verbose) {
+ 	ELFOBJ *eo = R_NEW0 (ELFOBJ);
+ 	if (eo) {
+ 		eo->kv = sdb_new0 ();
+ 		eo->size = r_buf_size (buf);
+ 		eo->verbose = verbose;
+ 		eo->b = r_buf_ref (buf);
++		eo->user_baddr = baddr;
+ 		if (!elf_init (eo)) {
+ 			Elf_(free) (eo);
+ 			return NULL;
+@@ -4890,7 +4891,6 @@ ut64 Elf_(p2v) (ELFOBJ *eo, ut64 paddr) {
+ // Deprecated temporarily. Use r_bin_elf_v2p_new in new code for now.
+ ut64 Elf_(v2p)(ELFOBJ *eo, ut64 vaddr) {
+ 	r_return_val_if_fail (eo, 0); // UT64_MAX or vaddr?
+-	// r_return_val_if_fail (eo, UT64_MAX);
+ 	if (!eo->phdr) {
+ 		if (is_bin_etrel (eo)) {
+ 			return vaddr - eo->baddr;
+
+
+
+
+@@ -135,6 +135,7 @@ struct Elf_(obj_t) {
+ 	int bss;
+ 	ut64 size;
+ 	ut64 baddr;
++	ut64 user_baddr;
+ 	ut64 boffset;
+ 	int endian;
+ 	bool verbose;
+@@ -198,7 +199,7 @@ const RVector* Elf_(load_fields)(struct Elf_(obj_t) *bin);  // RBinElfField
+ char *Elf_(get_rpath)(struct Elf_(obj_t) *bin);
+ 
+ struct Elf_(obj_t)* Elf_(new)(const char* file, bool verbose);
+-struct Elf_(obj_t)* Elf_(new_buf)(RBuffer *buf, bool verbose);
++struct Elf_(obj_t)* Elf_(new_buf)(RBuffer *buf, ut64 user_baddr, bool verbose);
+ void Elf_(free)(struct Elf_(obj_t)* bin);
+ 
+ ut64 Elf_(resize_section)(RBinFile *bf, const char *name, ut64 size);
+
+
+
+
+@@ -58,7 +58,8 @@ static Sdb* get_sdb(RBinFile *bf) {
+ }
+ 
+ static bool load_buffer(RBinFile *bf, void **bin_obj, RBuffer *buf, ut64 loadaddr, Sdb *sdb) {
+-	ELFOBJ *res = Elf_(new_buf) (buf, bf->rbin->verbose);
++	ut64 user_baddr = bf->user_baddr;
++	ELFOBJ *res = Elf_(new_buf) (buf, user_baddr, bf->rbin->verbose);
+ 	if (res) {
+ 	//	sdb_ns_set (sdb, "info", res->kv);
+ 		*bin_obj = res;
+@@ -453,9 +454,9 @@ static RList* libs(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static RBinReloc *reloc_convert(ELFOBJ* bin, RBinElfReloc *rel, ut64 got_addr) {
+-	r_return_val_if_fail (bin && rel, NULL);
+-	ut64 B = bin->baddr;
++static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
++	r_return_val_if_fail (eo && rel, NULL);
++	ut64 B = eo->baddr;
+ 	ut6

@@ -1,0 +1,144 @@
+@@ -56,6 +56,7 @@
+ #include <sys/poll.h>
+ #endif
+ #include <atomic>
++#include <array>
+ 
+ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+ static std::atomic<bool> quit{false};
+@@ -120,6 +121,93 @@ class BNetThreadServerCleanupObject {
+   ThreadList& thread_list_;
+ };
+ 
++static void RemoveDuplicateAddresses(dlist* addr_list)
++{
++  IPADDR* ipaddr = nullptr;
++  IPADDR* next = nullptr;
++  IPADDR* to_free = nullptr;
++
++  for (ipaddr = (IPADDR*)addr_list->first(); ipaddr;
++       ipaddr = (IPADDR*)addr_list->next(ipaddr)) {
++    next = (IPADDR*)addr_list->next(ipaddr);
++    while (next) {
++      /*
++       * See if the addresses match.
++       */
++      if (ipaddr->GetSockaddrLen() == next->GetSockaddrLen() &&
++          memcmp(ipaddr->get_sockaddr(), next->get_sockaddr(),
++                 ipaddr->GetSockaddrLen()) == 0) {
++        to_free = next;
++        next = (IPADDR*)addr_list->next(next);
++        addr_list->remove(to_free);
++        delete to_free;
++      } else {
++        next = (IPADDR*)addr_list->next(next);
++      }
++    }
++  }
++}
++
++static void LogAllAddresses(dlist* addr_list)
++{
++  std::array<char, 256 * 10> allbuf;
++
++  Dmsg1(100, "Addresses %s\n",
++        BuildAddressesString(addr_list, allbuf.data(), allbuf.size()));
++}
++
++static int OpenSocketAndBind(IPADDR* ipaddr,
++                             dlist* addr_list,
++                             uint16_t port_number)
++{
++  int fd = -1;
++  int tries = 0;
++
++  do {
++    ++tries;
++    if ((fd = socket(ipaddr->GetFamily(), SOCK_STREAM, 0)) < 0) {
++      Bmicrosleep(10, 0);
++    }
++  } while (fd < 0 && tries < 6);
++
++  if (fd < 0) {
++    BErrNo be;
++    std::array<char, 256> buf1;
++    std::array<char, 256 * 10> buf2;
++    Emsg3(M_ABORT, 0,
++          _("Cannot open stream socket. ERR=%s. Current %s All %s\n"),
++          be.bstrerror(), ipaddr->build_address_str(buf1.data(), buf1.size()),
++          BuildAddressesString(addr_list, buf2.data(), buf2.size()));
++    return -1;
++  }
++
++  int reuseaddress = 1;
++  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (sockopt_val_t)&reuseaddress,
++                 sizeof(reuseaddress)) < 0) {
++    BErrNo be;
++    Emsg1(M_WARNING, 0, _("Cannot set SO_REUSEADDR on socket: %s\n"),
++          be.bstrerror());
++    return -2;
++  }
++
++  tries = 0;
++
++  do {
++    ++tries;
++    if (bind(fd, ipaddr->get_sockaddr(), ipaddr->GetSockaddrLen()) < 0) {
++      BErrNo be;
++      Emsg2(M_WARNING, 0, _("Cannot bind port %d: ERR=%s: Retrying ...\n"),
++            ntohs(port_number), be.bstrerror());
++      Bmicrosleep(5, 0);
++    } else {
++      // success
++      return fd;
++    }
++  } while (tries < 3);
++
++  return -3;
++}
++
+ /**
+  * Become Threaded Network Server
+  *
+@@ -142,111 +230,29 @@ void BnetThreadServerTcp(
+     std::function<void*(void* bsock)> UserAgentShutdownCallback,
+     std::function<void()> CustomCallback)
+ {
+-  int newsockfd;
+-  socklen_t clilen;
+-  struct sockaddr_storage cli_addr; /* client's address */
+-  int tlog;
+-  int value;
+-  IPADDR *ipaddr, *next, *to_free;
+-  s_sockfd* fd_ptr = NULL;
+-  char buf[128];
+-#ifdef HAVE_POLL
+-  nfds_t nfds;
+-  int events;
+-  struct pollfd* pfds;
+-#endif
+-
+-  char allbuf[256 * 10];
+-
+   BNetThreadServerCleanupObject cleanup_object(sockfds, thread_list);
+ 
+-  quit = false;
++  quit = false;  // allow other threads to set this true during initialization
+   if (server_state) { server_state->store(BnetServerState::kStarting); }
+ 
+-  /*
+-   * Remove any duplicate addresses.
+-   */
+-  for (ipaddr = (IPADDR*)addr_list->first(); ipaddr;
+-       ipaddr = (IPADDR*)addr_list->next(ipaddr)) {
+-    next = (IPADDR*)addr_list->next(ipaddr);
+-    while (next) {
+-      /*
+-       * See if the addresses match.
+-       */
+-      if (ipaddr->GetSockaddrLen() == next->GetSockaddrLen() &&
+-          memcmp(ipaddr->get_sockaddr(), next->get_sockaddr(),
+-                 ipaddr->GetSockaddrLen()) == 0) {
+-        to_free = next;
+-        next = (IPADDR*)addr_list->next(next);
+-        addr_list->remove(to_free);

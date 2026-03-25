@@ -1,0 +1,106 @@
+@@ -198,6 +198,7 @@ extern s32 __leoSetReset(void);
+ extern s32 __osLeoInterrupt(void);
+ extern u16 leoLba_to_vzone(u32 lba);
+ extern u16 leoLba_to_phys(u32 lba);
++extern void leoSet_mseq(u16 rwmode);
+ 
+ extern s32 __leoActive;
+ extern s32 __leoResetCalled;
+
+
+
+
+@@ -3,8 +3,12 @@
+ 
+ extern vu16 LEOrw_flags;
+ extern u8 LEOC2_Syndrome[2][0xE8*4];
++extern block_param_form LEOc2_param;
+ 
+-void* read_write_track();
++u32 read_write_track();
++u32 leoChk_mecha_int(void);
++void leosetup_BM(void);
++u32 leochk_err_reg(void);
+ 
+ void leointerrupt(void* arg) {
+     u32 result;
+@@ -50,7 +54,164 @@ void leointerrupt(void* arg) {
+     }
+ }
+ 
+-#pragma GLOBAL_ASM("asm/nonmatchings/libleo/leoint/read_write_track.s")
++u32 read_write_track(void) {
++    u32 message;
++    u32 block;
++    u32 retry_cntr;
++    block_param_form block_param;
++    u16 bnum;
++    u8* temp;
++    u32 c2datasize;
++    
++    block_param.bytes = LEOtgt_param.sec_bytes;
++    block_param.blkbytes = LEOtgt_param.blk_bytes;
++    if (LEOrw_flags & 0x2000) {
++        //Sector Mode
++        block_param.blkbytes = block_param.bytes;
++    }
++    block_param.pntr = LEOwrite_pointer;
++    LEOwrite_pointer += block_param.blkbytes;
++    if (LEOtgt_param.rdwr_blocks == 2) {
++        LEOwrite_pointer += block_param.blkbytes;
++    }
++    retry_cntr = 0;
++    for (;;) {
++        LEOPiInfo->transferInfo.transferMode = 1;
++        LEOPiInfo->transferInfo.blockNum = 0;
++        LEOPiInfo->transferInfo.block[0].C1ErrNum = 0;
++        LEOPiInfo->transferInfo.block[0].sectorSize = block_param.bytes;
++        LEOPiInfo->transferInfo.block[0].dramAddr = block_param.pntr;
++        LEOPiInfo->transferInfo.block[0].C2Addr = &LEOC2_Syndrome[0];
++        if (LEOrw_flags & 0x2000) {
++            //Sector Mode
++            LEOtgt_param.rdwr_blocks = 1;
++            LEOPiInfo->transferInfo.transferMode = 3;
++        } else if (LEOtgt_param.rdwr_blocks == 2) {
++            LEOPiInfo->transferInfo.transferMode = 2;
++            LEOPiInfo->transferInfo.block[1] = LEOPiInfo->transferInfo.block[0];
++            LEOPiInfo->transferInfo.block[1].C2Addr = &LEOC2_Syndrome[1];
++            LEOPiInfo->transferInfo.block[1].dramAddr = ((u8*)LEOPiInfo->transferInfo.block[1].dramAddr + block_param.blkbytes);
++        }
++        message = leoChk_mecha_int();
++        if (message == 0) {
++            if (LEOrw_flags & 0x8000) {
++                //Write Mode
++                leoSet_mseq(1);
++            } else {
++                //Read Mode
++                leoSet_mseq(0);
++            }
++            leosetup_BM();
++            LEOPiInfo->transferInfo.bmCtlShadow = LEOasic_bm_ctl_shadow;
++            LEOPiInfo->transferInfo.seqCtlShadow = LEOasic_seq_ctl_shadow;
++            if (LEOrw_flags & 0x8000) {
++                LEOPiInfo->transferInfo.cmdType = 1;
++                osWritebackDCache(block_param.pntr, block_param.blkbytes * LEOtgt_param.rdwr_blocks);
++                osEPiStartDma(LEOPiInfo, &LEOPiDmaParam, 1);
++                osRecvMesg(&LEOdma_que, NULL, 1);
++                LEOasic_bm_ctl_shadow = LEOPiInfo->transferInfo.bmCtlShadow;
++                LEOasic_seq_ctl_shadow = LEOPiInfo->transferInfo.seqCtlShadow;
++                bnum = LEOPiInfo->transferInfo.blockNum;
++                message = LEOPiInfo->transferInfo.block[bnum].errStatus;
++                if (message == 0) {
++                    return message;
++                }
++                goto track_end;
++            } else {
++                if (LEOrw_flags & 0x4000) {
++                    osRecvMesg(&LEOc2ctrl_que, NULL, 1);
++                    osSendMesg(&LEOc2ctrl_que, NULL, 0);
++                }
++                LEOPiInfo->transferInfo.cmdType = 0;
++                osInvalDCache(block_param.pntr, block_param.blkbytes * LEOtgt_param.rdwr_blocks);
++                osEPiStartDma(LEOPiInfo, &LEOPiDmaParam, 0);
++                block = 0;
++                while (LEOtgt_param.rdwr_blocks != 0) {
++                    osRecvMesg(&LEOdma_que, NULL, 1);
++     

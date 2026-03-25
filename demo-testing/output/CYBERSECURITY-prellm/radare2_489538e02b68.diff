@@ -1,0 +1,124 @@
+@@ -1,289 +1,628 @@
+-// Copyright (c) 2014-2017, The Lemon Man, All rights reserved. LGPLv3
++/* radare - LGPL - Copyright 2020 - GustavoLCR */
+ 
+-// This library is free software; you can redistribute it and/or
+-// modify it under the terms of the GNU Lesser General Public
+-// License as published by the Free Software Foundation; either
+-// version 3.0 of the License, or (at your option) any later version.
++#include <r_debug.h>
++#include <DbgEng.h>
+ 
+-// This library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-// Lesser General Public License for more details.
++#ifndef CONTEXT_ARM
++#define CONTEXT_ARM 0x00200000L
++#endif
++#ifndef CONTEXT_ARM64
++#define CONTEXT_ARM64 0x00400000L
++#endif
++#ifndef CONTEXT_AMD64
++#define CONTEXT_AMD64 0x00100000L
++#endif
++#ifndef CONTEXT_i386
++#define CONTEXT_i386 0x00010000L
++#endif
++#ifndef IMAGE_FILE_MACHINE_ARM64
++#define IMAGE_FILE_MACHINE_ARM64 0xAA64
++#endif
++#ifndef DEBUG_DUMP_ACTIVE
++#define DEBUG_DUMP_ACTIVE 1030
++#endif
+ 
+-// You should have received a copy of the GNU Lesser General Public
+-// License along with this library.
++#define TIMEOUT 500
++#define THISCALL(dbginterface, function, ...) dbginterface->lpVtbl->function (dbginterface, __VA_ARGS__)
++#define ITHISCALL(dbginterface, function, ...) THISCALL (idbg->dbginterface, function, __VA_ARGS__)
++#define RELEASE(I) if (I) THISCALL (I, Release);
++
++typedef struct { // Keep in sync with io_windbg.c
++	bool initialized;
++	ULONG64 server;
++	ULONG64 processBase;
++	DWORD lastExecutionStatus;
++	PDEBUG_CLIENT5 dbgClient;
++	PDEBUG_CONTROL4 dbgCtrl;
++	PDEBUG_DATA_SPACES4 dbgData;
++	PDEBUG_REGISTERS2 dbgReg;
++	PDEBUG_SYSTEM_OBJECTS4 dbgSysObj;
++	PDEBUG_SYMBOLS3 dbgSymbols;
++	PDEBUG_ADVANCED3 dbgAdvanced;
++} DbgEngContext;
++
++static bool __is_target_kernel(DbgEngContext *idbg) {
++	ULONG Class, Qualifier;
++	if (SUCCEEDED (ITHISCALL (dbgCtrl, GetDebuggeeType, &Class, &Qualifier))) {
++		if (Class == DEBUG_CLASS_KERNEL) {
++			return true;
++		}
++	}
++	return false;
++}
+ 
+-#include <r_asm.h>
+-#include <r_debug.h>
+-#include <windbg.h>
+-#include <kd.h>
++static int windbg_init(RDebug *dbg) {
++	DbgEngContext *idbg = dbg->user;
++	if (!idbg || !idbg->initialized) {
++		return 0;
++	}
++	return 1;
++}
+ 
+-static WindCtx *wctx = NULL;
++static int windbg_step(RDebug *dbg) {
++	DbgEngContext *idbg = dbg->user;
++	r_return_val_if_fail (idbg && idbg->initialized, 0);
++	idbg->lastExecutionStatus = DEBUG_STATUS_STEP_INTO;
++	return SUCCEEDED (ITHISCALL (dbgCtrl, SetExecutionStatus, DEBUG_STATUS_STEP_INTO));
++}
+ 
+-static int r_debug_windbg_step(RDebug *dbg) {
+-	return true;
++static int windbg_step_over(RDebug *dbg) {
++	DbgEngContext *idbg = dbg->user;
++	r_return_val_if_fail (idbg && idbg->initialized, 0);
++	idbg->lastExecutionStatus = DEBUG_STATUS_STEP_OVER;
++	return SUCCEEDED (ITHISCALL (dbgCtrl, SetExecutionStatus, DEBUG_STATUS_STEP_OVER));
+ }
+ 
+-static int r_debug_windbg_reg_read(RDebug *dbg, int type, ut8 *buf, int size) {
+-	int ret = windbg_read_reg(wctx, buf, size);
+-	if (!ret || size != ret) {
+-		return -1;
++static int windbg_select(RDebug *dbg, int pid, int tid) {
++	DbgEngContext *idbg = dbg->user;
++	r_return_val_if_fail (idbg && idbg->initialized, 0);
++	ULONG Id = tid, Class, Qualifier;
++	if (!__is_target_kernel (idbg)) {
++		ITHISCALL (dbgSysObj, GetThreadIdBySystemId, tid, &Id);
++	}
++	if (SUCCEEDED (ITHISCALL (dbgSysObj, SetCurrentThreadId, Id))) {
++		return 1;
+ 	}
+-	r_reg_read_regs (dbg->reg, buf, ret);
+-	// Report as if no register has been written as we've already updated the arena here
+ 	return 0;
+ }
+ 
+-static int r_debug_windbg_reg_write(RDebug *dbg, int type, const ut8 *buf, int size) {
+-	if (!dbg->reg) {
+-		return false;
+-	}
+-	int arena_size;
+-	ut8 *arena = r_reg_get_bytes (dbg->reg, R_REG_TYPE_ALL, &arena_size);
+-	if (!arena) {
+-		eprintf ("Could not retrieve the register arena!\n");
+-		return false;
+-	}
+-	int ret =

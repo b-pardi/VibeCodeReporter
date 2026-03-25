@@ -1,0 +1,116 @@
+@@ -92,7 +92,6 @@ class Amd64Emulator(Amd64RegisterContext, e_i386.IntelEmulator):
+     accumreg = { 1:REG_AL, 2:REG_AX, 4:REG_EAX, 8:REG_RAX }
+ 
+     def __init__(self):
+-
+         archmod = Amd64Module()
+         e_i386.IntelEmulator.__init__(self, archmod=archmod)
+         # The above sets up the intel reg context, so we smash over it
+@@ -160,3 +159,4 @@ class Amd64Emulator(Amd64RegisterContext, e_i386.IntelEmulator):
+             self.setRegister(REG_RDX, r)
+         else:
+             e_i386.IntelEmulator.i_idiv(self, op)
++
+
+
+
+
+@@ -9,8 +9,9 @@ from envi.const import RMETA_NMASK
+ 
+ from envi.archs.i386.disasm import iflag_lookup, operand_range, priv_lookup, \
+         i386Opcode, i386ImmOper, i386RegOper, i386ImmMemOper, i386RegMemOper, \
+-        i386SibOper, PREFIX_REPNZ, PREFIX_REP, PREFIX_OP_SIZE, PREFIX_ADDR_SIZE, \
+-        MANDATORY_PREFIXES, PREFIX_REP_MASK, RMETA_LOW8, RMETA_LOW16
++        i386SibOper, PREFIX_REPNZ, PREFIX_REPZ, PREFIX_REP, PREFIX_REP_SIMD, \
++        PREFIX_OP_SIZE, PREFIX_ADDR_SIZE, MANDATORY_PREFIXES, PREFIX_REP_MASK,\
++        RMETA_LOW8, RMETA_LOW16
+ 
+ from .regs import *
+ from envi.archs.i386.opconst import OP_EXTRA_MEMSIZES, OP_MEM_B, OP_MEM_W, OP_MEM_D, \
+
+
+
+
+@@ -338,7 +338,7 @@ class i386RegMemOper(envi.DerefOper):
+             return None  # This operand type requires an emulator
+         base, size = emu.getSegmentInfo(op)
+         rval = emu.getRegister(self.reg)
+-        return base + rval + self.disp
++        return e_bits.unsigned(base + rval + self.disp, emu.imem_psize)
+ 
+     def isDeref(self):
+         # The disassembler may reach in and set this (if lea...)
+@@ -410,7 +410,7 @@ class i386ImmMemOper(envi.DerefOper):
+         ret = self.imm
+         if emu is not None:
+             base, size = emu.getSegmentInfo(op)
+-            ret += base
++            ret = e_bits.unsigned(ret + base, emu.imem_psize)
+         return ret
+ 
+     def render(self, mcanv, op, idx):
+@@ -524,7 +524,7 @@ class i386SibOper(envi.DerefOper):
+         base, size = emu.getSegmentInfo(op)
+         ret += base
+ 
+-        return ret + self.disp
++        return e_bits.unsigned(ret + self.disp, emu.imem_psize)
+ 
+     def _getOperBase(self, emu=None):
+         # Special SIB only method for getting the SIB base value
+
+
+
+
+@@ -115,12 +115,19 @@ thiscall_caller = ThisCall_Caller()
+ msfastcall_caller = MsFastCall_Caller()
+ bfastcall_caller = BFastCall_Caller()
+ 
++
+ class IntelEmulator(i386RegisterContext, envi.Emulator):
+ 
+     flagidx = REG_EFLAGS
+     accumreg = { 1:REG_AL, 2:REG_AX, 4:REG_EAX }
+-
+     def __init__(self, archmod=None):
++        self.__rep_prefix_handlers__ = {
++            PREFIX_REP: self.doRepzPrefix,
++            PREFIX_REPZ: self.doRepzPrefix,
++            PREFIX_REPNZ: self.doRepnzPrefix,
++            PREFIX_REP_SIMD: self.doRepSIMDPrefix,
++        }
++
+         # Set ourself up as an arch module *and* register context
+         #i386Module.__init__(self)
+         if archmod is None:
+@@ -238,27 +245,69 @@ class IntelEmulator(i386RegisterContext, envi.Emulator):
+         if meth is None:
+             raise e_exc.UnsupportedInstruction(self, op)
+ 
+-        newpc = meth(op)
++        rep_prefix = op.prefixes & PREFIX_REP_MASK
++        if rep_prefix and not self.getEmuOpt('i386:reponce'):
++            # REP instructions (REP/REPNZ/REPZ/REPSIMD) get their own handlers
++            handler = self.__rep_prefix_handlers__.get(rep_prefix)
++            newpc = handler(meth, op)
++
++        else:
++            newpc = meth(op)
++
+         if newpc is not None:
+             self.setProgramCounter(newpc)
+             return
+ 
+-        if op.prefixes & PREFIX_REP:
++        pc = self.getProgramCounter()
++        newpc = pc+op.size
++        self.setProgramCounter(newpc)
+ 
+-            ecx = self.getRegister(REG_ECX) - 1
+-            self.setRegister(REG_ECX, ecx)
++    ###### Repeat Prefix Handlers
+ 
+-            if self.getEmuOpt('i386:reponce'):
+-                ecx = 0
+-                self.setRegister(REG_ECX,0)
++

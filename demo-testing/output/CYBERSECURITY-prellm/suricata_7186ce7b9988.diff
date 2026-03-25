@@ -1,0 +1,99 @@
+@@ -695,6 +695,10 @@ static int Setup(Flow *f, HtpState *hstate)
+ 
+     htp_connp_open(hstate->connp, NULL, f->sp, NULL, f->dp, &f->startts);
+ 
++    StreamTcpReassemblySetMinInspectDepth(f->protoctx, STREAM_TOSERVER,
++            htp_cfg_rec->request.inspect_min_size);
++    StreamTcpReassemblySetMinInspectDepth(f->protoctx, STREAM_TOCLIENT,
++            htp_cfg_rec->response.inspect_min_size);
+     return 0;
+ error:
+     return -1;
+
+
+
+
+@@ -82,7 +82,8 @@ static void PrefilterPktStream(DetectEngineThreadCtx *det_ctx,
+         struct StreamMpmData stream_mpm_data = { det_ctx, mpm_ctx };
+         StreamReassembleRaw(p->flow->protoctx, p,
+                 StreamMpmFunc, &stream_mpm_data,
+-                &det_ctx->raw_stream_progress);
++                &det_ctx->raw_stream_progress,
++                false /* mpm doesn't use min inspect depth */);
+         SCLogDebug("POST det_ctx->raw_stream_progress %"PRIu64,
+                 det_ctx->raw_stream_progress);
+     } else {
+@@ -268,7 +269,7 @@ int DetectEngineInspectStreamPayload(DetectEngineCtx *de_ctx,
+     struct StreamContentInspectData inspect_data = { de_ctx, det_ctx, s, f };
+     int r = StreamReassembleRaw(f->protoctx, p,
+             StreamContentInspectFunc, &inspect_data,
+-            &unused);
++            &unused, ((s->flags & SIG_FLAG_FLUSH) != 0));
+     return r;
+ }
+ 
+@@ -338,7 +339,7 @@ int DetectEngineInspectStream(ThreadVars *tv,
+     struct StreamContentInspectEngineData inspect_data = { de_ctx, det_ctx, s, smd, f };
+     int match = StreamReassembleRaw(f->protoctx, p,
+             StreamContentInspectEngineFunc, &inspect_data,
+-            &unused);
++            &unused, ((s->flags & SIG_FLAG_FLUSH) != 0));
+ 
+     bool is_last = false;
+     if (flags & STREAM_TOSERVER) {
+
+
+
+
+@@ -698,6 +698,19 @@ static inline uint64_t GetLeftEdge(TcpSession *ssn, TcpStream *stream)
+                 raw_progress -= (uint64_t)chunk_size;
+             }
+         }
++
++        /* apply min inspect depth: if it is set we need to keep data
++         * before the raw progress. */
++        if (use_app && stream->min_inspect_depth) {
++            if (raw_progress < stream->min_inspect_depth)
++                raw_progress = 0;
++            else
++                raw_progress -= stream->min_inspect_depth;
++
++            SCLogDebug("stream->min_inspect_depth %u, raw_progress %"PRIu64,
++                    stream->min_inspect_depth, raw_progress);
++        }
++
+         if (use_app) {
+             left_edge = MIN(STREAM_APP_PROGRESS(stream), raw_progress);
+             SCLogDebug("left_edge %"PRIu64", using both app:%"PRIu64", raw:%"PRIu64,
+
+
+
+
+@@ -115,6 +115,9 @@ typedef struct TcpStream_ {
+     uint32_t raw_progress_rel;      /**< raw reassembly progress relative to STREAM_BASE_OFFSET */
+     uint32_t log_progress_rel;      /**< streaming logger progress relative to STREAM_BASE_OFFSET */
+ 
++    uint32_t min_inspect_depth;     /**< min inspect size set by the app layer, to make sure enough data
++                                     *   remains available for inspection together with app layer buffers */
++
+     StreamingBuffer sb;
+     struct TCPSEG seg_tree;         /**< red black tree of TCP segments. Data is stored in TcpStream::sb */
+     uint32_t segs_right_edge;
+
+
+
+
+@@ -1526,11 +1526,17 @@ static int StreamReassembleRawInline(TcpSession *ssn, const Packet *p,
+  *  \param[in] progress_in progress to work from
+  *  \param[out] progress_out absolute progress value of the data this
+  *                           call handled.
++ *  \param eof we're wrapping up so inspect all data we have, incl unACKd
++ *  \param respect_inspect_depth use Stream::min_inspect_depth if set
++ *
++ *  `respect_inspect_depth` is used to avoid useless inspection of too
++ *  much data.
+  */
+ static int StreamReassembleRawDo(TcpSession *ssn, TcpStream *stream,
+                         StreamReassembleRawFunc Callback, void *cb_data,
+                         const uint64_t progress_in,
+-                        uint64_t *progr

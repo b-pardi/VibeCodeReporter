@@ -1,0 +1,141 @@
+@@ -349,8 +349,8 @@ static RBinImport *import_from_name(RBin *rbin, const char *orig_name, HtPP *imp
+ 		}
+ 	}
+ 
+-	RBinImport *ptr = NULL;
+-	if (!(ptr = R_NEW0 (RBinImport))) {
++	RBinImport *ptr = R_NEW0 (RBinImport);
++	if (!ptr) {
+ 		return NULL;
+ 	}
+ 
+@@ -359,7 +359,7 @@ static RBinImport *import_from_name(RBin *rbin, const char *orig_name, HtPP *imp
+ 	const int _objc_class_len = strlen (_objc_class);
+ 	const char *_objc_metaclass = "_OBJC_METACLASS_$";
+ 	const int _objc_metaclass_len = strlen (_objc_metaclass);
+-	char *type = "FUNC";
++	const char * type = "FUNC";
+ 
+ 	if (!strncmp (name, _objc_class, _objc_class_len)) {
+ 		name += _objc_class_len;
+@@ -558,17 +558,17 @@ static RBinInfo *info(RBinFile *bf) {
+ 	return ret;
+ }
+ 
+-static bool _patch_reloc(struct MACH0_(obj_t) *bin, RIOBind *iob, struct reloc_t *reloc, ut64 symbol_at) {
++static bool _patch_reloc(struct MACH0_(obj_t) *mo, RIOBind *iob, struct reloc_t *reloc, ut64 symbol_at, bool cache_relocs) {
+ 	ut64 pc = reloc->addr;
+ 	ut64 ins_len = 0;
+ 
+-	switch (bin->hdr.cputype) {
+-	case CPU_TYPE_X86_64: {
++	switch (mo->hdr.cputype) {
++	case CPU_TYPE_X86_64:
+ 		switch (reloc->type) {
+ 		case X86_64_RELOC_UNSIGNED:
+ 			break;
+ 		case X86_64_RELOC_BRANCH:
+-			pc -= 1;
++			pc--;
+ 			ins_len = 5;
+ 			break;
+ 		default:
+@@ -576,7 +576,6 @@ static bool _patch_reloc(struct MACH0_(obj_t) *bin, RIOBind *iob, struct reloc_t
+ 			return false;
+ 		}
+ 		break;
+-	}
+ 	case CPU_TYPE_ARM64:
+ 	case CPU_TYPE_ARM64_32:
+ 		pc = reloc->addr & ~3;
+@@ -585,52 +584,58 @@ static bool _patch_reloc(struct MACH0_(obj_t) *bin, RIOBind *iob, struct reloc_t
+ 	case CPU_TYPE_ARM:
+ 		break;
+ 	default:
+-		R_LOG_WARN ("unsupported architecture for patching relocs, please file a bug. %s", MACH0_(get_cputype_from_hdr)(&bin->hdr));
++		R_LOG_WARN ("unsupported architecture for patching relocs, please file a bug. %s",
++				MACH0_(get_cputype_from_hdr)(&mo->hdr));
+ 		return false;
+ 	}
+ 
+-	ut64 val = symbol_at;
+-	if (reloc->pc_relative) {
+-		val = symbol_at - pc - ins_len;
+-	}
++	ut64 val = reloc->pc_relative ? symbol_at - pc - ins_len : symbol_at;
+ 
+ 	ut8 buf[8];
+ 	r_write_ble (buf, val, false, reloc->size * 8);
+-	if (reloc->size > 0) {
+-		iob->write_at (iob->io, reloc->addr, buf, reloc->size);
+-	} else {
++	if (reloc->size < 1) {
+ 		R_LOG_WARN ("invalid reloc size %d at 0x%08"PFMT64x, reloc->size, reloc->addr);
++		return false;
++	}
++	int res;
++	if (cache_relocs) {
++		res = iob->write_at (iob->io, reloc->addr, buf, reloc->size);
++	} else {
++		res = r_buf_write_at (mo->b, reloc->addr, buf, reloc->size);
++	}
++	if (res != reloc->size) {
++		R_LOG_WARN ("cannot write reloc at 0x%"PFMT64x, reloc->addr);
++		return false;
+ 	}
+-
+ 	return true;
+ }
+ 
+ static RList* patch_relocs(RBin *b) {
++	r_return_val_if_fail (b, NULL);
++
+ 	RList *ret = NULL;
+-	RIO *io = NULL;
+-	RBinObject *obj = NULL;
+-	struct MACH0_(obj_t) *mo = NULL;
+ 	RIOMap *g = NULL;
+ 	HtUU *relocs_by_sym = NULL;
+ 	RIODesc *gotr2desc = NULL;
+ 
+-	r_return_val_if_fail (b, NULL);
+-
+-	io = b->iob.io;
++	RIO *io = b->iob.io;
+ 	if (!io || !io->desc) {
+ 		return NULL;
+ 	}
+-	obj = r_bin_cur_object (b);
++
++	RBinObject *obj = r_bin_cur_object (b);
+ 	if (!obj) {
+ 		return NULL;
+ 	}
+-	mo = obj->bin_obj;
++	struct MACH0_(obj_t) *mo = obj->bin_obj;
++	const bool apply_relocs = !mo->b->readonly;
++	const bool cache_relocs = io->cached;
+ 
+-	RSkipList * all_relocs = MACH0_(get_relocs)(mo);
++	RSkipList *all_relocs = MACH0_(get_relocs)(mo);
+ 	if (!all_relocs) {
+ 		return NULL;
+ 	}
+-	RList * ext_relocs = r_list_new ();
++	RList *ext_relocs = r_list_new ();
+ 	if (!ext_relocs) {
+ 		goto beach;
+ 	}
+@@ -643,20 +648,23 @@ static RList* patch_relocs(RBin *b) {
+ 		r_list_append (ext_relocs, reloc);
+ 	}
+ 	if (mo->reloc_fixups && r_list_length (mo->reloc_fixups) > 0) {
+-		if (!io->cached) {
++		if (!apply_relocs) {
+ 			R_LOG_WARN ("run r2 with -e bin.cache=true to fix relocations in disassembly");
+ 			goto beach;
+-		} else {
+-			RBinReloc *r;
+-			RListIter *iter2;
+-
+-			r_list_foreach (mo->reloc_fixups, iter2

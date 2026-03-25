@@ -1,0 +1,121 @@
+@@ -724,17 +724,17 @@ static void PacketToDataProtoTLS(const Packet *p, const PacketAlert *pa, idmef_a
+ static void PacketToDataProtoSSH(const Packet *p, const PacketAlert *pa, idmef_alert_t *alert)
+ {
+     json_t *js, *s_js;
+-    SshState *ssh_state = (SshState *)FlowGetAppState(p->flow);
++    void *ssh_state = FlowGetAppState(p->flow);
+ 
+     if (ssh_state == NULL)
+         return;
+ 
+-    js = json_object();
+-    if (js == NULL)
++    void *tx_ptr = rs_ssh_state_get_tx(ssh_state, 0);
++    BUG_ON(tx_ptr == NULL);
++    js = rs_ssh_log_json(tx_ptr);
++    if (unlikely(js == NULL))
+         return;
+ 
+-    JsonSshLogJSON(js, ssh_state);
+-
+     s_js = json_object_get(js, "server");
+     if (s_js != NULL) {
+         JsonToAdditionalData(NULL, s_js, alert);
+
+
+
+
+@@ -41,6 +41,7 @@
+ #include "app-layer-protos.h"
+ #include "app-layer-parser.h"
+ #include "app-layer-ssh.h"
++#include "rust.h"
+ 
+ #include "conf.h"
+ 
+@@ -52,562 +53,6 @@
+ #include "util-byte.h"
+ #include "util-memcmp.h"
+ 
+-/** \internal
+- *  \brief Function to parse the SSH version string of the client
+- *
+- *  The input to this function is a byte buffer starting with SSH-
+- *
+- *  \param  ssh_state   Pointer the state in which the value to be stored
+- *  \param  input       Pointer the received input data
+- *  \param  input_len   Length in bytes of the received data
+- *
+- *  \retval len remaining length in input
+- */
+-static int SSHParseBanner(SshState *state, SshHeader *header, const uint8_t *input, uint32_t input_len)
+-{
+-    const uint8_t *line_ptr = input;
+-    uint32_t line_len = input_len;
+-
+-    /* is it the version line? */
+-    if (line_len < 4) {
+-        SCReturnInt(-1);
+-    }
+-    if (SCMemcmp("SSH-", line_ptr, 4) != 0) {
+-        SCReturnInt(-1);
+-    }
+-
+-    const uint8_t *banner_end = BasicSearch(line_ptr, line_len, (uint8_t*)"\r", 1);
+-    if (banner_end == NULL) {
+-        banner_end = BasicSearch(line_ptr, line_len, (uint8_t*)"\n", 1);
+-        if (banner_end == NULL) {
+-            SCLogDebug("No EOL at the end of banner buffer");
+-            SCReturnInt(-1);
+-        }
+-    }
+-
+-    if ((banner_end - line_ptr) > 255) {
+-        SCLogDebug("Invalid version string, it should be less than 255 "
+-                "characters including <CR><NL>, input value is %"PRIuMAX,
+-                (uintmax_t)(banner_end - line_ptr));
+-        SCReturnInt(-1);
+-    }
+-
+-    /* don't search things behind the end of banner */
+-    line_len = banner_end - line_ptr;
+-
+-    /* ok, we have found the version line/string, skip it and parse proto version */
+-    line_ptr += 4;
+-    line_len -= 4;
+-
+-    uint8_t *proto_end = BasicSearch(line_ptr, line_len, (uint8_t*)"-", 1);
+-    if (proto_end == NULL) {
+-        /* Strings starting with SSH- are not allowed
+-         * if they are not the real version string */
+-        SCLogDebug("Info Version String for SSH (invalid usage of SSH- prefix)");
+-        SCReturnInt(-1);
+-    }
+-    uint64_t proto_ver_len = (uint64_t)(proto_end - line_ptr);
+-    header->proto_version = SCMalloc(proto_ver_len + 1);
+-    if (header->proto_version == NULL) {
+-        SCReturnInt(-1);
+-    }
+-    memcpy(header->proto_version, line_ptr, proto_ver_len);
+-    header->proto_version[proto_ver_len] = '\0';
+-
+-    /* Now lets parse the software & version */
+-    line_ptr += proto_ver_len + 1;
+-    line_len -= proto_ver_len + 1;
+-    if (line_len < 1) {
+-        SCLogDebug("No software version specified (weird)");
+-        header->flags |= SSH_FLAG_VERSION_PARSED;
+-        /* Return the remaining length */
+-        SCReturnInt(0);
+-    }
+-
+-    uint64_t sw_ver_len = (uint64_t)(banner_end - line_ptr);
+-    /* sanity check on this arithmetic */
+-    if ((sw_ver_len <= 1) || (sw_ver_len >= input_len)) {
+-        SCLogDebug("Should not have sw version length '%" PRIu64 "'", sw_ver_len);
+-        header->flags |= SSH_FLAG_VERSION_PARSED;
+-        SCReturnInt(-1);
+-    }
+-
+-    header->software_version = SCMalloc(sw_ver_len + 1);
+-    if (header->software_version == 

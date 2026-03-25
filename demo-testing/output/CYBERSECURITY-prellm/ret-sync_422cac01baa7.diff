@@ -1,0 +1,144 @@
+@@ -1,5 +1,5 @@
+ """
+-Copyright (c) 2020, Alexandre Gazet
++Copyright (c) 2020-2021, Alexandre Gazet
+ 
+ Copyright (c) 2014, Cedric TESSIER
+ 
+@@ -33,6 +33,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ """
+ import socket
++import errno
+ import time
+ import sys
+ import threading
+@@ -49,7 +50,7 @@ except ImportError:
+ 
+ HOST = "localhost"
+ PORT = 9100
+-
++TIMER_PERIOD = 0.1
+ 
+ if __name__ == "__main__":
+     print("Run only as script from lldb... Not as standalone program")
+@@ -90,6 +91,64 @@ def rs_log(s, lvl=logging.INFO):
+         print("%s[%s]%s %s" % (LOG_COLOR_ON, LOG_PREFIX, LOG_COLOR_OFF, s))
+ 
+ 
++# periodically poll socket in a dedicated thread
++class Poller(threading.Thread):
++
++    def __init__(self, sc):
++        threading.Thread.__init__(self)
++        self.evt_enabled = threading.Event()
++        self.evt_enabled.clear()
++        self.evt_stop = threading.Event()
++        self.evt_stop.clear()
++        self.sc = sc
++
++    def run(self):
++        while True:
++            if self.evt_stop.is_set():
++                break
++
++            if not self.evt_enabled.is_set():
++                while True:
++                    if self.evt_enabled.wait(2*TIMER_PERIOD):
++                        break
++                    if not self.interpreter_alive():
++                        return
++
++            if not self.interpreter_alive():
++                return
++            if not self.sc._tunnel:
++                return
++
++            if self.sc._tunnel.is_up():
++                self.poll()
++
++            time.sleep(TIMER_PERIOD)
++
++    # "the main thread is the thread from which the Python interpreter was started"
++    def interpreter_alive(self):
++        return threading.main_thread().is_alive()
++
++    def poll(self):
++        msg = self.sc._tunnel.poll()
++        if msg:
++            batch = [cmd.strip() for cmd in msg.split('\n') if cmd]
++            if batch:
++                for cmd in batch:
++                    self.sc.exec(cmd)
++        else:
++            self.sc.exec('syncoff')
++            self.stop()
++
++    def enable(self):
++        self.evt_enabled.set()
++
++    def disable(self):
++        self.evt_enabled.clear()
++
++    def stop(self):
++        self.evt_stop.set()
++
++
+ # TODO: factorize with GNU GDB plugin
+ class Tunnel():
+ 
+@@ -122,6 +181,25 @@ class Tunnel():
+ 
+             rs_log("tunnel_send error: %s" % msg)
+ 
++    def poll(self):
++        if not self.is_up():
++            return None
++
++        self.sock.setblocking(False)
++
++        try:
++            msg = rs_decode(self.sock.recv(4096))
++        except socket.error as e:
++            err = e.args[0]
++            if (err == errno.EAGAIN or err == errno.EWOULDBLOCK):
++                return '\n'
++            else:
++                self.close()
++                return None
++
++        self.sock.setblocking(True)
++        return msg
++
+     def close(self):
+         if self.is_up():
+             self.send("[notice]{\"type\":\"dbg_quit\",\"msg\":\"dbg disconnected\"}\n")
+@@ -162,6 +240,7 @@ class Sync(object):
+ 
+     def __init__(self):
+         self._tunnel = None
++        self.poller = None
+         self._pcache = {}
+         self._dbg = lldb.debugger
+         self._platform = self._dbg.GetSelectedPlatform()
+@@ -225,8 +304,10 @@ class Sync(object):
+         if not self._tunnel:
+             return
+         self._locate(process)
++        self.rearm_poll_timer()
+ 
+     def _handleExit(self, process):
++        self.release_poll_timer()
+         self.reset()
+         rs_log("exit, sync finished")
+ 
+@@ -234,8 +315,8 @@ class Sync(object):
+         state = process.GetState()
+         if state == lldb.eStateStopped:
+             self._handleStop(process)
+-        elif state == lldb.eStateRunning:
+-            pass
++        elif state == lldb.eStateRunning or state == lldb.eStateStepping:
++            self.suspend_poll_timer()
+         elif state == lldb.eStateExited:
+             

@@ -1,0 +1,112 @@
+@@ -473,7 +473,8 @@ public class Main {
+             Set<String> adminUsernames = Arrays.asList(a.getArg("admin-usernames").split(","))
+                     .stream()
+                     .collect(Collectors.toSet());
+-            Admin storageAdmin = new Admin(adminUsernames, spaceRequests, userQuotas, core, localDht);
++            boolean enableWaitlist = a.getBoolean("enable-wait-list", false);
++            Admin storageAdmin = new Admin(adminUsernames, spaceRequests, userQuotas, core, localDht, enableWaitlist);
+             HttpSpaceUsage httpSpaceUsage = new HttpSpaceUsage(ipfsGateway, ipfsGateway);
+             ProxyingSpaceUsage p2pSpaceUsage = new ProxyingSpaceUsage(nodeId, corePropagator, spaceChecker, httpSpaceUsage);
+             UserService peergos = new UserService(p2pDht, crypto, corePropagator, p2pSocial, p2mMutable, storageAdmin, p2pSpaceUsage);
+
+
+
+
+@@ -38,6 +38,10 @@ public class UserQuotas {
+         });
+     }
+ 
++    public boolean acceptingSignups() {
++        return quotas.size() < maxUsers;
++    }
++
+     public List<String> getLocalUsernames() {
+         return new ArrayList<>(quotas.keySet());
+     }
+
+
+
+
+@@ -11,30 +11,45 @@ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.multihash.*;
+ import peergos.shared.storage.*;
+ import peergos.shared.storage.controller.*;
++import peergos.shared.util.*;
+ 
++import java.io.*;
++import java.nio.file.*;
+ import java.util.*;
+ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.*;
+ 
+ public class Admin implements InstanceAdmin {
+ 
++    private static final Path waitingList = Paths.get("waiting-list.txt");
++    private static final int MAX_WAITING = 1_000_000;
++
+     private final Set<String> adminUsernames;
+     private final JdbcSpaceRequests spaceRequests;
+     private final UserQuotas quotas;
+     private final CoreNode core;
+     private final ContentAddressedStorage ipfs;
+     private final AtomicLong lastPendingRequestTime = new AtomicLong(System.currentTimeMillis());
++    private final boolean enableWaitList;
++    private int numberWaiting;
+ 
+     public Admin(Set<String> adminUsernames,
+                  JdbcSpaceRequests spaceRequests,
+                  UserQuotas quotas,
+                  CoreNode core,
+-                 ContentAddressedStorage ipfs) {
++                 ContentAddressedStorage ipfs,
++                 boolean enableWaitList) {
+         this.adminUsernames = adminUsernames;
+         this.spaceRequests = spaceRequests;
+         this.quotas = quotas;
+         this.core = core;
+         this.ipfs = ipfs;
++        this.enableWaitList = enableWaitList;
++        try {
++            this.numberWaiting = Files.readAllLines(waitingList).size();
++        } catch (IOException e) {
++            this.numberWaiting = 0;
++        }
+     }
+ 
+     @Override
+@@ -89,4 +104,23 @@ public class Admin implements InstanceAdmin {
+             throw new RuntimeException(e);
+         }
+     }
++
++    @Override
++    public CompletableFuture<Boolean> acceptingSignups() {
++        return Futures.of(quotas.acceptingSignups());
++    }
++
++    @Override
++    public synchronized CompletableFuture<Boolean> addToWaitList(String email) {
++        if (! enableWaitList || numberWaiting >= MAX_WAITING)
++            return Futures.of(false);
++        try {
++            Files.write(waitingList, (email + "\n").getBytes(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
++            numberWaiting++;
++            return Futures.of(true);
++        } catch (IOException e) {
++            e.printStackTrace();
++            return Futures.of(false);
++        }
++    }
+ }
+
+
+
+
+@@ -56,6 +56,17 @@ public class AdminHandler implements HttpHandler {
+                     reply = new CborObject.CborBoolean(result);
+                     break;
+                 }
++                case HttpInstanceAdmin.WAIT_LIST: {
++                    String email = params.get("email").get(0);
++                    boolean result = target.addToWaitList(email).join();
++                   

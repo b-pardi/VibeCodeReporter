@@ -1,0 +1,99 @@
+@@ -53,7 +53,14 @@ class Flow : public GenericHashEntry {
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   struct ndpi_flow_struct *ndpiFlow;
+-  bool idle_mark; /* Marked when visited by the periodic activities */
++
++  /* Marked when visited by the periodic activities */
++  bool idle_mark;
++  /* When the interface isViewed(), the corresponding view needs to acknowledge the purge
++     before the flow can actually be deleted from memory. This guarantees the view has
++     seen the flow until it has become idle. */
++  bool purge_acknowledged_mark;
++
+   bool detection_completed, protocol_processed,
+     cli2srv_direction, twh_over, twh_ok, dissect_next_http_packet, passVerdict,
+     check_tor, l7_protocol_guessed, flow_alerted, flow_dropped_counts_increased,
+@@ -387,7 +394,13 @@ class Flow : public GenericHashEntry {
+   u_int64_t get_current_goodput_bytes_srv2cli();
+   u_int64_t get_current_packets_cli2srv();
+   u_int64_t get_current_packets_srv2cli();
+-  bool idle() { return(idle_mark); };
++
++  /* Methods to handle the flow in-memory lifecycle */
++  virtual bool idle() { return(idle_mark); };
++  virtual void set_to_purge(time_t t);
++  bool is_acknowledged_to_purge() const;
++  void set_acknowledge_to_purge();
++
+   char* print(char *buf, u_int buf_len) const;
+   void update_hosts_stats(struct timeval *tv, bool dump_alert);
+   u_int32_t key();
+
+
+
+
+@@ -91,9 +91,10 @@ class GenericHash {
+    * @param walk_all true = walk all hash, false, walk only one (non NULL) slot
+    * @param walker A pointer to the comparison function.
+    * @param user_data Value to be compared with the values of hash.
++   * @param walk_idle Allows idle entries to be walked. WARNING: Should never be used unless in ViewInterface::flowPollLoop
+    */
+   bool walk(u_int32_t *begin_slot, bool walk_all,
+-	    bool (*walker)(GenericHashEntry *h, void *user_data, bool *entryMatched), void *user_data);
++	    bool (*walker)(GenericHashEntry *h, void *user_data, bool *entryMatched), void *user_data, bool walk_idle = false);
+ 
+   /**
+    * @brief Purge idle hash entries.
+
+
+
+
+@@ -282,7 +282,8 @@ class NetworkInterface : public AlertableEntity {
+ 		      bool walk_all,
+ 		      WalkerType wtype,
+ 		      bool (*walker)(GenericHashEntry *h, void *user_data, bool *entryMatched),
+-		      void *user_data);
++		      void *user_data,
++		      bool walk_idle = false /* Should never walk idle unless in ViewInterface::flowPollLoop */);
+ 
+   void checkAggregationMode();
+   inline void setCPUAffinity(int core_id)      { cpu_affinity = core_id; };
+
+
+
+
+@@ -60,8 +60,6 @@ class ViewInterface : public NetworkInterface {
+   virtual u_int32_t getMacsHashSize();
+   virtual u_int32_t getHostsHashSize();
+   virtual u_int32_t getFlowsHashSize();
+-  virtual Mac*  getMac(u_int8_t _mac[6], bool createIfNotPresent, bool isInlineCall);
+-  virtual Host* getHost(char *host_ip, u_int16_t vlan_id, bool isInlineCall);
+   virtual Flow* findFlowByKey(u_int32_t key, AddressTree *allowed_hosts);
+   virtual Flow* findFlowByTuple(u_int16_t vlan_id,
+   				IpAddress *src_ip,  IpAddress *dst_ip,
+@@ -72,7 +70,8 @@ class ViewInterface : public NetworkInterface {
+ 		      WalkerType wtype,		      
+ 		      bool (*walker)(GenericHashEntry *h,
+ 				     void *user_data, bool *entryMatched),
+-		      void *user_data);
++		      void *user_data,
++		      bool walk_idle = false /* Should never walk idle unless in ViewInterface::flowPollLoop */);
+   
+   virtual void lua(lua_State* vm);
+ };
+
+
+
+
+@@ -46,7 +46,8 @@ Flow::Flow(NetworkInterface *_iface,
+     srv2cli_last_goodput_bytes = cli2srv_last_goodput_bytes = 0, good_ssl_hs = true,
+     flow_alerted = flow_dropped_counts_increased = false, vrfId = 0;
+ 
+-  idle_mark = false;
++  idle_mark = purge_acknowledged_mark = false;
++
+   detection_completed = false;
+   ndpiDetectedProtocol = ndpiUnknownProtocol;
+   doNotExpireBefore = iface->getTimeLastPktRcvd() + DONT_NOT_EXPIRE_BEFORE_SEC;
+@@ -1990,6 +1991,38 @@ u_int32_t Flow::key(Host *_cli, u_in

@@ -1,0 +1,99 @@
+@@ -95,7 +95,7 @@ struct bpf_map_def_extended {
+ #define CALI_F_L3_INGRESS    (CALI_F_INGRESS && CALI_F_L3_DEV)
+ 
+ #define CALI_F_CGROUP	(((CALI_COMPILE_FLAGS) & CALI_CGROUP) != 0)
+-#define CALI_F_DSR	(CALI_COMPILE_FLAGS & CALI_TC_DSR)
++#define CALI_F_DSR	((CALI_COMPILE_FLAGS & CALI_TC_DSR) != 0)
+ 
+ #define CALI_RES_REDIR_BACK	108 /* packet should be sent back the same iface */
+ #define CALI_RES_REDIR_IFINDEX	109 /* packet should be sent straight to
+
+
+
+
+@@ -36,6 +36,7 @@ enum cali_ct_type {
+ #define CALI_CT_FLAG_SVC_SELF	0x400 /* marks connections from a pod via service to self */
+ #define CALI_CT_FLAG_NP_LOOP	0x800 /* marks connections that were turned around when accessing nodeport on a local IP */
+ #define CALI_CT_FLAG_NP_REMOTE	0x1000 /* marks connections from local host to remote backend of a nodeport */
++#define CALI_CT_FLAG_NP_NO_DSR	0x2000 /* marks connections from a client which is excluded from DSR */
+ 
+ struct calico_ct_leg {
+ 	__u64 bytes;
+
+
+
+
+@@ -27,8 +27,9 @@ enum cali_globals_flags {
+ 	CALI_GLOBALS_RESERVED1			= 0x00000002,
+ 	CALI_GLOBALS_RESERVED2			= 0x00000004,
+ 	CALI_GLOBALS_RESERVED3			= 0x00000008,
+-	CALI_GLOBALS_RPF_OPTION_ENABLED	= 0x00000010,
+-	CALI_GLOBALS_RPF_OPTION_STRICT	= 0x00000020,
++	CALI_GLOBALS_RPF_OPTION_ENABLED		= 0x00000010,
++	CALI_GLOBALS_RPF_OPTION_STRICT		= 0x00000020,
++	CALI_GLOBALS_NO_DSR_CIDRS		= 0x00000040,
+ };
+ 
+ struct cali_ctlb_globals {
+
+
+
+
+@@ -29,6 +29,7 @@ enum cali_rt_flags {
+ 	CALI_RT_HOST        = 0x10,
+ 	CALI_RT_SAME_SUBNET = 0x20,
+ 	CALI_RT_TUNNELED    = 0x40,
++	CALI_RT_NO_DSR      = 0x80,
+ };
+ 
+ struct cali_rt {
+
+
+
+
+@@ -854,6 +854,17 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 			ct_ctx_nat.flags |= CALI_CT_FLAG_VIA_NAT_IF;
+ 		}
+ 
++		/* If we just received the first packet for a NP forwarded from a
++		 * different node via a tunnel and we are in DSR mode and there are optout
++		 * CIDRs from DSR, we need to make a check if this client also opted out
++		 * and save the information in conntrack.
++		 */
++		if (CALI_F_FROM_HEP && CALI_F_DSR && (GLOBAL_FLAGS & CALI_GLOBALS_NO_DSR_CIDRS)) {
++			if (state->tun_ip && cali_rt_lookup_flags(state->ip_src) & CALI_RT_NO_DSR) {
++				ct_ctx_nat.flags |= CALI_CT_FLAG_NP_NO_DSR;
++			}
++		}
++
+ 		if (state->ip_proto == IPPROTO_TCP) {
+ 			if (skb_refresh_validate_ptrs(ctx, TCP_SIZE)) {
+ 				DENY_REASON(ctx, CALI_REASON_SHORT);
+@@ -951,7 +962,8 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 				if (encap_needed) {
+ 					if (CALI_F_FROM_HEP && state->tun_ip == 0) {
+ 						if (CALI_F_DSR) {
+-							ct_ctx_nat.flags |= CALI_CT_FLAG_DSR_FWD;
++							ct_ctx_nat.flags |= CALI_CT_FLAG_DSR_FWD |
++								(state->ct_result.flags & CALI_CT_FLAG_NP_NO_DSR);
+ 						}
+ 						ct_ctx_nat.flags |= CALI_CT_FLAG_NP_FWD;
+ 					}
+@@ -1072,7 +1084,7 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 		 */
+ 		if (ct_related && state->ip_proto == IPPROTO_ICMP
+ 				&& state->ct_result.tun_ip
+-				&& !CALI_F_DSR) {
++				&& (!CALI_F_DSR || (state->ct_result.flags & CALI_CT_FLAG_NP_NO_DSR))) {
+ 			if (dnat_return_should_encap()) {
+ 				CALI_DEBUG("Returning related ICMP from workload to tunnel\n");
+ 			} else if (CALI_F_TO_HEP) {
+@@ -1103,7 +1115,7 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 				bpf_ntohl(state->ct_result.nat_ip), state->ct_result.nat_port);
+ 
+ 		if (dnat_return_should_encap() && state->ct_result.tun_ip) {
+-			if (CALI_F_DSR) {
++			if (CALI_F_DSR && !(state->ct_result.flags & CALI_CT_FLAG_NP_NO_DSR)) {
+ 				/* SNAT will be done after routing, when leaving HEP */
+ 				CALI_DEBUG("DSR enabled, skipping SNAT + encap\n");
+ 				goto allow;

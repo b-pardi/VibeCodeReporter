@@ -1,0 +1,91 @@
+@@ -175,6 +175,7 @@ static int DoInsertSegment (TcpStream *stream, TcpSegment *seg, TcpSegment **dup
+         SCLogDebug("empty tree, inserting seg %p seq %" PRIu32 ", "
+                    "len %" PRIu32 "", seg, seg->seq, TCP_SEG_LEN(seg));
+         TCPSEG_RB_INSERT(&stream->seg_tree, seg);
++        stream->segs_right_edge = SEG_SEQ_RIGHT_EDGE(seg);
+         return 0;
+     }
+ 
+@@ -187,6 +188,9 @@ static int DoInsertSegment (TcpStream *stream, TcpSegment *seg, TcpSegment **dup
+         *dup_seg = res;
+         return 2; // duplicate has overlap by definition.
+     } else {
++        if (SEQ_GT(SEG_SEQ_RIGHT_EDGE(seg), stream->segs_right_edge))
++            stream->segs_right_edge = SEG_SEQ_RIGHT_EDGE(seg);
++
+         /* insert succeeded, now check if we overlap with someone */
+         if (CheckOverlap(&stream->seg_tree, seg) == true) {
+             SCLogDebug("seg %u has overlap in the tree", seg->seq);
+
+
+
+
+@@ -84,6 +84,13 @@ RB_PROTOTYPE(TCPSEG, TcpSegment, rb, TcpSegmentCompare);
+ 
+ #define SEG_SEQ_RIGHT_EDGE(seg) ((seg)->seq + TCP_SEG_LEN((seg)))
+ 
++/* get right edge of sequence space of seen segments.
++ * Only use if STREAM_HAS_SEEN_DATA is true. */
++#define STREAM_SEQ_RIGHT_EDGE(stream)   (stream)->segs_right_edge
++#define STREAM_RIGHT_EDGE(stream)       (STREAM_BASE_OFFSET((stream)) + (STREAM_SEQ_RIGHT_EDGE((stream)) - (stream)->base_seq))
++/* return true if we have seen data segments. */
++#define STREAM_HAS_SEEN_DATA(stream)    (!RB_EMPTY(&(stream)->sb.sbb_tree) || (stream)->sb.stream_offset)
++
+ typedef struct TcpStream_ {
+     uint16_t flags:12;              /**< Flag specific to the stream e.g. Timestamp */
+     /* coccinelle: TcpStream:flags:STREAMTCP_STREAM_FLAG_ */
+@@ -110,6 +117,7 @@ typedef struct TcpStream_ {
+ 
+     StreamingBuffer sb;
+     struct TCPSEG seg_tree;         /**< red black tree of TCP segments. Data is stored in TcpStream::sb */
++    uint32_t segs_right_edge;
+ 
+     uint32_t sack_size;             /**< combined size of the SACK ranges currently in our tree. Updated
+                                      *   at INSERT/REMOVE time. */
+
+
+
+
+@@ -322,6 +322,7 @@ void StreamTcpReturnStreamSegments (TcpStream *stream)
+     }
+ }
+ 
++#ifdef UNITTESTS
+ /** \internal
+  *  \brief check if segments falls before stream 'offset' */
+ static inline int SEGMENT_BEFORE_OFFSET(TcpStream *stream, TcpSegment *seg, uint64_t offset)
+@@ -330,6 +331,7 @@ static inline int SEGMENT_BEFORE_OFFSET(TcpStream *stream, TcpSegment *seg, uint
+         return 1;
+     return 0;
+ }
++#endif
+ 
+ /** \param f locked flow */
+ void StreamTcpDisableAppLayer(Flow *f)
+@@ -1116,9 +1118,7 @@ int StreamTcpReassembleAppLayer (ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
+ #endif
+     /* if no segments are in the list or all are already processed,
+      * and state is beyond established, we send an empty msg */
+-    TcpSegment *seg_tail = RB_MAX(TCPSEG, &stream->seg_tree);
+-    if (seg_tail == NULL ||
+-            SEGMENT_BEFORE_OFFSET(stream, seg_tail, STREAM_APP_PROGRESS(stream)))
++    if (STREAM_HAS_SEEN_DATA(stream) && STREAM_RIGHT_EDGE(stream) <= STREAM_APP_PROGRESS(stream))
+     {
+         /* send an empty EOF msg if we have no segments but TCP state
+          * is beyond ESTABLISHED */
+
+
+
+
+@@ -2399,9 +2399,8 @@ static inline uint32_t StreamTcpResetGetMaxAck(TcpStream *stream, uint32_t seq)
+ {
+     uint32_t ack = seq;
+ 
+-    const TcpSegment *seg = RB_MAX(TCPSEG, &stream->seg_tree);
+-    if (seg != NULL) {
+-        const uint32_t tail_seq = seg->seq + TCP_SEG_LEN(seg);
++    if (STREAM_HAS_SEEN_DATA(stream)) {
++        const uint32_t tail_seq = STREAM_SEQ_RIGHT_EDGE(stream);
+         if (SEQ_GT(tail_seq, ack)) {
+             ack = tail_seq;
+         }

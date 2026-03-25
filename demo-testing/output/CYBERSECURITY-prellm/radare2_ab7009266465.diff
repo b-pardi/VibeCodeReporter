@@ -1,0 +1,117 @@
+@@ -772,6 +772,8 @@ R_API RDebugReasonType r_debug_wait(RDebug *dbg, RBreakpointItem **bp) {
+ 			}
+ 		}
+ 	}
++	eprintf ("r_debug_wait reason: %d %s\n", reason, r_debug_reason_to_string (reason));
++	eprintf ("pid: %d tid: %d\n", dbg->pid, dbg->tid);
+ 	return reason;
+ }
+ 
+@@ -1183,16 +1185,18 @@ repeat:
+ 	}
+ 
+ #if __linux__
+-	if (reason == R_DEBUG_REASON_NEW_PID && dbg->follow_child) {
++	if (reason == R_DEBUG_REASON_NEW_PID) {
+ #if DEBUGGER
+-		/// if the plugin is not compiled link fails, so better do runtime linking
+-		/// until this code gets fixed
+-		static bool (*linux_attach_new_process) (RDebug *dbg, int pid) = NULL;
+-		if (!linux_attach_new_process) {
+-			linux_attach_new_process = r_lib_dl_sym (NULL, "linux_attach_new_process");
+-		}
+-		if (linux_attach_new_process) {
+-			linux_attach_new_process (dbg, dbg->forked_pid);
++		if (dbg->follow_child) {
++			/// if the plugin is not compiled link fails, so better do runtime linking
++			/// until this code gets fixed
++			static bool (*linux_attach_new_process) (RDebug *dbg, int pid) = NULL;
++			if (!linux_attach_new_process) {
++				linux_attach_new_process = r_lib_dl_sym (NULL, "linux_attach_new_process");
++			}
++			if (linux_attach_new_process) {
++				linux_attach_new_process (dbg, dbg->forked_pid);
++			}
+ 		}
+ #endif
+ 		goto repeat;
+@@ -1281,7 +1285,10 @@ repeat:
+ 	r_cons_break_pop ();
+ #elif __linux__
+ 	// Letting threads continue after the debugger breaks is currently problematic in linux
+-	if (dbg->continue_all_threads) {
++	// Stop all threads when there is no user interrupt caused by statc_debug_stop
++	// to prevent queueing duplicate SIGSTOP signals
++	if (!r_cons_is_breaked () && dbg->continue_all_threads) {
++		eprintf ("STOP AFTER CONTINUE\n");
+ 		r_debug_stop (dbg);
+ 	}
+ #endif
+
+
+
+
+@@ -207,7 +207,7 @@ static void interrupt_process(RDebug *dbg) {
+ 
+ static int r_debug_native_stop(RDebug *dbg) {
+ #if __linux__
+-	return linux_stop_threads (dbg, dbg->reason.tid);
++	return linux_stop_threads (dbg, dbg->pid);
+ #else
+ 	return 0;
+ #endif
+@@ -240,28 +240,45 @@ static int r_debug_native_continue(RDebug *dbg, int pid, int tid, int sig) {
+ 		r_cons_break_push ((RConsBreak)interrupt_process, dbg);
+ 	}
+ 
+-	if (dbg->continue_all_threads && dbg->n_threads) {
+-		RList *list = dbg->threads;
++	ret = r_debug_ptrace (dbg, PTRACE_CONT, tid, NULL, (r_ptrace_data_t)(size_t)contsig);
++	eprintf ("Continue: %d\n", tid);
++	if (ret == -1) {
++		r_sys_perror ("PTRACE_CONT");
++	}
++	// Continue threads that are stopped by the debugger to keep other signals
++	// by checking the siginfo.si_pid:
++	// - 0		= stopped by PTRACE_ATTACH
++	// - dbgpid = stopped by debugger
++	if (dbg->continue_all_threads && dbg->threads) {
+ 		RDebugPid *th;
+ 		RListIter *it;
+-
+-		if (list) {
+-			r_list_foreach (list, it, th) {
+-				if (th->pid) {
+-					ret = r_debug_ptrace (dbg, PTRACE_CONT, th->pid, NULL, (r_ptrace_data_t)(size_t)contsig);
+-					if (ret) {
+-						perror ("PTRACE_CONT");
+-					}
++		int dbgpid = getpid ();
++		r_list_foreach (dbg->threads, it, th) {
++			// Check if thread is already running
++			siginfo_t siginfo = { 0 };
++			ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, th->pid, 0, (r_ptrace_data_t)(size_t)&siginfo);
++			if (ret == -1) {
++				continue;
++			}
++			eprintf ("tid: %d si_signo: %d siginfo.si_pid: %d\n", th->pid, siginfo.si_signo, siginfo.si_pid);
++			if (siginfo.si_signo == SIGSTOP &&
++				(siginfo.si_pid == dbgpid || siginfo.si_pid == 0)) {
++				int status;
++				ret = waitpid (th->pid, &status, 0);
++				eprintf ("Consume: %d status %d\n", th->pid, WSTOPSIG (status));
++				if (ret != th->pid) {
++					eprintf ("Error: waitpid fails to consume SIGSTOP\n");
++					continue;
++				}
++				eprintf ("Continue: %d\n", th->pid);
++				ret = r_debug_ptrace (dbg, PTRACE_CONT, th->pid, 0, 0);
++				if (ret == -1) {
++					eprintf ("Error: %d is not traced or already running.\n", th->pid);
++					r_sys_perror ("PTRACE_CONT");
+ 				}
+ 			}
+ 		}
+ 	}
+-	else {
+-		ret = r_debug_ptrace (dbg, PTRACE_CONT, tid, NULL, (r_ptrace_d

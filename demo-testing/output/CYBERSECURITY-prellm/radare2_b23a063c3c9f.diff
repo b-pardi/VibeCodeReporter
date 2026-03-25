@@ -1,0 +1,196 @@
+@@ -75,7 +75,7 @@ static const char *help_msg_p6[] = {
+ };
+ 
+ static const char *help_msg_pF[] = {
+-	"Usage: pF[apdb]", "[len]", "parse ASN1, PKCS, X509, DER, protobuf",
++	"Usage: pF[apdbA]", "[len]", "parse ASN1, PKCS, X509, DER, protobuf, axml",
+ 	"pFa", "[len]", "decode ASN1 from current block",
+ 	"pFaq", "[len]", "decode ASN1 from current block (quiet output)",
+ 	"pFb", "[len]", "decode raw proto buffers.",
+@@ -83,6 +83,7 @@ static const char *help_msg_pF[] = {
+ 	"pFo", "[len]", "decode ASN1 OID",
+ 	"pFp", "[len]", "decode PKCS7",
+ 	"pFx", "[len]", "Same with X509",
++	"pFA", "[len]", "decode Android Binary XML from current block",
+ 	NULL
+ };
+ 
+@@ -1270,6 +1271,17 @@ static void cmd_print_fromage(RCore *core, const char *input, const ut8* data, i
+ 			}
+ 		}
+ 		break;
++	case 'A': // "pFA"
++		{
++			char *s = r_axml_decode (data, size);
++			if (s) {
++				r_cons_printf ("%s", s);
++				free (s);
++			} else {
++				eprintf ("Malformed object: did you supply enough data?\ntry to change the block size (see b?)\n");
++			}
++		}
++		break;
+ 	default:
+ 	case '?': // "pF?"
+ 		r_core_cmd_help (core, help_msg_pF);
+
+
+
+
+@@ -77,6 +77,7 @@ int gettimeofday (struct timeval* p, void* tz);
+ #include "r_util/r_pkcs7.h"
+ #include "r_util/r_protobuf.h"
+ #include "r_util/r_big.h"
++#include "r_util/r_axml.h"
+ // requires io, core, ... #include "r_util/r_print.h"
+ 
+ #ifdef __cplusplus
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,16 @@
++/* radare - LGPL - Copyright 2021 - keegan */
++
++#ifndef R_AXML_H
++#define R_AXML_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++R_API char *r_axml_decode(const ut8* buffer, const ut64 size);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif //  R_AXML_H
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,437 @@
++/* radare2 - LGPL - Copyright 2021 - keegan */
++
++#include <string.h>
++#include <r_types.h>
++#include <r_core.h>
++
++#include "axml_resources.h"
++
++enum {
++	TYPE_STRING_POOL = 0x0001,
++	TYPE_XML = 0x0003,
++	TYPE_START_NAMESPACE = 0x100,
++	TYPE_END_NAMESPACE = 0x101,
++	TYPE_START_ELEMENT = 0x0102,
++	TYPE_END_ELEMENT = 0x103,
++	TYPE_RESOURCE_MAP = 0x180,
++};
++
++enum {
++	RESOURCE_NULL = 0x00,
++	RESOURCE_REFERENCE = 0x01,
++	RESOURCE_STRING = 0x03,
++	RESOURCE_FLOAT = 0x04,
++	RESOURCE_INT_DEC = 0x10,
++	RESOURCE_INT_HEX = 0x11,
++	RESOURCE_BOOL = 0x12,
++};
++
++enum {
++	FLAG_UTF8 = 1 << 8,
++};
++
++// Beginning of every header
++R_PACKED (
++typedef struct {
++	ut16 type;
++	ut16 header_size;
++	ut32 size;
++}) chunk_header_t;
++
++// String pool referenced throughout the Binary XML, there must only be ONE
++R_PACKED (
++typedef struct {
++	ut32 string_count;
++	ut32 style_count;
++	ut32 flags;
++	ut32 strings_offset;
++	ut32 styles_offset;
++	ut32 offsets[];
++}) string_pool_t;
++
++R_PACKED (
++typedef struct {
++	ut16 size;
++	ut8 unused;
++	ut8 type;
++	union {
++		ut32 d;
++		float f;
++	} data;
++}) resource_value_t;
++
++R_PACKED (
++typedef struct {
++	ut32 namespace;
++	ut32 name;
++	ut32 unused;
++	resource_value_t value;
++}) attribute_t;
++
++R_PACKED (
++typedef struct {
++	ut32 line;
++	ut32 comment;
++	ut32 namespace;
++	ut32 name;
++	ut32 flags;
++	ut16 attribute_count;
++	ut16 unused0;
++	ut16 unused1;
++	ut16 unused2;
++	attribute_t attributes[];
++}) start_element_t;
++
++R_PACKED (
++typedef struct {
++	ut32 line;
++	ut32 comment;
++	ut32 namespace;
++	ut32 name;
++}) end_element_t;
++
++R_PACKED (
++typedef struct {
++	ut32 line;
++	ut32 comment;
++	ut32 prefix;
++	ut32 uri;
++}) namespace_t;
++
++static char *string_lookup(string_pool_t *pool, const ut8 *data, ut64 data_size, ut32 i, size_t *length) {
++	if (i > r_read_le32 (&pool->string_count)) {
++		return NULL;
++	}
++
++	ut32 offset = r_read_le32 (&pool->offsets[i]);
++	ut8 *start = (ut8 *)((uintptr_t)data + r_read_le32 (&pool->strings_offset) + 8 + offset);
++
++	char *name = NULL;
++	if (pool->flags & FLAG_UTF8) {
++		if ((ut64)start > (ut64)data + data_size - sizeof(ut16)) {
++			return NULL;
++		}
++
++		// Ignore UTF-16LE encoded length
++		ut32 n = *start++;
++		if (n & 0x80) {
++			n = ((n & 0x7f) << 8) | *start++;
++		}
++
++		if ((ut64)start > (ut64)data +

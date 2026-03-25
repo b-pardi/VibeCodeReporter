@@ -1,0 +1,107 @@
+@@ -22,9 +22,6 @@
+ /* Pass unknown ICMPv6 NS to stack */
+ #define ACTION_UNKNOWN_ICMP6_NS CTX_ACT_OK
+ 
+-/* CB_PROXY_MAGIC overlaps with CB_ENCRYPT_MAGIC */
+-#define ENCRYPT_OR_PROXY_MAGIC 0
+-
+ #ifndef VLAN_FILTER
+ # define VLAN_FILTER(ifindex, vlan_id) return false;
+ #endif
+@@ -344,13 +341,9 @@ handle_ipv6_cont(struct __ctx_buff *ctx, __u32 secctx, const bool from_host,
+ 
+ #ifdef TUNNEL_MODE
+ 	if (info != NULL && info->tunnel_endpoint != 0) {
+-		/* If IPSEC is needed recirc through ingress to use xfrm stack
+-		 * and then result will routed back through bpf_netdev on egress
+-		 * but with encrypt marks.
+-		 */
+ 		return encap_and_redirect_with_nodeid(ctx, info->tunnel_endpoint,
+-						      info->key, info->node_id,
+-						      secctx, info->sec_identity,
++						      info->node_id, secctx,
++						      info->sec_identity,
+ 						      &trace);
+ 	} else {
+ 		struct tunnel_key key = {};
+@@ -762,8 +755,8 @@ skip_vtep:
+ #ifdef TUNNEL_MODE
+ 	if (info != NULL && info->tunnel_endpoint != 0) {
+ 		return encap_and_redirect_with_nodeid(ctx, info->tunnel_endpoint,
+-						      info->key, info->node_id,
+-						      secctx, info->sec_identity,
++						      info->node_id, secctx,
++						      info->sec_identity,
+ 						      &trace);
+ 	} else {
+ 		/* IPv4 lookup key: daddr & IPV4_MASK */
+@@ -1464,7 +1457,7 @@ out:
+ __section("to-host")
+ int cil_to_host(struct __ctx_buff *ctx)
+ {
+-	__u32 magic = ctx_load_meta(ctx, ENCRYPT_OR_PROXY_MAGIC);
++	__u32 magic = ctx_load_meta(ctx, CB_PROXY_MAGIC);
+ 	__u16 __maybe_unused proto = 0;
+ 	struct trace_ctx trace = {
+ 		.reason = TRACE_REASON_UNKNOWN,
+@@ -1475,10 +1468,7 @@ int cil_to_host(struct __ctx_buff *ctx)
+ 	__u32 src_id = 0;
+ 	__s8 ext_err = 0;
+ 
+-	if ((magic & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_ENCRYPT) {
+-		ctx->mark = magic; /* CB_ENCRYPT_MAGIC */
+-		src_id = ctx_load_meta(ctx, CB_ENCRYPT_IDENTITY);
+-	} else if ((magic & 0xFFFF) == MARK_MAGIC_TO_PROXY) {
++	if ((magic & 0xFFFF) == MARK_MAGIC_TO_PROXY) {
+ 		/* Upper 16 bits may carry proxy port number */
+ 		__be16 port = magic >> 16;
+ 
+
+
+
+
+@@ -12,29 +12,6 @@
+ 
+ #ifdef HAVE_ENCAP
+ #ifdef ENABLE_IPSEC
+-static __always_inline int
+-encap_and_redirect_nomark_ipsec(struct __ctx_buff *ctx, __u8 key,
+-				__u16 node_id, __u32 seclabel)
+-{
+-	/* Traffic from local host in tunnel mode will be passed to
+-	 * cilium_host. In non-IPSec case traffic with non-local dst
+-	 * will then be redirected to tunnel device. In IPSec case
+-	 * though we need to traverse xfrm path still. The mark +
+-	 * cb[4] hints will not survive a veth pair xmit to ingress
+-	 * however so below encap_and_redirect_ipsec will not work.
+-	 * Instead pass hints via cb[0], cb[4] (cb is not cleared
+-	 * by dev_ctx_forward) and catch hints with bpf_host
+-	 * prog that will populate mark/cb as expected by xfrm and 2nd
+-	 * traversal into bpf_host. Remember we can't use cb[0-3]
+-	 * in both cases because xfrm layer would overwrite them. We
+-	 * use cb[4] here so it doesn't need to be reset by
+-	 * bpf_host.
+-	 */
+-	set_encrypt_key_meta(ctx, key, node_id);
+-	set_identity_meta(ctx, seclabel);
+-	return CTX_ACT_OK;
+-}
+-
+ static __always_inline int
+ encap_and_redirect_ipsec(struct __ctx_buff *ctx, __u8 key, __u16 node_id,
+ 			 __u32 seclabel)
+@@ -112,21 +89,16 @@ __encap_and_redirect_with_nodeid(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
+ }
+ 
+ /* encap_and_redirect_with_nodeid returns CTX_ACT_OK after ctx meta-data is
+- * set (eg. when IPSec is enabled). Caller should pass the ctx to the stack at this
+- * point. Otherwise returns CTX_ACT_REDIRECT on successful redirect to tunnel device.
++ * set. Caller should pass the ctx to the stack at this point. Otherwise
++ * returns CTX_ACT_REDIRECT on successful redirect to tunnel device.
+  * On error returns CTX_ACT_DROP or DROP_WRITE_ERROR.
+  */
+ static __always_inline int
+ encap_and_redirect_with_nodeid(struct __ctx_buff *ctx, __be32 tunnel_endpoint,
+-			       __u8 key __maybe_unused,
+ 			       __u16 node_id __maybe_unused,
+ 			       __u32 seclabel

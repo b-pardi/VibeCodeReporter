@@ -1,0 +1,109 @@
+@@ -2614,31 +2614,59 @@ class DceRpcSession(DefaultSession):
+     # Since the connection-oriented transport guarantees sequentiality, the receiver
+     # will always receive the fragments in order.
+ 
+-    def _defragment(self, pkt):
++    def _defragment(self, pkt, body=None):
+         """
+         Function to defragment DCE/RPC packets.
+         """
+         uid = pkt.call_id
+         if pkt.pfc_flags.PFC_FIRST_FRAG and pkt.pfc_flags.PFC_LAST_FRAG:
+             # Not fragmented
+-            return pkt
++            return body
+         if pkt.pfc_flags.PFC_FIRST_FRAG or uid in self.frags:
+             # Packet is fragmented
+-            self.frags[uid] += pkt[DceRpc5].payload.payload.original
++            if body is None:
++                body = pkt[DceRpc5].payload.payload.original
++            self.frags[uid] += body
+             if pkt.pfc_flags.PFC_LAST_FRAG:
+-                pkt[DceRpc5].payload.remove_payload()
+-                pkt[DceRpc5].payload /= self.frags[uid]
+-                return pkt
++                return self.frags[uid]
+         else:
+             # Not fragmented
+-            return pkt
++            return body
+ 
+-    def _fragment(self, pkt):
++    # C706 sect 12.5.2.15 - PDU Body Length
++    # "The maximum PDU body size is 65528 bytes."
++    MAX_PDU_BODY_SIZE = 4176
++
++    def _fragment(self, pkt, body):
+         """
+         Function to fragment DCE/RPC packets.
+         """
+-        # unimplemented
+-        pass
++        if len(body) > self.MAX_PDU_BODY_SIZE:
++            # Clear any PFC_*_FRAG flag
++            pkt.pfc_flags &= 0xFC
++
++            # Iterate through fragments
++            cur = None
++            while body:
++                # Create a fragment
++                pkt_frag = pkt.copy()
++
++                if cur is None:
++                    # It's the first one
++                    pkt_frag.pfc_flags += "PFC_FIRST_FRAG"
++
++                # Split
++                cur, body = (
++                    body[: self.MAX_PDU_BODY_SIZE],
++                    body[self.MAX_PDU_BODY_SIZE :],
++                )
++
++                if not body:
++                    # It's the last one
++                    pkt_frag.pfc_flags += "PFC_LAST_FRAG"
++                yield pkt_frag, cur
++        else:
++            yield pkt, body
+ 
+     # [MS-RPCE] sect 3.3.1.5.2.2
+ 
+@@ -2656,12 +2684,6 @@ class DceRpcSession(DefaultSession):
+     # Similarly the signature output SHOULD be ignored.
+ 
+     def in_pkt(self, pkt):
+-        # Defragment
+-        pkt = self._defragment(pkt)
+-        if not pkt:
+-            return
+-        # Get opnum and options
+-        opnum, opts = self._up_pkt(pkt)
+         # Check for encrypted payloads
+         body = None
+         if conf.raw_layer in pkt.payload:
+@@ -2779,10 +2801,18 @@ class DceRpcSession(DefaultSession):
+                 if pkt.auth_padding:
+                     padlen = len(pkt.auth_padding)
+                     body, pkt.auth_padding = body[:-padlen], body[-padlen:]
+-                # Put back vt_trailer into the header
+-                if pkt.vt_trailer:
+-                    vtlen = len(pkt.vt_trailer)
+-                    body, pkt.vt_trailer = body[:-vtlen], body[-vtlen:]
++                # Put back vt_trailer into the header, if present.
++                if _SECTRAILER_MAGIC in body:
++                    body, pkt.vt_trailer = pkt.get_field("vt_trailer").getfield(
++                        pkt, body
++                    )
++        # If it's a request / response, could be fragmented
++        if isinstance(pkt.payload, (DceRpc5Request, DceRpc5Response)) and body:
++            body = self._defragment(pkt, body)
++            if not body:
++                return
++        # Get opnum and options
++        opnum, opts = self._up_pkt(pkt)
+         # Try to parse the payload
+         if opnum is not None and self.rpc_bind_interface:
+             # use opnum to parse the payload
+@@ -2798,9 +2828,28 @@ class DceRpcSession(DefaultSession):
+                 return pkt
+             i

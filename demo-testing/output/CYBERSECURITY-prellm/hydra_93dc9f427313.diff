@@ -1,0 +1,123 @@
+@@ -7,7 +7,7 @@ import hydra
+ log = logging.getLogger(__name__)
+ 
+ 
+-@hydra.main()
++@hydra.main(config_path="conf/config.yaml")
+ def experiment(_cfg):
+     log.info("Info level message")
+ 
+
+
+
+
+@@ -5,7 +5,7 @@ import sys
+ import hydra
+ 
+ 
+-@hydra.main()
++@hydra.main(config_path="conf/config.yaml")
+ def experiment(_cfg):
+     print(os.getcwd())
+ 
+
+
+
+
+@@ -4,6 +4,6 @@ from .errors import MissingConfigException
+ from .main import main
+ 
+ # Source of truth for Hydra's version
+-__version__ = "0.1.1"
++__version__ = "0.1.2"
+ 
+ __all__ = ["__version__", "MissingConfigException", "main", "utils"]
+
+
+
+
+@@ -33,6 +33,61 @@ class ConfigLoader:
+         self.all_config_checked = []
+         self.strict_cfg = strict_cfg
+ 
++    def load_configuration(self, overrides=[]):
++        assert overrides is None or isinstance(overrides, list)
++        overrides = overrides or []
++
++        # Load hydra config
++        hydra_cfg = self._create_cfg(cfg_filename="hydra.yaml")
++
++        # Load job config
++        job_cfg = self._create_cfg(cfg_filename=self.config_file)
++
++        cfg = self._merge_configs(hydra_cfg, job_cfg)
++        consumed_defaults = self._apply_defaults_overrides(cfg, overrides)
++        consumed_free_defaults = self._apply_free_defaults(cfg, overrides)
++        self._validate_config(cfg)
++        cfg = self._merge_defaults(cfg)
++
++        job = OmegaConf.create(dict(name=JobRuntime().get("name")))
++        cfg.hydra.job = OmegaConf.merge(job, cfg.hydra.job)
++
++        OmegaConf.set_struct(cfg, self.strict_cfg)
++
++        # Merge all command line overrides after enabling strict flag
++        all_consumed = consumed_defaults + consumed_free_defaults
++        remaining_overrides = [x for x in overrides if x not in all_consumed]
++        cfg.merge_with_dotlist(remaining_overrides)
++
++        remaining = consumed_defaults + consumed_free_defaults + remaining_overrides
++
++        def is_hydra(x):
++            return x.startswith("hydra.") or x.startswith("hydra/")
++
++        job_overrides = [x for x in remaining if not is_hydra(x)]
++        hydra_overrides = [x for x in remaining if is_hydra(x)]
++        cfg.hydra.overrides.task.extend(job_overrides)
++        cfg.hydra.overrides.hydra.extend(hydra_overrides)
++
++        return cfg
++
++    def load_sweep_config(self, master_config, sweep_overrides):
++        # Recreate the config for this sweep instance with the appropriate overrides
++        overrides = master_config.hydra.overrides.hydra.to_container() + sweep_overrides
++        sweep_config = self.load_configuration(overrides)
++
++        # Copy old config cache to ensure we get the same resolved values (for things like timestamps etc)
++        OmegaConf.copy_cache(from_config=master_config, to_config=sweep_config)
++
++        return sweep_config
++
++    def exists_in_search_path(self, filepath):
++        return self._find_config(filepath) is not None
++
++    def exists(self, filename):
++        is_pkg, path = self._split_path(filename)
++        return ConfigLoader._exists(is_pkg, path)
++
+     def get_job_search_path(self):
+         return self.job_search_path
+ 
+@@ -111,6 +166,39 @@ class ConfigLoader:
+ 
+         return result
+ 
++    @staticmethod
++    def _apply_defaults_overrides(cfg, overrides):
++        consumed = []
++        cfg_defaults = cfg.defaults.to_container()
++        key_to_idx = {}
++        for idx, d in enumerate(cfg_defaults):
++            if isinstance(d, dict):
++                key = next(iter(d.keys()))
++                key_to_idx[key] = idx
++        for override in overrides:
++            key, value = override.split("=")
++            if key in key_to_idx:
++                # Do not add sweep configs into defaults, those will be added to the sweep config
++                # after the list is broken into items
++                if "," not in value:
++                    cfg.defaults[key_to_idx[key]][key] = value
++                    overrides.remove(override)
++                    consumed.append(override)
++        return consume

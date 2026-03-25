@@ -1,0 +1,143 @@
+@@ -482,6 +482,7 @@ ct_recreate6:
+ 
+ #ifdef ENABLE_NODEPORT
+ # ifdef ENABLE_DSR
++		/* See comment in handle_ipv4_from_lxc(). */
+ 		if (ct_state->dsr) {
+ 			ret = xlate_dsr_v6(ctx, tuple, l4_off);
+ 			if (ret != 0)
+@@ -926,6 +927,10 @@ ct_recreate4:
+ 
+ #ifdef ENABLE_NODEPORT
+ # ifdef ENABLE_DSR
++		/* DSR RevDNAT typically happens in to-netdev. This part is only
++		 * needed for old connections that were established prior to
++		 * the bpf_host support:
++		 */
+ 		if (ct_state->dsr) {
+ 			ret = xlate_dsr_v4(ctx, tuple, l4_off, has_l4_header);
+ 			if (ret != 0)
+@@ -1439,22 +1444,11 @@ ipv6_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label,
+ skip_policy_enforcement:
+ #ifdef ENABLE_NODEPORT
+ 	if (ret == CT_NEW || ret == CT_REOPENED) {
+-		bool dsr = false;
+ # ifdef ENABLE_DSR
+-		int ret2;
+-
+-		if (!revalidate_data(ctx, &data, &data_end, &ip6))
+-			return DROP_INVALID;
+-
+-		ret2 = handle_dsr_v6(ctx, ip6, &dsr);
+-		if (ret2 != 0)
+-			return ret2;
+-
+-		ct_state_new.dsr = dsr;
+-		if (ret == CT_REOPENED && ct_state->dsr != dsr)
+-			ct_update_dsr(get_ct_map6(tuple), tuple, dsr);
++		if (ret == CT_REOPENED && ct_state->dsr)
++			ct_update_dsr(get_ct_map6(tuple), tuple, false);
+ # endif /* ENABLE_DSR */
+-		if (!dsr) {
++		{
+ 			bool node_port =
+ 				ct_has_nodeport_egress_entry6(get_ct_map6(tuple),
+ 							      tuple, false);
+@@ -1778,22 +1772,12 @@ ipv4_policy(struct __ctx_buff *ctx, int ifindex, __u32 src_label, enum ct_status
+ skip_policy_enforcement:
+ #ifdef ENABLE_NODEPORT
+ 	if (ret == CT_NEW || ret == CT_REOPENED) {
+-		bool dsr = false;
+ # ifdef ENABLE_DSR
+-		int ret2;
+-
+-		if (!revalidate_data(ctx, &data, &data_end, &ip4))
+-			return DROP_INVALID;
+-
+-		ret2 = handle_dsr_v4(ctx, ip4, &dsr);
+-		if (ret2 != 0)
+-			return ret2;
+-
+-		ct_state_new.dsr = dsr;
+-		if (ret == CT_REOPENED && ct_state->dsr != dsr)
+-			ct_update_dsr(get_ct_map4(tuple), tuple, dsr);
++		/* Clear .dsr flag for old connections: */
++		if (ret == CT_REOPENED && ct_state->dsr)
++			ct_update_dsr(get_ct_map4(tuple), tuple, false);
+ # endif /* ENABLE_DSR */
+-		if (!dsr) {
++		{
+ 			bool node_port =
+ 				ct_has_nodeport_egress_entry4(get_ct_map4(tuple),
+ 							      tuple, false);
+
+
+
+
+@@ -128,7 +128,9 @@ enum {
+ #define CILIUM_CALL_IPV6_NODEPORT_NAT_INGRESS	37
+ #define CILIUM_CALL_IPV4_NODEPORT_SNAT_FWD	38
+ #define CILIUM_CALL_IPV6_NODEPORT_SNAT_FWD	39
+-#define CILIUM_CALL_SIZE			40
++#define CILIUM_CALL_IPV4_NODEPORT_DSR_INGRESS	40
++#define CILIUM_CALL_IPV6_NODEPORT_DSR_INGRESS	41
++#define CILIUM_CALL_SIZE			42
+ 
+ typedef __u64 mac_t;
+ 
+
+
+
+
+@@ -522,45 +522,28 @@ snat_v4_rev_nat_can_skip(const struct ipv4_nat_target *target, const struct ipv4
+ 	return dport < target->min_port || dport > target->max_port;
+ }
+ 
++/* Expects to be called with a nodeport-level CT tuple (ie. CT_EGRESS):
++ * - extracted from a request packet,
++ * - on CT_NEW (ie. the tuple is reversed)
++ */
+ static __always_inline __maybe_unused int
+-snat_v4_create_dsr(struct __ctx_buff *ctx, struct iphdr *ip4,
+-		   __be32 to_saddr, __be16 to_sport)
++snat_v4_create_dsr(struct ipv4_ct_tuple *tuple, __be32 to_saddr, __be16 to_sport)
+ {
+-	struct ipv4_ct_tuple tuple = {};
++	struct ipv4_ct_tuple tmp = *tuple;
+ 	struct ipv4_nat_entry state = {};
+-	__u32 off;
+ 	int ret;
+ 
+ 	build_bug_on(sizeof(struct ipv4_nat_entry) > 64);
+ 
+-	tuple.nexthdr = ip4->protocol;
+-	tuple.daddr = ip4->saddr;
+-	tuple.saddr = ip4->daddr;
+-	tuple.flags = NAT_DIR_EGRESS;
+-
+-	off = ETH_HLEN + ipv4_hdrlen(ip4);
+-
+-	switch (tuple.nexthdr) {
+-	case IPPROTO_TCP:
+-	case IPPROTO_UDP:
+-#ifdef ENABLE_SCTP
+-	case IPPROTO_SCTP:
+-#endif  /* ENABLE_SCTP */
+-		if (l4_load_ports(ctx, off, &tuple.dport) < 0)
+-			return DROP_INVALID;
+-		break;
+-	default:
+-		/* NodePort svc can be reached only via TCP or UDP, so
+-		 * drop the rest.
+-		 */
+-		return DROP_NAT_UNSUPP_PROTO;
+-	}
++	tmp.flags = TUPLE_F_OUT;
++	tmp.sport = tuple->dport;
++	tmp.dport = tuple->sport;
+ 
+ 	state.common.created = bpf_mono_now();
+ 	state.to_saddr = to_saddr;
+ 	state.to_sport = to_sport;
+ 
+-

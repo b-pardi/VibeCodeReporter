@@ -1,0 +1,136 @@
+@@ -511,6 +511,7 @@ static void set_default_value_dynamic_info(ELFOBJ *eo) {
+ 	eo->dyn_info.dt_jmprel = R_BIN_ELF_ADDR_MAX;
+ 	eo->dyn_info.dt_pltgot = R_BIN_ELF_ADDR_MAX;
+ 	eo->dyn_info.dt_mips_pltgot = R_BIN_ELF_ADDR_MAX;
++	eo->dyn_info.dt_crel = R_BIN_ELF_ADDR_MAX;
+ 	eo->dyn_info.dt_bind_now = false;
+ 	eo->dyn_info.dt_flags = R_BIN_ELF_XWORD_MAX;
+ 	eo->dyn_info.dt_flags_1 = R_BIN_ELF_XWORD_MAX;
+@@ -597,6 +598,9 @@ static void fill_dynamic_entries(ELFOBJ *eo, ut64 loaded_offset, ut64 dyn_size)
+ 		case DT_MIPS_PLTGOT:
+ 			eo->dyn_info.dt_mips_pltgot = d.d_un.d_ptr;
+ 			break;
++		case DT_CREL:
++			eo->dyn_info.dt_crel = d.d_un.d_ptr;
++			break;
+ 		case DT_BIND_NOW:
+ 			eo->dyn_info.dt_bind_now = true;
+ 			break;
+@@ -1747,7 +1751,16 @@ static ut64 get_import_addr_loongarch(ELFOBJ *bin, RBinElfReloc *rel) {
+ }
+ 
+ static size_t get_size_rel_mode(Elf_(Xword) mode) {
+-	return mode == DT_RELA? sizeof (Elf_(Rela)): sizeof (Elf_(Rel));
++	if (mode == DT_RELA) {
++		return sizeof (Elf_(Rela));
++	} else if (mode == DT_REL) {
++		return sizeof (Elf_(Rel));
++	} else if (mode == DT_CREL) {
++		// CREL uses variable-length encoding, but we need to return a size for alignment
++		// This is just a placeholder - actual parsing will be different
++		return sizeof (Elf_(Rela));
++	}
++	return 0;
+ }
+ 
+ static ut64 get_num_relocs_dynamic_plt(ELFOBJ *eo) {
+@@ -3097,7 +3110,202 @@ static void fix_rva_and_offset(ELFOBJ *eo, RBinElfReloc *r, size_t pos) {
+ 	}
+ }
+ 
++// Function to read one byte of ULEB128 encoded data
++static ut64 read_uleb128(const ut8 *data, int data_size, ut64 *val, int *read_bytes) {
++	ut64 result = 0;
++	int shift = 0;
++	int count = 0;
++	while (count < data_size) {
++		ut8 b = data[count++];
++		result |= ((b & 0x7f) << shift);
++		if (!(b & 0x80)) {
++			break;
++		}
++		shift += 7;
++		if (shift >= 64) {
++			break;
++		}
++	}
++	if (val) {
++		*val = result;
++	}
++	if (read_bytes) {
++		*read_bytes = count;
++	}
++	return result;
++}
++
++// Function to read one byte of SLEB128 encoded data
++static st64 read_sleb128(const ut8 *data, int data_size, st64 *val, int *read_bytes) {
++	ut64 result = 0;
++	int shift = 0;
++	int count = 0;
++	ut8 b = 0;
++	while (count < data_size) {
++		b = data[count++];
++		result |= ((b & 0x7f) << shift);
++		shift += 7;
++		if (!(b & 0x80)) {
++			break;
++		}
++		if (shift >= 64) {
++			break;
++		}
++	}
++	// Sign extend if needed
++	if ((b & 0x40) && shift < 64) {
++		result |= ~0ULL << shift;
++	}
++	if (val) {
++		*val = (st64)result;
++	}
++	if (read_bytes) {
++		*read_bytes = count;
++	}
++	return (st64)result;
++}
++
++// Structure to track CREL state
++typedef struct {
++	ut64 count;       // Number of relocations
++	ut8 addend_bit;   // Addend bit flag (0 or 1)
++	ut8 shift;        // Shift value (0 to 3)
++	ut64 offset;      // Current offset
++	ut32 symidx;      // Current symbol index
++	ut32 type;        // Current relocation type
++	st64 addend;      // Current addend
++	ut64 section_offset; // File offset of the section
++	ut64 current_pos; // Current position within the section
++	bool header_read; // Whether header has been read
++} CrelInfo;
++
++// Helper function to initialize a CrelInfo structure
++static bool init_crel_info(ELFOBJ *eo, ut64 section_offset, CrelInfo *info) {
++	R_RETURN_VAL_IF_FAIL (eo && info, false);
++	memset (info, 0, sizeof (CrelInfo));
++	info->section_offset = section_offset;
++	info->current_pos = section_offset;
++	info->header_read = false;
++	return true;
++}
++
++// Function to read a CREL header
++static bool read_crel_header(ELFOBJ *eo, CrelInfo *info) {
++	if (!info || info->header_read) {
++		return false;
++	}
++	ut8 header_buf[16] = {0}; // Max ULEB128 size for 64-bit
++	int res = r_buf_read_at (eo->b, info->current_pos, header_buf, sizeof (header_buf));
++	if (res <= 0) {
++		return false;
++	}
++	ut64 header_val = 0;
++	int bytes_read = 0;
++	read_uleb128 (header_buf, sizeof (header_buf), &header_val, &bytes_read);
++	info->count = header_val >> 3;
++	info->addend_bit = (header_val >> 2) & 1;
++	info->shift = header_val & 3;
++	info->

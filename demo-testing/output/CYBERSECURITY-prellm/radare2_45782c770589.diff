@@ -1,0 +1,136 @@
+@@ -5,10 +5,6 @@
+ #include <r_core.h>
+ #include <signal.h>
+ 
+-#if __WINDOWS__
+-void w32_break_process_wrapper(void *);
+-#endif
+-
+ R_LIB_VERSION(r_debug);
+ 
+ // Size of the lookahead buffers used in r_debug functions
+@@ -1125,9 +1121,6 @@ R_API int r_debug_continue_kill(RDebug *dbg, int sig) {
+ 	if (!dbg) {
+ 		return false;
+ 	}
+-#if __WINDOWS__
+-	r_cons_break_push (w32_break_process_wrapper, dbg);
+-#endif
+ repeat:
+ 	if (r_debug_is_dead (dbg)) {
+ 		return false;
+@@ -1135,9 +1128,6 @@ repeat:
+ 	if (dbg->h && dbg->h->cont) {
+ 		/* handle the stage-2 of breakpoints */
+ 		if (!r_debug_recoil (dbg, R_DBG_RECOIL_CONTINUE)) {
+-#if __WINDOWS__
+-			r_cons_break_pop ();
+-#endif
+ 			return false;
+ 		}
+ 		/* tell the inferior to go! */
+@@ -1214,9 +1204,6 @@ repeat:
+ 		/* if continuing killed the inferior, we won't be able to get
+ 		 * the registers.. */
+ 		if (reason == R_DEBUG_REASON_DEAD || r_debug_is_dead (dbg)) {
+-#if __WINDOWS__
+-			r_cons_break_pop ();
+-#endif
+ 			return false;
+ 		}
+ 
+
+
+
+
+@@ -727,7 +727,7 @@ int w32_select(RDebug* dbg, int pid, int tid) {
+ 	} else if (tid) {
+ 		// If thread is dead, search for another one
+ 		r_list_foreach (dbg->threads, it, th) {
+-			if (th->bFinished) {
++			if (!__is_thread_alive (dbg, th->tid)) {
+ 				continue;
+ 			}
+ 			__continue_thread (th->hThread, dbg->bits);
+@@ -780,21 +780,16 @@ int w32_kill(RDebug *dbg, int pid, int tid, int sig) {
+ 	return ret;
+ }
+ 
+-void w32_break_process_wrapper(void *d) {
+-	w32_break_process (d);
+-}
+-
+ void w32_break_process(RDebug *dbg) {
+ 	RIOW32Dbg *rio = dbg->user;
+ 	if (dbg->corebind.cfggeti (dbg->corebind.core, "dbg.threads")) {
+ 		w32_select (dbg, rio->pi.dwProcessId, 0); // Suspend all threads
+-		breaked = true;
+ 	} else {
+ 		if (!w32_DebugBreakProcess (rio->pi.hProcess)) {
+ 			r_sys_perror ("w32_break_process/DebugBreakProcess");
+ 		}
+ 	}
+-
++	breaked = true;
+ }
+ 
+ static const char *__get_w32_excep_name(DWORD code) {
+@@ -859,6 +854,9 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 	char *dllname = NULL;
+ 	int ret = R_DEBUG_REASON_UNKNOWN;
+ 	static int exited_already = 0;
++
++	r_cons_break_push (w32_break_process, dbg);
++
+ 	/* handle debug events */
+ 	do {
+ 		/* do not continue when already exited but still open for examination */
+@@ -877,12 +875,14 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 			if (!w32dbgw_intret (inst)) {
+ 				if (w32dbgw_err (inst) != ERROR_SEM_TIMEOUT) {
+ 					r_sys_perror ("w32_dbg_wait/WaitForDebugEvent");
+-					return -1;
++					ret = -1;
++					goto end;
+ 				}
+ 				if (!__is_thread_alive (dbg, dbg->tid)) {
+ 					ret = w32_select (dbg, dbg->pid, dbg->tid);
+ 					if (ret == -1) {
+-						return R_DEBUG_REASON_DEAD;
++						ret = R_DEBUG_REASON_DEAD;
++						goto end;
+ 					}
+ 				}
+ 			} else {
+@@ -891,7 +891,8 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 		} while (!breaked);
+ 
+ 		if (breaked) {
+-			return R_DEBUG_REASON_NONE;
++			ret = R_DEBUG_REASON_NONE;
++			goto end;
+ 		}
+ 
+ 		tid = de.dwThreadId;
+@@ -902,12 +903,12 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 		/* TODO: DEBUG_CONTROL_C */
+ 		switch (de.dwDebugEventCode) {
+ 		case CREATE_PROCESS_DEBUG_EVENT:
+-			next_event = 0;
+ 			__r_debug_thread_add (dbg, pid, tid, de.u.CreateProcessInfo.hThread, de.u.CreateProcessInfo.lpThreadLocalBase, de.u.CreateProcessInfo.lpStartAddress, FALSE);
+ 			rio->pi.hProcess = de.u.CreateProcessInfo.hProcess;
+ 			rio->pi.hThread = de.u.CreateProcessInfo.hThread;
+ 			rio->pi.dwProcessId = pid;
+ 			ret = R_DEBUG_REASON_NEW_PID;
++			next_event = 0;
+ 			break;
+ 		case CREATE_THREAD_DEBUG_EVENT:
+ 			__r_debug_thread_add (dbg, pid, tid, de.u.CreateThread.hThread, de.u.CreateThread.lpThreadLocalBase, de.u.CreateThread.lpStartAddress, FALSE);
+@@ -926,7 +927,6 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 			} else {
+ 				__r_debug_thread_add (dbg, pid, tid, INVALID_HANDLE_VALUE, de.u.CreateThread.lpThreadLocalBase, de.u.CreateThread.lpStartAddress, TRUE);
+ 			}
+-			next_event = 0;
+ 			if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+ 				exited_already = pid;
+ 

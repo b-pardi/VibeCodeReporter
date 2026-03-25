@@ -1,0 +1,124 @@
+@@ -1,5 +1,6 @@
+ package peergos.server.sync;
+ 
++import peergos.shared.user.fs.AsyncReader;
+ import peergos.shared.util.ArrayOps;
+ import peergos.shared.util.Pair;
+ 
+@@ -165,12 +166,10 @@ public class DirectorySync {
+ 
+         List<Pair<Long, Long>> diffRanges = sourceState.diffRanges(targetState);
+ 
+-        byte[] buf = new byte[4096];
+-
+         for (Pair<Long, Long> range : diffRanges) {
+             long start = range.left;
+             long end = range.right;
+-            try (InputStream fin = srcFs.getBytes(source, start)) {
++            try (AsyncReader fin = srcFs.getBytes(source, start)) {
+                 targetFs.setBytes(target, start, fin, end - start);
+             }
+             if (priorSize > size)
+
+
+
+
+@@ -1,6 +1,8 @@
+ package peergos.server.sync;
+ 
+ import peergos.server.crypto.hash.Blake3;
++import peergos.server.simulation.FileAsyncReader;
++import peergos.shared.user.fs.AsyncReader;
+ 
+ import java.io.*;
+ import java.nio.channels.FileChannel;
+@@ -57,14 +59,14 @@ class LocalFileSystem implements SyncFilesystem {
+     }
+ 
+     @Override
+-    public void setBytes(Path p, long fileOffset, InputStream fin, long size) throws IOException {
++    public void setBytes(Path p, long fileOffset, AsyncReader fin, long size) throws IOException {
+         try (FileOutputStream fout = new FileOutputStream(p.toFile());
+              FileChannel channel = fout.getChannel()) {
+             channel.position(fileOffset);
+             byte[] buf = new byte[4096];
+             long done = 0;
+             while (done < size) {
+-                int read = fin.read(buf);
++                int read = fin.readIntoArray(buf, 0, (int) Math.min(buf.length, size - done)).join();
+                 fout.write(buf, 0, read);
+                 done += read;
+             }
+@@ -72,10 +74,8 @@ class LocalFileSystem implements SyncFilesystem {
+     }
+ 
+     @Override
+-    public InputStream getBytes(Path p, long fileOffset) throws IOException {
+-        FileInputStream fin = new FileInputStream(p.toFile());
+-        fin.getChannel().position(fileOffset);
+-        return fin;
++    public AsyncReader getBytes(Path p, long fileOffset) throws IOException {
++        return new FileAsyncReader(p.toFile());
+     }
+ 
+     @Override
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,135 @@
++package peergos.server.sync;
++
++import peergos.server.crypto.hash.Blake3;
++import peergos.shared.storage.auth.BatId;
++import peergos.shared.user.UserContext;
++import peergos.shared.user.fs.AsyncReader;
++import peergos.shared.user.fs.FileWrapper;
++import peergos.shared.util.Futures;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.time.Instant;
++import java.time.LocalDateTime;
++import java.time.ZoneOffset;
++import java.util.Optional;
++import java.util.Set;
++import java.util.function.Consumer;
++
++public class PeergosSyncFS implements SyncFilesystem {
++
++    private final UserContext context;
++
++    public PeergosSyncFS(UserContext context) {
++        this.context = context;
++    }
++
++    @Override
++    public boolean exists(Path p) {
++        return context.getByPath(p).join().isPresent();
++    }
++
++    @Override
++    public void mkdirs(Path p) {
++        int depth = p.getNameCount();
++        Optional<BatId> mirrorBat = context.mirrorBatId();
++        for (int i=1; i < depth; i++) {
++            Optional<FileWrapper> current = context.getByPath(p.subpath(0, i)).join();
++            if (current.isEmpty()) {
++                FileWrapper parent = context.getByPath(p.subpath(0, i - 1)).join().get();
++                parent.mkdir(p.getName(i).toString(), context.network, false, mirrorBat, context.crypto).join();
++            }
++        }
++    }
++
++    @Override
++    public void delete(Path p) {
++        FileWrapper f = context.getByPath(p).join().get();
++        FileWrapper parent = context.getByPath(p.getParent()).join().get();
++        f.remove(parent, p, context).join();
++    }
++
++    @Override
++    public void moveTo(Path src, Path target) {
++        FileWrapper fro

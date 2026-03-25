@@ -1,0 +1,142 @@
+@@ -60,6 +60,7 @@
+ #include "util-device.h"
+ #include "util-validate.h"
+ #include "util-crypt.h"
++#include "util-plugin.h"
+ 
+ #include "flow-var.h"
+ #include "flow-bit.h"
+@@ -67,6 +68,8 @@
+ 
+ #include "source-pcap-file.h"
+ 
++#include "suricata-plugin.h"
++
+ #define DEFAULT_LOG_FILENAME "eve.json"
+ #define DEFAULT_ALERT_SYSLOG_FACILITY_STR       "local0"
+ #define DEFAULT_ALERT_SYSLOG_FACILITY           LOG_LOCAL0
+@@ -1081,9 +1084,19 @@ OutputInitResult OutputJsonInitCtx(ConfNode *conf)
+                                       "redis JSON output option is not compiled");
+ #endif
+             } else {
+-                SCLogError(SC_ERR_INVALID_ARGUMENT,
+-                           "Invalid JSON output option: %s", output_s);
+-                exit(EXIT_FAILURE);
++#ifdef HAVE_PLUGINS
++                SCPluginFileType *plugin = SCPluginFindFileType(output_s);
++                if (plugin == NULL) {
++                    FatalError(SC_ERR_INVALID_ARGUMENT,
++                            "Invalid JSON output option: %s", output_s);
++                } else {
++                    json_ctx->json_out = LOGFILE_TYPE_PLUGIN;
++                    json_ctx->plugin = plugin;
++                }
++#else
++                FatalError(SC_ERR_INVALID_ARGUMENT,
++                        "Invalid JSON output option: %s", output_s);
++#endif
+             }
+         }
+ 
+@@ -1177,6 +1190,19 @@ OutputInitResult OutputJsonInitCtx(ConfNode *conf)
+             }
+         }
+ #endif
++        else if (json_ctx->json_out == LOGFILE_TYPE_PLUGIN) {
++            ConfNode *plugin_conf = ConfNodeLookupChild(conf,
++                json_ctx->plugin->name);
++            void *plugin_data = NULL;
++            if (json_ctx->plugin->Open(plugin_conf, &plugin_data) < 0) {
++                LogFileFreeCtx(json_ctx->file_ctx);
++                SCFree(json_ctx);
++                SCFree(output_ctx);
++            } else {
++                json_ctx->file_ctx->plugin = json_ctx->plugin;
++                json_ctx->file_ctx->plugin_data = plugin_data;
++            }
++        }
+ 
+         const char *sensor_id_s = ConfNodeLookupChildValue(conf, "sensor-id");
+         if (sensor_id_s != NULL) {
+
+
+
+
+@@ -31,6 +31,7 @@
+ #include "rust.h"
+ 
+ #include "app-layer-htp-xff.h"
++#include "suricata-plugin.h"
+ 
+ void OutputJsonRegister(void);
+ 
+@@ -102,6 +103,7 @@ typedef struct OutputJsonCtx_ {
+     enum LogFileType json_out;
+     OutputJsonCommonSettings cfg;
+     HttpXFFCfg *xff_cfg;
++    SCPluginFileType *plugin;
+ } OutputJsonCtx;
+ 
+ typedef struct OutputJsonThreadCtx_ {
+
+
+
+
+@@ -492,13 +492,17 @@ typedef enum {
+ } LoggerId;
+ 
+ #include "util-optimize.h"
++#ifndef SURICATA_PLUGIN
+ #include <htp/htp.h>
++#endif
+ #include "threads.h"
+ #include "tm-threads-common.h"
+ #include "util-debug.h"
+ #include "util-error.h"
+ #include "util-mem.h"
++#ifndef SURICATA_PLUGIN
+ #include "detect-engine-alert.h"
++#endif
+ #include "util-path.h"
+ #include "util-conf.h"
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,53 @@
++/* Copyright (C) 2020 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++#ifndef __SURICATA_PLUGIN_H__
++#define __SURICATA_PLUGIN_H__
++
++#include "autoconf.h"
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#include "conf.h"
++
++/**
++ * Structure to define a Suricata plugin.
++ */
++typedef struct SCPlugin_ {
++    const char *name;
++    const char *license;
++    const char *author

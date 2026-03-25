@@ -1,0 +1,88 @@
+@@ -43,10 +43,33 @@ class GenericHash {
+   u_int32_t current_size; /**< Current size of hash (including idle or ready-to-purge elements).*/
+   u_int32_t max_hash_size; /**< Max size of hash.*/
+   RwLock **locks;
++  map<u_int, u_int8_t> busy_trylocks; /**< Counts the number of busy trylocks for each bucket */
+   NetworkInterface *iface; /**< Pointer of network interface for this generic hash.*/
+   u_int last_purged_hash; /**< Index of last purged hash.*/
+   u_int purge_step;
+-  
++
++  /**
++   * @brief Perform certain actions when a bucket is found to be already locked
++   * @details purgeIdle performs trylocks on buckets and it may find them busy, already locked by other threads.
++   *          When the bucket is found to be busy, purgeIdle will call this method.
++   *
++   * @param hash_bucket The hash table index of the busy bucket
++   * @return void
++   *
++   */
++  void handleBusyTrylock(u_int hash_bucket);
++
++  /**
++   * @brief Perform certain actions when a bucket is found to be free
++   * @details purgeIdle performs trylocks on buckets and it may find them busy, already locked by other threads.
++   *          When the bucket is found to be free, purgeIdle will call this method.
++   *
++   * @param hash_bucket The hash table index of the free bucket
++   * @return void
++   *
++   */
++  void handleFreeTrylock(u_int hash_bucket);
++
+  public:
+   /**
+    * @brief A Constructor
+
+
+
+
+@@ -72,6 +72,36 @@ void GenericHash::cleanup() {
+ 
+ /* ************************************ */
+ 
++void GenericHash::handleBusyTrylock(u_int hash_bucket) {
++  map<u_int, u_int8_t>::iterator it;
++  u_int8_t num_busy = 1;
++
++  it = busy_trylocks.find(hash_bucket);
++
++  if(it == busy_trylocks.end())
++    busy_trylocks.insert(make_pair(hash_bucket, num_busy));
++  else
++    num_busy = ++it->second;
++
++  if(num_busy >= 5)
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Found a busy bucket too many consecutive times. "
++				 "Very likely, readers of this bucket are holding the lock for too long. "
++				 "[bucket: %u][failed trylocks: %u]", hash_bucket, num_busy);
++}
++
++/* ************************************ */
++
++void GenericHash::handleFreeTrylock(u_int hash_bucket) {
++  map<u_int, u_int8_t>::iterator it;
++
++  it = busy_trylocks.find(hash_bucket);
++
++  if(it != busy_trylocks.end())
++    busy_trylocks.erase(it);
++}
++
++/* ************************************ */
++
+ bool GenericHash::add(GenericHashEntry *h, bool do_lock) {
+   if(hasEmptyRoom()) {
+     u_int32_t hash = (h->key() % num_hashes);
+@@ -192,8 +222,11 @@ u_int GenericHash::purgeIdle(bool force_idle) {
+       GenericHashEntry *head, *prev = NULL;
+ 
+       // ntop->getTrace()->traceEvent(TRACE_NORMAL, "[purge] Locking %d", i);
+-      if(!locks[i]->trywrlock(__FILE__, __LINE__))
++      if(!locks[i]->trywrlock(__FILE__, __LINE__)) {
++	handleBusyTrylock(i);
+ 	continue; /* Busy, will retry next round */
++      } else
++	handleFreeTrylock(i);
+ 
+       head = table[i];

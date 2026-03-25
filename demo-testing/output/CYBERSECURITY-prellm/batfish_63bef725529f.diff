@@ -1,0 +1,81 @@
+@@ -1,5 +1,7 @@
+ package org.batfish.representation.fortios;
+ 
++import static org.batfish.datamodel.Names.generatedBgpPeerExportPolicyName;
++
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import java.util.HashMap;
+@@ -15,20 +17,40 @@ import org.batfish.datamodel.ConcreteInterfaceAddress;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.Interface;
+ import org.batfish.datamodel.Ip;
++import org.batfish.datamodel.OriginType;
++import org.batfish.datamodel.PrefixRange;
++import org.batfish.datamodel.PrefixSpace;
+ import org.batfish.datamodel.RoutingProtocol;
+ import org.batfish.datamodel.bgp.Ipv4UnicastAddressFamily;
+ import org.batfish.datamodel.routing_policy.RoutingPolicy;
+ import org.batfish.datamodel.routing_policy.expr.BooleanExpr;
+ import org.batfish.datamodel.routing_policy.expr.BooleanExprs;
++import org.batfish.datamodel.routing_policy.expr.CallExpr;
++import org.batfish.datamodel.routing_policy.expr.Conjunction;
+ import org.batfish.datamodel.routing_policy.expr.DestinationNetwork;
++import org.batfish.datamodel.routing_policy.expr.Disjunction;
++import org.batfish.datamodel.routing_policy.expr.ExplicitPrefixSet;
++import org.batfish.datamodel.routing_policy.expr.LiteralOrigin;
+ import org.batfish.datamodel.routing_policy.expr.MatchPrefixSet;
++import org.batfish.datamodel.routing_policy.expr.MatchProtocol;
+ import org.batfish.datamodel.routing_policy.expr.NamedPrefixSet;
++import org.batfish.datamodel.routing_policy.expr.Not;
++import org.batfish.datamodel.routing_policy.expr.WithEnvironmentExpr;
+ import org.batfish.datamodel.routing_policy.statement.If;
++import org.batfish.datamodel.routing_policy.statement.SetOrigin;
+ import org.batfish.datamodel.routing_policy.statement.Statement;
+ import org.batfish.datamodel.routing_policy.statement.Statements;
+ 
+ /** Helper functions for generating VI BGP structures for {@link FortiosConfiguration}. */
+ public final class FortiosBgpConversions {
++  private static final String BGP_COMMON_EXPORT_POLICY_NAME = "~BGP_COMMON_EXPORT_POLICY~";
++  private static final BooleanExpr MATCH_BGP =
++      new MatchProtocol(RoutingProtocol.BGP, RoutingProtocol.IBGP);
++  private static final BooleanExpr MATCH_NOT_BGP_OR_AGGREGATE =
++      new Not(
++          new MatchProtocol(RoutingProtocol.BGP, RoutingProtocol.IBGP, RoutingProtocol.AGGREGATE));
++  private static final BooleanExpr REDIST_WITH_ENVIRONMENT_ORIGIN_TYPE_IGP =
++      bgpRedistributeWithEnvironmentExpr(BooleanExprs.TRUE, OriginType.IGP);
+ 
+   /**
+    * Infer the interface that the given {@link BgpNeighbor} will use as its update source. If none
+@@ -91,6 +113,10 @@ public final class FortiosBgpConversions {
+       w.redFlag("Ignoring BGP process: No router ID configured");
+       return;
+     }
++
++    List<PrefixSpace> originatedSpaces =
++        generateCommonBgpExportPolicyAndGetOriginatedSpaces(bgpProcess, c);
++
+     Map<Ip, Interface> updateSources = new HashMap<>();
+     Map<String, Set<Ip>> neighborsByVrf = new HashMap<>();
+     for (BgpNeighbor neighbor : bgpProcess.getNeighbors().values()) {
+@@ -108,16 +134,85 @@ public final class FortiosBgpConversions {
+     }
+ 
+     for (Map.Entry<String, Set<Ip>> e : neighborsByVrf.entrySet()) {
+-      convertBgpProcessForVrf(bgpProcess, routerId, e.getKey(), e.getValue(), updateSources, c, w);
++      convertBgpProcessForVrf(
++          bgpProcess, routerId, e.getKey(), e.getValue(), updateSources, originatedSpaces, c, w);
+     }
+   }
+ 
++  /**
++   * Generates the common BGP export policy for the given {@link BgpProcess} on the given config and
++   * adds it to the config's routing policies.
++   *
++   * @return A list of all {@link PrefixSpace prefix spaces} originated by the BGP process.
++   */
++  private static List<PrefixSpace> generateCommonBgpExportPolicyAndGetOriginatedSpaces(
++      BgpProcess bgpProcess, Configuration c) {
++    ImmutableList.Builder<PrefixSpace> originatedPrefixSpaces = ImmutableList.builder();
++
++    

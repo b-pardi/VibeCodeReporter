@@ -1,0 +1,148 @@
+@@ -674,11 +674,6 @@ void Attributes::CheckAttr(Attr* a)
+ 			break;
+ 			}
+ 
+-		// Temporary since Broker does not support ListVals - and we
+-		// cannot easily convert to set/vector
+-		if ( type->AsTableType()->GetIndexTypes().size() != 1 )
+-			Error("&backend only supports one-element set/table indexes");
+-
+ 		// Only support atomic types for the moment, unless
+ 		// explicitly overriden
+ 		if ( ! type->AsTableType()->IsSet() &&
+@@ -714,11 +709,6 @@ void Attributes::CheckAttr(Attr* a)
+ 			break;
+ 			}
+ 
+-		// Temporary since Broker does not support ListVals - and we
+-		// cannot easily convert to set/vector
+-		if ( type->AsTableType()->GetIndexTypes().size() != 1 && ! Find(ATTR_BROKER_STORE_ALLOW_COMPLEX) )
+-			Error("&broker_store only supports one-element set/table indexes");
+-
+ 		// Only support atomic types for the moment, unless
+ 		// explicitly overriden
+ 		if ( ! type->AsTableType()->IsSet() &&
+
+
+
+
+@@ -458,7 +458,7 @@ public:
+ 
+ 	TypePtr ShallowClone() override;
+ 
+-	[[deprecated("Remove in v4.1.  Use Elements() isntead.")]]
++	[[deprecated("Remove in v4.1.  Use Elements() instead.")]]
+ 	detail::ListExpr* SetElements() const	{ return elements.get(); }
+ 
+ 	const detail::ListExprPtr& Elements() const
+
+
+
+
+@@ -2172,23 +2172,14 @@ void TableVal::SendToStore(const Val* index, const TableEntryVal* new_entry_val,
+ 		if ( ! handle )
+ 			return;
+ 
+-		// we either get passed the raw index_val - or a ListVal with exactly one element.
+-		// Since Broker does not support ListVals, we have to unoll this in the second case.
++		// For simple indexes, we either get passed the raw index_val - or a ListVal with exactly one element.
++		// We unoll this in the second case.
++		// For complex indexes, we just pass the ListVal.
+ 		const Val* index_val;
+-		if ( index->GetType()->Tag() == TYPE_LIST )
+-			{
+-			if ( index->AsListVal()->Length() != 1 )
+-				{
+-				emit_builtin_error("table with complex index not supported for &broker_store");
+-				return;
+-				}
+-
++		if ( index->GetType()->Tag() == TYPE_LIST && index->AsListVal()->Length() == 1)
+ 			index_val = index->AsListVal()->Idx(0).get();
+-			}
+ 		else
+-			{
+ 			index_val = index;
+-			}
+ 
+ 		auto broker_index = Broker::detail::val_to_data(index_val);
+ 
+
+
+
+
+@@ -345,6 +345,34 @@ struct val_converter {
+ 
+ 			return rval;
+ 			}
++		else if ( type->Tag() == TYPE_LIST )
++			{
++			// lists are just treated as vectors on the broker side.
++			auto lt = type->AsTypeList();
++			auto rval = make_intrusive<ListVal>(TYPE_ANY);
++			auto types = lt->GetTypes();
++			auto pure = lt->IsPure();
++
++			if ( pure )
++				// ListVal doesn't have a type constructor :)
++				rval = make_intrusive<ListVal>(lt->GetPureType()->Tag());
++
++			unsigned int pos = 0;
++			for ( auto& item : a )
++				{
++				if ( ! pure && pos >= types.size() )
++					return nullptr;
++
++				auto item_val = data_to_val(move(item), pure ? lt->GetPureType().get() : types.at(pos).get() );
++				pos++;
++
++				if ( ! item_val )
++					return nullptr;
++
++				rval->Append(std::move(item_val));
++				}
++			return rval;
++			}
+ 		else if ( type->Tag() == TYPE_FUNC )
+ 			{
+ 			if ( a.size() < 1 || a.size() > 2 )
+@@ -955,6 +983,31 @@ broker::expected<broker::data> val_to_data(const Val* v)
+ 			rval.emplace_back(move(*item));
+ 			}
+ 
++		return {std::move(rval)};
++		}
++	case TYPE_LIST:
++		{
++		// We don't really support lists on the broker side.
++		// So we just pretend that it is a vector instead.
++		auto list = v->AsListVal();
++		broker::vector rval;
++		rval.reserve(list->Length());
++
++		for ( auto i = 0u; i < list->Length(); ++i )
++			{
++			const auto& item_val = list->Idx(i);
++
++			if ( ! item_val )
++				continue;
++
++			auto item = val_to_data(item_val.get());
++
++			if ( ! item )
++				return broker::ec::invalid_data;
++
++			rval.emplace_back(move(*item));
++			}
++
+ 		return {std::move(rval)};
+ 		}
+ 	case TYPE_RECORD:
+
+
+
+
+@@ -1031,8 +1031,12 @@ void Manager::ProcessStoreEventInsertUpdate(const TableValPtr& table,
+ 			}
+ 
+ 		const auto& its = table->GetType()->AsTable

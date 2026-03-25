@@ -1,0 +1,136 @@
+@@ -120,7 +120,8 @@ class Ntop {
+ 
+ #ifndef WIN32
+   ContinuousPing *cping;
+-  Ping *ping;
++  Ping *default_ping;
++  std::map<std::string /* ifname */, Ping*> ping;
+ #endif
+   
+ #ifdef __linux__
+@@ -144,6 +145,7 @@ class Ntop {
+   void checkReloadHostChecks();
+   void checkReloadAlertExclusions();
+   void checkReloadHostPools();
++  void initPing();
+   
+  public:
+   /**
+@@ -550,9 +552,10 @@ class Ntop {
+   ndpi_serializer *getAlertSerializer(FlowAlertType fat, Flow *f) const;
+   
+ #ifndef WIN32
+-  inline ContinuousPing* getContinuousPing() { return(cping); }
+-  inline Ping*           getPing()           { return(ping);  }
++  inline ContinuousPing* getContinuousPing()   { return(cping); }
++  Ping*  getPing(char *ifname);
+ #endif
++  
+   inline bool hasDroppedPrivileges()         { return(privileges_dropped); }
+   inline void setDroppedPrivileges()         { privileges_dropped = true; }
+ 
+@@ -605,7 +608,8 @@ class Ntop {
+ #if defined(HAVE_CLICKHOUSE) && defined(HAVE_MYSQL)
+   inline u_int importClickHouseDumps(bool silence_warnings) { return(clickhouseImport.importDumps(silence_warnings)); }
+ #endif
+-
++  void collectResponses(lua_State* vm);
++  void collectContinuousResponses(lua_State* vm);
+ };
+ 
+ extern Ntop *ntop;
+
+
+
+
+@@ -815,9 +815,6 @@ struct ntopngLuaContext {
+   AddressTree *allowedNets;
+   NetworkInterface *iface;
+   AddressTree *addr_tree;
+-#ifndef WIN32
+-  Ping *ping;
+-#endif
+   SNMP *snmpBatch, *snmpAsyncEngine[MAX_NUM_ASYNC_SNMP_ENGINES];
+   Host *host;
+   NetworkStats *network;
+
+
+
+
+@@ -321,7 +321,9 @@ void ContinuousPing::collectProtoResponse(lua_State* vm, std::map<std::string,Co
+ 
+ void ContinuousPing::collectResponses(lua_State* vm, bool v6) {
+   std::map<std::string /* IP */, bool> * pinged = v6 ? &v6_pinged : &v4_pinged;
+-  lua_newtable(vm);
++
++  /* The lua_newtable() below is added by  Ntop::collectContinuousResponses() */
++  /* lua_newtable(vm); */
+ 
+   m.lock(__FILE__, __LINE__);
+ 
+
+
+
+
+@@ -142,12 +142,6 @@ LuaEngine::~LuaEngine() {
+       if((ctx->iface != NULL) && ctx->live_capture.pcaphdr_sent)
+ 	ctx->iface->deregisterLiveCapture(ctx);
+ 
+-#ifdef __linux__
+-      /* Other platforms use the singleton inside the Ntop class */
+-      if(ctx->ping != NULL)
+-	delete ctx->ping;
+-#endif
+-
+       if(ctx->addr_tree != NULL)
+         delete ctx->addr_tree;
+ 
+
+
+
+
+@@ -654,7 +654,7 @@ static int ntop_get_tls_version_name(lua_State* vm) {
+   u_int16_t tls_version;
+   u_int8_t unknown_version = 0;
+   char buf[32];
+-  
++
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TNUMBER) != CONST_LUA_OK) return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
+@@ -886,7 +886,7 @@ static int ntop_getservbyport(lua_State* vm) {
+ static int ntop_msleep(lua_State* vm) {
+   u_int ms_duration, max_duration = 60000 /* 1 min */;
+   struct timespec ts;
+-  
++
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TNUMBER) != CONST_LUA_OK) return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
+@@ -1650,7 +1650,7 @@ static int ntop_clickhouse_enabled(lua_State* vm) {
+ static int ntop_clickhouse_import_dumps(lua_State* vm) {
+ #if defined(HAVE_CLICKHOUSE) && defined(HAVE_MYSQL)
+   bool silence_warnings;
+-  
++
+   if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TBOOLEAN) != CONST_LUA_OK)
+     return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
+   else
+@@ -1905,45 +1905,13 @@ static int ntop_ping_host(lua_State* vm) {
+ 
+   if(!continuous) {
+     /* Ping one shot */
+-    if(true) { /* Put this to false to try the new ping */
+-      if(getLuaVMUservalue(vm, ping) == NULL) {
+-        Ping *ping;
+-
+-  #ifdef __linux__
+-        /* We support ICMP over multiple interfaces */
+-        try {
+-    ping = new Ping(ifname);
+-        } catch(...) {
+-    ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to create ping socket: are you root?");
+-    ping = NULL;
+-        }
+-  #else
+-        ping = 

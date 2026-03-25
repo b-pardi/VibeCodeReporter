@@ -1,0 +1,99 @@
+@@ -5,7 +5,7 @@ import contextlib
+ import datetime
+ import logging
+ 
+-from volatility3.framework import constants, exceptions, interfaces, renderers
++from volatility3.framework import constants, exceptions, interfaces, renderers, symbols
+ from volatility3.framework.configuration import requirements
+ from volatility3.framework.renderers import conversion, format_hints
+ from volatility3.framework.symbols import intermed
+@@ -31,6 +31,7 @@ class MFTScan(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
+             requirements.VersionRequirement(
+                 name="yarascanner", component=yarascan.YaraScanner, version=(2, 0, 0)
+             ),
++
+         ]
+ 
+     def _generator(self):
+@@ -189,3 +190,153 @@ class MFTScan(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
+             ],
+             self._generator(),
+         )
++
++
++class ADS(interfaces.plugins.PluginInterface):
++
++    """Scans for Alternate Data Stream"""
++
++    _required_framework_version = (2, 0, 0)
++
++    @classmethod
++    def get_requirements(cls):
++        return [
++            requirements.TranslationLayerRequirement(
++                name="primary",
++                description="Memory layer for the kernel",
++                architectures=["Intel32", "Intel64"],
++            ),
++            requirements.VersionRequirement(
++                name="yarascanner", component=yarascan.YaraScanner, version=(2, 0, 0)
++            ),
++        ]
++
++    def _generator(self):
++        layer = self.context.layers[self.config["primary"]]
++
++        # Yara Rule to scan for MFT Header Signatures
++        rules = yarascan.YaraScan.process_yara_options(
++            {"yara_rules": "/FILE0|FILE\*|BAAD/"}
++        )
++
++        # Read in the Symbol File
++        symbol_table = intermed.IntermediateSymbolTable.create(
++            context=self.context,
++            config_path=self.config_path,
++            sub_path="windows",
++            filename="mft",
++            class_types={"MFT_ENTRY": mft.MFTEntry,"FILE_NAME_ENTRY": mft.MFTFileName},
++        )
++
++        # get each of the individual Field Sets
++        mft_object = symbol_table + constants.BANG + "MFT_ENTRY"
++        header_object = symbol_table + constants.BANG + "ATTR_HEADER"
++        attribute_object = symbol_table + constants.BANG + "ATTRIBUTE"
++        fn_object = symbol_table + constants.BANG + "FILE_NAME_ENTRY"
++
++        # Scan the layer for Raw MFT records and parse the fields
++        for offset, _rule_name, _name, _value in layer.scan(
++            context=self.context, scanner=yarascan.YaraScanner(rules=rules)
++        ):
++            with contextlib.suppress(exceptions.PagedInvalidAddressException):
++                mft_record = self.context.object(
++                    mft_object, offset=offset, layer_name=layer.name
++                )
++                # We will update this on each pass in the next loop and use it as the new offset.
++                attr_base_offset = mft_record.FirstAttrOffset
++
++                attr_header = self.context.object(
++                    header_object,
++                    offset=offset + attr_base_offset,
++                    layer_name=layer.name,
++                )
++
++                # There is no field that has a count of Attributes
++                # Keep Attempting to read attributes until we get an invalid attr_header.AttrType
++                file_name = ""
++                while attr_header.AttrType.is_valid_choice:
++
++                    # Offset past the headers to the attribute data
++                    attr_data_offset = (
++                        offset
++                        + attr_base_offset
++                        + self.context.symbol_space.get_type(
++                            attribute_object
++                        ).relative_child_offset("Attr_Data")
++                    )
++
++                    if attr_header.AttrType.lookup() == "FILE_NAME":
++                        attr_data = self.context.object(
++        

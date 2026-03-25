@@ -1,0 +1,110 @@
+@@ -13,8 +13,10 @@ from api.models import Scan
+ from prowler.config.config import (
+     csv_file_suffix,
+     html_file_suffix,
++    json_asff_file_suffix,
+     json_ocsf_file_suffix,
+ )
++from prowler.lib.outputs.asff.asff import ASFF
+ from prowler.lib.outputs.compliance.aws_well_architected.aws_well_architected import (
+     AWSWellArchitected,
+ )
+@@ -109,6 +111,7 @@ OUTPUT_FORMATS_MAPPING = {
+         "kwargs": {},
+     },
+     "json-ocsf": {"class": OCSF, "suffix": json_ocsf_file_suffix, "kwargs": {}},
++    "json-asff": {"class": ASFF, "suffix": json_asff_file_suffix, "kwargs": {}},
+     "html": {"class": HTML, "suffix": html_file_suffix, "kwargs": {"stats": {}}},
+ }
+ 
+
+
+
+
+@@ -327,6 +327,16 @@ def generate_outputs_task(scan_id: str, provider_id: str, tenant_id: str):
+         ScanSummary.objects.filter(scan_id=scan_id)
+     )
+ 
++    # Check if we need to generate ASFF output for AWS providers with SecurityHub integration
++    generate_asff = False
++    if provider_type == "aws":
++        security_hub_integrations = Integration.objects.filter(
++            integrationproviderrelationship__provider_id=provider_id,
++            integration_type=Integration.IntegrationChoices.AWS_SECURITY_HUB,
++            enabled=True,
++        )
++        generate_asff = security_hub_integrations.exists()
++
+     qs = (
+         Finding.all_objects.filter(tenant_id=tenant_id, scan_id=scan_id)
+         .order_by("uid")
+@@ -337,6 +347,10 @@ def generate_outputs_task(scan_id: str, provider_id: str, tenant_id: str):
+ 
+         # Outputs
+         for mode, cfg in OUTPUT_FORMATS_MAPPING.items():
++            # Skip ASFF generation if not needed
++            if mode == "json-asff" and not generate_asff:
++                continue
++
+             cls = cfg["class"]
+             suffix = cfg["suffix"]
+             extra = cfg.get("kwargs", {}).copy()
+
+
+
+
+@@ -605,6 +605,369 @@ class TestCheckIntegrationsTask:
+             enabled=True,
+         )
+ 
++    @patch("tasks.tasks.s3_integration_task")
++    @patch("tasks.tasks.Integration.objects.filter")
++    @patch("tasks.tasks.ScanSummary.objects.filter")
++    @patch("tasks.tasks.Provider.objects.get")
++    @patch("tasks.tasks.initialize_prowler_provider")
++    @patch("tasks.tasks.Compliance.get_bulk")
++    @patch("tasks.tasks.get_compliance_frameworks")
++    @patch("tasks.tasks.Finding.all_objects.filter")
++    @patch("tasks.tasks._generate_output_directory")
++    @patch("tasks.tasks.FindingOutput._transform_findings_stats")
++    @patch("tasks.tasks.FindingOutput.transform_api_finding")
++    @patch("tasks.tasks._compress_output_files")
++    @patch("tasks.tasks._upload_to_s3")
++    @patch("tasks.tasks.Scan.all_objects.filter")
++    @patch("tasks.tasks.rmtree")
++    def test_generate_outputs_with_asff_for_aws_with_security_hub(
++        self,
++        mock_rmtree,
++        mock_scan_update,
++        mock_upload,
++        mock_compress,
++        mock_transform_finding,
++        mock_transform_stats,
++        mock_generate_dir,
++        mock_findings,
++        mock_get_frameworks,
++        mock_compliance_bulk,
++        mock_initialize_provider,
++        mock_provider_get,
++        mock_scan_summary,
++        mock_integration_filter,
++        mock_s3_task,
++    ):
++        """Test that ASFF output is generated for AWS providers with SecurityHub integration."""
++        # Setup
++        mock_scan_summary_qs = MagicMock()
++        mock_scan_summary_qs.exists.return_value = True
++        mock_scan_summary.return_value = mock_scan_summary_qs
++
++        # Mock AWS provider
++        mock_provider = MagicMock()
++        mock_provider.uid = "aws-account-123"
++        mock_provider.provider = "aws"
++        mock_provider_get.return_value = mock_provider
++
++        # Mock SecurityHub integration exists
++        mock_security_hub_integrations = MagicMock()
++        mock_security_hub_integrations.exists.return_value = True
++        mock_integration_filter.return_value = mock_security_hub_integrations
++
++        # Mock s3_int

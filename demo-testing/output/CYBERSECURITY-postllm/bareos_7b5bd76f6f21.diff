@@ -1,0 +1,118 @@
+@@ -136,12 +136,62 @@ bool VSSClient::InitializeForRestore(JobControlRecord* jcr)
+   return Initialize(0, true /*=>Restore*/);
+ }
+ 
++static std::size_t AppendPathPart(std::string& s, const char* path) {
++  for (std::size_t lookahead = 0; path[lookahead]; lookahead += 1) {
++    char cur = path[lookahead];
++    if (cur == '\\') {
++      s.append(path, lookahead+1);
++      return lookahead+1;
++    }
++  }
++  return 0;
++}
++
++static std::pair<std::string, std::string> FindMountPoint(const char* path,
++							  std::unordered_map<std::string, std::string>& mount_to_vol)
++{
++  std::string current_volume{};
++  std::size_t offset{0};
++  std::size_t lookahead{0};
++  while (lookahead = AppendPathPart(current_volume, path + offset),
++	 lookahead != 0) {
++    offset += lookahead;
++    if (auto found = mount_to_vol.find(current_volume);
++	found != mount_to_vol.end()) {
++      current_volume.assign(found->second);
++      path += offset;
++      offset = 0;
++    }
++  }
++  current_volume.resize(current_volume.size() - offset);
++  return {std::move(current_volume), path};
++}
++
+ bool VSSClient::GetShadowPath(const char* szFilePath,
+                               char* szShadowPath,
+                               int nBuflen)
+ {
+   if (!bBackupIsInitialized_) return false;
+ 
++  auto [volume, path] = FindMountPoint(szFilePath, this->mount_to_vol);
++
++  if (auto found = vol_to_vss.find(volume);
++      found != vol_to_vss.end()) {
++    bstrncpy(szShadowPath, found->second.c_str(), nBuflen);
++    auto len = strlen(szShadowPath);
++    szShadowPath[len] = '\\';
++    szShadowPath[len+1] = '\0';
++    nBuflen -= len + 1;
++    bstrncat(szShadowPath, path.c_str(), nBuflen);
++    return true;
++  } else {
++    Dmsg4(50, "Could not find shadow volume for volume '%s' (path = '%s'; input = '%s').\n"
++	  "Falling back to live system!\n",
++	  volume.c_str(), path.c_str(), szFilePath);
++    goto bail_out;
++  }
++
++#if 0
+   int volsize = 64;
+   std::unique_ptr<char[]> volbuf = std::unique_ptr<char[]>{new char[volsize], std::default_delete<char[]>{}};
+   int size = 512;
+@@ -207,6 +257,7 @@ bool VSSClient::GetShadowPath(const char* szFilePath,
+       return true;
+     }
+   }
++#endif
+ 
+  bail_out:
+   bstrncpy(szShadowPath, szFilePath, nBuflen);
+
+
+
+
+@@ -350,6 +350,8 @@ static inline POOLMEM* GetMountedVolumeForMountPointPath(POOLMEM* volumepath,
+ }
+ 
+ static inline bool HandleVolumeMountPoint(VSSClientGeneric* pVssClient,
++					  std::unordered_map<std::string, std::string>& mount_to_vol,
++					  LPWSTR parent,
+                                           IVssBackupComponents* pVssObj,
+                                           POOLMEM*& volumepath,
+                                           POOLMEM*& mountpoint)
+@@ -363,9 +365,18 @@ static inline bool HandleVolumeMountPoint(VSSClientGeneric* pVssClient,
+   vol = GetMountedVolumeForMountPointPath(volumepath, mountpoint);
+   hr = pVssObj->AddToSnapshotSet((LPWSTR)vol, GUID_NULL, &pid);
+ 
++
+   pvol = GetPoolMemory(PM_FNAME);
+   wchar_2_UTF8(pvol, (wchar_t*)vol);
+ 
++  PoolMem utf8_parent(PM_FNAME);
++  wchar_2_UTF8(utf8_parent.addr(), parent);
++  PoolMem path(PM_FNAME);
++  path.strcpy(utf8_parent.c_str());
++  path.strcat(mountpoint);
++
++  mount_to_vol.emplace(path.c_str(), pvol);
++
+   if (SUCCEEDED(hr)) {
+     pVssClient->AddVolumeMountPointSnapshots(pVssObj, (wchar_t*)vol);
+     Dmsg1(200, "%s added to snapshotset \n", pvol);
+@@ -666,6 +677,11 @@ void VSSClientGeneric::AddDriveSnapshots(IVssBackupComponents* pVssObj,
+         Dmsg2(200, "%s added to snapshotset (Drive %s:\\)\n", szBuf, szDrive);
+         FreePoolMemory(szBuf);
+       }
++      char drive[4] = "_:\\";
++      drive[0] = szDriveLetters[i];
++      PoolMem uvol(PM_FNAME);
++      wchar_2_UTF8(uvol.addr(), volume.c_str());
++      mount_to_vol.emplace(drive, uvol.c_str());
+     } else {
+       szDriveLetters[i] = tolower(szDriveLetters[i]);
+     }
+@@ -705,7 +721,10 @@ void VSSClientGeneric::AddVolumeMountPointSnapshots(
+   if (hMount != INVALID_HANDLE_VALUE) {
+     // C

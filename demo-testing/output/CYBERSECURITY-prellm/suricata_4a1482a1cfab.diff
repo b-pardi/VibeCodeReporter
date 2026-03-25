@@ -1,0 +1,90 @@
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2007-2018 Open Information Security Foundation
++/* Copyright (C) 2007-2021 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -40,6 +40,7 @@
+ #include "detect-engine-mpm.h"
+ #include "detect-engine-state.h"
+ #include "detect-engine-prefilter.h"
++#include "detect-engine-content-inspection.h"
+ #include "detect-content.h"
+ #include "detect-pcre.h"
+ 
+@@ -67,11 +68,12 @@ static void DetectHttpClientBodySetupCallback(const DetectEngineCtx *de_ctx,
+                                               Signature *s);
+ static int g_http_client_body_buffer_id = 0;
+ 
+-static InspectionBuffer *HttpClientBodyGetDataCallback(
+-        DetectEngineThreadCtx *det_ctx,
+-        const DetectEngineTransforms *transforms,
+-        Flow *f, const uint8_t flow_flags,
+-        void *txv, const int list_id);
++static int DetectEngineInspectBufferHttpBody(DetectEngineCtx *de_ctx,
++        DetectEngineThreadCtx *det_ctx, const DetectEngineAppInspectionEngine *engine,
++        const Signature *s, Flow *f, uint8_t flags, void *alstate, void *txv, uint64_t tx_id);
++
++static int PrefilterMpmHttpRequestBodyRegister(DetectEngineCtx *de_ctx, SigGroupHead *sgh,
++        MpmCtx *mpm_ctx, const DetectBufferMpmRegistery *mpm_reg, int list_id);
+ 
+ /**
+  * \brief Registers the keyword handlers for the "http_client_body" keyword.
+@@ -99,11 +101,10 @@ void DetectHttpClientBodyRegister(void)
+     sigmatch_table[DETECT_HTTP_REQUEST_BODY].flags |= SIGMATCH_INFO_STICKY_BUFFER;
+ 
+     DetectAppLayerInspectEngineRegister2("http_client_body", ALPROTO_HTTP1, SIG_FLAG_TOSERVER,
+-            HTP_REQUEST_BODY, DetectEngineInspectBufferGeneric, HttpClientBodyGetDataCallback);
++            HTP_REQUEST_BODY, DetectEngineInspectBufferHttpBody, NULL);
+ 
+     DetectAppLayerMpmRegister2("http_client_body", SIG_FLAG_TOSERVER, 2,
+-            PrefilterGenericMpmRegister, HttpClientBodyGetDataCallback, ALPROTO_HTTP1,
+-            HTP_REQUEST_BODY);
++            PrefilterMpmHttpRequestBodyRegister, NULL, ALPROTO_HTTP1, HTP_REQUEST_BODY);
+ 
+     DetectBufferTypeSetDescriptionByName("http_client_body",
+             "http request body");
+@@ -172,17 +173,44 @@ static inline HtpBody *GetRequestBody(htp_tx_t *tx)
+     return &htud->request_body;
+ }
+ 
+-static InspectionBuffer *HttpClientBodyGetDataCallback(DetectEngineThreadCtx *det_ctx,
+-        const DetectEngineTransforms *transforms,
+-        Flow *f, const uint8_t flow_flags,
+-        void *txv, const int list_id)
++typedef struct PrefilterMpmHttpRequestBody {
++    int list_id;
++    int base_list_id;
++    const MpmCtx *mpm_ctx;
++    const DetectEngineTransforms *transforms;
++} PrefilterMpmHttpRequestBody;
++
++static void PrefilterMpmHttpRequestBodyFree(void *ptr)
+ {
+-    SCEnter();
++    SCFree(ptr);
++}
+ 
++static inline InspectionBuffer *HttpRequestBodyXformsGetDataCallback(DetectEngineThreadCtx *det_ctx,
++        const DetectEngineTransforms *transforms, const int list_id, InspectionBuffer *base_buffer)
++{
+     InspectionBuffer *buffer = InspectionBufferGet(det_ctx, list_id);
+     if (buffer->inspect != NULL)
+         return buffer;
+ 
++    InspectionBufferSetup(det_ctx, list_id, buffer, base_buffer->inspect, base_buffer->inspect_len);
++    buffer->inspect_offset = base_buffer->inspect_offset;
++    InspectionBufferApplyTransforms(buffer, transforms);
++    SCLogDebug("xformed buffer %p size %u", buffer, buffer->inspect_len);
++    SCReturnPtr(buffer, "InspectionBuffer");
++}
++
++static InspectionBuffer *HttpRequestBodyGetDataCallback(DetectEngineThreadCtx *det_ctx,
++        const DetectEngineTransforms *transforms, Flow *f, const uint8_t flow_flags, void *txv,
++        const int list_id, const int base_id)
++{
++    SCEnter();
++
++    InspectionBuffer *buffer = InspectionBufferGet(det_ctx, base_id);
++    if (base_id != list_id && buffer->inspect != NULL)
++        return HttpRequestBodyXforms

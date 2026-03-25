@@ -1,0 +1,115 @@
+@@ -309,12 +309,38 @@ static bool __syncDebugMaps(RCore *core) {
+ 	return false;
+ }
+ 
++static char *callat(RCore *core, ut64 addr, const char *cmd) {
++	r_return_val_if_fail (core && core->cons, NULL);
++	r_cons_push ();
++	core->cons->context->noflush = true;
++	core->cons->context->cmd_str_depth++;
++	if (cmd && r_core_cmd_call_at (core, addr, cmd) == -1) {
++		//eprintf ("Invalid command: %s\n", cmd);
++		if (--core->cons->context->cmd_str_depth == 0) {
++			core->cons->context->noflush = false;
++			r_cons_flush ();
++		}
++		r_cons_pop ();
++		return NULL;
++	}
++	if (--core->cons->context->cmd_str_depth == 0) {
++		core->cons->context->noflush = false;
++	}
++	r_cons_filter ();
++	const char *static_str = r_cons_get_buffer ();
++	char *retstr = strdup (r_str_get (static_str));
++	r_cons_pop ();
++	r_cons_echo (NULL);
++	return retstr;
++}
++
+ R_API int r_core_bind(RCore *core, RCoreBind *bnd) {
+ 	bnd->core = core;
+ 	bnd->bphit = (RCoreDebugBpHit)r_core_debug_breakpoint_hit;
+ 	bnd->syshit = (RCoreDebugSyscallHit)r_core_debug_syscall_hit;
+ 	bnd->cmd = (RCoreCmd)r_core_cmd0;
+ 	bnd->cmdf = (RCoreCmdF)r_core_cmdf;
++	bnd->callat = (RCoreCallAt)callat;
+ 	bnd->cmdstr = (RCoreCmdStr)r_core_cmd_str;
+ 	bnd->cmdstrf = (RCoreCmdStrF)r_core_cmd_strf;
+ 	bnd->help = (RCoreBindHelp)core_help;
+@@ -3184,7 +3210,8 @@ R_API bool r_core_init(RCore *core) {
+ 	// We save the old num ad user, in order to restore it after free
+ 	core->lang = r_lang_new ();
+ 	core->lang->cmd_str = (char *(*)(void *, const char *))r_core_cmd_str;
+-	core->lang->cmdf = (int (*)(void *, const char *, ...))r_core_cmdf;
++	core->lang->cmdf = (RCoreCmdF)r_core_cmdf;
++	core->lang->call_at = (RCoreCallAtCallback) callat;
+ 	r_core_bind_cons (core);
+ 	core->table = NULL;
+ 	core->lang->cb_printf = r_cons_printf;
+
+
+
+
+@@ -13,6 +13,7 @@ typedef const char * const RCoreHelpMessage[];
+ 
+ typedef int (*RCoreCmd)(void *core, const char *cmd);
+ typedef int (*RCoreCmdF)(void *user, const char *fmt, ...);
++typedef char *(*RCoreCallAt)(void *user, ut64 addr, const char *cmd);
+ typedef int (*RCoreDebugBpHit)(void *core, void *bp);
+ typedef void (*RCoreDebugSyscallHit)(void *core);
+ typedef char* (*RCoreCmdStr)(void *core, const char *cmd);
+@@ -34,6 +35,7 @@ typedef struct r_core_bind_t {
+ 	void *core;
+ 	RCoreCmd cmd;
+ 	RCoreCmdF cmdf;
++	RCoreCallAt callat;
+ 	RCoreCmdStr cmdstr; // should be cmdStr if we care about snake
+ 	RCoreCmdStrF cmdstrf;
+ 	RCoreBindHelp help;
+
+
+
+
+@@ -486,6 +486,7 @@ R_API void r_core_cmd_queue_wait(RCore *core);
+ R_API void r_core_cmd_init(RCore *core);
+ R_API char *r_core_cmd_str_at(RCore *core, ut64 addr, const char *cmd);
+ R_API int r_core_cmd_call_at(RCore *core, ut64 addr, const char *cmd);
++R_API char *r_core_cmd_call_str_at(RCore *core, ut64 addr, const char *cmd);
+ R_API int r_core_cmd_call(RCore *core, const char *cmd);
+ R_API int r_core_cmd_callf(RCore *core, const char *cmd, ...);
+ R_API int r_core_cmd_pipe(RCore *core, char *radare_cmd, char *shell_cmd);
+
+
+
+
+@@ -12,6 +12,7 @@ R_LIB_VERSION_HEADER(r_lang);
+ 
+ typedef char* (*RCoreCmdStrCallback)(void* core, const char *s);
+ typedef int (*RCoreCmdfCallback)(void* core, const char *s, ...);
++typedef char *(*RCoreCallAtCallback)(void* core, ut64 addr, const char *s);
+ 
+ typedef struct r_lang_t {
+ 	void *user;
+@@ -20,6 +21,7 @@ typedef struct r_lang_t {
+ 	PrintfCallback cb_printf;
+ 	RCoreCmdStrCallback cmd_str;
+ 	RCoreCmdfCallback cmdf;
++	RCoreCallAtCallback call_at;
+ 	RList *sessions;
+ 	struct r_lang_session_t *session;
+ } RLang;
+
+
+
+
+@@ -393,6 +393,25 @@ static JSValue r2cmd(JSContext *ctx, JSValueConst this_val, int argc, JSValueCon
+ 	return JS_NewString (ctx, r_str_get (ret));
+ }
+ 
++static JSValue r2callAt(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
++	if (argc != 2 || !JS_IsString (argv[0]) || (!JS_IsString (argv[1]) && !JS_IsNumber (argv[1]))) {
++		return JS_ThrowRangeError (ctx, "r2.callAt takes two strings");
++	}
++	JSRuntime *rt = JS_GetRuntime (ctx);
++	QjsPluginManager *pm = JS_GetRuntimeOpaque (rt)

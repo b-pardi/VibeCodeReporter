@@ -1,0 +1,83 @@
+@@ -34,6 +34,16 @@ SHARED_OPTS = [
+     cfg.StrOpt('etcd_ca_cert_file',
+                help="The path to the TLS CA certificate file to use with "
+                     "etcd."),
++    cfg.StrOpt('etcd_username',
++               help="User name for accessing an etcd cluster with "
++                    "authentication enabled."),
++    cfg.StrOpt('etcd_password',
++               help="Password for accessing an etcd cluster with "
++                    "authentication enabled."),
++    # Large etcd subtree snapshot reads can take time, hence the
++    # default of 60 seconds here as opposed to something much shorter.
++    cfg.IntOpt('etcd_timeout', default=60,
++               help="Timeout (in seconds) for etcd requests."),
+     cfg.StrOpt('openstack_region',
+                help="When in a multi-region OpenStack deployment, a unique "
+                     "name for the region that this node (controller or "
+
+
+
+
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-# Copyright (c) 2018 Tigera, Inc. All rights reserved.
++# Copyright (c) 2018-2019 Tigera, Inc. All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -394,6 +394,93 @@ def logging_exceptions(fn):
+ _client = None
+ 
+ 
++# Wrap Etcd3Client to authenticate when needed and add an
++# Authorization header to the session headers.
++#
++# All of networking-calico's etcd operations go through either (1)
++# etcd3gw.client.Etcd3Client.post, or (2) etcd3gw.watch.Watcher.
++# Here, we hook (1) so as to authenticate when the normal POST request
++# fails; then we add the returned auth token as an Authorization
++# header on the underlying session.  Adding that header to the session
++# means that it will apply to etcd3gw.watch.Watcher, as well as to
++# POST requests for all non-watch operations.
++#
++# The question arises what happens if we do a watch operation before
++# there is correct Authorization on the session?  Firstly this is
++# unlikely, because we always watch following a preceding get of the
++# same key or subtree; but it might still be possible if the etcd
++# server is restarted after the get and before the watch.  Secondly,
++# we handle the watch request failing and loop round to retry the get
++# again.  Overall, therefore, we are safe on this point.
++class Etcd3AuthClient(Etcd3Client):
++    def __init__(self, host='localhost', port=2379, protocol="http",
++                 ca_cert=None, cert_key=None, cert_cert=None, timeout=None,
++                 username=None, password=None):
++        super(Etcd3AuthClient, self).__init__(host=host,
++                                              port=port,
++                                              protocol=protocol,
++                                              ca_cert=ca_cert,
++                                              cert_key=cert_key,
++                                              cert_cert=cert_cert,
++                                              timeout=timeout)
++        self.username = username
++        self.password = password
++
++    def authenticate(self):
++        # When authenticating, there mustn't be an Authorization
++        # header with an old token, or else etcd responds with
++        # "Unauthorized: invalid auth token".  So remove any existing
++        # Authorization header.
++        if 'Authorization' in self.session.headers:
++            del self.session.headers['Authorization']
++
++        # Send authenticate request.  If this raises an exception,
++        # e.g. because of a connectivity issue to the etcd server,
++        # it's OK for that to bubble up and be handled in the code
++        # that called post.
++        response = super(Etcd3AuthClient, self).post(
++            self.get_url('/auth/authenticate'),
++            json={"name": self.username, "password": self.password}
++        )
++
++        # Add Authorization header with the received token to the
++        # underlying requests session.  This covers all subseque

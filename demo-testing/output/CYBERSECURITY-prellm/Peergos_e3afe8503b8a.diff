@@ -1,0 +1,91 @@
+@@ -358,8 +358,7 @@ public class MultiUserTests {
+         String friendsPathToFile = u1.username + "/" + filename;
+         Optional<FileWrapper> priorUnsharedView = userToUnshareWith.getByPath(friendsPathToFile).get();
+         AbsoluteCapability priorPointer = priorUnsharedView.get().getPointer().capability;
+-        Location priorLocation = priorPointer.getLocation();
+-        CryptreeNode priorFileAccess = network.getMetadata(priorLocation).get().get();
++        CryptreeNode priorFileAccess = network.getMetadata(priorPointer).get().get();
+         SymmetricKey priorMetaKey = priorFileAccess.getMetaKey(priorPointer.rBaseKey);
+ 
+         // unshare with a single user
+@@ -373,7 +372,7 @@ public class MultiUserTests {
+         Optional<FileWrapper> unsharedView = userToUnshareWith.getByPath(friendsPathToFile).get();
+         String friendsNewPathToFile = u1.username + "/" + newname;
+         Optional<FileWrapper> unsharedView2 = userToUnshareWith.getByPath(friendsNewPathToFile).get();
+-        CryptreeNode fileAccess = network.getMetadata(priorLocation).get().get();
++        CryptreeNode fileAccess = network.getMetadata(priorPointer).get().get();
+         try {
+             // check we are trying to decrypt the correct thing
+             PaddedCipherText priorPropsCipherText = PaddedCipherText.fromCbor(((CborObject.CborList) priorFileAccess.toCbor()).value.get(4));
+
+
+
+
+@@ -5,6 +5,7 @@ import peergos.shared.io.ipfs.multihash.*;
+ import peergos.shared.io.ipfs.cid.*;
+ 
+ import java.util.*;
++import java.util.concurrent.*;
+ import java.util.function.*;
+ 
+ public class MaybeMultihash implements Cborable {
+@@ -28,6 +29,12 @@ public class MaybeMultihash implements Cborable {
+         return hash;
+     }
+ 
++    public CompletableFuture<Boolean> ifPresent(Function<Multihash, CompletableFuture<Boolean>> con) {
++        if (isPresent())
++            con.apply(hash);
++        return CompletableFuture.completedFuture(true);
++    }
++
+     public String toString() {
+         return hash != null ? hash.toString() : "EMPTY";
+     }
+
+
+
+
+@@ -364,10 +364,16 @@ public class NetworkAccess {
+                 .thenApply(res -> metadata.committedHash().get());
+     }
+ 
+-    public CompletableFuture<Optional<CryptreeNode>> getMetadata(Location loc) {
+-        if (loc == null)
+-            return CompletableFuture.completedFuture(Optional.empty());
+-        return tree.get(loc.owner, loc.writer, loc.getMapKey()).thenCompose(blobHash -> {
++    public CompletableFuture<Boolean> deleteChunkIfPresent(PublicKeyHash owner,
++                                                             SigningPrivateKeyAndPublicHash writer,
++                                                             byte[] mapKey,
++                                                             TransactionId tid) {
++        return tree.get(owner, writer.publicKeyHash, mapKey)
++                .thenCompose(valueHash -> valueHash.ifPresent(h -> tree.remove(owner, writer, mapKey, valueHash, tid)));
++    }
++
++    public CompletableFuture<Optional<CryptreeNode>> getMetadata(AbsoluteCapability cap) {
++        return tree.get(cap.owner, cap.writer, cap.getMapKey()).thenCompose(blobHash -> {
+             if (!blobHash.isPresent())
+                 return CompletableFuture.completedFuture(Optional.empty());
+             return dhtClient.get(blobHash.get())
+
+
+
+
+@@ -65,6 +65,10 @@ public class AbsoluteCapability implements Cborable {
+                 .collect(Collectors.joining("/", "#", ""));
+     }
+ 
++    public static AbsoluteCapability build(Location loc, SymmetricKey key) {
++        return new AbsoluteCapability(loc.owner, loc.writer, loc.getMapKey(), key);
++    }
++
+     public static AbsoluteCapability fromLink(String keysString) {
+         if (keysString.startsWith("#"))
+             keysString = keysString.substring(1);
+
+
+
+
+@@ -43,9 +43,10 @@ public class EncryptedChunkRetriever implements FileRetriever {
+                                                   Location ourLocation,
+                     

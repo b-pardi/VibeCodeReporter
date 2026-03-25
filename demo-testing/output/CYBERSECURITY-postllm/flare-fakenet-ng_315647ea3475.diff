@@ -1,0 +1,102 @@
+@@ -6,6 +6,7 @@ import sys
+ import time
+ import dpkt
+ import signal
++import jinja2
+ import socket
+ import logging
+ import threading
+@@ -90,9 +91,14 @@ class DivertParms(object):
+         Returns:
+             True if this pair of endpoints hasn't conversed before, else False
+         """
+-        return not (self.diverter.sessions.get(self.pkt.sport) ==
+-                    (self.pkt.dst_ip, self.pkt.dport))
++        # sessions.get returns (dst_ip, dport, pid, comm, dport0, proto) or
++        # None. We just want dst_ip and dport for comparison.
++        session = self.diverter.sessions.get(self.pkt.sport)
++        if session is None:
++            return True
+ 
++        return not ((session.dst_ip, session.dport) ==
++                        (self.pkt.dst_ip, self.pkt.dport))
+ 
+ class DiverterPerOSDelegate(object, metaclass=abc.ABCMeta):
+     """Delegate class for OS-specific methods that FakeNet-NG implementors must
+@@ -534,6 +540,18 @@ class DiverterBase(fnconfig.Config):
+         self.logger = logging.getLogger('Diverter')
+         self.logger.setLevel(logging_level)
+ 
++        # Network Based Indicators
++        self.nbis = {}
++
++        # Index remote Process IDs for MultiHost operations
++        self.remote_pid_counter = 0
++        
++        # Maps Proxy initiated source ports to original source ports
++        self.proxy_sport_to_orig_sport_map = {}
++
++        # Maps (proxy_sport, orig_sport) to pkt SSL encryption
++        self.is_proxied_pkt_ssl_encrypted = {}
++
+         # Rate limiting for displaying pid/comm/proto/IP/port
+         self.last_conn = None
+ 
+@@ -683,6 +701,8 @@ class DiverterBase(fnconfig.Config):
+ 
+     def stop(self):
+         self.logger.info('Stopping...')
++        self.prettyPrintNbi()
++        self.generate_html_report()
+         return self.stopCallback()
+ 
+     @abc.abstractmethod
+@@ -1761,7 +1781,11 @@ class DiverterBase(fnconfig.Config):
+         Returns:
+             None
+         """
+-        self.sessions[pkt.sport] = (pkt.dst_ip, pkt.dport)
++        session = namedtuple('session', ['dst_ip', 'dport', 'pid',
++                                         'comm', 'dport0', 'proto'])
++        pid, comm = self.get_pid_comm(pkt)
++        self.sessions[pkt.sport] = session(pkt.dst_ip, pkt.dport, pid,
++                                           comm, pkt._dport0, pkt.proto)
+ 
+     def maybeExecuteCmd(self, pkt, pid, comm):
+         """Execute any ExecuteCmd associated with this port/listener.
+@@ -1782,3 +1806,207 @@ class DiverterBase(fnconfig.Config):
+             self.logger.info('Executing command: %s' % (execCmd))
+             self.execute_detached(execCmd)
+ 
++    def mapProxySportToOrigSport(self, proto, orig_sport, proxy_sport,
++            is_ssl_encrypted):
++        """Maps Proxy initiated source ports to their original source ports.
++
++        The Proxy listener uses this method to notify the diverter about the
++        proxy originated source port for the original source port. It also
++        notifies if the packet uses SSL encryption.
++
++        Args:
++            proto: str protocol of socket created by ProxyListener
++            orig_sport: int source port that originated the packet
++            proxy_sport: int source port initiated by Proxy listener
++            is_ssl_encrypted: bool is the packet SSL encrypted or not
++
++        Returns:
++            None
++        """
++        self.proxy_sport_to_orig_sport_map[(proto, proxy_sport)] = orig_sport
++        self.is_proxied_pkt_ssl_encrypted[(proto, proxy_sport)] = is_ssl_encrypted
++
++    def logNbi(self, sport, nbi, proto, application_layer_proto,
++            is_ssl_encrypted):
++        """Collects the NBIs from all listeners into a dictionary.
++
++        All listeners (currently only HTTPListener) use this
++        method to notify the diverter about any NBI captured
++        within their scope.
++
++        Args:
++            sport: int port bound by listener
++            nbi: dict NBI captured within the listener
++            proto: str p

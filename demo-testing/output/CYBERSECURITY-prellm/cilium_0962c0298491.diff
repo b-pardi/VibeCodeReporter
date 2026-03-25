@@ -1,0 +1,119 @@
+@@ -422,14 +422,17 @@ static __always_inline int snat_v4_rewrite_ingress(struct __ctx_buff *ctx,
+ }
+ 
+ static __always_inline bool snat_v4_can_skip(const struct ipv4_nat_target *target,
+-					     const struct ipv4_ct_tuple *tuple, int dir)
++					     const struct ipv4_ct_tuple *tuple, int dir,
++					     bool from_endpoint)
+ {
+ 	__u16 dport = bpf_ntohs(tuple->dport), sport = bpf_ntohs(tuple->sport);
+ 
+-	if (dir == NAT_DIR_EGRESS && !target->src_from_world && sport < NAT_MIN_EGRESS)
++	if (dir == NAT_DIR_EGRESS && !from_endpoint && !target->src_from_world
++	    && sport < NAT_MIN_EGRESS)
+ 		return true;
+ 	if (dir == NAT_DIR_INGRESS && (dport < target->min_port || dport > target->max_port))
+ 		return true;
++
+ 	return false;
+ }
+ 
+@@ -483,7 +486,8 @@ static __always_inline __maybe_unused int snat_v4_create_dsr(struct __ctx_buff *
+ }
+ 
+ static __always_inline __maybe_unused int snat_v4_process(struct __ctx_buff *ctx, int dir,
+-					   const struct ipv4_nat_target *target)
++						const struct ipv4_nat_target *target,
++						bool from_endpoint)
+ {
+ 	struct icmphdr icmphdr __align_stack_8;
+ 	struct ipv4_nat_entry *state, tmp;
+@@ -533,7 +537,7 @@ static __always_inline __maybe_unused int snat_v4_process(struct __ctx_buff *ctx
+ 		return NAT_PUNT_TO_STACK;
+ 	};
+ 
+-	if (snat_v4_can_skip(target, &tuple, dir))
++	if (snat_v4_can_skip(target, &tuple, dir, from_endpoint))
+ 		return NAT_PUNT_TO_STACK;
+ 	ret = snat_v4_handle_mapping(ctx, &tuple, &state, &tmp, dir, off, target);
+ 	if (ret > 0)
+@@ -549,7 +553,8 @@ static __always_inline __maybe_unused int snat_v4_process(struct __ctx_buff *ctx
+ static __always_inline __maybe_unused
+ int snat_v4_process(struct __ctx_buff *ctx __maybe_unused,
+ 		    int dir __maybe_unused,
+-		    const struct ipv4_nat_target *target __maybe_unused)
++		    const struct ipv4_nat_target *target __maybe_unused,
++		    bool from_endpoint __maybe_unused)
+ {
+ 	return CTX_ACT_OK;
+ }
+
+
+
+
+@@ -698,7 +698,9 @@ static __always_inline bool nodeport_uses_dsr4(const struct ipv4_ct_tuple *tuple
+ }
+ 
+ static __always_inline bool nodeport_nat_ipv4_needed(struct __ctx_buff *ctx,
+-						     __be32 addr, int dir)
++						     __be32 addr, int dir,
++						     bool *from_endpoint __maybe_unused,
++						     const bool encap __maybe_unused)
+ {
+ 	void *data, *data_end;
+ 	struct iphdr *ip4;
+@@ -713,24 +715,69 @@ static __always_inline bool nodeport_nat_ipv4_needed(struct __ctx_buff *ctx,
+ 	 * overlapping tuples, e.g. applications in hostns reusing
+ 	 * source IPs we SNAT in node-port.
+ 	 */
+-	if (dir == NAT_DIR_EGRESS)
+-		return ip4->saddr == addr;
+-	else
++	if (dir == NAT_DIR_EGRESS) {
++		if (ip4->saddr == addr) {
++			return true;
++		}
++#ifdef ENABLE_MASQUERADE
++		struct endpoint_info *ep;
++
++		/* Do not MASQ when this function is executed from bpf_overlay
++		 * (encap=true denotes this fact). Otherwise, a packet will be
++		 * SNAT'd to cilium_host IP addr. */
++		if (encap)
++			return false;
++
++		if ((ep = __lookup_ip4_endpoint(ip4->saddr)) != NULL &&
++		    !(ep->flags & ENDPOINT_F_HOST)) {
++			struct remote_endpoint_info *info;
++			*from_endpoint = true;
++			info = ipcache_lookup4(&IPCACHE_MAP, ip4->daddr,
++					       V4_CACHE_KEY_LEN);
++			if (info != NULL) {
++				if (info->sec_label == WORLD_ID)
++					return true;
++#ifdef ENCAP_IFINDEX
++				/* In the tunnel mode, a packet from a local ep
++				 * to a remote node is not encap'd, and is sent
++				 * via a native dev. Therefore, such packet has
++				 * to be MASQ'd. Otherwise, it might be dropped
++				 * either by underlying network (e.g. AWS drops
++				 * packets by default from unknown subnets) or
++				 * by the remote node if its native dev's
++				 * rp_filter=1. */
++				if (info->sec_label == REMOTE_NODE_ID)
++					return true;
++#endif
++			}
++		}
++#endif /*ENABLE_MASQUERADE */
++
++		return false;
++	} else {
+ 		return ip4->daddr == addr;
++	}
+ }
+ 
+ static __always_inline int nodeport_nat_ipv4_fwd(struct __ctx_buff *ctx,
+-						 const __be32 addr)
++						 const __be32 addr,
++						 const bo

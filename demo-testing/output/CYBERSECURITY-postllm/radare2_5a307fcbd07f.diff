@@ -1,0 +1,149 @@
+@@ -21,7 +21,7 @@ R_LIB_VERSION_HEADER (r_lib);
+ #define R_LIB_SYMNAME "radare_plugin"
+ #define R_LIB_SYMFUNC "radare_plugin_function"
+ 
+-#define R2_ABIVERSION 16
++#define R2_ABIVERSION 17
+ #define R2_VERSION_ABI R2_ABIVERSION
+ 
+ #define R_LIB_ENV "R2_LIBR_PLUGINS"
+
+
+
+
+@@ -19,7 +19,8 @@ typedef enum {
+ 	R_TYPE_STRUCT = 2,
+ 	R_TYPE_UNION = 3,
+ 	R_TYPE_TYPEDEF = 4,
+-	R_TYPE_CLASS = 5
++	R_TYPE_FUNCTION = 5,
++	R_TYPE_CLASS = 6
+ } RTypeKind;
+ 
+ R_API bool r_type_set(Sdb *TDB, ut64 at, const char *field, ut64 val);
+
+
+
+
+@@ -64,10 +64,12 @@ R_API bool r_strbuf_copy(RStrBuf *dst, RStrBuf *src) {
+ 		dst->ptr = p;
+ 		dst->ptrlen = src->ptrlen;
+ 	} else {
++		dst->ptrlen = 0;
+ 		R_FREE (dst->ptr);
+ 		memcpy (dst->buf, src->buf, sizeof (dst->buf));
+ 	}
+ 	dst->len = src->len;
++	dst->weakref = false;
+ 	return true;
+ }
+ 
+@@ -466,7 +468,7 @@ R_API bool r_strbuf_replace(RStrBuf *sb, const char *key, const char *val) {
+ 		return false;
+ 	}
+ 	free (r_strbuf_drain_nofree (sb));
+-	return r_strbuf_setptr (sb, tmp, 0);
++	return r_strbuf_setptr (sb, tmp, -1);
+ }
+ 
+ R_API bool r_strbuf_replacef(RStrBuf *sb, const char *key, const char *fmt, ...) {
+@@ -495,7 +497,7 @@ R_API bool r_strbuf_replacef(RStrBuf *sb, const char *key, const char *fmt, ...)
+ 		return false;
+ 	}
+ 	free (r_strbuf_drain_nofree (sb));
+-	return r_strbuf_setptr (sb, tmp, 0);
++	return r_strbuf_setptr (sb, tmp, -1);
+ }
+ 
+ R_API void r_strbuf_free(RStrBuf *sb) {
+
+
+
+
+@@ -38,6 +38,9 @@ R_API RTypeKind r_type_kind(Sdb *TDB, const char *name) {
+ 	if (!strcmp (type, "union")) {
+ 		return R_TYPE_UNION;
+ 	}
++	if (!strcmp (type, "func")) {
++		return R_TYPE_FUNCTION;
++	}
+ 	if (!strcmp (type, "type")) {
+ 		return R_TYPE_BASIC;
+ 	}
+@@ -95,22 +98,22 @@ R_API char *r_type_enum_member(Sdb *TDB, const char *name, const char *member, u
+ 		? r_str_newf ("enum.%s.%s", name, member)
+ 		: r_str_newf ("enum.%s.0x%" PFMT64x, name, val);
+ 	char *res = sdb_get (TDB, q, 0);
++	free (q);
+ 	if (!res) {
+ 		q = r_str_newf ("enum.%s.%" PFMT64d, name, val);
+ 		res = sdb_get (TDB, q, 0);
++		free (q);
+ 	}
+-	free (q);
+ 	return res;
+ }
+ 
+ R_API char *r_type_enum_getbitfield(Sdb *TDB, const char *name, ut64 val) {
+-	int i;
+-
+ 	if (r_type_kind (TDB, name) != R_TYPE_ENUM) {
+ 		return NULL;
+ 	}
+ 	bool isFirst = true;
+ 	RStrBuf *sb = r_strbuf_newf ("0x%08" PFMT64x " : ", val);
++	int i;
+ 	for (i = 0; i < 32; i++) {
+ 		ut32 n = 1ULL << i;
+ 		if (! (val & n)) {
+@@ -141,13 +144,13 @@ R_API ut64 r_type_get_bitsize(Sdb *TDB, const char *type) {
+ 	} else if (r_str_startswith (type, "union ")) {
+ 		tmptype = type + strlen ("union ");
+ 	}
+-	if ( (strstr (type, "*(") || strstr (type, " *")) && !r_str_startswith (type, "char *")) {
++	if ((strstr (type, "*(") || strstr (type, " *")) && strcmp (type, "char *")) {
+ 		return 32;
+ 	}
+ 	const char *t = sdb_const_get (TDB, tmptype, 0);
+ 	if (!t) {
+ 		if (r_str_startswith (tmptype, "enum ")) {
+-			// XXX: Need a proper way to determine size of enum
++			//XXX: Need a proper way to determine size of enum
+ 			return 32;
+ 		}
+ 		return 0;
+@@ -160,10 +163,11 @@ R_API ut64 r_type_get_bitsize(Sdb *TDB, const char *type) {
+ 	}
+ 	if (!strcmp (t, "struct") || !strcmp (t, "union")) {
+ 		char *query = r_str_newf ("%s.%s", t, tmptype);
+-		ut64 ret = 0;
+ 		char *members = sdb_get (TDB, query, 0);
++		free (query);
++		char *next, *ptr = members;
++		ut64 ret = 0;
+ 		if (members) {
+-			char *next, *ptr = members;
+ 			do {
+ 				char *name = sdb_anext (ptr, &next);
+ 				if (!name) {
+@@ -198,7 +202,6 @@ R_API ut64 r_type_get_bitsize(Sdb *TDB, const char *type) {
+ 			} while (next);
+ 			free (members);
+ 		}
+-		free (query);
+ 		return ret;
+ 	}
+ 	return 0;
+@@ -302,7 +305,6 @@ R_API RList *r_type_get_by_offset(Sdb *TDB, ut64 offset) {
+ 	return offtypes;
+ }
+ 
+-// XXX 12 is the maxstructsizedelta
+ #define TYPE_RANGE_BASE(x) ( (x) >> 16)
+ 
+ static RList *types_range_list(Sdb *db, ut64 addr) {
+@@ -334,32 +336,37 @@ static void types_range_add(Sdb *db, ut64 addr) {
+ }
+ 
+ R_API char *r_type_link_at(Sdb *TDB, ut64 addr) {
+-	if (a

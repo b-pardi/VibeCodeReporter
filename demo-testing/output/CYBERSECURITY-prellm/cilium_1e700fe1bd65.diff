@@ -1,0 +1,159 @@
+@@ -131,10 +131,12 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
+ 		return DROP_INVALID;
+ 
+ #ifdef ENABLE_NODEPORT
+-	if (!bpf_skip_nodeport(ctx)) {
+-		ret = nodeport_lb6(ctx, srcid_from_proxy);
+-		if (ret < 0)
+-			return ret;
++	if (ctx_get_xfer(ctx) != XFER_PKT_NO_SVC) {
++		if (!bpf_skip_nodeport(ctx)) {
++			ret = nodeport_lb6(ctx, srcid_from_proxy);
++			if (ret < 0)
++				return ret;
++		}
+ 	}
+ #if defined(ENCAP_IFINDEX) || defined(NO_REDIRECT)
+ 	/* See IPv4 case for NO_REDIRECT comments */
+@@ -319,10 +321,12 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
+ 		return DROP_INVALID;
+ 
+ #ifdef ENABLE_NODEPORT
+-	if (!bpf_skip_nodeport(ctx)) {
+-		int ret = nodeport_lb4(ctx, srcid_from_proxy);
+-		if (ret < 0)
+-			return ret;
++	if (ctx_get_xfer(ctx) != XFER_PKT_NO_SVC) {
++		if (!bpf_skip_nodeport(ctx)) {
++			int ret = nodeport_lb4(ctx, srcid_from_proxy);
++			if (ret < 0)
++				return ret;
++		}
+ 	}
+ #if defined(ENCAP_IFINDEX) || defined(NO_REDIRECT)
+ 	/* We cannot redirect a packet to a local endpoint in the direct
+
+
+
+
+@@ -87,8 +87,16 @@ static __always_inline __maybe_unused int
+ bpf_xdp_exit(struct __ctx_buff *ctx, const int verdict)
+ {
+ 	/* Undo meta data, so GRO can perform natural aggregation. */
+-	if (verdict == CTX_ACT_OK)
+-		ctx_adjust_meta(ctx, META_PIVOT);
++	if (verdict == CTX_ACT_OK) {
++		__u32 meta_xfer = ctx_load_meta(ctx, XFER_MARKER);
++
++		/* We transfer data from XFER_MARKER. This specifically
++		 * does not break packet trains in GRO.
++		 */
++		ctx_adjust_meta(ctx, META_PIVOT - sizeof(__u32));
++		ctx_store_meta(ctx, 0, meta_xfer);
++	}
++
+ 	return verdict;
+ }
+ 
+@@ -230,6 +238,7 @@ static __always_inline int check_filters(struct __ctx_buff *ctx)
+ 	if (ctx_adjust_meta(ctx, -META_PIVOT))
+ 		return CTX_ACT_OK;
+ 
++	ctx_store_meta(ctx, XFER_MARKER, 0);
+ 	bpf_skip_nodeport_clear(ctx);
+ 
+ 	switch (proto) {
+
+
+
+
+@@ -17,8 +17,9 @@
+ #define CTX_ACT_DROP			XDP_DROP
+ #define CTX_ACT_TX			XDP_TX	/* hairpin only */
+ 
++					/* cb + RECIRC_MARKER + XFER_MARKER */
+ #define META_PIVOT			((int)(field_sizeof(struct __sk_buff, cb) + \
+-					       sizeof(__u32))) /* cb + RECIRC_MARKER */
++					       sizeof(__u32) * 2))
+ 
+ #define __CTX_OFF_MAX			0xff
+ 
+
+
+
+
+@@ -46,6 +46,9 @@
+ # endif
+ #endif
+ 
++/* XDP to SKB transferred meta data. */
++#define XFER_PKT_NO_SVC		1 /* Skip upper service handling. */
++
+ /* These are shared with test/bpf/check-complexity.sh, when modifying any of
+  * the below, that script should also be updated. */
+ #define CILIUM_CALL_DROP_NOTIFY			1
+
+
+
+
+@@ -498,6 +498,8 @@ static __always_inline int nodeport_lb6(struct __ctx_buff *ctx,
+ 		if (svc)
+ 			return DROP_IS_CLUSTER_IP;
+ 
++		ctx_set_xfer(ctx, XFER_PKT_NO_SVC);
++
+ 		if (nodeport_uses_dsr6(&tuple)) {
+ 			return CTX_ACT_OK;
+ 		} else {
+@@ -1061,6 +1063,8 @@ static __always_inline int nodeport_lb4(struct __ctx_buff *ctx,
+ 		if (svc)
+ 			return DROP_IS_CLUSTER_IP;
+ 
++		ctx_set_xfer(ctx, XFER_PKT_NO_SVC);
++
+ 		if (nodeport_uses_dsr4(&tuple)) {
+ 			return CTX_ACT_OK;
+ 		} else {
+
+
+
+
+@@ -106,4 +106,18 @@ ctx_skip_nodeport(struct __sk_buff *ctx __maybe_unused)
+ #endif
+ }
+ 
++static __always_inline __maybe_unused __u32 ctx_get_xfer(struct __sk_buff *ctx)
++{
++	__u32 *data_meta = ctx_data_meta(ctx);
++	void *data = ctx_data(ctx);
++
++	return !ctx_no_room(data_meta + 1, data) ? data_meta[0] : 0;
++}
++
++static __always_inline __maybe_unused void
++ctx_set_xfer(struct __sk_buff *ctx __maybe_unused, __u32 meta __maybe_unused)
++{
++	/* Only possible from XDP -> SKB. */
++}
++
+ #endif /* __LIB_OVERLOADABLE_SKB_H_ */
+
+
+
+
+@@ -52,7 +52,8 @@ redirect_self(struct xdp_md *ctx __maybe_unused)
+ #endif
+ }
+ 
+-#define RECIRC_MARKER	5
++#define RECIRC_MARKER	5 /* tail call recirculation */
++#define XFER_MARKER	6 /* xdp -> skb meta transfer */
+ 
+ static __always_inline __maybe_unused void
+ ctx_skip_nodeport_clear(struct xdp_md *ctx __maybe_unused)
+@@ -80,4 +81,16 @@ ctx_skip_nodeport(struct xdp_md *ctx __maybe_unused)
+ #endif
+ }
+ 
++static __always_inline __maybe_unused __u32
++

@@ -1,0 +1,101 @@
+@@ -33,9 +33,6 @@ from sys import version
+ import stat
+ import time
+ from collections import deque
+-import datetime
+-import dateutil
+-import dateutil.parser
+ import bareosfd
+ from bareosfd import *
+ 
+@@ -64,6 +61,14 @@ except ImportError as err_import:
+ except Exception as err_unknown:
+     bareosfd.JobMessage(bareosfd.M_FATAL, f"Unknown error {err_unknown}\n")
+ 
++NANOSECONDS_PER_SECOND = 1000 * 1000 * 1000
++# values smaller than this were definitely done without nanosecond support
++# for values larger than this we assume that you already used a version of
++# this plugin with ns support.
++# To avoid loading datetime just for this value we directly use the result.
++# int(datetime.datetime(2038,1,1).timestamp())
++LAST_BACKUP_TIME_WITH_SECONDS = 2145913200
++
+ 
+ def parse_row(row):
+     """
+@@ -81,6 +86,26 @@ def parse_row(row):
+     return [lsn, backup_label, tablespace]
+ 
+ 
++def convert_to_ns(data):
++    """
++    This function is used as a replacement when system doesn't have ns native support
++    in time and os function.
++    """
++    return int(data * NANOSECONDS_PER_SECOND)
++
++
++def current_time_ns():
++    """
++    unified function to return current time in ns
++    time.time_ns() exist since python 3.7 when no more supported
++    remove this function.
++    """
++    try:
++        return time.time_ns()
++    except AttributeError:
++        return convert_to_ns(time.time())
++
++
+ @BareosPlugin
+ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+     """
+@@ -162,7 +187,10 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         self.start_fast = False
+         self.stop_wait_wal_archive = True
+         self.switch_wal = True
++        # keep the timeout in sync with your PG checkpoint/archive timeout parameters
+         self.switch_wal_timeout = 60
++        self.wal_filename = None
++        self.wal_offset = None
+ 
+         # virtual files populates when using pg_backup_stop()
+         self.virtual_files = []
+@@ -186,7 +214,7 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         # We need to get the stat-packet in set_file_attributes() and use it again
+         # in end_restore_file(), and this may be mixed up with different files
+         self.stat_packets = {}
+-        self.last_lsn = 0
++        self.last_lsn = None
+         # True if backup level is Full
+         self.is_full_backup = False
+         # True between select pg_backup_start() and pg_backup_stop(). (while backing up
+@@ -195,7 +223,7 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         # We will store the `starttime` from `backup_label` here
+         self.backup_start_time = None
+         # PostgreSQL last backup stop time
+-        self.last_backup_stop_time = 0
++        self.last_backup_stop_time = None
+         # Our label, will be used as `backup label` in `select pg_start_backup()`
+         self.backup_label_string = ""
+         # Raw restore object data (json-string)
+@@ -213,7 +241,6 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         self.pg_major_version = None
+         self.last_pg_major = None
+         # TODO create support for external_config file
+-
+         self.statp = {}
+ 
+         if chr(self.level) == "D":
+@@ -250,6 +277,7 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+             for topdir, dirnames, filenames in os.walk(start_dir, topdown=True):
+                 # Usually Bareos takes care about timestamps when doing incremental backups
+                 # but there we have to compare against last BackupPostgreSQL finish timestamp.
++                # to ensure valid comparison we will handle microsecond
+ 
+                 # Filter out any ignored subdirectory
+                 dirnames[:] = [
+@@ -268,7 +296,7 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+                         try:
+                             # Avoid checking os.stat for Full we took them all.
+                             if chr(self.l

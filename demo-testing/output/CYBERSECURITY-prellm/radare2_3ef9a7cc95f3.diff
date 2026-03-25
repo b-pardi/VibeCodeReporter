@@ -1,0 +1,137 @@
+@@ -752,37 +752,43 @@ R_API RList *r_bin_get_libs(RBin *bin) {
+ 	return o ? o->libs : NULL;
+ }
+ 
+-R_API RList *r_bin_patch_relocs(RBin *bin) {
++static RList *relocs_rbtree2list(RBNode *root) {
++	RList *res = r_list_new ();
++	RBinReloc *reloc;
++	RBIter it;
++
++	r_rbtree_foreach (root, it, reloc, RBinReloc, vrb) {
++		r_list_append (res, reloc);
++	}
++	return res;
++}
++
++R_API RBNode *r_bin_patch_relocs(RBin *bin) {
+ 	r_return_val_if_fail (bin, NULL);
+-	static bool first = true;
+ 	RBinObject *o = r_bin_cur_object (bin);
+-	if (!o) {
+-		return NULL;
+-	}
+-	// r_bin_object_set_items set o->relocs but there we don't have access
+-	// to io
+-	// so we need to be run from bin_relocs, free the previous reloc and get
+-	// the patched ones
+-	if (first && o->plugin && o->plugin->patch_relocs) {
+-		RList *tmp = o->plugin->patch_relocs (bin);
+-		first = false;
+-		if (!tmp) {
+-			return o->relocs;
+-		}
+-		r_list_free (o->relocs);
+-		o->relocs = tmp;
+-		REBASE_PADDR (o, o->relocs, RBinReloc);
+-		first = false;
+-	}
+-	return o->relocs;
++	return o? r_bin_object_patch_relocs (bin, o): NULL;
++}
++
++// return a list of <const RBinReloc> that needs to be freed by the caller
++R_API RList *r_bin_patch_relocs_list(RBin *bin) {
++	r_return_val_if_fail (bin, NULL);
++	RBNode *root = r_bin_patch_relocs (bin);
++	return root? relocs_rbtree2list (root): NULL;
+ }
+ 
+-R_API RList *r_bin_get_relocs(RBin *bin) {
++R_API RBNode *r_bin_get_relocs(RBin *bin) {
+ 	r_return_val_if_fail (bin, NULL);
+ 	RBinObject *o = r_bin_cur_object (bin);
+ 	return o ? o->relocs : NULL;
+ }
+ 
++// return a list of <const RBinReloc> that needs to be freed by the caller
++R_API RList *r_bin_get_relocs_list(RBin *bin) {
++	r_return_val_if_fail (bin, NULL);
++	RBNode *root = r_bin_get_relocs (bin);
++	return root? relocs_rbtree2list (root): NULL;
++}
++
+ R_API RList *r_bin_get_sections(RBin *bin) {
+ 	r_return_val_if_fail (bin, NULL);
+ 	RBinObject *o = r_bin_cur_object (bin);
+
+
+
+
+@@ -29,6 +29,7 @@ R_IPI void r_bin_object_set_baddr(RBinObject *o, ut64 baddr);
+ R_IPI RBinObject *r_bin_object_new(RBinFile *binfile, RBinPlugin *plugin, ut64 baseaddr, ut64 loadaddr, ut64 offset, ut64 sz);
+ R_IPI RBinObject *r_bin_object_get_cur(RBin *bin);
+ R_IPI RBinObject *r_bin_object_find_by_arch_bits(RBinFile *binfile, const char *arch, int bits, const char *name);
++R_IPI RBNode *r_bin_object_patch_relocs(RBin *bin, RBinObject *o);
+ 
+ R_IPI const char *r_bin_lang_tostring(int lang);
+ R_IPI int r_bin_lang_type(RBinFile *binfile, const char *def, const char *sym);
+
+
+
+
+@@ -18,6 +18,22 @@ static void mem_free(void *data) {
+ 	free (mem);
+ }
+ 
++static int reloc_cmp(const void *a, const RBNode *b) {
++	const RBinReloc *ar = (const RBinReloc *)a;
++	const RBinReloc *br = container_of (b, const RBinReloc, vrb);
++	if (ar->vaddr > br->vaddr) {
++		return 1;
++	}
++	if (ar->vaddr < br->vaddr) {
++		return -1;
++	}
++	return 0;
++}
++
++static void reloc_free(RBNode *rbn) {
++	free (container_of (rbn, RBinReloc, vrb));
++}
++
+ static void object_delete_items(RBinObject *o) {
+ 	ut32 i = 0;
+ 	r_return_if_fail (o);
+@@ -26,7 +42,7 @@ static void object_delete_items(RBinObject *o) {
+ 	r_list_free (o->fields);
+ 	r_list_free (o->imports);
+ 	r_list_free (o->libs);
+-	r_list_free (o->relocs);
++	r_rbtree_free (o->relocs, reloc_free);
+ 	r_list_free (o->sections);
+ 	r_list_free (o->strings);
+ 	ht_up_free (o->strings_db);
+@@ -258,6 +274,17 @@ static void filter_classes(RBinFile *bf, RList *list) {
+ 	sdb_free (db);
+ }
+ 
++static RBNode *list2rbtree(RList *relocs) {
++	RListIter *it;
++	RBinReloc *reloc;
++	RBNode *res = NULL;
++
++	r_list_foreach (relocs, it, reloc) {
++		r_rbtree_insert (&res, reloc, &reloc->vrb, reloc_cmp);
++	}
++	return res;
++}
++
+ R_API int r_bin_object_set_items(RBinFile *binfile, RBinObject *o) {
+ 	RBinObject *old_o;
+ 	RBinPlugin *cp;
+@@ -351,8 +378,11 @@ R_API int r_bin_object_set_items(RBinFile *binfile, RBinObject *o) {
+ 	}
+ 	if (bin->filter_rules & (R_BIN_REQ_RELOCS | R_BIN_REQ_IMPORTS)) {
+ 		if (cp->relocs) {
+-			o->relocs = cp->relocs (binfile);

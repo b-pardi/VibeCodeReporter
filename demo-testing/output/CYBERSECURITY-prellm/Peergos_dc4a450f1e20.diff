@@ -1,0 +1,102 @@
+@@ -5,6 +5,7 @@ import peergos.shared.corenode.*;
+ import peergos.shared.crypto.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.util.*;
+ 
+ import java.io.*;
+ import java.util.*;
+@@ -35,12 +36,16 @@ public class SignUpFilter implements CoreNode {
+         boolean forUs = chain.get(chain.size() - 1).claim.storageProviders.contains(ourNodeId);
+         if (! forUs)
+             return target.updateChain(username, chain, proof, token);
+-        return CompletableFuture.completedFuture(true)
+-                .thenCompose(x -> {
+-                    if (judge.allowSignupOrUpdate(username, token))
+-                        return target.updateChain(username, chain, proof, token);
+-                    throw new IllegalStateException("This server is not currently accepting new sign ups. Please try again later");
+-                });
++
++        if (judge.allowSignupOrUpdate(username, token)) {
++            return target.updateChain(username, chain, proof, token).thenApply(res -> {
++                if (res.isEmpty())
++                    judge.consumeToken(token);
++                return res;
++            });
++        }
++
++        return Futures.errored(new IllegalStateException("This server is not currently accepting new sign ups. Please try again later"));
+     }
+ 
+     @Override
+
+
+
+
+@@ -18,6 +18,7 @@ public class JdbcQuotas {
+     private static final String GET_ALL_QUOTAS = "SELECT name, quota FROM freequotas;";
+     private static final String COUNT_USERS = "SELECT COUNT (name) FROM freequotas;";
+     private static final String REMOVE_USER = "DELETE FROM freequotas WHERE name = ?;";
++    private static final String HAS_TOKEN = "SELECT * FROM signuptokens WHERE token = ?;";
+     private static final String REMOVE_TOKEN = "DELETE FROM signuptokens WHERE token = ?;";
+     private static final String ADD_TOKEN = "INSERT INTO signuptokens (token) VALUES(?);";
+     private static final String LIST_TOKENS = "SELECT token from signuptokens;";
+@@ -126,7 +127,19 @@ public class JdbcQuotas {
+         }
+     }
+ 
+-    public boolean allowAndRemoveToken(String token) {
++    public boolean isTokenAllowed(String token) {
++        try (Connection conn = getConnection();
++             PreparedStatement select = conn.prepareStatement(HAS_TOKEN)) {
++            select.setString(1, token);
++            ResultSet res =  select.executeQuery();
++            return res.next();
++        } catch (SQLException sqe) {
++            LOG.log(Level.WARNING, sqe.getMessage(), sqe);
++            throw new IllegalStateException(sqe);
++        }
++    }
++
++    public boolean removeToken(String token) {
+         try (Connection conn = getConnection();
+              PreparedStatement select = conn.prepareStatement(REMOVE_TOKEN)) {
+             select.setString(1, token);
+
+
+
+
+@@ -109,7 +109,7 @@ public class UserQuotas implements QuotaAdmin {
+     public boolean allowSignupOrUpdate(String username, String token) {
+         if (quotas.hasUser(username))
+             return true;
+-        if (quotas.allowAndRemoveToken(token)) {
++        if (quotas.isTokenAllowed(token)) {
+             quotas.setQuota(username, defaultQuota);
+             return true;
+         }
+@@ -119,6 +119,14 @@ public class UserQuotas implements QuotaAdmin {
+         return true;
+     }
+ 
++    @Override
++    public boolean consumeToken(String token) {
++        if (! token.isEmpty()) {
++            return quotas.removeToken(token);
++        }
++        return false;
++    }
++
+     public String generateToken(SafeRandom rnd) {
+         String token = ArrayOps.bytesToHex(rnd.randomBytes(32));
+         quotas.addToken(token);
+
+
+
+
+@@ -17,6 +17,7 @@ public class HttpQuotaAdmin implements QuotaAdmin {
+     public static final String SIGNUPS = "signups";
+     public static final String USERNAMES = "usernames";
+     public static final String ALLOWED = "allowed";
++    public static final String TOKEN_REMOVE = "token-remove";
+     public static final Strin

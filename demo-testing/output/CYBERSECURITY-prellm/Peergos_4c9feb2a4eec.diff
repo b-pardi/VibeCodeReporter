@@ -1,0 +1,43 @@
+@@ -85,7 +85,17 @@ public class WriteSynchronizer {
+                                                           ComplexMutation transformer) {
+         return pending.computeIfAbsent(new Pair<>(owner, writer.publicKeyHash), p -> new AsyncLock<>(getWriterData(owner, p.right)))
+                 .runWithLock(current -> transformer.apply(current,
+-                        (aOwner, signer, wd, existing, tid) -> wd.commit(aOwner, signer, existing.hash, mutable, dht, tid)),
++                        (aOwner, signer, wd, existing, tid) -> wd.commit(aOwner, signer, existing.hash, mutable, dht, tid)
++                        .thenCompose(s -> {
++                            if (signer.publicKeyHash.equals(writer.publicKeyHash))
++                                return CompletableFuture.completedFuture(s);
++                            // need to update local queue for other writer
++                            return pending.computeIfAbsent(
++                                    new Pair<>(owner, signer.publicKeyHash),
++                                    p -> new AsyncLock<>(getWriterData(owner, p.right))
++                            ).runWithLock(v -> CompletableFuture.completedFuture(v.withVersion(signer.publicKeyHash, s.get(signer))))
++                                    .thenApply(x -> s);
++                        })),
+                         () -> getWriterData(owner, writer.publicKeyHash));
+     }
+ 
+
+
+
+
+@@ -339,6 +339,7 @@ public class FileWrapper {
+         WritableAbsoluteCapability ourNewCap = writableFilePointer().withBaseWriteKey(newBaseWriteKey.get());
+         return network.synchronizer.applyComplexUpdate(owner(), signingPair(), (current, committer) ->
+                 rotateWriteKeys(true, parent, newBaseWriteKey, network, random, hasher, current, committer))
++                .thenCompose(s -> s.withWriter(owner(), parent.writer(), network))
+                 .thenCompose(s -> parent.getUpdated(s, network)
+                         .thenCompose(p -> network.getFile(s, ourNewCap, entryWriter, ownername)
+                                 .thenApply(newUs -> new Pair<>(newUs.get(), p))));
+@@ -1223,8 +1224,9 @@ public class FileWrapper {
+         return network.synchronizer.applyComplexUpdate(owner, signer, (version, committer) -> IpfsTransaction.call(owner,
+                 tid -> network.uploadChunk(version, committer, newFileAccess, owner, getPointer().capability.getMapKey(), signer, tid)
+                         .thenCompose(newVersion -> copyAllChunks(false, cap, signer, network, newVersion, committer))
+-                        .thenCompose(copiedVersion -> parent.getPointer().fileAccess
+-                                .updateChildLink(copiedVersion, committer, parent.writableFilePointer(),
++                        .thenCompose(copiedVersion -> copiedVersion.withWriter(owner, parent.writer(), network))
++                        .thenCompose(withParent -> parent.getPointer().fileAccess
++                                .updateChildLink(withParent, committer, parent.writableFilePointer(),
+                                         parent.entryWriter,
+                                         getPointer(),
+                                         newRetrievedCapability, network, hasher))

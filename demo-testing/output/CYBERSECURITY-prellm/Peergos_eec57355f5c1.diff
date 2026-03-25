@@ -1,0 +1,77 @@
+@@ -8,9 +8,11 @@ import peergos.shared.crypto.hash.*;
+ import peergos.shared.io.ipfs.multihash.*;
+ import peergos.shared.mutable.*;
+ import peergos.shared.storage.*;
++import peergos.shared.util.*;
+ 
+ import java.util.*;
+ import java.util.concurrent.*;
++import java.util.concurrent.atomic.*;
+ import java.util.function.*;
+ import java.util.logging.*;
+ import java.util.stream.*;
+@@ -74,15 +76,14 @@ public class GarbageCollector {
+         for (int i=0; i < present.size(); i++)
+             toIndex.put(present.get(i), i);
+         BitSet reachable = new BitSet(present.size());
+-        for (PublicKeyHash writerHash : allPointers.keySet()) {
+-            byte[] signedRawCas = allPointers.get(writerHash);
+-            PublicSigningKey writer = storage.getSigningKey(writerHash).join().get();
+-            byte[] bothHashes = writer.unsignMessage(signedRawCas);
+-            HashCasPair cas = HashCasPair.fromCbor(CborObject.fromByteArray(bothHashes));
+-            MaybeMultihash updated = cas.updated;
+-            if (updated.isPresent())
+-                markReachable(storage, updated.get(), toIndex, reachable);
+-        }
++
++        int markParallelism = 50;
++        ForkJoinPool markPool = new ForkJoinPool(markParallelism);
++        List<ForkJoinTask<Boolean>> marked = allPointers.entrySet().stream()
++                .map(e -> markPool.submit(() -> markReachable(e.getKey(), e.getValue(), reachable, toIndex, storage)))
++                .collect(Collectors.toList());
++        marked.forEach(f -> f.join());
++
+         for (Multihash additional : pending) {
+             int index = toIndex.getOrDefault(additional, -1);
+             if (index >= 0)
+@@ -94,10 +95,47 @@ public class GarbageCollector {
+         // Save pointers snapshot
+         snapshotSaver.apply(allPointers.entrySet().stream()).join();
+ 
+-        long deletedBlocks = 0;
+-        long deletedSize = 0;
+-        long logPoint = 0;
+-        for (int i = reachable.nextClearBit(0); i >= 0 && i < present.size(); i = reachable.nextClearBit(i + 1)) {
++        int deleteParallelism = 50;
++        ForkJoinPool pool = new ForkJoinPool(deleteParallelism);
++        int batchSize = present.size() / deleteParallelism;
++        AtomicLong progressCounter = new AtomicLong(0);
++        List<ForkJoinTask<Pair<Long, Long>>> futures = IntStream.range(0, deleteParallelism)
++                .mapToObj(i -> pool.submit(() -> deleteUnreachableBlocks(i * batchSize,
++                        Math.min((i + 1) * batchSize, present.size()), reachable, present, progressCounter, storage)))
++                .collect(Collectors.toList());
++        Pair<Long, Long> deleted = futures.stream()
++                .map(ForkJoinTask::join).reduce((a, b) -> new Pair<>(a.left + b.left, a.right + b.right))
++                .get();
++        long deletedBlocks = deleted.left;
++        long deletedSize = deleted.right;
++        long t5 = System.nanoTime();
++        System.out.println("Deleting blocks took " + (t5-t4)/1_000_000_000 + "s");
++        System.out.println("GC complete. Freed " + deletedBlocks + " blocks totalling " + deletedSize + " bytes in " + (t5-t0)/1_000_000_000 + "s");
++    }
++
++    private static boolean markReachable(PublicKeyHash writerHash,
++                                         byte[] signedRawCas,
++                                         BitSet reachable,
++                                         Map<Multihash, Integer> toIndex,
++                                         DeletableContentAddressedStorage storage) {
++        PublicSigningKey writer = storage.getSigningKey(writerHash).join().get();
++        byte[] bothHashes = writer.unsignMessage(signedRawCas);
++        HashCasPair cas = HashCasPair.fromCbor(CborObject.fromByteArray(bothHashes));
++        MaybeMultihash updated = cas.updated;
++        if (updated.isPresent())
++            markReachable(storage, updated.get(), toIndex, reachable);
++        return true;
++    }
++
++    private static Pair<Long, Long> deleteUnreachableBlocks(int startInd

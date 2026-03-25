@@ -1,0 +1,156 @@
+@@ -26,7 +26,7 @@
+ #include <map>
+ #include <string>
+ 
+-class ColumnData;
++struct ColumnData;
+ class BareosDb;
+ 
+ class ColumnDescription {
+
+
+
+
+@@ -39,7 +39,7 @@ DatabaseImportMysql::DatabaseImportMysql(
+     const DatabaseConnection& db_connection,
+     std::size_t maximum_amount_of_rows_in)
+     : DatabaseImport(db_connection)
+-    , maximum_amount_of_rows_(maximum_amount_of_rows_in)
++    , limit_amount_of_rows_(maximum_amount_of_rows_in)
+ {
+   return;
+ }
+@@ -102,7 +102,7 @@ void DatabaseImportMysql::RunQuerySelectAllRows(
+       continue;
+     }
+ 
+-    Progress progress(db_, t.table_name);
++    Progress progress(db_, t.table_name, limit_amount_of_rows_);
+ 
+     std::cout << "--> copying..." << std::endl;
+ 
+@@ -122,9 +122,9 @@ void DatabaseImportMysql::RunQuerySelectAllRows(
+     query += " FROM ";
+     query += t.table_name;
+ 
+-    if (maximum_amount_of_rows_) {
++    if (limit_amount_of_rows_) {
+       query += " LIMIT ";
+-      query += std::to_string(maximum_amount_of_rows_);
++      query += std::to_string(limit_amount_of_rows_);
+     }
+ 
+     RowData row_data(t.column_descriptions, t.table_name);
+@@ -225,10 +225,9 @@ int DatabaseImportMysql::ResultHandlerCopy(void* ctx, int fields, char** row)
+ 
+   r->exporter.CopyRow(r->row_data);
+ 
+-  r->progress.Advance(1);
+-
+-  if (r->progress.IntegralChange()) {
+-    std::cout << r->progress.Rate() << "%" << std::endl;
++  if (r->progress.Increment()) {
++    std::cout << std::setw(3) << r->progress.Rate() << "%"
++              << " ETA:" << r->progress.Eta() << std::endl;
+   }
+   return 0;
+ }
+
+
+
+
+@@ -29,7 +29,7 @@ class BareosDb;
+ class DatabaseConnection;
+ class DatabaseExport;
+ class DatabaseTableDescriptions;
+-class ResultHandlerContext;
++struct ResultHandlerContext;
+ class Progress;
+ 
+ class DatabaseImportMysql : public DatabaseImport {
+@@ -49,7 +49,7 @@ class DatabaseImportMysql : public DatabaseImport {
+ 
+   void RunQuerySelectAllRows(DB_RESULT_HANDLER* result_handler,
+                              DatabaseExport& exporter);
+-  std::size_t maximum_amount_of_rows_{};
++  std::size_t limit_amount_of_rows_{};
+ };
+ 
+ 
+
+
+
+
+@@ -189,7 +189,9 @@ class DbCopy {
+     std::string configpath_{"/etc/bareos"};
+     std::string source_db_resource_name, destination_db_resource_name;
+     bool empty_destination_tables{false};
++#if 0
+     bool compare_all_rows{false};
++#endif
+     std::size_t maximum_number_of_rows;
+ 
+     void usage() noexcept
+
+
+
+
+@@ -23,8 +23,10 @@
+ #include "cats/cats.h"
+ #include "dird/dbcopy/progress.h"
+ 
++#include <iomanip>
+ #include <iostream>
+ #include <sstream>
++#include <thread>
+ 
+ struct Amount {
+   bool is_valid{};
+@@ -40,7 +42,9 @@ static int AmountHandler(void* ctx, int fields, char** row)
+   return 1;
+ }
+ 
+-Progress::Progress(BareosDb* db, const std::string& table_name)
++Progress::Progress(BareosDb* db,
++                   const std::string& table_name,
++                   std::size_t limit_amount_of_rows_)
+ {
+   Amount a;
+   std::string query{"SELECT count(*) from " + table_name};
+@@ -52,26 +56,55 @@ Progress::Progress(BareosDb* db, const std::string& table_name)
+   }
+ 
+   if (a.is_valid) {
++    if (a.amount > limit_amount_of_rows_) {
++      // commandline parameter
++      a.amount = limit_amount_of_rows_;
++    }
+     full_amount_ = a.amount;
+-    state_old.start = steady_clock::now();
+-    state_old.amount = a.amount;
+-    is_valid = true;
++    state_.amount = a.amount;
++    state_.start = system_clock::now();
++    state_old_ = state_;
++    is_valid_ = true;
+   }
+ }
+ 
+-void Progress::Advance(std::size_t increment)
++bool Progress::Increment()
+ {
+-  using Ratio = std::ratio<100, 1>;
++  if (!is_valid_) {
++    // if anything failed before do not abort, just omit the progress counter
++    return false;
++  }
++
++  state_.amount = state_.amount != 0 ? state_.amount - 1 : 0;
++  if ((state_.amount % 10000) != 0) { return false; }
++
++  state_.ratio =
++      Ratio::num - (state_.amount * Ratio::num) / (full_amount_ * Ratio::den);
++
++  state_.start = system_clock::now();
++
++ 

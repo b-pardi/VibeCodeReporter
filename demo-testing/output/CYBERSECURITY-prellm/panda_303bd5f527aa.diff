@@ -1,0 +1,114 @@
+@@ -158,6 +158,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+     uintptr_t ret;
+     TranslationBlock *last_tb;
+     int tb_exit;
++    uint8_t exitCode;
+     uint8_t *tb_ptr = itb->tc_ptr;
+ 
+     qemu_log_mask_and_addr(CPU_LOG_EXEC, itb->pc,
+@@ -199,9 +200,12 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+     cpu->can_do_io = 1;
+     last_tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
+ 
+-    panda_callbacks_after_block_exec(cpu, itb);
+-
+     tb_exit = ret & TB_EXIT_MASK;
++
++    /* force into variable of known size */
++    exitCode = (uint8_t)tb_exit;
++    panda_callbacks_after_block_exec(cpu, itb, exitCode);
++
+     trace_exec_tb_exit(last_tb, tb_exit);
+ 
+     if (tb_exit > TB_EXIT_IDX1) {
+
+
+
+
+@@ -9,7 +9,7 @@ void panda_callbacks_after_dma(CPUState *cpu, hwaddr addr1, const uint8_t *buf,
+ 
+ // cpu-exec.c
+ void panda_callbacks_before_block_exec(CPUState *cpu, TranslationBlock *tb);
+-void panda_callbacks_after_block_exec(CPUState *cpu, TranslationBlock *tb);
++void panda_callbacks_after_block_exec(CPUState *cpu, TranslationBlock *tb, uint8_t exitCode);
+ void panda_callbacks_before_block_translate(CPUState *cpu, target_ulong pc);
+ void panda_callbacks_after_block_translate(CPUState *cpu, TranslationBlock *tb);
+ bool panda_callbacks_after_find_fast(CPUState *cpu, TranslationBlock *tb, bool panda_bb_invalidate_done, bool *invalidate);
+
+
+
+
+@@ -117,17 +117,19 @@ typedef union panda_cb {
+ 
+     /* Callback ID: PANDA_CB_AFTER_BLOCK_EXEC
+ 
+-       after_block_exec: called after execution of every basic block
++       after_block_exec: called after execution of every basic block, although
++       if exitCode > TB_EXIT_IDX1, then the block exited early
+ 
+        Arguments:
+         CPUState *env: the current CPU state
+         TranslationBlock *tb: the TB we just executed
+         TranslationBlock *next_tb: the TB we will execute next (may be NULL)
++        uint8_t exitCode:  why the block execution exited
+ 
+        Return value:
+         unused
+     */
+-    int (*after_block_exec)(CPUState *env, TranslationBlock *tb);
++    int (*after_block_exec)(CPUState *env, TranslationBlock *tb, uint8_t exitCode);
+ 
+     /* Callback ID: PANDA_CB_BEFORE_BLOCK_TRANSLATE
+ 
+
+
+
+
+@@ -14,6 +14,8 @@ PANDAENDCOMMENT */
+ /* Change Log: */
+ /* 2018-MAY-29   move where mode bit calculated as requested */
+ /* 2018-APR-13   watch for x86 processor mode changing in i386 build */
++/* 2019-JAN-29   do not put an entry in the callstack if the block was stopped */
++/*               before the call at the end was made */
+ #define __STDC_FORMAT_MACROS
+ 
+ #include <cstdio>
+@@ -45,7 +47,7 @@ extern "C" {
+ bool translate_callback(CPUState* cpu, target_ulong pc);
+ int exec_callback(CPUState* cpu, target_ulong pc);
+ int before_block_exec(CPUState* cpu, TranslationBlock *tb);
+-int after_block_exec(CPUState* cpu, TranslationBlock *tb);
++int after_block_exec(CPUState* cpu, TranslationBlock *tb, uint8_t exitCode);
+ int after_block_translate(CPUState* cpu, TranslationBlock *tb);
+ 
+ bool init_plugin(void *);
+@@ -58,6 +60,9 @@ PPP_PROT_REG_CB(on_ret);
+ PPP_CB_BOILERPLATE(on_call);
+ PPP_CB_BOILERPLATE(on_ret);
+ 
++// callstack_instr arguments
++static bool verbose = false;
++
+ enum instr_type {
+   INSTR_UNKNOWN = 0,
+   INSTR_CALL,
+@@ -100,8 +105,29 @@ std::map<stackid, std::vector<stack_entry>> callstacks;
+ std::map<stackid, std::vector<target_ulong>> function_stacks;
+ // EIP -> instr_type
+ std::map<target_ulong, instr_type> call_cache;
++// stackid -> address of Stopped block
++std::map<stackid, target_ulong> stoppedInfo;
++
+ int last_ret_size = 0;
+ 
++void verbose_log(const char *msg, TranslationBlock *tb, stackid curStackid,
++        bool logReturn) {
++    if (verbose) {
++        printf("%s:  asid=0x", msg);
++#ifdef USE_STACK_HEURISTIC
++        printf(TARGET_FMT_lx ", sp=0x" TARGET_FMT_lx, curStackid.first,
++                curStackid.second);
++#else
++        printf(TARGET_FMT_lx, curStackid);
++#endif
++        p

@@ -1,0 +1,97 @@
+@@ -345,7 +345,8 @@ public class Main {
+             boolean isPkiNode = nodeId.equals(pkiServerNodeId);
+             CoreNode core = isPkiNode ?
+                     buildPkiCorenode(sqlMutable, localDht, a) :
+-                    new MirrorCoreNode(new HTTPCoreNode(ipfsGateway, pkiServerNodeId), localDht, proxingMutable, peergosId);
++                    new MirrorCoreNode(new HTTPCoreNode(ipfsGateway, pkiServerNodeId), proxingMutable, localDht,
++                            peergosId, a.fromPeergosDir("pki-mirror-state-path","pki-state.cbor"));
+ 
+             long defaultQuota = a.getLong("default-quota");
+             long maxUsers = a.getLong("max-users");
+
+
+
+
+@@ -2,38 +2,148 @@ package peergos.server.corenode;
+ 
+ import peergos.server.util.*;
+ import peergos.shared.*;
++import peergos.shared.cbor.*;
+ import peergos.shared.corenode.*;
+ import peergos.shared.crypto.hash.*;
+ import peergos.shared.mutable.*;
+ import peergos.shared.storage.*;
+ import peergos.shared.user.*;
+ 
++import java.io.*;
++import java.nio.file.*;
+ import java.util.*;
+ import java.util.concurrent.*;
++import java.util.function.*;
+ import java.util.logging.*;
++import java.util.stream.*;
+ 
+ public class MirrorCoreNode implements CoreNode {
+ 
+     private final CoreNode writeTarget;
+-    private final ContentAddressedStorage ipfs;
+     private final MutablePointers mutable;
++    private final ContentAddressedStorage ipfs;
+     private final PublicKeyHash pkiOwnerIdentity;
+ 
+-    private final Map<String, List<UserPublicKeyLink>> chains = new ConcurrentHashMap<>();
+-    private final Map<PublicKeyHash, String> reverseLookup = new ConcurrentHashMap<>();
+-    private final List<String> usernames = new ArrayList<>();
+-
+-    private MaybeMultihash currentRoot = MaybeMultihash.empty();
++    private volatile CorenodeState state;
++    private final Path statePath;
+     private volatile boolean running = true;
+ 
+     public MirrorCoreNode(CoreNode writeTarget,
+-                          ContentAddressedStorage ipfs,
+                           MutablePointers mutable,
+-                          PublicKeyHash pkiOwnerIdentity) {
++                          ContentAddressedStorage ipfs,
++                          PublicKeyHash pkiOwnerIdentity,
++                          Path statePath) {
+         this.writeTarget = writeTarget;
+-        this.ipfs = ipfs;
+         this.mutable = mutable;
++        this.ipfs = ipfs;
+         this.pkiOwnerIdentity = pkiOwnerIdentity;
++        this.statePath = statePath;
++        try {
++            this.state = load(statePath);
++        } catch (IOException e) {
++            // load empty
++            this.state = CorenodeState.buildEmpty(pkiOwnerIdentity, pkiOwnerIdentity, MaybeMultihash.empty(), MaybeMultihash.empty());
++        }
++        try {
++            boolean changed = update();
++            if (changed)
++                saveState();
++        } catch (Throwable t) {
++            Logging.LOG().log(Level.SEVERE, "Couldn't update mirror pki state: " + t.getMessage(), t);
++        }
++    }
++
++    private static class CorenodeState implements Cborable {
++        private final PublicKeyHash pkiOwnerIdentity, pkiKey;
++        private final MaybeMultihash pkiOwnerTarget, pkiKeyTarget;
++
++        private final Map<String, List<UserPublicKeyLink>> chains;
++        private final Map<PublicKeyHash, String> reverseLookup;
++        private final List<String> usernames;
++
++        public CorenodeState(PublicKeyHash pkiOwnerIdentity,
++                             PublicKeyHash pkiKey,
++                             MaybeMultihash pkiOwnerTarget,
++                             MaybeMultihash pkiKeyTarget,
++                             Map<String, List<UserPublicKeyLink>> chains,
++                             Map<PublicKeyHash, String> reverseLookup,
++                             List<String> usernames) {
++            this.pkiOwnerIdentity = pkiOwnerIdentity;
++            this.pkiKey = pkiKey;
++            this.pkiOwnerTarget = pkiOwnerTarget;
++           

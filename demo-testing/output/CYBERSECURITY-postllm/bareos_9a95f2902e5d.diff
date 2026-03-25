@@ -1,0 +1,110 @@
+@@ -1,7 +1,7 @@
+ /*
+    BAREOS® - Backup Archiving REcovery Open Sourced
+ 
+-   Copyright (C) 2020-2023 Bareos GmbH & Co. KG
++   Copyright (C) 2020-2024 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -1744,6 +1744,8 @@ static PyObject* PyBareosCheckChanges(PyObject*, PyObject* args)
+   }
+   sp.save_time = pSavePkt->save_time;
+ 
++  /* TODO: this is incorrect!  We need to set a lot more!
++   * AccurateCheckChanges uses the stat block to determine the file type! */
+   retval = bareos_core_functions->checkChanges(plugin_ctx, &sp);
+ 
+   // Copy back the two fields that are changed by checkChanges().
+
+
+
+
+@@ -250,7 +250,7 @@ bRC newPlugin(PluginContext* plugin_ctx)
+  * Release everything concerning a particular instance of a
+  * plugin. Normally called when the Job terminates.
+  */
+-bRC freePlugin(PluginContext* plugin_ctx)
++extern "C" bRC freePlugin(PluginContext* plugin_ctx)
+ {
+   struct plugin_private_context* plugin_priv_ctx
+       = (struct plugin_private_context*)plugin_ctx->plugin_private_context;
+@@ -275,7 +275,12 @@ bRC freePlugin(PluginContext* plugin_ctx)
+ 
+   // Stop any sub interpreter started per plugin instance.
+   auto* ts = PopThreadStateForInterp(plugin_priv_ctx->interp);
+-  ASSERT(ts);
++  if (!ts) {
++    Jmsg(plugin_ctx, M_FATAL, LOGPREFIX "No associated thread state found\n");
++    free(plugin_priv_ctx);
++    plugin_ctx->plugin_private_context = NULL;
++    return bRC_Error;
++  }
+   PyEval_AcquireThread(ts);
+ 
+   if (plugin_priv_ctx->pModule) { Py_DECREF(plugin_priv_ctx->pModule); }
+@@ -576,14 +581,22 @@ bail_out:
+ }
+ 
+ // Only set destination to value when it has no previous setting.
+-void SetStringIfNull(char** destination, char* value)
++void SetStringIfNull(char** destination, std::string_view val)
+ {
+   if (!*destination) {
+-    *destination = strdup(value);
++    *destination = CopyStringView(val);
+     StripBackSlashes(*destination);
+   }
+ }
+ 
++// Allows one or both pointers to be NULL
++static bool bstrcmp(const char* s1, const char* s2)
++{
++  if (s1 == s2) return true;
++  if (s1 == NULL || s2 == NULL) return false;
++  return strcmp(s1, s2) == 0;
++}
++
+ /**
+  * Parse the plugin definition passed in.
+  *
+@@ -592,14 +605,14 @@ void SetStringIfNull(char** destination, char* value)
+  * python:module_path=<path>:module_name=<python_module_name>:...
+  */
+ bRC parse_plugin_definition(PluginContext* plugin_ctx,
+-                            void* value,
+-                            PoolMem& plugin_options)
++                            const void* value,
++                            std::string& plugin_options)
+ {
+   bool found;
+   int i, cnt;
+   bool keep_existing;
+-  PoolMem plugin_definition(PM_FNAME);
+-  char *bp, *argument, *argument_value;
++  std::string plugin_definition;
++  const char *bp, *argument, *argument_value;
+   plugin_private_context* plugin_priv_ctx
+       = (plugin_private_context*)plugin_ctx->plugin_private_context;
+ 
+@@ -620,15 +633,12 @@ bRC parse_plugin_definition(PluginContext* plugin_ctx,
+   /* Parse the plugin definition.
+    * Make a private copy of the whole string. */
+   if (!plugin_priv_ctx->python_loaded && plugin_priv_ctx->plugin_options) {
+-    int len;
+-
+     /* We got some option string which got pushed before we actual were able to
+      * send it to the python module as the entry point was not instantiated. So
+      * we prepend that now in the option string and append the new option string
+      * with the first argument being the pluginname removed as that is already
+      * part of the other plugin option string. */
+-    len = strlen(plugin_priv_ctx->plugin_options);
+-    PmStrcpy(plugin_definition, plugin_priv_ctx->plugin_options);
++    plugin_definition = plugin_priv_ctx->plugin_options;
+ 
+     bp = strchr((char*)value, ':');
+     if (!bp) {
+@@ -640,13 +650,13 @@ bRC parse_plugin_definition(PluginContext* plugin_ctx,
+     }
+ 
+     // See if option string end

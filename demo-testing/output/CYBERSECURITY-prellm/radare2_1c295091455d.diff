@@ -1,0 +1,139 @@
+@@ -46,6 +46,23 @@
+ #define BREAD32(x, i) r_buf_read_ble32_at(x, i, bin->endian); (i) += 4
+ #define BREAD64(x, i) r_buf_read_ble64_at(x, i, bin->endian); (i) += 8
+ 
++#define NUMENTRIES_ROUNDUP(sectionsize, entrysize) (((sectionsize)+(entrysize)-1)/(entrysize))
++
++struct dynamic_relocation_section {
++	// symbol table
++	Elf_(Addr) addr_jmprel;
++	Elf_(Xword) jmprel_size;
++	Elf_(Xword) plt_mode;
++	// rel
++	Elf_(Addr) addr_rela;
++	Elf_(Xword) rela_size;
++	Elf_(Xword) relaent;
++	// rela
++	Elf_(Addr) addr_rel;
++	Elf_(Xword) rel_size;
++	Elf_(Xword) relent;
++};
++
+ #if R_BIN_ELF64
+ static inline int UTX_MUL(ut64 *r, ut64 a, ut64 b) {
+ 	return UT64_MUL (r, a, b);
+@@ -1426,16 +1443,7 @@ static ut64 get_import_addr_ppc(ELFOBJ *bin, struct ht_rel_t *rel, RBinElfSectio
+ 		base += (rel->k * 16);
+ 		return base;
+ 	}
+-	// FIXME: this does not seem to work as
+-	// expected. Commenting for now because it makes
+-	// refactoring much easier and it seems weird
+-	// anyway.
+-	// if (bin->is_rela == DT_RELA) {
+-	// 	len = r_buf_read_at (bin->b, rel_sec->offset, buf, sizeof (buf));
+-	// 	if (len < 4) {
+-	// 		goto out;
+-	//	}
+-	// }
++
+ 	ut64 base = r_read_le32 (buf);
+ 	base -= (nrel * 12) + 20;
+ 	base += (rel->k * 8);
+@@ -2627,150 +2635,268 @@ char *Elf_(r_bin_elf_get_rpath)(ELFOBJ *bin) {
+ 	return ret;
+ }
+ 
++static bool has_valid_section_header(ELFOBJ *bin, size_t pos) {
++	return bin->g_sections[pos].info < bin->ehdr.e_shnum && bin->shdr;
++}
++
++static void fix_rva_and_offset_relocable_file(ELFOBJ *bin, RBinElfReloc *r, size_t pos) {
++	if (has_valid_section_header (bin, pos)) {
++		r->rva = bin->shdr[bin->g_sections[pos].info].sh_offset + r->offset;
++		r->rva = Elf_(r_bin_elf_p2v) (bin, r->rva);
++	} else {
++		r->rva = r->offset;
++	}
++}
++
++static void fix_rva_and_offset_exec_file(ELFOBJ *bin, RBinElfReloc *r) {
++	r->rva = r->offset;
++	r->offset = Elf_(r_bin_elf_v2p) (bin, r->offset);
++}
++
++static void fix_rva_and_offset(ELFOBJ *bin, RBinElfReloc *r, size_t pos) {
++	if (is_bin_etrel (bin)) {
++		fix_rva_and_offset_relocable_file(bin, r, pos);
++	} else {
++		fix_rva_and_offset_exec_file(bin, r);
++	}
++}
++
++static size_t get_size_rel_mode(size_t rel_mode) {
++	return rel_mode == DT_RELA? sizeof (Elf_(Rela)): sizeof (Elf_(Rel));
++}
++
++static bool read_reloc(ELFOBJ *bin, RBinElfReloc *r, size_t rel_mode, ut64 offset) {
++	size_t size_struct = get_size_rel_mode (rel_mode);
++
++	ut8 buf[sizeof (Elf_(Rela))] = { 0 };
++	int res = r_buf_read_at (bin->b, offset, buf, size_struct);
++	if (res != size_struct) {
++		return false;
++	}
++
++	size_t i = 0;
++	Elf_(Rela) reloc_info;
++
++	reloc_info.r_offset = READWORD (buf, i);
++	reloc_info.r_info = READWORD (buf, i);
++
++	if (rel_mode == DT_RELA) {
++		reloc_info.r_addend = READWORD (buf, i);
++		r->addend = reloc_info.r_addend;
++	}
++
++	r->is_rela = rel_mode;
++	r->last = 0;
++	r->offset = reloc_info.r_offset;
++	r->sym = ELF_R_SYM (reloc_info.r_info);
++	r->type = ELF_R_TYPE (reloc_info.r_info);
++
++	return true;
++}
++
++static size_t get_num_relocs_dynamic(struct dynamic_relocation_section *info) {
++	size_t res = 0;
++
++	if (info->relaent) {
++		res += info->rela_size / info->relaent;
++	}
++
++	if (info->relent) {
++		res += info->rel_size / info->relent;
++	}
++
++	if (info->jmprel_size) {
++		res += info->jmprel_size / get_size_rel_mode(info->plt_mode);
++	}
++
++	return res;
++}
++
+ static bool sectionIsInvalid(ELFOBJ *bin, RBinElfSection *sect) {
+ 	return (sect->offset + sect->size > bin->size);
+ }
+ 
+-static size_t get_relocs_num(ELFOBJ *bin) {
+-	size_t i, size, ret = 0;
+-	/* we need to be careful here, in malformed files the section size might
+-	 * not be a multiple of a Rel/Rela size; round up so we allocate enough
+-	 * space.
+-	 */
+-#define NUMENTRIES_ROUNDUP(sectionsize, entrysize) (((sectionsize)+(entrysize)-1)/(entrysize))
++static size_t get_section_mode(ELFOBJ *bin, size_t pos) {
++	if (r_str_startswith (bin->g_sections[pos].name, ".rela.")) {
++		return DT_RELA;
++	} else if (r_str_startswith (bin->g_sections[pos].name, ".rel.")) {
++		return DT_

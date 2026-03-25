@@ -1,0 +1,112 @@
+@@ -366,8 +366,7 @@ class NetworkInterface : public Checkpointable {
+   void getnDPIStats(nDPIStats *stats, AddressTree *allowed_hosts, const char *host_ip, u_int16_t vlan_id);
+   void periodicStatsUpdate();
+   virtual void lua(lua_State* vm);
+-  void getnDPIProtocols(lua_State *vm);
+-  void getnDPIProtocols(lua_State *vm, ndpi_protocol_category_t filter);
++  void getnDPIProtocols(lua_State *vm, ndpi_protocol_category_t filter, bool skip_critical);
+   void setnDPIProtocolCategory(u_int16_t protoId, ndpi_protocol_category_t protoCategory);
+ 
+   int getActiveHostsList(lua_State* vm,
+
+
+
+
+@@ -98,6 +98,7 @@ class Utils {
+   static void initRedis(Redis **r, const char *redis_host, const char *redis_password, u_int16_t redis_port, u_int8_t _redis_db_id);
+   static bool str2DetailsLevel(const char *details, DetailsLevel *out);
+   static u_int32_t roundTime(u_int32_t now, u_int32_t rounder, int32_t offset_from_utc);
++  static bool isCriticalNetworkProtocol(u_int16_t protocol_id);
+ 
+   /* Patricia Tree */
+   static patricia_node_t* ptree_match(patricia_tree_t *tree, int family, void *addr, int bits);
+
+
+
+
+@@ -1206,6 +1206,11 @@ TrafficShaper* Host::get_shaper(ndpi_protocol ndpiProtocol, bool isIngress) {
+   if (iface->getL7Policer() && getMac() && (getMac()->locate() != located_on_lan_interface)) {
+     return iface->getL7Policer()->getShaper(DEFAULT_SHAPER_ID);
+   }
++
++  // Avoid dropping critical protocols
++  if(Utils::isCriticalNetworkProtocol(ndpiProtocol.master_protocol) ||
++          Utils::isCriticalNetworkProtocol(ndpiProtocol.app_protocol))
++    return iface->getL7Policer()->getShaper(PASS_ALL_SHAPER_ID);
+ #endif
+ 
+   if(iface->getL7Policer()) policy = iface->getL7Policer()->getIpPolicy(get_host_pool());
+@@ -1244,7 +1249,7 @@ TrafficShaper* Host::get_shaper(ndpi_protocol ndpiProtocol, bool isIngress) {
+ 
+     // Try to get a specific shaper
+     getProtocolShaper(ndpiProtocol, policy, &shaper_id, isIngress);
+-#endif
++#endif // HAVE_NEDGE
+   }
+ 
+ #ifdef SHAPER_DEBUG
+
+
+
+
+@@ -3287,7 +3287,8 @@ static int ntop_interface_name2id(lua_State* vm) {
+ 
+ static int ntop_get_ndpi_protocols(lua_State* vm) {
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
+-  ndpi_protocol_category_t category_filter;
++  ndpi_protocol_category_t category_filter = (ndpi_protocol_category_t)((u_int8_t)-1);
++  bool skip_critical = false;
+ 
+   if(ntop_interface == NULL)
+     ntop_interface = getCurrentInterface(vm);
+@@ -3302,11 +3303,10 @@ static int ntop_get_ndpi_protocols(lua_State* vm) {
+ 
+     if(category_filter >= NDPI_PROTOCOL_NUM_CATEGORIES)
+       return(CONST_LUA_ERROR);
++  }
++  if((lua_type(vm, 2) == LUA_TBOOLEAN)) skip_critical = lua_toboolean(vm, 2);
+ 
+-    ntop_interface->getnDPIProtocols(vm, category_filter);
+-  } else
+-    ntop_interface->getnDPIProtocols(vm);
+-
++  ntop_interface->getnDPIProtocols(vm, category_filter, skip_critical);
+   return(CONST_LUA_OK);
+ }
+ 
+
+
+
+
+@@ -4651,28 +4651,13 @@ u_int NetworkInterface::purgeIdleHostsMacsASesVlans() {
+ 
+ /* *************************************** */
+ 
+-void NetworkInterface::getnDPIProtocols(lua_State *vm) {
+-  int i;
+-
+-  lua_newtable(vm);
+-
+-  for(i=0; i<(int)ndpi_struct->ndpi_num_supported_protocols; i++) {
+-    char buf[8];
+-
+-    snprintf(buf, sizeof(buf), "%d", i);
+-    lua_push_str_table_entry(vm, ndpi_struct->proto_defaults[i].protoName, buf);
+-  }
+-}
+-
+-/* *************************************** */
+-
+ void NetworkInterface::setnDPIProtocolCategory(u_int16_t protoId, ndpi_protocol_category_t protoCategory) {
+   ndpi_set_proto_category(ndpi_struct, protoId, protoCategory);
+ }
+ 
+ /* **************************************************** */
+ 
+-void NetworkInterface::getnDPIProtocols(lua_State *vm, ndpi_protocol_category_t filter) {
++void NetworkInterface::getnDPIProtocols(lua_State *vm, ndpi_protocol_category_t filter, bool skip_critical) {
+   int i;
+ 
+   lua_newtable(vm);
+@@ -4680,7 +4665,8 @@ void NetworkInterface::getnDPIProtocols(lua_State *vm, ndpi_protocol_category_t
+   for(i=0; i<(

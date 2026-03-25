@@ -1,0 +1,66 @@
+@@ -61,6 +61,7 @@ def register_command_info(aliases, command_info):
+     for p in parsers:
+         command_info[p.prog] = p.description
+ 
++    aliases['xf'] = 'transform-folder'
+     command_info['shortcut'] = 'Manage record shortcuts'
+ 
+ 
+@@ -171,6 +172,7 @@ transform_parser.add_argument('-c', '--children', action='store_true', help=chil
+ dry_run_help = 'Preview the folder transformation without updating'
+ transform_parser.add_argument('-n', '--dry-run', action='store_true', help=dry_run_help)
+ transform_parser.add_argument('-f', '--force', action='store_true', help='Skip confirmation prompt and minimize output')
++transform_parser.add_argument('--clear-shares', action='store_true', help='Don\'t apply parent or subfolder share permissions to transformed folder tree')
+ transform_parser.error = raise_parse_exception
+ transform_parser.exit = suppress_exit
+ 
+@@ -1264,19 +1266,30 @@ class FolderTransformCommand(Command):
+                     raise CommandError('transform-folder', f'Folder {path} not found')
+ 
+         def validate(root_folders):   # type: (List[BaseFolderNode]) -> None
+-            if any([folder for folder in root_folders if folder.type == BaseFolderNode.SharedFolderFolderType]):
+-                raise CommandError('transform-folder', 'You cannot transform a folder within a shared-folder')
+-
+             SF_UID_KEY = 'shared_folder_uid'
+             shared_folders = []
+             contained_recs = []
+             for folder in root_folders:
+-                shared_folders.extend(get_shared_folders(folder).values())
++                shared_folders.extend(get_shared_folders(folder))
+                 contained_recs.extend(get_contained_records(folder))
+ 
+-            # Check contained shared folders (including root)
++            # Check relevant shared folders in each tree: descendants, root, and/or ancestor shared-folders
+             def has_full_sf_privs(sf):   # type: (Dict[str, Any]) -> bool
+-                return sf.get('manage_records') and sf.get('manage_users')
++                # Check if user has been directly granted full share-permissions for this folder
++                user_permissions = next((ushare for ushare in sf.get('users') if ushare.get('username') == params.user), None)
++                can_manage_records = user_permissions.get('manage_records') if user_permissions else False
++                can_manage_users = user_permissions.get('manage_users') if user_permissions else False
++                if not (can_manage_users and can_manage_records):
++                    # User shares don't grant the user full permissions => check team permissions instead
++                    if not params.team_cache or not sf.get('teams'):
++                        return False
++                    user_team_shares = [tshare for tshare in sf.get('teams') if tshare.get('team_uid') in params.team_cache]
++                    for team_share in user_team_shares:
++                        can_manage_records = team_share.get('manage_records') or can_manage_records
++                        can_manage_users = team_share.get('manage_users') or can_manage_users
++                        if can_manage_users and can_manage_records:
++                            break
++                return can_manage_users and can_manage_records
+ 
+             f_path_fn = lambda f_uid: get_folder_path(params, f_uid)
+             blockers = []
+@@ -1305,46 +1318,18 @@ class FolderTransformCommand(Command):
+                 msg += '\n'.join(sfs)
+                 raise CommandError('transform-folder', msg)
+ 
+-            # Check contained records
+-            can_reshare_fn = lambda rec_md: rec_md is None or rec_md.get('owner') or rec_md.get('can_share')
+-            rec_path_fn = lambda folder_path, record: folder_path + RecordV3.get_title(record)
+-
+-            blockers = []
+-            rq = record_pb2.AmIShareAdmin()
+-            for folder, record_uids in contained_recs:
+-                for r in record_uids:
+-                    rec = params.rec

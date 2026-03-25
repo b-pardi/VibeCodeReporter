@@ -1,0 +1,108 @@
+@@ -340,7 +340,7 @@ class NL_AUTH_SIGNATURE(Packet):
+             {
+                 0xFFFF: "Unencrypted",
+                 0x007A: "RC4",
+-                0x00A1: "AES-128",
++                0x001A: "AES-128",
+             },
+         ),
+         XLEShortField("Pad", 0xFFFF),
+@@ -2671,8 +2671,8 @@ class DceRpcSession(DefaultSession):
+         opnum, opts = self._up_pkt(pkt)
+         # Check for encrypted payloads
+         body = None
+-        if conf.raw_layer in pkt:
+-            body = bytes(pkt[conf.raw_layer])
++        if conf.raw_layer in pkt.payload:
++            body = bytes(pkt.payload[conf.raw_layer])
+         # If we are doing passive sniffing
+         if conf.dcerpc_session_enable and conf.winssps_passive:
+             # We have Windows SSPs, and no current context
+@@ -2801,18 +2801,18 @@ class DceRpcSession(DefaultSession):
+                     "Unknown opnum %s for interface %s"
+                     % (opnum, self.rpc_bind_interface)
+                 )
+-                pkt[conf.raw_layer].load = body
++                pkt.payload[conf.raw_layer].load = body
+                 return pkt
+             if body:
+                 # Dissect payload using class
+                 payload = cls(body, ndr64=self.ndr64, ndrendian=self.ndrendian, **opts)
+-                pkt[conf.raw_layer].underlayer.remove_payload()
++                pkt.payload[conf.raw_layer].underlayer.remove_payload()
+                 pkt /= payload
+             elif not cls.fields_desc:
+                 # Request class has no payload
+                 pkt /= cls(ndr64=self.ndr64, ndrendian=self.ndrendian, **opts)
+         elif body:
+-            pkt[conf.raw_layer].load = body
++            pkt.payload[conf.raw_layer].load = body
+         return pkt
+ 
+     def out_pkt(self, pkt):
+
+
+
+
+@@ -9,11 +9,13 @@
+ https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nrpc/ff8f970f-3e37-40f7-bd4b-af7336e4792f
+ """
+ 
++import enum
+ import os
+ import struct
+ import time
+ 
+ from scapy.config import conf, crypto_validator
++from scapy.fields import FlagValue, FlagsField
+ from scapy.layers.dcerpc import (
+     find_dcerpc_interface,
+     DCE_C_AUTHN_LEVEL,
+@@ -28,7 +30,11 @@ from scapy.layers.gssapi import (
+ )
+ from scapy.layers.ntlm import RC4, RC4K, RC4Init, SSP
+ 
+-from scapy.layers.msrpce.rpcclient import DCERPC_Client, DCERPC_Transport
++from scapy.layers.msrpce.rpcclient import (
++    DCERPC_Client,
++    DCERPC_Transport,
++    STATUS_ERREF,
++)
+ from scapy.layers.msrpce.raw.ms_nrpc import (
+     NetrServerAuthenticate3_Request,
+     NetrServerAuthenticate3_Response,
+@@ -56,11 +62,70 @@ from typing import (
+ 
+ # --- RFC
+ 
++# [MS-NRPC] sect 3.1.4.2
++_negotiateFlags = {
++    # Not used. MUST be ignored on receipt.
++    0x00000001: "A",
++    # B: BDCs persistently try to update their database to the PDC's
++    # version after they get a notification indicating that their
++    # database is out-of-date.
++    0x00000002: "BDCContinuousUpdate",
++    # C: Supports RC4 encryption.
++    0x00000004: "RC4",
++    # Not used. MUST be ignored on receipt.
++    0x00000008: "D",
++    # E: Supports BDCs handling CHANGELOGs.
++    0x00000010: "BDCChangelog",
++    # F: Supports restarting of full synchronization between DCs.
++    0x00000020: "RestartingDCSync",
++    # G: Does not require ValidationLevel 2 fornongeneric passthrough.
++    0x00000040: "NoValidationLevel2",
++    # H: Supports the NetrDatabaseRedo (Opnum 17) functionality
++    0x00000080: "DatabaseRedo",
++    # I: Supports refusal of password changes.
++    0x00000100: "RefusalPasswordChange",
++    # J: Supports the NetrLogonSendToSam (Opnum 32) functionality.
++    0x00000200: "SendToSam",
++    # K: Supports generic pass-through authentication.
++    0x00000400: "Generic-passthrough",
++    # L: Supports concurrent RPC calls.
++    0x00000800: "ConcurrentRPC",
++    # M: Supports avoiding of user account database replication.
++    0x00001000: "AvoidRepliAccountDB",
++    # N: Supports avoiding of Security Authority database rep

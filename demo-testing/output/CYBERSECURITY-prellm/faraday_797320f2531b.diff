@@ -1,0 +1,119 @@
+@@ -92,9 +92,16 @@ class WebsocketsChangesStream(ChangesStream):
+         super(WebsocketsChangesStream, self).stop()
+ 
+     def on_open(self, ws):
++        from persistence.server.server import _create_server_api_url, _post
++        r = _post(
++            _create_server_api_url() +
++            '/ws/{}/websocket_token/'.format(self.workspace_name),
++            expected_response=200)
++        token = r['token']
+         self.ws.send(json.dumps({
+             'action': 'JOIN_WORKSPACE',
+             'workspace': self.workspace_name,
++            'token': token,
+         }))
+ 
+     def on_message(self, ws, message):
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,23 @@
++# Faraday Penetration Test IDE
++# Copyright (C) 2016  Infobyte LLC (http://www.infobytesec.com/)
++# See the file 'doc/LICENSE' for the license information
++
++from flask import Blueprint
++from flask import current_app as app
++from itsdangerous import TimestampSigner
++from server.api.base import GenericWorkspacedView
++
++websocket_auth_api = Blueprint('websocket_auth_api', __name__)
++
++
++class WebsocketAuthView(GenericWorkspacedView):
++    route_base = 'websocket_token'
++
++    def post(self, workspace_name):
++        workspace = self._get_workspace(workspace_name)
++        signer = TimestampSigner(app.config['SECRET_KEY'], salt="websocket")
++        token = signer.sign(str(workspace.id))
++        return {"token": token}
++
++
++WebsocketAuthView.register(websocket_auth_api)
+
+
+
+
+@@ -64,6 +64,7 @@ def register_blueprints(app):
+     from server.api.modules.workspaces import workspace_api
+     from server.api.modules.handlers import handlers_api
+     from server.api.modules.comments import comment_api
++    from server.api.modules.websocket_auth import websocket_auth_api
+     app.register_blueprint(commandsrun_api)
+     app.register_blueprint(credentials_api)
+     app.register_blueprint(host_api)
+@@ -76,6 +77,7 @@ def register_blueprints(app):
+     app.register_blueprint(workspace_api)
+     app.register_blueprint(handlers_api)
+     app.register_blueprint(comment_api)
++    app.register_blueprint(websocket_auth_api)
+ 
+ 
+ def check_testing_configuration(testing, app):
+
+
+
+
+@@ -1,7 +1,9 @@
+ import json
+ import logging
++import itsdangerous
+ 
+ import Cookie
++import server.utils
+ from collections import defaultdict
+ from Queue import Queue, Empty
+ 
+@@ -13,7 +15,9 @@ from autobahn.twisted.websocket import (
+     WebSocketServerProtocol
+ )
+ 
+-logger =logging.getLogger(__name__)
++from server.models import Workspace
++
++logger = server.utils.logger.get_logger(__name__)
+ changes_queue = Queue()
+ 
+ 
+@@ -32,6 +36,7 @@ class BroadcastServerProtocol(WebSocketServerProtocol):
+         return (protocol, headers)
+ 
+     def onMessage(self, payload, is_binary):
++        from server.web import app
+         """
+             We only support JOIN and LEAVE workspace messages.
+             When authentication is implemented we need to verify
+@@ -42,7 +47,33 @@ class BroadcastServerProtocol(WebSocketServerProtocol):
+         if not is_binary:
+             message = json.loads(payload)
+             if message['action'] == 'JOIN_WORKSPACE':
+-                self.factory.join_workspace(self, message['workspace'])
++                if 'workspace' not in message or 'token' not in message:
++                    logger.warning('Invalid join workspace message: '
++                                   '{}'.format(message))
++                    self.sendClose()
++                    return
++                signer = itsdangerous.TimestampSigner(app.config['SECRET_KEY'],
++                                                      salt="websocket")
++                try:
++                    workspace_id = signer.unsign(message['token'], max_age=60)
++                except itsdangerous.BadData as e:
++                    self.sendClose()
++                    logger.warning('Invalid websocket token for workspace '
++                                   '{}'.format(message['workspace']))
++                    logger.exception(e)
++            

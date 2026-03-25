@@ -1,0 +1,110 @@
+@@ -2564,6 +2564,8 @@ char* Elf_(get_abi)(ELFOBJ *eo) {
+ 	case EM_V800:
+ 	case EM_V850:
+ 		break;
++	case EM_SBPF:
++		return r_str_newf ("sbpfv%d", eflags);
+ 	}
+ 	return NULL;
+ }
+@@ -4267,6 +4269,7 @@ static bool _add_sections_from_phdr(RBinFile *bf, ELFOBJ *eo, bool *found_load)
+ 	}
+ 
+ 	int i = 0, n = 0;
++
+ 	for (i = 0; i < num; i++) {
+ 		RBinSection *ptr = r_vector_end (&eo->cached_sections);
+ 		if (!ptr) {
+@@ -4277,6 +4280,7 @@ static bool _add_sections_from_phdr(RBinFile *bf, ELFOBJ *eo, bool *found_load)
+ 		ptr->vsize = phdr[i].p_memsz;
+ 		ptr->paddr = phdr[i].p_offset;
+ 		ptr->vaddr = phdr[i].p_vaddr;
++
+ 		ptr->perm = phdr[i].p_flags; // perm  are rwx like x=1, w=2, r=4, aka no need to convert from r2's R_PERM
+ 		ptr->is_segment = true;
+ 		switch (phdr[i].p_type) {
+@@ -5518,7 +5522,8 @@ ut64 Elf_(p2v) (ELFOBJ *eo, ut64 paddr) {
+ 			if (!p->p_vaddr && !p->p_offset) {
+ 				continue;
+ 			}
+-			return p->p_vaddr + paddr - p->p_offset;
++			ut64 vaddr = p->p_vaddr + paddr - p->p_offset;
++			return vaddr;
+ 		}
+ 	}
+ 
+
+
+
+
+@@ -453,6 +453,7 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
+ 	R_RETURN_VAL_IF_FAIL (eo && rel, NULL);
+ 	ut64 B = eo->baddr;
+ 	ut64 P = rel->rva; // rva has taken baddr into account
++
+ 	RBinReloc *r = R_NEW0 (RBinReloc);
+ 	r->import = NULL;
+ 	r->ntype = rel->type;
+@@ -779,16 +780,16 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
+ 		switch (rel->type) {
+ 		case R_BPF_64_64: // 64-bit immediate for lddw instruction
+ 			r->type = R_BIN_RELOC_64;
+-			r->vaddr = B + rel->offset;
++			r->vaddr = P;
+ 			return r;
+ 		case R_BPF_64_RELATIVE: // PC relative 64-bit address
+ 			r->type = R_BIN_RELOC_64;
+-			r->vaddr = B + rel->offset;
++			r->vaddr = P;
+ 			return r;
+ 		case R_BPF_64_32: // 32-bit function/syscall ID for call instruction
+ 			r->type = R_BIN_RELOC_32;
+ 			// The immediate value will be a function ID or syscall ID, not an address
+-			r->vaddr = B + rel->offset;
++			r->vaddr = P;
+ 			return r;
+ 		default:
+ 			R_LOG_DEBUG ("Unimplemented BPF reloc type %d", rel->type);
+@@ -817,7 +818,7 @@ static RBinReloc *reloc_convert(ELFOBJ* eo, RBinElfReloc *rel, ut64 got_addr) {
+ // Helper macro for left bit rotation
+ #define rotl32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+ 
+-// Firedancer-compatible Murmur3 32-bit hash function for sBPF syscalls
++// Murmur3 32-bit hash function for sBPF syscalls
+ static ut32 murmur3_32(const char* data, ut32 len, ut32 seed) {
+ 	const ut32 c1 = 0xcc9e2d51U;
+ 	const ut32 c2 = 0x1b873593U;
+@@ -1130,54 +1131,79 @@ static void _patch_reloc(ELFOBJ *bo, ut16 e_machine, RIOBind *iob, RBinElfReloc
+ 	}
+ 	case EM_BPF: // CHECK: some older solana programs have set an ehdr.e_machine of EM_BPF
+ 	case EM_SBPF: {
++		B = bo->user_baddr != UINT64_MAX ? bo->user_baddr : bo->baddr;
+ 		switch (rel->type) {
+-		case R_BPF_64_64: // 64-bit immediate for lddw instructions
+-			V = S + A;
+-			// Write as split 32-bit values to immediate fields (offset+4 and offset+12)
++		case R_BPF_64_64: { // 64-bit immediate for lddw instructions
++			// Read the current value from the immediate fields (addend)
++			// offset+4 = imm_lo, offset+8 = second instruction, offset+12 = imm_hi
++			ut32 vals[3];
++			ut64 addend = 0;
++			if (r_buf_fread_at (bo->b, rel->offset + 4, (ut8 *)vals, "iii", 1) == 12) {
++				addend = ((ut64)vals[2] << 32) | vals[0];
++			}
++			// V = symbol value + addend
++			V = S + addend;
++			// Normalize address: if V < base_addr, add base_addr
++			if (V < B) {
++				V += B;
++			}
++			// Write as split 32-bit values to immediate fields (rva+4 and rva+12)
+ 			r_write_le32 (buf, (ut32)(V & UT32_MAX));
+-			iob->overlay_write_at (iob->io, rel->rva + 4, buf, 4);
++			iob->overlay_write_at (iob->io, rel->rva + 4 + B, buf, 4);
+ 			r_write_le32 (buf, (ut32)(V >> 32));
+-			iob->overlay_write_at (iob->io, rel->rva + 12, buf, 4);
++			iob->overlay_write_at (iob->io, rel->rva + 12 + B, buf, 4);
+ 			break;
++		}
+ 
+ 		case R_BPF_64_RELATIVE: { // PC relativ

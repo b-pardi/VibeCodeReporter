@@ -1,0 +1,108 @@
+@@ -380,6 +380,7 @@ R_API bool r_anal_set_bits(RAnal *anal, int bits) {
+ }
+ 
+ R_API ut8 *r_anal_mask(RAnal *anal, int size, const ut8 *data, ut64 at) {
++	// see 'aobm' command
+ 	RAnalOp *op = NULL;
+ 	ut8 *ret = NULL;
+ 	int oplen, idx = 0;
+
+
+
+
+@@ -3442,7 +3442,8 @@ R_API int r_core_config_init(RCore *core) {
+ 	const char *analsyscc = r_anal_syscc_default (core->anal);
+ 	SETCB ("anal.syscc", analsyscc? analsyscc: "", (RConfigCallback)&cb_analsyscc, "specify default syscall calling convention");
+ 	SETCB ("anal.verbose", "false", &cb_analverbose, "show RAnal warnings when analyzing code");
+-	SETBPREF ("anal.a2f", "false",  "use the new WIP analysis algorithm (core/p/a2f), anal.depth ignored atm");
++	SETBPREF ("anal.mask", "false", "use the smart aobm command to compute the binary mask of the instruction");
++	SETBPREF ("anal.a2f", "false", "use the new WIP analysis algorithm (core/p/a2f), anal.depth ignored atm");
+ 	SETCB ("anal.roregs", "gp,zero", (RConfigCallback)&cb_anal_roregs, "comma separated list of register names to be readonly");
+ 	SETICB ("anal.cs", 0, (RConfigCallback)&cb_anal_cs, "set the value for the x86-16 CS segment register (see asm.offset.segment and asm.offset.segment.bits)");
+ 	SETICB ("anal.gp", 0, (RConfigCallback)&cb_anal_gp, "set the value of the GP register (MIPS)");
+
+
+
+
+@@ -2283,6 +2283,7 @@ static void core_anal_bytes(RCore *core, const ut8 *buf, int len, int nops, int
+ 		break;
+ 	}
+ 	}
++	const bool smart_mask = r_config_get_b (core->config, "anal.mask");
+ 	for (i = idx = ret = 0; idx < len && (!nops || (nops && i < nops)); i++, idx += ret) {
+ 		RAnalOp asmop = {0};
+ 		addr = core->offset + idx;
+@@ -2420,7 +2421,11 @@ static void core_anal_bytes(RCore *core, const ut8 *buf, int len, int nops, int
+ 			}
+ 
+ 			pj_ks (pj, "mnemonic", mnem);
+-			{
++			if (smart_mask) {
++				char *maskstr = r_core_cmd_strf (core, "aobm@0x%08"PFMT64x, op.addr);
++				pj_ks (pj, "mask", maskstr);
++				free (maskstr);
++			} else {
+ 				ut8 *mask = r_anal_mask (core->anal, len - idx, buf + idx, core->offset + idx);
+ 				char *maskstr = r_hex_bin2strdup (mask, size);
+ 				pj_ks (pj, "mask", maskstr);
+@@ -2606,10 +2611,17 @@ static void core_anal_bytes(RCore *core, const ut8 *buf, int len, int nops, int
+ 			}
+ 			{
+ 				ut8 *mask = r_anal_mask (core->anal, len - idx, buf + idx, core->offset + idx);
+-				char *maskstr = r_hex_bin2strdup (mask, size);
+-				printline ("mask", "%s\n", maskstr);
++				if (smart_mask) {
++					char *maskstr = r_core_cmd_strf (core, "aobm@0x%08"PFMT64x, op.addr);
++					r_str_trim (maskstr);
++					printline ("mask", "%s\n", maskstr);
++					free (maskstr);
++				} else {
++					char *maskstr = r_hex_bin2strdup (mask, size);
++					printline ("mask", "%s\n", maskstr);
++					free (maskstr);
++				}
+ 				free (mask);
+-				free (maskstr);
+ 			}
+ 			if (hint) {
+ 				if (hint->opcode) {
+@@ -8122,7 +8134,7 @@ static int intsort(const void *a, const void *b) {
+ 
+ static void cmd_anal_opcode_bits(RCore *core, const char *arg, int mode) {
+ 	ut8 buf[32] = {0};
+-	if (*arg) {
++	if (R_STR_ISNOTEMPTY (arg)) {
+ 		char *choparg = r_str_ndup (arg, 8);
+ 		int res = r_hex_str2bin (choparg, (ut8 *)buf);
+ 		free (choparg);
+@@ -8216,10 +8228,37 @@ static void cmd_anal_opcode_bits(RCore *core, const char *arg, int mode) {
+ 		r_cons_printf ("%s\n", s);
+ 		free (s);
+ 	} else {
+-		r_strbuf_appendf (sb, " : %s", analop.mnemonic);
+-		char *s = r_strbuf_drain (sb);
+-		r_cons_printf ("%s\n", s);
+-		free (s);
++		if (mode == 'm') {
++			int pi = 0;
++			char *s = r_strbuf_drain (sb);
++			char *p = s;
++			ut8 finalmask[8] = {0};
++			for (; *p; p++) {
++				int byte_index = (pi / 8);
++				int bit_index = (pi % 8);
++				ut8 *byte = finalmask + byte_index;
++				if (*p == '0') {
++					// only pick the bits that modify the 0th word
++					R_BIT_SET (byte, bit_index);
++					pi++;
++				} else if (isalnum (*p)) {
++					pi++;
++				}
++				if (byte_index >= last) {
++					break;
++				}
++			}
++			free (s);
++			for (i = 0; i < 8 && i < last; i++) {
++				r_cons_print

@@ -1,0 +1,155 @@
+@@ -89,8 +89,8 @@ enum {
+ #define CILIUM_CALL_IPV4_FROM_LXC		7
+ #define CILIUM_CALL_IPV4_FROM_NETDEV		CILIUM_CALL_IPV4_FROM_LXC
+ #define CILIUM_CALL_IPV4_FROM_OVERLAY		CILIUM_CALL_IPV4_FROM_LXC
+-#define CILIUM_CALL_UNUSED1			8
+-#define CILIUM_CALL_UNUSED2			9
++#define CILIUM_CALL_IPV46_RFC8215		8
++#define CILIUM_CALL_IPV64_RFC8215		9
+ #define CILIUM_CALL_IPV6_FROM_LXC		10
+ #define CILIUM_CALL_IPV6_FROM_NETDEV		CILIUM_CALL_IPV6_FROM_LXC
+ #define CILIUM_CALL_IPV6_FROM_OVERLAY		CILIUM_CALL_IPV6_FROM_LXC
+@@ -503,6 +503,8 @@ enum {
+ #define DROP_INVALID_TC_BUFFER  -184
+ #define DROP_NO_SID		-185
+ #define DROP_MISSING_SRV6_STATE	-186
++#define DROP_NAT46		-187
++#define DROP_NAT64		-188
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ #define NAT_46X64_RECIRC	100
+
+
+
+
+@@ -28,6 +28,22 @@ static __always_inline __maybe_unused bool is_v4_in_v6(const union v6addr *daddr
+ 	return ipv6_addrcmp(&dprobe, &dmasked) == 0;
+ }
+ 
++static __always_inline __maybe_unused bool is_v4_in_v6_rfc8215(const union v6addr *daddr)
++{
++	/* Check for 64:ff9b::<IPv4 address>. */
++	union v6addr dprobe  = {
++		.addr[1] = 0x64,
++		.addr[2] = 0xff,
++		.addr[3] = 0x9b,
++	};
++	union v6addr dmasked = {
++		.d1 = daddr->d1,
++	};
++
++	dmasked.p3 = daddr->p3;
++	return ipv6_addrcmp(&dprobe, &dmasked) == 0;
++}
++
+ static __always_inline __maybe_unused
+ void build_v4_in_v6(union v6addr *daddr, __be32 v4)
+ {
+@@ -37,6 +53,16 @@ void build_v4_in_v6(union v6addr *daddr, __be32 v4)
+ 	daddr->p4 = v4;
+ }
+ 
++static __always_inline __maybe_unused
++void build_v4_in_v6_rfc8215(union v6addr *daddr, __be32 v4)
++{
++	memset(daddr, 0, sizeof(*daddr));
++	daddr->addr[1] = 0x64;
++	daddr->addr[2] = 0xff;
++	daddr->addr[3] = 0x9b;
++	daddr->p4 = v4;
++}
++
+ static __always_inline __maybe_unused
+ void build_v4_from_v6(const union v6addr *v6, __be32 *daddr)
+ {
+@@ -344,4 +370,29 @@ static __always_inline int ipv6_to_ipv4(struct __ctx_buff *ctx,
+ 	return 0;
+ }
+ 
++static __always_inline int
++nat46_rfc8215(struct __ctx_buff *ctx __maybe_unused,
++	      const struct iphdr *ip4 __maybe_unused,
++	      int l3_off __maybe_unused)
++{
++	union v6addr src6, dst6;
++
++	build_v4_in_v6_rfc8215(&src6, ip4->saddr);
++	build_v4_in_v6_rfc8215(&dst6, ip4->daddr);
++
++	return ipv4_to_ipv6(ctx, l3_off, &src6, &dst6);
++}
++
++static __always_inline int
++nat64_rfc8215(struct __ctx_buff *ctx __maybe_unused,
++	      const struct ipv6hdr *ip6 __maybe_unused)
++{
++	__be32 src4, dst4;
++
++	build_v4_from_v6((const union v6addr *)&ip6->saddr, &src4);
++	build_v4_from_v6((const union v6addr *)&ip6->daddr, &dst4);
++
++	return ipv6_to_ipv4(ctx, src4, dst4);
++}
++
+ #endif /* __LIB_NAT_46X64__ */
+
+
+
+
+@@ -566,6 +566,129 @@ drop_err:
+ }
+ #endif /* ENABLE_DSR */
+ 
++#ifdef ENABLE_NAT_46X64_STATELESS
++__section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV46_RFC8215)
++int tail_nat_ipv46(struct __ctx_buff *ctx)
++{
++	struct bpf_fib_lookup_padded fib_params = {
++		.l = {
++			.family		= AF_INET6,
++			.ifindex	= ctx_get_ifindex(ctx),
++		},
++	};
++	bool l2_hdr_required = true;
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++	struct iphdr *ip4;
++	int ret, ext_err = 0;
++	int l3_off = ETH_HLEN;
++
++	if (!revalidate_data(ctx, &data, &data_end, &ip4)) {
++		ret = DROP_INVALID;
++		goto drop_err;
++	}
++	if (nat46_rfc8215(ctx, ip4, l3_off)) {
++		ret = DROP_NAT46;
++		goto drop_err;
++	}
++	if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
++		ret = DROP_INVALID;
++		goto drop_err;
++	}
++
++	ipv6_addr_copy((union v6addr *)&fib_params.l.ipv6_src,
++		       (union v6addr *)&ip6->saddr);
++	ipv6_addr_copy((union v6addr *)&fib_params.l.ipv6_dst,
++		       (union v6addr *)&ip6->daddr);
++
++	ret = fib_lookup(ctx, &fib_params.l, sizeof(fib_params), 0);
++	if (ret != 0) {
++		ext_err = ret;
++		ret = DROP_NO_FIB;
++		goto drop_err;
++	}
++
++	ret = maybe_add_l2_hdr(ctx, fib_params.l.ifindex, &l2_hdr_required);
++	if (ret != 0)
++		goto drop_err;
++	if (!l2_hdr_required)
++		goto out_send;
++
++	if (eth_store_daddr(ctx, fib_params.l.dmac, 0) < 0) {
++		ret = DROP_WRITE_ERROR;
++		goto drop_err;
++	}
++	if (eth

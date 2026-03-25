@@ -1,0 +1,133 @@
+@@ -142,6 +142,13 @@ struct hook {
+     void *user_data;
+ };
+ 
++// Add an inline hook to helper_table
++typedef void (*uc_add_inline_hook_t)(struct uc_struct *uc, struct hook *hk,
++                                     void **args, int args_len);
++
++// Delete a hook from helper_table
++typedef void (*uc_del_inline_hook_t)(struct uc_struct *uc, struct hook *hk);
++
+ // hook list offsets
+ //
+ // The lowest 6 bits are used for hook type index while the others
+@@ -254,6 +261,8 @@ struct uc_struct {
+     uc_tcg_flush_tlb tcg_flush_tlb;
+     uc_invalidate_tb_t uc_invalidate_tb;
+     uc_gen_tb_t uc_gen_tb;
++    uc_add_inline_hook_t add_inline_hook;
++    uc_del_inline_hook_t del_inline_hook;
+ 
+     /*  only 1 cpu in unicorn,
+         do not need current_cpu to handle current running cpu. */
+@@ -296,6 +305,7 @@ struct uc_struct {
+     // linked lists containing hooks per type
+     struct list hook[UC_HOOK_MAX];
+     struct list hooks_to_del;
++    int hooks_count[UC_HOOK_MAX];
+ 
+     // hook to count number of instructions for uc_emu_start()
+     uc_hook count_hook;
+
+
+
+
+@@ -4,6 +4,8 @@
+ #ifndef UNICORN_ARCH_POSTFIX
+ #define UNICORN_ARCH_POSTFIX _aarch64
+ #endif
++#define uc_add_inline_hook uc_add_inline_hook_aarch64
++#define uc_del_inline_hook uc_del_inline_hook_aarch64
+ #define tb_invalidate_phys_range tb_invalidate_phys_range_aarch64
+ #define use_idiv_instructions use_idiv_instructions_aarch64
+ #define arm_arch arm_arch_aarch64
+
+
+
+
+@@ -4,6 +4,8 @@
+ #ifndef UNICORN_ARCH_POSTFIX
+ #define UNICORN_ARCH_POSTFIX _aarch64eb
+ #endif
++#define uc_add_inline_hook uc_add_inline_hook_aarch64eb
++#define uc_del_inline_hook uc_del_inline_hook_aarch64eb
+ #define tb_invalidate_phys_range tb_invalidate_phys_range_aarch64eb
+ #define use_idiv_instructions use_idiv_instructions_aarch64eb
+ #define arm_arch arm_arch_aarch64eb
+
+
+
+
+@@ -1078,6 +1078,10 @@ void tcg_exec_init(struct uc_struct *uc, unsigned long tb_size)
+     /* Invalidate / Cache TBs */
+     uc->uc_invalidate_tb = uc_invalidate_tb;
+     uc->uc_gen_tb = uc_gen_tb;
++
++    /* Inline hooks optimization */
++    uc->add_inline_hook = uc_add_inline_hook;
++    uc->del_inline_hook = uc_del_inline_hook;
+ }
+ 
+ /* call with @p->lock held */
+
+
+
+
+@@ -4,6 +4,8 @@
+ #ifndef UNICORN_ARCH_POSTFIX
+ #define UNICORN_ARCH_POSTFIX _arm
+ #endif
++#define uc_add_inline_hook uc_add_inline_hook_arm
++#define uc_del_inline_hook uc_del_inline_hook_arm
+ #define tb_invalidate_phys_range tb_invalidate_phys_range_arm
+ #define use_idiv_instructions use_idiv_instructions_arm
+ #define arm_arch arm_arch_arm
+
+
+
+
+@@ -4,6 +4,8 @@
+ #ifndef UNICORN_ARCH_POSTFIX
+ #define UNICORN_ARCH_POSTFIX _armeb
+ #endif
++#define uc_add_inline_hook uc_add_inline_hook_armeb
++#define uc_del_inline_hook uc_del_inline_hook_armeb
+ #define tb_invalidate_phys_range tb_invalidate_phys_range_armeb
+ #define use_idiv_instructions use_idiv_instructions_armeb
+ #define arm_arch arm_arch_armeb
+
+
+
+
+@@ -32,13 +32,41 @@
+ static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t type, void *uc, uint64_t pc)
+ {
+     TCGv_i32 tsize = tcg_const_i32(tcg_ctx, size);
+-    TCGv_i32 ttype = tcg_const_i32(tcg_ctx, type);
++    TCGv_i32 ttype;
+     TCGv_ptr tuc = tcg_const_ptr(tcg_ctx, uc);
+     TCGv_i64 tpc = tcg_const_i64(tcg_ctx, pc);
+-    gen_helper_uc_tracecode(tcg_ctx, tsize, ttype, tuc, tpc);
++    TCGv_ptr tdata;
++    uc_engine* puc = uc;
++    struct list_item *cur;
++    struct hook* hk;
++    TCGTemp* args[] = {
++        tcgv_ptr_temp(tcg_ctx, tuc),
++        tcgv_i64_temp(tcg_ctx, tpc),
++        tcgv_i32_temp(tcg_ctx, tsize),
++        0
++    };
++
++    if (puc->hooks_count[type] == 1) {
++        cur = puc->hook[type].head;
++        
++        while (cur) {
++            hk = cur->data;
++            if (!hk->to_delete) {
++                tdata = tcg_const_ptr(tcg_ctx, hk->user_data);
++                args[3] = tcgv_ptr_temp(tcg_ctx, tdata);
++                puc->add_inline_hook(uc, hk, (void**)args, 4);
++                tcg_temp_free_ptr(tcg_ctx, tdata);
++           

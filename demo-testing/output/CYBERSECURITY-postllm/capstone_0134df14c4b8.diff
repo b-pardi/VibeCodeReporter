@@ -1,0 +1,123 @@
+@@ -474,7 +474,15 @@ static void ARM_add_not_defined_ops(MCInst *MI)
+ 			ARM_get_detail(MI)->operands[0].access |= CS_AC_WRITE;
+ 			MI->flat_insn->detail->writeback = true;
+ 		}
++		break;
++	}
+ 	}
++	if (MI->flat_insn->id == ARM_INS_PUSH ||
++	    MI->flat_insn->id == ARM_INS_POP ||
++	    MI->flat_insn->id == ARM_INS_VPUSH ||
++	    MI->flat_insn->id == ARM_INS_VPOP) {
++		map_add_implicit_read(MI, ARM_REG_SP);
++		map_add_implicit_write(MI, ARM_REG_SP);
+ 	}
+ }
+ 
+@@ -1963,8 +1971,7 @@ void ARM_set_detail_op_neon_lane(MCInst *MI, unsigned OpNum)
+ 	assert(map_get_op_type(MI, OpNum) == CS_OP_IMM);
+ 	unsigned Val = MCOperand_getImm(MCInst_getOperand(MI, OpNum));
+ 
+-	ARM_dec_op_count(MI);
+-	ARM_get_detail_op(MI, 0)->neon_lane = Val;
++	ARM_get_detail_op(MI, -1)->neon_lane = Val;
+ }
+ 
+ /// Adds a System Register and increments op_count by one.
+
+
+
+
+@@ -18,6 +18,13 @@ def get_report_file(toolpath, filepath, getDetails, cmt_out):
+ 	cmd = [toolpath, '-f', filepath]
+ 	process = Popen(cmd, stdout=PIPE, stderr=PIPE)
+ 	stdout, stderr = process.communicate()
++	if process.returncode != 0:
++		print('[-] Failed to run cstest on {}'.format(filepath))
++		print('[-] stdout:')
++		print(stdout)
++		print('[-] stderr:')
++		print(stderr)
++		return 0
+ 
+ #	stdout
+ 	failed_tests = []
+
+
+
+
+@@ -65,9 +65,36 @@ char *get_detail_arm(csh *handle, cs_mode mode, cs_insn *ins)
+ 			case ARM_OP_SETEND:
+ 				add_str(&result, " ; operands[%u].type: SETEND = %s", i, op->setend == ARM_SETEND_BE? "be" : "le");
+ 				break;
++			case ARM_OP_SYSM:
++				add_str(&result, " ; operands[%u].type: SYSM = 0x%" PRIx16 "\n", i, op->sysop.sysm);
++				add_str(&result, " ; operands[%u].type: MASK = %" PRIu8 "\n", i, op->sysop.msr_mask);
++				break;
+ 			case ARM_OP_SYSREG:
+-				add_str(&result, " ; operands[%u].type: SYSREG = %u", i, op->reg);
++				add_str(&result, " ; operands[%u].type: SYSREG = %s", i, cs_reg_name(*handle, (uint32_t) op->sysop.reg.mclasssysreg));
++				add_str(&result, " ; operands[%u].type: MASK = %" PRIu8, i, op->sysop.msr_mask);
++				break;
++			case ARM_OP_BANKEDREG:
++				// FIXME: Printing the name is currenliy not supported if the encodings overlap
++				// with system registers.
++				add_str(&result, " ; operands[%u].type: BANKEDREG = %" PRIu32, i, (uint32_t) op->sysop.reg.bankedreg);
++				if (op->sysop.msr_mask != UINT8_MAX)
++					add_str(&result, " ; operands[%u].type: MASK = %" PRIu8, i, op->sysop.msr_mask);
++			case ARM_OP_SPSR:
++			case ARM_OP_CPSR: {
++				const char type = op->type == ARM_OP_SPSR ? 'S' : 'C';
++				add_str(&result, " ; operands[%u].type: %cPSR = ", i, type);
++				uint16_t field = op->sysop.psr_bits;
++				if ((field & ARM_FIELD_SPSR_F) || (field & ARM_FIELD_CPSR_F))
++					add_str(&result, "f");
++				if ((field & ARM_FIELD_SPSR_S) || (field & ARM_FIELD_CPSR_S))
++					add_str(&result, "s");
++				if ((field & ARM_FIELD_SPSR_X) || (field & ARM_FIELD_CPSR_X))
++					add_str(&result, "x");
++				if ((field & ARM_FIELD_SPSR_C) || (field & ARM_FIELD_CPSR_C))
++					add_str(&result, "c");
++				add_str(&result, " ; operands[%u].type: MASK = %" PRIu8, i, op->sysop.msr_mask);
+ 				break;
++			}
+ 		}
+ 
+ 		if (op->neon_lane != -1) {
+
+
+
+
+@@ -160,6 +160,12 @@ static int setup_state(void **state) {
+ 	}
+ 
+ 	arch = get_value(arches, ARR_SIZE(arches), list_params[0]);
++	if (arch == -1) {
++		fprintf(stderr, "[  ERROR   ] --- Arch is not supported!\n");
++		failed_setup = 1;
++		return -1;
++	}
++
+ 	if (!strcmp(list_params[0], "CS_ARCH_ARM64")) 
+ 		mc_mode = 2;
+ 	else 
+@@ -185,18 +191,22 @@ static int setup_state(void **state) {
+ 		}
+ 	}
+ 
+-	if (arch == -1) {
+-		fprintf(stderr, "[  ERROR   ] --- Arch is not supported!\n");
+-		failed_setup = 1;
+-		return -1;
+-	}
+-
+ 	handle = (csh *)malloc(sizeof(csh));
+ 	if(cs_open(arch, mode, handle) != CS_ERR_OK) {
+ 		fprintf(stderr, "[  ERROR   ] --- Cannot initialize capstone\n");
+ 		failed_setup = 1;
+ 		return -1;
+ 	}
++
++	for (i = 0; i < ARR_SIZE(options); ++i) {
++		if (strstr(list_params[2], options[i].str)) {
++			if (cs_option(*handle, option

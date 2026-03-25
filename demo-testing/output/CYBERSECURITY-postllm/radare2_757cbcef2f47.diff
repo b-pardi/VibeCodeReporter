@@ -1,0 +1,179 @@
+@@ -105,7 +105,7 @@ R_API bool r_crypto_job_set_key(RCryptoJob *cj, const ut8* key, int keylen, int
+ 		keylen = strlen ((const char *)key);
+ 	}
+ 	if (!cj->h || !cj->h->set_key) {
+-		return false;
++		return true;
+ 	}
+ 	cj->key_len = keylen;
+ 	cj->key = calloc (1, cj->key_len);
+@@ -222,7 +222,7 @@ R_API void r_crypto_list(RCrypto *cry, PrintfCallback cb_printf, int mode) {
+ 			pj_ks (pj, "type", "hash");
+ 			pj_ks (pj, "name", cp->meta.name);
+ 			switch (cp->type) {
+-			case R_CRYPTO_TYPE_HASH:
++			case R_CRYPTO_TYPE_HASHER:
+ 				pj_ks (pj, "type", "hash");
+ 				break;
+ 			case R_CRYPTO_TYPE_ENCRYPT:
+
+
+
+
+@@ -53,7 +53,7 @@ RCryptoPlugin r_crypto_plugin_entropy = {
+ 		.author = "pancake",
+ 		.license = "MIT",
+ 	},
+-	.type = R_CRYPTO_TYPE_HASH,
++	.type = R_CRYPTO_TYPE_HASHER,
+ 	.update = update,
+ 	.end = end
+ };
+
+
+
+
+@@ -51,7 +51,7 @@ static bool ror_check(const char *algo) {
+ }
+ 
+ static bool update(RCryptoJob *cj, const ut8 *buf, int len) {
+-	if (!cj->flag) {
++	if (cj->flag != R_CRYPTO_DIR_ENCRYPT) {
+ 		return false;
+ 	}
+ 	ut8 *obuf = calloc (1, len);
+
+
+
+
+@@ -53,7 +53,7 @@ static void rot_decrypt(ut8 key, const ut8 *inbuf, ut8 *outbuf, int buflen) {
+ }
+ 
+ static bool rot_set_key(RCryptoJob *cj, const ut8 *key, int keylen, int mode, int direction) {
+-	cj->flag = direction;
++	cj->flag = direction == R_CRYPTO_DIR_ENCRYPT;
+ 	return rot_init (&cj->rot_key, key, keylen);
+ }
+ 
+@@ -67,10 +67,13 @@ static bool update(RCryptoJob *cj, const ut8 *buf, int len) {
+ 	if (!obuf) {
+ 		return false;
+ 	}
+-	if (cj->flag == 0) {
++	switch (cj->flag) {
++	case R_CRYPTO_DIR_ENCRYPT:
+ 		rot_crypt (cj->rot_key, buf, obuf, len);
+-	} else if (cj->flag == 1) {
++		break;
++	case R_CRYPTO_DIR_DECRYPT:
+ 		rot_decrypt (cj->rot_key, buf, obuf, len);
++		break;
+ 	}
+ 	r_crypto_job_append (cj, obuf, len);
+ 	free (obuf);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,35 @@
++/* radare - LGPL - Copyright 2024 - pancake */
++
++#include <r_lib.h>
++#include <r_crypto.h>
++
++static bool update(RCryptoJob *cj, const ut8 *buf, int len) {
++	char *s = r_str_ndup ((const char *)buf, len);
++	int n = r_str_hash (s);
++	free (s);
++	cj->output = malloc (4);
++	r_write_ble32 (cj->output, n, cj->c->bigendian);
++	eprintf ("0x%x\n", n);
++	cj->output_len = 4;
++	return true;
++}
++
++RCryptoPlugin r_crypto_plugin_strhash = {
++	.meta = {
++		.name = "strhash",
++		.author = "pancake",
++		.license = "MIT",
++	},
++	.type = R_CRYPTO_TYPE_HASHER,
++	.implements = "strhash",
++	.update = update,
++	.end = update
++};
++
++#ifndef R2_PLUGIN_INCORE
++R_API RLibStruct radare_plugin = {
++	.type = R_LIB_TYPE_CRYPTO,
++	.data = &r_crypto_plugin_strhash,
++	.version = R2_VERSION
++};
++#endif
+
+
+
+
+@@ -4,7 +4,6 @@
+ #define R2_CRYPTO_H
+ 
+ #include <r_types.h>
+-#include <r_list.h>
+ #include <r_th.h>
+ #include <r_crypto/r_des.h>
+ #include <r_hash.h>
+@@ -24,10 +23,12 @@ enum {
+ 	R_CRYPTO_MODE_CFB,
+ };
+ 
+-// TODO: use encode/decode wordings
++// TODO: use encode/decode wordings?
+ enum {
+-	R_CRYPTO_DIR_DECRYPT = 0,
+-	R_CRYPTO_DIR_ENCRYPT = 1,
++	R_CRYPTO_DIR_NONE = -1,
++	R_CRYPTO_DIR_HASH = 0,
++	R_CRYPTO_DIR_DECRYPT = 1,
++	R_CRYPTO_DIR_ENCRYPT = 2,
+ };
+ 
+ typedef struct r_crypto_t {
+@@ -41,6 +42,7 @@ typedef struct r_crypto_t {
+ 	int output_size;
+ 	int dir;
+ #endif
++	bool bigendian;
+ 	void *user;
+ 	RList *plugins;
+ } RCrypto;
+@@ -66,8 +68,8 @@ typedef struct r_crypto_job_t {
+ 
+ typedef enum {
+ 	R_CRYPTO_TYPE_ENCODER = 'e',
+-	R_CRYPTO_TYPE_HASH = 'h',
+-	R_CRYPTO_TYPE_ENCRYPT = 'c',
++	R_CRYPTO_TYPE_HASHER = 'h',
++	R_CRYPTO_TYPE_ENCRYPT = 'c', // CIPHER
+ } RCryptoType;
+ 
+ typedef bool (*RCryptoJobSetIVCallback)(RCryptoJob *ci, const ut8 *iv, int ivlen);
+@@ -118,6 +120,7 @@ R_API ut8 *r_crypto_job_get_output(RCryptoJob *cry, int *size);
+ #endif
+ 
+ /* plugin pointers */
++extern RCryptoPlugin r_crypto_plugin_strhash;
+ extern RCryptoPlugin r_crypto_plugin_aes;
+ extern RCryptoPlugin r_crypto_plugin_des;
+ extern RCryptoPlugin r_crypto_plugin_rc4;
+
+
+
+
+@@ -4,7 +4,6 @@
+ 
+ #include <r_io.h>
+ #include <r_main.h>
+-#include <r_hash.h>
+ #include <r_util/r_print.

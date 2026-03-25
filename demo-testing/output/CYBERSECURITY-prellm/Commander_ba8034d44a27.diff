@@ -1,0 +1,83 @@
+@@ -14,15 +14,14 @@ import argparse
+ import base64
+ import copy
+ import datetime
++import operator
+ import time
+ import json
+ import gzip
+ import logging
+-import os
+ import platform
+ import re
+-import sqlite3
+-from typing import Optional, List
++from typing import Optional, List, Union, Tuple
+ 
+ import requests
+ import socket
+@@ -37,12 +36,16 @@ from .recordv2 import RecordAddCommand
+ from .helpers import audit_report
+ from .enterprise_common import EnterpriseCommand
+ from .base import user_choice, suppress_exit, raise_parse_exception, dump_report_data, Command
+-from .. import api, utils, crypto
++from .. import api
+ from ..error import CommandError
+ from ..params import KeeperParams
+ from ..proto import enterprise_pb2
+ from .register import EMAIL_PATTERN
+-
++from ..sox import sox_data
++from ..sox.sox_data import RebuildTask
++from ..sox.sox_types import RecordPermissions
++from ..sox.storage_types import StorageRecordAging
++from typing import Dict, Callable
+ 
+ audit_report_parser = argparse.ArgumentParser(prog='audit-report', description='Run an audit trail report.')
+ audit_report_parser.add_argument('--syntax-help', dest='syntax_help', action='store_true', help='display help')
+@@ -127,11 +130,26 @@ action_report_parser.add_argument('--apply-action', '-a', dest='apply_action', a
+ action_report_parser.add_argument('--dry-run', '-n', dest='dry_run', default=False, action='store_true',
+                                   help='flag to enable dry-run mode')
+ 
++compliance_report_parser = argparse.ArgumentParser(prog='compliance-report', description='Run a SOX compliance report.')
++compliance_report_parser.add_argument('--rebuild', '-r', action='store_true', help='Rebuild local data from source')
++compliance_report_parser.add_argument('--node', action='store', help='ID or name of node (defaults to root node)')
++compliance_report_parser.add_argument('--username', '-u', action='append',
++                                  help='user(s) to include in report (set option once for each user to include)')
++compliance_report_parser.add_argument('--job-title', '-jt', action='append',
++                                  help='job titles to include in report (set option once for each title to include)')
++compliance_report_parser.add_argument('--shared', action='store_true',
++                                      help='flag for excluding non-shared records from report')
++compliance_report_parser.add_argument('--output', dest='output', action='store',
++                                  help='path to resulting output file (if any)')
++compliance_report_parser.add_argument('--format', dest='format', action='store', choices=['table', 'csv', 'json'],
++                                  default='table', help='format of output')
++
+ syslog_templates = None  # type: Optional[List[str]]
+ 
+ API_EVENT_SUMMARY_ROW_LIMIT = 2000
+ API_EVENT_RAW_ROW_LIMIT = 1000
+ 
++
+ def load_syslog_templates(params):
+     global syslog_templates
+     if syslog_templates is None:
+@@ -1345,215 +1363,146 @@ class AgingReportCommand(Command):
+         return aging_report_parser
+ 
+     def execute(self, params, **kwargs):
+-        enterprise_id = next(((x['node_id'] >> 32) for x in params.enterprise['nodes']), 0)
+-        path = os.path.dirname(os.path.abspath(params.config_filename or '1'))
+-        database_name = os.path.join(path, f'sox_data_{enterprise_id}.db')
+-
+-        if kwargs.get('rebuild') and os.path.exists(database_name):
+-            os.remove(database_name)
+-
+-        if not AgingReportCommand.data_updated:
+-            AgingReportCommand.prepare_database(params, database_name)
++        def get_floor(period):  # type: (str) -> Union[datetime.datetime, None]
++            dt = datetime.datetime.now()
++            if not period:
++                logging.info('\n\nThe default password aging period is 3 months\n'
++                             'To change this value pass --period=[PERIOD] parameter\n'
++                             '[PERIOD] example: 10d for 10 days; 3m for 3 months;

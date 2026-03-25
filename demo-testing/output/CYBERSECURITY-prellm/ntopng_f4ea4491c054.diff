@@ -1,0 +1,94 @@
+@@ -60,6 +60,12 @@ typedef enum {
+   SSL_ENCRYPTION_BOTH = 0x3,
+ } FlowSSLEncryptionStatus;
+ 
++typedef struct buffered_packet {
++  const struct pcap_pkthdr h;
++  u_char *packet;
++  struct buffered_packet *next;
++} BufferedPacket;
++
+ class Flow : public GenericHashEntry {
+  private:
+   Host *cli_host, *srv_host;
+@@ -69,6 +75,7 @@ class Flow : public GenericHashEntry {
+   u_int32_t vrfId;
+   u_int8_t protocol, src2dst_tcp_flags, dst2src_tcp_flags;
+   struct ndpi_flow_struct *ndpiFlow;
++  BufferedPacket *flow_packets_head, *flow_packets_tail;
+   bool detection_completed, protocol_processed,
+     cli2srv_direction, twh_over, dissect_next_http_packet, passVerdict,
+     check_tor, l7_protocol_guessed, flow_alerted, flow_dropped_counts_increased,
+@@ -466,6 +473,8 @@ class Flow : public GenericHashEntry {
+   inline void setIngress2EgressDirection(bool _ingress2egress) { ingress2egress_direction = _ingress2egress; }
+   inline bool isIngress2EgressDirection() { return(ingress2egress_direction); }
+ #endif
++  void addPacketToDump(const struct pcap_pkthdr *h, const u_char *packet);
++  void flushBufferedPackets();
+ };
+ 
+ #endif /* _FLOW_H_ */
+
+
+
+
+@@ -255,7 +255,7 @@ class NetworkInterface : public Checkpointable {
+      See C++ FAQ Lite covers this in section 23.7
+   */
+   inline virtual bool isPacketInterface()      { return(getIfType() != interface_type_FLOW); }
+-#ifndef HAVE_LIBCAP
++#if defined(linux) && !defined(HAVE_LIBCAP)
+   /* Note: if we miss the capabilities, we block the overriding of this method. */
+   inline bool isDiscoverableInterface()        { return(false);                              }
+ #else
+@@ -482,13 +482,13 @@ class NetworkInterface : public Checkpointable {
+ #ifdef NTOPNG_PRO
+   void refreshL7Rules();
+   void refreshShapers();
+-  inline L7Policer* getL7Policer()                     { return(policer);     }
++  inline L7Policer* getL7Policer()                     { return(policer);                }
+   inline FlowInterfacesStats* getFlowInterfacesStats() { return(flow_interfaces_stats);  }
+ #endif
+-  inline HostPools* getHostPools()         { return(host_pools);  }
++  inline HostPools* getHostPools()                     { return(host_pools);    }
+ 
+-  PacketDumper *getPacketDumper(void)      { return pkt_dumper; }
+-  PacketDumperTuntap *getPacketDumperTap(void)      { return pkt_dumper_tap; }
++  PacketDumper *getPacketDumper(void)                  { return pkt_dumper;     }
++  PacketDumperTuntap *getPacketDumperTap(void)         { return pkt_dumper_tap; }
+ 
+ #ifdef NTOPNG_PRO
+   void updateHostsL7Policy(u_int16_t host_pool_id);
+@@ -648,6 +648,7 @@ class NetworkInterface : public Checkpointable {
+ 		       u_int32_t s2d_pkts, u_int32_t d2s_pkts,
+ 		       u_int32_t s2d_bytes, u_int32_t d2s_bytes);
+   Host* findHostByIP(AddressTree *allowed_hosts, char *host_ip, u_int16_t vlan_id);
++  inline bool do_dump_unknown_traffic() { return(dump_unknown_traffic); }
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -29,8 +29,8 @@ class PacketDumper {
+   NetworkInterface *iface;
+   time_t dump_end;
+   pcap_dumper_t *dumper;
+-  u_int64_t num_sampled_packets, num_dumped_packets;
+-  u_int32_t file_id;
++  u_int64_t num_sampled_packets, num_dumped_packets, num_dumped_unknown_packets;
++  u_int32_t file_id, num_dumped_unknown_files;
+   u_int16_t iface_type;
+   time_t sec_start;
+   int sampling_rate;
+@@ -49,9 +49,12 @@ class PacketDumper {
+   void dumpPacket(const struct pcap_pkthdr *h, const u_char *packet,
+                   dump_reason reason, int sampling_rate,
+                   unsigned int max_pkts_per_file, unsigned int max_sec_per_file);
+-  inline u_int64_t get_num_dumped_packets() { return(num_dumped_packets); }
+-  inline u_int64_t get_num_dumped_files()   { return(file_id); }
++  inline u_int64_t get_num_dumped_packets() { return(num_dumped_packets+num_dumped_unknown_packets); }
++  inline u_int64_t get_num_dumped_files()   { return(file_id+num_dumped_unknown_files); }
+   void lua(lua_State *vm);
++  inline void incUnknownPacketDump(

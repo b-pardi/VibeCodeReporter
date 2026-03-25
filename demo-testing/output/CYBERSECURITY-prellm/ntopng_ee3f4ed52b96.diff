@@ -1,0 +1,94 @@
+@@ -90,7 +90,7 @@ class LuaEngine {
+   static void luaRegister(lua_State *L, const ntop_class_reg *reg);
+   static void luaRegisterInternalRegs(lua_State *L);
+ 
+-  void setInterface(const char *user);
++  bool setUserInterface(lua_State *L, const char * const user, char * const if_name, ssize_t if_name_len);
+ };
+ 
+ /**
+
+
+
+
+@@ -393,7 +393,6 @@ class Ntop {
+   void getUsers(lua_State* vm);
+   void getUserGroup(lua_State* vm);
+   void getAllowedNetworks(lua_State* vm);
+-  bool getInterfaceAllowed(lua_State* vm, char *ifname)         const;
+   bool isInterfaceAllowed(lua_State* vm, const char *ifname)    const;
+   bool isInterfaceAllowed(lua_State* vm, int ifid)              const;
+   bool checkUser(const char * const user, const char *password) const;
+@@ -453,7 +452,7 @@ class Ntop {
+   void addToHostBlacklist(char *net);
+   bool isBlacklistedIP(IpAddress *ip);
+   bool isExistingInterface(const char * const name) const;
+-  inline NetworkInterface* getFirstInterface() { return(iface[0]);         }
++  NetworkInterface* getFirstInterface(lua_State *vm = NULL) const;
+   inline NetworkInterface* getInterface(int i) { return(((i < num_defined_interfaces) && iface[i]) ? iface[i] : NULL); }
+ #ifdef NTOPNG_PRO
+   bool addToNotifiedInformativeCaptivePortal(u_int32_t client_ip);
+
+
+
+
+@@ -8174,52 +8174,59 @@ void LuaEngine::purifyHTTPParameter(char *param) {
+ 
+ /* ****************************************** */
+ 
+-void LuaEngine::setInterface(const char *user) {
+-  char key[64], ifname[MAX_INTERFACE_NAME_LEN];
+-  bool enforce_allowed_interface = false;
++bool LuaEngine::setUserInterface(lua_State *L, const char * const user, char * const if_name, ssize_t if_name_len) {
++  NetworkInterface *iface = NULL;
++  char key[CONST_MAX_LEN_REDIS_KEY];
++  const char * cur_user = user;
++  int res;
+ 
+-  if(user[0] != '\0') {
+-    // check if the user is restricted to browse only a given interface
+-
+-    if(snprintf(key, sizeof(key), CONST_STR_USER_ALLOWED_IFNAME, user)
+-       && !ntop->getRedis()->get(key, ifname, sizeof(ifname))) {
+-      // there is only one allowed interface for the user
+-      enforce_allowed_interface = true;
+-      goto set_preferred_interface;
+-    } else if(snprintf(key, sizeof(key), "ntopng.prefs.%s.ifname", user)
+-	      && ntop->getRedis()->get(key, ifname, sizeof(ifname)) < 0) {
+-      // no allowed interface and no default set interface
+-    set_default_if_name_in_session:
+-      snprintf(ifname, sizeof(ifname), "%s",
+-	       ntop->getInterfaceAtId(NULL /* allowed user interface check already enforced */,
+-				      0)->get_name());
+-      lua_push_str_table_entry(L, "ifname", ifname);
+-      ntop->getRedis()->set(key, ifname, 3600 /* 1h */);
+-    } else {
+-      goto set_preferred_interface;
+-    }
+-  } else {
+-    // We need to check if ntopng is running with the option --disable-login
+-    snprintf(key, sizeof(key), "ntopng.prefs.ifname");
+-    if(ntop->getRedis()->get(key, ifname, sizeof(ifname)) < 0) {
+-      goto set_preferred_interface;
+-    }
++  if(!user || user[0] == '\0')
++    cur_user = NTOP_NOLOGIN_USER;
+ 
+-  set_preferred_interface:
+-    NetworkInterface *iface;
++  if_name[0] = '\0';
++
++  snprintf(key, sizeof(key), CONST_STR_USER_ALLOWED_IFNAME, user);
+ 
+-    if((iface = ntop->getNetworkInterface(NULL /* allowed user interface check already enforced */,
+-					  ifname)) != NULL) {
+-      /* The specified interface still exists */
+-      lua_push_str_table_entry(L, "ifname", iface->get_name());
+-    } else if(!enforce_allowed_interface) {
+-      goto set_default_if_name_in_session;
++  /* First check if there's an allowed interface for the user ... */
++  if(snprintf(key, sizeof(key), CONST_STR_USER_ALLOWED_IFNAME, user)
++     && !(res = ntop->getRedis()->get(key, if_name, if_name_len))) {
++    if(!ntop->isExistingInterface(if_name)) {
++      ntop->getTrace()->traceEvent(TRACE_ERROR, "Interface %s not existing for user %s", if_name, cur_user);
++      return false; /* Cannot serve the request as the allowed interface is

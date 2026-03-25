@@ -1,0 +1,120 @@
+@@ -7,6 +7,36 @@
+ // set a maximum output buffer of 50MB
+ #define MAXOUT 50000000
+ 
++#if USE_SMALLZ4
++#include "../../../shlr/smallz4/smallz4cat.h"
++
++struct UserPtr {
++	const ut8 * input;
++	ut64 inputPos;
++	ut8 * output;
++	ut64 outputPos;
++	ut32 * outputSize;
++	int error;
++};
++
++void smallz4Write(const unsigned char* data, unsigned int numBytes, void *userPtr) {
++  struct UserPtr* user = (struct UserPtr*)userPtr;
++  if (data != NULL && numBytes > 0) {
++	if (*(user->outputSize) - user->outputPos < numBytes) {
++		user->error = -1;
++		return;
++	}
++	memcpy(user->output + user->outputPos, data, numBytes);
++	user->outputPos += numBytes;
++  }
++}
++
++unsigned char smallz4GetByte(void *userPtr) {
++  struct UserPtr* user = (struct UserPtr*)userPtr;
++  return *(user->input + (user->inputPos++));
++}
++#endif
++
+ static const char *gzerr(int n) {
+ 	const char * const errors[] = {
+ 		"",
+@@ -89,8 +119,23 @@ R_API ut8 *r_inflate_lz4(const ut8 *src, int srcLen, int *consumed, int *dstLen)
+ 	if (!obuf) {
+ 		return NULL;
+ 	}
++
++#if USE_SMALLZ4
++	struct UserPtr user =
++	{
++		.input = src,
++		.inputPos = 0,
++		.output = obuf,
++		.outputPos = 0,
++		.outputSize = &osz,
++		.error = 0
++	};
++	int res = unlz4Block_userPtr (smallz4GetByte, smallz4Write, &user, srcLen, NULL, NULL);
++	if (res < 1 || user.error != 0) {
++#else
+ 	int res = LZ4_decompress_safe ((const char*)src, (char*)obuf, (uint32_t) srcLen, (uint32_t) osz);
+ 	if (res < 1) {
++#endif
+ 		int mul = srcLen / -res;
+ 		int nosz = osz * (5 * (mul + 1));
+ 		if (nosz < osz) {
+@@ -104,8 +149,19 @@ R_API ut8 *r_inflate_lz4(const ut8 *src, int srcLen, int *consumed, int *dstLen)
+ 		}
+ 		obuf = nbuf;
+ 		osz = nosz;
++#if USE_SMALLZ4
++		user.output = obuf;
++		user.inputPos = 0;
++		user.outputPos = 0;
++		user.error = 0;
++		res = unlz4Block_userPtr (smallz4GetByte, smallz4Write, &user, srcLen, NULL, NULL);
++	}
++	user.output = NULL;
++	user.input = NULL;
++#else
+ 	}
+ 	res = LZ4_decompress_safe ((const char*)src, (char*)obuf, (uint32_t) srcLen, (uint32_t) osz);
++#endif
+ 	if (res > 0) {
+ 		*dstLen = res;
+ 		*consumed = srcLen;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,435 @@
++// //////////////////////////////////////////////////////////
++// smallz4cat.c
++// Copyright (c) 2016-2019 Stephan Brumme. All rights reserved.
++// see https://create.stephan-brumme.com/smallz4/
++//
++// "MIT License":
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"),
++// to deal in the Software without restriction, including without limitation
++// the rights to use, copy, modify, merge, publish, distribute, sublicense,
++// and/or sell copies of the Software, and to permit persons to whom the Software
++// is furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included
++// in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
++// INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
++// PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++// HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
++// SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++
++// This program is a shorter, more readable, albeit slower re-implementation of lz4cat ( https://github.com/Cyan4973/xxHash )
++
++// compile: gcc smallz4cat.c -O3 -o smallz4cat -Wall -pedantic -std=c99 -s
++// The static 8k binary was compiled using Clang and dietlibc (see https://www.fefe.de/dietlibc/ )
++
++// Limitations:
++// - skippable frames and legacy frames are not implemented (and most likely never will)
++// - checksums are not verified (see https://create.stephan-brumme.com/xxhash/ for a simple implementation)
++
++// Replace getByteFromIn() and sendToOut() by you

@@ -1,0 +1,101 @@
+@@ -19,6 +19,7 @@ import inspect
+ import logging
+ from datetime import date
+ 
++import sqlalchemy
+ # Related third party imports
+ from sqlalchemy import (
+     and_,
+@@ -26,12 +27,14 @@ from sqlalchemy import (
+     func,
+     nullsfirst,
+     nullslast,
+-    inspect as sqlalchemy_inspect, text,
++    inspect as sqlalchemy_inspect,
++    text,
+ )
+ from sqlalchemy.ext.associationproxy import AssociationProxy
+ from sqlalchemy.ext.hybrid import hybrid_property
+ from sqlalchemy.orm import ColumnProperty
+ from sqlalchemy.orm.attributes import InstrumentedAttribute, QueryableAttribute
++from sqlalchemy.sql.elements import BinaryExpression
+ 
+ # Local application imports
+ from faraday.server.models import (
+@@ -97,10 +100,18 @@ def get_related_association_proxy_model(attr):
+ 
+ def primary_key_names(model):
+     """Returns all the primary keys for a model."""
+-    return [key for key, field in inspect.getmembers(model)
+-            if isinstance(field, QueryableAttribute)
+-            and isinstance(field.property, ColumnProperty)
+-            and field.property.columns[0].primary_key]
++    return [
++        key for key, field in inspect.getmembers(model)
++        if isinstance(field, QueryableAttribute)
++        and (
++            isinstance(field.property, ColumnProperty) if hasattr(field, 'property') else False
++        )
++        and (
++            isinstance(field.property, ColumnProperty) if hasattr(field.property, 'columns') else False
++        )
++        and field.property.columns[0].primary_key
++        or isinstance(getattr(model, key, None), hybrid_property)
++    ]
+ 
+ 
+ def _sub_operator(model, argument, fieldname):
+@@ -423,7 +434,7 @@ class SearchParameters:
+     def __repr__(self):
+         """Returns a string representation of the search parameters."""
+         template = ('<SearchParameters filters={0}, order_by={1}, limit={2},'
+-                    ' group_by={3}, offset={4}, junction={5}>')
++                    ' group_by={3}, offset={4}>')
+         return template.format(self.filters, self.order_by, self.limit,
+                                self.group_by, self.offset)
+ 
+@@ -479,6 +490,7 @@ class QueryBuilder:
+     a given model.
+ 
+     """
++
+     @staticmethod
+     def _create_operation(model, fieldname, operator, argument, relation=None):
+         """Translates an operation described as a string to a valid SQLAlchemy
+@@ -565,7 +577,7 @@ class QueryBuilder:
+             opfunc = OPERATORS[operator]
+             # In Python 3.0 or later, this should be `inspect.getfullargspec`
+             # because `inspect.getargspec` is deprecated.
+-            numargs = len(inspect.getargspec(opfunc).args)
++            numargs = len(inspect.getfullargspec(opfunc).args)
+             # raises AttributeError if `fieldname` or `relation` does not exist
+             field = getattr(model, relation or fieldname)
+             # each of these will raise a TypeError if the wrong number of arguments
+@@ -713,6 +725,17 @@ class QueryBuilder:
+ 
+         filters = [filt for filt in filters_generator if filt is not None]
+ 
++        # explicit join with users table, only if required
++        for filter in filters:
++            if isinstance(filter, BinaryExpression):
++                try:
++                    table = getattr(filter.left, "table", None)
++                    if table.name == User.__tablename__ and User not in joined_models:
++                        query = query.join(User, model.creator_id == User.id)
++                        joined_models.add(User)
++                except Exception as e:
++                    continue
++
+         # Multiple filter criteria at the top level of the provided search
+         # parameters are interpreted as a conjunction (AND).
+         query = query.filter(*filters)
+@@ -778,6 +801,66 @@ class QueryBuilder:
+ 
+         return query
+ 
++    @staticmethod
++    def create_query_delete_returning_only_ids(session, model, search_params, _ignore_order_by=False):
++
++        query = sqlalchemy.delete(model)
++
++       

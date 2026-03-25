@@ -1,0 +1,170 @@
+@@ -22,8 +22,6 @@
+ 
+ #include "analyzer/protocol/stepping-stone/SteppingStone.h"
+ #include "analyzer/protocol/stepping-stone/events.bif.h"
+-#include "analyzer/protocol/arp/ARP.h"
+-#include "analyzer/protocol/arp/events.bif.h"
+ #include "Discard.h"
+ #include "RuleMatcher.h"
+ 
+@@ -33,6 +31,8 @@
+ #include "iosource/IOSource.h"
+ #include "iosource/PktDumper.h"
+ 
++#include "pcap.h"
++
+ // These represent NetBIOS services on ephemeral ports.  They're numbered
+ // so that we can use a single int to hold either an actual TCP/UDP server
+ // port or one of these.
+@@ -96,11 +96,6 @@ NetSessions::NetSessions()
+ 	else
+ 		pkt_profiler = nullptr;
+ 
+-	if ( arp_request || arp_reply || bad_arp )
+-		arp_analyzer = new analyzer::arp::ARP_Analyzer();
+-	else
+-		arp_analyzer = nullptr;
+-
+ 	memset(&stats, 0, sizeof(SessionStats));
+ 	}
+ 
+@@ -108,7 +103,6 @@ NetSessions::~NetSessions()
+ 	{
+ 	delete packet_filter;
+ 	delete pkt_profiler;
+-	Unref(arp_analyzer);
+ 	delete discarder;
+ 	delete stp_manager;
+ 
+@@ -178,8 +172,8 @@ void NetSessions::NextPacket(double t, const Packet* pkt)
+ 
+ 	else if ( pkt->l3_proto == L3_ARP )
+ 		{
+-		if ( arp_analyzer )
+-			arp_analyzer->NextPacket(t, pkt);
++		// Do nothing here as ARP has moved into a packet analyzer
++		//TODO: Revisit the use of packet's l3_proto
+ 		}
+ 
+ 	else
+
+
+
+
+@@ -234,8 +234,6 @@ protected:
+ 	using IPTunnelMap = std::map<IPPair, TunnelActivity>;
+ 	IPTunnelMap ip_tunnels;
+ 
+-	analyzer::arp::ARP_Analyzer* arp_analyzer;
+-
+ 	analyzer::stepping_stone::SteppingStoneManager* stp_manager;
+ 	detail::Discarder* discarder;
+ 	detail::PacketFilter* packet_filter;
+
+deleted file mode 100644
+
+
+
+@@ -1,244 +0,0 @@
+-// See the file "COPYING" in the main distribution directory for copyright.
+-
+-#include "ARP.h"
+-#include "Event.h"
+-#include "Reporter.h"
+-#include "Desc.h"
+-
+-#include "events.bif.h"
+-
+-namespace zeek::analyzer::arp {
+-
+-ARP_Analyzer::ARP_Analyzer()
+-	{
+-	}
+-
+-ARP_Analyzer::~ARP_Analyzer()
+-	{
+-	}
+-
+-// Argh! FreeBSD and Linux have almost completely different net/if_arp.h .
+-// ... and on Solaris we are missing half of the ARPOP codes, so define
+-// them here as necessary:
+-
+-#ifndef ARPOP_REQUEST
+-#define ARPOP_REQUEST    1 // ARP request.
+-#endif
+-#ifndef ARPOP_REPLY
+-#define ARPOP_REPLY      2 // ARP reply.
+-#endif
+-#ifndef ARPOP_PREQUEST
+-#define ARPOP_RREQUEST   3 // RARP request.
+-#endif
+-#ifndef ARPOP_RREPLY
+-#define ARPOP_RREPLY     4 // RARP reply.
+-#endif
+-#ifndef ARPOP_InREQUEST
+-#define ARPOP_InREQUEST  8 // InARP request.
+-#endif
+-#ifndef ARPOP_InREPLY
+-#define ARPOP_InREPLY    9 // InARP reply.
+-#endif
+-#ifndef ARPOP_NAK
+-#define ARPOP_NAK       10 // (ATM)ARP NAK.
+-#endif
+-
+-#ifndef ar_sha
+-#define ar_sha(ap)  ((caddr_t((ap)+1)) + 0)
+-#endif
+-
+-#ifndef ar_spa
+-#define ar_spa(ap)  ((caddr_t((ap)+1)) + (ap)->ar_hln)
+-#endif
+-
+-#ifndef ar_tha
+-#define ar_tha(ap)  ((caddr_t((ap)+1)) + (ap)->ar_hln + (ap)->ar_pln)
+-#endif
+-
+-#ifndef ar_tpa
+-#define ar_tpa(ap)  ((caddr_t((ap)+1)) + 2*(ap)->ar_hln + (ap)->ar_pln)
+-#endif
+-
+-#ifndef ARPOP_REVREQUEST
+-#define ARPOP_REVREQUEST ARPOP_RREQUEST
+-#endif
+-
+-#ifndef ARPOP_REVREPLY
+-#define ARPOP_REVREPLY ARPOP_RREPLY
+-#endif
+-
+-#ifndef ARPOP_INVREQUEST
+-#define ARPOP_INVREQUEST ARPOP_InREQUEST
+-#endif
+-
+-#ifndef ARPOP_INVREPLY
+-#define ARPOP_INVREPLY ARPOP_InREPLY
+-#endif
+-
+-
+-void ARP_Analyzer::NextPacket(double t, const Packet* pkt)
+-	{
+-	const u_char *data = pkt->data;
+-	// Check whether the packet is OK ("inspired" in tcpdump's print-arp.c).
+-	const struct arp_pkthdr* ah =
+-		(const struct arp_pkthdr*) (data + pkt->hdr_size);
+-
+-	// Check the size.
+-	int min_length = (ar_tpa(ah) - (char*) (data + pkt->hdr_size)) + ah->ar_pln;
+-	int real_length = pkt->cap_len - pkt->hdr_size;
+-	if ( min_length > real_length )
+-		{
+-		Corrupted("truncated_ARP");
+-		return;
+-		}
+-
+-	char errbuf[1024];
+-
+-	// Check the address description fields.
+-	switch ( ntohs(ah->ar_hrd) ) {
+-	case ARPHRD_ETHER:
+-		if ( ah->ar_hln != 6 )
+-			{ // don't know how to handle the opcode
+-			snpri

@@ -1,0 +1,115 @@
+@@ -90,7 +90,8 @@ SCOPED(SECMODModule);
+ 
+ struct StackSECItem : public SECItem {
+   StackSECItem() : SECItem({siBuffer, nullptr, 0}) {}
+-  ~StackSECItem() { SECITEM_FreeItem(this, PR_FALSE); }
++  ~StackSECItem() { Reset(); }
++  void Reset() { SECITEM_FreeItem(this, PR_FALSE); }
+ };
+ 
+ #endif  // nss_scoped_ptrs_h__
+
+
+
+
+@@ -6,6 +6,7 @@
+ 
+ #include <ctime>
+ 
++#include "prtime.h"
+ #include "secerr.h"
+ #include "ssl.h"
+ 
+@@ -58,7 +59,9 @@ TEST_P(TlsConnectTls13, DCNotConfigured) {
+ TEST_P(TlsConnectTls13, DCConnectEcdsaP256) {
+   Reset(kDelegatorId);
+   client_->EnableDelegatedCredentials();
+-  server_->AddDelegatedCredential(kDCId, kDCScheme, kDCValidFor, now());
++  server_->AddDelegatedCredential(TlsAgent::kServerEcdsa256,
++                                  ssl_sig_ecdsa_secp256r1_sha256, kDCValidFor,
++                                  now());
+ 
+   auto cfilter = MakeTlsFilter<TlsExtensionCapture>(
+       client_, ssl_delegated_credentials_xtn);
+@@ -66,6 +69,7 @@ TEST_P(TlsConnectTls13, DCConnectEcdsaP256) {
+ 
+   EXPECT_TRUE(cfilter->captured());
+   CheckPeerDelegCred(client_, true, 256);
++  EXPECT_EQ(ssl_sig_ecdsa_secp256r1_sha256, client_->info().signatureScheme);
+ }
+ 
+ // Connected with ECDSA-P521.
+@@ -83,10 +87,11 @@ TEST_P(TlsConnectTls13, DCConnectEcdsaP521) {
+ 
+   EXPECT_TRUE(cfilter->captured());
+   CheckPeerDelegCred(client_, true, 521);
++  EXPECT_EQ(ssl_sig_ecdsa_secp521r1_sha512, client_->info().signatureScheme);
+ }
+ 
+-// Connected with RSA-PSS.
+-TEST_P(TlsConnectTls13, DCConnectRsaPss) {
++// Connected with RSA-PSS, using an RSAE SPKI.
++TEST_P(TlsConnectTls13, DCConnectRsaPssRsae) {
+   Reset(kDelegatorId);
+   client_->EnableDelegatedCredentials();
+   server_->AddDelegatedCredential(
+@@ -98,6 +103,30 @@ TEST_P(TlsConnectTls13, DCConnectRsaPss) {
+ 
+   EXPECT_TRUE(cfilter->captured());
+   CheckPeerDelegCred(client_, true, 1024);
++  EXPECT_EQ(ssl_sig_rsa_pss_rsae_sha256, client_->info().signatureScheme);
++}
++
++// Connected with RSA-PSS, using a PSS SPKI.
++TEST_P(TlsConnectTls13, DCConnectRsaPssPss) {
++  Reset(kDelegatorId);
++
++  // Need to enable PSS-PSS, which is not on by default.
++  static const SSLSignatureScheme kSchemes[] = {ssl_sig_ecdsa_secp256r1_sha256,
++                                                ssl_sig_rsa_pss_pss_sha256};
++  client_->SetSignatureSchemes(kSchemes, PR_ARRAY_SIZE(kSchemes));
++  server_->SetSignatureSchemes(kSchemes, PR_ARRAY_SIZE(kSchemes));
++
++  client_->EnableDelegatedCredentials();
++  server_->AddDelegatedCredential(
++      TlsAgent::kServerRsaPss, ssl_sig_rsa_pss_pss_sha256, kDCValidFor, now());
++
++  auto cfilter = MakeTlsFilter<TlsExtensionCapture>(
++      client_, ssl_delegated_credentials_xtn);
++  Connect();
++
++  EXPECT_TRUE(cfilter->captured());
++  CheckPeerDelegCred(client_, true, 1024);
++  EXPECT_EQ(ssl_sig_rsa_pss_pss_sha256, client_->info().signatureScheme);
+ }
+ 
+ // Generate a weak key.  We can't do this in the fixture because certutil
+@@ -133,7 +162,7 @@ static void GenerateWeakRsaKey(ScopedSECKEYPrivateKey& priv,
+     ASSERT_EQ(
+         SECSuccess,
+         PK11_RandomUpdate(
+-            const_cast<void*>(reinterpret_cast<const void*>(&FRESH_ENTROPY)),
++            const_cast<void*>(reinterpret_cast<const void*>(FRESH_ENTROPY)),
+             sizeof(FRESH_ENTROPY)));
+     break;
+   }
+@@ -169,18 +198,37 @@ TEST_P(TlsConnectTls13, DCWeakKey) {
+   ConnectExpectAlert(client_, kTlsAlertInsufficientSecurity);
+ }
+ 
++class ReplaceDCSigScheme : public TlsHandshakeFilter {
++ public:
++  ReplaceDCSigScheme(const std::shared_ptr<TlsAgent>& a)
++      : TlsHandshakeFilter(a, {ssl_hs_certificate_verify}) {}
++
++ protected:
++  PacketFilter::Action FilterHandshake(const HandshakeHeader& header,
++                                       const DataBuffer& input,
++                                       DataBuffer* output) override {
++    *output = input;
++    output->Write(0, ssl_sig_ecdsa_secp384r1_sha384, 2);
++    return CHANGE;
++  }
++};
++
+ // Aborted because of incorrect DC signature algorithm i

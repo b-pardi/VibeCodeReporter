@@ -1,0 +1,113 @@
+@@ -8,13 +8,8 @@ import pwndbg.aglib.symbol
+ import pwndbg.aglib.typeinfo
+ 
+ 
+-def offset_of(typename: str, fieldname: str) -> int:
+-    dummy = pwndbg.aglib.memory.get_typed_pointer(typename, 0)
+-    return int(dummy[fieldname].address)
+-
+-
+ def container_of(ptr: int, typename: str, fieldname: str) -> pwndbg.dbg_mod.Value:
+-    obj_addr = int(ptr) - offset_of(typename, fieldname)
++    obj_addr = int(ptr) - pwndbg.aglib.typeinfo.load(typename).offsetof(fieldname)
+     return pwndbg.aglib.memory.get_typed_pointer(typename, obj_addr)
+ 
+ 
+@@ -57,8 +52,10 @@ def compound_head(page: pwndbg.dbg_mod.Value) -> pwndbg.dbg_mod.Value:
+     if int(head) & 1:
+         return (head - 1).cast(page.type.pointer()).dereference()
+ 
+-    pg_head = pwndbg.aglib.typeinfo.enum_member("enum pageflags", "PG_head")
+-    assert pg_head is not None, "Type 'enum pageflags' not found Or member 'PG_head' not exists"
++    pg_headty = pwndbg.aglib.typeinfo.load("enum pageflags")
++    assert pg_headty is not None, "Type 'enum pageflags' not found"
++    pg_head = pg_headty.enum_member("PG_head")
++    assert pg_head is not None, "Type 'enum pageflags' not found"
+ 
+     # https://elixir.bootlin.com/linux/v6.2/source/include/linux/page-flags.h#L212
+     if int(page["flags"]) & (1 << pg_head):
+
+
+
+
+@@ -106,14 +106,6 @@ def load(name: str) -> Optional[pwndbg.dbg_mod.Type]:
+     return None
+ 
+ 
+-def enum_member(type_name: str, member: str) -> int | None:
+-    t = load(type_name)
+-    if t is None:
+-        return None
+-
+-    return next((f.enumval for f in t.fields() if f.name == member), None)
+-
+-
+ def get_type(size: int) -> pwndbg.dbg_mod.Type:
+     return {
+         1: pwndbg.aglib.typeinfo.uint8,
+
+
+
+
+@@ -765,6 +765,74 @@ class Type:
+         # if there is a better debugger-specific way to do this.
+         return [field.name for field in self.fields()]
+ 
++    def enum_member(self, field_name: str) -> int | None:
++        """
++        Retrieve the integer value of an enum member.
++
++        It returns:
++        - integer value, when found field
++        - returns None, If the field does not exist
++        """
++        if self.code != TypeCode.ENUM:
++            raise TypeError("only enum supported")
++
++        return next((f.enumval for f in self.fields() if f.name == field_name), None)
++
++    def _offsetof(
++        self, field_name: str, *, base_offset_bits: int = 0, nested_cyclic_types: List[Type] = None
++    ) -> int | None:
++        NESTED_TYPES = (TypeCode.STRUCT, TypeCode.UNION)
++        struct_type = self
++        if nested_cyclic_types is None:
++            nested_cyclic_types = []
++
++        if struct_type.code == TypeCode.TYPEDEF:
++            struct_type = struct_type.strip_typedefs()
++
++        if struct_type.code not in NESTED_TYPES:
++            return None
++        elif struct_type in nested_cyclic_types:
++            return None
++
++        # note: lldb.SBType and gdb.Type dont support Sets
++        nested_cyclic_types.append(struct_type)
++
++        for field in struct_type.fields():
++            field_offset_bits = base_offset_bits + field.bitpos
++
++            if field.name == field_name:
++                if field_offset_bits % 8 != 0:
++                    # Possible bit-fields, misaligned struct, or unexpected alignment
++                    # This case is not supported because it introduces complexities
++                    # in handling non-byte-aligned or bit-level field offsets
++                    return None
++                return field_offset_bits // 8
++
++            nested_offset = field.type._offsetof(
++                field_name,
++                base_offset_bits=field_offset_bits,
++                nested_cyclic_types=nested_cyclic_types,
++            )
++            if nested_offset is not None:
++                return nested_offset
++
++        return None
++
++    def offsetof(self, field_name: str) -> int | None:
++        """
++        Calculate the byte offset of a field within a struct or union.
++
++        This method recursively trave

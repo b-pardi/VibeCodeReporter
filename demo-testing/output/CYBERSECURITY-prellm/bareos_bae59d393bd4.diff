@@ -1,0 +1,105 @@
+@@ -129,21 +129,24 @@ bool AuthenticateWithFileDaemon(JobControlRecord *jcr)
+ {
+   if (jcr->authenticated) { return true; }
+ 
+-  std::string qualified_resource_name;
+-  if (!my_config->GetQualifiedResourceNameTypeConverter()->ResourceToString(me->hdr.name, my_config->r_own_,
+-                                                                            qualified_resource_name)) {
+-    Dmsg0(100, "Could not generate qualified resource name for a storage resource\n");
+-    return false;
+-  }
+-
+-  ClientResource *client         = jcr->res.client;
+-  TlsResource *tls_configuration = dynamic_cast<TlsResource *>(client);
+   BareosSocket *fd               = jcr->file_bsock;
++  ClientResource *client         = jcr->res.client;
+ 
+-  if (!fd->DoTlsHandshake(4, tls_configuration, false, qualified_resource_name.c_str(), client->password.value,
+-                          jcr)) {
+-    Dmsg0(100, "Could not DoTlsHandshake() with a storage daemon\n");
+-    return false;
++  if (jcr->connection_handshake_tries_ == JobControlRecord::ConnectionHandshakeTries::kTryTlsFirst) {
++    std::string qualified_resource_name;
++    if (!my_config->GetQualifiedResourceNameTypeConverter()->ResourceToString(me->hdr.name, my_config->r_own_,
++                                                                              qualified_resource_name)) {
++      Dmsg0(100, "Could not generate qualified resource name for a storage resource\n");
++      return false;
++    }
++
++    TlsResource *tls_configuration = dynamic_cast<TlsResource *>(client);
++
++    if (!fd->DoTlsHandshake(4, tls_configuration, false, qualified_resource_name.c_str(), client->password.value,
++                            jcr)) {
++      Dmsg0(100, "Could not DoTlsHandshake() with a storage daemon\n");
++      return false;
++    }
+   }
+ 
+   char dirname[MAX_NAME_LENGTH];
+
+
+
+
+@@ -100,7 +100,7 @@ extern DirectorResource *director;
+ #define INC_LIST 0
+ #define EXC_LIST 1
+ 
+-static inline utime_t get_heartbeat_interval(ClientResource *res)
++static utime_t get_heartbeat_interval(ClientResource *res)
+ {
+    utime_t heartbeat;
+ 
+@@ -119,7 +119,7 @@ static inline utime_t get_heartbeat_interval(ClientResource *res)
+  * Try connecting every retry_interval (default 10 sec), and
+  * give up after max_retry_time (default 30 mins).
+  */
+-static inline bool connect_outbound_to_file_daemon(JobControlRecord *jcr, int retry_interval,
++static bool connect_outbound_to_file_daemon(JobControlRecord *jcr, int retry_interval,
+                                                    int max_retry_time, bool verbose)
+ {
+    bool result = false;
+@@ -161,47 +161,54 @@ static inline bool connect_outbound_to_file_daemon(JobControlRecord *jcr, int re
+ 
+ bool ConnectToFileDaemon(JobControlRecord *jcr, int retry_interval, int max_retry_time, bool verbose)
+ {
+-   bool result = false;
+-
+-   /*
+-    * connection already exists.
+-    * TODO: when is this the case? Is it really used? Does it than really need authentication?
+-    */
+-   if (!jcr->file_bsock) {
+-      /*
+-       * check without waiting, if waiting client connection exists.
+-       */
+-      if (!UseWaitingClient(jcr, 0)) {
+-         /*
+-          * open connection to client
+-          */
+-         if (!connect_outbound_to_file_daemon(jcr, retry_interval, max_retry_time, verbose)) {
+-            /*
+-             * Check if a waiting client connection exist.
+-             * If yes, use it, otherwise jcr->file_bsock will not be set.
+-             */
+-            UseWaitingClient(jcr, max_retry_time);
+-         }
+-      }
+-   }
+-
+-   /*
+-    * connection have been established
+-    */
+-   if (jcr->file_bsock) {
+-      jcr->setJobStatus(JS_Running);
+-      if (AuthenticateWithFileDaemon(jcr)) {
+-         result = true;
+-      }
+-   } else {
+-      Jmsg(jcr, M_FATAL, 0, "Failed to connect to client \"%s\".\n", jcr->res.client->name());
+-   }
+-
+-   if (!result) {
++   bool success = false;
++
++   /* try the connection twice in case of a client that cannot do Tls
++    * immediately without clear

@@ -1,0 +1,148 @@
+@@ -52,6 +52,7 @@ class AddressTree {
+   void getAddresses(lua_State* vm) const;
+   int16_t findAddress(int family, void *addr, u_int8_t *network_mask_bits = NULL);
+   int16_t findMac(const u_int8_t addr[]);
++  int16_t find(const char *addr, u_int8_t *network_mask_bits = NULL);
+   bool match(char *addr);
+   patricia_node_t* match(const IpAddress * const ipa, int network_bits) const;
+   void dump();
+
+
+
+
+@@ -575,6 +575,7 @@ struct ntopngLuaContext {
+   struct mg_connection *conn;
+   AddressTree *allowedNets;
+   NetworkInterface *iface;
++  AddressTree *addr_tree;
+ #ifndef WIN32
+   Ping *ping;
+ #endif
+
+
+
+
+@@ -244,6 +244,7 @@ patricia_node_t* AddressTree::match(const IpAddress * const ipa, int network_bit
+ 
+ /* ******************************************* */
+ 
++/* NOTE: this does NOT accept a char* address! Use AddressTree::find() instead. */
+ int16_t AddressTree::findAddress(int family, void *addr, u_int8_t *network_mask_bits) {
+   patricia_tree_t *p;
+   int bits;
+@@ -284,6 +285,38 @@ int16_t AddressTree::findMac(const u_int8_t addr[]) {
+ 
+ /* **************************************************** */
+ 
++/* Generic find with IPv4/IPv6/Mac */
++int16_t AddressTree::find(const char *addr, u_int8_t *network_mask_bits) {
++  u_int8_t mac[6];
++  u_int32_t _mac[6];
++
++  if(strchr(addr, '.')) {
++    /* IPv4 */
++    struct in_addr addr4;
++
++    if(inet_pton(AF_INET, addr, &addr4) != 1)
++      return(-1);
++
++    return(findAddress(AF_INET, &addr4, network_mask_bits));
++  } else if(sscanf(addr, "%02X:%02X:%02X:%02X:%02X:%02X",
++	    &_mac[0], &_mac[1], &_mac[2], &_mac[3], &_mac[4], &_mac[5]) == 6) {
++    /* MAC address */
++    for(int i=0; i<6; i++) mac[i] = _mac[i];
++
++    return(findMac(mac));
++  } else {
++    /* IPv6 */
++    struct in6_addr addr6;
++
++    if(inet_pton(AF_INET6, addr, &addr6) != 1)
++      return(-1);
++
++    return(findAddress(AF_INET6, &addr6, network_mask_bits));
++  }
++}
++
++/* **************************************************** */
++
+ static void address_tree_dump_funct(patricia_node_t * node, void *data, void *user_data) {
+   char address[128];
+   prefix_t *prefix;
+
+
+
+
+@@ -149,6 +149,9 @@ LuaEngine::~LuaEngine() {
+ 	delete ctx->ping;
+ #endif
+ 
++      if(ctx->addr_tree != NULL)
++        delete ctx->addr_tree;
++
+       free(ctx);
+     }
+ 
+@@ -821,6 +824,66 @@ static int ntop_set_ndpi_protocol_category(lua_State* vm) {
+ 
+ /* ****************************************** */
+ 
++static int ntop_ptree_insert(lua_State* vm) {
++  char *addr;
++  int16_t value;
++
++  if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK) return(CONST_LUA_ERROR);
++  addr = (char*)lua_tostring(vm, 1);
++
++  if(ntop_lua_check(vm, __FUNCTION__, 2, LUA_TNUMBER) != CONST_LUA_OK) return(CONST_LUA_ERROR);
++  value = (int16_t)lua_tointeger(vm, 2);
++
++  if(value < 0) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "Negative values not allowed in ptreeInsert");
++    return(CONST_LUA_ERROR);
++  }
++
++  if(getLuaVMUservalue(vm, addr_tree) == NULL) {
++    AddressTree *tree = new AddressTree(true);
++
++    if(tree == NULL)
++      return(CONST_LUA_ERROR);
++
++    getLuaVMUservalue(vm, addr_tree) = tree;
++  }
++
++  lua_pushboolean(vm, getLuaVMUservalue(vm, addr_tree)->addAddress(addr, value));
++
++  return(CONST_LUA_OK);
++}
++
++/* ****************************************** */
++
++static int ntop_ptree_match(lua_State* vm) {
++  char *addr;
++  int16_t value;
++  u_int8_t found_mask;
++
++  if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK) return(CONST_LUA_ERROR);
++  addr = (char*)lua_tostring(vm, 1);
++
++  if(!addr) return(CONST_LUA_ERROR);
++
++  if(getLuaVMUservalue(vm, addr_tree) == NULL) {
++    /* This corresponds to an empty tree, return no match */
++    lua_pushnil(vm);
++    return(CONST_LUA_OK);
++  }
++
++  value = getLuaVMUservalue(vm, addr_tree)->find(addr, &found_mask);
++
++  if(value == -1) {
++    /* Not found */
++    lua_pushnil(vm);
++  } else
++    lua_pushinteger(vm, value);
++
++  return(CONST_LUA_OK);
++}
++
++/* *************************************

@@ -1,0 +1,146 @@
+@@ -1482,7 +1482,7 @@ int tail_handle_arp(struct __ctx_buff *ctx)
+ __section_entry
+ int cil_from_container(struct __ctx_buff *ctx)
+ {
+-	__u16 proto;
++	__u16 proto = 0;
+ 	__u32 sec_label = SECLABEL;
+ 	__s8 ext_err = 0;
+ 	int ret;
+
+
+
+
+@@ -24,18 +24,30 @@ enum {
+ /**
+  * ctx_classify
+  * @ctx: socket buffer
++ * @proto: the layer 3 protocol (ETH_P_IP, ETH_P_IPV6).
+  *
+  * Compute classifiers (CLS_FLAG_*) for the given packet to be used during
+  * trace/drop notification events.
+  */
+ static __always_inline cls_flags_t
+-ctx_classify(const struct __ctx_buff *ctx __maybe_unused)
++ctx_classify(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
+ {
+-	if (ETH_HLEN != 0)
+-		return CLS_FLAG_NONE;
++	cls_flags_t flags = CLS_FLAG_NONE;
+ 
+-	if (ctx_get_protocol(ctx) == bpf_htons(ETH_P_IPV6))
+-		return CLS_FLAG_L3_DEV | CLS_FLAG_IPV6;
++	/*
++	 * Retrieve protocol when not being provided.
++	 * (ex. from drop notifications, or when previous calls to validate_ethertype failed)
++	 */
++	if (!proto)
++		proto = ctx_get_protocol(ctx);
++
++	/* Check whether the packet comes from a L3 device (no ethernet). */
++	if (ETH_HLEN == 0)
++		flags |= CLS_FLAG_L3_DEV;
++
++	/* Check if IPv6 packet. */
++	if (proto == bpf_htons(ETH_P_IPV6))
++		flags |= CLS_FLAG_IPV6;
+ 
+-	return CLS_FLAG_L3_DEV;
++	return flags;
+ }
+
+
+
+
+@@ -85,7 +85,7 @@ int tail_drop_notify(struct __ctx_buff *ctx)
+ 			return exitcode;
+ 	}
+ 
+-	flags = ctx_classify(ctx);
++	flags = ctx_classify(ctx, 0);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_DROP, (__u8)error),
+
+
+
+
+@@ -218,7 +218,7 @@ static __always_inline void
+ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 		   __u32 src, __u32 dst, __u16 dst_id, __u32 ifindex,
+ 		   enum trace_reason reason, __u32 monitor,
+-		   __be16 proto __maybe_unused, __u16 line, __u8 file)
++		   __be16 proto, __u16 line, __u8 file)
+ {
+ 	__u64 ctx_len = ctx_full_len(ctx);
+ 	__u64 cap_len = min_t(__u64, monitor ? : TRACE_PAYLOAD_LEN,
+@@ -244,7 +244,7 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 			return;
+ 	}
+ 
+-	flags = ctx_classify(ctx);
++	flags = ctx_classify(ctx, proto);
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
+@@ -293,8 +293,7 @@ _send_trace_notify4(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 			return;
+ 	}
+ 
+-	flags = ctx_classify(ctx);
+-
++	flags = ctx_classify(ctx, bpf_htons(ETH_P_IP));
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
+@@ -343,7 +342,7 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
+ 			return;
+ 	}
+ 
+-	flags = ctx_classify(ctx) | CLS_FLAG_IPV6;
++	flags = ctx_classify(ctx, bpf_htons(ETH_P_IPV6));
+ 
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
+
+
+
+
+@@ -25,7 +25,7 @@
+ 	if (is_ipv4) {                                                       \
+ 		assert(((flags) & CLS_FLAG_IPV6) == 0);                      \
+ 	} else {                                                             \
+-		assert((((flags) & CLS_FLAG_IPV6) != 0) == (ETH_HLEN == 0)); \
++		assert((((flags) & CLS_FLAG_IPV6) != 0));                    \
+ 	}                                                                    \
+ }
+ 
+@@ -86,7 +86,20 @@ check(struct __ctx_buff *ctx, bool is_ipv4)
+ 
+ 	adjust_l2(ctx);
+ 
++	void *data, *data_end;
++	struct iphdr *ip4;
++	struct ipv6hdr *ip6;
+ 	cls_flags_t flags;
++	__be16 proto;
++
++	/* Parse L3 once. */
++	if (is_ipv4) {
++		assert(revalidate_data(ctx, &data, &data_end, &ip4));
++		proto = bpf_htons(ETH_P_IP);
++	} else {
++		assert(revalidate_data(ctx, &data, &data_end, &ip6));
++		proto = bpf_htons(ETH_P_IPV6);
++	}
+ 
+ 	/*
+ 	 * Ensure L3_DEVICE_CHECK:
+@@ -94,7 +107,7 @@ check(struct __ctx_buff *ctx, bool is_ipv4)
+ 	 * - CLS_FLAG_IPv6 is set with IPv6 packets and ETH_HLEN is zero.
+ 	 */
+ 	TEST("native", {
+-		flags = ctx_classify(ctx);
++		flags = ctx_classify(ctx, proto);
+ 		L3_DEVICE_CHECK(flags, is_ipv4);
+ 	})

@@ -1,0 +1,81 @@
+@@ -16,6 +16,8 @@ import static org.batfish.datamodel.acl.SourcesReferencedByIpAccessLists.SOURCE_
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.Maps;
++import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+@@ -33,12 +35,15 @@ import org.batfish.common.bdd.BDDSourceManager;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.Interface;
+ import org.batfish.datamodel.IpProtocol;
++import org.batfish.datamodel.Vrf;
+ import org.batfish.datamodel.collections.NodeInterfacePair;
+ import org.batfish.datamodel.flow.Accept;
+ import org.batfish.datamodel.flow.FibLookup;
+ import org.batfish.datamodel.flow.ForwardOutInterface;
++import org.batfish.datamodel.flow.OriginatingSessionScope;
+ import org.batfish.datamodel.flow.SessionAction;
+ import org.batfish.symbolic.state.StateExpr;
++import org.batfish.symbolic.state.VrfAccept;
+ 
+ /**
+  * Factory for creating {@link BDDFirewallSessionTraceInfo} objects for bidirectional reachability
+@@ -61,7 +66,8 @@ final class BDDReachabilityAnalysisSessionFactory {
+   private final Map<String, Configuration> _configs;
+   private final Map<String, BDDSourceManager> _srcManagers;
+   private final LastHopOutgoingInterfaceManager _lastHopManager;
+-  private final Map<NodeInterfacePair, BDD> _sessionBdds;
++  private final Map<NodeInterfacePair, BDD> _incomingSessionBdds;
++  private final Map<String, Map<String, BDD>> _originatingSessionBdds;
+   private final BDDReverseFlowTransformationFactory _reverseFlowTransformationFactory;
+   private final BDDReverseTransformationRanges _reverseTransformationRanges;
+ 
+@@ -81,8 +87,12 @@ final class BDDReachabilityAnalysisSessionFactory {
+         IpProtocol.IP_PROTOCOLS_WITH_SESSIONS.stream()
+             .map(bddPacket.getIpProtocol()::value)
+             .reduce(bddPacket.getFactory().one(), BDD::or);
+-    _sessionBdds =
+-        reachableSessionCreationBdds(configs, forwardReachableBdds, ipProtocolsWithSessionsBdd);
++    _incomingSessionBdds =
++        reachableIncomingSessionCreationBdds(
++            configs, forwardReachableBdds, ipProtocolsWithSessionsBdd);
++    _originatingSessionBdds =
++        reachableOriginatingSessionCreationBdds(
++            configs, forwardReachableBdds, ipProtocolsWithSessionsBdd);
+     _reverseFlowTransformationFactory = transformationFactory;
+     _reverseTransformationRanges = reverseTransformationRanges;
+   }
+@@ -130,12 +140,18 @@ final class BDDReachabilityAnalysisSessionFactory {
+   private List<BDDFirewallSessionTraceInfo> computeInitializedSessions(Configuration config) {
+     String hostname = config.getHostname();
+ 
++    List<String> sessionOriginateVrfs =
++        config.getVrfs().values().stream()
++            .filter(Vrf::hasOriginatingSessions)
++            .map(Vrf::getName)
++            .collect(ImmutableList.toImmutableList());
++
+     List<Interface> sessionExitInterfaces =
+         config.getAllInterfaces().values().stream()
+             .filter(iface -> iface.getActive() && iface.getFirewallSessionInterfaceInfo() != null)
+             .collect(ImmutableList.toImmutableList());
+ 
+-    if (sessionExitInterfaces.isEmpty()) {
++    if (sessionOriginateVrfs.isEmpty() && sessionExitInterfaces.isEmpty()) {
+       // No sessions to create (and won't have any entries in _lastHopManager), so return now
+       return ImmutableList.of();
+     }
+@@ -152,28 +168,45 @@ final class BDDReachabilityAnalysisSessionFactory {
+                     .map(BDDFiniteDomain::getValueBdds)
+                     .orElse(ImmutableMap.of()));
+ 
+-    return sessionExitInterfaces.stream()
+-        .flatMap(
+-            iface -> {
+-              BDD exitIfaceBdd = _sessionBdds.get(NodeInterfacePair.of(hostname, iface.getName()));
+-              return exitIfaceBdd == null || exitIfaceBdd.isZero()
+-                  ? Stream.of()
+-                  : computeInitializedSessions(

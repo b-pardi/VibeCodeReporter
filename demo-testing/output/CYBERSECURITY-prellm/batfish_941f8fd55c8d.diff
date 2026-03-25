@@ -1,0 +1,78 @@
+@@ -661,19 +661,160 @@ public class Batfish extends PluginConsumer implements IBatfish {
+   @Override
+   public AnswerElement answerAclReachability(
+       String aclNameRegexStr, NamedStructureEquivalenceSets<?> aclEqSets) {
+-    AclLinesAnswerElement answerElement = new AclLinesAnswerElement();
+ 
+     Pattern aclNameRegex;
+     try {
+       aclNameRegex = Pattern.compile(aclNameRegexStr);
+     } catch (PatternSyntaxException e) {
+       throw new BatfishException(
+-          "Supplied regex for nodes is not a valid java regex: \"" + aclNameRegexStr + "\"", e);
++          "Supplied regex for nodes is not a valid Java regex: \"" + aclNameRegexStr + "\"", e);
+     }
+ 
++    AclLinesAnswerElement answerElement = new AclLinesAnswerElement();
+     Map<String, Configuration> configurations = loadConfigurations();
+ 
++    // Run first batch of nod jobs to find unreachable lines
++    List<NodSatJob<AclLine>> jobs =
++        generateUnreachableAclLineJobs(aclNameRegex, aclEqSets, configurations, answerElement);
++    Map<AclLine, Boolean> linesReachableMap = new TreeMap<>();
++    computeNodSatOutput(jobs, linesReachableMap);
++
++    // Create two maps with hostnames as keys and Map(acl name -> acl lines) as values. One map will
++    // contain all ACLs with unreachable lines, the other will have all fully reachable ACLs.
++    Map<String, Map<String, List<AclLine>>> hostnamesToAclsWithUnreachableLinesMap =
++        new TreeMap<>();
++    Map<String, Map<String, List<AclLine>>> hostnamesToFullyReachableAclsMap = new TreeMap<>();
++    for (Entry<AclLine, Boolean> e : linesReachableMap.entrySet()) {
++      AclLine line = e.getKey();
++      String aclName = line.getAclName();
++      String hostname = line.getHostname();
++
++      Map<String, List<AclLine>> fullyReachableAcls =
++          hostnamesToFullyReachableAclsMap.computeIfAbsent(hostname, k -> new TreeMap<>());
++      Map<String, List<AclLine>> aclsWithUnreachableLines =
++          hostnamesToAclsWithUnreachableLinesMap.computeIfAbsent(hostname, k -> new TreeMap<>());
++
++      if (!e.getValue()) {
++        // Current line is unreachable.
++        // Get lines so far of this ACL. Could be in fullyReachableAcls or aclsWithUnreachableLines.
++        // If ACL was thus far completely reachable, move its lines into aclsWithUnreachableLines.
++        List<AclLine> aclRecordedAsReachable = fullyReachableAcls.remove(aclName);
++        if (aclRecordedAsReachable != null) {
++          aclRecordedAsReachable.add(line);
++          aclsWithUnreachableLines.put(aclName, aclRecordedAsReachable);
++        } else {
++          // Otherwise, there were already earlier unreachable lines. Just add the new one.
++          aclsWithUnreachableLines.get(aclName).add(line);
++        }
++      } else {
++        // Current line is reachable.
++        // Get lines so far of this ACL. Could be in fullyReachableAcls, aclsWithUnreachableLines,
++        // or this could be the first line. Create/get the ACL's list of lines.
++        List<AclLine> aclLineList = aclsWithUnreachableLines.get(aclName);
++        if (aclLineList == null) {
++          aclLineList = fullyReachableAcls.computeIfAbsent(aclName, k -> new ArrayList<>());
++        }
++        // Add line to the ACL's list of lines.
++        aclLineList.add(line);
++      }
++    }
++
++    // Run second batch of nod jobs to get earliest more general lines for each unreachable line
++    // Produces a map of acl line -> line number of earliest more general reachable line
++    List<NodFirstUnsatJob<AclLine, Integer>> step2Jobs =
++        generateEarliestMoreGeneralAclLineJobs(
++            hostnamesToAclsWithUnreachableLinesMap,
++            hostnamesToFullyReachableAclsMap,
++            linesReachableMap,
++            configurations);
++    Map<AclLine, Integer> blockingLinesMap = new TreeMap<>();
++    computeNodFirstUnsatOutput(step2Jobs, blockingLinesMap);
++
++    // For each line:
++    // - Add <hostname, aclName> pair to allAclHostPairs set
++    // - Create an AclReachabil

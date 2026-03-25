@@ -1,0 +1,120 @@
+@@ -105,6 +105,9 @@ class module(ModuleType):
+ 
+     @pwndbg.lib.cache.cache_until("stop", "prompt")
+     def read_reg(self, reg: str, frame: pwndbg.dbg_mod.Frame | None = None) -> int | None:
++        return self.read_reg_uncached(reg, frame)
++
++    def read_reg_uncached(self, reg: str, frame: pwndbg.dbg_mod.Frame | None = None) -> int | None:
+         reg = reg.lstrip("$")
+         try:
+             value = get_register(reg, frame)
+
+
+
+
+@@ -160,7 +160,7 @@ def argument(n: int, abi: pwndbg.lib.abi.ABI | None = None) -> int:
+     regs = abi.register_arguments
+ 
+     if n < len(regs):
+-        return getattr(pwndbg.aglib.regs, regs[n])
++        return pwndbg.aglib.regs.read_reg_uncached(regs[n])
+ 
+     n -= len(regs)
+ 
+
+
+
+
+@@ -942,6 +942,7 @@ def load_commands() -> None:
+     import pwndbg.commands.kdmabuf
+     import pwndbg.commands.kdmesg
+     import pwndbg.commands.klookup
++    import pwndbg.commands.kmem_trace
+     import pwndbg.commands.kmod
+     import pwndbg.commands.knft
+     import pwndbg.commands.ksyscalls
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,257 @@
++from __future__ import annotations
++
++import argparse
++import threading
++
++import pwndbg.aglib.regs
++import pwndbg.aglib.symbol
++import pwndbg.arguments
++import pwndbg.color as C
++import pwndbg.color.message as M
++import pwndbg.commands
++from pwndbg.dbg import BreakpointLocation
++
++parser = argparse.ArgumentParser(
++    description="""
++    Tracing kernel memory (SLUB and buddy) allocations and frees.
++    Unless --all is specified, only the allocations triggered by the until the function returns will be printed.
++    This option may be helpful if you also want to trace frees scheduled with rcu or if the traced command steps out of the current function.
++    """
++)
++parser.add_argument("-s", "--trace-slab", action="store_true", help="enable slab allocator tracing")
++parser.add_argument(
++    "-b", "--trace-buddy", action="store_true", help="enable buddy allocator tracing"
++)
++parser.add_argument("-v", "--verbose", action="store_true", help="print backtraces")
++parser.add_argument(
++    "-c", "--command", type=str, default="n", help="command to be traced (e.g. `n`, `nextret`)"
++)
++parser.add_argument(
++    "--all",
++    action="store_true",
++    help="display ALL memory allocations/frees regardless if they are triggered by the current function.",
++)
++
++
++class KmemTracepointsData:
++    def __init__(self, verbose, trace_all):
++        self.results = []
++        self.order = None
++        self.mutex = threading.RLock()
++        self.verbose = verbose
++        self.curr = None  # None means tracing all
++        if not trace_all:
++            # current frame only accounting for jumps
++            pc = pwndbg.dbg.selected_frame().parent().pc()
++            self.curr = pwndbg.aglib.symbol.resolve_addr(pc).split("+")[0]
++
++    def add_result(self, result: str):
++        if not result:
++            return
++        with self.mutex:
++            bt = pwndbg.commands.context.context_backtrace(False)
++            if not self.curr or any(self.curr in line for line in bt):
++                self.results.append(result)
++                if self.verbose:
++                    self.results += bt
++
++    def _format_kmem_tracepoint_output(self, prefix, name, type, addr):
++        prefix = prefix.ljust(12, " ")
++        if "FREE" in prefix:
++            prefix = C.red(prefix)
++        else:
++            prefix = C.green(prefix)
++        name = C.blue(name.ljust(16, " "))
++        type = type.ljust(4, " ")
++        return f"{prefix} {name} {type} @ {C.blue(hex(addr))}"
++
++    def format_slab_kmem_tracepoint_output(self, is_free: bool, objaddr: int):
++        if objaddr == 0:
++            return
++        if is_free:
++            prefix = "[SLAB FREE]"
++        else:
++            prefix = "[SLAB ALLOC]"
++        try:
++            cache = pwndbg.aglib.kernel.slab.find_containing_slab_cache(objaddr)
++            name = cache.name
++        except Exception:
++            self.results.append(M.warn(f"{pre

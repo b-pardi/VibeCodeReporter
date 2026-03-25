@@ -1,0 +1,90 @@
+@@ -31,6 +31,7 @@ import getpass
+ from sys import version_info
+ import stat
+ import time
++from collections import deque
+ import datetime
+ import dateutil
+ import dateutil.parser
+@@ -104,19 +105,32 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+ 
+         # Last argument of super constructor is a list of mandatory arguments
+         super().__init__(plugindef, ["postgresql_data_dir", "wal_archive_dir"])
+-        self.ignore_subdirs = [
+-            "log",
+-            "pg_wal",
+-            "pg_log",
+-            "pg_xlog",
+-            "pgsql_tmp",
++
++        # The contents of the directories pg_dynshmem/, pg_notify/, pg_serial/, pg_snapshots/,
++        # pg_stat_tmp/, and pg_subtrans/ can be omitted from the backup as they will be initialized
++        # on postmaster startup. (but not the directories themselves)
++        # They are mandatory to make pg cluster start successful.
++        # By default we will exclude them so os.walk will not go into it,
++        # but we re-add the dir afterwards in case of Full backup.
++        self.mandatory_subdirs = [
+             "pg_dynshmem",
+             "pg_notify",
+             "pg_serial",
+             "pg_snapshots",
+             "pg_stat_tmp",
+             "pg_subtrans",
++            "pg_wal"
+         ]
++        # log is not exclude by default but can be a good candidate.
++        # pgsql_tmp can have several locations.
++        self.ignore_subdirs = [
++            # "log",
++            "pgsql_tmp",
++        ]
++        self.ignore_subdirs.extend(self.mandatory_subdirs)
++        # pg_internal.init files can be omitted from the backup whenever a file of that name is
++        # found. These files contain relation cache data that is always rebuilt when recovering.
++        self.ignore_files = ['pg_internal.init']
+         self.options = {}
+         self.db_con = None
+         self.db_user = None
+@@ -141,7 +155,7 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+         self.data_stream = None
+         self.fname = ""
+         self.file_type = ""
+-        self.files_to_backup = []
++        self.paths_to_backup = deque()
+         self.file_to_backup = ""
+         # Store os.stat of PG_VERSION as reference for our virtual files
+         self.ref_statp = None
+@@ -178,61 +192,178 @@ class BareosFdPluginPostgreSQL(BareosFdPluginBaseclass):  # noqa
+ 
+         self.statp = {}
+ 
+-    def build_files_to_backup(self, start_dir):
++    def __build_paths_to_backup(self, start_dir):
+         """
+-        Build the list of files to be backed up by recursing from top directory.
+-        The parsing has to be in reverse mode so file first, directory at the end
+-
+-        Will be used to parse `postgresql_data_dir`, `wal_archive_dir`, `tablespace`
+-        NOTE os.walk is the favorite choice.
++        Build the tree of paths to be backed up by recursing from top directory.
++        To be able to exclude the ignore_subdirs we use os.walk with TopDown True.
++        The deque is reversed, so file appear first, and directories at the end.
++        self.paths_to_backup is extended with it.
++        
++        That function be used to parse `postgresql_data_dir`, `wal_archive_dir`, `tablespace`
+         """
+         if not start_dir.endswith("/"):
+             start_dir += "/"
+-        self.files_to_backup.append(start_dir)
+-        for topdir, dirnames, filenames in os.walk(start_dir, topdown=False):
++        self.paths_to_backup.append(start_dir)
++        # local store for searching tree
++        _paths = deque()
++        for topdir, dirnames, filenames in os.walk(start_dir, topdown=True):
+             # TODO check that assumption
+             # Usually Bareos takes care about timestamps when doing
+             # incremental backups but here we have to compare against
+             # last BackupPostgreSQL timestamp
+-            # 20230926 Why should we, or if yes only for wal ?
+-            for filename in filenames:
+-                if os.path.basename(os.path.normpath

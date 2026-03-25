@@ -1,0 +1,124 @@
+@@ -410,6 +410,7 @@
+ 
+ #define CONST_DEFAULT_FILE_MODE      0600 /* rw */
+ #define CONST_DEFAULT_DIR_MODE       0700 /* rwx */
++#define CONST_MAX_REDIS_CONN_RETRIES 16
+ #define CONST_MAX_LEN_REDIS_KEY      256
+ #define CONST_MAX_LEN_REDIS_VALUE    2*65526
+ 
+
+
+
+
+@@ -66,77 +66,94 @@ Redis::~Redis() {
+ 
+ void Redis::reconnectRedis() {
+   struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+-  redisReply *reply;
+-  u_int num_attempts = 10;
++  redisReply *reply = NULL;
++  u_int num_attempts;
++  bool connected;
+ 
+-  operational = false;
++  operational = connected = false;
++
++  for(num_attempts = CONST_MAX_REDIS_CONN_RETRIES; num_attempts > 0; num_attempts--) {
++    if(redis) {
++      ntop->getTrace()->traceEvent(TRACE_NORMAL, "Redis has disconnected, reconnecting [remaining attempts: %u]",
++				   num_attempts - 1);
++      redisFree(redis);
++    }
+ 
+-  if(redis != NULL) {
+-    ntop->getTrace()->traceEvent(TRACE_NORMAL, "Redis has disconnected: reconnecting...");
+-    redisFree(redis);
+-  }
+ #ifdef __linux__
+-  struct stat buf;
++    struct stat buf;
+ 
+-  if(!stat(redis_host, &buf) && S_ISSOCK(buf.st_mode))
+-    redis = redisConnectUnixWithTimeout(redis_host, timeout), is_socket_connection = true;
+-  else
++    if(!stat(redis_host, &buf) && S_ISSOCK(buf.st_mode))
++      redis = redisConnectUnixWithTimeout(redis_host, timeout), is_socket_connection = true;
++    else
+ #endif
+-    redis = redisConnectWithTimeout(redis_host, redis_port, timeout);
++      redis = redisConnectWithTimeout(redis_host, redis_port, timeout);
++
++    if(redis == NULL || redis->err) {
++      if(redis)
++	ntop->getTrace()->traceEvent(TRACE_ERROR, "Connection error [%s]", redis->errstr);
++
++      goto conn_retry;
++    }
++
++    if(redis_password) {
++      num_requests++;
++      reply = (redisReply*)redisCommand(redis, "AUTH %s", redis_password);
++      if(reply && (reply->type == REDIS_REPLY_ERROR)) {
++	ntop->getTrace()->traceEvent(TRACE_ERROR,
++				     "Redis authentication failed: %s", reply->str ? reply->str : "???");
++
++	break;
++      }
++    }
+ 
+-  if(redis_password) {
++    freeReplyObject(reply);
+     num_requests++;
+-    reply = (redisReply*)redisCommand(redis, "AUTH %s", redis_password);
++    reply = (redisReply*)redisCommand(redis, "PING");
+     if(reply && (reply->type == REDIS_REPLY_ERROR)) {
+-      ntop->getTrace()->traceEvent(TRACE_ERROR,
+-				   "Redis authentication failed: %s", reply->str ? reply->str : "???");
+-      goto redis_error_handler;
++      ntop->getTrace()->traceEvent(TRACE_ERROR, "%s", reply->str ? reply->str : "???");
++
++      goto conn_retry;
+     }
+-  }
+ 
+-  while(redis && num_attempts > 0) {
++    freeReplyObject(reply);
+     num_requests++;
+-    reply = (redisReply*)redisCommand(redis, "PING");
++    reply = (redisReply*)redisCommand(redis, "SELECT %u", redis_db_id);
+     if(reply && (reply->type == REDIS_REPLY_ERROR)) {
+       ntop->getTrace()->traceEvent(TRACE_ERROR, "%s", reply->str ? reply->str : "???");
+-      sleep(1);
+-      num_attempts--;
+-    } else
+-      break;
++
++      goto conn_retry;
++    }
++
++    freeReplyObject(reply);
++    connected = true;
++    break;
++
++  conn_retry:
++    sleep(1);
+   }
+ 
+-  if((redis == NULL) || (reply == NULL)) {
+-  redis_error_handler:
++  if(!connected) {
+     if(ntop->getTrace()->get_trace_level() == 0) ntop->getTrace()->set_trace_level(MAX_TRACE_LEVEL);
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "ntopng requires redis server to be up and running");
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "Please start it and try again or use -r");
+     ntop->getTrace()->traceEvent(TRACE_ERROR, "to specify a redis server other than the default");
+-    exit(0);
+-  } else {
+-    freeReplyObject(reply);
+ 
+-    num_requests++;
+-    reply = (redisReply*)redisCommand(redis, "SELECT %u", redis_db_id);
+-    if(reply && (reply->type == REDIS_REPLY_ERROR)) {
+-      ntop->getTrace()->traceEvent(TRACE_ERROR, "%s", reply->str ? reply->str : "???");
+-      goto redis_error_handler;
+-    } else {
+-      freeReplyObjec

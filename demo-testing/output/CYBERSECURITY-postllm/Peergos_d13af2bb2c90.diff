@@ -1,0 +1,89 @@
+@@ -81,6 +81,7 @@ public class IpfsCoreNode implements CoreNode {
+         LOG.info("Initializing PKI from root " + currentPkiRoot);
+         update(currentPkiRoot, currentPkiSequence);
+         if (! currentPkiRoot.isPresent()) {
++            reverseLookup.put(peergosIdentity, "peergos");
+             CommittedWriterData committed = IpfsTransaction.call(peergosIdentity,
+                     tid -> WriterData.createEmpty(peergosIdentity, signer, ipfs, hasher, tid).join()
+                             .commit(peergosIdentity, signer, MaybeMultihash.empty(), Optional.of(1L), mutable, ipfs, hasher, tid)
+
+
+
+
+@@ -33,6 +33,7 @@ public class FileContentAddressedStorage implements DeletableContentAddressedSto
+     private final BlockRequestAuthoriser authoriser;
+     private final Hasher hasher;
+     private final Cid ourId;
++    private CoreNode pki;
+ 
+     public FileContentAddressedStorage(Path root,
+                                        Cid ourId,
+@@ -55,7 +56,9 @@ public class FileContentAddressedStorage implements DeletableContentAddressedSto
+     }
+ 
+     @Override
+-    public void setPki(CoreNode pki) {}
++    public void setPki(CoreNode pki) {
++        this.pki = pki;
++    }
+ 
+     @Override
+     public ContentAddressedStorage directToOrigin() {
+@@ -135,11 +138,11 @@ public class FileContentAddressedStorage implements DeletableContentAddressedSto
+                 .collect(Collectors.toList()));
+     }
+ 
+-    private static Path getFilePath(PublicKeyHash owner, Cid h) {
++    private Path getFilePath(PublicKeyHash owner, Cid h) {
+         String key = DirectS3BlockStore.hashToKey(h);
+ 
+         Path path = PathUtil.get("")
+-                .resolve(owner.toString())
++                .resolve(pki.getUsername(owner).join())
+                 .resolve(key.substring(key.length() - 3, key.length() - 1))
+                 .resolve(key + ".data");
+         return path;
+
+
+
+
+@@ -260,10 +260,14 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+         return this;
+     }
+ 
+-    private static String hashToKey(Multihash hash) {
++    private static String legacyHashToKey(Multihash hash) {
+         return DirectS3BlockStore.hashToKey(hash);
+     }
+ 
++    private String hashToKey(PublicKeyHash owner, Multihash hash) {
++        return pki.getUsername(owner).join() + "/" + DirectS3BlockStore.hashToKey(hash);
++    }
++
+     private Cid keyToHash(String key) {
+         return DirectS3BlockStore.keyToHash(key.substring(folder.length()));
+     }
+@@ -275,7 +279,8 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+             Cid hash = DirectS3BlockStore.keyToHash(path.substring(slash + 1));
+             if (owner.isPresent())
+                 return new Pair<>(owner.get(), hash);
+-            PublicKeyHash parsedOwner = PublicKeyHash.fromString(path.substring(0, slash));
++            String username = path.substring(0, slash);
++            PublicKeyHash parsedOwner = pki.getPublicKeyHash(username).join().get();
+             return new Pair<>(parsedOwner, hash);
+         }
+         // legacy path without owner
+@@ -347,7 +352,7 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+                 .collect(Collectors.toList());
+ 
+         for (BlockMirrorCap block : blocks) {
+-            String s3Key = hashToKey(block.hash);
++            String s3Key = hashToKey(owner, block.hash);
+             res.add(S3Request.preSignGet(folder + s3Key, Optional.of(600), Optional.empty(), S3AdminRequests.asAwsDate(ZonedDateTime.now()), host, region, storageClass, accessKeyId, secretKey, useHttps, hasher).join());
+         }
+         long byteCount = 0;
+@@ -403,7 +408,7 @@ public class S3BlockStorage implements DeletableContentAddressedStorage {
+                 if (props.left.type != Multihash.Type.sha2_256)
+                     throw new IllegalStateException("Can only pre-auth writes of sha256 hashed blocks!");
+                 transactions.addBlock(props.left, tid, owner);
+-            

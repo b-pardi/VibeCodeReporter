@@ -1,0 +1,150 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,412 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/MMDB.h"
++
++#include <netinet/in.h>
++#include <netinet/ip.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <chrono>
++
++#include "zeek/Func.h"
++#include "zeek/IPAddr.h"
++#include "zeek/ZeekString.h"
++
++namespace zeek {
++
++#ifdef USE_GEOIP
++
++static int msg_count = 0;
++static double msg_suppression_time = 0;
++static bool did_loc_db_error = false;
++static bool did_asn_db_error = false;
++static constexpr int msg_limit = 20;
++static constexpr double msg_suppression_duration = 300;
++
++static std::unique_ptr<MMDB> mmdb_loc;
++static std::unique_ptr<MMDB> mmdb_asn;
++
++static void report_msg(const char* format, ...) {
++    if ( zeek::run_state::network_time > msg_suppression_time + msg_suppression_duration ) {
++        msg_count = 0;
++        msg_suppression_time = zeek::run_state::network_time;
++    }
++
++    if ( msg_count >= msg_limit )
++        return;
++
++    ++msg_count;
++
++    va_list al;
++    va_start(al, format);
++    std::string msg = zeek::util::vfmt(format, al);
++    va_end(al);
++
++    zeek::reporter->Info("%s", msg.data());
++}
++
++MMDB::MMDB(const char* filename, struct stat info)
++    : file_info(info), lookup_error{false}, last_check{zeek::run_state::network_time} {
++    int status = MMDB_open(filename, MMDB_MODE_MMAP, &mmdb);
++
++    if ( MMDB_SUCCESS != status ) {
++        throw std::runtime_error(MMDB_strerror(status));
++    }
++}
++
++MMDB::~MMDB() { MMDB_close(&mmdb); }
++
++MMDB_lookup_result_s MMDB::Lookup(const struct sockaddr* const sa) {
++    int mmdb_error;
++    MMDB_lookup_result_s result = MMDB_lookup_sockaddr(&mmdb, sa, &mmdb_error);
++
++    if ( MMDB_SUCCESS != mmdb_error ) {
++        lookup_error = true;
++        throw std::runtime_error(MMDB_strerror(mmdb_error));
++    }
++
++    return result;
++}
++
++// Check to see if the Maxmind DB should be closed and reopened.  This will
++// happen if there was a lookup error or if the mmap'd file has been replaced
++// by an external process.
++bool MMDB::StaleDB() {
++    struct stat buf;
++
++    if ( lookup_error )
++        return true;
++
++    static double mmdb_stale_check_interval = zeek::id::find_val("mmdb_stale_check_interval")->AsInterval();
++
++    if ( mmdb_stale_check_interval < 0.0 )
++        return false;
++
++    if ( zeek::run_state::network_time - last_check < mmdb_stale_check_interval )
++        return false;
++
++    last_check = zeek::run_state::network_time;
++
++    if ( 0 != stat(mmdb.filename, &buf) )
++        return true;
++
++    if ( buf.st_ino != file_info.st_ino || buf.st_mtime != file_info.st_mtime ) {
++        report_msg("%s change detected for MaxMind DB [%s]",
++                   buf.st_ino != file_info.st_ino ? "Inode" : "Modification time", mmdb.filename);
++        return true;
++    }
++
++    return false;
++}
++
++const char* MMDB::Filename() { return mmdb.filename; }
++
++static bool mmdb_open(const char* filename, bool asn) {
++    struct stat buf;
++
++    if ( 0 != stat(filename, &buf) ) {
++        return false;
++    }
++
++    try {
++        if ( asn ) {
++            mmdb_asn.reset(new MMDB(filename, buf));
++        }
++        else {
++            mmdb_loc.reset(new MMDB(filename, buf));
++        }
++    }
++
++    catch ( const std::exception& e ) {
++        if ( asn )
++            did_asn_db_error = false;
++        else
++            did_loc_db_error = false;
++
++        report_msg("Failed to open MaxMind DB: %s [%s]", filename, e.what());
++        return false;
++    }
++
++    return true;
++}
++
++static bool mmdb_open_loc(const char* filename) { return mmdb_open(filename, false); }
++
++static bool mmdb_open_asn(const char* filename) { return mmdb_open(filename, true); }
++
++static void mmdb_check_loc() {
++    if ( mmdb_loc && mmdb_loc->StaleDB() ) {
++        report_msg("Closing stale MaxMind DB [%s]", mmdb_loc->Filename());
++        did_loc_db_error = false;
++        mmdb_loc.reset();
++    }
++}
++
++static void mmdb_check_asn() 

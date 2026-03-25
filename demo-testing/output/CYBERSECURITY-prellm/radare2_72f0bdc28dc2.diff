@@ -1,0 +1,108 @@
+@@ -5,7 +5,6 @@
+ #include <r_util.h>
+ #include <r_list.h>
+ 
+-#define USE_FCN_RECURSE 1
+ #define USE_SDB_CACHE 0
+ #define READ_AHEAD 1
+ #define SDB_KEY_BB "bb.0x%"PFMT64x ".0x%"PFMT64x
+@@ -460,6 +459,14 @@ static RAnalBlock *appendBasicBlock(RAnal *anal, RAnalFunction *fcn, ut64 addr)
+ 	}
+ 
+ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth);
++
++static int fcn_recurse_at(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int depth) {
++	int ret = fcn_recurse (anal, fcn, addr, anal->opt.bb_max_size, depth - 1);
++	r_anal_fcn_update_tinyrange_bbs (fcn);
++	r_anal_fcn_set_size (anal, fcn, r_anal_fcn_size (fcn));
++	return ret;
++}
++
+ #define recurseAt(x) {\
+ 	ret = fcn_recurse (anal, fcn, x, anal->opt.bb_max_size, depth - 1);\
+ 	r_anal_fcn_update_tinyrange_bbs (fcn);\
+@@ -1136,6 +1143,25 @@ repeat:
+ 			// FITFCNSZ(); // defer this, in case this instruction is a branch delay entry
+ 			// fcn->size += oplen; /// XXX. must be the sum of all the bblocks
+ 		}
++		if (anal->opt.trycatch) {
++			const char *name = anal->coreb.getName (anal->coreb.core, at);
++			if (name) {
++				if (r_str_startswith (name, "try.") && r_str_endswith (name, ".from")) {
++					char *handle = strdup (name);
++					// handle = r_str_replace (handle, ".from", ".to", 0);
++					ut64 from_addr = anal->coreb.numGet (anal->coreb.core, handle);
++					handle = r_str_replace (handle, ".from", ".catch", 0);
++					ut64 handle_addr = anal->coreb.numGet (anal->coreb.core, handle);
++					bb->jump = at + oplen;
++					if (from_addr != bb->addr) {
++						bb->fail = handle_addr;
++						recurseAt (handle_addr);
++						eprintf ("(%s)\n", handle);
++						bb = appendBasicBlock (anal, fcn, addr);
++					}
++				}
++			}
++		}
+ 		idx += oplen;
+ 		delay.un_idx = idx;
+ 		if (op.delay > 0 && !delay.pending) {
+@@ -1818,7 +1844,6 @@ R_API void r_anal_del_jmprefs(RAnal *anal, RAnalFunction *fcn) {
+ 
+ /* Does NOT invalidate read-ahead cache. */
+ R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int reftype) {
+-	int ret;
+ 	r_anal_fcn_set_size (NULL, fcn, 0); // fcn is not yet in anal => pass NULL
+ 	/* defines fcn. or loc. prefix */
+ 	fcn->type = (reftype == R_ANAL_REF_TYPE_CODE) ? R_ANAL_FCN_TYPE_LOC : R_ANAL_FCN_TYPE_FCN;
+@@ -1833,12 +1858,11 @@ R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 len, int r
+ 	}
+ 	fcn->maxstack = 0;
+ #if USE_FCN_RECURSE
+-	ret = fcn_recurse (anal, fcn, addr, len, anal->opt.depth);
++	int ret = fcn_recurse (anal, fcn, addr, len, anal->opt.depth);
+ 	// update tinyrange for the function
+ 	r_anal_fcn_update_tinyrange_bbs (fcn);
+ #else
+-	int depth = anal->opt.depth;
+-	recurseAt (addr)
++	int ret = fcn_recurse_at (anal, fcn, addr, len, anal->opt.depth);
+ #endif
+ 	if (anal->opt.endsize && ret == R_ANAL_RET_END && r_anal_fcn_size (fcn)) {   // cfg analysis completed
+ 		RListIter *iter;
+
+
+
+
+@@ -2537,6 +2537,13 @@ static bool cb_anal_brokenrefs(void *user, void *data) {
+ 	return true;
+ }
+ 
++static bool cb_anal_trycatch(void *user, void *data) {
++	RCore *core = (RCore*) user;
++	RConfigNode *node = (RConfigNode*) data;
++	core->anal->opt.trycatch = node->i_value;
++	return true;
++}
++
+ static bool cb_anal_bb_max_size(void *user, void *data) {
+ 	RCore *core = (RCore*) user;
+ 	RConfigNode *node = (RConfigNode*) data;
+@@ -2821,6 +2828,7 @@ R_API int r_core_config_init(RCore *core) {
+ 	SETCB ("anal.jmp.mid", "true", &cb_anal_jmpmid, "Continue analysis after jump to middle of instruction (x86 only)");
+ 
+ 	SETCB ("anal.refstr", "false", &cb_anal_searchstringrefs, "Search string references in data references");
++	SETCB ("anal.trycatch", "false", &cb_anal_trycatch, "Honor try.X.Y.{from,to,catch} flags");
+ 	SETCB ("anal.bb.maxsize", "512K", &cb_anal_bb_max_size, "Maximum basic block size");
+ 	SETCB ("anal.pushret", "false", &cb_anal_pushret, "Analyze push+ret as jmp");
+ 
+
+
+
+
+@@ -611,6 +611,7 @@ typedef struct r_anal_options_t {
+ 	int searchstringrefs;
+ 	int followbrokenfcnsrefs;
+ 	int bb_max_size;
++	bool trycatch;
+ 

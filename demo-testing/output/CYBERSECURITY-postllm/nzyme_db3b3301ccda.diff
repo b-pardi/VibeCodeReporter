@@ -1,0 +1,105 @@
+@@ -118,6 +118,7 @@ public class MockNzyme implements NzymeNode {
+     private final TasksQueue tasksQueue;
+     private final BaseConfiguration baseConfiguration;
+     private final Crypto crypto;
++    private final ClusterManager clusterManager;
+ 
+     public MockNzyme() {
+         this(0, 5, TimeUnit.SECONDS);
+@@ -153,6 +154,8 @@ public class MockNzyme implements NzymeNode {
+             throw new RuntimeException(e);
+         }
+ 
++        this.clusterManager = new ClusterManager(this);
++
+         this.messageBus = new PostgresMessageBusImpl(this);
+         ((PostgresMessageBusImpl) this.messageBus).initialize(taskAndMessagePollInterval, taskAndMessagePollIntervalUnit);
+ 
+@@ -211,6 +214,8 @@ public class MockNzyme implements NzymeNode {
+ 
+     @Override
+     public void initialize() {
++        this.clusterManager.initialize();
++
+         try {
+             this.crypto.initialize(false);
+         } catch (Crypto.CryptoInitializationException e) {
+@@ -229,7 +234,7 @@ public class MockNzyme implements NzymeNode {
+ 
+     @Override
+     public ClusterManager getClusterManager() {
+-        return null;
++        return clusterManager;
+     }
+ 
+     @Override
+
+
+
+
+@@ -275,6 +275,9 @@ public class NzymeNodeImpl implements NzymeNode {
+     public void initialize() {
+         LOG.info("Initializing nzyme version: {}.", version.getVersionString());
+ 
++        LOG.info("Initializing cluster manager.");
++        this.clusterManager.initialize();
++
+         LOG.info("Initializing message bus [{}].", this.messageBus.getClass().getCanonicalName());
+         this.messageBus.initialize();
+ 
+
+
+
+
+@@ -1,18 +1,23 @@
+ package app.nzyme.core.crypto;
+ 
+ import app.nzyme.core.crypto.database.TLSKeyAndCertificateEntry;
++import app.nzyme.core.crypto.pgp.PGPKeyMessageBusReceiver;
++import app.nzyme.core.crypto.pgp.PGPKeyProviderTaskHandler;
++import app.nzyme.core.crypto.pgp.PGPKeys;
+ import app.nzyme.core.crypto.tls.*;
+ import app.nzyme.core.crypto.database.TLSWildcardKeyAndCertificateEntry;
+ import app.nzyme.core.distributed.Node;
+ import app.nzyme.core.distributed.tasksqueue.Task;
+ import app.nzyme.core.distributed.tasksqueue.TaskType;
+ import app.nzyme.plugin.Database;
++import app.nzyme.plugin.distributed.messaging.MessageType;
+ import com.codahale.metrics.Timer;
+ import app.nzyme.core.NzymeNode;
+ import app.nzyme.core.util.MetricNames;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
+ import com.google.common.io.BaseEncoding;
++import com.google.common.io.Files;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+@@ -100,6 +105,8 @@ public class Crypto {
+ 
+     private final BouncyCastleProvider bcProvider;
+ 
++    private PGPKeys nodeLocalPGPKeys = null;
++
+     public Crypto(NzymeNode nzyme) {
+         this.nzyme = nzyme;
+ 
+@@ -123,14 +130,25 @@ public class Crypto {
+         File privateKeyLocation = Paths.get(cryptoDirectoryConfig.toString(), PGP_PRIVATE_KEY_FILE_NAME).toFile();
+         File publicKeyLocation = Paths.get(cryptoDirectoryConfig.toString(), PGP_PUBLIC_KEY_FILE_NAME).toFile();
+ 
++        // Create node-local PGP key.
++        try {
++            nodeLocalPGPKeys = generatePGPKeys();
++            nzyme.getNodeManager().setLocalPGPKeys(nodeLocalPGPKeys);
++        } catch (PGPException | NoSuchProviderException | NoSuchAlgorithmException | IOException e) {
++            throw new CryptoInitializationException("Could not generate node-local PGP key.", e);
++        }
++
+         boolean fetchPGPKeysAllowed = true;
+-        boolean newCluster = false; // Check if a cluster ID exists.
+ 
+         if (!privateKeyLocation.exists() || !publicKeyLocation.exists()) {
+-            if (fetchPGPKeysAllowed && !newCluster) {
+-                LOG.info("PGP private or public key missing and not a new cluster. Requesting keys from other nodes...");
++            if (fetchPGPKeysAllowed && nzyme.getClusterManager().joinedExistingClus

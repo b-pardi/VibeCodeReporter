@@ -1,0 +1,121 @@
+@@ -10,7 +10,9 @@ and protocol collection class :class:`~pcapkit.corekit.protochain.ProtoChain`.
+ 
+ """
+ from pcapkit.corekit.infoclass import Info
++from pcapkit.corekit.multidict import MultiDict, OrderedMultiDict
+ from pcapkit.corekit.protochain import ProtoChain
+ from pcapkit.corekit.version import VersionInfo
+ 
+-__all__ = ['Info', 'ProtoChain', 'VersionInfo']
++__all__ = ['Info', 'ProtoChain', 'VersionInfo',
++           'MultiDict', 'OrderedMultiDict']
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,592 @@
++# -*- coding: utf-8 -*-
++"""multi-mapping dictionary"""
++
++import copy
++from typing import TYPE_CHECKING, TypeVar, Generic, cast, overload
++
++from pcapkit.utilities.exceptions import MissingKeyError, UnsupportedCall
++
++if TYPE_CHECKING:
++    from typing import Any, Optional, Iterable, Iterator, Mapping, SupportsIndex, NoReturn
++    from typing_extensions import Literal
++
++__all__ = ['MultiDict', 'OrderedMultiDict']
++
++###############################################################################
++# Type variables
++###############################################################################
++
++_T = TypeVar('_T')
++_KT = TypeVar('_KT')
++_VT = TypeVar('_VT')
++
++###############################################################################
++# Internals
++###############################################################################
++
++
++class _omd_bucket(Generic[_KT, _VT]):
++    """Wraps values in the :class:`OrderedMultiDict`.
++
++    This makes it possible to keep an order over multiple different keys. It
++    requires a lot of extra memory and slows down access a lit, but makes it
++    possible to access elements in ``O(1)`` and iterate in ``O(n)``
++
++    """
++    prev: 'Optional[_omd_bucket]'
++    next: 'Optional[_omd_bucket]'
++    key: '_KT'
++    value: '_VT'
++
++    __slots__ = ('prev', 'key', 'value', 'next')
++
++    def __init__(self, omd: 'OrderedMultiDict', key: '_KT', value: '_VT') -> 'None':
++        self.prev = omd._last_bucket
++        self.key = key
++        self.value = value
++        self.next = None
++
++        if omd._first_bucket is None:
++            omd._first_bucket = self
++        if omd._last_bucket is not None:
++            omd._last_bucket.next = self
++        omd._last_bucket = self
++
++    def unlink(self, omd: 'OrderedMultiDict') -> 'None':
++        if self.prev:
++            self.prev.next = self.next
++        if self.next:
++            self.next.prev = self.prev
++        if omd._first_bucket is self:  # pylint: disable=protected-access
++            omd._first_bucket = self.next  # pylint: disable=protected-access
++        if omd._last_bucket is self:  # pylint: disable=protected-access
++            omd._last_bucket = self.prev  # pylint: disable=protected-access
++
++
++class _Missing:
++    def __repr__(self) -> 'str':
++        return "no value"
++
++    def __reduce__(self) -> 'str':
++        return "_missing"
++
++
++_missing = _Missing()
++
++###############################################################################
++# Helpers
++###############################################################################
++
++
++def iter_multi_items(mapping: 'Mapping[_KT, _VT | Iterable[_VT]] | Iterable[tuple[_KT, _VT]]') -> 'Iterator[tuple[_KT, _VT]]':  # pylint: disable=line-too-long
++    """Iterates over the items of a mapping yielding keys and values
++    without dropping any from more complex structures.
++    """
++    if isinstance(mapping, MultiDict):
++        yield from mapping.items(multi=True)
++    elif isinstance(mapping, dict):
++        for key, value in mapping.items():
++            if isinstance(value, (tuple, list)):
++                for v in value:
++                    yield key, v
++            else:
++                yield key, value
++    else:
++        yield from mapping
++
++
++###############################################################################
++# Data structures
++###############################################################################
++
++
++class MultiDict(dict, Generic[_KT, _VT]):
++    """A :

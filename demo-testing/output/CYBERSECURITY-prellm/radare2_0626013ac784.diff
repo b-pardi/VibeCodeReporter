@@ -1,0 +1,135 @@
+@@ -226,6 +226,7 @@ static const char *help_msg_dm[] = {
+ 	"dms-", " <id> <mapaddr>", "Restore memory snapshot",
+ 	"dmS", " [addr|libname] [sectname]", "List sections of target lib",
+ 	"dmS*", " [addr|libname] [sectname]", "List sections of target lib in radare commands",
++	"dmL", " address size", "Allocate <size> bytes at <address> and promote to huge page",
+ 	//"dm, " rw- esp 9K", "set 9KB of the stack as read+write (no exec)",
+ 	"TODO:", "", "map files in process memory. (dmf file @ [addr])",
+ 	NULL
+@@ -1826,7 +1827,7 @@ static int cmd_debug_map(RCore *core, const char *input) {
+ 				*p++ = 0;
+ 				addr = r_num_math (core->num, input + 1);
+ 				size = r_num_math (core->num, p);
+-				r_debug_map_alloc (core->dbg, addr, size);
++				r_debug_map_alloc (core->dbg, addr, size, false);
+ 			} else {
+ 				eprintf ("Usage: dm addr size\n");
+ 				return false;
+@@ -1848,6 +1849,21 @@ static int cmd_debug_map(RCore *core, const char *input) {
+ 		}
+ 		eprintf ("The address doesn't match with any map.\n");
+ 		break;
++	case 'L': // "dmL"
++		{
++			int size;
++			char *p = strchr (input + 2, ' ');
++			if (p) {
++				*p++ = 0;
++				addr = r_num_math (core->num, input + 1);
++				size = r_num_math (core->num, p);
++				r_debug_map_alloc (core->dbg, addr, size, true);
++			} else {
++				eprintf ("Usage: dmL addr size\n");
++				return false;
++			}
++		}
++		break;
+ 	case '\0': // "dm"
+ 	case '*': // "dm*"
+ 	case 'j': // "dmj"
+
+
+
+
+@@ -313,10 +313,10 @@ R_API int r_debug_map_sync(RDebug *dbg) {
+ 	return (int)ret;
+ }
+ 
+-R_API RDebugMap* r_debug_map_alloc(RDebug *dbg, ut64 addr, int size) {
++R_API RDebugMap* r_debug_map_alloc(RDebug *dbg, ut64 addr, int size, bool thp) {
+ 	RDebugMap *map = NULL;
+ 	if (dbg && dbg->h && dbg->h->map_alloc) {
+-		map = dbg->h->map_alloc (dbg, addr, size);
++		map = dbg->h->map_alloc (dbg, addr, size, thp);
+ 	}
+ 	return map;
+ }
+
+
+
+
+@@ -1062,7 +1062,67 @@ static int io_perms_to_prot (int io_perms) {
+ 	return prot_perms;
+ }
+ 
+-static RDebugMap* linux_map_alloc (RDebug *dbg, ut64 addr, int size) {
++
++static int linux_map_thp (RDebug *dbg, ut64 addr, int size) {
++#ifndef __ANDROID__
++	RBuffer *buf = NULL;
++	char code[1024];
++	int ret = true;
++	char *asm_list[] = {
++		"x86", "x86.as",
++		"x64", "x86.as",
++		NULL
++	};
++	// In architectures where radare is supported, arm and x86, it is 2MB
++	const size_t thpsize = 1<<21;
++
++	if ((size%thpsize)) {
++		eprintf ("size not a power of huge pages size\n");
++		return false;
++	}
++
++	// In always mode, is more into mmap syscall level
++	// even though the address might not have the 'hg'
++	// vmflags
++	if (r_sys_thp_mode() != 1) {
++		eprintf ("transparent huge page mode is not in madvise mode\n");
++		return false;
++	}
++
++	int num = r_syscall_get_num (dbg->anal->syscall, "madvise");
++
++	snprintf (code, sizeof (code),
++		"sc_madvise@syscall(%d);\n"
++		"main@naked(0) { .rarg0 = sc_madvise(0x%08" PFMT64x ",%d, %d);break;\n"
++		"}\n",
++		num, addr, size, MADV_HUGEPAGE);
++	r_egg_reset (dbg->egg);
++	r_egg_setup (dbg->egg, dbg->arch, 8 * dbg->bits, 0, 0);
++	r_egg_load (dbg->egg, code, 0);
++	if (!r_egg_compile (dbg->egg)) {
++		eprintf ("Cannot compile.\n");
++		goto err_linux_map_thp;
++	}
++	if (!r_egg_assemble_asm (dbg->egg, asm_list)) {
++		eprintf ("r_egg_assemble: invalid assembly\n");
++		goto err_linux_map_thp;
++	}
++	buf = r_egg_get_bin (dbg->egg);
++	if (buf) {
++		r_reg_arena_push (dbg->reg);
++		ut64 tmpsz;
++		const ut8 *tmp = r_buf_data (buf, &tmpsz);
++		ret = r_debug_execute (dbg, tmp, tmpsz, 1) == 0;
++		r_reg_arena_pop (dbg->reg);
++	}
++err_linux_map_thp:
++	return ret;
++#else
++	return false;
++#endif
++}
++
++static RDebugMap* linux_map_alloc (RDebug *dbg, ut64 addr, int size, bool thp) {
+ 	RBuffer *buf = NULL;
+ 	RDebugMap* map = NULL;
+ 	char code[1024], *sc_name;
+@@ -1111,6 +1171,12 @@ static RDebugMap* linux_map_alloc (RDebug *dbg, ut64 addr, int size) {
+ 		map_addr = r_debug_execute (dbg, tmp, tmpsz, 1);
+ 		r_reg_arena_pop (dbg->reg);
+ 		if (map_addr != (ut64)-1) {
++			if (thp) {
++				if (!linux_map_thp 

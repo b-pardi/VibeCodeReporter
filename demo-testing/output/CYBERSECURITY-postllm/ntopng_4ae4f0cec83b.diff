@@ -1,0 +1,122 @@
+@@ -977,6 +977,7 @@ class Host : public GenericHashEntry,
+   inline int32_t getInterfaceIndex()            { return(iface_index); };
+ 
+   virtual SPSCQueue<std::pair<u_int16_t, u_int16_t>> *getContactedServerPorts() { return (NULL);};
++  virtual char *getSerializationKey(char *buf, uint bufsize) { return (NULL); };
+ };
+ 
+ #endif /* _HOST_H_ */
+
+
+
+
+@@ -29,10 +29,10 @@ class LocalHost : public Host {
+   int16_t local_network_id;
+   time_t initialization_time;
+   LocalHostStats *initial_ts_point;
++  SPSCQueue<std::pair<u_int16_t, u_int16_t>> contacted_server_ports;
+   UsedPorts usedPorts;
+   HostFingerprints *fingerprints;
+   std::unordered_map<u_int32_t, DoHDoTStats *> doh_dot_map;
+-  SPSCQueue<std::pair<u_int16_t, u_int16_t>> contacted_server_ports;
+   u_int8_t router_mac[6]; /* MAC address pf the first router used (no Mac* to
+                              avoid purging race conditions) */
+   u_int8_t router_mac_set : 1, drop_all_host_traffic : 1, systemHost : 1, _notused : 5;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,21 @@
++#ifndef _SERVER_PORTS_BITMAP_H_
++#define _SERVER_PORTS_BITMAP_H_
++
++#include "ntop_includes.h"
++
++class ServerPortsBitmap {
++ private:
++  ndpi_bitmap *tcp_bitmap, *udp_bitmap;
++  const char* bitmap_serialize(ndpi_bitmap* bitmap);
++  void bitmap_deserialize(const char* tcp_str, const char* udp_str);
++
++ public:
++  ServerPortsBitmap();
++  ~ServerPortsBitmap();
++
++  inline void addPort(bool isTCP, u_int16_t port) { ndpi_bitmap_set((isTCP ? tcp_bitmap : udp_bitmap), port); };
++  const char* serializer();
++  bool deserializer(const char* json_str);
++};
++
++#endif /*_SERVER_PORTS_BITMAP_H_*/
+
+
+
+
+@@ -26,16 +26,20 @@
+ 
+ class UsedPorts {
+  private:
++  Host* h;
+   /* Used for both TCP and UDP */
+-  std::unordered_map<u_int16_t, ndpi_protocol> udp_server_ports,
+-      tcp_server_ports;
+-  std::unordered_map<u_int16_t, ndpi_protocol> udp_client_contacted_ports,
+-      tcp_client_contacted_ports;
++  std::unordered_map<u_int16_t, ndpi_protocol> udp_server_ports, tcp_server_ports;
++  std::unordered_map<u_int16_t, ndpi_protocol> udp_client_contacted_ports, tcp_client_contacted_ports;
+ 
++  ServerPortsBitmap *bitmap_server_ports;
++  
+   void setLuaArray(lua_State *vm, NetworkInterface *iface, bool isTCP,
+                    std::unordered_map<u_int16_t, ndpi_protocol> *ports);
+-
++  char* getRedisKey(char *redis_key, size_t key_len);
++  void restore();
++  
+  public:
++  UsedPorts(Host* h);
+   UsedPorts();
+   ~UsedPorts();
+ 
+
+
+
+
+@@ -249,6 +249,7 @@
+ #define TRAFFIC_FILTERING_CACHE_DURATION 43200 /* 12 h */
+ #define DNS_CACHE_DURATION            3600     /*  1 h */
+ #define LOCAL_HOSTS_CACHE_DURATION    3600     /*  1 h */
++#define LOCALHOST_SERVER_PORT_BITMAP "ntopng.cache.localhost_srv_port_bitmap.%d%s" 
+ #define HOST_LABEL_NAMES_KEY          "ntopng.cache.host_labels.%s"
+ #define IFACE_DHCP_RANGE_KEY          "ntopng.prefs.ifid_%u.dhcp_ranges"
+ #define HOST_SERIALIZED_KEY           "ntopng.serialized_hosts.ifid_%u_%s@%d"
+
+
+
+
+@@ -346,6 +346,7 @@ using namespace std;
+ #include <radcli/radcli.h>
+ #endif
+ 
++#include "ServerPortsBitmap.h"
+ #include "Condvar.h"
+ #include "TimeseriesExporter.h"
+ #include "InfluxDBTimeseriesExporter.h"
+
+
+
+
+@@ -26,7 +26,8 @@
+ LocalHost::LocalHost(NetworkInterface *_iface, int32_t _iface_idx,
+ 		     Mac *_mac, u_int16_t _vlanId,
+                      u_int16_t _observation_point_id, IpAddress *_ip)
+-  : Host(_iface, _iface_idx, _mac, _vlanId, _observation_point_id, _ip), contacted_server_ports(CONST_MAX_NUM_QUEUED_PORTS, "localhost-serverportsproto") {
++  : Host(_iface, _iface_idx, _mac, _vlanId, _observation_point_id, _ip), 
++    contacted_server_ports(CONST_MAX_NUM_QUEUED_PORTS, "localhost-serverportsproto"), usedPorts(this) {
+   if(trace_new_delete) ntop->getTrace()->traceEvent(TRACE_NORMAL, "[new] %s", __FILE__);
+   
+ #ifdef LOCALHOST_DEBUG
+@@ -43,7 +44,8 @@ LocalHost::LocalHost(NetworkInterface *_iface, int32_t _iface_idx,
+ LocalHost::LocalHost(NetworkInterface *_iface, int32_t _iface_idx,
+ 		     char

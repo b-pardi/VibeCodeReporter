@@ -1,0 +1,142 @@
+@@ -173,6 +173,7 @@ struct {
+ #endif
+ 
+ #if defined(LB_SELECTION_PER_SERVICE) || LB_SELECTION == LB_SELECTION_MAGLEV
++#ifndef LB_MAGLEV_EXTERNAL
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+ 	__type(key, __u16);
+@@ -188,6 +189,7 @@ struct {
+ 		__uint(max_entries, 1);
+ 	});
+ } cilium_lb4_maglev __section_maps_btf;
++#endif /* LB_MAGLEV_EXTERNAL */
+ #endif /* LB_SELECTION == LB_SELECTION_MAGLEV */
+ #endif /* ENABLE_IPV4 */
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,400 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "bpf/ctx/xdp.h"
++#include "common.h"
++#include "pktgen.h"
++
++/* Enable code paths under test */
++#define ENABLE_IPV4
++#define ENABLE_NODEPORT
++#define ENABLE_NODEPORT_ACCELERATION
++#define ENABLE_SESSION_AFFINITY
++#define TEST_LB_MAGLEV_MAP_MAX_ENTRIES 65536
++#define TEST_CONDITIONAL_PREALLOC      0
++#define TEST_REVNAT		       1
++#define LB_MAGLEV_EXTERNAL
++
++#define DISABLE_LOOPBACK_LB
++
++/* Skip ingress policy checks, not needed to validate hairpin flow */
++#define USE_BPF_PROG_FOR_INGRESS_POLICY
++
++#define CLIENT_ID1    1
++#define CLIENT_ID2    2
++#define CLIENT_IP1    v4_ext_one
++#define CLIENT_IP2    v4_ext_three
++#define CLIENT_PORT1  __bpf_htons(111)
++#define CLIENT_PORT2  __bpf_htons(222)
++#define CLIENT_PORT3  __bpf_htons(333)
++
++#define FRONTEND_IP   v4_svc_one
++#define FRONTEND_PORT tcp_svc_one
++
++#define BACKEND_PORT  __bpf_htons(8080)
++
++#define fib_lookup    mock_fib_lookup
++
++static volatile const __u8 *client_1_mac = mac_one;
++static volatile const __u8 *client_2_mac = mac_two;
++static volatile const __u8 lb_mac[ETH_ALEN] = {
++	0xce, 0x72, 0xa7, 0x03, 0x88, 0x56
++};
++
++static volatile const __u8 base_backend_mac[ETH_ALEN] = {
++	0xce, 0x72, 0xa7, 0x03, 0x87, 0x00
++};
++
++#include "node_config.h"
++
++#undef LB_SELECTION
++#define LB_SELECTION LB_SELECTION_MAGLEV
++#undef LB_MAGLEV_LUT_SIZE
++#define LB_MAGLEV_LUT_SIZE 20
++
++/* Define a mock maglev map that would be used by the LB code */
++struct lb4_maglev_map_inner {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(value_size, sizeof(__u32) * LB_MAGLEV_LUT_SIZE);
++	__uint(max_entries, 1);
++} test_lb4_maglev_map_inner __section_maps_btf;
++
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
++	__type(key, __u32);
++	__type(value, __u32);
++	__uint(pinning, LIBBPF_PIN_BY_NAME);
++	__uint(max_entries, TEST_LB_MAGLEV_MAP_MAX_ENTRIES);
++	__uint(map_flags, TEST_CONDITIONAL_PREALLOC);
++	/* Maglev inner map definition */
++	__array(values, struct lb4_maglev_map_inner);
++} cilium_lb4_maglev __section_maps_btf = {
++	.values = {[TEST_REVNAT] = &test_lb4_maglev_map_inner, },
++};
++
++static __always_inline void get_backend_mac(__u8 *dst, __u32 backend_id)
++{
++	__bpf_memcpy_builtin(dst, (__u8 *)base_backend_mac, ETH_ALEN);
++	dst[5] = (__u8)(backend_id & 0xFF);
++}
++
++long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
++		     __maybe_unused int plen, __maybe_unused __u32 flags)
++{
++	params->ifindex = 0;
++
++	__bpf_memcpy_builtin(params->smac, (__u8 *)lb_mac, ETH_ALEN);
++
++	if (params->ipv4_dst == CLIENT_IP1) {
++		__bpf_memcpy_builtin(params->dmac, (__u8 *)client_1_mac, ETH_ALEN);
++	} else if (params->ipv4_dst == CLIENT_IP2) {
++		__bpf_memcpy_builtin(params->dmac, (__u8 *)client_2_mac, ETH_ALEN);
++	} else { /* Backends */
++		/* Last 2 bytes is the backend ID */
++		__u32 backend_id = __bpf_htonl(params->ipv4_dst) & 0xFFFF;
++		__u8 new_backend_mac[ETH_ALEN];
++
++		get_backend_mac(new_backend_mac, backend_id);
++		__bpf_memcpy_builtin(params->dmac, (__u8 *)new_backend_mac, ETH_ALEN);
++	}
++
++	return 0;
++}
++
++#include "bpf_xdp.c"
++#include "lib/lb.h"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 1);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++.values = {
++  [0] = &cil_xdp_entry,
++},
++};
++
++static __always_inline int
++generate_packet(struct __ctx_buff *ctx, int client_id, __u16 sr

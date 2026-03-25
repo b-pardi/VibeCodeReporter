@@ -1,0 +1,121 @@
+@@ -39,7 +39,6 @@ namespace channel {
+ // This ensures that there is only one producer (who writes to the input)
+ // and one consumer (who reads from the output).
+ 
+-struct failed_to_acquire_lock {};
+ struct channel_closed {};
+ 
+ template <typename T> class queue {
+@@ -74,12 +73,22 @@ template <typename T> class queue {
+     }
+     handle(const handle&) = delete;
+     handle& operator=(const handle&) = delete;
+-    handle(handle&&) = delete;
+-    handle& operator=(handle&&) = delete;
++    handle(handle&& that) : locked{std::move(that.locked)}, update{that.update}
++    {
++      that.update = nullptr;
++    }
++    handle& operator=(handle&& that)
++    {
++      locked = std::move(that.locked);
++      update = std::exchange(that.update, nullptr);
++    }
+ 
+     std::vector<T>& data() { return locked->data; }
+ 
+-    ~handle() { update->notify_one(); }
++    ~handle()
++    {
++      if (update) { update->notify_one(); }
++    }
+   };
+ 
+   /* the *_lock functions return std::nullopt only if the channel is closed
+@@ -88,7 +97,9 @@ template <typename T> class queue {
+    * they succeeded, failed to acquire the lock or if the channel was closed
+    * from the other side. */
+ 
+-  std::optional<handle> output_lock()
++  using result_type = std::variant<handle, channel_closed>;
++
++  result_type output_lock()
+   {
+     auto locked = shared.lock();
+     if (locked->out_dead) {
+@@ -96,46 +107,25 @@ template <typename T> class queue {
+       // Maybe we should assert this instead ?
+       Dmsg0(50,
+             "Tried to read from channel that was closed from the read side.\n");
+-      return std::nullopt;
++      return channel_closed{};
+     }
+ 
+-    locked.wait(in_update, [](const auto& intern) {
+-      return intern.data.size() > 0 || intern.in_dead;
++    locked.wait(in_update, [](const auto& queue) {
++      return queue.data.size() > 0 || queue.in_dead;
+     });
+-    if (locked->data.size() == 0) {
+-      return std::nullopt;
+-    } else {
+-      return std::make_optional<handle>(std::move(locked), &out_update);
+-    }
+-  }
+ 
+-  std::optional<handle> input_lock()
+-  {
+-    auto locked = shared.lock();
+-    locked.wait(out_update, [max_size = max_size](const auto& intern) {
+-      return intern.data.size() < max_size || intern.out_dead;
+-    });
+-    if (locked->in_dead) {
+-      // note(ssura): This happening is programmer error.
+-      // Maybe we should assert this instead ?
+-      Dmsg0(50,
+-            "Tried to write to channel that was closed from the write side.\n");
+-      return std::nullopt;
+-    }
+-    if (locked->out_dead) {
+-      return std::nullopt;
++    if (locked->data.size() == 0) {
++      return channel_closed{};
+     } else {
+-      return std::make_optional<handle>(std::move(locked), &in_update);
++      return result_type(std::in_place_type<handle>, std::move(locked),
++                         &out_update);
+     }
+   }
+ 
+-  using try_result
+-      = std::variant<handle, failed_to_acquire_lock, channel_closed>;
+-
+-  try_result try_output_lock()
++  std::optional<result_type> try_output_lock()
+   {
+     auto locked = shared.try_lock();
+-    if (!locked) { return failed_to_acquire_lock{}; }
++    if (!locked) { return std::nullopt; }
+     if (locked.value()->out_dead) {
+       // note(ssura): This happening is programmer error.
+       // Maybe we should assert this instead ?
+@@ -147,18 +137,39 @@ template <typename T> class queue {
+       if (locked.value()->in_dead) {
+         return channel_closed{};
+       } else {
+-        return failed_to_acquire_lock{};
++        return std::nullopt;
+       }
+     }
+ 
+-    return try_result(std::in_place_type<handle>, std::move(locked).value(),
+-                      &out_update);
++    return result_type(std::in_place_type<handle>, std::move(locked).value(),
++                       &out_update);
++  }
++
++  result_type input_lock()
++  {
++    auto locked = shared.lock();
++    locked.wait(out_update, [max_size = max_size](const auto& queue) {
++      return queue.data.size() < max_size || queue.o

@@ -1,0 +1,127 @@
+@@ -194,6 +194,13 @@ rules_attributes = {
+     ]
+ }
+ 
++service_datatypes = {
++    "service/name": "string",
++    "service/port": "int",
++    "service/status": "string",
++    "service/version": "string",
++}
++
+ order_regex = re.compile(r"^$|^\d+(-\d+)*$")
+ 
+ WORKFLOW_LIMIT = 2
+
+
+
+
+@@ -1195,13 +1195,6 @@ class Host(Metadata):
+         cascade="all, delete-orphan"
+     )
+ 
+-    @property
+-    def service(self):
+-        if self.services:
+-            return self.services[0]
+-        else:
+-            return None
+-
+     # 1 workspace <--> N hosts
+     # 1 to N (the FK is placed in the child) and bidirectional (backref)
+     workspace_id = Column(Integer, ForeignKey('workspace.id', ondelete='CASCADE'), index=True, nullable=False)
+
+
+
+
+@@ -17,6 +17,7 @@ from faraday.server.api.modules.workflow import (
+     OPERATORS,
+     fields_lookup,
+     rules_attributes,
++    service_datatypes,
+ )
+ from faraday.server.extensions import socketio
+ from faraday.server.models import (
+@@ -183,22 +184,35 @@ def _process_field_data(obj, field):
+     if field[0] == "service_id":
+         return obj, "service_id"
+ 
++    # special case for host services
++    if obj.__class__.__name__.lower() == "host" and field[0] == "service":
++        field = ["services"] + field[1:]
++
+     for route in field:
++
++        # break if previous iteration was a list
++        if isinstance(obj, list):
++            field = route
++            break
++
+         obj_data_in_field = getattr(obj, route, None)
+         if obj_data_in_field is None:
+             raise ValueError(f"Field \"{route}\" not found in object {obj}")
+         if isinstance(obj_data_in_field, db.Model):
+             obj = obj_data_in_field
++        elif isinstance(obj_data_in_field, list):
++            obj = obj_data_in_field
+         else:
+             field = route
+             break
+-    return obj, field
+ 
++    if not isinstance(obj, list):
++        obj = [obj]
++    return obj, field
+ 
+-def _check_leaf(obj, condition):
+ 
+-    target_obj, field = _process_field_data(obj, condition.field)
+-    model_data = getattr(target_obj, field, None)
++def _perform_leaf_check(obj, condition, field):
++    model_data = getattr(obj, field, None)
+ 
+     operator = OPERATORS.get(condition.operator, None)
+     if operator is None:
+@@ -207,7 +221,10 @@ def _check_leaf(obj, condition):
+     class_name = obj.__class__.__name__.lower()
+     class_name = "vulnerability" if "web" in class_name else class_name
+ 
+-    data_type = [x.get("type") for x in rules_attributes[class_name] if x.get("name") == condition.field][0]
++    if class_name != "service":
++        data_type = [x.get("type") for x in rules_attributes[class_name] if x.get("name") == condition.field][0]
++    else:
++        data_type = service_datatypes.get(condition.field, None)
+     data = condition.data
+ 
+     if data_type == "string":
+@@ -241,6 +258,14 @@ def _check_leaf(obj, condition):
+     return operator(model_data, data)
+ 
+ 
++def _check_leaf(obj, condition):
++    target_objs, field = _process_field_data(obj, condition.field)
++    results = []
++    for target_obj in target_objs:
++        results.append(_perform_leaf_check(target_obj, condition, field))
++    return any(results)
++
++
+ def _check_condition(obj, condition):
+     if condition.type == "leaf":
+         try:
+
+
+
+
+@@ -8,7 +8,7 @@ from faraday.server.api.modules.workflow import JobView, TaskView, PipelineView,
+ from faraday.server.models import Workflow, Action, db, Pipeline
+ from faraday.server.utils.workflows import _process_entry, WORKFLOW_QUEUE
+ from tests import factories
+-from tests.factories import ActionFactory, HostFactory, VulnerabilityFactory, \
++from tests.factories import ActionFactory, HostFactory, ServiceFactory, VulnerabilityFactory, \
+     VulnerabilityWebFactory
+ from tests.test_api_non_workspaced_base import ReadWriteAPITests
+ 
+@@ -378,6 +378,46 @@ class TestWorkflowMixinsView(ReadWriteAPITests):
+         assert host.description != "ActionExecuted"
+         assert host.description == "testi

@@ -1,0 +1,95 @@
+@@ -1,78 +1,90 @@
+-from datetime import datetime
+-from app.utility.authorize import Authorize
+-from app.utility.auth_jwt import authenticated_login, login_session, logout_session, reset_password
+-from functools import wraps
++import base64
++from collections import namedtuple
+ 
++from aiohttp import web
++from aiohttp.web_exceptions import HTTPUnauthorized, HTTPForbidden
++from aiohttp_security import SessionIdentityPolicy, check_permission, remember, forget
++from aiohttp_security import setup as setup_security
++from aiohttp_security.abc import AbstractAuthorizationPolicy
++from aiohttp_session import setup as setup_session
++from aiohttp_session.cookie_storage import EncryptedCookieStorage
++from cryptography import fernet
+ 
+-class AuthService:
+-
+-    def __init__(self, data_svc, ssl_cert, utility_svc):
+-        self.log = utility_svc.create_logger('auth_svc')
+-        self.data_svc = data_svc
+-        self.ssl_cert = ssl_cert
+-        self.auth_funcs = dict(auth = authenticated_login, login = login_session, logout = logout_session, reset = reset_password)
+-        self.redirect_landing = '/enter'  # set to default address to prevent redirection errors that occur if invalid
+-
+-    def set_app(self, app):
+-        self.app_handle = app
+ 
+-    def set_new_auth(self, auth_handler, login_handler, logout_handler, reset_handler):
+-        self.auth_funcs['auth'] = auth_handler
+-        self.auth_funcs['login'] = login_handler
+-        self.auth_funcs['logout'] = logout_handler
+-        self.auth_funcs['reset'] = reset_handler
+-
+-    def set_new_login_landing(self, landing):
+-        self.redirect_landing = landing
+-
+-    async def login_wrapper(self, session, user):
+-        await self.auth_funcs['login'](self, session, user)
++class AuthService:
+ 
+-    async def logout_wrapper(self, session):
+-        await self.auth_funcs['logout'](self, session)
++    User = namedtuple('User', ['username', 'password', 'permissions'])
+ 
+-    async def reset_wrapper(self, submission, session):
+-        return await self.auth_funcs['reset'](self, submission, session)
++    def __init__(self, utility_svc):
++        self.log = utility_svc.create_logger('auth_svc')
++        self.user_map = dict()
++
++    async def apply(self, app, users):
++        for k, v in users.items():
++            self.user_map[k] = self.User(k, v, ('admin', 'user'),)
++        app.user_map = self.user_map
++        fernet_key = fernet.Fernet.generate_key()
++        secret_key = base64.urlsafe_b64decode(fernet_key)
++        storage = EncryptedCookieStorage(secret_key, cookie_name='API_SESSION')
++        setup_session(app, storage)
++        policy = SessionIdentityPolicy()
++        setup_security(app, policy, DictionaryAuthorizationPolicy(self.user_map))
+ 
+     @staticmethod
+-    async def generate(password):
+-        return await Authorize().registration_salt_key(password)
++    async def logout_user(request):
++        await forget(request, web.Response())
++        raise web.HTTPFound('/login')
++
++    async def login_user(self, request):
++        data = await request.post()
++        response = web.HTTPFound('/')
++        verified = await self._check_credentials(
++            request.app.user_map, data.get('username'), data.get('password'))
++        if verified:
++            await remember(request, response, data.get('username'))
++            return response
++        raise web.HTTPFound('/login')
+ 
+-    async def register(self, username, password):
+-        salt, key = await self.generate(password)
+-        await self.data_svc.dao.create('users', dict(username=username, password=key, salt=salt, last_login=datetime.now()))
+-
+-    async def login(self, username, password):
+-        if not username:
+-            return False
++    @staticmethod
++    async def check_permissions(request):
++        try:
++            await check_permission(request, 'admin')
++        except HTTPUnauthorized:
++            raise web.HTTPFound('/login')
++        except HTTPForbidden:
++            raise web.HTTPFound('/logi

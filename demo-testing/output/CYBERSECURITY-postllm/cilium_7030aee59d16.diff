@@ -1,0 +1,128 @@
+@@ -36,6 +36,7 @@ mock_ctx_redirect_peer(const struct __sk_buff *ctx __maybe_unused, int ifindex _
+ 
+ #include "lib/endpoint.h"
+ #include "lib/ipcache.h"
++#include "lib/lb.h"
+ 
+ struct {
+ 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+@@ -69,10 +70,6 @@ int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
+ 	struct iphdr *l3;
+ 	struct sctphdr *l4;
+ 	__u16 revnat_id = 1;
+-	struct lb4_key lb_svc_key = {};
+-	struct lb4_service lb_svc_value = {};
+-	struct lb4_reverse_nat revnat_value = {};
+-	struct lb4_backend backend = {};
+ 
+ 	/* Init packet builder */
+ 	pktgen__init(&builder, ctx);
+@@ -107,37 +104,9 @@ int hairpin_flow_forward_setup(struct __ctx_buff *ctx)
+ 	/* Calc lengths, set protocol fields and calc checksums */
+ 	pktgen__finish(&builder);
+ 
+-	/* Register a fake LB backend with endpoint ID 124 for our service */
+-	lb_svc_key.address = v4_svc_one;
+-	lb_svc_key.dport = tcp_svc_one;
+-	lb_svc_key.scope = LB_LOOKUP_SCOPE_EXT;
+-
+-	/* Create a service with only one backend */
+-	lb_svc_value.count = 1;
+-	lb_svc_value.flags = SVC_FLAG_ROUTABLE;
+-	lb_svc_value.rev_nat_index = revnat_id;
+-	map_update_elem(&LB4_SERVICES_MAP_V2, &lb_svc_key, &lb_svc_value, BPF_ANY);
+-
+-	/* Insert a reverse NAT entry for the above service */
+-	revnat_value.address = v4_svc_one;
+-	revnat_value.port = tcp_svc_one;
+-	map_update_elem(&LB4_REVERSE_NAT_MAP, &revnat_id, &revnat_value, BPF_ANY);
+-
+-	/* A backend between 1 and .count is chosen, since we have only one backend
+-	 * it is always backend_slot 1. Point it to backend_id 124.
+-	 */
+-	lb_svc_key.backend_slot = 1;
+-	lb_svc_value.backend_id = 124;
+-	map_update_elem(&LB4_SERVICES_MAP_V2, &lb_svc_key, &lb_svc_value, BPF_ANY);
+-
+-	/* Create backend id 124 which contains the IP and port to send the
+-	 * packet to.
+-	 */
+-	backend.address = v4_pod_one;
+-	backend.port = tcp_svc_one;
+-	backend.proto = IPPROTO_SCTP;
+-	backend.flags = 0;
+-	map_update_elem(&LB4_BACKEND_MAP, &lb_svc_value.backend_id, &backend, BPF_ANY);
++	lb_v4_add_service(v4_svc_one, tcp_svc_one, 1, revnat_id);
++	lb_v4_add_backend(v4_svc_one, tcp_svc_one, 1, 124,
++			  v4_pod_one, tcp_svc_one, IPPROTO_SCTP, 0);
+ 
+ 	/* Add an IPCache entry for pod 1 */
+ 	ipcache_v4_add_entry(v4_pod_one, 0, 112233, 0, 0);
+
+
+
+
+@@ -66,6 +66,7 @@
+ #include <bpf_lxc.c>
+ 
+ #include "lib/ipcache.h"
++#include "lib/lb.h"
+ 
+ /*
+  * Tests
+@@ -179,40 +180,11 @@ int lxc_to_overlay_syn_pktgen(struct __ctx_buff *ctx)
+ SETUP("tc", "01_lxc_to_overlay_syn")
+ int lxc_to_overlay_syn_setup(struct __ctx_buff *ctx)
+ {
+-	struct lb4_key lb_svc_key = {
+-		.address = FRONTEND_IP,
+-		.dport = FRONTEND_PORT,
+-		.scope = LB_LOOKUP_SCOPE_EXT,
+-	};
+-	struct lb4_service lb_svc_value = {
+-		.count = 1,
+-		.rev_nat_index = 1,
+-	};
+-	map_update_elem(&LB4_SERVICES_MAP_V2, &lb_svc_key, &lb_svc_value, BPF_ANY);
+-
+-	lb_svc_key.backend_slot = 1;
+-	lb_svc_value.backend_id = 1;
+-	map_update_elem(&LB4_SERVICES_MAP_V2, &lb_svc_key, &lb_svc_value, BPF_ANY);
+-
+-	struct lb4_reverse_nat revnat_value = {
+-		.address = FRONTEND_IP,
+-		.port = FRONTEND_PORT,
+-	};
+-	map_update_elem(&LB4_REVERSE_NAT_MAP, &lb_svc_value.rev_nat_index, &revnat_value, BPF_ANY);
+-
+-	struct lb4_backend backend = {
+-		.address = BACKEND_IP,
+-		.port = BACKEND_PORT,
+-		.proto = IPPROTO_TCP,
+-		.flags = BE_STATE_ACTIVE,
+ 
+-		/* Encode cluster_id into backend. So that we can distinguish
+-		 * the backends localted in the different clusters, but has
+-		 * exactly the same IP.
+-		 */
+-		.cluster_id = BACKEND_CLUSTER_ID,
+-	};
+-	map_update_elem(&LB4_BACKEND_MAP, &lb_svc_value.backend_id, &backend, BPF_ANY);
++	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, 1, 1);
++	lb_v4_add_backend(FRONTEND_IP, FRONTEND_PORT, 1, 1,
++			  BACKEND_IP, BACKEND_PORT, IPPROTO_TCP,
++			  BACKEND_CLUSTER_ID);
+ 
+ 	ipcache_v4_add_entry(BACKEND_IP, BACKEND_CLUSTER_ID, BACKEND_IDENTITY,
+ 			     BACKEND_NODE_IP, 0);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,118 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#ifdef ENABLE_IPV4
++static _

@@ -1,0 +1,96 @@
+@@ -135,13 +135,11 @@ bool Backend::Init(std::string nid) {
+     return DoInit();
+ }
+ 
+-std::optional<detail::Event> Backend::MakeClusterEvent(FuncValPtr handler, ArgsSpan args, double timestamp) const {
++std::optional<detail::Event> Backend::MakeClusterEvent(FuncValPtr handler, ArgsSpan args) const {
+     auto checked_args = detail::check_args(handler, args);
+     if ( ! checked_args )
+         return std::nullopt;
+ 
+-    if ( timestamp == 0.0 )
+-        timestamp = zeek::event_mgr.CurrentEventTime();
+ 
+     const auto& eh = zeek::event_registry->Lookup(handler->AsFuncPtr()->GetName());
+     if ( ! eh ) {
+@@ -149,7 +147,26 @@ std::optional<detail::Event> Backend::MakeClusterEvent(FuncValPtr handler, ArgsS
+         return std::nullopt;
+     }
+ 
+-    return zeek::cluster::detail::Event{eh, std::move(*checked_args), timestamp};
++    /**
++     * If you ever stare at this and wonder: Currently, if someone calls
++     * Cluster::publish() from within a remote event in script land, then
++     * CurrentEventTime() below will yield the network timestamp of the
++     * remote event. That means that the outgoing event from this node will
++     * have the network timestamp of the originating node, which may be
++     * different from what the local network time is.
++     *
++     * This could be confusing and another policy might be to always set
++     * the network timestamp metadata for for outgoing events to the local
++     * network time instead, even when currently handling a remote event.
++     *
++     * @J-Gras prefers the current behavior. @awelzel wonders if there should
++     * be an opt-in/opt-out for this behavior. Procrastinating it for now.
++     */
++    zeek::detail::EventMetadataVectorPtr meta;
++    if ( zeek::BifConst::EventMetadata::add_network_timestamp )
++        meta = zeek::detail::MakeEventMetadataVector(zeek::event_mgr.CurrentEventTime());
++
++    return zeek::cluster::detail::Event{eh, std::move(*checked_args), std::move(meta)};
+ }
+ 
+ void Backend::DoReadyToPublishCallback(Backend::ReadyCallback cb) {
+
+
+
+
+@@ -232,9 +232,8 @@ public:
+      *
+      * @param handler A function val representing an event handler.
+      * @param args The arguments for the event handler.
+-     * @param timestamp The network time to add to the event as metadata.
+      */
+-    std::optional<detail::Event> MakeClusterEvent(FuncValPtr handler, ArgsSpan args, double timestamp = 0.0) const;
++    std::optional<detail::Event> MakeClusterEvent(FuncValPtr handler, ArgsSpan args) const;
+ 
+     /**
+      * Publish a cluster::detail::Event instance to a given topic.
+
+
+
+
+@@ -17,29 +17,20 @@
+ namespace {
+ 
+ // Convert a script-level Cluster::Event to a cluster::detail::Event.
+-std::optional<zeek::cluster::detail::Event> to_cluster_event(const zeek::RecordValPtr& rec) {
++std::optional<zeek::cluster::detail::Event> to_cluster_event(const zeek::cluster::Backend* backend,
++                                                             const zeek::RecordValPtr& rec) {
+     const auto& func = rec->GetField<zeek::FuncVal>(0);
+     const auto& vargs = rec->GetField<zeek::VectorVal>(1);
+ 
+     if ( ! func )
+         return std::nullopt;
+ 
+-    const auto& eh = zeek::event_registry->Lookup(func->AsFuncPtr()->GetName());
+-    if ( ! eh ) {
+-        zeek::emit_builtin_error(
+-            zeek::util::fmt("event registry lookup of '%s' failed", zeek::obj_desc_short(func.get()).c_str()));
+-        return std::nullopt;
+-    }
+-
+     // Need to copy from VectorVal to zeek::Args
+     zeek::Args args(vargs->Size());
+     for ( size_t i = 0; i < vargs->Size(); i++ )
+         args[i] = vargs->ValAt(i);
+ 
+-    // TODO: Support configurable timestamps or custom metadata on the record.
+-    auto timestamp = zeek::event_mgr.CurrentEventTime();
+-
+-    return zeek::cluster::detail::Event(eh, std::move(args), timestamp);
++    return backend->MakeClusterEvent(func, zeek::Span{args});
+ }
+ } // namespace
+ 
+@@ -97,11 +88,8 @@ zeek::ValPtr publish_event(const zeek::ValPtr& topic, zeek::Ar

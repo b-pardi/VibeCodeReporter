@@ -1,0 +1,102 @@
+@@ -507,16 +507,24 @@ static inline bool panda_in_kernel(const CPUState *cpu) {
+  * Return: True if address is in kernel, false otherwise.
+  */
+ static inline bool address_in_kernel_code_linux(target_ulong addr){
++    // TODO: Find a way to ask QEMU what the permissions are on an area.
++    #if (defined(TARGET_ARM) && !defined(TARGET_AARCH64)) || (defined(TARGET_I386) && !defined(TARGET_X86_64))
++    // I386: https://elixir.bootlin.com/linux/latest/source/arch/x86/include/asm/page_32_types.h#L18
++    // ARM32: https://people.kernel.org/linusw/how-the-arm32-kernel-starts
++    // ARM has a variable VMSPLIT. Technically this can be several values,
++    // but the most common offset is 0xc0000000. 
++    target_ulong vmsplit =  0xc0000000;
++    return addr >= vmsplit;
++    #else
++    // MIPS32: https://elixir.bootlin.com/linux/latest/source/arch/mips/include/asm/mach-malta/spaces.h#L36
++    // https://techpubs.jurassic.nl/manuals/0620/developer/DevDriver_PG/sgi_html/ch01.html
+     // https://www.kernel.org/doc/html/latest/vm/highmem.html
+-    // https://github.com/torvalds/linux/blob/master/Documentation/x86/x86_64/mm.rst
++    // x86_64: https://github.com/torvalds/linux/blob/master/Documentation/x86/x86_64/mm.rst
+     // If addr MSB set -> kernelspace!
+-
++    // AARCH64: https://elixir.bootlin.com/linux/latest/source/arch/arm64/include/asm/memory.h#L45
+     target_ulong msb_mask = ((target_ulong)1 << ((sizeof(target_long) * 8) - 1));
+-    if (msb_mask & addr) {
+-        return true;
+-    } else {
+-        return false;
+-    }
++    return msb_mask & addr;
++    #endif
+ }
+ 
+ 
+@@ -595,8 +603,13 @@ static inline target_ulong panda_current_sp(const CPUState *cpu) {
+     // valid on x86 and x86_64
+     return env->regs[R_ESP];
+ #elif defined(TARGET_ARM)
+-    // R13 on ARM.
+-    return env->regs[13];
++    if (env->aarch64) {
++        // X31 on AARCH64.
++        return env->xregs[31];
++    } else {
++        // R13 on ARM.
++        return env->regs[13];
++    }
+ #elif defined(TARGET_PPC)
+     // R1 on PPC.
+     return env->gpr[1];
+
+
+
+
+@@ -7,8 +7,28 @@
+  * See the COPYING file in the top-level directory. 
+  * 
+ PANDAENDCOMMENT */
+-// This needs to be defined before anything is included in order to get
+-// the PRIx64 macro
++
++/**
++ * Logic for this plugin:
++ *  On the first execve or execveat the system will transition to the kernel
++ *  and back to userspace. We attempt to catch the very first block of the new
++ *  program by looking for the first block where the stack pointer is in 
++ *  userspace, paged in, and has a value that makes sense for the auxiliary
++ *  vector (described below). Specifically, we check that the first argument,
++ *  the argc value, is a reasonable number. We chose this reasonable number
++ *  to be 0x200000, a common value for ARG_MAX on unix systems.
++ * 
++ *  Once we have established the location of the auxiliary vector we make a PPP
++ *  callback and pass the values of the auxv to the callback.
++ * 
++ * Issues:
++ *  Currently the plugin catches about 95% of the new programs across
++ *  architectures. The remaining 5% are somewhat elusive. It may be that the
++ *  kernel does something like immediately switching to a new program or memory
++ *  is not paged in at the stage we might expect.
++ */
++
++
+ #define __STDC_FORMAT_MACROS
+ 
+ #include <linux/auxvec.h>
+@@ -22,15 +42,15 @@ using namespace std;
+ // These need to be extern "C" so that the ABI is compatible with
+ // QEMU/PANDA, which is written in C
+ extern "C" {
+-bool init_plugin(void *);
+-void uninit_plugin(void *);
+-#include "syscalls2/syscalls_ext_typedefs.h"
+-#include "syscalls2/syscalls2_info.h"
+-#include "syscalls2/syscalls2_ext.h"
+-#include "proc_start_linux.h"
+-#include "proc_start_linux_ppp.h"
+-PPP_PROT_REG_CB(on_rec_auxv);
+-PPP_CB_BOILERPLATE(on_rec_auxv);
++    bool init_plugin(void *);
++    void uninit_plugin(void *);
++    #include "syscalls2/syscalls_ext_typedefs.h"
++    #include "syscalls2/syscalls2_info.h"
++    #include "syscalls2/syscalls2_ext.h"
++    

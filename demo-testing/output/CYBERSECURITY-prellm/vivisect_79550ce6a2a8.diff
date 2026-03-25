@@ -1,0 +1,99 @@
+@@ -11,6 +11,14 @@ def analyze(vw):
+     if vw.verbose:
+         vw.vprint('...analyzing pointers.')
+ 
++    # Let's analyze and Relocations we know are pointers
++    for rva, rtype in self.reloc_by_va.items():
++        if rtype != RTYPE_BASEPTR:
++            continue
++
++        for xfr, xto, xtype in vw.getXrefsFrom(rva):
++            vw.analyzePointer(xto)
++
+     # Now, lets find likely free-hanging pointers
+     for addr, pval in vw.findPointers():
+         if vw.isDeadData(pval):
+
+
+
+
+@@ -239,7 +239,7 @@ class VivWorkspaceCore(object, viv_impapi.ImportApi):
+ 
+         # RTYPE_BASERELOC assumes the memory is already accurate (eg. PE's unless rebased)
+ 
+-        if rtype == RTYPE_BASEOFF:
++        if rtype in (RTYPE_BASEOFF, RTYPE_BASEPTR):
+             # add imgbase and offset to pointer in memory
+             # 'data' arg must be 'offset' number
+             ptr = imgbase + data
+@@ -247,14 +247,20 @@ class VivWorkspaceCore(object, viv_impapi.ImportApi):
+                 logger.warn('RTYPE_BASEOFF calculated a bad pointer: 0x%x (imgbase: 0x%x)', ptr, imgbase)
+ 
+             # writes are costly, especially on larger binaries
+-            if ptr == self.readMemoryPtr(rva):
+-                return
+-
+-            with self.getAdminRights():
+-                self.writeMemoryPtr(rva, ptr)
++            if ptr != self.readMemoryPtr(rva):
++                with self.getAdminRights():
++                    self.writeMemoryPtr(rva, ptr)
+ 
+             logger.info('_handleADDRELOC: %x -> %x (map: 0x%x)', rva, ptr, imgbase)
+ 
++        if rtype == RTYPE_BASEPTR:
++            # make it like a pointer (but one that could move with each load)
++            #   self.addXref(va, tova, REF_PTR)
++            #   ploc = self.addLocation(va, psize, LOC_POINTER)
++            #   don't follow.  handle it later, once "known code" is analyzed
++            self._handleADDXREF((rva, ptr, REF_PTR, 0))
++            self._handleADDLOCATION((rva, self.psize, LOC_POINTER, None))
++
+     def _handleADDMODULE(self, einfo):
+         print('DEPRICATED (ADDMODULE) ignored: %s' % einfo)
+ 
+
+
+
+
+@@ -166,6 +166,7 @@ EXP_DATA     = 1
+ # Relocation types
+ RTYPE_BASERELOC = 0 # VA contains a pointer to a va (and is assumed fixed up by parser)
+ RTYPE_BASEOFF   = 1 # Add Base and Offset to a pointer at a memory location
++RTYPE_BASEPTR   = 2 # Like BASEOFF, but treated as a Pointer, not part of an instruction/etc.
+ 
+ # Function Local Symbol Types
+ LSYM_NAME   = 0 # syminfo is a (typestr,name) tuple
+
+
+
+
+@@ -445,10 +445,15 @@ def loadElfIntoWorkspace(vw, elf, filename=None, baseaddr=None):
+     # for now, ignore them.
+     for cmnt, fva in new_functions:
+         logger.info('adding function from ELF metadata: 0x%x (%s)', fva, cmnt)
+-        vw.addEntryPoint(fva)
++        vw.addEntryPoint(fva)   # addEntryPoint queue's code analysis for later in the analysis pass
+ 
+     for va, tva in new_pointers:
+         logger.info('adding pointer 0x%x -> 0x%x', va, tva)
++        if tva is not None:
++            vw.makePointer(va, tva, follow=False)   # depend on Pointer Analysis module, after code analysis
++        else:
++            vw.makePointer(va, follow=False)
++
+     return fname
+ 
+ def applyRelocs(elf, vw, addbase=False, baseaddr=0):
+@@ -486,7 +491,7 @@ def applyRelocs(elf, vw, addbase=False, baseaddr=0):
+                     if rtype in (Elf.R_386_RELATIVE, ):
+                         ptr = vw.readMemoryPtr(rlva)
+                         logger.info('R_386_RELATIVE: adding Relocation 0x%x -> 0x%x (name: %s) ', rlva, ptr, dmglname)
+-                        vw.addRelocation(rlva, vivisect.RTYPE_BASEOFF, ptr)
++                        vw.addRelocation(rlva, vivisect.RTYPE_BASEPTR, ptr)
+ 
+                     else:
+                         logger.info('unknown reloc type: %d %s (at %s)' % (rtype, name, hex(rlva)))
+@@ -501,7 +506,7 @@ def applyRelocs(elf, vw, addbase=False, baseaddr=0):
+                     #quick check to make sure we don't provide this symbol
+                     if ptr:

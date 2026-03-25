@@ -1,0 +1,112 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,520 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++# Copyright (C) 2015-2021 Bareos GmbH & Co. KG
++#
++# This program is Free Software; you can redistribute it and/or
++# modify it under the terms of version three of the GNU Affero General Public
++# License as published by the Free Software Foundation, which is
++# listed in the file LICENSE.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++# Affero General Public License for more details.
++#
++# You should have received a copy of the GNU Affero General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++# 02110-1301, USA.
++#
++# Author: Philipp Storz
++#
++# Uses mariabackup for backup and restore of mariadb databases
++
++from bareosfd import *
++import os
++from subprocess import *
++from BareosFdPluginBaseclass import *
++import BareosFdWrapper
++import datetime
++import time
++import tempfile
++import shutil
++import json
++
++
++class BareosFdMariabackup(BareosFdPluginBaseclass):
++    """
++    Plugin for backing up all innodb databases found in a specific mariadb server
++    using the native mariabackup tool.
++    """
++
++    def __init__(self, plugindef):
++        # BareosFdPluginBaseclass.__init__(self, plugindef)
++        super(BareosFdMariabackup, self).__init__(plugindef)
++        # we first create and backup the stream and after that
++        # the lsn file as restore-object
++        self.files_to_backup = ["lsnfile", "stream"]
++        self.tempdir = tempfile.mkdtemp()
++        # self.logdir = GetValue(bVarWorkingDir)
++        self.logdir = "/var/log/bareos/"
++        self.log = "bareos-plugin-mariabackup.log"
++        self.rop_data = {}
++        self.max_to_lsn = 0
++        self.err_fd = None
++
++    def parse_plugin_definition(self, plugindef):
++        """
++        We have default options that should work out of the box in the most  use cases
++        that the mysql/mariadb is on the same host and can be accessed without user/password information,
++        e.g. with a valid my.cnf for user root.
++        """
++        BareosFdPluginBaseclass.parse_plugin_definition(self, plugindef)
++
++        if "dumpbinary" in self.options:
++            self.dumpbinary = self.options["dumpbinary"]
++        else:
++            self.dumpbinary = "mariabackup"
++
++        if "restorecommand" not in self.options:
++            self.restorecommand = "mbstream -x -C "
++        else:
++            self.restorecommand = self.options["restorecommand"]
++
++        # Default is not to write an extra logfile
++        if "log" not in self.options:
++            self.log = False
++        elif self.options["log"] == "false":
++            self.log = False
++        elif os.path.isabs(self.options["log"]):
++            self.log = self.options["log"]
++        else:
++            self.log = os.path.join(self.logdir, self.options["log"])
++
++        # By default, standard mysql-config files will be used, set
++        # this option to use extra files
++        self.connect_options = {"read_default_group": "client"}
++        if "mycnf" in self.options:
++            self.connect_options["read_default_file"] = self.options["mycnf"]
++            self.mycnf = "--defaults-extra-file=%s " % self.options["mycnf"]
++        else:
++            self.mycnf = ""
++
++        # If true, incremental jobs will only be performed, if LSN has increased
++        # since last call.
++        if (
++            "strictIncremental" in self.options
++            and self.options["strictIncremental"] == "true"
++        ):
++            self.strictIncremental = True
++        else:
++            self.strictIncremental = False
++
++        self.dumpoptions = self.mycnf
++
++        # if dumpoptions is set, we use that here, otherwise defaults
++        if "dumpoptions" in self.options:
++ 

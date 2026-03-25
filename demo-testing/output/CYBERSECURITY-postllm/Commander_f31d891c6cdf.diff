@@ -1,0 +1,66 @@
+@@ -59,7 +59,8 @@ from ..display import bcolors
+ from ..error import CommandError, KeeperApiError
+ from ..params import KeeperParams, LAST_RECORD_UID
+ from ..proto import pam_pb2, router_pb2, record_pb2
+-from ..subfolder import find_parent_top_folder, try_resolve_path, BaseFolderNode
++from ..subfolder import find_folders, find_parent_top_folder, \
++    try_resolve_path, BaseFolderNode
+ from ..vault import TypedField
+ from .discover.job_start import PAMGatewayActionDiscoverJobStartCommand
+ from .discover.job_status import PAMGatewayActionDiscoverJobStatusCommand
+@@ -92,6 +93,7 @@ class PAMControllerCommand(GroupCommand):
+         self.register_command('rotation', PAMRotationCommand(), 'Manage Rotations', 'r')
+         self.register_command('action', GatewayActionCommand(), 'Execute action on the Gateway', 'a')
+         self.register_command('tunnel', PAMTunnelCommand(), 'Manage Tunnels', 't')
++        self.register_command('split', PAMSplitCommand(), 'Split credentials from legacy PAM Machine', 's')
+         self.register_command('legacy', PAMLegacyCommand(), 'Switch to legacy PAM commands')
+ 
+ 
+@@ -2587,10 +2589,17 @@ class PAMTunnelEditCommand(Command):
+             # Generate a 256-bit (32-byte) random seed
+             seed = os.urandom(32)
+             dirty = False
+-            if not traffic_encryption_key.value:
++            if not traffic_encryption_key or not traffic_encryption_key.value:
+                 base64_seed = bytes_to_base64(seed)
+                 record_seed = vault.TypedField.new_field('trafficEncryptionSeed', base64_seed, "")
+-                record.custom.append(record_seed)
++                # if field is present update in-place, if in rec definition add to fields[] else custom[]
++                record_types_with_seed = ("pamDatabase", "pamDirectory", "pamMachine", "pamRemoteBrowser")
++                if traffic_encryption_key:
++                    traffic_encryption_key.value = [base64_seed]
++                elif record.get_record_type() in record_types_with_seed:
++                    record.fields.append(record_seed)  # DU-469
++                else:
++                    record.custom.append(record_seed)
+                 dirty = True
+             if dirty:
+                 record_management.update_record(params, record)
+@@ -3111,3 +3120,261 @@ class PAMTunnelStartCommand(Command):
+                     gateway_uid = value.get('controllerUid', '') or ''
+ 
+         return gateway_uid
++
++
++class PAMSplitCommand(Command):
++    pam_cmd_parser = argparse.ArgumentParser(prog='pam split')
++    pam_cmd_parser.add_argument('pam_machine_record', type=str, action='store',
++                                help='The record UID or title of the legacy PAM Machine '
++                                'record with built-in PAM User credentials.')
++    pam_cmd_parser.add_argument('--configuration', '-c', required=False, dest='pam_config', action='store',
++                                help='The PAM Configuration Name or UID - If the legacy record was configured '
++                                     'for rotation this command will try to autodetect PAM Configuration settings '
++                                     'otherwise you\'ll be prompted to provide the PAM Config.')
++    pam_cmd_parser.add_argument('--folder', '-f', required=False, dest='pam_user_folder', action='store',
++                                help='The folder where to store the new PAM User record - '
++                                     'folder names/paths are case sensitive!'
++                                     '(if skipped - PAM User will be created into the '
++                                     'same folder as PAM Machine)')
++
++    def get_parser(self):
++        return PAMSplitCommand.pam_cmd_parser
++
++    def execute(self, params, **kwargs):
++        def remove_field(record, field): # type: (vault.TypedRecord, vault.TypedField) -> bool
++            # Since TypedRecord.get_typed_field scans both fields[] and custom[]
++            # we need corr

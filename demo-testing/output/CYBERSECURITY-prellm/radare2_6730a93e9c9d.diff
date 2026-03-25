@@ -1,0 +1,168 @@
+@@ -360,7 +360,7 @@ static bool run_commands(RList *cmds, RList *files, bool quiet) {
+ 	/* -c */
+ 	r_list_foreach (cmds, iter, cmdn) {
+ 		//r_core_cmd0 (&r, cmdn);
+-		r_core_cmd_task_sync (&r, cmdn, false);
++		r_core_cmd (&r, cmdn, false);
+ 		r_cons_flush ();
+ 	}
+ 	if (quiet) {
+@@ -493,6 +493,7 @@ int main(int argc, char **argv, char **envp) {
+ 		return main_help (1);
+ 	}
+ 	r_core_init (&r);
++	r_core_task_sync_begin (&r);
+ 	if (argc == 2 && !strcmp (argv[1], "-p")) {
+ 		r_core_project_list (&r, 0);
+ 		r_cons_flush ();
+@@ -1443,6 +1444,9 @@ beach:
+ 		exit (ret);
+ 		return ret;
+ 	}
++
++	r_core_task_sync_end (&r);
++
+ 	// not really needed, cause r_core_fini will close the file
+ 	// and this fh may be come stale during the command
+ 	// execution.
+
+
+
+
+@@ -280,6 +280,20 @@ R_API void r_cons_break_end() {
+ 	}
+ }
+ 
++R_API void *r_cons_sleep_begin(void) {
++	if (!I.cb_sleep_begin) {
++		return NULL;
++	}
++	return I.cb_sleep_begin (I.user);
++}
++
++R_API void r_cons_sleep_end(void *user) {
++	if (!I.cb_sleep_end) {
++		return;
++	}
++	I.cb_sleep_end (I.user, user);
++}
++
+ #if __WINDOWS__ && !__CYGWIN__
+ static HANDLE h;
+ static BOOL __w32_control(DWORD type) {
+
+
+
+
+@@ -161,11 +161,15 @@ static int r_line_readchar_win(int *vch) { // this function handle the input in
+ 	ut8 buf[2];
+ 	HANDLE h;
+ 	int i;
++	void *bed;
+ 
+ 	if (I.zerosep) {
+ 		*vch = 0;
+ 		buf[0] = 0;
+-		if (read (0, buf, 1) != 1)
++		bed = r_cons_sleep_begin ();
++		int rsz = read (0, buf, 1);
++		r_cons_sleep_end (bed);
++		if (rsz != 1)
+ 			return -1;
+ 		return buf[0];
+ 	}
+@@ -176,7 +180,9 @@ do_it_again:
+ 	GetConsoleMode (h, &mode);
+ 	SetConsoleMode (h, 0);	// RAW
+ 	*vch = 0;
++	bed = r_cons_sleep_begin ();
+ 	ret = ReadConsoleInput (h, irInBuf, 128, &out);
++	r_cons_sleep_end (bed);
+ 	if (ret < 1) {
+ 		return 0;
+ 	}
+
+
+
+
+@@ -286,12 +286,14 @@ do_it_again:
+ 	h = GetStdHandle (STD_INPUT_HANDLE);
+ 	GetConsoleMode (h, &mode);
+ 	SetConsoleMode (h, 0 | ENABLE_MOUSE_INPUT); // RAW
++	void *bed = r_cons_sleep_begin ();
+ 	if (usec) {
+ 		if (WaitForSingleObject (h, usec) == WAIT_TIMEOUT) {
+ 			return -1;
+ 		}
+ 	}
+ 	ret = ReadConsoleInput (h, irInBuf, 128, &out);
++	r_cons_sleep_end (bed);
+ 	if (ret) {
+ 		for (i = 0; i < out; i++) {
+ 			if (irInBuf[i].EventType==MOUSE_EVENT) {
+@@ -451,6 +453,7 @@ R_API void r_cons_switchbuf(bool active) {
+ }
+ 
+ R_API int r_cons_readchar() {
++	void *bed;
+ 	char buf[2];
+ 	buf[0] = -1;
+ 	if (readbuffer_length > 0) {
+@@ -461,7 +464,9 @@ R_API int r_cons_readchar() {
+ 	}
+ #if __WINDOWS__ && !__CYGWIN__ //&& !MINGW32
+ 	#if 1   // if something goes wrong set this to 0. skuater.....
++	bed = r_cons_sleep_begin ();
+ 	return readchar_win(0);
++	r_cons_sleep_end (bed);
+ 	#endif
+ 	BOOL ret;
+ 	DWORD out;
+@@ -469,7 +474,9 @@ R_API int r_cons_readchar() {
+ 	HANDLE h = GetStdHandle (STD_INPUT_HANDLE);
+ 	GetConsoleMode (h, &mode);
+ 	SetConsoleMode (h, 0); // RAW
++	bed = r_cons_sleep_begin ();
+ 	ret = ReadConsole (h, buf, 1, &out, NULL);
++	r_cons_sleep_end (bed);
+ 	FlushConsoleInputBuffer (h);
+ 	if (!ret) {
+ 		return -1;
+@@ -477,7 +484,10 @@ R_API int r_cons_readchar() {
+ 	SetConsoleMode (h, mode);
+ #else
+ 	r_cons_set_raw (1);
+-	if (read (0, buf, 1) == -1) {
++	bed = r_cons_sleep_begin ();
++	ssize_t ret = read (0, buf, 1);
++	r_cons_sleep_end (bed);
++	if (ret != 1) {
+ 		return -1;
+ 	}
+ 	if (bufactive) {
+
+
+
+
+@@ -1789,6 +1789,17 @@ static void r_core_break (RCore *core) {
+ 	}
+ }
+ 
++static void *r_core_sleep_begin (RCore *core) {
++	RCoreTask *task = r_core_task_self (core);
++	r_core_task_sleep_begin (task);
++	return task;
++}
++
++static void r_core_sleep_end (RCore *core, void *user) {
++	RCoreTask *task = (RCoreTask *)user;
++	r_core_task_sleep_end (task);
++}
++
+ R_API bool r_core_init(RCore *core) {
+ 	core->blocksize = R_CORE_BLOCKSIZE;
+ 	core->block = (ut8*)calloc (R_CORE_BLOCKSIZE + 1, 1);
+@@ -1883,6 +1894,8 @@ R_API bool r_core_init(RCore *core) {
+ 	core->lang->cmdf = (int (*)(void *, const char *, ...))r_core_cmdf;
+ 	core->cons->cb_editor = (RConsEditorCallback)r_core_editor;
+ 	core->cons->cb_br

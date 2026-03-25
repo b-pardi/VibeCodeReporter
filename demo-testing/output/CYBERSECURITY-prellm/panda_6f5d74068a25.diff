@@ -1,0 +1,128 @@
+@@ -17,7 +17,18 @@ PANDAENDCOMMENT */
+ #include "osi/osi_types.h"
+ #include "osi/osi_ext.h"
+ 
+-static FILE *coveragelog;
++const char *DEFAULT_FILE = "coverage.csv";
++
++// commands that can be accessed through the QEMU monitor
++const char *MONITOR_HELP = "help";
++constexpr size_t MONITOR_HELP_LEN = 4;
++const char *MONITOR_ENABLE = "coverage_enable";
++constexpr size_t MONITOR_ENABLE_LEN = 15;
++const char *MONITOR_DISABLE = "coverage_disable";
++constexpr size_t MONITOR_DISABLE_LEN = 16;
++
++
++static FILE *coveragelog = NULL;
+ 
+ enum coverage_mode {
+     MODE_PROCESS = 0,
+@@ -60,10 +71,33 @@ bool operator==(const RecordID &lhs, const RecordID &rhs)
+     return result;
+ }
+ 
++// the pointer passed in to init_plugin
++void *coverage_plugin = nullptr;
++
+ coverage_mode mode = MODE_ASID;
++panda_cb pcb_before_block_exec;
++uint32_t buffer_size = BUFSIZ;
++bool enabled = false;
++bool before_block_exec_registered = false;
++
++static void log_message(const char *message)
++{
++    printf("%s%s\n", PANDA_MSG, message);
++}
++
++static void log_message(const char *message1, const char *message2)
++{
++    printf("%s%s %s\n", PANDA_MSG, message1, message2);
++}
++
++static void log_message(const char *message, uint32_t number)
++{
++    printf("%s%s %d\n", PANDA_MSG, message, number);
++}
+ 
+ void write_process_record(RecordID id, uint64_t size)
+ {
++
+     // Get the process name
+     char *process_name = NULL;
+     bool in_kernel = panda_in_kernel(first_cpu);
+@@ -93,6 +127,11 @@ void write_process_record(RecordID id, uint64_t size)
+ 
+ int before_block_exec_process_full(CPUState *cpu, TranslationBlock *tb)
+ {
++    // part of workaround to broken enable/disable plugin callback framework
++    if (!enabled) {
++        return 0;
++    }
++
+     RecordID id;
+     id.pc = tb->pc;
+     OsiThread *thread = get_current_thread(cpu);
+@@ -112,6 +151,11 @@ int before_block_exec_process_full(CPUState *cpu, TranslationBlock *tb)
+ 
+ int before_block_exec_process_unique(CPUState *cpu, TranslationBlock *tb)
+ {
++    // part of workaround to broken enable/disable plugin callback framework
++    if (!enabled) {
++        return 0;
++    }
++
+     // We keep track of PID/TID/PC tuples that we've already seen
+     // since we only need to write out distinct tuples once.
+     static std::unordered_set<RecordID> seen;
+@@ -155,6 +199,11 @@ void write_asid_record(RecordID id, uint64_t size)
+ 
+ int before_block_exec_asid_full(CPUState *cpu, TranslationBlock *tb)
+ {
++    // part of workaround to broken enable/disable plugin callback framework
++    if (!enabled) {
++        return 0;
++    }
++
+     RecordID id;
+     id.pc = tb->pc;
+     id.pidOrAsid = panda_current_asid(first_cpu);
+@@ -165,6 +214,11 @@ int before_block_exec_asid_full(CPUState *cpu, TranslationBlock *tb)
+ 
+ int before_block_exec_asid_unique(CPUState *cpu, TranslationBlock *tb)
+ {
++    // part of workaround to broken enable/disable plugin callback framework
++    if (!enabled) {
++        return 0;
++    }
++
+     // We keep track of pairs of ASIDs and PCs that we've already seen
+     // since we only need to write out distinct pairs once.
+     static std::unordered_set<RecordID> seen;
+@@ -182,6 +236,123 @@ int before_block_exec_asid_unique(CPUState *cpu, TranslationBlock *tb)
+     return 0;
+ }
+ 
++bool enable_logging(const char *filename)
++{
++    // Open the coverage CSV file, and set up the file buffering
++    coveragelog = fopen(filename, "w");
++    if (BUFSIZ != buffer_size) {
++        int buf_mode = _IOFBF;
++        // If buffer_size is 0, then turn off buffering
++        if (0 == buffer_size) {
++            buf_mode = _IONBF;
++        }
++        // Let setvbuf take care of allocating and freeing buffer
++        int ret_code = setvbuf(coveragelog, NULL, buf_mode, buffer_size);
++        if (0 != ret_code) {
++            LOG_ERROR("could not change buffer size");
++            return false;
++        }
++    }
++
++    // Output headers
++    if (MODE_PROCESS == mode) {
++        fprintf(coveragelog, "process\n");
++        fprintf(coveragelog, 

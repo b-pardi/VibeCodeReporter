@@ -1,0 +1,148 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,537 @@
++#include <r_bin.h>
++
++#include "pcap.h"
++
++void pcap_obj_free(pcap_obj_t *obj) {
++	if (obj) {
++		free (obj->header);
++		r_list_free (obj->recs);
++		r_buf_fini (obj->b);
++		free (obj);
++	}
++}
++
++static bool pcap_obj_init_hdr(pcap_obj_t *obj) {
++	pcap_hdr_t *hdr = R_NEW0 (pcap_hdr_t);
++	if (!hdr) {
++		return false;
++	}
++	hdr->magic = r_buf_read_ble32_at (obj->b, 0, obj->bigendian);
++	hdr->version_major = r_buf_read_ble16_at (obj->b, 4, obj->bigendian);
++	hdr->version_minor = r_buf_read_ble16_at (obj->b, 6, obj->bigendian);
++	hdr->this_zone = r_buf_read_ble32_at (obj->b, 8, obj->bigendian);
++	hdr->ts_accuracy = r_buf_read_ble32_at (obj->b, 12, obj->bigendian);
++	hdr->max_pkt_len = r_buf_read_ble32_at (obj->b, 16, obj->bigendian);
++	hdr->network = r_buf_read_ble32_at (obj->b, 20, obj->bigendian);
++	obj->header = hdr;
++	return true;
++}
++
++void pcaprec_free(pcaprec_t *rec) {
++	if (rec) {
++		free (rec->hdr);
++		free (rec->link.ether_hdr);
++		free (rec->net.ipv4_hdr);
++		free (rec->transport.tcp_hdr);
++		free (rec->data);
++		free (rec);
++	}
++}
++
++static bool parse_tcp(RBuffer *b, ut64 off, pcaprec_t *rec, ut32 size) {
++	pcaprec_tcp_t *tcp = R_NEW0 (pcaprec_tcp_t);
++	if (!tcp) {
++		return false;
++	}
++	ut8 buf[sizeof (pcaprec_tcp_t)] = {0};
++	r_buf_read_at (b, off, buf, sizeof (buf));
++	tcp->src_port = r_read_at_be16 (buf, 0);
++	tcp->dst_port = r_read_at_be16 (buf, 2);
++	tcp->seq_num = r_read_at_be32 (buf, 4);
++	tcp->ack_num = r_read_at_be32 (buf, 8);
++	tcp->hdr_len = r_read_at_be8 (buf, 12);
++	tcp->flags = r_read_at_be16 (buf, 13);
++	tcp->win_sz = r_read_at_be16 (buf, 15);
++	tcp->chksum = r_read_at_be16 (buf, 17);
++	tcp->urgnt_ptr = r_read_at_be16 (buf, 19);
++
++	// data offset at (((tcp->hdr_len >> 4) & 0x0F) * 4)
++	ut32 dataoff = ((tcp->hdr_len & 0xF0) >> 2);
++	if (dataoff >= size) {
++		free (tcp);
++		return false;
++	}
++	rec->datasz = size - dataoff;
++	if (rec->datasz < 1) {
++		free (tcp);
++		return false;
++	}
++#if 0
++	rec->data = malloc (rec->datasz + 1);
++	if (!rec->data) {
++		free (tcp);
++		return false;
++	}
++	r_buf_read_at (b, off + dataoff, rec->data, rec->datasz);
++	if (r_str_nlen ((const char *)rec->data, rec->datasz) > 10) {
++#if 0
++		eprintf ("0x%08x  ", off + dataoff);
++		fflush (stderr);
++		write (1, rec->data, rec->datasz);
++		write (1, "\n", 1);
++		rec->data[10] = 0;
++#endif
++	// eprintf ("SIZE %d %d : %s\n", off + dataoff, rec->datasz, rec->data);
++		rec->data[rec->datasz] = 0;
++		rec->transport.tcp_hdr = tcp;
++		return true;
++	}
++#else
++	rec->transport.tcp_hdr = tcp;
++	return true;
++
++#endif
++	free (rec->data);
++	free (rec);
++	return false;
++	// memcpy (rec->data, buf + dataoff, rec->datasz);
++}
++
++static bool parse_ipv4(RBuffer *b, ut64 off, pcaprec_t *rec) {
++	ut8 buf[sizeof (pcaprec_ipv4_t)] = {0};
++	pcaprec_ipv4_t *ipv4 = R_NEW0 (pcaprec_ipv4_t);
++	if (!ipv4) {
++		return false;
++	}
++	r_buf_read_at (b, off, buf, sizeof (buf));
++	ipv4->ver_len = r_read_at_be8 (buf, 0);
++	ipv4->diff_serv = r_read_at_be8 (buf, 1);
++	ipv4->tot_len = r_read_at_be16 (buf, 2);
++	ipv4->id = r_read_at_be16 (buf, 4);
++	ipv4->flag_frag = r_read_at_be16 (buf, 6);
++	ipv4->ttl = r_read_at_be8 (buf, 8);
++	ipv4->protocol = r_read_at_be8 (buf, 9);
++	ipv4->chksum = r_read_at_be16 (buf, 10);
++	ipv4->src = r_read_at_be32 (buf, 12);
++	ipv4->dst = r_read_at_be32 (buf, 16);
++
++	switch (ipv4->protocol) {
++	case TRANSPORT_TCP:
++	{
++		ut32 tcpoff = ((ipv4->ver_len & 0x0F) * 4);
++		if (!parse_tcp (b, off, rec, ipv4->tot_len - tcpoff)) {// tot_len - tcpoff);
++			return false;
++		}
++		// rec, buf + tcpoff, ipv4->tot_len - tcpoff);
++		break;
++	}
++	default:
++		break;
++	}
++	rec->net.ipv4_hdr = ipv4;
++	return true;
++}
++
++static bool parse_ipv6(RBuffer *b, ut64 off, pcaprec_t *rec) {
++	pcaprec_ipv6_t *ipv6 = R_NEW0 (pcaprec_ipv6_t);
++	if (!ipv6) {
++		return false;
++	}
++	ut8 buf[sizeof (pcaprec_ipv6_t)] = { 0 };
++	r_buf_read_at (b, off, (ut8*)buf, sizeof (pcaprec_ipv6_t));
++	ipv6->vc_flow = r_read_at_be32 (buf, 0);
++	ipv6->pl

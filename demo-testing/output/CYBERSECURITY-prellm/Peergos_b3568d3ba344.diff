@@ -1,0 +1,101 @@
+@@ -433,8 +433,10 @@ public class Main {
+             JdbcSpaceRequests spaceRequests = JdbcSpaceRequests.build(spaceDb, sqlCommands);
+             UserQuotas userQuotas = new UserQuotas(quotaFilePath, defaultQuota, maxUsers);
+             CoreNode signupFilter = new SignUpFilter(core, userQuotas, nodeId);
++            RamUsageStore usageStore = RamUsageStore.build(statePath, localPointers, localDht);
++            SpaceCheckingKeyFilter.update(usageStore, localPointers, localDht);
+             SpaceCheckingKeyFilter spaceChecker = new SpaceCheckingKeyFilter(core, localPointers, localDht, userQuotas,
+-                    spaceRequests, statePath);
++                    spaceRequests, usageStore);
+             CorenodeEventPropagator corePropagator = new CorenodeEventPropagator(signupFilter);
+             corePropagator.addListener(spaceChecker::accept);
+             MutableEventPropagator localMutable = new MutableEventPropagator(localPointers);
+
+deleted file mode 100644
+
+
+
+@@ -1,586 +0,0 @@
+-package peergos.server;
+-
+-import java.util.concurrent.atomic.*;
+-import java.util.logging.*;
+-
+-import peergos.server.space.*;
+-import peergos.server.storage.*;
+-import peergos.server.util.*;
+-
+-import peergos.server.corenode.*;
+-import peergos.server.mutable.*;
+-import peergos.shared.*;
+-import peergos.shared.cbor.*;
+-import peergos.shared.corenode.*;
+-import peergos.shared.crypto.asymmetric.*;
+-import peergos.shared.crypto.hash.*;
+-import peergos.shared.mutable.*;
+-import peergos.shared.storage.*;
+-import peergos.shared.user.*;
+-import peergos.shared.util.*;
+-
+-import java.time.*;
+-import java.io.ByteArrayInputStream;
+-import java.io.IOException;
+-import java.nio.file.Files;
+-import java.nio.file.Path;
+-import java.nio.file.StandardOpenOption;
+-import java.util.*;
+-import java.util.concurrent.*;
+-import java.util.stream.Collectors;
+-
+-/** This class checks whether a given user is using more storage space than their quota
+- *
+- */
+-public class SpaceCheckingKeyFilter implements SpaceUsage {
+-    private static final Logger LOG = Logging.LOG();
+-    private static final long USAGE_TOLERANCE = 1024 * 1024;
+-    private final CoreNode core;
+-    private final MutablePointers mutable;
+-    private final ContentAddressedStorage dht;
+-    private final UserQuotas quotaSupplier;
+-    private final JdbcSpaceRequests spaceRequests;
+-    private final Path statePath;
+-    private final State state;
+-    private boolean initializedFully = false;
+-    private final AtomicBoolean isRunning = new AtomicBoolean(true);
+-    private final BlockingQueue<MutableEvent> mutableQueue = new ArrayBlockingQueue<>(1000);
+-
+-    /**
+-     *
+-     * @param core
+-     * @param mutable
+-     * @param dht
+-     * @param quotaSupplier The quota supplier
+-     * @param statePath path to local file with user usages
+-     */
+-    public SpaceCheckingKeyFilter(CoreNode core,
+-                                  MutablePointers mutable,
+-                                  ContentAddressedStorage dht,
+-                                  UserQuotas quotaSupplier,
+-                                  JdbcSpaceRequests spaceRequests,
+-                                  Path statePath) {
+-        this.core = core;
+-        this.mutable = mutable;
+-        this.dht = dht;
+-        this.quotaSupplier = quotaSupplier;
+-        this.spaceRequests = spaceRequests;
+-        this.statePath = statePath;
+-        this.state = initState(statePath, mutable, dht);
+-        new Thread(() -> {
+-            while (isRunning.get()) {
+-                try {
+-                    MutableEvent event = mutableQueue.take();
+-                    processMutablePointerEvent(event);
+-                } catch (InterruptedException e) {}
+-            }
+-        }, "SpaceCheckingKeyFilter").start();
+-        //add shutdown-hook to call close
+-        Runtime.getRuntime().addShutdownHook(new Thread(this::close, "SpaceChecker shutdown"));
+-    }
+-
+-    public static class State implements Cborable {
+-        final Map

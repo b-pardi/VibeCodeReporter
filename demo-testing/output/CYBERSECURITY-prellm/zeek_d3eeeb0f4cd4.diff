@@ -1,0 +1,158 @@
+@@ -1,6 +1,10 @@
+ // See the file "COPYING" in the main distribution directory for copyright.
+ 
+-#include "Dict.h"
++#ifdef USE_OPEN_DICT
++
++#include "OpenDict.cc"
++
++#else//USE_OPEN_DICT
+ 
+ #include "zeek-config.h"
+ 
+@@ -1132,3 +1136,7 @@ void Dictionary::StopIteration(IterCookie* cookie) const
+ 	}
+ 
+ } // namespace zeek
++
++TEST_SUITE_END();
++
++#endif//USE_OPEN_DICT
+
+
+
+
+@@ -1,4 +1,9 @@
+ // See the file "COPYING" in the main distribution directory for copyright.
++#ifdef USE_OPEN_DICT
++
++#include "OpenDict.h"
++
++#else//USE_OPEN_DICT
+ 
+ #pragma once
+ 
+@@ -419,3 +424,5 @@ public:
+ 
+ using Dictionary [[deprecated("Remove in v4.1. Use zeek::Dictionary instead.")]] = zeek::Dictionary;
+ template<typename T> using PDict [[deprecated("Remove in v4.1. Use zeek::PDict instead.")]] = zeek::PDict<T>;
++
++#endif//USE_OPEN_DICT
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,961 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek-config.h"
++
++#ifdef HAVE_MEMORY_H
++#include <memory.h>
++#endif
++#include <algorithm>
++#include <signal.h>
++#include <climits>
++#include <fstream>
++#include "OpenDict.h"
++#include "Reporter.h"
++#include "util.h"
++
++#ifdef DEBUG
++#define ASSERT_VALID(o) 0->AssertValid()
++#else
++#define ASSERT_VALID(o)
++#endif//DEBUG
++
++struct IterCookie {
++	IterCookie(Dictionary* d) : robust(false),d(d),next(-1), inserted(0), visited(0){}
++	bool robust;
++	Dictionary* d;
++	int next; //index for next valid entry. -1 is default not started yet.
++
++	//the following only used in robust cookies.
++	std::vector<DictEntry>* inserted;	// inserted while iterating
++	std::vector<DictEntry>* visited; //visited but moved across next due to insertion.
++	void MakeRobust()
++		{
++		robust = true;
++		ASSERT( next <0 ); //must make it robust before any iteration.
++		inserted = new std::vector<DictEntry>();
++		visited = new std::vector<DictEntry>();
++		ASSERT(d&&d->cookies);
++		d->cookies->push_back(this); 
++		}
++
++	void AssertValid() const
++		{
++		ASSERT(d && -1 <= next && next <= d->Capacity());
++		ASSERT((!robust && !inserted && !visited) || (robust && inserted && visited));
++		}
++
++	~IterCookie()
++		{
++			ASSERT_VALID(this);
++			if( robust)
++				{
++				d->cookies->erase(std::remove(d->cookies->begin(), d->cookies->end(), this));
++				delete inserted;
++				delete visited;
++				}
++		}
++};
++
++/////////////////////////////////////////////////////////////////////////////////////////////////
++//bucket math
++int Dictionary::Log2(int num) const
++	{
++	int i=0;
++	while(num>>=1)
++		i++;
++	return i;
++	}
++
++int Dictionary::Buckets(bool expected) const 
++	{ 
++	int buckets = (1 << log2_buckets); 
++	if( expected)
++		return buckets;
++	return table ? buckets : 0;
++	}
++
++int Dictionary::Capacity(bool expected) const 
++	{ 
++	int capacity = (1 << log2_buckets) + (log2_buckets+0); 
++	if( expected)
++		return capacity;
++	return table ? capacity : 0;
++	}
++
++int Dictionary::ThresholdEntries() const
++	{ 	
++	//SizeUp the dictionary when dict is 75% full
++	//However, when the dict is small (<=2^4+4=20), SizeUp only when dict is 100% full (right after the current insertion)
++	//the dict will always SizeUp when the last entry is occupied after current insertion.
++	//the idea is the current insertion is always successful.
++	int capacity = Capacity();
++	if( log2_buckets <= DICT_THRESHOLD_BITS)
++		return capacity; //20 or less elements, 1.0, only size up when necessary.
++	return capacity - (capacity>>DICT_LOAD_FACTOR_BITS); 
++	}
++
++hash_t Dictionary::FibHash(hash_t h) const
++	{
++	//refer for details: https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
++	//GoldenRatio phi = (sqrt(5)+1)/2 = 1.6180339887...
++	//1/phi = phi - 1
++
++	h &= HASH_MASK;
++	h *= 11400714819323198485llu; //2^64/phi
++	return h;
++	}
++
++//return position in dict with 2^bit size.
++int Dictionary::BucketByHash(hash_t h, int log2_table_size) const //map h to n-bit
++	{
++	ASSERT(log2_table_size>=0);
++	if( !l

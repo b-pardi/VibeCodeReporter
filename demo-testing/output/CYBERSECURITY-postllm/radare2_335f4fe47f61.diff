@@ -1,0 +1,124 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,901 @@
++/* radare2 - LGPL - Copyright 2025 - Based on bpf_cs plugin, modified for Solana BPF */
++
++#include <r_anal.h>
++#include <r_esil.h>
++#include <r_lib.h>
++#include <r_arch.h>
++
++#include <capstone/capstone.h>
++
++#define SBPF_PROGRAM_ADDR 	0x100000000ULL
++#define SBPF_STACK_ADDR 	0x200000000ULL
++// Rust strings are not null-terminated
++// We need to cap the string size to avoid reading garbage
++#define SBPF_MAX_STRING_SIZE 0x100
++
++#if CS_API_MAJOR >= 5
++
++#define CSINC BPF
++#define CSINC_MODE get_capstone_mode(as)
++
++static int get_capstone_mode(RArchSession *as) {
++	int mode = R_ARCH_CONFIG_IS_BIG_ENDIAN (as->config)
++		? CS_MODE_BIG_ENDIAN: CS_MODE_LITTLE_ENDIAN;
++	// sBPF is always extended mode (64-bit)
++	mode |= CS_MODE_BPF_EXTENDED;
++	return mode;
++}
++
++#include "../capstone.inc.c"
++
++#define OP(n) insn->detail->bpf.operands[n]
++// the "& 0xffffffff" is for some weird CS bug in JMP
++#define IMM(n) (insn->detail->bpf.operands[n].imm & UT32_MAX)
++#define OPCOUNT insn->detail->bpf.op_count
++
++// calculate jump address from immediate
++#define JUMP(n) (op->addr + insn->size * (1 + IMM (n)))
++
++// Solana syscall name mapping (retrieved from firedancer validator)
++static struct {
++	ut32 hash;
++	const char *name;
++} solana_syscalls[] = {
++	{0xb6fc1a11U, "abort"},
++	{0x686093bbU, "sol_panic_"},
++	{0x207559bdU, "sol_log_"},
++	{0x5c2a3178U, "sol_log_64_"},
++	{0x52ba5096U, "sol_log_compute_units_"},
++	{0x7ef088caU, "sol_log_pubkey"},
++	{0x9377323cU, "sol_create_program_address"},
++	{0x48504a38U, "sol_try_find_program_address"},
++	{0x11f49d86U, "sol_sha256"},
++	{0xd7793abbU, "sol_keccak256"},
++	{0x17e40350U, "sol_secp256k1_recover"},
++	{0x174c5122U, "sol_blake3"},
++	{0xaa2607caU, "sol_curve_validate_point"},
++	{0xdd1c41a6U, "sol_curve_group_op"},
++	{0xd56b5fe9U, "sol_get_clock_sysvar"},
++	{0x23a29a61U, "sol_get_epoch_schedule_sysvar"},
++	{0xbf7188f6U, "sol_get_rent_sysvar"},
++	{0x717cc4a3U, "sol_memcpy_"},
++	{0x434371f8U, "sol_memmove_"},
++	{0x5fdcde31U, "sol_memcmp_"},
++	{0x3770fb22U, "sol_memset_"},
++	{0xa22b9c85U, "sol_invoke_signed_c"},
++	{0xd7449092U, "sol_invoke_signed_rust"},
++	{0x83f00e8fU, "sol_alloc_free_"},
++	{0xa226d3ebU, "sol_set_return_data"},
++	{0x5d2245e4U, "sol_get_return_data"},
++	{0x7317b434U, "sol_log_data"},
++	{0xadb8efc8U, "sol_get_processed_sibling_instruction"},
++	{0, NULL}
++};
++
++static const char *get_syscall_name(ut32 hash) {
++	int i;
++	for (i = 0; solana_syscalls[i].name; i++) {
++		if (solana_syscalls[i].hash == hash) {
++			return solana_syscalls[i].name;
++		}
++	}
++	return NULL;
++}
++
++
++static void analop_esil(RArchSession *a, RAnalOp *op, cs_insn *insn, ut64 addr);
++static void check_and_create_string_flag(RArchSession *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len);
++
++static char *mnemonics(RArchSession *s, int id, bool json) {
++	CapstonePluginData *cpd = (CapstonePluginData*)s->data;
++	return r_arch_cs_mnemonics (s, cpd->cs_handle, id, json);
++}
++
++static bool decode(RArchSession *a, RAnalOp *op, RArchDecodeMask mask) {
++	CapstonePluginData *cpd = (CapstonePluginData*)a->data;
++	const ut8 *buf = op->bytes;
++	const int len = op->size;
++	op->size = 8;
++	cs_insn *insn = NULL;
++	int n = cs_disasm (cpd->cs_handle, (ut8*)buf, len, op->addr, 1, &insn);
++	if (n < 1) {
++		op->type = R_ANAL_OP_TYPE_ILL;
++		if (mask & R_ARCH_OP_MASK_DISASM) {
++			op->mnemonic = strdup ("invalid");
++		}
++	} else {
++		if (mask & R_ARCH_OP_MASK_DISASM) {
++			// Handle CALL instruction
++			if (insn->id == BPF_INS_CALL && insn->detail && OPCOUNT > 0 && OP(0).type == BPF_OP_IMM) {
++				st32 imm = IMM (0);
++				// Check if this is a syscall first
++				const char *syscall_name = get_syscall_name (imm);
++				if (syscall_name) {
++					op->mnemonic = r_str_newf ("call %s", syscall_name);
++				} else {
++					// PC-relative call
++					st64 current_pc = op->addr / 8; 	 		// Current PC in instruction units
++					st64 target_pc = current_pc + imm + 1;  	// Target PC in instruction units
++					st64 ta

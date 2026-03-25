@@ -1,0 +1,95 @@
+@@ -227,7 +227,7 @@ from __future__ import print_function
+ # 2020-01-31 v0.56 KS: - added option --no-xlm, improved MHT detection
+ # 2020-03-22       PL: - uses plugin_biff to display DCONN objects and their URL
+ 
+-__version__ = '0.56dev4'
++__version__ = '0.56dev5'
+ 
+ #------------------------------------------------------------------------------
+ # TODO:
+@@ -795,6 +795,8 @@ SUSPICIOUS_KEYWORDS = {
+          'DisableUnsafeLocationsInPV', 'blockcontentexecutionfrominternet'),
+     'May attempt to modify the VBA code (self-modification)':
+         ('VBProject', 'VBComponents', 'CodeModule', 'AddFromString'),
++    'May modify Excel 4 Macro formulas at runtime (XLM/XLF)':
++        ('FORMULA.FILL',),
+ }
+ 
+ # Suspicious Keywords to be searched for directly as regex, without escaping
+@@ -3249,13 +3251,21 @@ class VBA_Parser(object):
+                 data = self.ole_file.openstream(excel_stream).read()
+                 log.debug('Running BIFF plugin from oledump')
+                 try:
+-                    biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-x')
++                    # starting from plugin_biff 0.0.12, we use the CSV output (-c) instead of -x
++                    # biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-x')
++                    # First let's get the list of boundsheets, and check if there are Excel 4 macros:
++                    biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-o BOUNDSHEET')
+                     self.xlm_macros = biff_plugin.Analyze()
+-                    if len(self.xlm_macros)>0:
++                    if "Excel 4.0 macro sheet" in '\n'.join(self.xlm_macros):
+                         log.debug('Found XLM macros')
++                        # get the list of labels, which may contain the "Auto_Open" trigger
++                        biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-o LABEL')
++                        self.xlm_macros += biff_plugin.Analyze()
++                        biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-c -r LN')
++                        self.xlm_macros += biff_plugin.Analyze()
+                         # we run plugin_biff again, this time to search DCONN objects and get their URLs, if any:
+                         # ref: https://inquest.net/blog/2020/03/18/Getting-Sneakier-Hidden-Sheets-Data-Connections-and-XLM-Macros
+-                        biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-o 876 -s')
++                        biff_plugin = cBIFF(name=[excel_stream], stream=data, options='-o DCONN -s')
+                         self.xlm_macros += biff_plugin.Analyze()
+                         return True
+                 except:
+
+
+
+
+@@ -1,11 +1,9 @@
+ #!/usr/bin/env python
+ 
+-from __future__ import print_function
+-
+ __description__ = 'BIFF plugin for oledump.py'
+ __author__ = 'Didier Stevens'
+-__version__ = '0.0.11'
+-__date__ = '2020/04/06'
++__version__ = '0.0.12'
++__date__ = '2020/05/18'
+ 
+ # Slightly modified version by Philippe Lagadec to be imported into olevba
+ 
+@@ -38,6 +36,9 @@ History:
+               d3c1627ca2775d98717eb1abf2b70aedf383845d87993c6b924f2f55d9d4d696 (ptgFunc)
+               1d48a42a0b06a087e966b860c8f293a9bf57da8d70f5f83c61242afc5b81eb4f (=SELECT($B$1:$1000:$1000:$B:$B,$B$1))
+   2020/04/06: 0.0.11 Python 2 bugfixes; password protect record FILEPASS
++  2020/05/16: 0.0.12 option -c
++  2020/05/17: option -r
++  2020/05/18: continue
+ 
+ Todo:
+ """
+@@ -52,6 +53,9 @@ import binascii
+ from .oledump_extract import *
+ # end modifications
+ 
++DEFAULT_SEPARATOR = ','
++QUOTE = '"'
++
+ def P23Decode(value):
+     if sys.version_info[0] > 2:
+         try:
+@@ -61,6 +65,24 @@ def P23Decode(value):
+     else:
+         return value
+ 
++def ToString(value):
++    if isinstance(value, str):
++        return value
++    else:
++        return str(value)
++
++def Quote(value, separator, quote):
++    value = ToString(value)
++    if len(value) > 1 and value[0] == quote and value[-1] == quote:
++        

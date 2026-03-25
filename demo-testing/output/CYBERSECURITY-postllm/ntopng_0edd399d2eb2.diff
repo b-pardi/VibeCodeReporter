@@ -1,0 +1,155 @@
+@@ -95,6 +95,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   std::atomic<u_int64_t>
+       num_active_alerted_flows_error; /* Counts all flow alerts with severity >=
+                                          error   */
++  std::atomic<u_int32_t> num_active_probes; /* Count active ZMQ probes */
+   u_int32_t num_host_dropped_alerts, num_flow_dropped_alerts,
+       num_other_dropped_alerts, last_purge_idle;
+   u_int64_t num_written_alerts, num_alerts_queries, score_as_cli, score_as_srv;
+@@ -1201,6 +1202,10 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   };
+ #endif
+ 
++  void incNumActiveProbes();
++  void decNumActiveProbes();
++  u_int64_t getNumActiveProbes() const;
++
+   void incNumAlertedFlows(Flow *f, AlertLevel severity);
+   void decNumAlertedFlows(Flow *f, AlertLevel severity);
+   virtual u_int64_t getNumActiveAlertedFlows() const;
+
+
+
+
+@@ -786,6 +786,7 @@ class Ntop {
+     return (kafkaClient.sendMessage(kafka_broker_info, msg, msg_len));
+   }
+ #endif
++  u_int64_t getNumActiveProbes() const;
+ };
+ 
+ extern Ntop *ntop;
+
+
+
+
+@@ -28,15 +28,11 @@
+ 
+ class LuaEngine;
+ 
+-typedef struct {
+-  char *endpoint;
+-  void *socket;
+-} zmq_subscriber;
+-
+ class ZMQCollectorInterface : public ZMQParserInterface {
+  private:
+   void *context;
+-  std::map<u_int32_t, u_int32_t> source_id_last_msg_id;
++  std::map<u_int32_t /* source_id */, zmq_probe *> active_probes;
++  time_t last_active_probes_check;
+   bool is_collector;
+   u_int16_t num_subscribers;
+   zmq_subscriber subscriber[MAX_ZMQ_SUBSCRIBERS];
+@@ -45,6 +41,7 @@ class ZMQCollectorInterface : public ZMQParserInterface {
+ #if ZMQ_VERSION >= ZMQ_MAKE_VERSION(4, 1, 0)
+   char *findInterfaceEncryptionKeys(char *public_key, char *secret_key, int public_key_len, int secret_key_len);
+ #endif
++  void checkIdleProbes(time_t now);
+ 
+  public:
+   ZMQCollectorInterface(const char *_endpoint);
+
+
+
+
+@@ -178,6 +178,8 @@
+ #define MAX_ZMQ_SUBSCRIBERS UNLIMITED_MAX_ZMQ_SUBSCRIBERS
+ #endif
+ 
++#define ZMQ_PROBE_EXPIRATION_TIME 10 /* seconds */
++
+ #define MAX_INTERFACE_NAME_LEN 512
+ #define MAX_USER_NETS_VAL_LEN 255
+ #define NUM_HOSTS_RESOLVED_BITS 2 << 19 /* ~1 million */
+
+
+
+
+@@ -254,6 +254,16 @@ struct zmq_msg_hdr_v2 {
+   u_int32_t msg_id, source_id;
+ };
+ 
++typedef struct {
++  char *endpoint;
++  void *socket;
++} zmq_subscriber;
++
++typedef struct {
++  u_int32_t last_seen;
++  u_int32_t last_msg_id;
++} zmq_probe;
++
+ typedef u_int8_t dump_mac_t[DUMP_MAC_SIZE];
+ typedef char macstr_t[MACSTR_SIZE];
+ 
+
+
+
+
+@@ -310,6 +310,7 @@ void NetworkInterface::init(const char *interface_name) {
+   tot_num_anomalies.local_hosts = tot_num_anomalies.remote_hosts = 0;
+   num_active_alerted_flows_notice = 0, num_active_alerted_flows_warning = 0,
+   num_active_alerted_flows_error = 0;
++  num_active_probes = 0;
+ 
+   is_view = false;
+   viewed_by = NULL;
+@@ -10125,6 +10126,24 @@ u_int64_t NetworkInterface::getNumActiveAlertedFlows() const {
+ 
+ /* *************************************** */
+ 
++void NetworkInterface::incNumActiveProbes() {
++  num_active_probes++;
++}
++
++/* *************************************** */
++
++void NetworkInterface::decNumActiveProbes() {
++  num_active_probes--;
++}
++
++/* *************************************** */
++
++u_int64_t NetworkInterface::getNumActiveProbes() const {
++  return num_active_probes;
++}
++
++/* *************************************** */
++
+ bool NetworkInterface::dequeueFlowFromCompanion(ParsedFlow **f) {
+   if (!companionQueue[next_compq_remove_idx]) {
+     *f = NULL;
+
+
+
+
+@@ -3717,6 +3717,17 @@ bool Ntop::broadcastControlMessage(char *msg) {
+ 
+ /* ******************************************* */
+ 
++u_int64_t Ntop::getNumActiveProbes() const {
++  u_int64_t n = 0;
++
++  for (int i = 0; i < num_defined_interfaces; i++)
++    n += iface[i]->getNumActiveProbes();
++
++  return n;
++}
++
++/* ******************************************* */
++
+ #ifndef WIN32
+ 
+ /* ******************************************* */
+@@ -4010,3 +4021,6 @@ bool Ntop::createPcapInterface(const char 

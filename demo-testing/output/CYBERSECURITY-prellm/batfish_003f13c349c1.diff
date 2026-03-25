@@ -1,0 +1,107 @@
+@@ -33,4 +33,8 @@ public interface TopologyContainer {
+ 
+   @Nonnull
+   VxlanTopology getVxlanTopology();
++
++  /** See {@link TunnelTopology} */
++  @Nonnull
++  TunnelTopology getTunnelTopology();
+ }
+
+
+
+
+@@ -134,4 +134,7 @@ public interface TopologyProvider {
+    */
+   @Nonnull
+   VxlanTopology getVxlanTopology(NetworkSnapshot snapshot);
++
++  @Nonnull
++  TunnelTopology getInitialTunnelTopology(NetworkSnapshot snapshot);
+ }
+
+
+
+
+@@ -23,17 +23,22 @@ import java.util.Map.Entry;
+ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.SortedMap;
+ import java.util.function.Consumer;
+ import java.util.function.Function;
+ import java.util.stream.IntStream;
+ import java.util.stream.Stream;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
++import org.batfish.common.plugin.TracerouteEngine;
++import org.batfish.common.topology.TunnelTopology.Builder;
+ import org.batfish.common.util.CollectionUtil;
+ import org.batfish.common.util.CommonUtil;
+ import org.batfish.datamodel.ConcreteInterfaceAddress;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.Edge;
++import org.batfish.datamodel.Flow;
++import org.batfish.datamodel.FlowDisposition;
+ import org.batfish.datamodel.Interface;
+ import org.batfish.datamodel.Interface.DependencyType;
+ import org.batfish.datamodel.InterfaceType;
+@@ -45,6 +50,7 @@ import org.batfish.datamodel.SwitchportMode;
+ import org.batfish.datamodel.Topology;
+ import org.batfish.datamodel.VniSettings;
+ import org.batfish.datamodel.collections.NodeInterfacePair;
++import org.batfish.datamodel.flow.TraceAndReverseFlow;
+ import org.batfish.datamodel.ipsec.IpsecTopology;
+ import org.batfish.datamodel.vxlan.VxlanNode;
+ import org.batfish.datamodel.vxlan.VxlanTopology;
+@@ -557,6 +563,55 @@ public final class TopologyUtil {
+    * <p>Ignores {@code Loopback} interfaces and inactive interfaces.
+    */
+   public static Topology synthesizeL3Topology(Map<String, Configuration> configurations) {
++    Map<Prefix, List<Interface>> prefixInterfaces = computeInterfacesBucketByPrefix(configurations);
++
++    ImmutableSortedSet.Builder<Edge> edges = ImmutableSortedSet.naturalOrder();
++    for (Entry<Prefix, List<Interface>> bucketEntry : prefixInterfaces.entrySet()) {
++      Prefix p = bucketEntry.getKey();
++      Set<Interface> candidateInterfaces = candidateInterfacesForPrefix(prefixInterfaces, p);
++
++      for (Interface iface1 : bucketEntry.getValue()) {
++        for (Interface iface2 : candidateInterfaces) {
++          // No device self-adjacencies in the same VRF.
++          if (!isValidLayer3Adjacency(iface1, iface2)) {
++            continue;
++          }
++          // Additionally, don't connect if any of the two endpoint interfaces have Tunnel or VPN
++          // interfaceTypes
++          if (TUNNEL_INTERFACE_TYPES.contains(iface1.getInterfaceType())
++              || TUNNEL_INTERFACE_TYPES.contains(iface2.getInterfaceType())) {
++            continue;
++          }
++          edges.add(new Edge(iface1, iface2));
++        }
++      }
++    }
++    return new Topology(edges.build());
++  }
++
++  /**
++   * Collect all interfaces that have subnets overlapping P iff they have an IP address in P. Use an
++   * IdentityHashSet to prevent duplicates.
++   */
++  @Nonnull
++  private static Set<Interface> candidateInterfacesForPrefix(
++      Map<Prefix, List<Interface>> prefixBuckets, Prefix p) {
++    Set<Interface> candidateInterfaces = Sets.newIdentityHashSet();
++    IntStream.range(0, Prefix.MAX_PREFIX_LENGTH)
++        .mapToObj(
++            i -> prefixBuckets.getOrDefault(Prefix.create(p.getStartIp(), i), ImmutableList.of()))
++        .flatMap(Collection::stream)
++        .filter(
++            iface ->
++                iface.getAllConcreteAddresses().stream().anyMatch(ia -> p.containsIp(ia.getIp())))
++        .forEach(candidateInterfaces::add);
++    return candidateInterfaces;
++  }
++
++  /** Bucket Interfaces that are not loopbacks and not /32s by their prefix */
++  @No

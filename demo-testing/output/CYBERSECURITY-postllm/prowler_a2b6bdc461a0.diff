@@ -1,0 +1,103 @@
+@@ -77,6 +77,9 @@ class ECS(AWSService):
+                         log_driver=container.get("logConfiguration", {}).get(
+                             "logDriver", ""
+                         ),
++                        log_option=container.get("logConfiguration", {})
++                        .get("options", {})
++                        .get("mode", ""),
+                     )
+                 )
+             task_definition.pid_mode = response["taskDefinition"].get("pidMode", "")
+@@ -180,6 +183,7 @@ class ContainerDefinition(BaseModel):
+     user: str
+     environment: list[ContainerEnvVariable]
+     log_driver: Optional[str]
++    log_option: Optional[str]
+ 
+ 
+ class TaskDefinition(BaseModel):
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,30 @@
++from prowler.lib.check.models import Check, Check_Report_AWS
++from prowler.providers.aws.services.ecs.ecs_client import ecs_client
++
++
++class ecs_task_definitions_logging_block_mode(Check):
++    def execute(self):
++        findings = []
++        for task_definition in ecs_client.task_definitions.values():
++            report = Check_Report_AWS(self.metadata())
++            containers = 0
++            report.region = task_definition.region
++            report.resource_id = f"{task_definition.name}:{task_definition.revision}"
++            report.resource_arn = task_definition.arn
++            report.resource_tags = task_definition.tags
++            report.status = "PASS"
++            report.status_extended = f"ECS task definition {task_definition.name} with revision {task_definition.revision} containers has logging configured with non blocking mode."
++            failed_containers = []
++            for container in task_definition.container_definitions:
++                if container.log_driver:
++                    containers = containers + 1
++                    if container.log_option != "non-blocking":
++                        report.status = "FAIL"
++                        failed_containers.append(container.name)
++
++            if failed_containers:
++                report.status_extended = f"ECS task definition {task_definition.name} with revision {task_definition.revision} running with logging set to blocking mode on containers: {', '.join(failed_containers)}"
++
++            if containers > 0:
++                findings.append(report)
++        return findings
+
+
+
+
+@@ -22,6 +22,13 @@ def mock_make_api_call(self, operation_name, kwarg):
+                     {
+                         "name": "test-container",
+                         "image": "test-image",
++                        "logConfiguration": {
++                            "logDriver": "awslogs",
++                            "options": {
++                                "mode": "non-blocking",
++                                "max-buffer-size": "25m",
++                            },
++                        },
+                         "environment": [
+                             {"name": "DB_PASSWORD", "value": "pass-12343"},
+                         ],
+@@ -163,7 +170,14 @@ class Test_ECS_Service:
+         assert ecs.task_definitions[task_arn].network_mode == "host"
+         assert not ecs.task_definitions[task_arn].container_definitions[0].privileged
+         assert ecs.task_definitions[task_arn].container_definitions[0].user == ""
+-        assert ecs.task_definitions[task_arn].container_definitions[0].log_driver == ""
++        assert (
++            ecs.task_definitions[task_arn].container_definitions[0].log_driver
++            == "awslogs"
++        )
++        assert (
++            ecs.task_definitions[task_arn].container_definitions[0].log_option
++            == "non-blocking"
++        )
+         assert ecs.task_definitions[task_arn].pid_mode == "host"
+         assert (
+             not ecs.task_definitions[task_arn]
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,172 @@
++from unittest.mock import patch
++
++from boto3 import client
++from moto import mock_aws
++
++from tests.providers.aws.utils import AWS_REGION_US_EAST_1, set_mo

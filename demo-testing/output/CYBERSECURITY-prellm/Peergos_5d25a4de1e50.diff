@@ -1,0 +1,59 @@
+@@ -440,7 +440,7 @@ public class NetworkAccess {
+     }
+ 
+     private static CompletableFuture<EntryPoint> getUptodateEntryPoint(EntryPoint e, NetworkAccess network) {
+-        // User might have changed their password and thus identity key, check for an update
++        // User might have changed their identity key, check for an update
+         return network.coreNode.updateUser(e.ownerName)
+                 .thenCompose(x -> network.coreNode.getPublicKeyHash(e.ownerName))
+                 .thenApply(currentIdOpt -> {
+
+
+
+
+@@ -239,10 +239,17 @@ public class SocialFeed {
+                 (s, c) -> {
+                     return context.getFollowingNodes()
+                             .thenCompose(friends -> {
+-                                List<CompletableFuture<Snapshot>> pointers = friends.stream().map(f -> f.getLatestVersion(network)).collect(Collectors.toList());
++                                List<CompletableFuture<Optional<Pair<FriendSourcedTrieNode,Snapshot>>>> pointers = friends.stream()
++                                        .map(f -> f.getLatestVersion(network).thenApply(v -> Optional.of(new Pair<>(f, v))).exceptionally(t -> Optional.empty()))
++                                        .collect(Collectors.toList());
+                                 return Futures.combineAllInOrder(pointers)
+-                                        .thenApply(versions -> versions.stream().reduce((a, b) -> a.merge(b)))
+-                                        .thenApply(vOpt ->  new Pair<>(friends, vOpt.map(s::mergeAndOverwriteWith).orElse(s)));
++                                        .thenApply(pairs -> pairs.stream()
++                                                .flatMap(Optional::stream)
++                                                .map(p -> new Pair<>(Stream.of(p.left), p.right))
++                                                .reduce((a, b) -> new Pair<>(Stream.concat(a.left, b.left), a.right.merge(b.right))))
++                                        .thenApply(combined ->  new Pair<>(
++                                                combined.map(p ->  p.left.collect(Collectors.toSet())).orElse(Collections.emptySet()),
++                                                combined.map(p ->  p.right).map(s::mergeAndOverwriteWith).orElse(s)));
+                             })
+                             .thenCompose(fv -> Futures.reduceAll(fv.left.stream(), new Pair<>(fv.right, Stream.<Update>empty()),
+                                     (p, friend) -> getFriendUpdate(friend, p.left, c, network)
+
+
+
+
+@@ -390,6 +390,8 @@ public class IncomingCapCache {
+         // if the friend's mutable pointer hasn't changed since our last update we can short circuit early
+         PublicKeyHash owner = sharedDir.pointer.owner;
+         PublicKeyHash writer = sharedDir.pointer.writer;
++        if (! s.contains(writer))
++            return Futures.of(new Pair<>(s, CapsDiff.empty()));
+         CommittedWriterData latestCwd = s.get(writer);
+         MaybeMultihash latestRoot = latestCwd.hash;
+         Pair<MaybeMultihash, CapsDiff> cached = pointerCache.get(writer);
+@@ -421,21 +423,23 @@ public class IncomingCapCache {
+                                                    Snapshot s,
+                                                    NetworkAccess network) {
+         return network.getFile(originalSharedDir, s)
+-                .thenCompose(shared -> retrieveNewCaps(shared.get(), current, network, crypto))
+-                .thenCompose(direct -> Futures.combineAll(groups.stream()
+-                        .parallel()
+-                        .map(e -> network.getFile(e, s)
+-                                .thenApply(Optional::get)
+-                                .thenCompose(sharedDir -> retrieveNewCaps(sharedDir,
+-                                        current.groups.getOrDefault(sharedDir.getName(), ProcessedCaps.empty()), network, crypto)
+-                                        .thenApply(diff -> Optional.of(new Pair<>(sharedDir.getName(), d

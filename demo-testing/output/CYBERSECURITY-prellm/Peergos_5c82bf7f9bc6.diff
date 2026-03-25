@@ -1,0 +1,57 @@
+@@ -557,6 +557,145 @@ public class FileWrapper {
+                 true, network, crypto, monitor, firstChunkMapKey);
+     }
+ 
++    public CompletableFuture<Snapshot> overwriteSection(Snapshot current,
++                                                        Committer committer,
++                                                        AsyncReader fileData,
++                                                        long inputStartIndex,
++                                                        long endIndex,
++                                                        Location parentLocation,
++                                                        NetworkAccess network,
++                                                        Crypto crypto,
++                                                        ProgressConsumer<Long> monitor) {
++        if (! isWritable())
++            return Futures.errored(new IllegalStateException("Unable to modify file without write access!"));
++        if (isDirty())
++            return Futures.errored(new IllegalStateException("File needs cleaning before modification."));
++
++        FileProperties existingProps = getFileProperties();
++        String filename = existingProps.name;
++        LOG.info("Overwriting section [" + Long.toHexString(inputStartIndex) + ", " + Long.toHexString(endIndex) + "] of: " + filename);
++
++        Supplier<Location> locationSupplier = () -> new Location(getLocation().owner, getLocation().writer, crypto.random.randomBytes(32));
++
++        SymmetricKey parentParentKey = getPointer().getParentParentKey();
++        WritableAbsoluteCapability childCap = writableFilePointer();
++        return current.withWriter(owner(), writer(), network)
++                .thenCompose(base -> {
++                    FileWrapper child = this;
++                    FileProperties childProps = child.getFileProperties();
++                    final AtomicLong filesSize = new AtomicLong(childProps.size);
++                    return child.getRetriever(crypto.hasher).thenCompose(retriever -> {
++                        SymmetricKey baseKey = child.pointer.capability.rBaseKey;
++                        CryptreeNode fileAccess = child.pointer.fileAccess;
++                        SymmetricKey dataKey = fileAccess.getDataKey(baseKey);
++
++                        List<Long> startIndexes = new ArrayList<>();
++
++                        for (long startIndex = inputStartIndex; startIndex < endIndex; startIndex = startIndex + Chunk.MAX_SIZE - (startIndex % Chunk.MAX_SIZE))
++                            startIndexes.add(startIndex);
++
++                        BiFunction<Snapshot, Long, CompletableFuture<Snapshot>> composer = (version, startIndex) -> {
++                            MaybeMultihash currentHash = child.pointer.fileAccess.committedHash();
++                            return retriever.getChunk(version.get(child.writer()).props, network, crypto, startIndex,
++                                    filesSize.get(), childCap, childProps.streamSecret, currentHash, monitor)
++                                    .thenCompose(currentLocation -> {
++                                                CompletableFuture<Optional<Location>> locationAt = retriever
++                                                        .getMapLabelAt(version.get(child.writer()).props, childCap,
++                                                                childProps.streamSecret, startIndex + Chunk.MAX_SIZE, crypto.hasher, network)
++                                                        .thenApply(x -> x.map(m -> getLocation().withMapKey(m)));
++                                                return locationAt.thenCompose(location ->
++                                                        CompletableFuture.completedFuture(new Pair<>(currentLocation, location)));
++                                            }
++                                    ).thenCompose(pair -> {
++
++                                        if (!pair.left.isPresent()) {
++           

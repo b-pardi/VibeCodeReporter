@@ -1,0 +1,143 @@
+@@ -32,27 +32,27 @@
+  *  having to come up with custom ips.
+  */
+ 
+-#define IPv4(a, b, c, d) (((d) << 24) + ((c) << 16) + ((b) << 8) + (a))
++#define IPV4(a, b, c, d) (((d) << 24) + ((c) << 16) + ((b) << 8) + (a))
+ 
+ /* IPv4 addresses for hosts, external to the cluster */
+-#define v4_ext_one	IPv4(110, 0, 11, 1)
+-#define v4_ext_two	IPv4(120, 0, 12, 2)
+-#define v4_ext_three	IPv4(130, 0, 13, 3)
++#define v4_ext_one	IPV4(110, 0, 11, 1)
++#define v4_ext_two	IPV4(120, 0, 12, 2)
++#define v4_ext_three	IPV4(130, 0, 13, 3)
+ 
+ /* IPv4 addresses for nodes in the cluster */
+-#define v4_node_one	IPv4(10, 0, 10, 1)
+-#define v4_node_two	IPv4(10, 0, 10, 2)
+-#define v4_node_three	IPv4(10, 0, 10, 3)
++#define v4_node_one	IPV4(10, 0, 10, 1)
++#define v4_node_two	IPV4(10, 0, 10, 2)
++#define v4_node_three	IPV4(10, 0, 10, 3)
+ 
+ /* IPv4 addresses for services in the cluster */
+-#define v4_svc_one	IPv4(172, 16, 10, 1)
+-#define v4_svc_two	IPv4(172, 16, 10, 2)
+-#define v4_svc_three	IPv4(172, 16, 10, 3)
++#define v4_svc_one	IPV4(172, 16, 10, 1)
++#define v4_svc_two	IPV4(172, 16, 10, 2)
++#define v4_svc_three	IPV4(172, 16, 10, 3)
+ 
+ /* IPv4 addresses for pods in the cluster */
+-#define v4_pod_one	IPv4(192, 168, 0, 1)
+-#define v4_pod_two	IPv4(192, 168, 0, 2)
+-#define v4_pod_three	IPv4(192, 168, 0, 3)
++#define v4_pod_one	IPV4(192, 168, 0, 1)
++#define v4_pod_two	IPV4(192, 168, 0, 2)
++#define v4_pod_three	IPV4(192, 168, 0, 3)
+ 
+ /* Source port to be used by a client */
+ #define tcp_src_one	__bpf_htons(22334)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,227 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "bpf/ctx/xdp.h"
++#include "common.h"
++#include "pktgen.h"
++
++#define ENABLE_IPV4
++#define ENABLE_NODEPORT
++#define ENABLE_NODEPORT_ACCELERATION
++#define ENABLE_SESSION_AFFINITY
++
++/* Make sure we always pick backend slot 1 if we end up in backend selection. */
++#define LB_SELECTION LB_SELECTION_FIRST
++
++#define fib_lookup mock_fib_lookup
++
++static const char fib_smac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02};
++static const char fib_dmac[6] = {0x13, 0x37, 0x13, 0x37, 0x13, 0x37};
++
++long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
++		     __maybe_unused int plen, __maybe_unused __u32 flags)
++{
++	memcpy(params->smac, fib_smac, sizeof(fib_smac));
++	memcpy(params->dmac, fib_dmac, sizeof(fib_dmac));
++	return 0;
++}
++
++#include "bpf_xdp.c"
++#include "lib/nodeport.h"
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 2);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[0] = &bpf_xdp_entry,
++	},
++};
++
++#define CLIENT_IP IPV4(10, 0, 0, 1)
++#define FRONTEND_IP IPV4(10, 0, 1, 1)
++#define BACKEND_IP1 IPV4(10, 0, 2, 1)
++#define BACKEND_IP2 IPV4(10, 0, 3, 1)
++#define FRONTEND_PORT bpf_htons(80)
++#define BACKEND_PORT bpf_htons(8080)
++#define REV_NAT_INDEX 123
++#define BACKEND_ID1 7
++#define BACKEND_ID2 42
++
++static __always_inline int craft_packet(struct __ctx_buff *ctx)
++{
++	struct pktgen builder;
++	struct ethhdr *eh;
++	struct iphdr *iph;
++	struct tcphdr *tcph;
++
++	pktgen__init(&builder, ctx);
++
++	eh = pktgen__push_ethhdr(&builder);
++	if (!eh)
++		return TEST_ERROR;
++	*eh = (struct ethhdr){.h_source = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
++			      .h_dest = {0x12, 0x23, 0x34, 0x45, 0x56, 0x67},
++			      .h_proto = bpf_htons(ETH_P_IP)};
++
++	iph = pktgen__push_default_iphdr(&builder);
++
++	if (!iph)
++		return TEST_ERROR;
++
++	iph->saddr = CLIENT_IP;
++	iph->daddr = FRONTEND_IP;
++
++	tcph = pktgen__push_default_tcphdr(&builder);
++	if (!tcph)
++		return TEST_ERROR;
++
++	tcph->source = bpf_htons(23445);
++	tcph->dest = FRONTEND_PORT;
++
++	if (!pktgen__push_data(&builder, default_data, sizeof(default_data)))
++		return TEST_ERROR;
++
++	pktgen__finish(&builder);
++
++	return 0;
++}
++
++#define SVC_KEY_VALUE(_beslot, _beid, _scope)				\
++	{								\
++		.key = {.address = FRONTEND_IP,				\
++			.dport = FRONTEND_PORT,				\
++			.sco

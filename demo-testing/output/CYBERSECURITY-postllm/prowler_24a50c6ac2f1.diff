@@ -1,0 +1,118 @@
+@@ -78,3 +78,21 @@ def custom_exception_handler(exc, context):
+                 message_item["message"] for message_item in exc.detail["messages"]
+             ]
+     return exception_handler(exc, context)
++
++
++class ConflictException(APIException):
++    status_code = status.HTTP_409_CONFLICT
++    default_detail = "A conflict occurred. The resource already exists."
++    default_code = "conflict"
++
++    def __init__(self, detail=None, code=None, pointer=None):
++        error_detail = {
++            "detail": detail or self.default_detail,
++            "status": self.status_code,
++            "code": self.default_code,
++        }
++
++        if pointer:
++            error_detail["source"] = {"pointer": pointer}
++
++        super().__init__(detail=[error_detail])
+
+
+
+
+@@ -5494,6 +5494,30 @@ class TestScheduleViewSet:
+         )
+         assert response.status_code == status.HTTP_404_NOT_FOUND
+ 
++    @patch("api.v1.views.Task.objects.get")
++    def test_schedule_daily_already_scheduled(
++        self,
++        mock_task_get,
++        authenticated_client,
++        providers_fixture,
++        tasks_fixture,
++    ):
++        provider, *_ = providers_fixture
++        prowler_task = tasks_fixture[0]
++        mock_task_get.return_value = prowler_task
++        json_payload = {
++            "provider_id": str(provider.id),
++        }
++        response = authenticated_client.post(
++            reverse("schedule-daily"), data=json_payload, format="json"
++        )
++        assert response.status_code == status.HTTP_202_ACCEPTED
++
++        response = authenticated_client.post(
++            reverse("schedule-daily"), data=json_payload, format="json"
++        )
++        assert response.status_code == status.HTTP_409_CONFLICT
++
+ 
+ @pytest.mark.django_db
+ class TestIntegrationViewSet:
+
+
+
+
+@@ -2,10 +2,10 @@ import json
+ from datetime import datetime, timedelta, timezone
+ 
+ from django_celery_beat.models import IntervalSchedule, PeriodicTask
+-from rest_framework_json_api.serializers import ValidationError
+ from tasks.tasks import perform_scheduled_scan_task
+ 
+ from api.db_utils import rls_transaction
++from api.exceptions import ConflictException
+ from api.models import Provider, Scan, StateChoices
+ 
+ 
+@@ -24,15 +24,9 @@ def schedule_provider_scan(provider_instance: Provider):
+     if PeriodicTask.objects.filter(
+         interval=schedule, name=task_name, task="scan-perform-scheduled"
+     ).exists():
+-        raise ValidationError(
+-            [
+-                {
+-                    "detail": "There is already a scheduled scan for this provider.",
+-                    "status": 400,
+-                    "source": {"pointer": "/data/attributes/provider_id"},
+-                    "code": "invalid",
+-                }
+-            ]
++        raise ConflictException(
++            detail="There is already a scheduled scan for this provider.",
++            pointer="/data/attributes/provider_id",
+         )
+ 
+     with rls_transaction(tenant_id):
+
+
+
+
+@@ -3,9 +3,9 @@ from unittest.mock import patch
+ 
+ import pytest
+ from django_celery_beat.models import IntervalSchedule, PeriodicTask
+-from rest_framework_json_api.serializers import ValidationError
+ from tasks.beat import schedule_provider_scan
+ 
++from api.exceptions import ConflictException
+ from api.models import Scan
+ 
+ 
+@@ -48,8 +48,8 @@ class TestScheduleProviderScan:
+         with patch("tasks.tasks.perform_scheduled_scan_task.apply_async"):
+             schedule_provider_scan(provider_instance)
+ 
+-        # Now, try scheduling again, should raise ValidationError
+-        with pytest.raises(ValidationError) as exc_info:
++        # Now, try scheduling again, should raise ConflictException
++        with pytest.raises(ConflictException) as exc_info:
+             schedule_provider_scan(provider_instance)
+ 
+         assert "There is already a scheduled scan for this provider." in str(

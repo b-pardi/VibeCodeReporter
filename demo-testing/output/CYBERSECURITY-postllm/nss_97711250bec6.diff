@@ -1,0 +1,99 @@
+@@ -408,8 +408,8 @@ SECStatus SSLInt_AdvanceWriteSeqNum(PRFileDesc *fd, PRUint64 to) {
+       pk11ctxt->ivFixedBits = cipher_def->iv_size * BPB;
+       pk11ctxt->ivGen = CKG_GENERATE_COUNTER;
+     }
+-    /* DTLS included the epoch in the fixed portion of the IV */
+-    if (IS_DTLS(ss)) {
++    /* DTLS1.2 and below included the epoch in the fixed portion of the IV */
++    if (IS_DTLS_1_OR_12(ss)) {
+       pk11ctxt->ivFixedBits += 2 * BPB;
+     }
+   }
+
+
+
+
+@@ -83,6 +83,11 @@ bool TlsCipherSpec::Unprotect(const TlsRecordHeader& header,
+     seqno = out_header->sequence_number();
+   }
+ 
++  if (header.is_dtls() && (header.version() >= SSL_LIBRARY_VERSION_TLS_1_3)) {
++    // Removing the epoch (16 first bits)
++    seqno = seqno & 0xffffffffffff;
++  }
++
+   auto header_bytes = out_header->header();
+   rv = SSL_AeadDecrypt(aead_.get(), seqno, header_bytes.data(),
+                        header_bytes.len(), ciphertext.data(), ciphertext.len(),
+@@ -115,6 +120,11 @@ bool TlsCipherSpec::Protect(const TlsRecordHeader& header,
+   (void)header.WriteHeader(&header_bytes, 0, plaintext.len() + 16);
+   uint64_t seqno = dtls_ ? header.sequence_number() : out_seqno_;
+ 
++  if (header.is_dtls() && (header.version() >= SSL_LIBRARY_VERSION_TLS_1_3)) {
++    // Removing the epoch (16 first bits)
++    seqno = seqno & 0xffffffffffff;
++  }
++
+   SECStatus rv =
+       SSL_AeadEncrypt(aead_.get(), seqno, header_bytes.data(),
+                       header_bytes.len(), plaintext.data(), plaintext.len(),
+
+
+
+
+@@ -1731,10 +1731,10 @@ ssl3_BuildRecordPseudoHeader(DTLSEpoch epoch,
+                              SSL3ProtocolVersion version,
+                              PRBool isDTLS,
+                              int length,
+-                             sslBuffer *buf)
++                             sslBuffer *buf, SSL3ProtocolVersion v)
+ {
+     SECStatus rv;
+-    if (isDTLS) {
++    if (isDTLS && v < SSL_LIBRARY_VERSION_TLS_1_3) {
+         rv = sslBuffer_AppendNumber(buf, epoch, 2);
+         if (rv != SECSuccess) {
+             return SECFailure;
+@@ -2140,11 +2140,10 @@ ssl3_MACEncryptRecord(ssl3CipherSpec *cwSpec,
+         rv = sslBuffer_Skip(wrBuf, len, NULL);
+         PORT_Assert(rv == SECSuccess); /* Can't fail. */
+     }
+-
+     rv = ssl3_BuildRecordPseudoHeader(
+         cwSpec->epoch, cwSpec->nextSeqNum, ct,
+         cwSpec->version >= SSL_LIBRARY_VERSION_TLS_1_0, cwSpec->recordVersion,
+-        isDTLS, contentLen, &pseudoHeader);
++        isDTLS, contentLen, &pseudoHeader, cwSpec->version);
+     PORT_Assert(rv == SECSuccess);
+     if (cwSpec->cipherDef->type == type_aead) {
+         const unsigned int nonceLen = cwSpec->cipherDef->explicit_nonce_size;
+@@ -2171,7 +2170,7 @@ ssl3_MACEncryptRecord(ssl3CipherSpec *cwSpec,
+             ivOffset = ivLen;
+             gen = CKG_GENERATE_COUNTER;
+         }
+-        ivOffset = tls13_SetupAeadIv(isDTLS, ivOut, cwSpec->keyMaterial.iv,
++        ivOffset = tls13_SetupAeadIv(isDTLS, cwSpec->version, ivOut, cwSpec->keyMaterial.iv,
+                                      ivOffset, ivLen, cwSpec->epoch);
+         rv = tls13_AEAD(cwSpec->cipherContext,
+                         PR_FALSE,
+@@ -13196,7 +13195,7 @@ ssl3_UnprotectRecord(sslSocket *ss,
+ 
+         rv = ssl3_BuildRecordPseudoHeader(
+             spec->epoch, cText->seqNum,
+-            rType, isTLS, rVersion, IS_DTLS(ss), decryptedLen, &header);
++            rType, isTLS, rVersion, IS_DTLS(ss), decryptedLen, &header, spec->version);
+         PORT_Assert(rv == SECSuccess);
+ 
+         /* build the iv */
+@@ -13265,7 +13264,7 @@ ssl3_UnprotectRecord(sslSocket *ss,
+         rv = ssl3_BuildRecordPseudoHeader(
+             spec->epoch, cText->seqNum,
+             rType, isTLS, rVersion, IS_DTLS(ss),
+-            plaintext->len - spec->macDef->mac_size, &header);
++            plaintext->len - spec->macDef->mac_size, &header, spec->version);
+         PORT_Assert(rv == SECSuccess);
+         if (cipher_def->type == type_block) {
+             rv = ssl3_ComputeRecordMACConstantTime(
+
+
+

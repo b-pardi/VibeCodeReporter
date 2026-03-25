@@ -1,0 +1,111 @@
+@@ -29,7 +29,9 @@ class DB {
+   struct timeval lastUpdateTime;
+   float exportRate;
+   u_int64_t exportedFlows, lastExportedFlows;
+-  u_int32_t droppedFlows, queueDroppedFlows;
++  /* Multiple threads can inc in case of view interfaces */
++  std::atomic<u_int32_t> droppedFlows;
++  std::atomic<u_int32_t> queueDroppedFlows;
+   u_int64_t checkpointExportedFlows;
+   u_int32_t checkpointDroppedFlows, checkpointQueueDroppedFlows;
+ 
+
+
+
+
+@@ -542,7 +542,7 @@ class Flow : public GenericHashEntry {
+ 	     const ICMPinfo * const icmp_info,
+ 	     bool *src2srv_direction) const;
+   void sumStats(nDPIStats *ndpi_stats, FlowStats *stats);
+-  bool dumpFlow(time_t t, NetworkInterface *dumper, bool last_dump_before_free);
++  bool dumpFlow(time_t t, bool last_dump_before_free);
+   bool match(AddressTree *ptree);
+   void dissectHTTP(bool src2dst_direction, char *payload, u_int16_t payload_len);
+   void dissectDNS(bool src2dst_direction, char *payload, u_int16_t payload_len);
+
+
+
+
+@@ -437,7 +437,7 @@ class NetworkInterface : public AlertableEntity {
+ 			LocalTrafficStats *_localStats, nDPIStats *_ndpiStats,
+ 			PacketStats *_pktStats, TcpPacketStats *_tcpPacketStats,
+ 			ProtoStats *_discardedProbingStats, DSCPStats *_dscpStats) const;
+-
++  inline DB *getDB() const         { return db;                  };
+   inline EthStats* getStats()      { return(&ethStats);          };
+   inline int get_datalink()        { return(pcap_datalink_type); };
+   inline void set_datalink(int l)  { pcap_datalink_type = l;     };
+@@ -686,7 +686,7 @@ class NetworkInterface : public AlertableEntity {
+ 
+   void getFlowsStatus(lua_State *vm);
+   inline void startDBLoop() { if(db) db->startDBLoop(); };
+-  inline void incDBNumDroppedFlows(u_int num = 1) { if(db) db->incNumDroppedFlows(num); };
++  inline void incDBNumDroppedFlows(DB *dumper, u_int num = 1) { if(dumper) dumper->incNumDroppedFlows(num); };
+ #ifdef NTOPNG_PRO
+   inline void getFlowDevices(lua_State *vm) {
+     if(flow_interfaces_stats) flow_interfaces_stats->luaDeviceList(vm); else lua_newtable(vm);
+@@ -847,8 +847,9 @@ class NetworkInterface : public AlertableEntity {
+   void updateFlowPeriodicity(Flow *f);
+ #endif
+ 
+-  inline void incNumQueueDroppedFlows(u_int32_t num)  { if(db) db->incNumQueueDroppedFlows(num); };
+-  void dumpFlowLoop();
++  void incNumQueueDroppedFlows(u_int32_t num);
++  u_int64_t dequeueFlowsForDump(u_int idle_flows_budget, u_int active_flows_budget);
++  virtual void dumpFlowLoop();
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -85,6 +85,7 @@ class ViewInterface : public NetworkInterface {
+   				u_int16_t src_port, u_int16_t dst_port,
+ 				u_int8_t l4_proto,
+ 				AddressTree *allowed_hosts) const;
++  void dumpFlowLoop();
+ };
+ 
+ #endif /* _VIEW_INTERFACE_H_ */
+
+
+
+
+@@ -1043,6 +1043,12 @@ extern struct ntopngLuaContext* getUserdata(struct lua_State *vm);
+ 
+ #define COMPANION_QUEUE_LEN          4096
+ 
++/*
++  Queue lengths for flow-dump-related queues
++ */
++#define MAX_IDLE_FLOW_QUEUE_LEN      131072
++#define MAX_ACTIVE_FLOW_QUEUE_LEN    131072
++
+ #ifdef NTOPNG_EMBEDDED_EDITION
+ #define DEFAULT_THREAD_POOL_SIZE     1
+ #define MAX_THREAD_POOL_SIZE         1
+
+
+
+
+@@ -1218,7 +1218,7 @@ char* Flow::print(char *buf, u_int buf_len) const {
+ 
+ /* *************************************** */
+ 
+-bool Flow::dumpFlow(time_t t, NetworkInterface *dumper_iface, bool last_dump_before_free) {
++bool Flow::dumpFlow(time_t t, bool last_dump_before_free) {
+   bool rc = false;
+    
+   if(!ntop->getPrefs()->is_tiny_flows_export_enabled() && isTiny()) {
+@@ -1239,8 +1239,8 @@ bool Flow::dumpFlow(time_t t, NetworkInterface *dumper_iface, bool last_dump_bef
+   }
+ 
+   if(!last_dump_before_free) {
+-    if((dumper_iface->getIfType() == interface_type_PCAP_DUMP
+-	&& (!dumper_iface->read_from_pcap_dump_done()))
++    if((getInterface()->getIfType() == interface_type_PCAP_DUMP
++	&& (!getInterface()->read_from_pcap_dump_done()))
+        || timeToPeriodicDump(t)) {
+       return(rc); /* Don't call too often periodic flow dump */
+   

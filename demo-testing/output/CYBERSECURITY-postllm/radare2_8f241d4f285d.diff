@@ -1,0 +1,158 @@
+@@ -719,244 +719,330 @@ static char *get_section_string(RBin *bin, RBinSection * section, size_t offset)
+ 	return res;
+ }
+ 
++typedef struct entry_descriptor {
++	ut64 type;
++	ut64 form;
++} entry_descriptor;
++
++#define MAX_V5_DESCRIPTORS 7
++
++typedef struct entry_formatv5 {
++	int ndesc;
++	entry_descriptor descs[MAX_V5_DESCRIPTORS];
++} entry_formatv5;
++
++// Parse v5 directory/file content description into ent.
++static const ut8 *parse_line_entryv5(const ut8 *buf, const ut8 *buf_end, entry_formatv5 *ent) {
++	if (ent == NULL) {
++		return NULL;
++	}
++
++	ut8 nform = READ8 (buf);
++	if (nform >= MAX_V5_DESCRIPTORS) {
++		R_LOG_WARN ("Too many entry formats: %d >= %d", nform, MAX_V5_DESCRIPTORS);
++		return NULL;
++	}
++	ent->ndesc = 0;
++	int i;
++	for (i = 0; i < nform; i++) {
++		entry_descriptor *e = &ent->descs[i];
++		const ut8 *nbuf = r_uleb128 (buf, buf_end - buf, &e->type, NULL);
++		if (!nbuf || buf == nbuf) {
++			return NULL;
++		}
++
++		buf = nbuf;
++		nbuf = r_uleb128 (buf, buf_end - buf, &e->form, NULL);
++		if (!nbuf || buf == nbuf) {
++			return NULL;
++		}
++		buf = nbuf;
++		ent->ndesc++;
++	}
++	return buf;
++};
++
++static const ut8 *ut64_form_value(entry_descriptor desc, const ut8 *buf, const ut8 *buf_end, ut64 *val, bool be) {
++	const ut8 *nbuf = NULL;
++	ut64 data = 0;
++
++	switch (desc.form) {
++	case DW_FORM_udata:
++		nbuf = r_uleb128 (buf, buf_end - buf, &data, NULL);
++		if (!nbuf || nbuf == buf) {
++			return NULL;
++		}
++		*val = data;
++		return nbuf;
++	case DW_FORM_data1:
++		if (buf + 1 >= buf_end) {
++			return NULL;
++		}
++		*val = buf[0];
++		buf += 1;
++		return buf;
++	case DW_FORM_data2:
++		if (buf + 2 >= buf_end) {
++			return NULL;
++		}
++		*val = r_read_ble16 (buf, be);
++		buf += 2;
++		return buf;
++	case DW_FORM_data4:
++		if (buf + 4 >= buf_end) {
++			return NULL;
++		}
++		*val = r_read_ble32 (buf, be);
++		buf += 4;
++		return buf;
++	case DW_FORM_data8:
++		if (buf + 8 >= buf_end) {
++			return NULL;
++		}
++		*val = r_read_ble64 (buf, be);
++		buf += 8;
++		return buf;
++	default:
++		R_LOG_DEBUG ("Expected data form but got: %#x", desc.form);
++		return NULL;
++	}
++}
++
++static const ut8 *str_form_value(entry_descriptor desc, RBin *bin, const ut8 *buf, const ut8 *buf_end, char **v, bool be, bool is_64bit) {
++	const size_t maxlen = 0xfff;
++	char *name = NULL;
++	ut64 section_offset = 0;
++	RBinSection *section = NULL;
++
++	switch (desc.form) {
++	case DW_FORM_line_strp:
++		section_offset = dwarf_read_offset (is_64bit, &buf, buf_end, be);
++		section = getsection (bin, DWARF_SN_LINE_STR);
++		name = get_section_string (bin, section, section_offset);
++		if (name == NULL) {
++			return NULL;
++		}
++		r_str_ansi_strip (name);
++		r_str_replace_ch (name, '\n', 0, true);
++		r_str_replace_ch (name, '\t', 0, true);
++		*v = name;
++		return buf;
++	case DW_FORM_strp:
++		section_offset = dwarf_read_offset (is_64bit, &buf, buf_end, be);
++		section = getsection (bin, DWARF_SN_STR);
++		name = get_section_string (bin, section, section_offset);
++		if (name == NULL) {
++			return NULL;
++		}
++		r_str_ansi_strip (name);
++		r_str_replace_ch (name, '\n', 0, true);
++		r_str_replace_ch (name, '\t', 0, true);
++		*v = name;
++		return buf;
++	case DW_FORM_strp_sup:
++		// TODO: handle this properly
++		dwarf_read_offset (is_64bit, &buf, buf_end, be);
++		return buf;
++	case DW_FORM_string:
++		// TODO: find a way to test this case.
++		if (buf == NULL || buf >= buf_end) {
++			return NULL;
++		}
++		const int len = R_MIN (maxlen, (buf_end - buf));
++		if (len < 0) {
++			return NULL;
++		}
++		*v = r_str_ndup ((const char *)buf, len);
++		buf += len + 1;
++		return buf;
++	default:
++		R_LOG_DEBUG ("Expected form type string but got: %#x", desc.form);
++		return NULL;
++	}
++};
++
++static const ut8 *data16_form_value(entry_descriptor desc, const ut8 *buf, const ut8 *buf_end, ut8 val[16]) {
++	if (desc.form != DW_FORM_data16) {
++		R_LOG_DEBUG ("Expected form type data16 but got: %#x", desc.form);
++		return NULL;
++	}
++	if (buf + 16 >= buf_end) {
++		return NULL;
++	}
++
++	memcpy (val, buf, 16);
++	buf += 16;
++

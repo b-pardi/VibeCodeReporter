@@ -1,0 +1,102 @@
+@@ -165,10 +165,6 @@ bool BlastDataToStorageDaemon(JobControlRecord* jcr, crypto_cipher_t cipher)
+     jcr->fd_impl->xattr_data->u.build->content = GetPoolMemory(PM_MESSAGE);
+   }
+ 
+-  // enable the use of some workers
+-  auto num_workers = std::thread::hardware_concurrency() / 2;
+-  jcr->fd_impl->pool.ensure_num_workers(num_workers);
+-
+   // Subroutine SaveFile() is called for each file
+   if (!FindFiles(jcr, (FindFilesPacket*)jcr->fd_impl->ff, SaveFile,
+                  PluginSave)) {
+@@ -1054,6 +1050,29 @@ static result<std::size_t> SendData(BareosSocket* sd,
+   return size;
+ }
+ 
++struct message {
++  PoolMem backing{PM_MESSAGE};
++  std::size_t header_size{0};
++  std::size_t data_size{0};
++
++  message(std::size_t header_size) : header_size{header_size} {}
++
++  void reserve(std::size_t max_data_size)
++  {
++    backing.check_size(header_size + max_data_size);
++  }
++
++  char* header() { return backing.addr(); }
++
++  char* data() { return backing.addr() + header_size; }
++
++  const char* header() const { return backing.c_str(); }
++
++  const char* data() const { return backing.c_str() + header_size; }
++
++  std::size_t size() const { return header_size + data_size; }
++};
++
+ // Send the content of a file on anything but an EFS filesystem.
+ static inline bool SendPlainData(b_ctx& bctx)
+ {
+@@ -1066,8 +1085,9 @@ static inline bool SendPlainData(b_ctx& bctx)
+   // Currently we do not support encryption while doing
+   // parallel sending/checksumming/compression/etc.
+   // This is mostly because EncryptData() is weird!
+-  // FIXME(ssura): change this
+   if (BitIsSet(FO_ENCRYPT, flags)) { return SendPlainDataSerially(bctx); }
++
++  // Setting up the parallel pipeline is not worth it for small files.
+   if (file_size < 128 * 1024) { return SendPlainDataSerially(bctx); }
+ 
+   bool retval = false;
+@@ -1093,53 +1113,108 @@ static inline bool SendPlainData(b_ctx& bctx)
+     };
+   }
+ 
+-  DIGEST* checksum = bctx.digest;
+-  DIGEST* signing = bctx.signing_digest;
++  auto& threadpool = bctx.jcr->fd_impl->threads;
++  work_group compute_group(20);
++  const std::size_t num_workers = std::thread::hardware_concurrency() / 2;
+ 
+-  size_t bytes_read{0};
++  // FIXME(ssura): this should become a std::latch once C++20 arrives
++  std::condition_variable compute_fin;
++  synchronized<std::size_t> latch{num_workers};
++  threadpool.borrow_threads(num_workers,
++                            [&latch, &compute_group, &compute_fin] {
++                              compute_group.work_until_completion();
+ 
+-  thread_pool& pool = bctx.jcr->fd_impl->pool;
++                              *latch.lock() -= 1;
++                              compute_fin.notify_one();
++                            });
+ 
+-  std::optional<std::future<void>> update_digest;
++  using shared_message = std::shared_ptr<const message>;
+ 
+   // FIXME(ssura): How big should the buffer be ?
+-  auto [in, out] = channel::CreateBufferedChannel<
+-      std::future<result<std::pair<PoolMem, std::size_t>>>>(5);
+-
+-  // FIXME(ssura): We have to wrap out in a shared_ptr, because borrow_thread
+-  //               needs a copyable function.  Once we move to
+-  //               move_only_function we can remove this.
+-  std::shared_ptr chunks = std::make_shared<decltype(out)>(std::move(out));
+-  std::future<result<std::size_t>> bytes_send_fut = borrow_thread(
+-      pool, [chunks = std::move(chunks), sd]() mutable -> result<size_t> {
++  auto [in, out]
++      = channel::CreateBufferedChannel<std::future<result<shared_message>>>(
++          num_workers);
++
++  std::promise<result<std::size_t>> promise{};
++  std::future bytes_send_fut = promise.get_future();
++  threadpool.borrow_thread(
++      [prom = std::move(promise), out = std::move(out), sd]() mutable {
+         std::size_t accumulated = 0;
+-        for (std::optional fut = chunks->get(); fut.has_value();
+-             fut = chunks->get()) {
++        for (std::optional fut = out.get(); fut.has_value(); fut = out.get()) {
+           result p = fut->get();
+-          if (

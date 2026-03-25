@@ -1,0 +1,94 @@
+@@ -123,6 +123,20 @@ class Operation(BaseObject):
+                 if await self._trust_issues(member):
+                     break
+ 
++    async def wait_for_links_completion(self, link_paws):
++        """
++        Wait for started links to be completed
++        :param link_paws:
++        :return: None
++        """
++        for link_paw in link_paws:
++            link = [link for link in self.chain if link.paw == link_paw][0]
++            member = [member for member in self.agents if member.paw == link_paw][0]
++            while (not link.finish and not link.status == link.states["DISCARD"]):
++                await asyncio.sleep(5)  #TODO: Make this configurable in planner file
++                if await self._trust_issues(member):
++                    break
++
+     """ PRIVATE """
+ 
+     async def _trust_issues(self, agent):
+
+
+
+
+@@ -109,7 +109,7 @@ class AppService(BaseService):
+ 
+     async def _cleanup_operation(self, operation):
+         for member in operation.agents:
+-            for link in await self.get_service('planning_svc').select_cleanup_links(operation, member):
++            for link in await self.get_service('planning_svc').get_cleanup_links(operation, member):
+                 operation.add_link(link)
+         await operation.wait_for_phase_completion()
+ 
+
+
+
+
+@@ -4,150 +4,98 @@ import re
+ from base64 import b64decode
+ 
+ from app.objects.c_link import Link
+-from app.utility.base_service import BaseService
++from app.utility.base_planning_svc import BasePlanningService
+ from app.utility.rule import RuleSet
+ 
+ 
+-class PlanningService(BaseService):
++class PlanningService(BasePlanningService):
+ 
+     def __init__(self):
+         self.log = self.add_service('planning_svc', self)
+ 
+-    async def select_links(self, operation, agent, phase):
++    async def get_links(self, operation, phase=None, agent=None, trim=True):
+         """
+-        For an operation, phase and agent combination, determine which (potential) links can be executed
++        For an operation, phase and agent combination, create links (that can be executed).
++        When no agent is supplied, links for all agents are returned
+         :param operation:
+-        :param agent:
+         :param phase:
++        :param agent:
++        :param trim: call trim_links() on list of links before returning
+         :return: a list of links
+         """
+-        if (not agent.trusted) and (not operation.allow_untrusted):
+-            self.log.debug('Agent %s untrusted: no link created' % agent.paw)
+-            return []
+-        phase_abilities = [i for p, v in operation.adversary.phases.items() if p <= phase for i in v]
++        if phase:
++            abilities = [i for p, v in operation.adversary.phases.items() if p <= phase for i in v]
++        else:
++            abilities = [i for p, v in operation.adversary.phases.items() for i in v]
++    
+         link_status = await self._default_link_status(operation)
+-
+         links = []
+-        for a in await agent.capabilities(phase_abilities):
+-            links.append(
+-                Link(operation=operation.id, command=a.test, paw=agent.paw, score=0, ability=a,
+-                     status=link_status, jitter=self.jitter(operation.jitter))
+-            )
+-        ability_requirements = {ab.unique: ab.requirements for ab in phase_abilities}
+-        links[:] = await self._trim_links(operation, links, agent, ability_requirements)
++        if agent and await self._check_untrusted_agents_allowed(agent=agent, operation=operation, msg='no link created'):
++            links.extend(await self._generate_new_links(operation, agent, abilities, link_status))
++        else:
++            for agent in operation.agents:
++                if await self._check_untrusted_agents_allowed(agent=agent, operation=operation, msg='no link created'):
++                    links.extend(await self._generate_new_links(operation, agent, abilities, link_status))
++
++        if trim:
++            ability_requirements = {ab.unique: ab.requirements for a

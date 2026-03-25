@@ -1,0 +1,124 @@
+@@ -9,14 +9,6 @@ regs = None
+ def load_aglib():
+     import pwndbg.aglib.argv
+     import pwndbg.aglib.ctypes
+-    import pwndbg.aglib.disasm
+-    import pwndbg.aglib.disasm.aarch64
+-    import pwndbg.aglib.disasm.arm
+-    import pwndbg.aglib.disasm.mips
+-    import pwndbg.aglib.disasm.ppc
+-    import pwndbg.aglib.disasm.riscv
+-    import pwndbg.aglib.disasm.sparc
+-    import pwndbg.aglib.disasm.x86
+     import pwndbg.aglib.dynamic
+     import pwndbg.aglib.elf
+     import pwndbg.aglib.file
+
+
+
+
+@@ -1,508 +0,0 @@
+-"""
+-Functionality for disassmebling code at an address, or at an
+-address +/- a few instructions.
+-"""
+-
+-from __future__ import annotations
+-
+-import collections
+-import re
+-import sys
+-from typing import DefaultDict
+-from typing import List
+-from typing import Set
+-from typing import Tuple
+-
+-import capstone
+-from capstone import *  # noqa: F403
+-
+-import pwndbg
+-import pwndbg.aglib.arch
+-import pwndbg.aglib.disasm.arch
+-import pwndbg.aglib.memory
+-import pwndbg.emu.emulator
+-import pwndbg.lib.cache
+-from pwndbg.aglib.disasm.arch import DEBUG_ENHANCEMENT
+-from pwndbg.aglib.disasm.instruction import ManualPwndbgInstruction
+-from pwndbg.aglib.disasm.instruction import PwndbgInstruction
+-from pwndbg.aglib.disasm.instruction import PwndbgInstructionImpl
+-from pwndbg.aglib.disasm.instruction import SplitType
+-from pwndbg.color import message
+-from pwndbg.dbg import EventType
+-
+-if pwndbg.dbg.is_gdblib_available():
+-    import gdb
+-
+-
+-CapstoneArch = {
+-    "arm": CS_ARCH_ARM,
+-    "armcm": CS_ARCH_ARM,
+-    "aarch64": CS_ARCH_AARCH64,
+-    "i386": CS_ARCH_X86,
+-    "i8086": CS_ARCH_X86,
+-    "x86-64": CS_ARCH_X86,
+-    "powerpc": CS_ARCH_PPC,
+-    "mips": CS_ARCH_MIPS,
+-    "sparc": CS_ARCH_SPARC,
+-    "rv32": CS_ARCH_RISCV,
+-    "rv64": CS_ARCH_RISCV,
+-    "s390x": CS_ARCH_SYSTEMZ,
+-}
+-
+-CapstoneEndian = {
+-    "little": CS_MODE_LITTLE_ENDIAN,
+-    "big": CS_MODE_BIG_ENDIAN,
+-}
+-
+-CapstoneMode = {4: CS_MODE_32, 8: CS_MODE_64}
+-
+-CapstoneSyntax = {"intel": CS_OPT_SYNTAX_INTEL, "att": CS_OPT_SYNTAX_ATT}
+-
+-# For variable-instruction-width architectures
+-# (x86 and amd64), we keep a cache of instruction
+-# sizes, and where the end of the instruction falls.
+-#
+-# This allows us to consistently disassemble backward.
+-VariableInstructionSizeMax = {
+-    "i386": 16,
+-    "x86-64": 16,
+-    "i8086": 16,
+-    "mips": 8,
+-    "rv32": 22,
+-    "rv64": 22,
+-    "s390x": 6,
+-}
+-
+-
+-# Caching strategy:
+-# To ensure we don't have stale register/memory information in our cached PwndbgInstruction,
+-# we clear the cache whenever we DON'T do a `stepi`, `nexti`, `step`, or `next` command.
+-# Although `stepi` and `nexti` always go to the next machine instruction in memory, `step` and `next`
+-# can skip over multiple when GDB has debugging symbols and sourcecode
+-# In order to determine that we did a `stepi`, `nexti`, `step`, or `next`, whenever the process stops,
+-# we check if the current program counter is at the address of one of the instructions that we
+-# emulated to the last time the process stopped. This allows use to skips a handful of instruction, but still retain the cache
+-# Any larger changes of the program counter will cause the cache to reset.
+-
+-next_addresses_cache: Set[int] = set()
+-
+-
+-# Register GDB event listeners for all stop events
+-@pwndbg.dbg.event_handler(EventType.STOP)
+-def enhance_cache_listener() -> None:
+-    # Clear the register value cache to ensure we get the correct program counter value
+-    pwndbg.aglib.regs.read_reg.cache.clear()  # type: ignore[attr-defined]
+-
+-    if pwndbg.aglib.regs.pc not in next_addresses_cache:
+-        # Clear the enhanced instruction cache to ensure we don't use stale values
+-        computed_instruction_cache.clear()
+-
+-
+-@pwndbg.dbg.event_handler(EventType.MEMORY_CHANGED)
+-@pwndbg.dbg.event_handler(EventType.REGISTER_CHANGED)
+-def clear_on_reg_mem_change() -> None:
+-    # We clear all the future computed instructions because when we manually change a register or memory, it's o

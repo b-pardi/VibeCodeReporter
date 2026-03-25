@@ -1,0 +1,133 @@
+@@ -24,6 +24,7 @@ public class AssetManager {
+ 
+     public enum OrderColumn {
+ 
++        FIRST_SEEN("first_seen"),
+         LAST_SEEN("last_seen"),
+         MAC("mac");
+ 
+
+
+
+
+@@ -108,6 +108,10 @@ public class ContextService {
+     public Optional<MacAddressContextEntry> findMacAddressContext(String mac,
+                                                                   @Nullable UUID organizationId,
+                                                                   @Nullable UUID tenantId) {
++        if (mac == null) {
++            return Optional.empty();
++        }
++
+         try {
+             return macAddressContextCache.get(MacAddressContextCacheKey.create(mac, organizationId, tenantId));
+         } catch(ExecutionException e) {
+@@ -118,6 +122,10 @@ public class ContextService {
+     public Optional<MacAddressContextEntry> findMacAddressContextNoCache(String mac,
+                                                                          @Nullable UUID organizationId,
+                                                                          @Nullable UUID tenantId) {
++        if (mac == null) {
++            return Optional.empty();
++        }
++
+         try(Timer.Context ignored = macLookupTimer.time()) {
+             if (organizationId != null && tenantId != null) {
+                 // Tenant data.
+
+
+
+
+@@ -23,6 +23,7 @@ import app.nzyme.core.dot11.db.*;
+ import app.nzyme.core.dot11.db.monitoring.*;
+ import app.nzyme.core.dot11.db.monitoring.probereq.MonitoredProbeRequestEntryMapper;
+ import app.nzyme.core.dot11.tracks.db.TrackDetectorConfigMapper;
++import app.nzyme.core.ethernet.arp.db.ArpPacketEntryMapper;
+ import app.nzyme.core.ethernet.dhcp.db.DHCPTransactionMapper;
+ import app.nzyme.core.ethernet.dns.db.*;
+ import app.nzyme.core.ethernet.l4.db.L4SessionMapper;
+@@ -185,7 +186,8 @@ public class DatabaseImpl implements Database {
+                 .registerRowMapper(new AssetHostnameEntryMapper())
+                 .registerRowMapper(new AssetIpAddressEntryMapper())
+                 .registerRowMapper(new UdpConversationEntryMapper())
+-                .registerRowMapper(new L4SessionMapper());
++                .registerRowMapper(new L4SessionMapper())
++                .registerRowMapper(new ArpPacketEntryMapper());
+ 
+         if (configuration.slowQueryLogThreshold().isPresent()) {
+             LOG.info("Slow query log enabled with threshold <{}ms>.", configuration.slowQueryLogThreshold().get());
+
+
+
+
+@@ -1,6 +1,7 @@
+ package app.nzyme.core.ethernet;
+ 
+ import app.nzyme.core.NzymeNode;
++import app.nzyme.core.ethernet.arp.ARP;
+ import app.nzyme.core.ethernet.dhcp.DHCP;
+ import app.nzyme.core.ethernet.dns.DNS;
+ import app.nzyme.core.ethernet.l4.L4;
+@@ -12,6 +13,7 @@ public class Ethernet {
+ 
+     private final NzymeNode nzyme;
+ 
++    private final ARP arp;
+     private final DHCP dhcp;
+     private final L4 l4;
+     private final TCP tcp;
+@@ -21,6 +23,8 @@ public class Ethernet {
+ 
+     public Ethernet(NzymeNode nzyme) {
+         this.nzyme = nzyme;
++
++        this.arp = new ARP(this);
+         this.dhcp = new DHCP(this);
+         this.l4 = new L4(this);
+         this.tcp = new TCP(this);
+@@ -33,6 +37,10 @@ public class Ethernet {
+         return this.nzyme;
+     }
+ 
++    public ARP arp() {
++        return arp;
++    }
++
+     public DHCP dhcp() {
+         return dhcp;
+     }
+
+
+
+
+@@ -2,6 +2,6 @@ package app.nzyme.core.ethernet;
+ 
+ public enum L4Type {
+ 
+-    TCP, UDP
++    TCP, UDP, NONE
+ 
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,92 @@
++package app.nzyme.core.ethernet.arp;
++
++import app.nzyme.core.NzymeNode;
++import app.nzyme.core.database.OrderDirection;
++import app.nzyme.core.ethernet.Ethernet;
++import app.nzyme.core.ethernet.arp.db.ArpPacketEntry;
++import app.nzyme.core.util.TimeRange;
++
++import java.util.Collections;
++import java.util.List;
++import java.util.UUID;
++
++public class ARP {
++
++    public enum OrderColumn {
++
++        TIMESTAMP("timestamp"),
++        ETHERNET_SOURCE_MAC("ethernet_source_mac"),
++        ETHERNET_DES

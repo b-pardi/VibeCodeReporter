@@ -1,0 +1,126 @@
+@@ -115,7 +115,7 @@ class _L2bpfSocket(SuperSocket):
+             )
+ 
+         self.fd_flags = None  # type: Optional[int]
+-        self.assigned_interface = None
++        self.type = type
+ 
+         # SuperSocket mandatory variables
+         if promisc is None:
+@@ -155,7 +155,6 @@ class _L2bpfSocket(SuperSocket):
+             )
+         except IOError:
+             raise Scapy_Exception("BIOCSETIF failed on %s" % self.iface)
+-        self.assigned_interface = self.iface
+ 
+         # Set the interface into promiscuous
+         if self.promisc:
+@@ -466,6 +465,25 @@ class L2bpfSocket(L2bpfListenSocket):
+ 
+ class L3bpfSocket(L2bpfSocket):
+ 
++    def __init__(self,
++                 iface=None,  # type: Optional[_GlobInterfaceType]
++                 type=ETH_P_ALL,  # type: int
++                 promisc=None,  # type: Optional[bool]
++                 filter=None,  # type: Optional[str]
++                 nofilter=0,  # type: int
++                 monitor=False,  # type: bool
++                 ):
++        super(L3bpfSocket, self).__init__(
++            iface=iface,
++            type=type,
++            promisc=promisc,
++            filter=filter,
++            nofilter=nofilter,
++            monitor=monitor,
++        )
++        self.filter = filter
++        self.send_socks = {network_name(self.iface): self}
++
+     def recv(self, x: int = BPF_BUFFER_LENGTH, **kwargs: Any) -> Optional['Packet']:
+         """Receive on layer 3"""
+         r = SuperSocket.recv(self, x, **kwargs)
+@@ -485,12 +503,14 @@ class L3bpfSocket(L2bpfSocket):
+             iff = network_name(conf.iface)
+ 
+         # Assign the network interface to the BPF handle
+-        if self.assigned_interface != iff:
+-            try:
+-                fcntl.ioctl(self.bpf_fd, BIOCSETIF, struct.pack("16s16x", iff.encode()))  # noqa: E501
+-            except IOError:
+-                raise Scapy_Exception("BIOCSETIF failed on %s" % iff)
+-            self.assigned_interface = iff
++        if iff not in self.send_socks:
++            self.send_socks[iff] = L3bpfSocket(
++                iface=iff,
++                type=self.type,
++                filter=self.filter,
++                promisc=self.promisc,
++            )
++        fd = self.send_socks[iff]
+ 
+         # Build the frame
+         #
+@@ -529,12 +549,23 @@ class L3bpfSocket(L2bpfSocket):
+             warning("Cannot write to %s according to the documentation!", iff)
+             return
+         else:
+-            frame = self.guessed_cls() / pkt
++            frame = fd.guessed_cls() / pkt
+ 
+         pkt.sent_time = time.time()
+ 
+         # Send the frame
+-        return L2bpfSocket.send(self, frame)
++        return L2bpfSocket.send(fd, frame)
++
++    @staticmethod
++    def select(sockets, remain=None):
++        # type: (List[SuperSocket], Optional[float]) -> List[SuperSocket]
++        socks = []  # type: List[SuperSocket]
++        for sock in sockets:
++            if isinstance(sock, L3bpfSocket):
++                socks += sock.send_socks.values()
++            else:
++                socks.append(sock)
++        return L2bpfSocket.select(socks, remain=remain)
+ 
+ 
+ # Sockets manipulation functions
+
+
+
+
+@@ -17,7 +17,12 @@ from scapy.automaton import select_objects
+ from scapy.compat import raw, plain_str
+ from scapy.config import conf
+ from scapy.consts import WINDOWS
+-from scapy.data import MTU, ETH_P_ALL
++from scapy.data import (
++    DLT_RAW_ALT,
++    DLT_RAW,
++    ETH_P_ALL,
++    MTU,
++)
+ from scapy.error import (
+     Scapy_Exception,
+     log_loading,
+@@ -78,20 +83,27 @@ _pcap_if_flags = [
+ 
+ 
+ class _L2libpcapSocket(SuperSocket):
+-    __slots__ = ["pcap_fd"]
++    __slots__ = ["pcap_fd", "lvl"]
+ 
+     def __init__(self, fd):
+         # type: (_PcapWrapper_libpcap) -> None
+         self.pcap_fd = fd
+         ll = self.pcap_fd.datalink()
+         if ll in conf.l2types:
+-            self.cls = conf.l2types[ll]
++            self.LL = conf.l2types[ll]
++            if ll in [
++                DLT_RAW,
++                DLT_RAW_ALT,
++

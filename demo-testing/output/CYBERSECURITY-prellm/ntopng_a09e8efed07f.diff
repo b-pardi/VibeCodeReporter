@@ -1,0 +1,105 @@
+@@ -226,14 +226,8 @@ class Flow : public GenericHashEntry {
+   ~Flow();
+ 
+   virtual void set_to_purge(time_t t) {
+-    /* not called from the datapath for flows, so it is only
+-       safe to touch low goodput uses */
+-    if(good_low_flow_detected) {
+-      if(cli_host) cli_host->decLowGoodputFlows(t, true);
+-      if(srv_host) srv_host->decLowGoodputFlows(t, false);
+-    }
+-    
+     GenericHashEntry::set_to_purge(t);
++    postFlowSetPurge(t);
+   };
+ 
+   FlowStatus getFlowStatus();
+@@ -490,6 +484,7 @@ class Flow : public GenericHashEntry {
+   inline bool isIngress2EgressDirection() { return(ingress2egress_direction); }
+ #endif
+   void housekeep();
++  void postFlowSetPurge(time_t t);
+ #ifdef HAVE_EBPF
+   void setProcessInfo(eBPFevent *event, bool client_process);
+ #endif
+
+
+
+
+@@ -124,6 +124,7 @@ class Host : public GenericHashEntry {
+   void updateStats(struct timeval *tv);
+   void incLowGoodputFlows(time_t t, bool asClient);
+   void decLowGoodputFlows(time_t t, bool asClient);
++  inline void incNumAnomalousFlows(bool asClient)   { return(stats->incNumAnomalousFlows(asClient)); };
+   inline u_int16_t get_host_pool()         { return(host_pool_id);   };
+   inline u_int16_t get_vlan_id()           { return(vlan_id);        };
+   char* get_name(char *buf, u_int buf_len, bool force_resolution_if_not_found);
+
+
+
+
+@@ -45,6 +45,7 @@ class HostStats: public Checkpointable, public GenericTrafficElement {
+   /* Written by NetworkInterface::processPacket thread */
+   PacketStats sent_stats, recv_stats;
+   u_int32_t total_num_flows_as_client, total_num_flows_as_server;
++  u_int32_t anomalous_flows_as_client, anomalous_flows_as_server;
+   struct {
+     u_int32_t pktRetr, pktOOO, pktLost, pktKeepAlive;
+   } tcpPacketStats; /* Sent packets */
+@@ -66,6 +67,7 @@ class HostStats: public Checkpointable, public GenericTrafficElement {
+ 
+   virtual void getJSONObject(json_object *my_object, DetailsLevel details_level);
+   inline void incFlagStats(bool as_client, u_int8_t flags)  { if (as_client) sent_stats.incFlagStats(flags); else recv_stats.incFlagStats(flags); };
++  inline void incNumAnomalousFlows(bool as_client)          { if(as_client) anomalous_flows_as_client++; else anomalous_flows_as_server++; };
+   inline nDPIStats* getnDPIStats()                          { return(ndpiStats); };
+ 
+   inline void incRetransmittedPkts(u_int32_t num)   { tcpPacketStats.pktRetr += num;      };
+
+
+
+
+@@ -3594,3 +3594,22 @@ void Flow::setProcessInfo(eBPFevent *event, bool client_process) {
+   }
+ }
+ #endif
++
++/* ***************************************************** */
++
++/* Called when a flow is set_to_purge */
++void Flow::postFlowSetPurge(time_t t) {
++  /* not called from the datapath for flows, so it is only
++     safe to touch low goodput uses */
++  if(good_low_flow_detected) {
++    if(cli_host) cli_host->decLowGoodputFlows(t, true);
++    if(srv_host) srv_host->decLowGoodputFlows(t, false);
++  }
++
++  FlowStatus status = getFlowStatus();
++
++  if(status != status_normal) {
++    if(cli_host) cli_host->incNumAnomalousFlows(true);
++    if(srv_host) srv_host->incNumAnomalousFlows(false);
++  }
++}
+
+
+
+
+@@ -38,6 +38,7 @@ HostStats::HostStats(Host *_host) {
+   last_update_time.tv_sec = 0, last_update_time.tv_usec = 0;
+ 
+   total_num_flows_as_client = total_num_flows_as_server = 0;
++  anomalous_flows_as_client = anomalous_flows_as_server = 0;
+   checkpoint_set = false;
+   checkpoint_sent_bytes = checkpoint_rcvd_bytes = 0;
+   memset(&tcpPacketStats, 0, sizeof(tcpPacketStats));
+@@ -58,10 +59,13 @@ HostStats::~HostStats() {
+ 
+ /* *************************************** */
+ 
++/* NOTE: check out LocalHostStats for deserialization */
+ void HostStats::getJSONObject(json_object *my_object, DetailsLevel details_level) {
+   if(details_level >= details_high) {
+     json_object_object_add(my_object, "flows.as_client", json_object_new_int(total_num_flows_as_client));
+     json_object_object_add(my_object, "flows.as_server", json_object_new_int(total_num_flows_as_server));
++    json_o

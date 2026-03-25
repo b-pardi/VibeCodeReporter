@@ -1,0 +1,127 @@
+@@ -79,7 +79,7 @@ static void __anal_hint_tree_calc_max_addr(RBNode *node) {
+ }
+ #endif
+ 
+-static int __anal_hint_range_tree_cmp(const void *a_, const RBNode *b_) {
++static int __anal_hint_range_tree_cmp(const void *a_, const RBNode *b_, void *user) {
+ 	const RAnalRange *a = a_;
+ 	const RAnalRange *b = container_of (b_, const RAnalRange, rb);
+ 	if (a && b) {
+@@ -120,7 +120,7 @@ static bool __anal_range_hint_tree_delete(RBNode **root, RAnalRange *data) {
+ static void __anal_range_hint_tree_insert(RBNode **root, RAnalRange *range) {
+ 	r_rbtree_aug_insert (root, range, &(range->rb),
+ 			     __anal_hint_range_tree_cmp,
+-			     NULL);
++			     NULL, NULL);
+ }
+ 
+ static void __anal_add_range_on_hints(RAnal *a, ut64 addr, int bits) {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,682 @@
++#include <r_types.h>
++#include <r_util.h>
++#include <r_anal.h>
++
++/*	shared internal state of the subgraph generating functions	*/
++
++typedef struct esil_cfg_generator_t {
++	RAnalEsil *esil;
++	union {
++		RStack *ifelse;
++		RStack *vals;
++	};
++	// union for semantic purposes
++	RContRBTree *blocks;
++	// consider moving this to cfg? well, yes and no.
++	// making Graph nodes fast available in RAnalEsilCFG is great idea
++	// A balanced tree is only best solution, if we want to store and lookup intervals
++	// We need to look for intervals, so that we can resolve goto destinations INSIDE of a cpu-instruction
++	// After an instruction got graphed, we only need their entry node (nodes with first == {xxx, 0 })
++	// So after graphing an instruction, the blocks-tree should be cleared (don't free the content)
++	// 	and nodes with first == {xxx, 0} should be stored in an sdb or similar in cfg, with xxx as key
++	RAnalEsilCFG *cfg;
++	RGraphNode *cur;
++	// current graph-node, so that I don't have to abuse cfg->start
++	RIDStorage *atoms;
++	// is this needed
++	ut64 off;
++	// is this needed
++} EsilCfgGen;
++
++// esil has support for multiple elses,
++// so we need these cookies on the ifelse-stack to keep track of things:
++// when entering an if-block the parent is set as the else_block
++// when entering an else block it is set as else_block, if is_else is false, other wise as if_block
++// when entering an else block is_else flips
++typedef struct esil_cfg_scope_cookie_t {
++	RGraphNode *if_block;
++	RGraphNode *else_block;
++	bool is_else;
++} EsilCfgScopeCookie;
++
++typedef enum {
++	ESIL_VAL_CONST,
++	ESIL_VAL_REG,
++	ESIL_VAL_RESULT
++} EsilValType;
++
++typedef struct esil_value_t {
++	ut64 val; //should be a union, but for goto-analysis ut64 is fine
++	EsilValType type;
++} EsilVal;
++
++/*	HELPERS 	*/
++
++static char *condrets_strtok(char *str, const char tok) {
++	if (!str) {
++		return NULL;
++	}
++	ut32 i = 0;
++	while (1 == 1) {
++		if (!str[i]) {
++			break;
++		}
++		if (str[i] == tok) {
++			str[i] = '\0';
++			return &str[i + 1];
++		}
++		i++;
++	}
++	return NULL;
++}
++
++RAnalEsilOp *esil_get_op (RAnalEsil *esil, const char *op) {
++	r_return_val_if_fail (op && strlen (op) && esil && esil->ops, NULL);
++	char t[128];
++	char *h = sdb_itoa (sdb_hash (op), t, 16);
++	return (RAnalEsilOp *)(size_t)sdb_num_get (esil->ops, h, 0);
++}
++
++// this little thot atomizes an esil expressions by splitting it on ','
++static void esil_expr_atomize(RIDStorage *atoms, char *expr) {
++	ut32 forget_me;
++	for (
++		; !!expr && r_id_storage_add (atoms, expr, &forget_me);
++		expr = condrets_strtok (expr, ',')) {
++	}
++}
++
++static void _free_bb_cb(void *data) {
++	RAnalEsilBB *bb = (RAnalEsilBB *)data;
++	free (bb->expr);
++	free (bb);
++}
++
++// REMINDER: generating the block content needs to prepend setting the program counter
++// r_anal_esil_cfg_op does this ^, use it whenever generating cfg from op
++
++// this nasty function is an insert-compare for RGraphNodes that contain RAnalEsilBB
++static int _graphnode_esilbb_insert_cmp(void *incoming, void *in, void *user) {
++	RGraphNode *incoming_gnode = (RGraphNode *)incoming;
++	RGraphNode *in_gnode = (RGraphNode *)in;
++	RAnalEsilBB *incoming_bb = (RAnalEsilBB *)incoming_gnode->data;
++	RA

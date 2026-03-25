@@ -1,0 +1,123 @@
+@@ -32,6 +32,11 @@ typedef struct {
+   u_int64_t last, next;
+ } TCPSeqNum;
+ 
++typedef struct {
++  /* 0...254, 255 means more events */
++  u_int8_t num_syn, num_rst, num_fin, num_zero_window;
++} tcp_stats;
++
+ typedef struct {
+   /* TCP stats */
+   TCPSeqNum tcp_seq_s2d, tcp_seq_d2s;
+@@ -212,6 +217,8 @@ private:
+   } external_alert;
+ 
+   char *tcp_fingerprint;
++  tcp_stats tcp_stats_src2dst, tcp_stats_dst2src;
++  
+   bool trigger_immediate_periodic_update; /* needed to process external alerts */
+   time_t next_call_periodic_update; /* The time at which the periodic lua script
+                                        on this flow shall be called */
+@@ -417,7 +424,8 @@ private:
+   void processHostName(char *host_name);
+ #endif
+   void updateMac();
+-
++  void decodeTCPstats(u_int32_t v, tcp_stats *stats);
++  
+ public:
+   Flow(NetworkInterface *_iface, int32_t iface_idx,
+        u_int16_t _vlanId,
+@@ -998,6 +1006,7 @@ public:
+            bool asListElement);
+   void lua_get_min_info(lua_State *vm);
+   void lua_duration_info(lua_State *vm);
++  void lua_dump_tcp_stats(lua_State *vm, const tcp_stats *s, const char *label) const;
+   void lua_snmp_info(lua_State *vm);
+   void lua_device_protocol_allowed_info(lua_State *vm);
+   void lua_get_flow_connection_state(lua_State *vm);
+@@ -1568,6 +1577,8 @@ public:
+   inline void incNumProcessedPkts()     { numFlowProcessedPkts++;                  }
+   inline void setNumPktsMarker()        { numPktsMarkerSet = numFlowProcessedPkts; }
+ #endif
++
++  void updateTCPStats(u_int32_t cli_stats, u_int32_t srv_stats);
+ };
+ 
+ #endif /* _FLOW_H_ */
+
+
+
+
+@@ -41,7 +41,8 @@ class ParsedFlow : public ParsedFlowCore, public ParsedeBPF {
+   char *l7_json;
+   char *smtp_rcp_to, *smtp_mail_from;
+   u_int32_t src_ip_addr_pre_nat, dst_ip_addr_pre_nat,
+-              src_ip_addr_post_nat, dst_ip_addr_post_nat;
++    src_ip_addr_post_nat, dst_ip_addr_post_nat;
++  u_int32_t tcp_stats_src_to_dst, tcp_stats_dst_to_src;
+   u_int8_t tls_unsafe_cipher, flow_verdict;
+   ndpi_os os_hint;
+   u_int16_t tls_cipher;
+@@ -178,9 +179,11 @@ class ParsedFlow : public ParsedFlowCore, public ParsedeBPF {
+   inline void setQoEDst2Src(u_int8_t t)   { qoe.dst_to_src = t; }
+   inline void setOSHint(ndpi_os t) { os_hint = t;        }
+   inline ndpi_os getOSHint()       { return(os_hint);    }
+-
++  inline void setTCPStats(u_int32_t value, bool cli2src) {
++    if(cli2src) tcp_stats_src_to_dst = value; else tcp_stats_dst_to_src = value;
++  }
+   u_int32_t get_private_flow_id();
+-
++  inline u_int32_t get_tcp_stats(bool cli2srv) { return(cli2srv ? tcp_stats_src_to_dst : tcp_stats_dst_to_src); }
+   void print();
+ };
+ 
+
+
+
+
+@@ -572,6 +572,9 @@
+ #define L7_DOMAIN_INFO        NTOP_BASE_ID+591
+ #define TCP_FINGERPRINT       NTOP_BASE_ID+597
+ #define NPROBE_SOURCE_ID      NTOP_BASE_ID+600 /* Unique nProbe identifier */
++#define TCP_STATS_SRC_TO_DST  NTOP_BASE_ID+601
++#define TCP_STATS_DST_TO_SRC  NTOP_BASE_ID+602
++
+ 
+ /* sFlow Counter Fields */
+ #define SFLOW_DEVICE_IP 0
+
+
+
+
+@@ -53,7 +53,9 @@ Flow::Flow(NetworkInterface *_iface,
+   collected_qoe.src_to_dst = collected_qoe.dst_to_src = NTOP_QOE_UNKNOWN, has_collected_qoe = 0;
+   tcp = NULL;
+   c_mac_updated = s_mac_updated = false;
+-
++  memset(&tcp_stats_src2dst, 0, sizeof(tcp_stats_src2dst));
++  memset(&tcp_stats_dst2src, 0, sizeof(tcp_stats_dst2src));
++  
+ #ifdef NTOPNG_PRO
+   udp = NULL;
+ #endif
+@@ -5294,9 +5296,9 @@ void Flow::updateTcpWindow(u_int16_t window, bool src2dst_direction) {
+   /* The update depends on the direction of the flow */
+   if(window == 0) {
+     if(src2dst_direction)
+-      src2dst_tcp_zero_window = 1;
++      src2dst_tcp_zero_window = 1, tcp_stats_src2dst.num_zero_window++;
+     else
+-      dst2src_tcp_zero_window = 1;
++      dst2src_tcp_zero_window = 1, tcp_stats_dst2src.num_zero_window++;
+   }
+ }
+ 
+@@ -5435,6 +5437,18 @@ void Flow::updateTcpFlags(const struct bpf_timeval *when, u_int8_t flags,
+   } else {
+     /* Packet Interface */
+ 
++    if((flags & TH_SYN) == TH_SYN) {
++      if(s

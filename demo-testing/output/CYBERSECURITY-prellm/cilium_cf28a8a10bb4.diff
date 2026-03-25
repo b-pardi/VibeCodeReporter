@@ -1,0 +1,121 @@
+@@ -10,16 +10,22 @@
+ #include "maps.h"
+ 
+ static __always_inline __maybe_unused struct endpoint_info *
+-lookup_ip6_endpoint(struct ipv6hdr *ip6)
++lookup_ip6_endpoint_from_daddr(const union v6addr *ip6)
+ {
+ 	struct endpoint_key key = {};
+ 
+-	key.ip6 = *((union v6addr *) &ip6->daddr);
++	key.ip6 = *ip6;
+ 	key.family = ENDPOINT_KEY_IPV6;
+ 
+ 	return map_lookup_elem(&ENDPOINTS_MAP, &key);
+ }
+ 
++static __always_inline __maybe_unused struct endpoint_info *
++lookup_ip6_endpoint(struct ipv6hdr *ip6)
++{
++	return lookup_ip6_endpoint_from_daddr((union v6addr *)&ip6->daddr);
++}
++
+ static __always_inline __maybe_unused struct endpoint_info *
+ __lookup_ip4_endpoint(__u32 ip)
+ {
+
+
+
+
+@@ -9,6 +9,7 @@
+ #include "common.h"
+ #include "eth.h"
+ #include "drop.h"
++#include "eps.h"
+ 
+ #define ICMP6_TYPE_OFFSET (sizeof(struct ipv6hdr) + offsetof(struct icmp6hdr, icmp6_type))
+ #define ICMP6_CSUM_OFFSET (sizeof(struct ipv6hdr) + offsetof(struct icmp6hdr, icmp6_cksum))
+@@ -156,8 +157,17 @@ static __always_inline int icmp6_send_echo_reply(struct __ctx_buff *ctx,
+ 	return DROP_MISSED_TAIL_CALL;
+ }
+ 
++/*
++ * send_icmp6_ndisc_adv
++ * @ctx:	socket buffer
++ * @nh_off:	offset to the IPv6 header
++ * @mac:	device mac address
++ * @to_router:	ndisc is sent to router, otherwise ndisc is sent to an endpoint.
++ *
++ * Send an ICMPv6 nadv reply in return to an ICMPv6 ndisc.
++ */
+ static __always_inline int send_icmp6_ndisc_adv(struct __ctx_buff *ctx,
+-						int nh_off, union macaddr *mac)
++						int nh_off, union macaddr *mac, bool to_router)
+ {
+ 	struct icmp6hdr icmp6hdr __align_stack_8 = {}, icmp6hdr_old __align_stack_8;
+ 	__u8 opts[8], opts_old[8];
+@@ -173,9 +183,16 @@ static __always_inline int send_icmp6_ndisc_adv(struct __ctx_buff *ctx,
+ 	icmp6hdr.icmp6_code = 0;
+ 	icmp6hdr.icmp6_cksum = icmp6hdr_old.icmp6_cksum;
+ 	icmp6hdr.icmp6_dataun.un_data32[0] = 0;
+-	icmp6hdr.icmp6_router = 1;
+-	icmp6hdr.icmp6_solicited = 1;
+-	icmp6hdr.icmp6_override = 0;
++
++	if (to_router) {
++		icmp6hdr.icmp6_router = 1;
++		icmp6hdr.icmp6_solicited = 1;
++		icmp6hdr.icmp6_override = 0;
++	} else {
++		icmp6hdr.icmp6_router = 0;
++		icmp6hdr.icmp6_solicited = 1;
++		icmp6hdr.icmp6_override = 1;
++	}
+ 
+ 	if (ctx_store_bytes(ctx, nh_off + sizeof(struct ipv6hdr), &icmp6hdr,
+ 			    sizeof(icmp6hdr), 0) < 0)
+@@ -349,6 +366,7 @@ static __always_inline int icmp6_send_time_exceeded(struct __ctx_buff *ctx,
+ static __always_inline int __icmp6_handle_ns(struct __ctx_buff *ctx, int nh_off)
+ {
+ 	union v6addr target, router;
++	struct endpoint_info *ep;
+ 
+ 	if (ctx_load_bytes(ctx, nh_off + ICMP6_ND_TARGET_OFFSET, target.addr,
+ 			   sizeof(((struct ipv6hdr *)NULL)->saddr)) < 0)
+@@ -357,10 +375,18 @@ static __always_inline int __icmp6_handle_ns(struct __ctx_buff *ctx, int nh_off)
+ 	cilium_dbg(ctx, DBG_ICMP6_NS, target.p3, target.p4);
+ 
+ 	BPF_V6(router, ROUTER_IP);
++
+ 	if (ipv6_addrcmp(&target, &router) == 0) {
+ 		union macaddr router_mac = NODE_MAC;
+ 
+-		return send_icmp6_ndisc_adv(ctx, nh_off, &router_mac);
++		return send_icmp6_ndisc_adv(ctx, nh_off, &router_mac, true);
++	}
++
++	ep = lookup_ip6_endpoint_from_daddr(&target);
++	if (ep) {
++		union macaddr router_mac = NODE_MAC;
++
++		return send_icmp6_ndisc_adv(ctx, nh_off, &router_mac, false);
+ 	}
+ 
+ 	/* Unknown target address, drop */
+@@ -430,54 +456,58 @@ icmp6_host_handle(struct __ctx_buff *ctx __maybe_unused)
+ {
+ 	__u8 type __maybe_unused;
+ 
++	type = icmp6_load_type(ctx, ETH_HLEN);
++	if (type == ICMP6_NS_MSG_TYPE)
++		return icmp6_handle_ns(ctx, ETH_HLEN, METRIC_INGRESS);
++
+ #ifdef ENABLE_HOST_FIREWALL
+ 	/* When the host firewall is enabled, we drop and allow ICMPv6 messages
+ 	 * according to RFC4890, except for echo request and reply messages which
+ 	 * are handled by host policies and can be dropped.
+-	 * |          ICMPv6 Message         |   Action     | Type |
+-	 * |---------------------------------|--------------|------|
+-	 * |          ICMPv6-unreach         |  CTX_ACT_OK  |   1  |
+-	 * |          ICMPv6-too-big         |  CTX_ACT_OK  |   2  |
+-	 * |        

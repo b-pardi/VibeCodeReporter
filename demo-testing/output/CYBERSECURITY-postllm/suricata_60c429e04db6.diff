@@ -1,0 +1,107 @@
+@@ -16,6 +16,8 @@
+  */
+ 
+ #include "suricata.h"
++#include "detect.h"
++#include "detect-engine.h"
+ #include "runmodes.h"
+ #include "conf.h"
+ #include "pcap.h"
+@@ -145,6 +147,13 @@ done:
+     pthread_exit(NULL);
+ }
+ 
++static uint8_t RateFilterCallback(const Packet *p, const uint32_t sid, const uint32_t gid,
++        const uint32_t rev, uint8_t original_action, uint8_t new_action, void *arg)
++{
++    /* Don't change the action. */
++    return new_action;
++}
++
+ int main(int argc, char **argv)
+ {
+     SuricataPreInit(argv[0]);
+@@ -208,6 +217,8 @@ int main(int argc, char **argv)
+ 
+     SuricataInit();
+ 
++    SCDetectEngineRegisterRateFilterCallback(RateFilterCallback, NULL);
++
+     /* Create and start worker on its own thread, passing the PCAP
+      * file as argument. This needs to be done in between SuricataInit
+      * and SuricataPostInit. */
+@@ -238,6 +249,7 @@ int main(int argc, char **argv)
+      * function and SCTmThreadsSlotPacketLoopFinish that require them
+      * to be run concurrently at this time. */
+     SuricataShutdown();
++
+     GlobalsDestroy();
+ 
+     return EXIT_SUCCESS;
+
+
+
+
+@@ -709,7 +709,8 @@ static int ThresholdSetup(const DetectThresholdData *td, ThresholdEntry *te,
+     return 0;
+ }
+ 
+-static int ThresholdCheckUpdate(const DetectThresholdData *td, ThresholdEntry *te,
++static int ThresholdCheckUpdate(const DetectEngineCtx *de_ctx, const DetectThresholdData *td,
++        ThresholdEntry *te,
+         const Packet *p, // ts only? - cache too
+         const uint32_t sid, const uint32_t gid, const uint32_t rev, PacketAlert *pa)
+ {
+@@ -793,8 +794,9 @@ static int ThresholdCheckUpdate(const DetectThresholdData *td, ThresholdEntry *t
+                 te->current_count = 1;
+             }
+             break;
+-        case TYPE_RATE:
++        case TYPE_RATE: {
+             SCLogDebug("rate_filter");
++            const uint8_t original_action = pa->action;
+             ret = 1;
+             /* Check if we have a timeout enabled, if so,
+              * we still matching (and enabling the new_action) */
+@@ -821,7 +823,16 @@ static int ThresholdCheckUpdate(const DetectThresholdData *td, ThresholdEntry *t
+                     te->current_count = 1;
+                 }
+             }
++            if (de_ctx->RateFilterCallback && original_action != pa->action) {
++                pa->action = de_ctx->RateFilterCallback(p, sid, gid, rev, original_action,
++                        pa->action, de_ctx->rate_filter_callback_arg);
++                if (pa->action == original_action) {
++                    /* Reset back to original action, clear modified flag. */
++                    pa->flags &= ~PACKET_ALERT_FLAG_RATE_FILTER_MODIFIED;
++                }
++            }
+             break;
++        }
+         case TYPE_BACKOFF:
+             SCLogDebug("backoff");
+ 
+@@ -844,8 +855,8 @@ static int ThresholdCheckUpdate(const DetectThresholdData *td, ThresholdEntry *t
+     return ret;
+ }
+ 
+-static int ThresholdGetFromHash(struct Thresholds *tctx, const Packet *p, const Signature *s,
+-        const DetectThresholdData *td, PacketAlert *pa)
++static int ThresholdGetFromHash(const DetectEngineCtx *de_ctx, struct Thresholds *tctx,
++        const Packet *p, const Signature *s, const DetectThresholdData *td, PacketAlert *pa)
+ {
+     /* fast track for count 1 threshold */
+     if (td->count == 1 && td->type == TYPE_THRESHOLD) {
+@@ -894,7 +905,7 @@ static int ThresholdGetFromHash(struct Thresholds *tctx, const Packet *p, const
+             r = ThresholdSetup(td, te, p->ts, s->id, s->gid, s->rev, p->tenant_id);
+         } else {
+             // existing, check/update
+-            r = ThresholdCheckUpdate(td, te, p, s->id, s->gid, s->rev, pa);
++            r = ThresholdCheckUpdate(de_ctx, td, te, p, s->id, s->gid, s->rev, pa);
+         }
+ 
+         (void)THashDecrUsecnt(res.data);
+@@ -909,8 +920,8 @@ static int ThresholdGetFromHash(struct Thresholds *tctx, const Packet *p, const
+  *  \retval 1 normal match
+  *  \retval 0 no match
+  */
+-static int Thres

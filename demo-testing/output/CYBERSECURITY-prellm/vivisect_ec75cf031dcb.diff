@@ -1,0 +1,83 @@
+@@ -819,7 +819,7 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+     def addExport(self, va, etype, name, filename, makeuniq=False):
+         """
+         Add an already created export object.
+-        
++
+         makeuniq allows Vivisect to append some number to make the name unique.
+         This behavior allows for colliding names (eg. different versions of a function)
+         to coexist in the same workspace.
+@@ -920,6 +920,12 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+                     if loc[L_LTYPE] == LOC_STRING:
+                         if loc[L_VA] == va:
+                             return loc[L_SIZE]
++                        if ord(bytez[offset+count]) != 0:
++                            # we probably hit a case where the string at the lower va is
++                            # technically the start of the full string, but the binary does
++                            # some optimizations and just ref's inside the full string to save 
++                            # some space
++                            return count + loc[L_SIZE]
+                         return loc[L_VA] - (va + count) + loc[L_SIZE]
+                     return -1
+ 
+@@ -966,6 +972,12 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+                 loc = self.getLocation(va+count)
+                 if loc:
+                     if loc[L_LTYPE] == LOC_UNI:
++                        if loc[L_VA] == va:
++                            return loc[L_SIZE]
++                        if ord(bytes[offset+count]) != 0:
++                            # same thing as in the string case, a binary can ref into a string
++                            # only part of the full string.
++                            return count + loc[L_SIZE]
+                         return loc[L_VA] - (va + count) + loc[L_SIZE]
+                     return -1
+ 
+@@ -1938,11 +1950,65 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+         offset, bytes = self.getByteDef(va)
+         return e_bits.parsebytes(bytes, offset, size, bigend=self.bigend)
+ 
++    def _getSubstrings(self, va, size, ltyp):
++        # rip through the desired memory range to populate any substrings
++        subs = set()
++        end = va + size
++        for offs in range(va, end, 1):
++            loc = self.getLocation(offs, range=True)
++            if loc and loc[L_LTYPE] == LOC_STRING and loc[L_VA] > va:
++                subs.add((loc[L_VA], loc[L_SIZE]))
++                if loc[L_TINFO]:
++                    subs = subs.union(set(loc[L_TINFO]))
++        return list(subs)
++
++    def _getStrTinfo(self, va, subs):
++        ploc = self.getLocation(va, range=False)
++        if ploc:
++            # the string we're making is a substring of some outer one
++            # still make this string location, but let the parent know about us too and our
++            # children as well. Ultimately, the outermost parent should be responsible for
++            # knowing about all it's substrings
++            modified = False
++            pva, psize, ptype, pinfo = ploc
++            if (va, size) not in pinfo:
++                modified = True
++                pinfo.append((va, size))
++
++            for sva, ssize in subs:
++                if (sva, ssize) not in pinfo:
++                    modified = True
++                    pinfo.append((sva, ssize))
++            if modified:
++                tinfo = pinfo
++        else:
++            tinfo = subs
++
++        return tinfo
++
+     def makeString(self, va, size=None):
+         """
+         Create a new string location at the given VA.  You may optionally
+         specify size.  If size==None, the string will be parsed as a NULL
+         terminated ASCII string.
++
++        Substrings are also handled here. Generally, the idea is:
++        * if the memory range is completey undefined, we just create a new string at the VA specified (provided that asciiStringSize return a size greater than 0 or the paramet

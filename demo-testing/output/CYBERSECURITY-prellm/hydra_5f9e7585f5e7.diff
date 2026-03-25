@@ -1,0 +1,126 @@
+@@ -112,6 +112,16 @@ class EnvSetupConf:
+     )
+ 
+ 
++class RayRunEnv(Enum):
++    """
++    https://docs.ray.io/en/releases-1.1.0/package-ref.html?highlight=exec#ray-exec
++    """
++
++    auto = "auto"
++    host = "host"
++    docker = "docker"
++
++
+ @dataclass
+ class RayClusterConf:
+     """
+@@ -190,8 +200,8 @@ class RayClusterConf:
+     head_start_ray_commands: List[str] = field(
+         default_factory=lambda: [
+             "ray stop",
+-            "ulimit -n 65536;ray start --head --redis-port=6379 --object-manager-port=8076\
+---autoscaling-config=~/ray_bootstrap_config.yaml",
++            "ulimit -n 65536;ray start --head --port=6379 --object-manager-port=8076 \
++            --autoscaling-config=~/ray_bootstrap_config.yaml",
+         ]
+     )
+ 
+@@ -208,6 +218,7 @@ class RayClusterConf:
+ @dataclass
+ class RayAWSConf(RayConf):
+     cluster: RayClusterConf = RayClusterConf()
++    run_env: RayRunEnv = RayRunEnv.auto
+ 
+ 
+ @dataclass
+
+
+
+
+@@ -58,12 +58,12 @@ def launch(
+     assert launcher.task_function is not None
+ 
+     setup_commands = launcher.env_setup.commands
++    packages = filter(
++        lambda x: x[1] is not None, launcher.env_setup.pip_packages.items()
++    )
+     with read_write(setup_commands):
+         setup_commands.extend(
+-            [
+-                f"pip install {package}=={version}"
+-                for package, version in launcher.env_setup.pip_packages.items()
+-            ]
++            [f"pip install {package}=={version}" for package, version in packages]
+         )
+         setup_commands.extend(launcher.ray_cfg.cluster.setup_commands)
+ 
+@@ -118,7 +118,7 @@ def launch_jobs(
+     with tempfile.TemporaryDirectory() as local_tmp_download_dir:
+ 
+         with ray_tmp_dir(
+-            launcher.ray_yaml_path, launcher.docker_enabled
++            launcher.ray_yaml_path, launcher.ray_cfg.run_env.name
+         ) as remote_tmp_dir:
+ 
+             ray_rsync_up(
+@@ -126,7 +126,8 @@ def launch_jobs(
+             )
+ 
+             script_path = os.path.join(os.path.dirname(__file__), "_remote_invoke.py")
+-            ray_rsync_up(launcher.ray_yaml_path, script_path, remote_tmp_dir)
++            remote_script_path = os.path.join(remote_tmp_dir, "_remote_invoke.py")
++            ray_rsync_up(launcher.ray_yaml_path, script_path, remote_script_path)
+ 
+             if launcher.sync_up.source_dir:
+                 source_dir = _get_abs_code_dir(launcher.sync_up.source_dir)
+@@ -145,8 +146,8 @@ def launch_jobs(
+ 
+             ray_exec(
+                 launcher.ray_yaml_path,
+-                launcher.docker_enabled,
+-                os.path.join(remote_tmp_dir, "_remote_invoke.py"),
++                launcher.ray_cfg.run_env.name,
++                remote_script_path,
+                 remote_tmp_dir,
+             )
+ 
+
+
+
+
+@@ -81,10 +81,8 @@ def ray_rsync_down(yaml_path: str, remote_dir: str, local_dir: str) -> None:
+ 
+ 
+ @contextmanager
+-def ray_tmp_dir(yaml_path: str, docker: bool) -> Generator[Any, None, None]:
+-    args = ["ray", "exec"]
+-    if docker:
+-        args.append("--docker")
++def ray_tmp_dir(yaml_path: str, run_env: str) -> Generator[Any, None, None]:
++    args = ["ray", "exec", f"--run-env={run_env}"]
+ 
+     mktemp_args = args + [yaml_path, "echo $(mktemp -d)"]
+     out, _ = _run_command(mktemp_args)
+@@ -101,14 +99,11 @@ def ray_tmp_dir(yaml_path: str, docker: bool) -> Generator[Any, None, None]:
+     _run_command(rmtemp_args)
+ 
+ 
+-def ray_new_dir(yaml_path: str, new_dir: str, docker: bool) -> None:
++def ray_new_dir(yaml_path: str, new_dir: str, run_env: str) -> None:
+     """
+     The output of exec os.getcwd() via ray on remote cluster.
+     """
+-    args = ["ray", "exec"]
+-    if docker:
+-        args += "--docker"
+-
++    args = ["ray", "exec", f"--run-env={run_env}"]
+     mktemp_args = args + [yaml_path, f"mkdir -p {new_dir}"]
+     _run_command(mktemp_args)
+ 
+@@ -122,14 +117,13 @@ def ray_down(yaml_path: str) -> None:
+ 
+ 
+ def ray_up(yaml_path: str) -> None:
+-    _run_command(["ray", "up", "-y", yaml_path]

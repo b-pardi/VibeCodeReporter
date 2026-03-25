@@ -1,0 +1,109 @@
+@@ -4,7 +4,7 @@
+ import logging
+ from typing import Generator, Iterable, List, Optional
+ 
+-from volatility3.framework import constants, exceptions, interfaces, renderers
++from volatility3.framework import symbols, constants, exceptions, interfaces, renderers
+ from volatility3.framework.configuration import requirements
+ from volatility3.framework.renderers import format_hints
+ from volatility3.framework.symbols import intermed
+@@ -18,7 +18,7 @@ class Modules(interfaces.plugins.PluginInterface):
+     """Lists the loaded kernel modules."""
+ 
+     _required_framework_version = (2, 0, 0)
+-    _version = (2, 0, 1)
++    _version = (2, 0, 2)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -127,6 +127,32 @@ class Modules(interfaces.plugins.PluginInterface):
+                 file_output,
+             )
+ 
++    @classmethod
++    def get_kernel_space_start(cls, context, layer_name: str, module_name: str) -> int:
++        """
++        Returns the starting address of the kernel address space
++
++        This method allows plugins that analyze kernel data structures to quickly detect
++        smeared or otherwise invalid data as many pointers must point into the kernel or
++        access during runtime would crash the system
++        """
++        module = context.modules[module_name]
++
++        if symbols.symbol_table_is_64bit(context, module.symbol_table_name):
++            object_type = "unsigned long long"
++        else:
++            object_type = "unsigned long"
++
++        range_start_offset = module.get_symbol("MmSystemRangeStart").address
++
++        kernel_space_start = module.object(
++            object_type=object_type, offset=range_start_offset
++        )
++
++        layer = context.layers[layer_name]
++
++        return kernel_space_start & layer.address_mask
++
+     @classmethod
+     def get_session_layers(
+         cls,
+
+
+
+
+@@ -5,9 +5,9 @@
+ import logging
+ from typing import List, Generator
+ 
+-from volatility3.framework import interfaces, symbols
++from volatility3.framework import interfaces, exceptions
+ from volatility3.framework.configuration import requirements
+-from volatility3.plugins.windows import thrdscan, ssdt
++from volatility3.plugins.windows import thrdscan, ssdt, modules
+ 
+ vollog = logging.getLogger(__name__)
+ 
+@@ -37,6 +37,9 @@ class Threads(thrdscan.ThrdScan):
+             requirements.PluginRequirement(
+                 name="ssdt", plugin=ssdt.SSDT, version=(1, 0, 0)
+             ),
++            requirements.PluginRequirement(
++                name="modules", plugin=modules.Modules, version=(2, 0, 2)
++            ),
+         ]
+ 
+     @classmethod
+@@ -56,24 +59,27 @@ class Threads(thrdscan.ThrdScan):
+         """
+         module = context.modules[module_name]
+         layer_name = module.layer_name
+-        symbol_table = module.symbol_table_name
++        symbol_table_name = module.symbol_table_name
+ 
+         collection = ssdt.SSDT.build_module_collection(
+-            context, layer_name, symbol_table
++            context, layer_name, symbol_table_name
+         )
+ 
+-        # FIXME - use a proper constant once established
+-        # used to filter out smeared pointers
+-        if symbols.symbol_table_is_64bit(context, symbol_table):
+-            kernel_start = 0xFFFFF80000000000
+-        else:
+-            kernel_start = 0x80000000
++        kernel_space_start = modules.Modules.get_kernel_space_start(
++            context, layer_name, module_name
++        )
+ 
+         for thread in thrdscan.ThrdScan.scan_threads(context, module_name):
+-            # we don't want smeared or terminated threads
++            # We don't want smeared or terminated threads
++            # So we access the owning process (which could also be terminated or smeared)
++            # Plus check the start address holding page
+             try:
+                 proc = thread.owning_process()
+-            except AttributeError:
++                pid = proc.UniqueProcessId
++                ppid = proc.Inherited

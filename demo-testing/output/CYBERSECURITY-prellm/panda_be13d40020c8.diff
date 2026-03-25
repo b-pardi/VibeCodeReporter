@@ -1,0 +1,111 @@
+@@ -48,9 +48,17 @@ static const char *chroot_dir;
+ static int daemonize;
+ static int daemon_pipe;
+ 
++extern void (*panda_external_signal_handler)(int, siginfo_t*,void*);
++
+ void os_setup_early_signal_handling(void)
+ {
+     struct sigaction act;
++    
++    if (panda_external_signal_handler != NULL){
++        // don't set up signal handling if we already initialized it
++        return;
++    }
++
+     sigfillset(&act.sa_mask);
+     act.sa_flags = 0;
+     act.sa_handler = SIG_IGN;
+@@ -66,8 +74,16 @@ void os_setup_signal_handling(void)
+ {
+     struct sigaction act;
+ 
++    void (*handler)(int,siginfo_t*, void*) = termsig_handler;
++
++    if (panda_external_signal_handler != NULL){
++        /* Here we go ahead and set the handler to the previously set handler
++         * in case it needs to be reinitialized for a different thread.
++         */
++        handler = panda_external_signal_handler;
++    }
+     memset(&act, 0, sizeof(act));
+-    act.sa_sigaction = termsig_handler;
++    act.sa_sigaction = handler;
+     act.sa_flags = SA_SIGINFO;
+     sigaction(SIGINT,  &act, NULL);
+     sigaction(SIGHUP,  &act, NULL);
+
+
+
+
+@@ -43,6 +43,12 @@ target_ulong panda_current_sp_external(CPUState *cpu);
+ target_ulong panda_current_sp_masked_pagesize_external(CPUState *cpu, target_ulong pagesize);
+ target_ulong panda_virt_to_phys_external(CPUState *cpu, target_ulong virt_addr);
+ 
++
++// set to true if panda_setup_signal_handling is called
++void (*panda_external_signal_handler)(int, siginfo_t*,void*) = NULL;
++
++void panda_setup_signal_handling(void (*f) (int, siginfo_t*, void *));
++
+ void map_memory(char* name, uint64_t size, uint64_t address);
+ 
+ // REDEFINITIONS below here from monitor.h
+
+
+
+
+@@ -363,7 +363,28 @@ class Panda():
+                 progress("Disabling TB chaining")
+             self.disabled_tb_chaining = True
+             self.libpanda.panda_disable_tb_chaining()
++    
++    def setup_internal_signal_handler(self):
++        ffi.cdef("void panda_setup_signal_handling(void (*f) (int,void*,void*));",override=True)
++        @ffi.callback("void(int,void*,void*)")
++        def SigHandler(SIG,a,b):
++            from signal import SIGINT, SIGHUP, SIGTERM
++            if SIG == SIGINT:
++                self.end_run_raise_signal = KeyboardInterrupt
++                self.end_analysis()
++            elif SIG == SIGHUP:
++                self.end_run_raise_signal = KeyboardInterrupt
++                self.end_analysis()
++            elif SIG == SIGTERM:
++                self.end_run_raise_signal = KeyboardInterrupt
++                self.end_analysis()
++            else:
++                print(f"PyPanda Signal handler received unhandled signal {SIG}")
++        
++        self.__sighandler = SigHandler
++        self.libpanda.panda_setup_signal_handling(self.__sighandler)
+ 
++    
+     def run(self):
+         '''
+         This function starts our running PANDA instance from Python. At termination this function returns and the script continues to run after it.
+@@ -388,11 +409,16 @@ class Panda():
+ 
+         # Ensure our internal CBs are always enabled
+         self.enable_internal_callbacks()
+-
++        self.setup_internal_signal_handler()
+         self.running.set()
+         self.libpanda.panda_run() # Give control to panda
+         self.running.clear() # Back from panda's execution (due to shutdown or monitor quit)
+         self.libpanda.panda_unload_plugins() # Unload c plugins - should be safe now since exec has stopped
++        if hasattr(self, "end_run_raise_signal"):
++            raise self.end_run_raise_signal
++        if hasattr(self, "callback_exit_exception"):
++            raise self.callback_exit_exception
++            
+ 
+     def end_analysis(self):
+         '''
+@@ -408,7 +434,6 @@ class Panda():
+         if self.running.is_set():
+             # If we were running, stop the execution and check if we crashed
+             self.queue_async(self.stop_run, internal=True)
+-            self.queue_async(self.check_crashed, internal=True)
+ 
+     def run_repl

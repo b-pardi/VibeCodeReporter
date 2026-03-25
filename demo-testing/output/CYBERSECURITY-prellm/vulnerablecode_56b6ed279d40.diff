@@ -1,0 +1,117 @@
+@@ -47,7 +47,7 @@ class NpmDataSource(GitDataSource):
+ 
+     def __enter__(self):
+         super(NpmDataSource, self).__enter__()
+-        self._versions = VersionAPI()
++        self._versions = NpmVersionAPI()
+         if not getattr(self, '_added_files', None):
+             self._added_files, self._updated_files = self.file_changes(
+                 recursive=True, file_ext='json', subdir='./vuln/npm')
+
+
+
+
+@@ -20,6 +20,7 @@
+ #  VulnerableCode is a free software code scanning tool from nexB Inc. and others.
+ #  Visit https://github.com/nexB/vulnerablecode/ for support and download.
+ 
++import asyncio
+ import json
+ from itertools import chain
+ from typing import Optional, Mapping
+@@ -51,10 +52,13 @@ class RustDataSource(GitDataSource):
+ 
+     @property
+     def crates_api(self):
+-        if not hasattr(self, '_crates_api'):
+-            setattr(self, '_crates_api', CratesVersionAPI())
++        if not hasattr(self, "_crates_api"):
++            setattr(self, "_crates_api", CratesVersionAPI())
+         return self._crates_api
+ 
++    def set_api(self, packages):
++        asyncio.run(self.crates_api.load_api(packages))
++
+     def added_advisories(self) -> Set[Advisory]:
+         return self._load_advisories(self._added_files)
+ 
+@@ -63,6 +67,8 @@ class RustDataSource(GitDataSource):
+ 
+     def _load_advisories(self, files) -> Set[Advisory]:
+         files = [f for f in files if not f.endswith("-0000.toml")]  # skip temporary files
++        packages = self.collect_packages(files)
++        self.set_api(packages)
+ 
+         while files:
+             batch, files = files[: self.batch_size], files[self.batch_size:]
+@@ -75,13 +81,19 @@ class RustDataSource(GitDataSource):
+                     advisories.add(advisory)
+             yield advisories
+ 
+-    def _load_advisory(self, path: str) -> Optional[Advisory]:
+-        with open(path) as f:
+-            record = toml.load(f)
+-            advisory = record.get("advisory", {})
++    def collect_packages(self, paths):
++        packages = set()
++        for path in paths:
++            record = load_toml(path)
++            packages.add(record["advisory"]["package"])
+ 
+-        references = []
++        return packages
++
++    def _load_advisory(self, path: str) -> Optional[Advisory]:
++        record = load_toml(path)
++        advisory = record.get("advisory", {})
+         crate_name = advisory["package"]
++        references = []
+         if advisory.get("url"):
+             references.append(Reference(url=advisory["url"]))
+ 
+@@ -161,3 +173,8 @@ def categorize_versions(
+             unaffected.update(uncategorized_versions)
+ 
+     return unaffected, affected
++
++
++def load_toml(path):
++    with open(path) as f:
++        return toml.load(f)
+
+
+
+
+@@ -102,26 +102,21 @@ class PypiVersionAPI(VersionAPI):
+ 
+ 
+ class CratesVersionAPI(VersionAPI):
+-    def get(self, package_name: str) -> Set[str]:
+-        package_name = package_name.strip()
+-
+-        if package_name not in self.cache:
+-            releases = set()
+-
+-            try:
+-                with urlopen(f"https://crates.io/api/v1/crates/{package_name}") as response:
+-                    response = json.load(response)
+-                    for version_info in response["versions"]:
+-                        releases.add(version_info["num"])
+-            except HTTPError as e:
+-                if e.code == 404:
+-                    pass
+-                else:
+-                    raise
++    async def load_api(self, pkg_set):
++        async with ClientSession(raise_for_status=True) as session:
++            await asyncio.gather(
++                *[self.fetch(pkg, session) for pkg in pkg_set if pkg not in self.cache]
++            )
+ 
+-            self.cache[package_name] = releases
++    async def fetch(self, pkg, session):
++        url = f"https://crates.io/api/v1/crates/{pkg}"
++        response = await session.request(method="GET", url=url)
++        response = await response.json()
++        versions = set()
++        for version_info in response["versio

@@ -1,0 +1,130 @@
+@@ -4943,6 +4943,42 @@ class MongoDBFlow(MongoDB, DBFlow):
+         self._conn2flow(bulks[self.column_flow], rec)
+         self._conn2passive(bulks[self.column_passive], rec)
+ 
++    def _flow2flow(self, flow_bulk, rec):
++        """
++        Take a line coming from Netflow or Argus and add it to flow bulk
++        """
++        findspec = self._get_flow_key(rec)
++
++        updatespec = {
++            '$min': {'firstseen': rec['start_time']},
++            '$max': {'lastseen': rec['end_time']},
++            '$inc': {
++                'cspkts': rec['cspkts'],
++                'scpkts': rec['scpkts'],
++                'csbytes': rec['csbytes'],
++                'scbytes': rec['scbytes'],
++                'count': 1
++            },
++        }
++
++        self._update_timeslots(updatespec, rec)
++
++        if rec['proto'] in ['udp', 'tcp']:
++            updatespec.setdefault("$addToSet", {})["sports"] = rec["sport"]
++        elif rec['proto'] == 'icmp':
++            updatespec.setdefault("$addToSet", {})["codes"] = rec["code"]
++
++        flow_bulk.find(findspec).upsert().update(updatespec)
++        return [findspec]
++
++    def flow2flow(self, bulks, rec):
++        """
++        Take a line coming from Netflow or Argus and add it to bulks
++        """
++        rec['src_addr_0'], rec['src_addr_1'] = self.ip2internal(rec['src'])
++        rec['dst_addr_0'], rec['dst_addr_1'] = self.ip2internal(rec['dst'])
++        self._flow2flow(bulks[self.column_flow], rec)
++
+     @staticmethod
+     def bulk_commit(bulks):
+         for bulk in bulks:
+
+
+
+
+@@ -159,6 +159,15 @@ ALL_DESCS = {
+ }
+ 
+ 
++# Associates a list of fields that must be present to the
++# link attributes and the accumulators
++FIELD_REQUEST_EXT = [
++    (('sport', 'dport'), ('proto', 'dport'), {'sports': ('{sport}', 5)}),
++    (('type', 'code'), ('proto', 'type'), {'codes': ('{code}', None)}),
++    (('type'), ('proto', 'type'), {}),
++]
++
++
+ class Neo4jDB(DBFlow):
+     values = re.compile('{([^}]+)}')
+ 
+@@ -1517,6 +1526,23 @@ DETACH DELETE old_f
+                 accumulators=accumulators)
+         bulk.append(query_cache[linkattrs], rec)
+ 
++    def flow2flow(self, bulk, rec):
++        query_cache = self.query_cache
++        linkattrs = ('proto',)
++        accumulators = {}
++        for (fields, sp_linkattrs,
++             sp_accumulators) in FIELD_REQUEST_EXT:
++            if all(field in rec for field in fields):
++                linkattrs = sp_linkattrs
++                accumulators = sp_accumulators
++                break
++        counters = ["cspkts", "scpkts", "csbytes", "scbytes"]
++        if linkattrs not in query_cache:
++            query_cache[linkattrs] = self.add_flow(
++                ["Flow"], linkattrs, counters=counters,
++                accumulators=accumulators)
++        bulk.append(query_cache[linkattrs], rec)
++
+     @staticmethod
+     def bulk_commit(bulk):
+         bulk.commit()
+
+
+
+
+@@ -65,6 +65,23 @@ META_DESC = {
+     },
+     'modbus': {
+         'name': 'func', 'exception': None
++    },
++    'snmp': {
++        'version': None, 'community': None, 'get_requests': None,
++        'get_bulk_requests': None, 'get_responses': None,
++        'set_requests': None
++    },
++    'ssl': {
++        'version': None, 'cipher': None, 'curve': None, 'server_name': None,
++        'last_alert': None, 'next_protocol': None, 'subject': None,
++        'issuer': None, 'client_subject': None, 'client_issuer': None
++    },
++    'rdp': {
++        'cookie': None, 'result': None, 'security_protocol': None,
++        'keyboard_layout': None, 'client_build': None, 'client_name': None,
++        'client_dig_product_id': None, 'cert_type': None, 'cert_count': None,
++        'cert_permanent': None, 'encryption_level': None,
++        'encryption_method': None
+     }
+ }
+ 
+
+
+
+
+@@ -58,12 +58,30 @@ def sip2flow(bulk, rec):
+     db.flow.any2flow(bulk, 'sip', rec)
+ 
+ 
++def snmp2flow(bulk, rec):
++    rec['proto'] = 'udp'
++    db.flow.any2flow(bulk, 'snmp', rec)
++
++
++def ssl2flow(bulk, rec):
++    rec['proto'] =

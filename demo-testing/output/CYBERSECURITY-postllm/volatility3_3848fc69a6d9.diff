@@ -1,0 +1,98 @@
+@@ -1,6 +1,7 @@
+ # This file is Copyright 2021 Volatility Foundation and licensed under the Volatility Software License 1.0
+ # which is available at https://www.volatilityfoundation.org/license/vsl-v1.0
+ #
++import re
+ import logging
+ from abc import ABC, abstractmethod
+ from enum import Enum
+@@ -9,7 +10,6 @@ from typing import Generator, Iterator, List, Tuple
+ from volatility3.framework import (
+     class_subclasses,
+     constants,
+-    contexts,
+     interfaces,
+     renderers,
+ )
+@@ -143,7 +143,7 @@ class ABCKmsg(ABC):
+         return "%lu.%06lu" % (nsec / 1000000000, (nsec % 1000000000) / 1000)
+ 
+     def get_timestamp_in_sec_str(self, obj) -> str:
+-        # obj could be printk_log or printk_info
++        # obj could be log, printk_log or printk_info
+         return self.nsec_to_sec_str(obj.ts_nsec)
+ 
+     def get_caller(self, obj):
+@@ -153,7 +153,7 @@ class ABCKmsg(ABC):
+         if obj.has_member("caller_id"):
+             return self.get_caller_text(obj.caller_id)
+         else:
+-            return ""
++            return renderers.NotAvailableValue()
+ 
+     def get_caller_text(self, caller_id):
+         caller_name = "CPU" if caller_id & 0x80000000 else "Task"
+@@ -161,7 +161,7 @@ class ABCKmsg(ABC):
+         return caller
+ 
+     def get_prefix(self, obj) -> Tuple[int, int, str, str]:
+-        # obj could be printk_log or printk_info
++        # obj could be log, printk_log or printk_info
+         return (
+             obj.facility,
+             obj.level,
+@@ -186,39 +186,90 @@ class ABCKmsg(ABC):
+             return str(facility)
+ 
+ 
+-class KmsgLegacy(ABCKmsg):
+-    """Linux kernels prior to v5.10, the ringbuffer is initially kept in
+-    __log_buf, and log_buf is a pointer to the former. __log_buf is declared as
+-    a char array but it actually contains an array of printk_log structs.
+-    The length of this array is defined in the kernel KConfig configuration via
+-    the CONFIG_LOG_BUF_SHIFT value as a power of 2.
+-    This can also be modified by the log_buf_len kernel boot parameter.
+-    In SMP systems with more than 64 CPUs this ringbuffer size is dynamically
+-    allocated according the number of CPUs based on the value of
+-    CONFIG_LOG_CPU_MAX_BUF_SHIFT, and the log_buf pointer is updated
+-    consequently to the new buffer.
+-    In that case, the original static buffer in __log_buf is unused.
++class Kmsg_pre_3_5(ABCKmsg):
++    """The kernel ring buffer (log_buf) is a char array that sequentially stores
++    log lines, each separated by newline (LF) characters. i.e:
++        <6>[ 9565.250411] line1!\n<6>[ 9565.250412] line2\n...
+     """
+ 
+     @classmethod
+     def symtab_checks(cls, vmlinux) -> bool:
+-        return vmlinux.has_type("printk_log")
++        return (
++            vmlinux.has_symbol("log_end")
++            and not vmlinux.has_symbol("log_first_idx")
++            and not (
++                vmlinux.has_type("log")
++                and vmlinux.get_type("log").has_member("ts_nsec")
++            )
++        )
++
++    def run(self) -> Iterator[Tuple[str, str, str, str, str]]:
++        log_buf_ptr = self.vmlinux.object_from_symbol(symbol_name="log_buf")
++        log_buf_len = self.vmlinux.object_from_symbol(symbol_name="log_buf_len")
++        log_buf = utility.pointer_to_string(log_buf_ptr, count=log_buf_len)
++        log_end = self.vmlinux.object_from_symbol(symbol_name="log_end")
++
++        if log_end > log_buf_len:
++            start = log_end - log_buf_len
++            first_half = log_buf[start:]
++            second_half = log_buf[:start]
++            log_buf = first_half + second_half
++
++        log_buf_lines = log_buf.splitlines()
++
++        for log_buf_line in log_buf_lines:
++            m = re.match(r"<(\d+)>\[\s*(\d+\.\d+)\]\s(.*?)$", log_buf_line)
++            if not m:
++                # If there was a wrap-around in the ring buffer, it will find
++                # remnants at the top. As those remnants do not conform to the
++                # expected line format, they are discarded
++    

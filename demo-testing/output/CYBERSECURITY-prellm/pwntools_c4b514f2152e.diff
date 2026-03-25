@@ -1,0 +1,154 @@
+@@ -37,6 +37,7 @@ from pwnlib.memleak import MemLeak, RelativeMemLeak
+ from pwnlib.regsort import *
+ from pwnlib.replacements import *
+ from pwnlib.rop import ROP
++from pwnlib.rop.ret2dlresolve import Ret2dlresolve, Ret2dlresolveRop
+ from pwnlib.rop.srop import SigreturnFrame
+ from pwnlib.runner import *
+ from pwnlib.timeout import Timeout
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,336 @@
++from copy import deepcopy
++
++from pwnlib.context import context
++from pwnlib.log import getLogger
++from pwnlib.rop import ROP
++from pwnlib.util.packing import *
++
++
++log = getLogger(__name__)
++
++class Elf32_Rel(object):
++    size=1 # see build method for explanation
++    """
++    typedef struct elf32_rel {
++        Elf32_Addr	r_offset;
++        Elf32_Word	r_info;
++    } Elf32_Rel;
++    """
++    def __init__(self, r_offset=0, r_info=0):
++        self.r_offset = r_offset
++        self.r_info = r_info
++
++    def __bytes__(self):
++        return p32(self.r_offset) + p32(self.r_info)
++
++    def __str__(self):
++        return str(bytes(self))
++
++    def __flat__(self):
++        return bytes(self)
++
++
++class Elf64_Rel(object):
++    size=24
++    """
++    typedef struct elf64_rel {
++        Elf64_Addr r_offset;
++        Elf64_Xword r_info;
++    } Elf64_Rel;
++    """
++    def __init__(self, r_offset=0, r_info=0):
++        self.r_offset = r_offset
++        self.r_info = r_info
++
++    def __bytes__(self):
++        return p64(self.r_offset) + p64(self.r_info) + p64(0)
++
++    def __str__(self):
++        return str(bytes(self))
++
++    def __flat__(self):
++        return bytes(self)
++
++
++class Elf32_Sym(object):
++    size = 16
++    """
++    typedef struct elf32_sym{
++        Elf32_Word	st_name;
++        Elf32_Addr	st_value;
++        Elf32_Word	st_size;
++        unsigned char	st_info;
++        unsigned char	st_other;
++        Elf32_Half	st_shndx;
++    } Elf32_Sym;
++    """
++    def __init__(self, st_name=0, st_value=0, st_size=0, st_info=0, st_other=0, st_shndx=0):
++        # St_info and st_other can be int, str or byte,
++        # they'll be saved as int
++        if not isinstance(st_info, int):
++            st_info = context._encode(st_info)[0]
++        if not isinstance(st_other, int):
++            st_other = context._encode(st_other)[0]
++
++        self.st_name = st_name
++        self.st_value = st_value
++        self.st_size = st_size
++        self.st_info = st_info
++        self.st_other = st_other
++        self.st_shndx = st_shndx
++
++    def __bytes__(self):
++        return p32(self.st_name) + \
++            p32(self.st_value) + \
++            p32(self.st_size) + \
++            p8(self.st_info) + \
++            p8(self.st_other) + \
++            p16(self.st_shndx)
++
++    def __str__(self):
++        return str(bytes(self))
++
++    def __flat__(self):
++        return bytes(self)
++
++class Elf64_Sym(object):
++    size=24
++    """
++    typedef struct elf64_sym {
++        Elf64_Word st_name;
++        unsigned char	st_info;
++        unsigned char	st_other;
++        Elf64_Half st_shndx;
++        Elf64_Addr st_value;
++        Elf64_Xword st_size;
++    } Elf64_Sym;
++    """
++    def __init__(self, st_name=0, st_value=0, st_size=0, st_info=0, st_other=0, st_shndx=0):
++        if not isinstance(st_info, int):
++            st_info = context._encode(st_info)[0]
++        if not isinstance(st_other, int):
++            st_other = context._encode(st_other)[0]
++            
++        self.st_name = st_name
++        self.st_value = st_value
++        self.st_size = st_size
++        self.st_info = st_info
++        self.st_other = st_other
++        self.st_shndx = st_shndx
++
++    def __bytes__(self):
++        return p32(self.st_name) + \
++            p8(self.st_info) + \
++            p8(self.st_other) + \
++            p16(self.st_shndx) + \
++            p64(self.st_value) + \
++            p64(self.st_size)
++
++    def __str__(self):
++        return str(bytes(self))
++
++    def __flat__(self):
++        return bytes(self)
++
++
++class MarkedBytes(bytes):
++    pass
++
++
++class Ret2dlresolve(

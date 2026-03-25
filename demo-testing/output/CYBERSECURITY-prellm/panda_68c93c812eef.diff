@@ -1,0 +1,114 @@
+@@ -16,6 +16,7 @@ PANDAENDCOMMENT */
+ // 2018-APR-13   watch for x86 processor mode changing in i386 build
+ // 2019-JAN-29   do not put an entry in the callstack if the block was stopped
+ //               before the call at the end was made
++// 2019-MAY-21   add (more accurate) stack segregation option (threaded)
+ #define __STDC_FORMAT_MACROS
+ 
+ #include <cstdio>
+@@ -38,6 +39,13 @@ PANDAENDCOMMENT */
+ #include "panda/plugin.h"
+ #include "panda/plugin_plugin.h"
+ 
++// needed for the threaded stack_type
++#include "osi/osi_types.h"
++#include "osi/osi_ext.h"
++#include "wintrospection/wintrospection.h"
++#include "wintrospection/wintrospection_ext.h"
++#include "osi_linux/osi_linux_ext.h"
++
+ #include "callstack_instr.h"
+ 
+ extern "C" {
+@@ -60,6 +68,8 @@ PPP_PROT_REG_CB(on_ret);
+ PPP_CB_BOILERPLATE(on_call);
+ PPP_CB_BOILERPLATE(on_ret);
+ 
++stack_type stack_segregation = STACK_ASID;
++
+ // callstack_instr arguments
+ static bool verbose = false;
+ 
+@@ -86,18 +96,17 @@ csh cs_handle_32;
+ csh cs_handle_64;
+ 
+ // Track the different stacks we have seen to handle multiple threads
+-// within a single process.
++// within a single process.  Used by STACK_HEURISTIC
+ std::map<target_ulong,std::set<target_ulong>> stacks_seen;
+ 
+-// Use a typedef here so we can switch between the stack heuristic and
+-// the original code easily
+-#ifdef USE_STACK_HEURISTIC
++// For STACK_ASID, the first entry of the pair is the ASID, and the second is 0
++// For STACK_HEURISTIC, the first entry is the ASID and the second is the SP
++// For STACK_THREADED, the first entry is the process ID and the second is the thread ID
+ typedef std::pair<target_ulong,target_ulong> stackid;
++
++// STACK_HEURISTIC also needs to cache the SP and ASID
+ target_ulong cached_sp = 0;
+ target_ulong cached_asid = 0;
+-#else
+-typedef target_ulong stackid;
+-#endif
+ 
+ // stackid -> shadow stack
+ std::map<stackid, std::vector<stack_entry>> callstacks;
+@@ -113,13 +122,17 @@ int last_ret_size = 0;
+ void verbose_log(const char *msg, TranslationBlock *tb, stackid curStackid,
+         bool logReturn) {
+     if (verbose) {
+-        printf("%s:  asid=0x", msg);
+-#ifdef USE_STACK_HEURISTIC
+-        printf(TARGET_FMT_lx ", sp=0x" TARGET_FMT_lx, curStackid.first,
+-                curStackid.second);
+-#else
+-        printf(TARGET_FMT_lx, curStackid);
+-#endif
++        printf("%s:  ", msg);
++        if (STACK_HEURISTIC== stack_segregation) {
++            printf("asid=0x" TARGET_FMT_lx ", sp=0x" TARGET_FMT_lx,
++                curStackid.first, curStackid.second);
++        } else if (STACK_THREADED == stack_segregation) {
++            printf("processID=0x" TARGET_FMT_lx ", threadID=0x" TARGET_FMT_lx,
++                    curStackid.first, curStackid.second);
++        } else {
++            // STACK_ASID
++            printf("asid=0x" TARGET_FMT_lx, curStackid.first);
++        }
+         printf(", block pc=0x" TARGET_FMT_lx, tb->pc);
+         if (logReturn) {
+             printf(", returns to 0x" TARGET_FMT_lx, (tb->pc+tb->size));
+@@ -150,54 +163,87 @@ static inline target_ulong get_stack_pointer(CPUArchState* env) {
+ }
+ 
+ static stackid get_stackid(CPUArchState* env) {
+-#ifdef USE_STACK_HEURISTIC
+-    target_ulong asid;
+-
+-    // Track all kernel-mode stacks together
+-    if (in_kernelspace(env))
+-        asid = 0;
+-    else
+-        asid = panda_current_asid(ENV_GET_CPU(env));
+-
+-    // Invalidate cached stack pointer on ASID change
+-    if (cached_asid == 0 || cached_asid != asid) {
+-        cached_sp = 0;
+-        cached_asid = asid;
+-    }
+-
+-    target_ulong sp = get_stack_pointer(env);
++    if (STACK_HEURISTIC == stack_segregation) {
++        target_ulong asid;
++
++        // Track all kernel-mode stacks together
++        if (in_kernelspace(env))
++            asid = 0;
++        else
++            asid = panda_current_asid(ENV_GET_CPU(env));
++
++        // Invalidate cached stack pointer on ASID change
++        if (cached_asid == 0 || cached_asid != asid) {
++            cached_sp = 0;
++            cached_asid = asid

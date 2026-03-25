@@ -1,0 +1,124 @@
+@@ -1,22 +1,194 @@
+-static bool parse_instruction(RBpfSockFilter *f, BPFAsmParser *p, ut64 pc) {
++#define PARSE_REG(_tok, _out) do { \
++	int __v = -1; \
++	if ((_tok) && (((_tok)[0]|32) == 'r')) { __v = atoi ((_tok) + 1); } \
++	PARSE_NEED (__v >= 0 && __v <= 10); \
++	_out = __v; \
++} while (0)
++#define EMIT(_opc,_dst,_src,_off,_imm) do { \
++	out[0] = (_opc); \
++	out[1] = (((_src)&0x0f) << 4) | ((_dst)&0x0f); \
++	r_write_le16 (out + 2, (st16)(_off)); \
++	r_write_le32 (out + 4, (ut32)(_imm)); \
++	*outlen = 8; \
++	return true; \
++} while (0)
++// ALU64 ops (imm/reg)
++#define ALU64(_opk,_opx) do { \
++	PARSE_NEED (opc == 3); \
++	PARSE_REG (op[0], rd); \
++	PARSE_STR (op[1], ","); \
++	if (((op[2][0]|32) == 'r')) { PARSE_REG (op[2], rs); EMIT ((_opx), rd, rs, 0, 0); } \
++	else { immv = strtoul (op[2], NULL, 0); EMIT ((_opk), rd, 0, 0, immv); } \
++} while (0)
++// 32-bit ALU common
++#define ALU32(_opk,_opx) do { \
++	PARSE_NEED (opc == 3); \
++	PARSE_REG (op[0], rd); \
++	PARSE_STR (op[1], ","); \
++	if (((op[2][0]|32) == 'r')) { PARSE_REG (op[2], rs); EMIT ((_opx), rd, rs, 0, 0); } \
++	else { immv = strtoul (op[2], NULL, 0); EMIT ((_opk), rd, 0, 0, immv); } \
++} while (0)
++#define JCC(_opk,_opx) do { \
++	PARSE_NEED (opc == 5); \
++	PARSE_REG (op[0], rd); \
++	PARSE_STR (op[1], ","); \
++	if (((op[2][0]|32) == 'r')) { PARSE_REG (op[2], rs); } else { rs = -1; } \
++	PARSE_STR (op[3], ","); \
++	offv = (st32)strtol (op[4], NULL, 0); \
++	if (rs >= 0) { EMIT ((_opx), rd, rs, offv, 0); } \
++	immv = strtoul (op[2], NULL, 0); \
++	EMIT ((_opk), rd, 0, offv, immv); \
++} while (0)
++
++static inline bool parse_instruction(RBpfSockFilter *f, BPFAsmParser *p, ut64 pc, RBpfDialect dialect, ut8 *out, int *outlen) {
+ 	const char *mnemonic_tok = token_next (p);
+ 	PARSE_NEED_TOKEN (mnemonic_tok);
+-	int mlen = r_str_nlen (mnemonic_tok, 5);
+-	if (mlen < 2 || mlen > 4) {
++	int mlen = r_str_nlen (mnemonic_tok, 8);
++	if (mlen < 2 || mlen > 7) {
+ 		R_LOG_ERROR ("invalid mnemonic");
+ 	}
+ 
+-	char mnemonic[5] = {0};
+-	strncpy (mnemonic, mnemonic_tok, 4);
++	char mnemonic[8] = {0};
++	strncpy (mnemonic, mnemonic_tok, 7);
+ 
+ 	int opc;
+ 	bpf_token op[11] = {0};
+-	for (opc = 0; opc < (sizeof (op) / sizeof (op[0]));) {
+-		const char *t = token_next (p);
+-		if (t == NULL) {
+-			break;
++	if (dialect != R_BPF_DIALECT_EXTENDED) {
++		for (opc = 0; opc < (int)(sizeof (op) / sizeof (op[0]));) {
++			const char *t = token_next (p);
++			if (t == NULL) {
++				break;
++			}
++			strncpy (op[opc++], t, TOKEN_MAX_LEN);
++		}
++	} else {
++		opc = 0;
++	}
++
++	if (dialect == R_BPF_DIALECT_EXTENDED) {
++		// eBPF assembler fast-path for common instructions
++		// Encoding: out[0]=opcode, out[1]=(src<<4)|dst, out[2..3]=off(le16), out[4..7]=imm(le32)
++		int opc = 0;
++		bpf_token op[12] = {0};
++		for (opc = 0; opc < (int)(sizeof (op) / sizeof (op[0])); opc++) {
++			const char *t = token_next (p);
++			if (!t) break;
++			strncpy (op[opc], t, TOKEN_MAX_LEN);
++		}
++		// helpers
++		int rd, rs; st32 offv; ut32 immv;
++
++		// exit
++		if (TOKEN_EQ (mnemonic, "exit")) {
++			PARSE_NEED (opc == 0);
++			EMIT (0x95, 0, 0, 0, 0);
++		}
++		// call imm
++		if (TOKEN_EQ (mnemonic, "call")) {
++			PARSE_NEED (opc == 1);
++			immv = strtoul (op[0], NULL, 0);
++			EMIT (0x85, 0, 0, 0, immv);
+ 		}
+-		strncpy (op[opc++], t, TOKEN_MAX_LEN);
++		// ja/jmp +off
++		if (TOKEN_EQ (mnemonic, "ja") || TOKEN_EQ (mnemonic, "jmp")) {
++			PARSE_NEED (opc == 1);
++			offv = (st32)strtol (op[0], NULL, 0);
++			EMIT (0x05, 0, 0, offv, 0);
++		}
++		// mov64 rd, rs|imm
++		if (TOKEN_EQ (mnemonic, "mov64") || TOKEN_EQ (mnemonic, "mov")) {
++			PARSE_NEED (opc == 3);
++			PARSE_REG (op[0], rd);
++			PARSE_STR (op[1], ",");
++			if ((((op[2][0]|32) == 'r'))) {
++				PARSE_REG (op[2], rs);
++				EMIT (0xbf, rd, rs, 0, 0);
++			} else {
++				immv = strtoul (op[2], NULL, 0);
++				EMIT (0xb7, rd, 0, 0, immv);
++			}
++		}
++		if (TOKEN_EQ (mnemonic, "add64")) { ALU64 (0x07, 0x0f); }
++		if (TOKEN_EQ (mnemonic, "sub64")) { ALU64 (0x17, 0x1f); }
++		if (TOKEN_EQ (mnemonic, "mul6

@@ -1,0 +1,103 @@
+@@ -32,8 +32,10 @@ class AlertsQueue {
+ 
+  public:
+   AlertsQueue(NetworkInterface *iface);
++
+   void pushOutsideDhcpRangeAlert(u_char* cli_mac, Mac *sender_mac,
+     u_int32_t ip, u_int32_t router_ip, int vlan_id);
++  void pushSlowPeriodicActivity(u_long msec_diff, u_long max_duration_ms, const char *activity_path);
+ };
+ 
+ #endif
+
+
+
+
+@@ -753,6 +753,7 @@ class NetworkInterface : public AlertableEntity {
+   inline bool hasAlerts()                                 { return(has_stored_alerts || (getNumEngagedAlerts() > 0)); }
+   inline void refreshHasAlerts()                          { has_stored_alerts = alertsManager ? alertsManager->hasAlerts() : false; }
+   inline void incNumDroppedAlerts(u_int32_t num_dropped)  { num_dropped_alerts += num_dropped; }
++  inline AlertsQueue* getAlertsQueue()                    { return(alerts_queue); }
+   void walkAlertables(int entity_type, const char *entity_value, alertable_callback *callback, void *user_data);
+   void getEngagedAlertsCount(lua_State *vm, int entity_type, const char *entity_value);
+   void getEngagedAlerts(lua_State *vm, int entity_type, const char *entity_value, AlertType alert_type, AlertLevel alert_severity);
+
+
+
+
+@@ -45,7 +45,6 @@ class ThreadedActivity {
+   void schedulePeriodicActivity(ThreadPool *pool);
+   void setInterfaceTaskRunning(NetworkInterface *iface, bool running);
+   bool isInterfaceTaskRunning(NetworkInterface *iface);
+-  bool storeSlowActivityAlert(u_long duration_time, NetworkInterface *iface);
+   
+  public:
+   ThreadedActivity(const char* _path,
+
+
+
+
+@@ -514,8 +514,6 @@
+ #define CONST_INFLUXDB_MAX_DUMP_SIZE       4194304 /* 4 MB */
+ #define CONST_ALERT_MSG_QUEUE                    "ntopng.alert_queue"
+ #define CONST_ALERT_MAC_IP_QUEUE                 "ntopng.alert_mac_ip_queue"
+-#define CONST_ALERT_OUTSIDE_DHCP_RANGE           "ntopng.alert_outside_dhcp_range_queue"
+-#define CONST_ALERT_PERIODIC_ACTIVITY_QUEUE      "ntopng.periodic_activity_queue"
+ #define CONST_ALERT_NFQ_FLUSHED                  "ntopng.alert_nfq_flushed_queue"
+ #define CONST_ALERT_HOST_REMOTE_TO_REMOTE        "ntopng.alert_host_remote_to_remote"
+ #define CONST_ALERT_BCAST_DOMAIN_TOO_LARGE_QUEUE "ntopng.alert_bcast_domain_too_large"
+
+
+
+
+@@ -126,6 +126,7 @@ typedef enum {
+   alert_broadcast_domain_too_large = 34,
+   alert_ids = 35,
+   misconfigured_dhcp_range = 36,
++  slow_periodic_activity = 40,
+   /* 
+      IMPORTANT IMPORTANT IMPORTANT
+      If # status >= 64 then extend Utils.h and Lua bitmap functions to handle it
+
+
+
+
+@@ -66,3 +66,19 @@ void AlertsQueue::pushOutsideDhcpRangeAlert(u_char *cli_mac, Mac *sender_mac,
+     json_object_put(jobject);
+   }
+ }
++
++/* **************************************************** */
++
++void AlertsQueue::pushSlowPeriodicActivity(u_long msec_diff,
++    u_long max_duration_ms, const char *activity_path) {
++  json_object *jobject = json_object_new_object();
++
++  if(jobject) {
++    json_object_object_add(jobject, "duration_ms", json_object_new_int64(msec_diff));
++    json_object_object_add(jobject, "max_duration_ms", json_object_new_int64(max_duration_ms));
++    json_object_object_add(jobject, "path", json_object_new_string(activity_path));
++
++    pushAlertJson(slow_periodic_activity, jobject);
++    json_object_put(jobject);
++  }
++}
+
+
+
+
+@@ -193,7 +193,7 @@ void ThreadedActivity::runScript(char *script_path, NetworkInterface *iface) {
+       (strcmp(path, HOUSEKEEPING_SCRIPT_PATH) != 0) &&
+       (strcmp(path, DISCOVER_SCRIPT_PATH) != 0) &&
+       (strcmp(path, TIMESERIES_SCRIPT_PATH) != 0))
+-    storeSlowActivityAlert(msec_diff, iface);
++    iface->getAlertsQueue()->pushSlowPeriodicActivity(msec_diff, periodicity * 1e3, path);
+ 
+   if(iface == ntop->getSystemInterface())
+     systemTaskRunning = false;
+@@ -212,30 +212,6 @@ void ThreadedActivity::aperiodicActivityBody() {
+ 
+ /* ******************************************* */
+ 
+-bool ThreadedActivity::storeSlowActivityAlert(u_long msec_diff, NetworkInterface *iface) {
+-  u_long max_duration_ms = periodicity * 1e3;

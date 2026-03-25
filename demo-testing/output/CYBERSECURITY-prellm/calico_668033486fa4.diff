@@ -1,0 +1,121 @@
+@@ -64,8 +64,12 @@ MAKEFUNC(int, redirect_map, void *map, __u32 key, __u64 flags)
+ MAKEFUNC(void, tail_call, void *ctx, void *map, uint32_t index)
+ MAKEFUNC(void, skb_store_bytes, void *ctx, __u32 offset, const void *from, __u32 len, __u64 flags)
+ MAKEFUNC(int, l4_csum_replace, void *ctx, __u32 offset, __u64 from, __u64 to, __u64 flags)
+-MAKEFUNC(void, l3_csum_replace, void *ctx, __u32 offset, __u64 from, __u64 to, __u64 flags)
++MAKEFUNC(int, l3_csum_replace, void *ctx, __u32 offset, __u64 from, __u64 to, __u64 flags)
+ MAKEFUNC(int, fib_lookup, void *ctx, struct bpf_fib_lookup *params, int plen, __u32 flags)
++MAKEFUNC(int, skb_change_head, void *ctx, __u32 len, __u64 flags)
++MAKEFUNC(int, skb_change_tail, void *ctx, __u32 len, __u64 flags)
++MAKEFUNC(int, skb_adjust_room, void *ctx, __s32 len, __u32 mode, __u64 flags)
++MAKEFUNC(int, csum_diff, __be32 *from, __u32 from_size, __be32 *to, __u32 to_size, __wsum seed)
+ 
+ #define printk(fmt, ...) do { char fmt2[] = fmt; bpf_trace_printk(fmt2, sizeof(fmt2) , ## __VA_ARGS__); } while (0)
+ 
+@@ -156,6 +160,7 @@ enum calico_skb_mark {
+ #define skb_has_data_after(skb, ptr, size) (!skb_shorter(skb, skb_offset(skb, ptr) + \
+ 					     sizeof(*ptr) + (size)))
+ #define skb_tail_len(skb, ptr) ((skb)->data_end - (long)ptr)
++#define skb_ptr(skb, off) ((void *)((long)(skb)->data + (off)))
+ 
+ #define IPV4_UDP_SIZE		(sizeof(struct iphdr) + sizeof(struct udphdr))
+ #define ETH_IPV4_UDP_SIZE	(sizeof(struct ethhdr) + IPV4_UDP_SIZE)
+
+
+
+
+@@ -1,9 +1,22 @@
+ #ifndef __CALI_NAT_H__
+ #define __CALI_NAT_H__
+ 
++#include <stddef.h>
+ #include <linux/in.h>
++#include <linux/ip.h>
++#include <linux/if_ether.h>
++#include <linux/udp.h>
++#include <linux/version.h>
+ #import "bpf.h"
+ 
++#ifndef CALI_HOST_IP
++#define CALI_HOST_IP 0x0
++#endif
++
++#ifndef CALI_VXLAN_PORT
++#define CALI_VXLAN_PORT 4789 /* IANA VXLAN port */
++#endif
++
+ // Map: NAT level one.  Dest IP and port -> ID and num backends.
+ 
+ struct calico_nat_v4_key {
+@@ -91,4 +104,123 @@ static CALI_BPF_INLINE struct calico_nat_dest* calico_v4_nat_lookup(__u8 ip_prot
+ 	return nat_lv2_val;
+ }
+ 
++struct vxlanhdr {
++	__be32 flags;
++	__be32 vni;
++};
++
++static CALI_BPF_INLINE int vxlan_v4_encap(struct __sk_buff *skb,
++					  __be32 ipaddr,
++					  bool is_src,
++					  enum calico_tc_flags flags)
++{
++	int ret;
++	uint32_t new_hdrsz;
++	struct ethhdr *eth, *eth_inner;
++	struct iphdr *ip, *ip_inner;
++	struct udphdr *udp;
++	struct vxlanhdr *vxlan;
++	__wsum csum;
++
++	new_hdrsz = sizeof(struct ethhdr) + sizeof(struct iphdr) +
++			sizeof(struct udphdr) + sizeof(struct vxlanhdr);
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,0)
++	ret = bpf_skb_adjust_room(skb, new_hdrsz, BPF_ADJ_ROOM_MAC,
++						  BPF_F_ADJ_ROOM_ENCAP_L4_UDP |
++						  BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 |
++						  BPF_F_ADJ_ROOM_ENCAP_L2(sizeof(struct ethhdr)));
++
++#else
++	/* XXX if IP options are used, we loose them */
++	ret = bpf_skb_adjust_room(skb, new_hdrsz, BPF_ADJ_ROOM_NET, 0);
++#endif
++	if (ret) {
++		goto out;
++	}
++
++	ret = -1;
++
++	if skb_shorter(skb, sizeof(struct ethhdr) + new_hdrsz +
++			    sizeof(struct ethhdr) + sizeof(struct iphdr)) {
++		CALI_DEBUG("VXLAN encap: too short after room adjust\n");
++		goto out;
++	}
++
++	eth = (void *)(long)skb->data;
++	ip = (void*)(eth + 1);
++	udp = (void*)(ip + 1);
++	vxlan = (void *)(udp +1);
++	eth_inner = (void *)(vxlan+1);
++	ip_inner = (void*)(eth_inner+1);
++
++	/* Copy the original IP header. Since it is aready DNATed, the dest IP is
++	 * already set. All we need to do it to change the source IP
++	 */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,2,0)
++	*ip = *ip_inner;
++#else
++	*ip_inner = *ip;
++#endif
++	*(is_src ? &ip->saddr : &ip->daddr) = ipaddr;
++	ip->tot_len = host_to_be16(be16_to_host(ip->tot_len) + new_hdrsz);
++	ip->ihl = 5; /* in case there were options in ip_inner */
++	ip->check = 0;
++	ip->protocol = 17; /* UDP */
++
++	udp->source = udp->dest = host_to_be16(CALI_VXLAN_PORT);
++	udp->len = host_to_be16(skb_tail_len(skb, udp));
++
++	/* set the I flag to make the VNI valid

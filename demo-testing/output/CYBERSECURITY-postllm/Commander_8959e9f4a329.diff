@@ -1,0 +1,90 @@
+@@ -689,8 +689,8 @@ def communicate_rest(params, request, endpoint, *, rs_type=None, payload_version
+     raise KeeperApiError('Error', endpoint)
+ 
+ 
+-def communicate(params, request):
+-    # type: (KeeperParams, dict) -> dict
++def communicate(params, request, retry_on_throttle=True):
++    # type: (KeeperParams, dict, Optional[bool]) -> dict
+ 
+     request['client_time'] = current_milli_time()
+     request['locale'] = LOCALE
+@@ -700,6 +700,11 @@ def communicate(params, request):
+     try:
+         response_json = run_command(params, request)
+         if response_json['result'] != 'success':
++            if retry_on_throttle and response_json.get('result_code') == 'throttled':
++                logging.info('Throttled. sleeping for 10 seconds')
++                time.sleep(10)
++                # Allow maximum 1 retry per call
++                return communicate(params, request, retry_on_throttle=False)
+             raise KeeperApiError(response_json['result_code'], response_json['message'])
+         TTK.update_time_of_last_activity()
+         return response_json
+
+
+
+
+@@ -1,10 +1,11 @@
+ import argparse
+ import datetime
++import itertools
+ import json
+ import logging
+ import operator
+ from functools import partial
+-from typing import Optional, Dict, Tuple, List, Any, Iterable
++from typing import Optional, Dict, Tuple, List, Any, Iterable, Union
+ 
+ from keepercommander.commands.base import GroupCommand, dump_report_data, field_to_title
+ from keepercommander.commands.enterprise_common import EnterpriseCommand
+@@ -366,52 +367,50 @@ class ComplianceRecordAccessReportCommand(BaseComplianceReportCommand):
+ 
+     def generate_report_data(self, params, kwargs, sox_data, report_fmt, node, root_node):
+         # type: (KeeperParams, Dict[str, Any], sox.sox_data.SoxData, str, int, int) -> List[List[str]]
+-        def get_records_accessed(email, records=None):
+-            records_accessed = dict()   # type: Dict[str, Dict[str, Any]]
++        def get_records_accessed_rq(email, filter_recs=None, created_max=None):
++            # type: (str, Optional[List[str]], Optional[int]) -> Union[None, Dict[str, Any]]
+             # Empty record filter list -> no records to search for
+-            if records is not None and not records:
+-                return records_accessed
++            if filter_recs is not None and not filter_recs:
++                return None
+ 
+             columns = ['record_uid', 'ip_address', 'keeper_version']
+             rq_filter = {'username': email}
+-            if records is not None:
+-                rq_filter['record_uid'] = records
+-
+-            rq = {
+-                'command':      'get_audit_event_reports',
+-                'report_type':  'span',
+-                'scope':        'enterprise',
+-                'aggregate':    ['last_created'],
+-                'limit':        API_EVENT_SUMMARY_ROW_LIMIT,
+-                'filter':       rq_filter,
+-                'columns':      columns,
+-            }
+-
+-            def update_records_accessed(record_access_events):
+-                for event in record_access_events:
+-                    r_uid = event.get('record_uid')
+-                    records_accessed.setdefault(r_uid, event)
+-
+-            def get_events(period_end, filter_recs):
+-                if period_end:
+-                    rq_filter['created'] = {'max': period_end}
++            if filter_recs is not None:
+                 rq_filter['record_uid'] = filter_recs
+-                rs = api.communicate(params, rq)
+-                return rs.get('audit_event_overview_report_rows')
+-
+-            done = records is not None and not records
+-            max_ts = 0
+-            missing_records = [] if not records else [*records]
+-            while not done:
+-                chunk = missing_records[:API_EVENT_SUMMARY_ROW_LIMIT]
+-                events = get_events(max_ts, chunk)
+-                update_records_accessed(events)
+-                missing_records = [r for r in records if r not in records_accessed] if

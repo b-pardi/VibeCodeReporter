@@ -1,0 +1,107 @@
+@@ -29,6 +29,10 @@ class AlertCheckLuaEngine : public LuaEngine {
+   u_int num_calls;
+   ticks total_ticks;
+ 
++  u_int32_t num_missed_proto_detected;
++  u_int32_t num_missed_periodic_update;
++  u_int32_t num_missed_idle;
++
+  public:
+   AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodicity p, NetworkInterface *iface);
+   virtual ~AlertCheckLuaEngine();
+@@ -38,6 +42,10 @@ class AlertCheckLuaEngine : public LuaEngine {
+   ScriptPeriodicity getPeriodicity() const;
+   const char * getGranularity() const;
+ 
++  inline void incNumMissedProtoDetected()     { num_missed_proto_detected++;  }
++  inline void incNumMissedPeriodicUpdate()    { num_missed_periodic_update++; }
++  inline void incNumMissedIdle()              { num_missed_idle++;            }
++
+   void lua_stats(const char * key, lua_State *vm);
+ };
+ 
+
+
+
+
+@@ -240,7 +240,7 @@ class Flow : public GenericHashEntry {
+   const char* cipher_weakness2str(ndpi_cipher_weakness w) const;
+   bool get_partial_traffic_stats(FlowTrafficStats **dst, FlowTrafficStats *delta, bool *first_partial) const;
+   bool isLuaCallPerformed(FlowLuaCall flow_lua_call, const struct timeval *tv);
+-  void performLuaCall(FlowLuaCall flow_lua_call, const struct timeval *tv, AlertCheckLuaEngine **acle);
++  void performLuaCall(FlowLuaCall flow_lua_call, const struct timeval *tv, AlertCheckLuaEngine *acle);
+ 
+  public:
+   Flow(NetworkInterface *_iface,
+
+
+
+
+@@ -60,6 +60,7 @@ typedef struct {
+   AlertCheckLuaEngine *acle;
+   struct timeval *tv;
+   time_t deadline;
++  bool quick_update;
+ } periodic_ht_state_update_user_data_t;
+ 
+ typedef struct {
+
+
+
+
+@@ -28,6 +28,8 @@ AlertCheckLuaEngine::AlertCheckLuaEngine(AlertEntity alert_entity, ScriptPeriodi
+   total_ticks = 0;
+   const char *lua_file = NULL;
+ 
++  num_missed_idle = num_missed_periodic_update = num_missed_proto_detected = 0;
++
+   p = script_periodicity;
+ 
+   switch(alert_entity) {
+@@ -101,6 +103,10 @@ void AlertCheckLuaEngine::lua_stats(const char *key, lua_State *vm) {
+     lua_push_uint64_table_entry(vm, "num_calls", (u_int64_t)num_calls);
+     lua_push_float_table_entry(vm, "tot_duration_ms", elapsed_time * 1000);
+ 
++    lua_push_uint64_table_entry(vm, "num_missed_idle", num_missed_idle);
++    lua_push_uint64_table_entry(vm, "num_missed_periodic_update", num_missed_periodic_update);
++    lua_push_uint64_table_entry(vm, "num_missed_proto_detected", num_missed_proto_detected);
++
+     lua_pushstring(vm, "stats");
+     lua_insert(vm, -2);
+     lua_settable(vm, -3);
+
+
+
+
+@@ -1875,23 +1875,43 @@ void Flow::periodic_hash_entry_state_update(void *user_data, bool quick) {
+     break;
+ 
+   case hash_entry_state_flow_protocoldetected:
+-    if(!quick) performLuaCall(flow_lua_call_protocol_detected, tv, &periodic_ht_state_update_user_data->acle);
++    if(!isLuaCallPerformed(flow_lua_call_protocol_detected, tv)) {
++      if(!periodic_ht_state_update_user_data->acle)
++	periodic_ht_state_update_user_data->acle = new AlertCheckLuaEngine(alert_entity_flow, minute_script /* doesn't matter */, iface);
++
++      if(!quick)
++	performLuaCall(flow_lua_call_protocol_detected, tv, periodic_ht_state_update_user_data->acle);
++      else
++	periodic_ht_state_update_user_data->acle->incNumMissedProtoDetected();
++    }
+     set_hash_entry_state_active();
+     break;
+ 
+   case hash_entry_state_active:
+-    if(!quick) {
+-      periodic_dump_check(tv);
+-      performLuaCall(flow_lua_call_periodic_update, tv, &periodic_ht_state_update_user_data->acle);
++    if(!isLuaCallPerformed(flow_lua_call_periodic_update, tv)) {
++      if(!periodic_ht_state_update_user_data->acle)
++	periodic_ht_state_update_user_data->acle = new AlertCheckLuaEngine(alert_entity_flow, minute_script /* doesn't matter */, iface);
++
++      if(!quick) {
++	periodic_dump_check(tv); /* NOTE: this call can take a long time! */
++	performLuaCall(flow_lua_call_periodic_update, tv, periodic_ht_state_update_user_data->acle);
++      } else
++	periodic_ht_state_update_user_data->acle->incNumMissedPeriodicUpdate();
+     }
+     /* Don'

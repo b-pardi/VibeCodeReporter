@@ -1,0 +1,90 @@
+@@ -683,12 +683,11 @@ public abstract class UserTests {
+         String username = generateUsername();
+         String password = "test01";
+         UserContext context = PeergosNetworkUtils.ensureSignedUp(username, password, network, crypto);
+-        FileWrapper userRoot = context.getUserRoot().get();
+         List<String> names = new ArrayList<>();
+         IntStream.range(0, 2000).forEach(i -> names.add(randomString()));
+ 
+         for (String filename: names) {
+-            userRoot.mkdir(filename, context.network, false, context.crypto.random);
++            context.getUserRoot().get().mkdir(filename, context.network, false, context.crypto.random);
+         }
+     }
+ 
+
+
+
+
+@@ -62,7 +62,7 @@ public class MutableTreeImpl implements MutableTree {
+         // and whoever commits first will win. We also need to retrieve the writer data again from the network after
+         // a previous transaction has completed (another node/user may have updated the mapping)
+         return pending.computeIfAbsent(writer, w -> new AsyncLock<>(getWriterData(owner, w)))
+-                .runWithLock(x -> getWriterData(owner, writer).thenCompose(updater));
++                .runWithLock(current -> updater.apply(current), () -> getWriterData(owner, writer));
+     }
+ 
+     @Override
+
+
+
+
+@@ -344,6 +344,7 @@ public class DirAccess implements CryptreeNode {
+                 .collect(Collectors.toSet());
+     }
+ 
++    @Override
+     public Set<AbsoluteCapability> getChildrenCapabilities(AbsoluteCapability us) {
+         return getChildren(us.rBaseKey).stream()
+                 .map(cap -> cap.toAbsolute(us))
+
+
+
+
+@@ -43,6 +43,10 @@ public interface CryptreeNode extends Cborable {
+                         new IllegalStateException("No link to private signing key present on directory!")));
+     }
+ 
++    default Set<AbsoluteCapability> getChildrenCapabilities(AbsoluteCapability us) {
++        return Collections.emptySet();
++    }
++
+     CompletableFuture<? extends CryptreeNode> updateProperties(WritableAbsoluteCapability us,
+                                                                Optional<SigningPrivateKeyAndPublicHash> entryWriter,
+                                                                FileProperties newProps,
+
+
+
+
+@@ -16,25 +16,35 @@ public class AsyncLock<T> {
+         this.queueHead = initialValue;
+     }
+ 
++    public synchronized CompletableFuture<T> runWithLock(Function<T, CompletionStage<T>> processor) {
++        return runWithLock(processor, () -> queueHead);
++    }
++
+     /**
+      *
+-     * @param updater
+-     * @return A future completed with the result from updater, or exceptionally completed on error
++     * @param processor
++     * @param updater a method to get a fresh value which is called if updater completes exceptionally
++     * @return A future completed with the result from a computation, or exceptionally completed on error
+      */
+-    public synchronized CompletableFuture<T> runWithLock(Function<T, CompletionStage<T>> updater) {
++    public synchronized CompletableFuture<T> runWithLock(Function<T, CompletionStage<T>> processor, Supplier<CompletableFuture<T>> updater) {
+         CompletableFuture<T> existing = queueHead;
+         CompletableFuture<T> newHead = new CompletableFuture<>();
+         this.queueHead = newHead;
+ 
+         CompletableFuture<T> result = new CompletableFuture<>();
+-        existing.thenCompose(current -> updater.apply(current)
++        existing.thenCompose(current -> processor.apply(current)
+                 .thenApply(res -> newHead.complete(res) && result.complete(res))
+-                .exceptionally(t -> newHead.complete(current) && result.completeExceptionally(t)));
++                .exceptionally(t -> {
++                    updater.get().thenCompose(processor)
++                            .thenApply(res -> newHead.complete(res) && result.complete(res))
++                            .exceptionally(e -> newHead.complete(current) && result.completeExceptionally(e));
++                    ret

@@ -1,0 +1,97 @@
+@@ -1868,7 +1868,6 @@ void AppLayerRequestProtocolTLSUpgrade(Flow *f)
+ 
+ void AppLayerProtoDetectReset(Flow *f)
+ {
+-    FlowUnsetChangeProtoFlag(f);
+     FLOW_RESET_PM_DONE(f, STREAM_TOSERVER);
+     FLOW_RESET_PM_DONE(f, STREAM_TOCLIENT);
+     FLOW_RESET_PP_DONE(f, STREAM_TOSERVER);
+@@ -1878,8 +1877,8 @@ void AppLayerProtoDetectReset(Flow *f)
+     f->probing_parser_toserver_alproto_masks = 0;
+     f->probing_parser_toclient_alproto_masks = 0;
+ 
+-    AppLayerParserStateCleanup(f, f->alstate, f->alparser);
+-    f->alstate = NULL;
++    // Does not free the structures for the parser
++    // keeps f->alstate for new state creation
+     f->alparser = NULL;
+     f->alproto    = ALPROTO_UNKNOWN;
+     f->alproto_ts = ALPROTO_UNKNOWN;
+
+
+
+
+@@ -1214,7 +1214,7 @@ int AppLayerParserParse(ThreadVars *tv, AppLayerParserThreadCtx *alp_tctx, Flow
+     SetEOFFlags(pstate, flags);
+ 
+     alstate = f->alstate;
+-    if (alstate == NULL) {
++    if (alstate == NULL || FlowChangeProto(f)) {
+         f->alstate = alstate = p->StateAlloc(alstate, f->alproto_orig);
+         if (alstate == NULL)
+             goto error;
+@@ -1449,12 +1449,12 @@ void AppLayerParserSetStreamDepthFlag(uint8_t ipproto, AppProto alproto, void *s
+ 
+ /***** Cleanup *****/
+ 
+-void AppLayerParserStateCleanup(const Flow *f, void *alstate,
+-                                AppLayerParserState *pstate)
++void AppLayerParserStateProtoCleanup(
++        uint8_t protomap, AppProto alproto, void *alstate, AppLayerParserState *pstate)
+ {
+     SCEnter();
+ 
+-    AppLayerParserProtoCtx *ctx = &alp_ctx.ctxs[f->protomap][f->alproto];
++    AppLayerParserProtoCtx *ctx = &alp_ctx.ctxs[protomap][alproto];
+ 
+     if (ctx->StateFree != NULL && alstate != NULL)
+         ctx->StateFree(alstate);
+@@ -1466,6 +1466,11 @@ void AppLayerParserStateCleanup(const Flow *f, void *alstate,
+     SCReturn;
+ }
+ 
++void AppLayerParserStateCleanup(const Flow *f, void *alstate, AppLayerParserState *pstate)
++{
++    AppLayerParserStateProtoCleanup(f->protomap, f->alproto, alstate, pstate);
++}
++
+ static void ValidateParserProtoDump(AppProto alproto, uint8_t ipproto)
+ {
+     uint8_t map = FlowGetProtoMapping(ipproto);
+
+
+
+
+@@ -257,6 +257,8 @@ int AppLayerParserIsEnabled(AppProto alproto);
+ 
+ /***** Cleanup *****/
+ 
++void AppLayerParserStateProtoCleanup(
++        uint8_t protomap, AppProto alproto, void *alstate, AppLayerParserState *pstate);
+ void AppLayerParserStateCleanup(const Flow *f, void *alstate, AppLayerParserState *pstate);
+ 
+ void AppLayerParserRegisterProtocolParsers(void);
+
+
+
+
+@@ -631,11 +631,17 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
+     } else if (alproto != ALPROTO_UNKNOWN && FlowChangeProto(f)) {
+         f->alproto_orig = f->alproto;
+         SCLogDebug("protocol change, old %s", AppProtoToString(f->alproto_orig));
++        void *alstate_orig = f->alstate;
++        AppLayerParserState *alparser = f->alparser;
++        // we delay AppLayerParserStateCleanup because we may need previous parser state
+         AppLayerProtoDetectReset(f);
+         /* rerun protocol detection */
+-        if (TCPProtoDetect(tv, ra_ctx, app_tctx, p, f, ssn, stream,
+-                           data, data_len, flags) != 0) {
++        int rd = TCPProtoDetect(tv, ra_ctx, app_tctx, p, f, ssn, stream, data, data_len, flags);
++        FlowUnsetChangeProtoFlag(f);
++        AppLayerParserStateProtoCleanup(f->protomap, f->alproto_orig, alstate_orig, alparser);
++        if (rd != 0) {
+             SCLogDebug("proto detect failure");
++            f->alstate = NULL;
+             goto failure;
+         }
+         SCLogDebug("protocol change, old %s, new %s",

@@ -1,0 +1,84 @@
+@@ -113,6 +113,7 @@ download_membership_parser.exit = suppress_exit
+ 
+ 
+ apply_membership_parser = argparse.ArgumentParser(prog='apply-membership', description='Loads shared folder membership from JSON file into Keeper.')
++apply_membership_parser.add_argument('--full-sync', dest='full_sync', action='store_true', help='Update and remove membership also.')
+ apply_membership_parser.add_argument('name', type=str, nargs='?', help='Input file name. "shared_folder_membership.json" if omitted.')
+ apply_membership_parser.error = raise_parse_exception
+ apply_membership_parser.exit = suppress_exit
+@@ -435,11 +436,12 @@ class ApplyMembershipCommand(Command):
+             if isinstance(obj, Team):
+                 teams.append(obj)
+ 
++        full_sync = kwargs.get('full_sync') is True
+         if len(shared_folders) > 0:
+-            imp_exp.import_user_permissions(params, shared_folders)
++            imp_exp.import_user_permissions(params, shared_folders, full_sync)
+ 
+         if len(teams) > 0:
+-            imp_exp.import_teams(params, teams)
++            imp_exp.import_teams(params, teams, full_sync)
+ 
+ 
+ class DownloadRecordTypeCommand(EnterpriseCommand):
+
+
+
+
+@@ -408,7 +408,7 @@ def export(params, file_format, filename, **kwargs):
+         logging.info('%d records exported', rec_count)
+ 
+ 
+-def import_teams(params, teams):   # type: (KeeperParams, List[ImportTeam]) -> None
++def import_teams(params, teams, full_sync=False):   # type: (KeeperParams, List[ImportTeam], bool) -> None
+     if not params.enterprise:
+         logging.warning('Only enterprise administrator can import teams.')
+         return
+@@ -435,11 +435,12 @@ def import_teams(params, teams):   # type: (KeeperParams, List[ImportTeam]) -> N
+             if u['status'] == 'active' and u['lock'] == 0:
+                 user_lookup[u['username'].lower()] = u['enterprise_user_id']
+ 
+-    users_to_add = []    # type: List[Tuple[str, str]]
++    users_to_add = []       # type: List[Tuple[str, str]]
++    users_to_remove = []    # type: List[Tuple[str, int]]
+     for team in teams:
+         team_uid = None
+         if team.uid and isinstance(team.uid, str):
+-            for v in team_lookup:
++            for v in team_lookup.values():
+                 if isinstance(v, str):
+                     if v == team.uid:
+                         team_uid = team.uid
+@@ -461,21 +462,25 @@ def import_teams(params, teams):   # type: (KeeperParams, List[ImportTeam]) -> N
+ 
+         if team_uid and isinstance(team.members, list):
+             current_members = set((x['enterprise_user_id'] for x in params.enterprise.get('team_users', []) if x['team_uid'] == team_uid))
++            keep_members = set()
+             for email in team.members:
+                 if isinstance(email, str):
+                     email = email.lower()
+                     if email in user_lookup:
+                         user_id = user_lookup[email]
++                        keep_members.add(user_id)
+                         if user_id not in current_members:
+                             users_to_add.append((email, team_uid))
++            if full_sync and len(keep_members) > 0:
++                users_to_remove.extend(((team_uid, x) for x in current_members.difference(keep_members)))
+ 
++    rqs = []
+     if len(users_to_add) > 0:
+         emails = set((x[0] for x in users_to_add))
+         api.load_user_public_keys(params, list(emails))
+         team_uids = set((x[1] for x in users_to_add))
+         api.load_team_keys(params, list(team_uids))
+ 
+-        rqs = []
+         for email, team_uid in users_to_add:
+             if team_uid in params.key_cache and email in params.key_cache and email in user_lookup:
+                 team_key = params.key_cache[team_uid]
+@@ -494,16 +499,44 @@ def import_teams(params, teams):   # type: (KeeperParams, List[ImportTeam]) -> N
+                         })
+                     except Exception as e:
+                         logging.debug('Add user to team error: %s', str(e))
+-        if rqs:
+-  

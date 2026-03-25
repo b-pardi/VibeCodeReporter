@@ -1,0 +1,133 @@
+@@ -102,6 +102,20 @@ struct bpf_map_def SEC("maps") cpus_count = {
+ 	.max_entries	= 1,
+ };
+ 
++struct bpf_map_def SEC("maps") tx_peer = {
++	.type = BPF_MAP_TYPE_DEVMAP,
++	.key_size = sizeof(int),
++	.value_size = sizeof(int),
++	.max_entries = 1,
++};
++
++struct bpf_map_def SEC("maps") tx_peer_int = {
++	.type = BPF_MAP_TYPE_ARRAY,
++	.key_size = sizeof(int),
++	.value_size = sizeof(int),
++	.max_entries = 1,
++};
++
+ static __always_inline int get_sport(void *trans_data, void *data_end,
+         uint8_t protocol)
+ {
+@@ -157,6 +171,8 @@ static int __always_inline filter_ipv4(void *data, __u64 nh_off, void *data_end)
+     uint32_t key0 = 0;
+     uint32_t *cpu_max = bpf_map_lookup_elem(&cpus_count, &key0);
+     uint32_t *cpu_selected;
++    int *iface_peer;
++    int tx_port = 0;
+ 
+     if ((void *)(iph + 1) > data_end)
+         return XDP_PASS;
+@@ -195,7 +211,12 @@ static int __always_inline filter_ipv4(void *data, __u64 nh_off, void *data_end)
+         value->packets++;
+         value->bytes += data_end - data;
+ 
+-        return XDP_DROP;
++        iface_peer = bpf_map_lookup_elem(&tx_peer_int, &key0);
++        if (!iface_peer) {
++            return XDP_DROP;
++        } else {
++            return bpf_redirect_map(&tx_peer, tx_port, 0);
++        }
+     }
+ 
+     if (cpu_max && *cpu_max) {
+@@ -221,6 +242,8 @@ static int __always_inline filter_ipv6(void *data, __u64 nh_off, void *data_end)
+     uint32_t key0 = 0;
+     int *cpu_max = bpf_map_lookup_elem(&cpus_count, &key0);
+     uint32_t *cpu_selected;
++    int tx_port = 0;
++    int *iface_peer;
+ 
+     if ((void *)(ip6h + 1) > data_end)
+         return 0;
+@@ -250,7 +273,13 @@ static int __always_inline filter_ipv6(void *data, __u64 nh_off, void *data_end)
+         value->packets++;
+         value->bytes += data_end - data;
+         value->time = bpf_ktime_get_ns();
+-        return XDP_DROP;
++
++        iface_peer = bpf_map_lookup_elem(&tx_peer_int, &key0);
++        if (!iface_peer) {
++            return XDP_DROP;
++        } else {
++            return bpf_redirect_map(&tx_peer, tx_port, 0);
++        }
+     }
+     if (cpu_max && *cpu_max) {
+         cpu_dest = (tuple.src[0] + tuple.dst[0] + tuple.src[3] + tuple.dst[3]) % *cpu_max;
+
+
+
+
+@@ -409,6 +409,7 @@ static void *ParseAFPConfig(const char *iface)
+             aconf->flags |= AFP_BYPASS;
+             RunModeEnablesBypassManager();
+             BypassedFlowManagerRegisterCheckFunc(EBPFCheckBypassedFlowTimeout);
++            BypassedFlowManagerRegisterUpdateFunc(EBPFUpdateFlow);
+ #else
+             SCLogError(SC_ERR_UNIMPLEMENTED, "Bypass set but eBPF support is not built-in");
+ #endif
+@@ -496,6 +497,10 @@ static void *ParseAFPConfig(const char *iface)
+                         EBPFBuildCPUSet(NULL, aconf->iface);
+                 }
+             }
++            /* we have a peer and we use bypass so we can set up XDP iface redirect */
++            if (aconf->out_iface) {
++                EBPFSetPeerIface(aconf->iface, aconf->out_iface);
++            }
+         }
+ #else
+         SCLogError(SC_ERR_UNIMPLEMENTED, "XDP support is not built-in");
+
+
+
+
+@@ -2360,6 +2360,7 @@ static int AFPBypassCallback(Packet *p)
+         if (AFPInsertHalfFlow(p->afp_v.v4_map_fd, &key, inittime) == 0) {
+             return 0;
+         }
++        EBPFUpdateFlow(p->flow, p);
+         return 1;
+     }
+     /* For IPv6 case we don't handle extended header in eBPF */
+@@ -2390,6 +2391,7 @@ static int AFPBypassCallback(Packet *p)
+         if (AFPInsertHalfFlow(p->afp_v.v6_map_fd, &key, inittime) == 0) {
+             return 0;
+         }
++        EBPFUpdateFlow(p->flow, p);
+         return 1;
+     }
+ #endif
+
+
+
+
+@@ -46,6 +46,7 @@
+ #include "util-device.h"
+ 
+ #include "device-storage.h"
++#include "flow-storage.h"
+ 
+ #include <bpf/libbpf.h>
+ #include <bpf/bpf.h>
+@@ -57,6 +58,7 @@
+ #define BYPASSED_FLOW_TIMEOUT   60
+ 
+ static int g_livedev_storage_id = -1;
++static int g_flow_storage_id = -1;
+ 
+ struct bpf_map_item {
+     char * name;
+@@ -68,6 +70,11 @@ struct bpf_maps_info {
+     int 

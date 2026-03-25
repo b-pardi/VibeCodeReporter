@@ -1,0 +1,114 @@
+@@ -43,14 +43,6 @@ struct bpf_map_def_extended __attribute__((section("maps"))) cali_jump = {
+ #endif
+ };
+ 
+-static CALI_BPF_INLINE void tc_state_fill_from_iphdr(struct cali_tc_state *state, struct iphdr *ip)
+-{
+-	state->ip_src = ip->saddr;
+-	state->ip_dst = ip->daddr;
+-	state->ip_proto = ip->protocol;
+-	state->ip_size = ip->tot_len;
+-}
+-
+ /* Add new values to the end as these are program indices */
+ enum cali_jump_index {
+ 	PROG_INDEX_POLICY,
+
+
+
+
+@@ -102,7 +102,16 @@ deny:
+ 	return -1;
+ }
+ 
+-static CALI_BPF_INLINE int parse_packet_nextheader(struct cali_tc_ctx *ctx) {
++static CALI_BPF_INLINE void tc_state_fill_from_iphdr(struct cali_tc_ctx *ctx)
++{
++	ctx->state->ip_src = ctx->ip_header->saddr;
++	ctx->state->ip_dst = ctx->ip_header->daddr;
++	ctx->state->ip_proto = ctx->ip_header->protocol;
++	ctx->state->ip_size = ctx->ip_header->tot_len;
++}
++
++static CALI_BPF_INLINE int tc_state_fill_from_nextheader(struct cali_tc_ctx *ctx)
++{
+ 	switch (ctx->state->ip_proto) {
+ 	case IPPROTO_TCP:
+ 		// Re-check buffer space for TCP (has larger headers than UDP).
+
+
+
+
+@@ -169,10 +169,10 @@ static CALI_BPF_INLINE int calico_tc(struct __sk_buff *skb)
+ 	}
+ 
+ 	/* Copy fields that are needed by downstream programs from the packet to the state. */
+-	tc_state_fill_from_iphdr(ctx.state, ctx.ip_header);
++	tc_state_fill_from_iphdr(&ctx);
+ 
+ 	/* Parse out the source/dest ports (or type/code for ICMP). */
+-	switch (parse_packet_nextheader(&ctx)) {
++	switch (tc_state_fill_from_nextheader(&ctx)) {
+ 	case -1:
+ 		goto deny;
+ 	case -2:
+@@ -1069,7 +1069,7 @@ int calico_tc_skb_send_icmp_replies(struct __sk_buff *skb)
+ 		goto deny;
+ 	}
+ 
+-	tc_state_fill_from_iphdr(ctx.state, ctx.ip_header);
++	tc_state_fill_from_iphdr(&ctx);
+ 	ctx.state->sport = ctx.state->dport = 0;
+ 	return forward_or_drop(&ctx);
+ deny:
+
+
+
+
+@@ -44,7 +44,6 @@
+ /* calico_xdp is the main function used in all of the xdp programs */
+ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ {
+-	CALI_DEBUG("Entering calico_xdp_accepted_entrypoint\n");
+ 	/* Initialise the context, which is stored on the stack, and the state, which
+ 	 * we use to pass data from one program to the next via tail calls. */
+ 	struct cali_tc_ctx ctx = {
+@@ -76,9 +75,9 @@ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ 		goto allow;
+ 	}
+ 
+-	tc_state_fill_from_iphdr(ctx.state, ctx.ip_header);
++	tc_state_fill_from_iphdr(&ctx);
+ 
+-	switch(parse_packet_nextheader(&ctx)) {
++	switch(tc_state_fill_from_nextheader(&ctx)) {
+ 	case -1:
+ 		ctx.fwd.res = XDP_DROP;
+ 		goto deny;
+@@ -87,13 +86,25 @@ static CALI_BPF_INLINE int calico_xdp(struct xdp_md *xdp_ctx)
+ 		goto allow;
+ 	}
+ 
++	// Allow a packet if it hits an entry in the failsafe map
+ 	if (is_failsafe_in(ctx.state->ip_proto, ctx.state->dport, ctx.state->ip_src)) {
+ 		CALI_DEBUG("Inbound failsafe port: %d. Skip policy\n", ctx.state->post_nat_dport);
+ 		ctx.state->pol_rc = CALI_POL_ALLOW;
+ 		goto allow;
+ 	}
+ 
+-	return XDP_DROP;
++	// Jump to the policy program
++	CALI_DEBUG("About to jump to policy program.\n");
++	bpf_tail_call(xdp_ctx, &cali_jump, PROG_INDEX_POLICY);
++	if (CALI_F_HEP) {
++		CALI_DEBUG("HEP with no policy, allow.\n");
++		ctx.state->pol_rc = CALI_POL_ALLOW;
++		goto allow;
++	} else {
++		/* should not reach here */
++		CALI_DEBUG("WEP with no policy, deny.\n");
++		goto deny;
++	}
+ 
+ allow:
+ 	return XDP_PASS;

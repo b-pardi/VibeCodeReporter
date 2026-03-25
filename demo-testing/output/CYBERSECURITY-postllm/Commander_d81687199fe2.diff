@@ -1,0 +1,99 @@
+@@ -52,6 +52,7 @@ from ..versioning import is_binary_app, is_up_to_date_version
+ 
+ BREACHWATCH_MAX = 5
+ KEEPER_API_BATCH_LIMIT = 999  # Maximum objects per pre_delete API request
++KEEPER_API_FOLDER_BATCH_LIMIT = 500  # Maximum folders per pre_delete API request
+ 
+ is_windows = sys.platform.startswith('win')
+ 
+@@ -634,7 +635,15 @@ class ThisDeviceCommand(Command):
+ 
+ class RecordDeleteAllCommand(Command):
+     """
+-    Delete all records and folders from the vault.
++    Delete all records and folders from the user vault.
++    
++    IMPORTANT: This command automatically skips shared folders and their records.
++    For shared folders, use the recommended workflow:
++    1. 'transform-folder <folder_name>' to move records to user folders (fast)
++    2. Run delete-all to clean remaining user vault content
++    
++    The command will alert you about any skipped shared folder content.
++    If the vault is already empty, no confirmation is required.
+ 
+     Args:
+         params: KeeperParams instance
+@@ -643,27 +652,33 @@ class RecordDeleteAllCommand(Command):
+     Returns:
+         None
+         
+-    Note:
+-        Records in multiple folders will be processed using the first 
+-        folder found. Deletions are processed in batches of 999 items.
++        Note:
++        Only processes user folders and records. Uses batches of up to 999 items per 
++        API call. Records in multiple folders will be processed using the first user 
++        folder found.
+     """
+     
+     def get_parser(self):
+         return delete_all_parser
+ 
+     def execute(self, params, **kwargs):
+-        """Delete all records and folders from vault."""
++        """Delete all records and folders from vault. Skips confirmation if vault is already empty."""
+         try:
+             DeletionValidator.validate_params(params)
+         except ValueError:
+             logging.error("Invalid parameters provided")
+             return
+         
++        api.sync_down(params)
++        
++        if self._is_vault_empty(params):
++            print("No records or folders to delete. Vault is already empty.")
++            return
++        
+         if not self._confirm_user_wants_deletion(kwargs):
+             return
+         
+         kwargs['force'] = True
+-        api.sync_down(params)
+         
+         record_stats = self._process_record_deletion(params)
+         folder_stats = self._process_folder_deletion(params)
+@@ -671,6 +686,19 @@ class RecordDeleteAllCommand(Command):
+         self._display_summary(record_stats, folder_stats)
+         self._finalize_deletion(params, record_stats, folder_stats)
+ 
++    def _is_vault_empty(self, params):
++        """Check if vault is completely empty (no records, no folders)."""
++        from ..subfolder import BaseFolderNode
++        
++        if len(params.record_cache) > 0:
++            return False
++        
++        for folder_uid, folder in params.folder_cache.items():
++            if folder.type != BaseFolderNode.RootFolderType:
++                return False
++        
++        return True
++
+     def _confirm_user_wants_deletion(self, kwargs):
+         """Show warning and get user confirmation."""
+         from ..display import bcolors
+@@ -699,15 +727,68 @@ class RecordDeleteAllCommand(Command):
+         return True
+ 
+     def _process_record_deletion(self, params):
+-        """Collect and delete all records."""
+-        records_with_folders = self._collect_records_with_folders(params)
++        """Collect and delete all records, avoiding shared folder records."""
++        records_with_folders, skipped_stats = self._collect_records_with_folders_safe(params)
+         if not records_with_folders:
+             logging.info('No records found to delete')
+             return DeletionStats()
+         
+-        logging.info('Preparing to delete %s records from Keeper', len(records_with_folders))
++        if skipped_stats['shared_folders'] > 0 or skipped_stats['shared_records'] > 0:
++            print(f"\nSHARED FOLDER CONTENT SKIPPED

@@ -1,0 +1,129 @@
+@@ -220,7 +220,7 @@ bool safety_rx_hook(const CANPacket_t *to_push) {
+   generic_rx_checks();
+ 
+   // the relay malfunction hook runs on all incoming rx messages.
+-  // check all tx msgs for liveness on sending bus if specified.
++  // check all applicable tx msgs for liveness on sending bus.
+   // used to detect a relay malfunction or control messages from disabled ECUs like the radar
+   const int bus = GET_BUS(to_push);
+   const int addr = GET_ADDR(to_push);
+@@ -283,11 +283,24 @@ static int get_fwd_bus(int bus_num) {
+ int safety_fwd_hook(int bus_num, int addr) {
+   bool blocked = relay_malfunction || current_safety_config.disable_forwarding;
+ 
++  // Block messages that are being checked for relay malfunctions. Safety modes can opt out of this
++  // in the case of selective AEB forwarding
++  const int destination_bus = get_fwd_bus(bus_num);
++  if (!blocked) {
++    for (int i = 0; i < current_safety_config.tx_msgs_len; i++) {
++      const CanMsg *m = &current_safety_config.tx_msgs[i];
++      if (m->check_relay && !m->disable_static_blocking && (m->addr == addr) && (m->bus == destination_bus)) {
++        blocked = true;
++        break;
++      }
++    }
++  }
++
+   if (!blocked && (current_hooks->fwd != NULL)) {
+     blocked = current_hooks->fwd(bus_num, addr);
+   }
+ 
+-  return blocked ? -1 : get_fwd_bus(bus_num);
++  return blocked ? -1 : destination_bus;
+ }
+ 
+ bool get_longitudinal_allowed(void) {
+
+
+
+
+@@ -87,9 +87,6 @@ static bool ford_get_quality_flag_valid(const CANPacket_t *to_push) {
+   return valid;
+ }
+ 
+-static bool ford_canfd = false;
+-static bool ford_longitudinal = false;
+-
+ #define FORD_INACTIVE_CURVATURE 1000U
+ #define FORD_INACTIVE_CURVATURE_RATE 4096U
+ #define FORD_INACTIVE_PATH_OFFSET 512U
+@@ -99,14 +96,6 @@ static bool ford_longitudinal = false;
+ 
+ #define FORD_MAX_SPEED_DELTA 2.0  // m/s
+ 
+-static bool ford_lkas_msg_check(int addr) {
+-  return (addr == FORD_ACCDATA_3)
+-      || (addr == FORD_Lane_Assist_Data1)
+-      || ((addr == FORD_LateralMotionControl) && !ford_canfd)
+-      || ((addr == FORD_LateralMotionControl2) && ford_canfd)
+-      || (addr == FORD_IPMA_Data);
+-}
+-
+ // Curvature rate limits
+ #define FORD_LIMITS(limit_lateral_acceleration) {                                               \
+   .max_angle = 1000,          /* 0.02 curvature */                                              \
+@@ -311,29 +300,6 @@ static bool ford_tx_hook(const CANPacket_t *to_send) {
+   return tx;
+ }
+ 
+-static bool ford_fwd_hook(int bus_num, int addr) {
+-  bool block_msg = false;
+-
+-  switch (bus_num) {
+-    case FORD_CAM_BUS: {
+-      if (ford_lkas_msg_check(addr)) {
+-        // Block stock LKAS and UI messages
+-        block_msg = true;
+-      } else if (ford_longitudinal && (addr == FORD_ACCDATA)) {
+-        // Block stock ACC message
+-        block_msg = true;
+-      } else {
+-      }
+-      break;
+-    }
+-    default: {
+-      break;
+-    }
+-  }
+-
+-  return block_msg;
+-}
+-
+ static safety_config ford_init(uint16_t param) {
+   // warning: quality flags are not yet checked in openpilot's CAN parser,
+   // this may be the cause of blocked messages
+@@ -380,9 +346,9 @@ static safety_config ford_init(uint16_t param) {
+   };
+ 
+   const uint16_t FORD_PARAM_CANFD = 2;
+-  ford_canfd = GET_FLAG(param, FORD_PARAM_CANFD);
++  const bool ford_canfd = GET_FLAG(param, FORD_PARAM_CANFD);
+ 
+-  ford_longitudinal = false;
++  bool ford_longitudinal = false;
+ 
+ #ifdef ALLOW_DEBUG
+   const uint16_t FORD_PARAM_LONGITUDINAL = 1;
+@@ -407,7 +373,6 @@ const safety_hooks ford_hooks = {
+   .init = ford_init,
+   .rx = ford_rx_hook,
+   .tx = ford_tx_hook,
+-  .fwd = ford_fwd_hook,
+   .get_counter = ford_get_counter,
+   .get_checksum = ford_get_checksum,
+   .compute_checksum = ford_compute_checksum,
+
+
+
+
+@@ -187,19 +187,6 @@ static bool rivian_fwd_hook(int bus, int addr) {
+     }
+   }
+ 
+-  if (bus == 2) {
+-    // ACM_lkaHbaCmd: lateral control message
+-    if (addr == 0x120) {
+-      block_msg = true;
+-    }
+-
+-    // ACM_longitudinalRequest: longitudinal control

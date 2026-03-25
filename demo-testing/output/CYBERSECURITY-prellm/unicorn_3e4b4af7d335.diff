@@ -1,0 +1,123 @@
+@@ -267,6 +267,7 @@ struct uc_struct {
+     unsigned int alloc_hint;
+     /* qemu/exec-vary.c */
+     TargetPageBits *init_target_page;
++    int target_bits;                    // User defined page bits by uc_ctl
+     BounceBuffer bounce;                // qemu/cpu-exec.c
+     volatile sig_atomic_t exit_request; // qemu/cpu-exec.c
+     /* qemu/accel/tcg/cpu-exec-common.c */
+@@ -339,6 +340,7 @@ struct uc_struct {
+     struct list saved_contexts; // The contexts saved by this uc_struct.
+     bool no_exit_request;       // Disable check_exit_request temporarily. A
+                           // workaround to treat the IT block as a whole block.
++    bool init_done; // Whether the initialization is done.
+ };
+ 
+ // Metadata stub for the variable-size cpu context used with uc_context_*()
+
+
+
+
+@@ -35,7 +35,17 @@ bool set_preferred_target_page_bits(struct uc_struct *uc, int bits)
+      * a particular size.
+      */
+ #ifdef TARGET_PAGE_BITS_VARY
+-    assert(bits >= TARGET_PAGE_BITS_MIN);
++    //assert(bits >= TARGET_PAGE_BITS_MIN);
++    if (uc->init_target_page == NULL) {
++        uc->init_target_page = calloc(1, sizeof(TargetPageBits));
++    } else {
++        return false;
++    }
++
++    if (bits < TARGET_PAGE_BITS_MIN) {
++        return false;
++    }
++
+     if (uc->init_target_page->bits == 0 || uc->init_target_page->bits > bits) {
+         if (uc->init_target_page->decided) {
+             return false;
+@@ -50,10 +60,15 @@ void finalize_target_page_bits(struct uc_struct *uc)
+ {
+ #ifdef TARGET_PAGE_BITS_VARY
+     if (uc->init_target_page == NULL) {
+-        uc->init_target_page = g_new0(TargetPageBits, 1);
++        uc->init_target_page = calloc(1, sizeof(TargetPageBits));
+     } else {
+         return;
+     }
++
++    if (uc->target_bits != 0) {
++        uc->init_target_page->bits = uc->target_bits;
++    }
++
+     if (uc->init_target_page->bits == 0) {
+         uc->init_target_page->bits = TARGET_PAGE_BITS_MIN;
+     }
+
+
+
+
+@@ -156,10 +156,29 @@ static void test_uc_ctl_tb_cache()
+     OK(uc_close(uc));
+ }
+ 
++static void test_uc_ctl_change_page_size()
++{
++    uc_engine *uc;
++    uc_engine *uc2;
++    int r_pc;
++
++    OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc));
++    OK(uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc2));
++
++    OK(uc_ctl_set_page_size(uc, 4096));
++
++    OK(uc_mem_map(uc2, 1 << 10, 1 << 10, UC_PROT_ALL));
++    uc_assert_err(UC_ERR_ARG, uc_mem_map(uc, 1 << 10, 1 << 10, UC_PROT_ALL));
++
++    OK(uc_close(uc));
++    OK(uc_close(uc2));
++}
++
+ TEST_LIST = {{"test_uc_ctl_mode", test_uc_ctl_mode},
+              {"test_uc_ctl_page_size", test_uc_ctl_page_size},
+              {"test_uc_ctl_arch", test_uc_ctl_arch},
+              {"test_uc_ctl_time_out", test_uc_ctl_time_out},
+              {"test_uc_ctl_exits", test_uc_ctl_exits},
+              {"test_uc_ctl_tb_cache", test_uc_ctl_tb_cache},
++             {"test_uc_ctl_change_page_size", test_uc_ctl_change_page_size},
+              {NULL, NULL}};
+\ No newline at end of file
+
+
+
+
+@@ -25,6 +25,7 @@
+ #include "qemu/target/riscv/unicorn.h"
+ 
+ #include "qemu/include/qemu/queue.h"
++#include "qemu-common.h"
+ 
+ UNICORN_EXPORT
+ unsigned int uc_version(unsigned int *major, unsigned int *minor)
+@@ -136,6 +137,14 @@ bool uc_arch_supported(uc_arch arch)
+     }
+ }
+ 
++#define UC_INIT(uc)                                                            \
++    if (unlikely(!(uc)->init_done)) {                                          \
++        int __init_ret = uc_init(uc);                                          \
++        if (unlikely(__init_ret != UC_ERR_OK)) {                               \
++            return __init_ret;                                                 \
++        }                                                                      \
++    }
++
+ static gint uc_exits_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
+ {
+     uint64_t lhs = *((uint64_t *)a);
+@@ -150,6 +159,31 @@ static gint uc_exits_cmp(gconstpointer a, gconstpointer b, gpointer user_data)
+     }
+ }
+ 
++static uc_err uc_init(uc_engi

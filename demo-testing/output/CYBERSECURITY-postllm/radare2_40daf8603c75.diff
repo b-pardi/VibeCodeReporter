@@ -1,0 +1,202 @@
+@@ -77,6 +77,9 @@ enum {
+ 	GPROBE_NACK = 0x0b,
+ 	GPROBE_ACK = 0x0c,
+ 	GPROBE_PRINT = 0x0D,
++	GPROBE_FAST_FLASH_WRITE = 0x10,
++	GPROBE_FLASH_ERASE = 0x19,
++	GPROBE_FLASH_ID_CRC = 0x1c,
+ 	GPROBE_RESET = 0x20,
+ 	GPROBE_GET_DEVICE_ID = 0x30,
+ 	GPROBE_GET_INFORMATION = 0x40,
+@@ -968,6 +971,264 @@ fail:
+ 	return -1;
+ }
+ 
++static int gprobe_flasherase(struct gport *port, ut16 sector) {
++	if (!port) {
++		return -1;
++	}
++	RBuffer *request = r_buf_new ();
++	RBuffer *reply = NULL;
++	const ut8 cmd = GPROBE_FLASH_ERASE;
++
++	if (!request) {
++		goto fail;
++	}
++
++	r_buf_append_bytes (request, &cmd, 1);
++	r_buf_append_bytes (request, (const ut8 *)&sector, 2);
++
++	port->frame (request);
++
++	if (port->send_request (port, request)) {
++		goto fail;
++	}
++
++	while (1) {
++		RBuffer *reply = NULL;
++
++		int res = get_reply (port, GPROBE_ACK, &reply);
++
++		if (reply)
++			r_buf_free (reply);
++
++		if (!res)
++			break;
++
++		if (r_cons_is_breaked ())
++			break;
++	}
++
++	r_buf_free (request);
++	r_buf_free (reply);
++
++	return 0;
++
++fail:
++	r_buf_free (request);
++	r_buf_free (reply);
++	return -1;
++}
++
++static int gprobe_flashid(struct gport *port) {
++	if (!port) {
++		return -1;
++	}
++	RBuffer *request = r_buf_new ();
++	RBuffer *reply = NULL;
++	const ut8 cmd = GPROBE_FLASH_ID_CRC;
++	const ut8 rsvd0[] = { 0xff, 0x00, 0x00 };
++	const ut8 rsvd1[] = { 0x20, 0x00, 0x00 };
++
++	if (!request) {
++		goto fail;
++	}
++
++	r_buf_append_bytes (request, &cmd, 1);
++	r_buf_append_bytes (request, rsvd0, 3);
++	r_buf_append_bytes (request, rsvd1, 3);
++
++	port->frame (request);
++
++	if (port->send_request (port, request)) {
++		goto fail;
++	}
++
++	int res = get_reply (port, cmd, &reply);
++	if (res)
++		goto fail;
++
++	ut16 id = r_buf_read_be16_at (reply, 0);
++	printf ("%04x\n", id);
++
++	r_buf_free (request);
++	r_buf_free (reply);
++
++	return 0;
++
++fail:
++	r_buf_free (request);
++	r_buf_free (reply);
++	return -1;
++}
++
++static int gprobe_flashcrc(struct gport *port, ut32 address, ut32 count) {
++	if (!port) {
++		return -1;
++	}
++	RBuffer *request = r_buf_new ();
++	RBuffer *reply = NULL;
++	const ut8 cmd = GPROBE_FLASH_ID_CRC;
++
++	if (!request) {
++		goto fail;
++	}
++
++	r_buf_append_bytes (request, &cmd, 1);
++	r_buf_append_ut8 (request, (address >> 16) & 0xff);
++	r_buf_append_ut8 (request, (address >> 8) & 0xff);
++	r_buf_append_ut8 (request, (address >> 0) & 0xff);
++	r_buf_append_ut8 (request, (count >> 16) & 0xff);
++	r_buf_append_ut8 (request, (count >> 8) & 0xff);
++	r_buf_append_ut8 (request, (count >> 0) & 0xff);
++
++	port->frame (request);
++
++	if (port->send_request (port, request)) {
++		goto fail;
++	}
++
++	if (get_reply (port, cmd, &reply)) {
++		goto fail;
++	}
++
++	ut16 id = r_buf_read_be16_at (reply, 0);
++	printf ("0x%04x\n", id);
++
++	r_buf_free (request);
++	r_buf_free (reply);
++
++	return 0;
++
++fail:
++	r_buf_free (request);
++	r_buf_free (reply);
++	return -1;
++}
++
++static ut16 calculate_crc_16(const void *buf, size_t buf_size) {
++	const ut8 *byte_buf;
++	ut16 crc;
++	ut8 data;
++	unsigned int i;
++	ut8 flag;
++
++	byte_buf = (const unsigned char *)buf;
++	crc = 0x1021;
++	for (; buf_size > 0; --buf_size) {
++		data = *byte_buf++;
++		for (i = 8; i > 0; --i) {
++			flag = data ^ (crc >> 8);
++			crc <<= 1;
++			if (flag & 0x80)
++				crc ^= 0x1021;
++			data <<= 1;
++		}
++	}
++	return crc;
++}
++
++static int fast_flash_write(struct gport *port, ut32 address, ut8 *buf, size_t size) {
++	RBuffer *request = r_buf_new ();
++	RBuffer *reply = NULL;
++	const ut8 cmd = GPROBE_FAST_FLASH_WRITE;
++
++	if (!request) {
++		goto fail;
++	}
++
++	/* send primer */
++	r_buf_append_bytes (request, &cmd, 1);
++
++	port->frame (request);
++
++	if (port->send_request (port, request)) {
++		goto fail;
++	}
++
++	r_buf_free (request);
++
++	r_sys_usleep (5000);
++
++	/* send data packet */
++	request = r_buf_new ();
++
++	if (!request) {
++		goto fail;
++	}
++
++	r_buf_append_ut8 (request, (address >> 24) & 0xff);
++	r_buf_append_ut8 (request, (address >> 16) & 0xff);
++	r_buf_append_ut8 (request, (address >> 8) & 0xff);
++	r_buf_append_ut8 (request, (address >> 0) & 0

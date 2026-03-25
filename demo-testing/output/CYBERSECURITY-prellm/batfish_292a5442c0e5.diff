@@ -1,0 +1,83 @@
+@@ -2,6 +2,7 @@ package org.batfish.representation.aws;
+ 
+ import static com.google.common.base.MoreObjects.firstNonNull;
+ import static com.google.common.base.Preconditions.checkArgument;
++import static org.batfish.datamodel.acl.AclLineMatchExprs.not;
+ import static org.batfish.representation.aws.Utils.getTraceElementForSecurityGroup;
+ 
+ import com.fasterxml.jackson.databind.JsonNode;
+@@ -12,7 +13,6 @@ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import java.io.IOException;
+ import java.io.Serializable;
+-import java.util.ArrayList;
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -35,10 +35,18 @@ import org.batfish.datamodel.AclAclLine;
+ import org.batfish.datamodel.AclLine;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.DeviceType;
++import org.batfish.datamodel.ExprAclLine;
+ import org.batfish.datamodel.FirewallSessionInterfaceInfo;
++import org.batfish.datamodel.HeaderSpace;
+ import org.batfish.datamodel.Interface;
+ import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.IpAccessList;
++import org.batfish.datamodel.IpSpace;
++import org.batfish.datamodel.IpWildcard;
++import org.batfish.datamodel.IpWildcardSetIpSpace;
++import org.batfish.datamodel.LineAction;
++import org.batfish.datamodel.TraceElement;
++import org.batfish.datamodel.acl.MatchHeaderSpace;
+ import org.batfish.datamodel.answers.ParseVendorConfigurationAnswerElement;
+ import org.batfish.representation.aws.Instance.Status;
+ 
+@@ -56,7 +64,12 @@ public final class Region implements Serializable {
+ 
+   static final String SG_INGRESS_ACL_NAME = "~SECURITY_GROUP_INGRESS_ACL~";
+ 
+-  static final String SG_EGRESS_ACL_NAME = "~SECURITY_GROUP_EGRESS_ACL~";
++  static String instanceEgressAclName(String interfaceName) {
++    return String.format("~EGRESS_ACL~%s", interfaceName);
++  }
++
++  static final TraceElement DENY_SPOOFED_SOURCE_IP_TRACE_ELEMENT =
++      TraceElement.of("Deny spoofed source IPs");
+ 
+   @Nonnull private final Map<String, Address> _addresses;
+ 
+@@ -728,7 +741,7 @@ public final class Region implements Serializable {
+ 
+     // VpcPeeringConnections are processed in AwsConfiguration since they can be cross region
+ 
+-    applySecurityGroupsAcls(awsConfiguration.getConfigurationNodes(), warnings);
++    applyInstanceInterfaceAcls(awsConfiguration.getConfigurationNodes(), warnings);
+ 
+     // TODO: for now, set all interfaces to have the same bandwidth
+     for (Configuration cfgNode : awsConfiguration.getConfigurationNodes().values()) {
+@@ -740,52 +753,49 @@ public final class Region implements Serializable {
+ 
+   /** Convert security groups of all nodes to IpAccessLists and apply to all interfaces */
+   @VisibleForTesting
+-  void applySecurityGroupsAcls(Map<String, Configuration> cfgNodes, Warnings warnings) {
++  void applyInstanceInterfaceAcls(Map<String, Configuration> cfgNodes, Warnings warnings) {
+     for (Entry<String, Set<SecurityGroup>> entry : _configurationSecurityGroups.entrySet()) {
+       Configuration cfgNode = cfgNodes.get(entry.getKey());
+-      List<AclLine> inAclAclLines = new ArrayList<>();
+-      List<AclLine> outAclAclLines = new ArrayList<>();
+-      entry.getValue().stream()
+-          .sorted(Comparator.comparing(SecurityGroup::getId)) // for stable ordering of lines
+-          .forEach(
+-              securityGroup -> {
+-                String sgName = String.format("Security Group %s", securityGroup.getGroupName());
+-                Optional.ofNullable(
+-                        securityGroupToIpAccessList(securityGroup, true, cfgNode, warnings))
+-                    .map(
+-                        acl ->
+-                            new AclAclLine(
+-                                sgName,
+-                                acl.getName(),
+-                                getTraceElementForSecurityGroup(securityGroup.getGroupName())))
+-                    .ifPresent(inAclAclLines::add);
++      List<AclLine> inAclAclLines

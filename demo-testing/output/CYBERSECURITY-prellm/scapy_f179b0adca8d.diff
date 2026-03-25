@@ -1,0 +1,143 @@
+@@ -441,6 +441,11 @@ class WinProgPath(ConfClass):
+         self.hexedit = win_find_exe("hexer")
+         self.sox = win_find_exe("sox")
+         self.wireshark = win_find_exe("wireshark", "wireshark")
++        self.usbpcapcmd = win_find_exe(
++            "USBPcapCMD",
++            installsubdir="USBPcap",
++            env="programfiles"
++        )
+         self.powershell = win_find_exe(
+             "powershell",
+             installsubdir="System32\\WindowsPowerShell\\v1.0",
+
+
+
+
+@@ -484,6 +484,7 @@ recv_poll_rate: how often to check for new packets. Defaults to 0.05s.
+     L2socket = None
+     L2listen = None
+     BTsocket = None
++    USBsocket = None
+     min_pkt_size = 60
+     histfile = os.getenv('SCAPY_HISTFILE',
+                          os.path.join(os.path.expanduser("~"),
+
+
+
+
+@@ -87,6 +87,7 @@ DLT_IEEE802_11_RADIO = 127
+ DLT_LINUX_IRDA = 144
+ DLT_IEEE802_11_RADIO_AVS = 163
+ DLT_BLUETOOTH_HCI_H4 = 187
++DLT_USB_LINUX = 189
+ DLT_IEEE802_15_4_WITHFCS = 195
+ DLT_BLUETOOTH_HCI_H4_WITH_PHDR = 201
+ DLT_PPI = 192
+@@ -94,6 +95,8 @@ DLT_CAN_SOCKETCAN = 227
+ DLT_IPV4 = 228
+ DLT_IPV6 = 229
+ DLT_IEEE802_15_4_NOFCS = 230
++DLT_USBPCAP = 249
++DLT_USB_DARWIN = 266
+ DLT_BLUETOOTH_LE_LL = 251
+ DLT_BLUETOOTH_LE_LL_WITH_PHDR = 256
+ 
+
+
+
+
+@@ -853,6 +853,11 @@ class XLongField(LongField):
+         return lhex(self.i2h(pkt, x))
+ 
+ 
++class XLELongField(LELongField, XLongField):
++    def i2repr(self, pkt, x):
++        return XLongField.i2repr(self, pkt, x)
++
++
+ class IEEEFloatField(Field):
+     def __init__(self, name, default):
+         Field.__init__(self, name, default, "f")
+
+
+
+
+@@ -20,7 +20,7 @@ from scapy.packet import bind_layers, Packet
+ from scapy.fields import ByteEnumField, ByteField, Field, FieldLenField, \
+     FieldListField, FlagsField, IntField, LEShortEnumField, LEShortField, \
+     LenField, PacketListField, SignedByteField, StrField, StrFixedLenField, \
+-    StrLenField, XByteField, BitField
++    StrLenField, XByteField, BitField, XLELongField
+ from scapy.supersocket import SuperSocket
+ from scapy.sendrecv import sndrcv
+ from scapy.data import MTU
+@@ -39,14 +39,6 @@ class XLEShortField(LEShortField):
+         return lhex(self.i2h(pkt, x))
+ 
+ 
+-class XLELongField(LEShortField):
+-    def __init__(self, name, default):
+-        Field.__init__(self, name, default, "<Q")
+-
+-    def i2repr(self, pkt, x):
+-        return lhex(self.i2h(pkt, x))
+-
+-
+ class LEMACField(Field):
+     def __init__(self, name, default):
+         Field.__init__(self, name, default, "6s")
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,239 @@
++# This file is part of Scapy
++# See http://www.secdev.org/projects/scapy for more information
++# Copyright (C) Philippe Biondi <phil@secdev.org>
++# Copyright (C) Gabriel Potter <gabriel@potter.fr>
++# This program is published under a GPLv2 license
++
++"""
++Default USB frames & Basic implementation
++"""
++
++# TODO: support USB headers for Linux and Darwin (usbmon/netmon)
++# https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-usb.c  # noqa: E501
++
++import re
++import subprocess
++
++from scapy.config import conf
++from scapy.consts import WINDOWS
++from scapy.compat import chb, plain_str
++from scapy.data import MTU, DLT_USBPCAP
++from scapy.error import warning
++from scapy.fields import ByteField, XByteField, ByteEnumField, LEShortField, \
++    LEShortEnumField, LEIntField, LEIntEnumField, XLELongField, \
++    LenField
++from scapy.packet import Packet, bind_top_down
++from scapy.supersocket import SuperSocket
++from scapy.utils import PcapReader
++
++# USBpcap
++
++_usbd_status_codes = {
++    0x00000000: "Success",
++    0x40000000: "Pending",
++    0xC0000000: "Halted",
++    0x80000000: "Error"
++}
++
++_transfer_types = {
++    0x0: "Isochronous",
++    0x1: "Interrupt",
++    0x2: "Control"
++}
++
++# From https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-usb.c  # noqa: E501
++_urb_functions = {
++    0x0008: "URB_FUNCTION_CONTROL_TRANSFER",
++    0x0009: "URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER",
++    0x000A: "U

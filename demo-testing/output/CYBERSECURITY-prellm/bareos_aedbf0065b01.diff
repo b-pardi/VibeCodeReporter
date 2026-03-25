@@ -1,0 +1,120 @@
+@@ -13,9 +13,15 @@ class DirectorConsole(LowLevel):
+                  port=9101,
+                  dirname=None,
+                  name="*UserAgent*",
+-                 password=None):
++                 password=None,
++                 tls_psk_enable=True,
++                 tls_psk_require=False
++                 ):
+         super(DirectorConsole, self).__init__()
+-        self.connect(address, port, dirname, ConnectionType.DIRECTOR)
++        self.tls_psk_enable=tls_psk_enable
++        self.tls_psk_require=tls_psk_require
++        self.identity_prefix = u'R_CONSOLE'
++        self.connect(address, port, dirname, ConnectionType.DIRECTOR, name, password)
+         self.auth(name=name, password=password, auth_success_regex=b'^1000 OK.*$')
+         self._init_connection()
+ 
+
+
+
+
+@@ -15,9 +15,17 @@ class FileDaemon(LowLevel):
+                  port=9102,
+                  dirname=None,
+                  name=None,
+-                 password=None):
++                 password=None,
++                 tls_psk_enable=True,
++                 tls_psk_require=False
++                 ):
+         super(FileDaemon, self).__init__()
+-        self.connect(address, port, dirname, ConnectionType.FILEDAEMON)
++        self.tls_psk_enable=tls_psk_enable
++        self.tls_psk_require=tls_psk_require
++        # Well, we are not really a Director,
++        # but using the interface provided for Directors.
++        self.identity_prefix = u'R_DIRECTOR'
++        self.connect(address, port, dirname, ConnectionType.FILEDAEMON, name, password)
+         self.auth(name=name, password=password, auth_success_regex=b'^2000 OK Hello.*$')
+         self._init_connection()
+ 
+
+
+
+
+@@ -17,9 +17,21 @@ import random
+ import re
+ from   select import select
+ import socket
++import ssl
+ import struct
+ import sys
+ import time
++import warnings
++
++# Try to load the sslpsk module,
++# with implement TLS-PSK (Transport Layer Security - Pre-Shared-Key)
++# on top of the ssl module.
++# If it is not available, we continue anyway,
++# but don't use TLS-PSK.
++try:
++    import sslpsk
++except ImportError:
++    warnings.warn(u'Connection encryption via TLS-PSK is not available, as the module sslpsk is not installed.')
+ 
+ class LowLevel(object):
+     """
+@@ -36,37 +48,110 @@ class LowLevel(object):
+         self.dirname = None
+         self.socket = None
+         self.auth_credentials_valid = False
++        self.tls_psk_enable = True
++        self.tls_psk_require = False
+         self.connection_type = None
++        # identity_prefix have to be set in each class
++        self.identity_prefix = u'R_NONE'
+         self.receive_buffer = b''
+ 
+-    def connect(self, address, port, dirname, type):
++
++    def connect(self, address, port, dirname, type, name = None, password = None):
+         self.address = address
+-        self.port = port
++        self.port = int(port)
+         if dirname:
+             self.dirname = dirname
+         else:
+             self.dirname = address
+         self.connection_type = type
++        self.name = name
++        self.password = password
++
+         return self.__connect()
+ 
+ 
+     def __connect(self):
++        connected = False
++        if self.tls_psk_require and not self.is_tls_psk_available():
++            raise ConnectionError(u'TLS-PSK is required, but sslpsk module not loaded/available.')
++
++        if self.tls_psk_enable and self.is_tls_psk_available():
++            try:
++                self.__connect_tls_psk()
++            except (ConnectionError, ssl.SSLError) as e:
++                if self.tls_psk_require:
++                    raise
++                else:
++                    self.logger.warn(u'Failed to connect via TLS-PSK. Trying plain connection.')
++            else:
++                connected = True
++                self.logger.debug("Encryption: {}".format(self.socket.cipher()))
++
++        if not connected:
++            self.__connect_plain()
++            connected = True
++            self.logger.debug("Encryption: None")
++
++        return connected
++

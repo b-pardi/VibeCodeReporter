@@ -1,0 +1,131 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,57 @@
++#! /usr/bin/env python
++
++# This file is part of IVRE.
++# Copyright 2011 - 2022 Pierre LALET <pierre@droids-corp.org>
++#
++# IVRE is free software: you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# IVRE is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
++# License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
++
++"""Support for http server log files"""
++
++from __future__ import annotations  # drop when Python 3.10+ only is supported
++import datetime
++import re
++from typing import Any, Dict
++
++
++from ivre.parser import Parser
++from ivre.utils import LOGGER
++
++
++LINE_RE = re.compile(
++    r'^(?P<addr>[^ ]*) (?P<identity>[^ ]*) (?P<username>[^ ]*) \[(?P<datetime>[^]]*)\] "(?P<request>[^"]*)" (?P<status>[^ ]*) (?P<size>[^ ]*) "(?P<referer>[^"]*)" "(?P<useragent>[^"]*)"\r?$'
++)
++
++
++class WeblogFile(Parser):
++    """Http server log generator"""
++
++    def parse_line(self, line: bytes) -> Dict[str, Any]:
++        m = LINE_RE.match(line.decode())
++        if not m:
++            LOGGER.warning("Cannot parse line [%r]", line)
++            return {}
++        try:
++            # Timestamp, without timezone specification
++            timestamp = datetime.datetime.strptime(
++                m.group("datetime").split()[0], "%d/%b/%Y:%H:%M:%S"
++            )
++        except ValueError:
++            LOGGER.warning("Cannot parse timestamp from line [%r]", line)
++            return {}
++        # data of event
++        return {
++            "host": m.group("addr"),
++            "ts": timestamp,
++            "useragent": m.group("useragent"),
++        }
+
+
+
+
+@@ -1,7 +1,7 @@
+ #! /usr/bin/env python
+ 
+ # This file is part of IVRE.
+-# Copyright 2011 - 2021 Pierre LALET <pierre@droids-corp.org>
++# Copyright 2011 - 2022 Pierre LALET <pierre@droids-corp.org>
+ #
+ # IVRE is free software: you can redistribute it and/or modify it
+ # under the terms of the GNU General Public License as published by
+@@ -50,6 +50,7 @@ __all__ = [
+     "scanstatus",
+     "version",
+     "view",
++    "weblog2db",
+     "zeek2db",
+ ]
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,101 @@
++#! /usr/bin/env python
++
++# This file is part of IVRE.
++# Copyright 2011 - 2022 Pierre LALET <pierre@droids-corp.org>
++#
++# IVRE is free software: you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++#
++# IVRE is distributed in the hope that it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
++# License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with IVRE. If not, see <http://www.gnu.org/licenses/>.
++
++
++"""Update the passive database from http server log files"""
++
++
++from argparse import ArgumentParser
++from functools import partial
++from sys import stdin
++from typing import Dict, Generator, List, Optional, Tuple
++
++
++from ivre.db import DBPassive, db
++from ivre.parser.weblog import WeblogFile
++from ivre.passive import handle_rec, getinfos
++from ivre.tools.passiverecon2db import _get_ignore_rules
++from ivre.types import Record
++
++
++def rec_iter(
++    filenames: List[str],
++    sensor: Optional[str],
++    ignore_rules: Dict[str, Dict[str, List[Tuple[int, int]]]],
++) -> Generator[Tuple[Optional[int], Record], None, None]:
++    ignorenets = ignore_rules.get("IGNORENETS", {})
++    neverignore = ignore_rules.get(

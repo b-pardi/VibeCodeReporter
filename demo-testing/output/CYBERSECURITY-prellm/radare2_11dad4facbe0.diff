@@ -1,0 +1,136 @@
+@@ -171,7 +171,6 @@ R_API RAnal *r_anal_new(void) {
+ 	anal->rb_hints_ranges = NULL;
+ 	anal->lineswidth = 0;
+ 	anal->fcns = r_list_newf (r_anal_function_free);
+-	anal->fcn_addr_tree = NULL;
+ 	anal->refs = r_anal_ref_list_new ();
+ 	anal->leaddrs = NULL;
+ 	r_anal_set_bits (anal, 32);
+@@ -494,7 +493,6 @@ R_API int r_anal_purge (RAnal *anal) {
+ 	sdb_reset (anal->sdb_classes_attrs);
+ 	r_list_free (anal->fcns);
+ 	anal->fcns = r_list_newf (r_anal_function_free);
+-	anal->fcn_addr_tree = NULL;
+ 	r_list_free (anal->refs);
+ 	anal->refs = r_anal_ref_list_new ();
+ 	return 0;
+
+
+
+
+@@ -3,26 +3,6 @@
+ #include <r_anal.h>
+ 
+ #define D if (anal->verbose)
+-#define ADDR_FCN_CONTAINER(x) container_of ((RBNode*)(x), RAnalFunction, addr_rb)
+-
+-static int _fcn_addr_tree_cmp(const void *a_, const RBNode *b_, void *user) {
+-	const RAnalFunction *a = (const RAnalFunction *)a_;
+-	const RAnalFunction *b = ADDR_FCN_CONTAINER (b_);
+-	ut64 from0 = a->addr, from1 = b->addr;
+-	if (from0 != from1) {
+-		return from0 < from1 ? -1 : 1;
+-	}
+-	return 0;
+-}
+-
+-static bool _fcn_tree_delete(RAnal *anal, RAnalFunction *fcn) {
+-	r_return_val_if_fail (anal && fcn, false);
+-	return !!r_rbtree_delete (&anal->fcn_addr_tree, fcn, _fcn_addr_tree_cmp, NULL, NULL, NULL);
+-}
+-
+-static void _fcn_tree_insert(RAnal *anal, RAnalFunction *fcn) {
+-	r_rbtree_insert (&anal->fcn_addr_tree, fcn, &(fcn->addr_rb), _fcn_addr_tree_cmp, NULL);
+-}
+ 
+ static bool get_functions_block_cb(RAnalBlock *block, void *user) {
+ 	RList *list = user;
+@@ -111,7 +91,6 @@ R_API void r_anal_function_free(void *_fcn) {
+ 	RAnal *anal = fcn->anal;
+ 	ht_up_delete (anal->ht_addr_fun, fcn->addr);
+ 	ht_pp_delete (anal->ht_name_fun, fcn->name);
+-	_fcn_tree_delete (anal, fcn);
+ 
+ 	free (fcn->name);
+ 	free (fcn->attr);
+@@ -133,7 +112,6 @@ R_API bool r_anal_add_function(RAnal *anal, RAnalFunction *fcn) {
+ 	if (anal->flg_fcn_set) {
+ 		anal->flg_fcn_set (anal->flb.f, fcn->name, fcn->addr, r_anal_function_size_from_entry (fcn));
+ 	}
+-	_fcn_tree_insert (anal, fcn);
+ 	r_list_append (anal->fcns, fcn);
+ 	ht_pp_insert (anal->ht_name_fun, fcn->name, fcn);
+ 	ht_up_insert (anal->ht_addr_fun, fcn->addr, fcn);
+@@ -194,9 +172,9 @@ R_API bool r_anal_function_relocate(RAnalFunction *fcn, ut64 addr) {
+ 	if (r_anal_get_function_at (fcn->anal, addr)) {
+ 		return false;
+ 	}
+-	_fcn_tree_delete (fcn->anal, fcn);
++	ht_up_delete (fcn->anal->ht_addr_fun, fcn->addr);
+ 	fcn->addr = addr;
+-	_fcn_tree_insert (fcn->anal, fcn);
++	ht_up_insert (fcn->anal->ht_addr_fun, addr, fcn);
+ 	return true;
+ }
+ 
+
+
+
+
+@@ -1831,7 +1831,6 @@ R_API int r_core_anal_fcn_clean(RCore *core, ut64 addr) {
+ 
+ 	if (!addr) {
+ 		r_list_purge (core->anal->fcns);
+-		core->anal->fcn_addr_tree = NULL;
+ 		if (!(core->anal->fcns = r_list_new ())) {
+ 			return false;
+ 		}
+
+
+
+
+@@ -2904,7 +2904,6 @@ static int cmd_anal_fcn(RCore *core, const char *input) {
+ 				r_anal_del_jmprefs (core->anal, f);
+ 			}
+ 			r_list_purge (core->anal->fcns);
+-			core->anal->fcn_addr_tree = NULL;
+ 		} else {
+ 			ut64 addr = input[2]
+ 				? r_num_math (core->num, input + 2)
+
+
+
+
+@@ -629,7 +629,6 @@ typedef struct r_anal_t {
+ 	RList *fcns;
+ 	HtUP *ht_addr_fun; // address => function
+ 	HtPP *ht_name_fun; // name => function
+-	RBNode *fcn_addr_tree; // keyed on addr
+ 	RList *refs;
+ 	RList *vartypes;
+ 	RReg *reg;
+
+
+
+
+@@ -1,75 +1,9 @@
+ #include <r_anal.h>
+ #include "minunit.h"
+ 
+-static bool check_invariants(RAnal *anal) {
+-	RBIter iter;
+-	RAnalBlock *block;
+-	ut64 last_start = UT64_MAX;
+-	r_rbtree_foreach (anal->bb_tree, iter, block, RAnalBlock, _rb) {
+-		if (last_start != UT64_MAX) {
+-			mu_assert ("corrupted binary tree", block->addr >= last_start);
+-			mu_assert_neq (block->addr, last_start, "double blocks");
+-		}
+-		last_start = block->addr;
+-
+-		mu_assert ("block->ref < 1, but it is still in the tree", block->ref >= 1);
+-		mu_assert ("block->ref < r_list_length (block->fcns)", block->ref >= r_list_length (block->fcns));
+-
+-		RListIter *fcniter;
+-		RAnalFunction *fcn;
+-		r_list_foreach (block->fcns, fcniter, fcn) {

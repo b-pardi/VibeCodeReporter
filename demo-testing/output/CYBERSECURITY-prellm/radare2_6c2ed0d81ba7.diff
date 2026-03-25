@@ -1,0 +1,128 @@
+@@ -360,6 +360,52 @@ static void recursive_help(RCore *core, int detail, const char *cmd_prefix) {
+ 	recursive_help_go (core, detail, desc);
+ }
+ 
++static bool lastcmd_repeat(RCore *core, int next) {
++	int res = -1;
++	// Fix for backtickbug px`~`
++	if (!core->lastcmd || core->cons->context->cmd_depth < 1) {
++		return false;
++	}
++	switch (*core->lastcmd) {
++	case '.':
++		if (core->lastcmd[1] == '(') { // macro call
++			res = r_core_cmd0 (core, core->lastcmd);
++		}
++		break;
++	case 'd': // debug
++		res = r_core_cmd0 (core, core->lastcmd);
++		switch (core->lastcmd[1]) {
++		case 's':
++		case 'c':
++			r_core_cmd0 (core, "sr PC;pd 1");
++		}
++		break;
++	case 'p': // print
++	case 'x':
++	case '$':
++		if (!strncmp (core->lastcmd, "pd", 2)) {
++			if (core->lastcmd[2]== ' ') {
++				r_core_cmdf (core, "so %s", core->lastcmd + 3);
++			} else {
++				r_core_cmd0 (core, "so `pi~?`");
++			}
++		} else {
++			if (next) {
++				r_core_seek (core, core->offset + core->blocksize, 1);
++			} else {
++				if (core->blocksize > core->offset) {
++					r_core_seek (core, 0, 1);
++				} else {
++					r_core_seek (core, core->offset - core->blocksize, 1);
++				}
++			}
++		}
++		res = r_core_cmd0 (core, core->lastcmd);
++		break;
++	}
++	return res != -1;
++}
++
+ static int r_core_cmd_nullcallback(void *data) {
+ 	RCore *core = (RCore*) data;
+ 	if (core->cons->context->breaked) {
+@@ -369,7 +415,7 @@ static int r_core_cmd_nullcallback(void *data) {
+ 	if (!core->cmdrepeat) {
+ 		return 0;
+ 	}
+-	r_core_cmd_repeat (core, true);
++	lastcmd_repeat (core, true);
+ 	return 1;
+ }
+ 
+@@ -1195,7 +1241,7 @@ static int cmd_interpret(void *data, const char *input) {
+ 
+ 	switch (*input) {
+ 	case '\0': // "."
+-		r_core_cmd_repeat (core, 0);
++		lastcmd_repeat (core, 0);
+ 		break;
+ 	case ':': // ".:"
+ 		if ((ptr = strchr (input + 1, ' '))) {
+@@ -1224,7 +1270,7 @@ static int cmd_interpret(void *data, const char *input) {
+ 	case '.': // ".." same as \n
+ 		if (input[1] == '.') { // "..." run the last command repeated
+ 			// same as \n with e cmd.repeat=true
+-			r_core_cmd_repeat (core, 1);
++			lastcmd_repeat (core, 1);
+ 		} else if (input[1]) {
+ 			char *str = r_core_cmd_str_pipe (core, r_str_trim_ro (input));
+ 			if (str) {
+@@ -2469,7 +2515,7 @@ static int r_core_cmd_subst(RCore *core, char *cmd) {
+ 	// lines starting with # are ignored (never reach cmd_hash()), except #! and #?
+ 	if (!*cmd) {
+ 		if (core->cmdrepeat > 0) {
+-			r_core_cmd_repeat (core, true);
++			lastcmd_repeat (core, true);
+ 			ret = r_core_cmd_nullcallback (core);
+ 		}
+ 		goto beach;
+@@ -4360,58 +4406,161 @@ R_API void run_pending_anal(RCore *core) {
+ 	}
+ }
+ 
++static int run_cmd_depth(RCore *core, char *cmd);
++
+ #if USE_TREESITTER
+-static inline bool is_ts_commands(TSNode node) {
+-	return strcmp (ts_node_type (node), "commands") == 0;
++#define TS_START_END(node, start, end) do {		\
++		start = ts_node_start_byte (node);	\
++		end = ts_node_end_byte (node);		\
++	} while (0)
++
++static char *ts_node_sub_string(TSNode node, const char *cstr) {
++	ut32 start, end;
++	TS_START_END (node, start, end);
++	return r_str_newf ("%.*s", end - start, cstr + start);
+ }
+ 
+-static inline bool is_ts_arged_command(TSNode node) {
+-	return strcmp (ts_node_type (node), "arged_command") == 0;
+-}
++// TODO: use integer type instead of string-based one
++#define DEFINE_IS_TS_FCN(name) static inline bool is_ts_##name(TSNode node) { \
++		return strcmp (ts_node_type (node), #name) == 0;	\
++	}
++
++#define DEFINE_HANDLE_TS_FCN(name) \
++	DEFINE_IS_TS_FCN (name) \
++	static bool handle_ts_##name##_internal(RCore *core, const char *cstr, TSNode node, bool log, char *node_string); \
++	static bool handle_ts_##name(RCore *core, const char *cstr, TSNode node, bool log) { \
++		char *cmd_string = ts_node_sub_string (node, cstr);	\
++		R_LOG_DEBUG (#name ": '%s'\n", cmd_string);		\
++		bool res = handle_ts_##name##_internal (core, cstr, node, log, cmd_string); \
++		free (cmd_string);					\
++		return res;						\
++	} \
++	static bool handle_ts_##name##_internal(RCore *core, const c

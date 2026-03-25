@@ -1,0 +1,112 @@
+@@ -4202,9 +4202,22 @@ int read_reply_pcap(pcap_t *pd, long to_usec,
+       netutil_fatal("Error from pcap_next_ex: %s\n", pcap_geterr(pd));
+     }
+ 
+-    if (pcap_status == 1 && *p != NULL && accept_callback(*p, *head, *datalink, *offset)) {
+-      break;
+-    } else if (pcap_status == 0 || *p == NULL) {
++    if (pcap_status == 1 && *p != NULL) {
++      /* Offset may be different in the case of 802.1q */
++      if (*datalink == DLT_EN10MB
++          && (*head)->caplen >= sizeof(struct eth_hdr)
++          && 0 == memcmp((*p) + offsetof(struct eth_hdr, eth_type), "\x81\x00", 2)) {
++        *offset += 4;
++      }
++      if (accept_callback(*p, *head, *datalink, *offset)) {
++        break;
++      } else {
++        /* We'll be a bit patient if we're getting actual packets back, but
++           not indefinitely so */
++        if (badcounter++ > 50)
++          timedout = 1;
++      }
++    } else {
+       /* Should we timeout? */
+       if (to_usec == 0) {
+         timedout = 1;
+@@ -4214,11 +4227,6 @@ int read_reply_pcap(pcap_t *pd, long to_usec,
+           timedout = 1;
+         }
+       }
+-    } else {
+-      /* We'll be a bit patient if we're getting actual packets back, but
+-         not indefinitely so */
+-      if (badcounter++ > 50)
+-        timedout = 1;
+     }
+   } while (!timedout);
+ 
+@@ -4258,7 +4266,7 @@ static bool accept_arp(const unsigned char *p, const struct pcap_pkthdr *head,
+     return false;
+ 
+   if (datalink == DLT_EN10MB) {
+-    return ntohs(*((u16 *) (p + 12))) == ETH_TYPE_ARP;
++    return ntohs(*((u16 *) (p + offset - 2))) == ETH_TYPE_ARP;
+   } else if (datalink == DLT_LINUX_SLL) {
+     return ntohs(*((u16 *) (p + 2))) == ARPHRD_ETHER && /* sll_hatype */
+       ntohs(*((u16 *) (p + 4))) == 6 && /* sll_halen */
+
+
+
+
+@@ -1565,7 +1565,7 @@ void ProbeMode::probe_nping_event_handler(nsock_pool nsp, nsock_event nse, void
+  const unsigned char *link=NULL;
+  size_t linklen=0;
+  size_t packetlen=0;
+- u16 *ethtype=NULL;
++ u16 ethtype=0;
+  u8 buffer[512+1];
+  size_t link_offset=0;
+  static struct timeval pcaptime;
+@@ -1632,9 +1632,9 @@ void ProbeMode::probe_nping_event_handler(nsock_pool nsp, nsock_event nse, void
+             /* If we are on a Ethernet network, extract the next packet protocol
+              * from the Ethernet frame. */
+             if( nsock_iod_linktype(nsi) == DLT_EN10MB ){
+-                ethtype=(u16*)(link+12);
+-                *ethtype=ntohs(*ethtype);
+-                switch(*ethtype){
++                ethtype=*(u16*)(link + linklen - 2);
++                ethtype=ntohs(ethtype);
++                switch(ethtype){
+                     case ETHTYPE_IPV4:
+                     case ETHTYPE_IPV6:
+                         ip=true;
+@@ -1644,7 +1644,7 @@ void ProbeMode::probe_nping_event_handler(nsock_pool nsp, nsock_event nse, void
+                         ip=false;
+                     break;
+                     default:
+-                        nping_warning(QT_1, "RCVD (%.4fs) Unsupported protocol (Ethernet type %02X)", o.stats.elapsedRuntime(t), *ethtype);
++                        nping_warning(QT_1, "RCVD (%.4fs) Unsupported protocol (Ethernet type %02X)", o.stats.elapsedRuntime(t), ethtype);
+                         print_hexdump(VB_3, packet, packetlen);
+                         return;
+                     break;
+
+
+
+
+@@ -476,8 +476,15 @@ void nse_readpcap(nsock_event nsev, const unsigned char **l2_data, size_t *l2_le
+     return;
+   }
+ 
+-  l2l = MIN(mp->l3_offset, n->caplen);
+-  l3l = MAX(0, n->caplen-mp->l3_offset);
++  l2l = mp->l3_offset;
++  if (mp->datalink == DLT_EN10MB
++      && n->caplen >= sizeof(struct eth_hdr)
++      && 0 == memcmp(n->packet + offsetof(struct eth_hdr, eth_type), "\x81\x00", 2))
++    l2l += 4;
++  }
++  if (l2l > n->caplen)
++    l2l = n->caplen;
++  l3l = MAX(0, n->caplen - l2l);
+ 
+   if (l2_data)
+     *l2_data = n->packet;
+
+
+
+
+@@ -1610,7 +1610,7 @@ int setTargetMACIfAvailable(Target *target, struct link_header *linkhdr,
+   if (!linkhdr || !target || !src)
+     return 1;
+ 

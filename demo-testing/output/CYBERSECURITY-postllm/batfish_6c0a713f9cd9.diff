@@ -1,0 +1,98 @@
+@@ -19,6 +19,8 @@ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Objects;
+ import java.util.Set;
++import java.util.stream.Collectors;
++import java.util.stream.Stream;
+ import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import org.batfish.common.plugin.TracerouteEngine;
+@@ -228,36 +230,43 @@ public final class BgpTopologyUtils {
+       vrf.put(peer.getVrfName(), peer);
+     }
+     SetMultimap<BgpPeerConfigId, Ip> localIps = localIpsBuilder.build();
+-    for (BgpPeerConfigId neighborId : graph.nodes()) {
+-      switch (neighborId.getType()) {
+-        case DYNAMIC:
+-          // Passive end of the peering cannot initiate a connection
+-          continue;
+-        case ACTIVE:
+-          addActivePeerEdges(
+-              neighborId,
+-              graph,
+-              networkConfigurations,
+-              ipVrfOwners,
+-              receivers,
+-              localIps.get(neighborId),
+-              checkReachability,
+-              tracerouteEngine);
+-          break;
+-        case UNNUMBERED:
+-          addUnnumberedPeerEdges(neighborId, graph, networkConfigurations, l3Adjacencies);
+-          break;
+-        default:
+-          throw new IllegalArgumentException(
+-              String.format("Unrecognized peer type: %s", neighborId));
+-      }
++
++    // In parallel, test which sessions can be established, and collect the new edges into a list.
++    // Have to materialize so that adding the edges to the graph is done sequentially.
++    List<BgpEdge> newEdges =
++        graph.nodes().parallelStream()
++            .flatMap(
++                neighborId -> {
++                  switch (neighborId.getType()) {
++                    case DYNAMIC:
++                      // Passive end of the peering cannot initiate a connection
++                      return Stream.of();
++                    case ACTIVE:
++                      return addActivePeerEdges(
++                          neighborId,
++                          networkConfigurations,
++                          ipVrfOwners,
++                          receivers,
++                          localIps.get(neighborId),
++                          checkReachability,
++                          tracerouteEngine);
++                    case UNNUMBERED:
++                      return addUnnumberedPeerEdges(
++                          neighborId, graph.nodes(), networkConfigurations, l3Adjacencies);
++                    default:
++                      throw new IllegalArgumentException(
++                          String.format("Unrecognized peer type: %s", neighborId));
++                  }
++                })
++            .collect(Collectors.toList());
++    for (BgpEdge newEdge : newEdges) {
++      graph.putEdgeValue(newEdge._source, newEdge._target, newEdge._sessionProps);
+     }
+     return new BgpTopology(graph);
+   }
+ 
+-  private static void addActivePeerEdges(
++  private static Stream<BgpEdge> addActivePeerEdges(
+       BgpPeerConfigId neighborId,
+-      MutableValueGraph<BgpPeerConfigId, BgpSessionProperties> graph,
+       NetworkConfigurations nc,
+       Map<Ip, Map<String, Set<String>>> ipOwners,
+       Map<String, Multimap<String, BgpPeerConfigId>> receivers,
+@@ -270,102 +279,122 @@ public final class BgpTopologyUtils {
+         || neighbor.getLocalAs() == null
+         || neighbor.getPeerAddress() == null
+         || neighbor.getRemoteAsns().isEmpty()) {
+-      return;
++      return Stream.of();
+     }
+     // Find nodes that own the neighbor's peer address
+     Map<String, Set<String>> possibleVrfs = ipOwners.get(neighbor.getPeerAddress());
+     if (possibleVrfs == null) {
+-      return;
++      return Stream.of();
+     }
+ 
+-    Set<BgpPeerConfigId> alreadyEstablished = graph.adjacentNodes(neighborId);
+-    for (Entry<String, Set<String>> entry : possibleVrfs.entrySet()) {
+-      String node = entry.getKey();
+-      Set<String> vrfs = entry.getValue();
+-      Multimap<String, BgpPeerConfigId> receiversByVrf = receivers.get(node);
+-      if (rece

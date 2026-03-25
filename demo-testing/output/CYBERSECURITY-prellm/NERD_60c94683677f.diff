@@ -1,0 +1,123 @@
+@@ -79,7 +79,7 @@ def main():
+     
+     # TODO load all modules automatically (or just modules specified in config)
+     #import modules.test_module
+-    import modules.event_receiver
++    # TODO remove import modules.event_receiver
+     import modules.updater
+     import modules.cleaner
+     import modules.dns
+@@ -103,7 +103,7 @@ def main():
+     # TODO create all modules automatically (loop over all modules.* and find all objects derived from NERDModule)
+     #  or take if from configuration
+     module_list = [
+-        modules.event_receiver.EventReceiver(),
++        #modules.event_receiver.EventReceiver(),
+         modules.updater.Updater(),
+         modules.cleaner.Cleaner(),
+         #modules.refresher.Refresher(),
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,303 @@
++#!/usr/bin/env python3
++
++"""
++NERD standalone script for receiving IDEA messages about detected security events.
++
++Fetches IDEA messages dropped to a specified directory and updates entity
++records accordingly.
++"""
++
++import g
++
++import time
++import os
++import socket
++import json
++import logging
++import pika  # RabbitMQ client
++import signal
++
++import sys
++sys.path.append("../")
++from common.utils import parse_rfc_time
++import common.config
++import common.eventdb_psql
++import core.update_manager
++import core.mongodb
++
++running_flag = True  # read_dir function terminates when this is set to False
++logger = logging.getLogger('EventReceiver')
++
++# Configuration files paths
++cfg_file = "../etc/nerdd.yml"
++common_cfg_file = "../etc/nerd.yml"
++
++g.config = common.config.read_config(cfg_file)
++g.config.update(common.config.read_config(common_cfg_file))
++g.db = core.mongodb.MongoEntityDatabase(g.config)
++g.eventdb = common.eventdb_psql.PSQLEventDatabase(g.config)
++g.um = core.update_manager.UpdateManager(g.config, g.db)
++
++
++def read_dir(path):
++    """
++    Indefinitely watches given directory for new files. Each incoming file is
++    read, parsed as JSON, and yield to caller (function behaves as a generator).
++    """
++
++    class NamedFile(object):
++        """ Wrapper class for file objects, which allows and tracks filename
++            changes.
++        """
++
++        def __init__(self, pth, name, fd=None):
++            self.name = name
++            self.path = pth
++            if fd:
++                self.f = os.fdopen(fd, "w+b")
++            else:
++                self.f = None
++
++        def __str__(self):
++            return "%s(%s, %s)" % (type(self).__name__, self.path, self.name)
++
++        def get_path(self, basepath=None, name=None):
++            return os.path.join(basepath or self.path, name or self.name)
++
++        def open(self, mode):
++            return open(self.get_path(), mode)
++
++        def moveto(self, destpath):
++            os.rename(self.get_path(), self.get_path(basepath=destpath))
++            self.path = destpath
++
++        def rename(self, newname):
++            os.rename(self.get_path(), self.get_path(name=newname))
++            self.name = newname
++
++        def remove(self):
++            os.remove(self.get_path())
++
++    class SafeDir(object):
++        """ Maildir like directory for safe file exchange.
++            - Producers are expected to drop files into "temp" under globally unique
++              filename and rename it into "incoming" atomically (newfile method)
++            - Workers pick files in "incoming", rename them into "temp",
++              do whatever they want, and either discard them or move into
++              "errors" directory
++        """
++
++        def __init__(self, p):
++            self.path = self._ensure_path(p)
++            self.incoming = self._ensure_path(os.path.join(self.path, "incoming"))
++            self.errors = self._ensure_path(os.path.join(self.path, "errors-worker"))
++            self.temp = self._ensure_path(os.path.join(self.path, "temp-worker"))
++            self.hostname = socket.gethostname()
++            self.pid = os.getpid()
++
++        def __str__(self):
++            return "%s(%s)" % (ty

@@ -1,0 +1,150 @@
+@@ -22,104 +22,7 @@
+  */
+ 
+ #include "suricata-common.h"
+-#include "stream.h"
+-#include "app-layer-parser.h"
+ #include "app-layer-dns-common.h"
+-#ifdef DEBUG
+-#include "util-print.h"
+-#endif
+-#include "util-memcmp.h"
+-#include "util-atomic.h"
+-
+-typedef struct DNSConfig_ {
+-    uint32_t request_flood;
+-    uint32_t state_memcap;  /**< memcap in bytes per state */
+-    uint64_t global_memcap; /**< memcap in bytes globally for parser */
+-} DNSConfig;
+-static DNSConfig dns_config;
+-
+-void DNSConfigInit(void)
+-{
+-    memset(&dns_config, 0x00, sizeof(dns_config));
+-}
+-
+-void DNSConfigSetRequestFlood(uint32_t value)
+-{
+-    dns_config.request_flood = value;
+-}
+-
+-void DNSConfigSetStateMemcap(uint32_t value)
+-{
+-    dns_config.state_memcap = value;
+-}
+-
+-SC_ATOMIC_DECLARE(uint64_t, dns_memuse); /**< byte counter of current memuse */
+-SC_ATOMIC_DECLARE(uint64_t, dns_memcap_state); /**< counts number of 'rejects' */
+-SC_ATOMIC_DECLARE(uint64_t, dns_memcap_global); /**< counts number of 'rejects' */
+-
+-void DNSConfigSetGlobalMemcap(uint64_t value)
+-{
+-    dns_config.global_memcap = value;
+-
+-    SC_ATOMIC_INIT(dns_memuse);
+-    SC_ATOMIC_INIT(dns_memcap_state);
+-    SC_ATOMIC_INIT(dns_memcap_global);
+-}
+-
+-void DNSIncrMemcap(uint32_t size, DNSState *state)
+-{
+-    if (state != NULL) {
+-        state->memuse += size;
+-    }
+-    SC_ATOMIC_ADD(dns_memuse, size);
+-}
+-
+-void DNSDecrMemcap(uint32_t size, DNSState *state)
+-{
+-    if (state != NULL) {
+-        BUG_ON(size > state->memuse); /**< TODO remove later */
+-        state->memuse -= size;
+-    }
+-
+-    BUG_ON(size > SC_ATOMIC_GET(dns_memuse)); /**< TODO remove later */
+-    (void)SC_ATOMIC_SUB(dns_memuse, size);
+-}
+-
+-int DNSCheckMemcap(uint32_t want, DNSState *state)
+-{
+-    if (state != NULL) {
+-        if (state->memuse + want > dns_config.state_memcap) {
+-            SC_ATOMIC_ADD(dns_memcap_state, 1);
+-            DNSSetEvent(state, DNS_DECODER_EVENT_STATE_MEMCAP_REACHED);
+-            return -1;
+-        }
+-    }
+-
+-    if (SC_ATOMIC_GET(dns_memuse) + (uint64_t)want > dns_config.global_memcap) {
+-        SC_ATOMIC_ADD(dns_memcap_global, 1);
+-        return -2;
+-    }
+-
+-    return 0;
+-}
+-
+-uint64_t DNSMemcapGetMemuseCounter(void)
+-{
+-    uint64_t x = SC_ATOMIC_GET(dns_memuse);
+-    return x;
+-}
+-
+-uint64_t DNSMemcapGetMemcapStateCounter(void)
+-{
+-    uint64_t x = SC_ATOMIC_GET(dns_memcap_state);
+-    return x;
+-}
+-
+-uint64_t DNSMemcapGetMemcapGlobalCounter(void)
+-{
+-    uint64_t x = SC_ATOMIC_GET(dns_memcap_global);
+-    return x;
+-}
+ 
+ SCEnumCharMap dns_decoder_event_table[ ] = {
+     { "UNSOLLICITED_RESPONSE",      DNS_DECODER_EVENT_UNSOLLICITED_RESPONSE, },
+@@ -156,891 +59,6 @@ void DNSAppLayerRegisterGetEventInfo(uint8_t ipproto, AppProto alproto)
+     return;
+ }
+ 
+-AppLayerDecoderEvents *DNSGetEvents(void *state, uint64_t id)
+-{
+-    DNSState *dns_state = (DNSState *)state;
+-    DNSTransaction *tx;
+-
+-    if (dns_state->curr && dns_state->curr->tx_num == (id + 1)) {
+-        return dns_state->curr->decoder_events;
+-    }
+-
+-    TAILQ_FOREACH(tx, &dns_state->tx_list, next) {
+-        if (tx->tx_num == (id+1))
+-            return tx->decoder_events;
+-    }
+-    return NULL;
+-}
+-
+-void *DNSGetTx(void *alstate, uint64_t tx_id)
+-{
+-    DNSState *dns_state = (DNSState *)alstate;
+-    DNSTransaction *tx = NULL;
+-
+-    /* fast track: try the current tx */
+-    if (dns_state->curr && dns_state->curr->tx_num == tx_id + 1)
+-        return dns_state->curr;
+-
+-    /* fast track:
+-     * if the prev tx_id is equal to the stored tx ptr, we can
+-     * use this shortcut to get to the next. */
+-    if (dns_state->iter) {
+-        if (tx_id == dns_state->iter->tx_num) {
+-            tx = TAILQ_NEXT(dns_state->iter, next);
+-            if (tx && tx->tx_num == tx_id + 1) {
+-                dns_state->iter = tx;
+-                return tx;
+-            }
+-        }
+-    }
+-
+-    /* no luck with the fast tracks, do the full list walk */
+-    TAILQ_FOREACH(tx, &dns_state->tx_list, next) {
+-       

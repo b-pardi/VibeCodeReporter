@@ -1,0 +1,174 @@
+@@ -356,8 +356,12 @@ static int r_core_file_do_load_for_debug(RCore *r, ut64 baseaddr, R_NULLABLE con
+ 	int xtr_idx = 0; // if 0, load all if xtr is used
+ 
+ 	// TODO : Honor file.path eval var too?
+-	if (filenameuri && r_str_startswith (filenameuri, "dbg://")) {
+-		filenameuri += 6;
++	if (filenameuri) {
++		if (r_str_startswith (filenameuri, "dbg://")) {
++			filenameuri += 6;
++		} else if (r_str_startswith (filenameuri, "sysgdb://")) {
++			filenameuri += 9;
++		}
+ 	}
+ 	if (!desc) {
+ 		return false;
+
+
+
+
+@@ -631,6 +631,7 @@ extern RIOPlugin r_io_plugin_isotp;
+ extern RIOPlugin r_io_plugin_xalz;
+ extern RIOPlugin r_io_plugin_reg;
+ extern RIOPlugin r_io_plugin_treebuf;
++extern RIOPlugin r_io_plugin_sysgdb;
+ extern RIOPlugin r_io_plugin_serial;
+ extern RIOPlugin r_io_plugin_cyclic;
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,515 @@
++/* radare - LGPL - Copyright 2023 - pancake */
++
++#include <r_io.h>
++#include <r_lib.h>
++
++#define DEBUG 0
++
++static R_TH_LOCAL RSocket *gs = NULL;
++#if __APPLE__
++static R_TH_LOCAL bool use_lldb = true;
++static bool usefirst = true;
++#else
++static R_TH_LOCAL bool use_lldb = false;
++static bool usefirst = false;
++#endif
++static bool lastbroken = false;
++static bool use_pwndbg = false;
++
++// TODO: make it vargarg...
++static char *runcmd(const char *cmd) {
++	char buf[4096] = {0};
++	if (cmd) {
++		if (usefirst) {
++			usefirst = false;
++			free (runcmd ("starti"));
++		}
++		r_socket_printf (gs, "%s\n", cmd);
++	} else {
++		if (use_lldb) {
++			cmd = "process launch --stop-at-entry\n";
++		} else {
++			usefirst = true;
++		}
++	}
++	if (lastbroken) {
++		r_socket_read (gs, (ut8*)buf, sizeof (buf) - 1);
++		lastbroken = false;
++	}
++	int timeout = 10000;
++	char *str = NULL;
++	r_socket_block_time (gs, 1, timeout, 0);
++	while (true) {
++#if DEBUG
++		eprintf ("LOOP\n");
++#endif
++		memset (buf, 0, sizeof (buf));
++		if (use_lldb && !r_socket_ready (gs, 0, 250)) {
++			return str;
++		}
++		int rc = r_socket_read (gs, (ut8*)buf, sizeof (buf) - 1); // always NULL-terminate the string
++		if (rc < 0) {
++#if DEBUG
++			eprintf ("socket-read-break\n");
++#endif
++			r_socket_read (gs, (ut8*)buf, sizeof (buf) - 1);
++			lastbroken = true;
++			free (str);
++			return NULL;
++		}
++		if (rc == 0) {
++			break;
++		}
++		buf[sizeof (buf) - 1] = 0;
++		r_str_ansi_strip (buf);
++#if DEBUG
++		write (1, "READ: (", 7);
++		write (1, buf, strlen (buf));
++		write (1, ")\n", 2);
++#endif
++		if (use_lldb) {
++			if (!cmd) {
++				usefirst = true;
++				return r_str_append (str, buf);
++			}
++			if (0 && usefirst) {
++				str = r_str_append (str, buf);
++				int rc = r_socket_read (gs, (ut8*)buf, sizeof (buf) - 1); // always NULL-terminate the string
++				usefirst = false;
++				if (rc < 1) {
++					return str;
++				}
++			}
++			// (lldb ) goes first, so we skip it
++			str = r_str_append (str, buf);
++			if (strstr (buf, "(lldb")) {
++				//return str;
++			}
++		} else {
++			char *promptFound;
++			if (!use_pwndbg && usefirst) {
++				use_pwndbg = strstr (buf, "pwndbg>");
++			}
++			if (use_pwndbg) {
++				promptFound = strstr (buf, "pwndbg>");
++				if (promptFound) {
++					return r_str_append (str, buf);
++				}
++			} else {
++				promptFound = strstr (buf, "(gdb) ");
++				if (promptFound) {
++					if (promptFound[6]) {
++						promptFound = NULL;
++					}
++				}
++			}
++			if (promptFound) {
++				*promptFound = 0;
++				return r_str_append (str, buf);
++			}
++		}
++		str = r_str_append (str, buf);
++	}
++	free (str);
++	return NULL;
++}
++
++static int __write(RIO *io, RIODesc *fd, const ut8 *buf, int count) {
++	if (!fd || !fd->data) {
++		return -1;
++	}
++	int i;
++	for (i = 0; i < count ; i++) {
++		ut64 addr = io->off + i;
++		char *cmd = r_str_newf ("set *((unsigned char *)0x%"PFMT64x") = 0x%x", addr, buf[i]);
++		free (runcmd (cmd));
++		free (cmd);
++	}
++
++	return count;
++}
++
++static int __read(RIO *io, RIODesc *fd, ut8 *buf, int count) {
++	if (!fd || !fd->data) {
++		return -1;
++	}
++	const ut64 addr = io->off;
++	if (count > (1024*128)) {
++		// cannot read that much
++		return -1;
++	}
++	if (addr == 0 |

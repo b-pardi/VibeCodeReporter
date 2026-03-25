@@ -1,0 +1,138 @@
+@@ -8,6 +8,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mpi-priv.h"
++#include "mplogic.h"
+ #if defined(OSF1)
+ #include <c_asm.h>
+ #endif
+@@ -1688,98 +1689,112 @@ mp_iseven(const mp_int *a)
+ /* {{{ mp_gcd(a, b, c) */
+ 
+ /*
+-  Like the old mp_gcd() function, except computes the GCD using the
+-  binary algorithm due to Josef Stein in 1961 (via Knuth).
++  Computes the GCD using the constant-time algorithm
++  by Bernstein and Yang (https://eprint.iacr.org/2019/266)
++  "Fast constant-time gcd computation and modular inversion"
+  */
+ mp_err
+ mp_gcd(mp_int *a, mp_int *b, mp_int *c)
+ {
+     mp_err res;
+-    mp_int u, v, t;
+-    mp_size k = 0;
++    mp_digit cond = 0, mask = 0;
++    mp_int g, temp, f;
++    int i, j, m, bit = 1, delta = 1, shifts = 0, last = -1;
++    mp_size top, flen, glen;
++    mp_int *clear[3];
+ 
+     ARGCHK(a != NULL && b != NULL && c != NULL, MP_BADARG);
+-
+-    if (mp_cmp_z(a) == MP_EQ && mp_cmp_z(b) == MP_EQ)
+-        return MP_RANGE;
++    /*
++    Early exit if either of the inputs is zero.
++    Caller is responsible for the proper handling of inputs.
++    */
+     if (mp_cmp_z(a) == MP_EQ) {
+-        return mp_copy(b, c);
++        res = mp_copy(b, c);
++        SIGN(c) = ZPOS;
++        return res;
+     } else if (mp_cmp_z(b) == MP_EQ) {
+-        return mp_copy(a, c);
+-    }
+-
+-    if ((res = mp_init(&t)) != MP_OKAY)
++        res = mp_copy(a, c);
++        SIGN(c) = ZPOS;
+         return res;
+-    if ((res = mp_init_copy(&u, a)) != MP_OKAY)
+-        goto U;
+-    if ((res = mp_init_copy(&v, b)) != MP_OKAY)
+-        goto V;
+-
+-    SIGN(&u) = ZPOS;
+-    SIGN(&v) = ZPOS;
+-
+-    /* Divide out common factors of 2 until at least 1 of a, b is even */
+-    while (mp_iseven(&u) && mp_iseven(&v)) {
+-        s_mp_div_2(&u);
+-        s_mp_div_2(&v);
+-        ++k;
+     }
+ 
+-    /* Initialize t */
+-    if (mp_isodd(&u)) {
+-        if ((res = mp_copy(&v, &t)) != MP_OKAY)
+-            goto CLEANUP;
+-
+-        /* t = -v */
+-        if (SIGN(&v) == ZPOS)
+-            SIGN(&t) = NEG;
+-        else
+-            SIGN(&t) = ZPOS;
++    MP_CHECKOK(mp_init(&temp));
++    clear[++last] = &temp;
++    MP_CHECKOK(mp_init_copy(&g, a));
++    clear[++last] = &g;
++    MP_CHECKOK(mp_init_copy(&f, b));
++    clear[++last] = &f;
+ 
+-    } else {
+-        if ((res = mp_copy(&u, &t)) != MP_OKAY)
+-            goto CLEANUP;
++    /*
++    For even case compute the number of
++    shared powers of 2 in f and g.
++    */
++    for (i = 0; i < USED(&f) && i < USED(&g); i++) {
++        mask = ~(DIGIT(&f, i) | DIGIT(&g, i));
++        for (j = 0; j < MP_DIGIT_BIT; j++) {
++            bit &= mask;
++            shifts += bit;
++            mask >>= 1;
++        }
+     }
++    /* Reduce to the odd case by removing the powers of 2. */
++    s_mp_div_2d(&f, shifts);
++    s_mp_div_2d(&g, shifts);
+ 
+-    for (;;) {
+-        while (mp_iseven(&t)) {
+-            s_mp_div_2(&t);
+-        }
++    /* Allocate to the size of largest mp_int. */
++    top = (mp_size)1 + ((USED(&f) >= USED(&g)) ? USED(&f) : USED(&g));
++    MP_CHECKOK(s_mp_grow(&f, top));
++    MP_CHECKOK(s_mp_grow(&g, top));
++    MP_CHECKOK(s_mp_grow(&temp, top));
+ 
+-        if (mp_cmp_z(&t) == MP_GT) {
+-            if ((res = mp_copy(&t, &u)) != MP_OKAY)
+-                goto CLEANUP;
++    /* Make sure f contains the odd value. */
++    MP_CHECKOK(mp_cswap((~DIGIT(&f, 0) & 1), &f, &g, top));
+ 
+-        } else {
+-            if ((res = mp_copy(&t, &v)) != MP_OKAY)
+-                goto CLEANUP;
++    /* Upper bound for the total iterations. */
++    flen = mpl_significant_bits(&f);
++    glen = mpl_significant_bits(&g);
++    m = 4 + 3 * ((flen >= glen) ? flen : glen);
+ 
+-            /* v = -t */
+-            if (SIGN(&t) == ZPOS)
+-                SIGN(&v) = NEG;
+-            else
+-                SIGN(&v) = ZPOS;
+-        }
++#if defined(_MSC_VER)
++#pragma warning(push)
++#pragma warning(disable : 4146) // Thanks MSVC, we know what we're negating an unsigned mp_digit
++#endif
+ 
+-        if ((res = m

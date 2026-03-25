@@ -1,0 +1,111 @@
+@@ -244,7 +244,11 @@ define_clean_header(ffi, "{inc}/callstack_instr.h")
+ 
+ #define_clean_header(ffi, "{inc}/panda_qemu_support.h")
+ define_clean_header(ffi, "{inc}/panda_datatypes.h")
+-""".format(inc=INCLUDE_DIR_PYP))
++define_clean_header(ffi, "{inc}/breakpoints.h")
++""".format(inc=INCLUDE_DIR_PYP,
++        GLOBAL_MAX_SYSCALL_ARG_SIZE=64, # It's sizeof(uint64_t) so that's always 64
++        GLOBAL_MAX_SYSCALL_ARGS=17 # Constant from syscalls2/generated/syscalls_ext_typedefs.h
++        ))
+ 
+         for pypanda_header in pypanda_headers:
+             pdty.write('define_clean_header(ffi, "%s")\n' % pypanda_header)
+@@ -382,6 +386,7 @@ pcb.init : pandacbtype("init", -1),
+         pdth.write("#define MAX_PANDA_PLUGINS 16\n")
+         pdth.write("#define MAX_PANDA_PLUGIN_ARGS 32\n")
+ 
++
+         for filename in ["callbacks/cb-defs.h",
+                         f"{PLUGINS_DIR}/osi_linux/utils/kernelinfo/kernelinfo.h",
+                          "panda_api.h", ]:
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,17 @@
++from .ffi_importer import ffi
++
++class gdb_mixins():
++    def set_breakpoint(self, cpu, pc):
++        '''
++        Set a GDB breakpoint such that when the guest hits PC, execution is paused and an attached
++        GDB instance can introspect on guest memory. Requires starting panda with -s, at least for now
++        '''
++        BP_GDB = 0x10
++        self.libpanda.cpu_breakpoint_insert(cpu, pc, BP_GDB, ffi.NULL)
++
++    def clear_breakpoint(self, cpu, pc):
++        '''
++        Remove a breakpoint
++        '''
++        BP_GDB = 0x10
++        self.libpanda.cpu_breakpoint_remove(cpu, pc, BP_GDB)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,17 @@
++// Manully created. Sorry. Didn't know how to deal with the QTAILQ stuff with cffi
++
++typedef struct {
++    struct CPUBreakpoint *tqe_next;       /* next element */
++    struct CPUBreakpoint **tqe_prev;      /* address of previous next element */
++} CPUBreakpoint_qtailq;
++
++typedef struct CPUBreakpoint {
++    vaddr pc;
++    uint64_t rr_instr_count;
++    int flags; /* BP_* */
++    CPUBreakpoint_qtailq entry; // Was a QTAILQ(CPUBreakpoint)
++} CPUBreakpoint;
++
++int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags, CPUBreakpoint **breakpoint);
++
++int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags);
+
+
+
+
+@@ -34,10 +34,11 @@ from .callback_mixins   import callback_mixins
+ from .taint_mixins      import taint_mixins
+ from .volatility_mixins import volatility_mixins
+ from .pyperiph_mixins   import pyperipheral_mixins
++from .gdb_mixins        import gdb_mixins
+ 
+ import pdb
+ 
+-class Panda(libpanda_mixins, blocking_mixins, osi_mixins, hooking_mixins, callback_mixins, taint_mixins, volatility_mixins, pyperipheral_mixins):
++class Panda(libpanda_mixins, blocking_mixins, osi_mixins, hooking_mixins, callback_mixins, taint_mixins, volatility_mixins, pyperipheral_mixins, gdb_mixins):
+     def __init__(self, arch="i386", mem="128M",
+             expect_prompt=None, # Regular expression describing the prompt exposed by the guest on a serial console. Used so we know when a running command has finished with its output
+             os_version=None,
+@@ -480,8 +481,12 @@ class Panda(libpanda_mixins, blocking_mixins, osi_mixins, hooking_mixins, callba
+ 
+     def current_sp(self, cpustate): # under construction
+         if self.arch == "i386":
+-            from x86.helper import R_ESP
++            # XXX see far more complex logic in panda/include/panda/common.h
++            from panda.x86.helper import R_ESP
+             return cpustate.env_ptr.regs[R_ESP]
++        elif self.arch == "arm":
++            from panda.arm.helper import R_SP
++            return cpustate.env_ptr.regs[R_SP]
+         else:
+             raise NotImplemented("current_sp doesn't yet support arch {}".format(self.arch))
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python3
++'''
++TODO: We don't currently have a way to unset the breakpoint so you get stuck there :(
++'''
++
++from sys import argv
++from panda import Panda, blocking, 

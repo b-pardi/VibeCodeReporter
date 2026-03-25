@@ -1,0 +1,104 @@
+@@ -730,6 +730,10 @@ const struct DecodeEvents_ DEvents[] = {
+             "stream.est_invalid_ack",
+             STREAM_EST_INVALID_ACK,
+     },
++    {
++            "stream.est_ack_zwp_data",
++            STREAM_EST_ACK_ZWP_DATA,
++    },
+     {
+             "stream.fin_invalid_ack",
+             STREAM_FIN_INVALID_ACK,
+
+
+
+
+@@ -259,6 +259,7 @@ enum {
+     STREAM_EST_SYN_RESEND_DIFF_SEQ,
+     STREAM_EST_SYN_TOCLIENT,
+     STREAM_EST_INVALID_ACK,
++    STREAM_EST_ACK_ZWP_DATA,
+     STREAM_FIN_INVALID_ACK,
+     STREAM_FIN1_ACK_WRONG_SEQ,
+     STREAM_FIN1_FIN_WRONG_SEQ,
+
+
+
+
+@@ -204,6 +204,9 @@ enum TcpState {
+ #define STREAMTCP_FLAG_TCP_FAST_OPEN BIT_U32(15)
+ /** SYN/ACK ignored the data while ACKing the SYN */
+ #define STREAMTCP_FLAG_TFO_DATA_IGNORED BIT_U32(16)
++/* zero window probe */
++#define STREAMTCP_FLAG_ZWP_TS BIT_U32(17)
++#define STREAMTCP_FLAG_ZWP_TC BIT_U32(18)
+ 
+ /*
+  * Per STREAM flags
+
+
+
+
+@@ -2527,10 +2527,17 @@ static int HandleEstablishedPacketToServer(
+                "ACK %" PRIu32 ", WIN %"PRIu16"", ssn, p->payload_len,
+                 TCP_GET_SEQ(p), TCP_GET_ACK(p), TCP_GET_WINDOW(p));
+ 
+-    if (StreamTcpValidateAck(ssn, &(ssn->server), p) == -1) {
+-        SCLogDebug("ssn %p: rejecting because of invalid ack value", ssn);
+-        StreamTcpSetEvent(p, STREAM_EST_INVALID_ACK);
+-        return -1;
++    const bool has_ack = (p->tcph->th_flags & TH_ACK) != 0;
++    if (has_ack) {
++        if ((ssn->flags & STREAMTCP_FLAG_ZWP_TC) && TCP_GET_ACK(p) == ssn->server.next_seq + 1) {
++            SCLogDebug("ssn %p: accepting ACK as it ACKs the one byte from the ZWP", ssn);
++            StreamTcpSetEvent(p, STREAM_EST_ACK_ZWP_DATA);
++
++        } else if (StreamTcpValidateAck(ssn, &ssn->server, p) == -1) {
++            SCLogDebug("ssn %p: rejecting because of invalid ack value", ssn);
++            StreamTcpSetEvent(p, STREAM_EST_INVALID_ACK);
++            return -1;
++        }
+     }
+ 
+     /* check for Keep Alive */
+@@ -2616,6 +2623,8 @@ static int HandleEstablishedPacketToServer(
+         SCLogDebug("ssn %p: zero window probe", ssn);
+         zerowindowprobe = 1;
+         STREAM_PKT_FLAG_SET(p, STREAM_PKT_FLAG_TCP_ZERO_WIN_PROBE);
++        ssn->flags |= STREAMTCP_FLAG_ZWP_TS;
++        StreamTcpReassembleHandleSegment(tv, stt->ra_ctx, ssn, &ssn->client, p);
+ 
+     } else if (SEQ_GEQ(TCP_GET_SEQ(p) + p->payload_len, ssn->client.next_seq)) {
+         StreamTcpUpdateNextSeq(ssn, &ssn->client, (TCP_GET_SEQ(p) + p->payload_len));
+@@ -2694,10 +2703,17 @@ static int HandleEstablishedPacketToClient(
+                " ACK %" PRIu32 ", WIN %"PRIu16"", ssn, p->payload_len,
+                 TCP_GET_SEQ(p), TCP_GET_ACK(p), TCP_GET_WINDOW(p));
+ 
+-    if (StreamTcpValidateAck(ssn, &ssn->client, p) == -1) {
+-        SCLogDebug("ssn %p: rejecting because of invalid ack value", ssn);
+-        StreamTcpSetEvent(p, STREAM_EST_INVALID_ACK);
+-        return -1;
++    const bool has_ack = (p->tcph->th_flags & TH_ACK) != 0;
++    if (has_ack) {
++        if ((ssn->flags & STREAMTCP_FLAG_ZWP_TS) && TCP_GET_ACK(p) == ssn->client.next_seq + 1) {
++            SCLogDebug("ssn %p: accepting ACK as it ACKs the one byte from the ZWP", ssn);
++            StreamTcpSetEvent(p, STREAM_EST_ACK_ZWP_DATA);
++
++        } else if (StreamTcpValidateAck(ssn, &ssn->client, p) == -1) {
++            SCLogDebug("ssn %p: rejecting because of invalid ack value", ssn);
++            StreamTcpSetEvent(p, STREAM_EST_INVALID_ACK);
++            return -1;
++        }
+     }
+ 
+     /* To get the server window value from the servers packet, when connection
+@@ -2757,6 +2773,10 @@ static int HandleEstablishedPacketToClient(
+         SCLogDebug("ssn %p: zero window probe", ssn);
+         zerowindowprobe = 1;
+         STREAM_PKT_FLAG_SET(p, STREAM_PKT_FLAG_TCP_ZERO_WIN_PROBE);
++        ssn->flags |= STREAMTCP_FLAG_ZWP_TC;
++
++        /* accept the segment */
++        StreamTcpReassembleHandleSegment(tv, stt->ra_ctx, ssn, &ssn->server, p);
+ 
+     } else if (SEQ_GEQ(TCP_GET_SEQ(p) + p->pa

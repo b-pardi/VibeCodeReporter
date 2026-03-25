@@ -1,0 +1,124 @@
+@@ -116,6 +116,7 @@ class Utils {
+   static int numberOfSetBits(u_int32_t i);
+   static void initRedis(Redis **r, const char *redis_host, const char *redis_password,
+ 			u_int16_t redis_port, u_int8_t _redis_db_id, bool giveup_on_failure);
++  static json_object *cloneJSONSimple(json_object *src);
+ 
+   /* ScriptPeriodicity */
+   static const char* periodicityToScriptName(ScriptPeriodicity p);
+
+
+
+
+@@ -2428,12 +2428,20 @@ void NetworkInterface::pollQueuedeCompanionEvents() {
+ 	if(new_flow)
+ 	  flow->updateSeen();
+ 
++        if(dequeued->getAdditionalFieldsJSON()) {
++          flow->setJSONInfo(dequeued->getAdditionalFieldsJSON());
++        }
++
+         if(dequeued->external_alert) {
+           /* Flow from SyslogParserInterface (Suricata) */
+           enum json_tokener_error jerr = json_tokener_success;
+           json_object *o = json_tokener_parse_verbose(dequeued->external_alert, &jerr);
+           if(o) flow->setExternalAlert(o, dequeued->external_alert_severity);
+-        } else {
++        }
++
++        if(dequeued->process_info_set || 
++           dequeued->container_info_set || 
++           dequeued->tcp_info_set) {
+           /* Flow from ZMQParserInterface (nProbe Agent) */
+ 	  flow->setParsedeBPFInfo(dequeued, src2dst_direction);
+         }
+
+
+
+
+@@ -45,10 +45,14 @@ ParsedFlow::ParsedFlow() : ParsedFlowCore(), ParsedeBPF() {
+ 
+ ParsedFlow::ParsedFlow(const ParsedFlow &pf) : ParsedFlowCore(pf), ParsedeBPF(pf) {
+ 
+-  /* Currently we avoid additional fields in the copy constructor */
+-  additional_fields_json = NULL; 
++  /* Currently we avoid TLV additional fields in the copy constructor */
+   additional_fields_tlv = NULL; 
+ 
++  if (pf.additional_fields_json != NULL)
++    additional_fields_json = Utils::cloneJSONSimple(pf.additional_fields_json);
++  else
++    additional_fields_json = NULL; 
++
+   if(pf.http_url)  http_url = strdup(pf.http_url); else http_url = NULL;
+   if(pf.http_site) http_site = strdup(pf.http_site); else http_site = NULL;
+   if(pf.http_method) http_method = strdup(pf.http_method); else http_method = NULL;
+
+
+
+
+@@ -52,7 +52,8 @@ void ParserInterface::processFlow(ParsedFlow *zflow) {
+     if(zflow->process_info_set || 
+        zflow->container_info_set || 
+        zflow->tcp_info_set ||
+-       zflow->external_alert) {
++       zflow->external_alert ||
++       zflow->getAdditionalFieldsJSON()) {
+       deliverFlowToCompanions(zflow);
+     }
+ 
+
+
+
+
+@@ -4092,3 +4092,43 @@ u_int64_t Utils::bitmapClear(u_int64_t bitmap, u_int8_t v) {
+   
+   return(bitmap);
+ }
++
++/* ****************************************************** */
++
++json_object *Utils::cloneJSONSimple(json_object *src) {
++  struct json_object_iterator obj_it = json_object_iter_begin(src);
++  struct json_object_iterator obj_itEnd = json_object_iter_end(src);
++  json_object *obj = json_object_new_object();
++
++  if (obj == NULL)
++    return NULL;
++
++  while(!json_object_iter_equal(&obj_it, &obj_itEnd)) {
++    const char *key   = json_object_iter_peek_name(&obj_it);
++    json_object *v    = json_object_iter_peek_value(&obj_it);
++    enum json_type type = json_object_get_type(v);
++
++    if(key != NULL && v != NULL)
++    switch(type) {
++    case json_type_int:
++      json_object_object_add(obj, key, json_object_new_int64(json_object_get_int64(v)));
++      break;
++    case json_type_double:
++      json_object_object_add(obj, key, json_object_new_double(json_object_get_double(v)));
++      break;
++    case json_type_string:
++      json_object_object_add(obj, key, json_object_new_string(json_object_get_string(v)));
++      break;
++    case json_type_boolean:
++      json_object_object_add(obj, key, json_object_new_boolean(json_object_get_boolean(v)));
++      break;
++    case json_type_object: /* not supported */
++    default:
++      break;
++    }
++
++    json_object_iter_next(&obj_it);
++  }
++
++  return obj;
++}
+
+
+
+
+@@ -1037,7 +1037,6 @@ void ZMQParserInterface::parseSingleJSONFlow(json_object *o,
+     case json_type_object:
+       /* This is handled by parseNProbeAgentF

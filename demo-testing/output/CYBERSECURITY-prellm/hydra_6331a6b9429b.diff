@@ -1,0 +1,114 @@
+@@ -2,9 +2,9 @@
+ 
+ import copy
+ import warnings
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from textwrap import dedent
+-from typing import Dict, List, Optional, Union
++from typing import Callable, Dict, List, Optional, Union
+ 
+ from omegaconf import DictConfig, OmegaConf
+ 
+@@ -23,6 +23,12 @@ from hydra.core.override_parser.types import Override
+ from hydra.errors import ConfigCompositionException
+ 
+ 
++@dataclass
++class Deletion:
++    name: Optional[str]
++    used: bool = field(default=False, compare=False)
++
++
+ @dataclass
+ class Overrides:
+     override_choices: Dict[str, str]
+@@ -33,11 +39,14 @@ class Overrides:
+ 
+     known_choices: Dict[str, str]
+ 
++    deletions: Dict[str, Deletion]
++
+     def __init__(self, repo: IConfigRepository, overrides_list: List[Override]) -> None:
+         self.override_choices = {}
+         self.override_used = {}
+         self.append_group_defaults = []
+         self.config_overrides = []
++        self.deletions = {}
+ 
+         self.known_choices = {}
+ 
+@@ -47,11 +56,21 @@ class Overrides:
+             if not is_group:
+                 self.config_overrides.append(override)
+             else:
+-                if not isinstance(value, str):
++                if override.is_delete():
++                    key = override.get_key_element()[1:]
++                    value = override.value()
++                    if value is not None and not isinstance(value, str):
++                        raise ValueError(
++                            f"Config group override deletion value must be a string : {override}"
++                        )
++
++                    self.deletions[key] = Deletion(name=value)
++
++                elif not isinstance(value, str):
+                     raise ValueError(
+                         f"Config group override must be a string : {override}"
+                     )
+-                if override.is_add():
++                elif override.is_add():
+                     self.append_group_defaults.append(
+                         GroupDefault(
+                             group=override.key_or_group,
+@@ -95,6 +114,13 @@ class Overrides:
+                 )
+                 raise ConfigCompositionException(msg)
+ 
++    def ensure_deletions_used(self) -> None:
++        for key, deletion in self.deletions.items():
++            if not deletion.used:
++                desc = f"{key}={deletion.name}" if deletion.name is not None else key
++                msg = f"Could not delete '{desc}'. No match in the defaults list"
++                raise ConfigCompositionException(msg)
++
+     def set_known_choice(self, default: InputDefault) -> None:
+         if isinstance(default, GroupDefault):
+             key = default.get_override_key()
+@@ -107,6 +133,24 @@ class Overrides:
+                         f"Internal error, value of {key} is being changed from {prev} to {default.get_name()}"
+                     )
+ 
++    def is_deleted(self, default: InputDefault) -> bool:
++        if not isinstance(default, GroupDefault):
++            return False
++        key = default.get_override_key()
++        if key in self.deletions:
++            deletion = self.deletions[key]
++            if deletion.name is None:
++                return True
++            else:
++                return deletion.name == default.get_name()
++
++    def delete(self, default: InputDefault) -> bool:
++        assert isinstance(default, GroupDefault)
++        default.deleted = True
++
++        key = default.get_override_key()
++        self.deletions[key].used = True
++
+ 
+ @dataclass
+ class DefaultsList:
+@@ -114,7 +158,7 @@ class DefaultsList:
+     config_overrides: List[Override]
+ 
+ 
+-def _validate_self(containing_node: InputDefault, defaults: List[InputDefault]) -> None:
++def _validate_self(containing_node: InputDefault, defaults: List[InputDefault]) -> bool:
+     # check that self is present only once
+     has_self = False
+     for d in defaults:
+@@ -162,7 +206,7 @@ def _expand_virtual_root(
+         d.parent_base_di

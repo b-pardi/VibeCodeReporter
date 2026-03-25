@@ -1,0 +1,80 @@
+@@ -17,10 +17,11 @@ import logging
+ import os
+ import time
+ import urllib.parse
++from itertools import product, groupby
+ 
+ from keeper_secrets_manager_core.utils import bytes_to_base64, url_safe_str_to_bytes
+ 
+-from typing import Sequence, List
++from typing import Sequence, List, Optional
+ 
+ from .base import Command, dump_report_data, user_choice, as_boolean
+ from . import record
+@@ -326,41 +327,103 @@ class KSMCommand(Command):
+ 
+     @staticmethod
+     def share_app(params, app_name_or_uid, email, is_admin=False, unshare=False):
++        # type: (KeeperParams, str, List[str], Optional[bool], Optional[bool]) -> None
+         app_rec = KSMCommand.get_app_record(params, app_name_or_uid)
+         if app_rec is None:
+             logging.warning('Application "%s" not found.' % app_name_or_uid)
+             return
+         app_uid = app_rec.get('record_uid', '')
+-        app_info = KSMCommand.get_app_info(params, app_uid)
+-        sf_action = 'remove' if unshare else 'grant'
+         sr_action = 'revoke' if unshare else 'grant'
+-        sf_perm_keys = ('manage_users', 'manage_records', 'can_edit', 'can_share')
+-        sf_perms = {k: is_admin and not unshare and 'on' or 'off' for k in sf_perm_keys}
+         rec_perms = dict(can_edit=is_admin and not unshare, can_share=is_admin and not unshare)
+         users = [email]
+-        share_folder_args = dict(**sf_perms, action=sf_action, user=users)
+         share_rec_args = dict(**rec_perms, action=sr_action, email=users)
+ 
+-        from keepercommander.commands.register import ShareRecordCommand
+-        from keepercommander.commands.register import ShareFolderCommand
+-
+         # (Un)Share application record
++        from keepercommander.commands.register import ShareRecordCommand
+         share_rec_cmd = ShareRecordCommand()
+         share_rec_cmd.execute(params, record=app_uid, **share_rec_args)
+ 
+-        get_share_uid = lambda share: utils.base64_url_encode(share.secretUid)
++        api.sync_down(params)
++        KSMCommand.update_shares_user_permissions(params, app_uid, removed=unshare and email or None)
++
++    @staticmethod
++    def update_shares_user_permissions(params, app_uid, removed=None):   # type: (KeeperParams, str, Optional[str] ) -> None
++        # Get app user-permissions
++        api.get_record_shares(params, [app_uid])
++        app_rec = KSMCommand.get_app_record(params, app_uid)
++        if app_rec is None:
++            logging.warning('Application "%s" not found.' % app_uid)
++            return
++
++        user_perms = app_rec.get('shares', {}).get('user_permissions', [])
++        sf_perm_keys = ('manage_users', 'manage_records')
++        rec_perm_keys = ('can_edit', 'can_share')
++        rec_user_permissions = ('editable', 'shareable')
++
++        # Apply app user-permissions to app shares
++        app_info = KSMCommand.get_app_info(params, app_uid)
++        share_uids = [utils.base64_url_encode(s.secretUid) for ai in app_info for s in (ai.shares or [])]
++        shared_recs = [uid for uid in share_uids if uid in params.record_cache]
++        shared_folders = [uid for uid in share_uids if uid not in shared_recs]
++
++        api.get_record_shares(params, shared_recs)
+ 
+-        # (Un)Share shared-folders associated w/ application
+-        is_sf = lambda share: APIRequest_pb2.ApplicationShareType.Name(share.shareType) == 'SHARE_TYPE_FOLDER'
+-        shared_folders = [get_share_uid(s) for ai in app_info for s in ai.shares or [] if is_sf(s)]
+-        share_folder_cmd = ShareFolderCommand()
+-        share_folder_cmd.execute(params, folder=shared_folders, **share_folder_args)
++        def share_needs_update(user, share_uid, elevated):
++            if is_removed:
++                return True
++
++            is_rec_share = share_uid in params.record_cache
++            perm_keys, share_cache = (rec_user_permissions, params.record_cache) if is_rec_share \
++                else (sf_perm_keys, params.shared_folder_cache)
++            get_user_permissions = lambda cached_share: 

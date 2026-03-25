@@ -1,0 +1,97 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,2471 @@
++// See the file "COPYING" in the toplevel directory for copyright.
++
++#include "Gen-ZAM.h"
++
++#include <ctype.h>
++#include <cstring>
++#include <regex>
++
++using namespace std;
++
++// Helper functions to convert dashes to underscores or vice versa.
++static char dash_to_under(char c) { return c == '-' ? '_' : c; }
++
++static char under_to_dash(char c) { return c == '_' ? '-' : c; }
++
++// Structure for binding together Zeek script types, internal names Gen-ZAM
++// uses to track them, mnemonics for referring to them in instruction names,
++// the corresponding Val accessor, and whether the type requires memory
++// management.
++struct TypeInfo {
++    string tag;
++    ZAM_Type zt;
++    string suffix;
++    string accessor; // doesn't include "As" prefix or "()" suffix
++    bool is_managed;
++};
++
++static vector<TypeInfo> ZAM_type_info = {
++    {"TYPE_ADDR", ZAM_TYPE_ADDR, "A", "Addr", true},       {"TYPE_ANY", ZAM_TYPE_ANY, "a", "Any", true},
++    {"TYPE_COUNT", ZAM_TYPE_UINT, "U", "Count", false},    {"TYPE_DOUBLE", ZAM_TYPE_DOUBLE, "D", "Double", false},
++    {"TYPE_FILE", ZAM_TYPE_FILE, "f", "File", true},       {"TYPE_FUNC", ZAM_TYPE_FUNC, "F", "Func", true},
++    {"TYPE_INT", ZAM_TYPE_INT, "I", "Int", false},         {"TYPE_LIST", ZAM_TYPE_LIST, "L", "List", true},
++    {"TYPE_OPAQUE", ZAM_TYPE_OPAQUE, "O", "Opaque", true}, {"TYPE_PATTERN", ZAM_TYPE_PATTERN, "P", "Pattern", true},
++    {"TYPE_RECORD", ZAM_TYPE_RECORD, "R", "Record", true}, {"TYPE_STRING", ZAM_TYPE_STRING, "S", "String", true},
++    {"TYPE_SUBNET", ZAM_TYPE_SUBNET, "N", "SubNet", true}, {"TYPE_TABLE", ZAM_TYPE_TABLE, "T", "Table", true},
++    {"TYPE_TYPE", ZAM_TYPE_TYPE, "t", "Type", true},       {"TYPE_VECTOR", ZAM_TYPE_VECTOR, "V", "Vector", true},
++};
++
++// Maps op-type mnemonics to the corresponding internal value used by Gen-ZAM.
++static unordered_map<char, ZAM_Type> type_names = {
++    {'*', ZAM_TYPE_DEFAULT}, {'A', ZAM_TYPE_ADDR},   {'a', ZAM_TYPE_ANY},     {'D', ZAM_TYPE_DOUBLE},
++    {'f', ZAM_TYPE_FILE},    {'F', ZAM_TYPE_FUNC},   {'I', ZAM_TYPE_INT},     {'L', ZAM_TYPE_LIST},
++    {'X', ZAM_TYPE_NONE},    {'O', ZAM_TYPE_OPAQUE}, {'P', ZAM_TYPE_PATTERN}, {'R', ZAM_TYPE_RECORD},
++    {'S', ZAM_TYPE_STRING},  {'N', ZAM_TYPE_SUBNET}, {'T', ZAM_TYPE_TABLE},   {'t', ZAM_TYPE_TYPE},
++    {'U', ZAM_TYPE_UINT},    {'V', ZAM_TYPE_VECTOR},
++};
++
++// Inverse of the above.
++static unordered_map<ZAM_Type, char> expr_name_types;
++
++// Given a ZAM_Type, returns the corresponding TypeInfo.
++const TypeInfo& find_type_info(ZAM_Type zt) {
++    assert(zt != ZAM_TYPE_NONE);
++
++    auto pred = [zt](const TypeInfo& ti) -> bool { return ti.zt == zt; };
++    auto ti = std::find_if(ZAM_type_info.begin(), ZAM_type_info.end(), pred);
++
++    assert(ti != ZAM_type_info.end());
++    return *ti;
++}
++
++// Given a ZAM_Type, return its ZVal accessor.  Takes into account
++// some naming inconsistencies between ZVal's and Val's.
++string find_type_accessor(ZAM_Type zt, bool is_lhs) {
++    if ( zt == ZAM_TYPE_NONE )
++        return "";
++
++    string acc = string("As") + find_type_info(zt).accessor;
++    if ( is_lhs )
++        acc += "Ref";
++
++    return acc + "()";
++}
++
++// Maps ZAM operand types to pairs of (1) the C++ name used to declare
++// the operand in a method declaration, and (2) the variable name to
++// use for the operand.
++unordered_map<ZAM_OperandClass, pair<const char*, const char*>> ArgsManager::oc_to_args = {
++    {ZAM_OC_AUX, {"OpaqueVals*", "v"}},
++    {ZAM_OC_CONSTANT, {"const ConstExpr*", "c"}},
++    {ZAM_OC_EVENT_HANDLER, {"EventHandler*", "h"}},
++    {ZAM_OC_INT, {"int", "i"}},
++    {ZAM_OC_BRANCH, {"int", "i"}},
++    {ZAM_OC_GLOBAL, {"int", "i"}},
++    {ZAM_OC_STEP_ITER, {"int", "i"}},
++    {ZAM_OC_TBL_ITER, {"int", "i"}},
++    {ZAM_OC_LIST, {"const ListExpr*", "l"}},
++    {ZAM_OC_RECORD_FIELD, {"const NameExpr*", "n"}},
++    {ZAM_OC_VAR, {"const NameExpr*", "n"}},
++
++    // The following gets special treatment.
++    {ZAM_OC_ASSIG

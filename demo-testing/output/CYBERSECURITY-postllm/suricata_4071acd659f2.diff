@@ -1,0 +1,104 @@
+@@ -38,4 +38,10 @@
+ 
+ #define ACTION_DROP_REJECT (ACTION_REJECT_ANY | ACTION_DROP)
+ 
++enum ActionScope {
++    ACTION_SCOPE_AUTO = 0,
++    ACTION_SCOPE_PACKET, /**< apply action to packet */
++    ACTION_SCOPE_FLOW,   /**< apply drop/pass/accept action to flow */
++};
++
+ #endif /* SURICATA_ACTION_GLOBALS_H */
+
+
+
+
+@@ -341,12 +341,17 @@ static inline void FlowApplySignatureActions(
+         DEBUG_VALIDATE_BUG_ON(s->type == SIG_TYPE_NOT_SET);
+         DEBUG_VALIDATE_BUG_ON(s->type == SIG_TYPE_MAX);
+ 
+-        enum SignaturePropertyFlowAction flow_action = signature_properties[s->type].flow_action;
+-        if (flow_action == SIG_PROP_FLOW_ACTION_FLOW) {
++        if (s->action_scope == ACTION_SCOPE_FLOW) {
+             pa->flags |= PACKET_ALERT_FLAG_APPLY_ACTION_TO_FLOW;
+-        } else if (flow_action == SIG_PROP_FLOW_ACTION_FLOW_IF_STATEFUL) {
+-            if (pa->flags & (PACKET_ALERT_FLAG_STATE_MATCH | PACKET_ALERT_FLAG_STREAM_MATCH)) {
++        } else if (s->action_scope == ACTION_SCOPE_AUTO) {
++            enum SignaturePropertyFlowAction flow_action =
++                    signature_properties[s->type].flow_action;
++            if (flow_action == SIG_PROP_FLOW_ACTION_FLOW) {
+                 pa->flags |= PACKET_ALERT_FLAG_APPLY_ACTION_TO_FLOW;
++            } else if (flow_action == SIG_PROP_FLOW_ACTION_FLOW_IF_STATEFUL) {
++                if (pa->flags & (PACKET_ALERT_FLAG_STATE_MATCH | PACKET_ALERT_FLAG_STREAM_MATCH)) {
++                    pa->flags |= PACKET_ALERT_FLAG_APPLY_ACTION_TO_FLOW;
++                }
+             }
+         }
+ 
+
+
+
+
+@@ -1035,17 +1035,32 @@ void EngineAnalysisRules2(const DetectEngineCtx *de_ctx, const Signature *s)
+         SCJbAppendString(ctx.js, "pass");
+     }
+     SCJbClose(ctx.js);
+-    enum SignaturePropertyFlowAction flow_action = signature_properties[s->type].flow_action;
+-    switch (flow_action) {
+-        case SIG_PROP_FLOW_ACTION_PACKET:
+-            SCJbSetString(ctx.js, "scope", "packet");
+-            break;
+-        case SIG_PROP_FLOW_ACTION_FLOW:
+-            SCJbSetString(ctx.js, "scope", "flow");
+-            break;
+-        case SIG_PROP_FLOW_ACTION_FLOW_IF_STATEFUL:
+-            SCJbSetString(ctx.js, "scope", "flow_if_stateful");
+-            break;
++
++    if (s->action_scope == ACTION_SCOPE_AUTO) {
++        enum SignaturePropertyFlowAction flow_action = signature_properties[s->type].flow_action;
++        switch (flow_action) {
++            case SIG_PROP_FLOW_ACTION_PACKET:
++                SCJbSetString(ctx.js, "scope", "packet");
++                break;
++            case SIG_PROP_FLOW_ACTION_FLOW:
++                SCJbSetString(ctx.js, "scope", "flow");
++                break;
++            case SIG_PROP_FLOW_ACTION_FLOW_IF_STATEFUL:
++                SCJbSetString(ctx.js, "scope", "flow_if_stateful");
++                break;
++        }
++    } else {
++        enum ActionScope as = s->action_scope;
++        switch (as) {
++            case ACTION_SCOPE_PACKET:
++                SCJbSetString(ctx.js, "scope", "packet");
++                break;
++            case ACTION_SCOPE_FLOW:
++                SCJbSetString(ctx.js, "scope", "flow");
++                break;
++            case ACTION_SCOPE_AUTO: /* should be unreachable */
++                break;
++        }
+     }
+     SCJbClose(ctx.js);
+ 
+
+
+
+
+@@ -1268,7 +1268,7 @@ static int SigParseProtoHookApp(Signature *s, const char *proto_hook, const char
+     }
+     s->init_data->hook.sm_list = list;
+ 
+-    SCLogNotice("protocol:%s hook:%s: type:%s alproto:%u hook:%d", p, h,
++    SCLogDebug("protocol:%s hook:%s: type:%s alproto:%u hook:%d", p, h,
+             SignatureHookTypeToString(s->init_data->hook.type), s->init_data->hook.t.app.alproto,
+             s->init_data->hook.t.app.app_progress);
+     return 0;
+@@ -1453,12 +1453,52 @@ static uint8_t ActionStringToFlags(const char *action)
+  *            Signature.
+  * \retval -1 On failure.
+  */
+-static int SigParseAction(Signature *s, const char *action)
++static int SigParseAction(Signature *

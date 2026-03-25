@@ -1,0 +1,96 @@
+@@ -16,12 +16,12 @@ import shlex
+ 
+ from prompt_toolkit.completion import Completion, Completer
+ 
++from . import vault
+ from .params import KeeperParams
+ from .commands.folder import mv_parser
+ from .commands.base import GroupCommand, Command
+ from .commands.connect import ConnectCommand
+ from .commands import commands, enterprise_commands, msp_commands
+-from . import api
+ from .subfolder import try_resolve_path as sf_try_resolve_path
+ 
+ 
+@@ -273,7 +273,7 @@ class CommandCompleter(Completer):
+                                         if r.get('version', 0) not in {2, 3}:
+                                             continue
+                                         if 'display_name' not in r:
+-                                            rec = api.get_record(self.params, uid)
++                                            rec = vault.KeeperRecord.load(self.params, uid)
+                                             r['display_name'] = rec.title or rec.record_uid
+                                         n = r.get('display_name') or ''
+                                         if len(n) > 0:
+
+
+
+
+@@ -12,15 +12,12 @@ import base64
+ import json
+ import logging
+ from urllib.parse import urlparse, urlunparse
+-from typing import Iterator, Tuple, Optional, List, Callable
++from typing import Iterator, Tuple, Optional, List, Callable, Dict, Iterable
+ 
+ from .constants import KEEPER_PUBLIC_HOSTS
+-from . import api, crypto, utils, rest_api
+-from .proto import breachwatch_pb2 as breachwatch_proto, client_pb2 as client_proto
+-from .proto import APIRequest_pb2 as api_request_proto
++from . import api, crypto, utils, rest_api, vault
++from .proto import breachwatch_pb2, client_pb2, APIRequest_pb2
+ from .error import KeeperApiError
+-from .proto.APIRequest_pb2 import SecurityData, SecurityDataRequest, ReusedPasswordsRequest
+-from .record import Record
+ from .params import KeeperParams
+ 
+ 
+@@ -32,66 +29,95 @@ class BreachWatch(object):
+         self.password_token = None
+         self.send_audit_events = False
+ 
++    @staticmethod
++    def extract_password(record):     # type: (vault.KeeperRecord) -> Optional[str]
++        if isinstance(record, vault.PasswordRecord):
++            return record.password
++        if isinstance(record, vault.TypedRecord):
++            password_field = record.get_typed_field('password')
++            if password_field:
++                return password_field.get_default_value(str)
++
++    @staticmethod
++    def extract_url(record):     # type: (vault.KeeperRecord) -> Optional[str]
++        if isinstance(record, vault.PasswordRecord):
++            return record.link
++        if isinstance(record, vault.TypedRecord):
++            url_field = record.get_typed_field('url')
++            if url_field:
++                return url_field.get_default_value(str)
++
+     def scan_password(self, params, password, euid=None):
+-        # type: (KeeperParams, str, Optional[bytes]) -> Optional[breachwatch_proto.HashStatus]
++        # type: (KeeperParams, str, Optional[bytes]) -> Optional[breachwatch_pb2.HashStatus]
+ 
+         bw_hash = utils.breach_watch_hash(password)
+         if not euid:
+             score = utils.password_score(password)
+             if score < 40:
+-                result = breachwatch_proto.HashStatus()
++                result = breachwatch_pb2.HashStatus()
+                 result.hash1 = bw_hash
+                 result.breachDetected = True
+                 return result
+ 
+         self._ensure_init(params)
+-        check = breachwatch_proto.HashCheck()
++        check = breachwatch_pb2.HashCheck()
+         check.hash1 = bw_hash
+         if euid:
+             check.euid = euid
+-        rq = breachwatch_proto.BreachWatchStatusRequest()
++        rq = breachwatch_pb2.BreachWatchStatusRequest()
+         rq.hashCheck.append(check)
+         rs = self._execute_status(rq)
+         return rs.hashStatus[0]
+ 
+-    def scan_passwords(self, params, passwords):  # type: (any, Iterator[str]) -> Iterator[Tuple[str, any]]
+-        results = {

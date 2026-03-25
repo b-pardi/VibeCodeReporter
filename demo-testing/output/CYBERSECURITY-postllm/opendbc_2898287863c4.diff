@@ -1,0 +1,113 @@
+@@ -14,6 +14,7 @@ from opendbc.car.hyundai.hyundaicanfd import hkg_can_fd_checksum
+ from opendbc.car.volkswagen.mqbcan import volkswagen_mqb_meb_checksum, xor_checksum
+ from opendbc.car.tesla.teslacan import tesla_checksum
+ from opendbc.car.body.bodycan import body_checksum
++from opendbc.car.psa.psacan import psa_checksum
+ 
+ 
+ class SignalType:
+@@ -29,6 +30,7 @@ class SignalType:
+   HKG_CAN_FD_CHECKSUM = 9
+   FCA_GIORGIO_CHECKSUM = 10
+   TESLA_CHECKSUM = 11
++  PSA_CHECKSUM = 12
+ 
+ 
+ @dataclass
+@@ -196,6 +198,8 @@ def get_checksum_state(dbc_name: str) -> ChecksumState | None:
+     return ChecksumState(8, 4, 7, 3, False, SignalType.BODY_CHECKSUM, body_checksum)
+   elif dbc_name.startswith("tesla_model3_party"):
+     return ChecksumState(8, -1, 0, -1, True, SignalType.TESLA_CHECKSUM, tesla_checksum, tesla_setup_signal)
++  elif dbc_name.startswith("psa_"):
++    return ChecksumState(4, 4, 7, 3, False, SignalType.PSA_CHECKSUM, psa_checksum)
+   return None
+ 
+ 
+
+
+
+
+@@ -145,6 +145,7 @@ class CarHarness(EnumBase):
+   rivian = BaseCarHarness("Rivian A connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable, Cable.usbc_coupler])
+   tesla_a = BaseCarHarness("Tesla A connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable, Cable.usbc_coupler])
+   tesla_b = BaseCarHarness("Tesla B connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable, Cable.usbc_coupler])
++  psa_a = BaseCarHarness("PSA A connector", parts=[Accessory.harness_box, Cable.long_obdc_cable, Cable.usbc_coupler])
+ 
+ 
+ class Device(EnumBase):
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,41 @@
++from opendbc.can.packer import CANPacker
++from opendbc.car import Bus
++from opendbc.car.lateral import apply_std_steer_angle_limits
++from opendbc.car.interfaces import CarControllerBase
++from opendbc.car.psa.psacan import create_lka_steering
++from opendbc.car.psa.values import CarControllerParams
++
++
++class CarController(CarControllerBase):
++  def __init__(self, dbc_names, CP):
++    super().__init__(dbc_names, CP)
++    self.packer = CANPacker(dbc_names[Bus.main])
++    self.apply_angle_last = 0
++    self.status = 2
++
++  def update(self, CC, CS, now_nanos):
++    can_sends = []
++    actuators = CC.actuators
++
++    # lateral control
++    if self.frame % 5 == 0:
++      apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
++                                                 CS.out.steeringAngleDeg, CC.latActive, CarControllerParams.ANGLE_LIMITS)
++
++      # EPS disengages on steering override, activation sequence 2->3->4 to re-engage
++      # STATUS  -  0: UNAVAILABLE, 1: UNSELECTED, 2: READY, 3: AUTHORIZED, 4: ACTIVE
++      if not CC.latActive:
++        self.status = 2
++      elif not CS.eps_active and not CS.out.steeringPressed:
++        self.status = 2 if self.status == 4 else self.status + 1
++      else:
++        self.status = 4
++
++      can_sends.append(create_lka_steering(self.packer, CC.latActive, apply_angle, self.status))
++
++      self.apply_angle_last = apply_angle
++
++    new_actuators = actuators.as_builder()
++    new_actuators.steeringAngleDeg = self.apply_angle_last
++    self.frame += 1
++    return new_actuators, can_sends
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,73 @@
++from opendbc.car import structs, Bus
++from opendbc.can.parser import CANParser
++from opendbc.car.common.conversions import Conversions as CV
++from opendbc.car.psa.values import DBC, CarControllerParams
++from opendbc.car.interfaces import CarStateBase
++
++GearShifter = structs.CarState.GearShifter
++TransmissionType = structs.CarParams.TransmissionType
++
++
++class CarState(CarStateBase):
++  def update(self, can_parsers) -> structs.CarState:
++    cp = can_parsers[Bus.main]
++    cp_adas = can_parsers[Bus.adas]
++    cp_cam = can_parsers[Bus.cam]
++    ret = structs.CarState()
++
++    # car speed
++    self.parse_wheel_speeds(ret,
++      cp.vl['Dyn4_FRE']['P263_VehV_VPsvValWhlFr

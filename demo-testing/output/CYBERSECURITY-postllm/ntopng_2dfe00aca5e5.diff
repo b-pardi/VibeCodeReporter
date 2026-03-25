@@ -1,0 +1,111 @@
+@@ -41,6 +41,7 @@ import { default as PageSNMPDeviceRules } from "./page-snmp-device-rules.vue";
+ import { default as PageSnmpDevicesInterfacesSimilarity } from "./page-snmp-devices-interfaces-similarity.vue";
+ import { default as PageHostsPortsAnalysis } from "./page-hosts-ports-analysis.vue";
+ import { default as NedgeRepeatersConfig } from "./page-nedge-repeaters-config.vue";
++import { default as PageInactiveHosts } from "./page-inactive-hosts.vue";
+ 
+ // components
+ import { default as AlertInfo } from "./alert-info.vue";
+@@ -99,6 +100,7 @@ let ntopVue = {
+     PageManageConfigurationBackup2: PageManageConfigurationBackup2,
+     PageSNMPDeviceRules: PageSNMPDeviceRules,
+     PageHostsPortsAnalysis: PageHostsPortsAnalysis,
++    PageInactiveHosts: PageInactiveHosts,
+ 
+     PageEditApplications: PageEditApplications,
+ 
+
+
+
+
+@@ -1497,6 +1497,7 @@ extern struct ntopngLuaContext *getUserdata(struct lua_State *vm);
+ #define CUSTOM_FLOW_END_SCRIPT \
+   "scripts/callbacks/checks/flows/custom_flow_end_script.lua"
+ 
++#define OFFLINE_LOCAL_HOSTS_KEY "ntopng.hosts.offline.ifid_%d"
+ /******************************************************************************/
+ 
+ #endif /* _NTOP_DEFINES_H_ */
+
+
+
+
+@@ -272,7 +272,7 @@ void Host::initialize(Mac *_mac, u_int16_t _vlanId,
+   data_delete_requested = 0, stats_reset_requested = 0,
+   name_reset_requested = 0, prefs_loaded = 0;
+   host_services_bitmap = 0, disabled_alerts_tstamp = 0, num_remote_access = 0,
+-  num_incomplete_flows = 0;
++  num_incomplete_flows = 0, deferred_init = 0;
+ 
+   num_resolve_attempts = 0, nextResolveAttempt = 0,
+   num_active_flows_as_client = 0, num_active_flows_as_server = 0,
+@@ -283,8 +283,8 @@ void Host::initialize(Mac *_mac, u_int16_t _vlanId,
+ 
+   last_stats_reset = ntop->getLastStatsReset(); /* assume fresh stats, may be
+                                                    changed by deserialize */
+-  asn = 0, asname = NULL, obs_point = NULL, os = NULL, os_type = os_unknown;
+-  ssdpLocation = NULL, blacklist_name = NULL;
++  as = NULL, asn = 0, asname = NULL, obs_point = NULL, os = NULL, os_type = os_unknown;
++  ssdpLocation = NULL, blacklist_name = NULL, country = NULL;
+ 
+   memset(&names, 0, sizeof(names));
+   memset(view_interface_mac, 0, sizeof(view_interface_mac));
+@@ -331,9 +331,6 @@ void Host::initialize(Mac *_mac, u_int16_t _vlanId,
+                 5 /* StdError: 18.4% */);
+   ndpi_hll_init(&incoming_hosts_tcp_udp_port_with_no_tx_hll,
+                 5 /* StdError: 18.4% */);
+-
+-  deferredInitialization(); /* TODO To be called asynchronously for improving
+-                               performance */
+ }
+ 
+ /* *************************************** */
+@@ -1278,6 +1275,11 @@ void Host::periodic_stats_update(const struct timeval *tv) {
+   Mac *cur_mac = getMac();
+   OSType cur_os_type = os_type, cur_os_from_fingerprint = os_unknown;
+ 
++  if(!deferred_init) {
++    deferred_init = 1;
++    deferredInitialization();
++  }
++
+   checkReloadPrefs();
+   checkNameReset();
+   checkDataReset();
+
+
+
+
+@@ -46,6 +46,7 @@ LocalHost::LocalHost(NetworkInterface *_iface, char *ipAddress,
+ /* *************************************** */
+ 
+ LocalHost::~LocalHost() {
++  addOfflineData();
+   if (initial_ts_point) delete (initial_ts_point);
+   freeLocalHostData();
+ }
+@@ -145,6 +146,60 @@ void LocalHost::initialize() {
+ 
+ /* *************************************** */
+ 
++void LocalHost::deferredInitialization() {
++  removeOfflineData();
++  Host::deferredInitialization();
++}
++
++/* *************************************** */
++
++void LocalHost::addOfflineData() {
++  /* Remove the key from the hash, used to get the offline hosts */
++  if(!ntop->getRedis())
++    return;
++
++  char buf[64], *json_str = NULL;
++  ndpi_serializer host_json; 
++  u_int32_t json_str_len = 0;
++  Mac *cur_mac = getMac();
++  
++  ndpi_init_serializer(&host_json, ndpi_serialization_format_json);
++  ndpi_serialize_string_string(&host_json, "ip", ip.print(buf, sizeof(buf)));
++
++  ndpi_serialize_string_uint64(&host_json, "fi

@@ -1,0 +1,99 @@
+@@ -35,6 +35,37 @@ public class BgpAdvertisement implements Comparable<BgpAdvertisement>, Serializa
+     IBGP_RECEIVED,
+     IBGP_SENT;
+ 
++    /** Returns true if this advertisement is from an ebgp peer. */
++    public boolean isEbgp() {
++      switch (this) {
++        case EBGP_ORIGINATED:
++        case EBGP_RECEIVED:
++        case EBGP_SENT:
++          return true;
++        default:
++          return false;
++      }
++    }
++
++    /**
++     * Returns true if this advertisement is from a device's local view of the route, aka, it has
++     * already been processed/filtered by import policy. These routes are installed directly in the
++     * RIB.
++     */
++    public boolean isReceived() {
++      switch (this) {
++        case EBGP_RECEIVED:
++        case IBGP_RECEIVED:
++          return true;
++        case EBGP_SENT:
++        case IBGP_SENT:
++          return false;
++        default:
++          // include originated.
++          throw new BatfishException("Missing or invalid bgp advertisement type");
++      }
++    }
++
+     private static final Map<String, BgpAdvertisementType> _map = buildMap();
+ 
+     private static Map<String, BgpAdvertisementType> buildMap() {
+
+
+
+
+@@ -42,7 +42,6 @@ import javax.annotation.Nullable;
+ import javax.annotation.ParametersAreNonnullByDefault;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+-import org.batfish.common.BatfishException;
+ import org.batfish.datamodel.AbstractRoute;
+ import org.batfish.datamodel.AbstractRouteDecorator;
+ import org.batfish.datamodel.AnnotatedRoute;
+@@ -1417,6 +1416,112 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+     return transformedOutgoingRoute;
+   }
+ 
++  private void processExternalBgpAdvertisement(
++      BgpAdvertisement advert, Map<Bgpv4Rib, RibDelta.Builder<Bgpv4Route>> ribDeltas) {
++    Ip srcIp = advert.getSrcIp();
++    // TODO: support passive and unnumbered bgp connections
++    Prefix srcPrefix = srcIp.toPrefix();
++    BgpPeerConfig neighbor = _process.getActiveNeighbors().get(srcPrefix);
++    assert neighbor != null; // invariant of being processed
++
++    // Build a route based on the type of this advertisement
++    BgpAdvertisementType type = advert.getType();
++    boolean ebgp = type.isEbgp();
++
++    Bgpv4Rib targetRib = ebgp ? _ebgpv4Rib : _ibgpv4Rib;
++    RoutingProtocol targetProtocol = ebgp ? RoutingProtocol.BGP : RoutingProtocol.IBGP;
++
++    // Route advertisement does not contain its admin distance.
++    int admin = _process.getAdminCost(targetProtocol);
++
++    if (type.isReceived()) {
++      // Since the route is received, it is from a post-import-chain view of the route.
++      // Copy its attributes directly where possible then directly import it into the RIB.
++      Bgpv4Route route =
++          Bgpv4Route.testBuilder()
++              .setAdmin(admin)
++              .setAsPath(advert.getAsPath())
++              .setClusterList(advert.getClusterList())
++              .setCommunities(advert.getCommunities())
++              .setLocalPreference(advert.getLocalPreference())
++              .setMetric(advert.getMed())
++              .setNetwork(advert.getNetwork())
++              .setNextHopIp(advert.getNextHopIp())
++              .setOriginatorIp(advert.getOriginatorIp())
++              .setOriginType(advert.getOriginType())
++              .setProtocol(targetProtocol)
++              .setReceivedFromIp(advert.getSrcIp())
++              // TODO: support external route reflector clients
++              .setReceivedFromRouteReflectorClient(false)
++              .setSrcProtocol(advert.getSrcProtocol())
++              // TODO: possibly support setting tag
++              .setWeight(advert.getWeight())
++              .build();
++      ribDeltas.get(targetRib).from(targetRib.mergeRouteGetDelta(route));
++    } else {
++      // Since the route was logged after sending, it is from a pre-import-chain view of the route.
++      // Override some attributes with local ones, then send it through

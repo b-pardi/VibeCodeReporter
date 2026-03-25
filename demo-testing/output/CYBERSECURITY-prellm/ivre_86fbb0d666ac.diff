@@ -1,0 +1,107 @@
+@@ -51,10 +51,9 @@ from past.builtins import basestring
+ import bson
+ import pymongo
+ 
+-import random
+ from ivre.db import DB, DBActive, DBNmap, DBPassive, DBAgent, DBView, DBFlow, \
+     LockError
+-from ivre import config, passive, utils, xmlnmap
++from ivre import config, passive, utils, xmlnmap, flow
+ from pymongo.errors import BulkWriteError
+ 
+ 
+@@ -4530,6 +4529,11 @@ class MongoDBFlow(MongoDB, DBFlow):
+         MongoDB.__init__(self, host, dbname, **kargs)
+         DBFlow.__init__(self)
+         self.columns = [colname_flows, colname_passive, colname_timescales]
++        self.passive_inserters = {
++            'http': self._http2passive,
++            'dns': self._dns2passive,
++            'ssh': self._ssh2passive
++        }
+ 
+     def start_bulk_insert(self):
+         """
+@@ -4558,13 +4562,15 @@ class MongoDBFlow(MongoDB, DBFlow):
+             key['dst_port'] = rec['dport']
+         return key
+ 
+-    def _get_passive_keys(self, rec):
++    def _get_passive_keys(self, rec, recontype=None):
+         keys = [
+             {'addr_0': rec['src_addr_0'], 'addr_1': rec['src_addr_1']},
+             {'addr_0': rec['dst_addr_0'], 'addr_1': rec['dst_addr_1']}
+         ]
+         for key in keys:
+-            key['recontype'] = 'UNKNOWN'
++            key['recontype'] = (recontype if recontype is not None
++                                else "UNKNOWN")
++            key['schema_version'] = passive.SCHEMA_VERSION
+         return keys
+ 
+     def _add_or_update_dict_in_dict(self, main_dict, main_key, key, value):
+@@ -4581,7 +4587,6 @@ class MongoDBFlow(MongoDB, DBFlow):
+         updatespec = {
+             '$min': {'firstseen': rec['start_time']},
+             '$max': {'lastseen': rec['end_time']},
+-            '$set': {'proto': rec['proto']},
+             '$inc': {
+                 'sdpkts': rec['orig_pkts'],
+                 'dspkts': rec['resp_pkts'],
+@@ -4598,19 +4603,41 @@ class MongoDBFlow(MongoDB, DBFlow):
+                                              'src_ports', rec['sport'])
+ 
+         flow_bulk.find(findspec).upsert().update(updatespec)
++        return [findspec]
++
++    def _any2flow(self, flow_bulk, rec, meta_fields):
++        """
++        Take a parsed *.log line entry and appropriate meta fields
++        in order to add it to flow bulk
++        """
++        findspec = self._get_flow_key(rec)
++        meta_dict = {}
++        for field, key in meta_fields.items():
++            meta_dict[field] = rec[field] if key is None else rec[key]
++        updatespec = {
++            '$min': {'firstseen': rec['start_time']},
++            '$max': {'lastseen': rec['end_time']},
++            '$addToSet': {'meta': meta_dict},  # TODO : should be optionnal
++            '$inc': {'count': 1}
++        }
++
++        self._add_or_update_dict_in_dict(updatespec, '$addToSet',
++                                         'src_ports', rec['sport'])
++
++        flow_bulk.find(findspec).upsert().update(updatespec)
++        return [findspec]
+ 
+     def _conn2passive(self, passive_bulk, rec):
+         """
+         Take a parsed conn.log line entry and add it to passive bulk
+         """
+-
++        added_passive = []
+         # Try to use MongoDBPassive later
+ 
+         updatespec = {
+             '$inc': {'count': 1},
+             '$min': {'firstseen': rec['start_time']},
+             '$max': {'lastseen': rec['end_time']},
+-            '$set': {'schema_version': passive.SCHEMA_VERSION},
+             # '$set': {'sensor': rec['sensor']}
+         }
+ 
+@@ -4621,32 +4648,224 @@ class MongoDBFlow(MongoDB, DBFlow):
+ 
+         for findspec in findspecs:
+             passive_bulk.find(findspec).upsert().update(updatespec)
++            added_passive.append(findspec)
++        return added_passive
+ 
+-    def _conn2timescales(self, timescale_bulk, rec):
+-        findspec = {
+-            'time': self.date_round(rec['start_time'])
++    def _ssh2passive_insert_entries(self, passive_bulk, rec, spec, updatespec,
++                                    is_server):
++        keys = flow

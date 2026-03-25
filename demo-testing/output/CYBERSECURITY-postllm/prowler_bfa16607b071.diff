@@ -1,0 +1,109 @@
+@@ -1,12 +1,38 @@
+ from types import MappingProxyType
+ 
++from api.models import Provider
++from prowler.config.config import get_available_compliance_frameworks
+ from prowler.lib.check.compliance_models import Compliance
+ from prowler.lib.check.models import CheckMetadata
+ 
+-from api.models import Provider
+-
+ PROWLER_COMPLIANCE_OVERVIEW_TEMPLATE = {}
+ PROWLER_CHECKS = {}
++AVAILABLE_COMPLIANCE_FRAMEWORKS = {}
++
++
++def get_compliance_frameworks(provider_type: Provider.ProviderChoices) -> list[str]:
++    """
++    Retrieve and cache the list of available compliance frameworks for a specific cloud provider.
++
++    This function lazily loads and caches the available compliance frameworks (e.g., CIS, MITRE, ISO)
++    for each provider type (AWS, Azure, GCP, etc.) on first access. Subsequent calls for the same
++    provider will return the cached result.
++
++    Args:
++        provider_type (Provider.ProviderChoices): The cloud provider type for which to retrieve
++            available compliance frameworks (e.g., "aws", "azure", "gcp", "m365").
++
++    Returns:
++        list[str]: A list of framework identifiers (e.g., "cis_1.4_aws", "mitre_attack_azure") available
++        for the given provider.
++    """
++    global AVAILABLE_COMPLIANCE_FRAMEWORKS
++    if provider_type not in AVAILABLE_COMPLIANCE_FRAMEWORKS:
++        AVAILABLE_COMPLIANCE_FRAMEWORKS[provider_type] = (
++            get_available_compliance_frameworks(provider_type)
++        )
++
++    return AVAILABLE_COMPLIANCE_FRAMEWORKS[provider_type]
+ 
+ 
+ def get_prowler_provider_checks(provider_type: Provider.ProviderChoices):
+
+
+
+
+@@ -3,16 +3,17 @@ import io
+ import json
+ import os
+ from datetime import datetime, timedelta, timezone
+-from unittest.mock import ANY, Mock, patch
++from unittest.mock import ANY, MagicMock, Mock, patch
+ 
+ import jwt
+ import pytest
+-from botocore.exceptions import NoCredentialsError
++from botocore.exceptions import ClientError, NoCredentialsError
+ from conftest import API_JSON_CONTENT_TYPE, TEST_PASSWORD, TEST_USER
+ from django.conf import settings
+ from django.urls import reverse
+ from rest_framework import status
+ 
++from api.compliance import get_compliance_frameworks
+ from api.models import (
+     ComplianceOverview,
+     Integration,
+@@ -2277,7 +2278,8 @@ class TestScanViewSet:
+         scan.save()
+ 
+         monkeypatch.setattr(
+-            "api.v1.views.env", type("env", (), {"str": lambda self, key: bucket})()
++            "api.v1.views.env",
++            type("env", (), {"str": lambda self, *args, **kwargs: "test-bucket"})(),
+         )
+ 
+         class FakeS3Client:
+@@ -2346,6 +2348,263 @@ class TestScanViewSet:
+         assert content_disposition.startswith('attachment; filename="')
+         assert f'filename="{file_path.name}"' in content_disposition
+ 
++    def test_compliance_invalid_framework(self, authenticated_client, scans_fixture):
++        scan = scans_fixture[0]
++        scan.state = StateChoices.COMPLETED
++        scan.output_location = "dummy"
++        scan.save()
++
++        url = reverse("scan-compliance", kwargs={"pk": scan.id, "name": "invalid"})
++        resp = authenticated_client.get(url)
++        assert resp.status_code == status.HTTP_404_NOT_FOUND
++        assert resp.json()["errors"]["detail"] == "Compliance 'invalid' not found."
++
++    def test_compliance_executing(
++        self, authenticated_client, scans_fixture, monkeypatch
++    ):
++        scan = scans_fixture[0]
++        scan.state = StateChoices.EXECUTING
++        scan.save()
++        task = Task.objects.create(tenant_id=scan.tenant_id)
++        scan.task = task
++        scan.save()
++        dummy = {"id": str(task.id), "state": StateChoices.EXECUTING}
++
++        monkeypatch.setattr(
++            "api.v1.views.TaskSerializer",
++            lambda *args, **kwargs: type("S", (), {"data": dummy}),
++        )
++
++        framework = get_compliance_frameworks(scan.provider.provider)[0]
++        url = reverse("scan-compliance", kwargs={"pk": scan.id, "name": framework})
++   

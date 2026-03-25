@@ -1,0 +1,116 @@
+@@ -188,7 +188,8 @@ public interface IBatfish extends IPluginConsumer {
+       NodesSpecifier notFinalNodeRegex,
+       Set<String> transitNodes,
+       Set<String> notTransitNodes,
+-      boolean useCompression);
++      boolean useCompression,
++      int maxChunkSize);
+ 
+   void writeDataPlane(DataPlane dp, DataPlaneAnswerElement ae);
+ }
+
+
+
+
+@@ -46,6 +46,7 @@ import java.util.SortedMap;
+ import java.util.SortedSet;
+ import java.util.TreeMap;
+ import java.util.TreeSet;
++import java.util.function.BiConsumer;
+ import java.util.function.Consumer;
+ import java.util.function.Supplier;
+ import java.util.regex.Pattern;
+@@ -484,6 +485,14 @@ public class CommonUtil {
+     return s.toString();
+   }
+ 
++  public static <T> void forEachWithIndex(Iterable<T> ts, BiConsumer<Integer, T> biConsumer) {
++    int i = 0;
++    for (T t : ts) {
++      biConsumer.accept(i, t);
++      i++;
++    }
++  }
++
+   public static Path getCanonicalPath(Path path) {
+     try {
+       return Paths.get(path.toFile().getCanonicalPath());
+
+
+
+
+@@ -600,6 +600,10 @@ public final class Settings extends BaseSettings implements BdpSettings, Grammar
+     return nullablePath(_config.getString(BfConsts.ARG_ANSWER_JSON_PATH));
+   }
+ 
++  public int getAvailableThreads() {
++    return Math.min(Runtime.getRuntime().availableProcessors(), getJobs());
++  }
++
+   public TestrigSettings getBaseTestrigSettings() {
+     return _baseTestrigSettings;
+   }
+
+
+
+
+@@ -151,9 +151,7 @@ public class BatfishJobExecutor {
+       return Executors.newSingleThreadExecutor();
+     }
+     // if parallel processing is allowed
+-    int maxConcurrentThreads = Runtime.getRuntime().availableProcessors();
+-    int numConcurrentThreads = Math.min(maxConcurrentThreads, _settings.getJobs());
+-    return Executors.newFixedThreadPool(numConcurrentThreads);
++    return Executors.newFixedThreadPool(_settings.getAvailableThreads());
+   }
+ 
+   <
+
+
+
+
+@@ -12,6 +12,7 @@ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.ImmutableSortedSet;
++import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
+ import io.opentracing.ActiveSpan;
+ import io.opentracing.util.GlobalTracer;
+@@ -4075,7 +4076,8 @@ public class Batfish extends PluginConsumer implements IBatfish {
+       NodesSpecifier notFinalNodeRegex,
+       Set<String> transitNodes,
+       Set<String> notTransitNodes,
+-      boolean useCompression) {
++      boolean useCompression,
++      int maxChunkSize) {
+     Settings settings = getSettings();
+     String tag = getFlowTag(_testrigSettings);
+ 
+@@ -4085,8 +4087,6 @@ public class Batfish extends PluginConsumer implements IBatfish {
+         useCompression ? compressionResult._compressedConfigs : loadConfigurations();
+     DataPlane dataPlane = useCompression ? compressionResult._compressedDataPlane : loadDataPlane();
+ 
+-    Synthesizer dataPlaneSynthesizer = synthesizeDataPlane(configurations, dataPlane);
+-
+     // collect ingress nodes
+     Set<String> ingressNodes = ingressNodeRegex.getMatchingNodes(configurations);
+     Set<String> notIngressNodes = notIngressNodeRegex.getMatchingNodes(configurations);
+@@ -4132,8 +4132,7 @@ public class Batfish extends PluginConsumer implements IBatfish {
+               "Same node %s can not be in both transit and notTransit", illegalTransitNodes));
+     }
+ 
+-    // build query jobs
+-    List<NodJob> jobs =
++    List<Pair<String, String>> originateNodeVrfs =
+         activeIngressNodes
+             .stream()
+             .flatMap(
+@@ -4143,22 +4142,46 @@ public class Batfish extends PluginConsumer implements IBatfish {
+                         .getVrfs()
+                         .keySet()
+                         .stream()
+-                        .map(
+-                            ingressVrf -> {
+-                              Map<String, Set<String>> nodeVrfs =
+-                                  ImmutableMap.of(ingressNode, ImmutableSet.

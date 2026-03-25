@@ -1,0 +1,91 @@
+@@ -577,7 +577,7 @@ public class Main extends Builder {
+ 
+             Account p2pAccount = new ProxyingAccount(nodeId, core, account, accountProxy);
+             VerifyingAccount verifyingAccount = new VerifyingAccount(p2pAccount, core, localStorage);
+-            CachingStorage cachingStorage = new CachingStorage(p2pDht, 1000, 50 * 1024);
++            ContentAddressedStorage cachingStorage = new AuthedCachingStorage(p2pDht, blockRequestAuthoriser, hasher, 1000, 50 * 1024);
+ 
+             ProxyingBatCave p2pBats = new ProxyingBatCave(nodeId, core, batStore, new HttpBatCave(p2pHttpProxy, p2pHttpProxy));
+             UserService peergos = new UserService(cachingStorage, p2pBats, crypto, corePropagator, verifyingAccount, p2pSocial, p2mMutable, storageAdmin,
+
+new file mode 100755
+
+
+
+@@ -0,0 +1,162 @@
++package peergos.shared.storage;
++
++import peergos.server.storage.auth.*;
++import peergos.shared.cbor.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.cid.*;
++import peergos.shared.io.ipfs.multihash.*;
++import peergos.shared.storage.auth.*;
++import peergos.shared.util.*;
++
++import java.util.*;
++import java.util.concurrent.*;
++
++public class AuthedCachingStorage extends DelegatingStorage {
++    private final ContentAddressedStorage target;
++    private final LRUCache<Multihash, byte[]> cache;
++    private final LRUCache<Multihash, CompletableFuture<Optional<CborObject>>> pending;
++    private final LRUCache<Multihash, CompletableFuture<Optional<byte[]>>> pendingRaw;
++    private final BlockRequestAuthoriser authoriser;
++    private final Hasher h;
++    private final Cid ourNodeId;
++    private final int maxValueSize, cacheSize;
++
++    public AuthedCachingStorage(ContentAddressedStorage target,
++                                BlockRequestAuthoriser authoriser,
++                                Hasher h,
++                                int cacheSize,
++                                int maxValueSize) {
++        super(target);
++        this.target = target;
++        this.ourNodeId = target.id().join();
++        this.authoriser = authoriser;
++        this.h = h;
++        this.cache = new LRUCache<>(cacheSize);
++        this.maxValueSize = maxValueSize;
++        this.cacheSize = cacheSize;
++        this.pending = new LRUCache<>(100);
++        this.pendingRaw = new LRUCache<>(100);
++    }
++
++    public Collection<byte[]> getCached() {
++        return cache.values();
++    }
++
++    @Override
++    public CompletableFuture<BlockStoreProperties> blockStoreProperties() {
++        return target.blockStoreProperties();
++    }
++
++    @Override
++    public ContentAddressedStorage directToOrigin() {
++        return new AuthedCachingStorage(target.directToOrigin(), authoriser, h, cacheSize, maxValueSize);
++    }
++
++    @Override
++    public CompletableFuture<List<Cid>> put(PublicKeyHash owner,
++                                            PublicKeyHash writer,
++                                            List<byte[]> signedHashes,
++                                            List<byte[]> blocks,
++                                            TransactionId tid) {
++        return target.put(owner, writer, signedHashes, blocks, tid)
++                .thenApply(res -> {
++                    for (int i=0; i < blocks.size(); i++) {
++                        byte[] block = blocks.get(i);
++                        if (block.length < maxValueSize)
++                            cache.put(res.get(i), block);
++                    }
++                    return res;
++                });
++    }
++
++    private CompletableFuture<byte[]> authoriseGet(Cid key, byte[] block, Optional<BatWithId> bat) {
++        return bat.map(b -> b.bat.generateAuth(key, ourNodeId, 300, S3Request.currentDatetime(), bat.get().id, h)
++                .thenApply(BlockAuth::encode)).orElse(Futures.of(""))
++                .thenCompose(auth -> authoriser.allowRead(key, block, ourNodeId, auth))
++                .thenCompose(allow -> allow ? Futures.of(block) : Futures.errored(n

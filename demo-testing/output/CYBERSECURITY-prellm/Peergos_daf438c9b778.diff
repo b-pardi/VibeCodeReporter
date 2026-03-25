@@ -1,0 +1,93 @@
+@@ -119,6 +119,7 @@ public class Main {
+                     new Command.Arg("mutable-pointers-file", "The filename for the mutable pointers datastore", true, "mutable.sql"),
+                     new Command.Arg("social-sql-file", "The filename for the follow requests datastore", true, "social.sql"),
+                     new Command.Arg("space-requests-sql-file", "The filename for the space requests datastore", true, "space-requests.sql"),
++                    new Command.Arg("space-usage-sql-file", "The filename for the space usage datastore", true, "space-usage.sql"),
+                     new Command.Arg("transactions-sql-file", "The filename for the transactions datastore", false, "transactions.sql"),
+                     new Command.Arg("webroot", "the path to the directory to serve as the web root", false),
+                     new Command.Arg("default-quota", "default maximum storage per user", false, Long.toString(1024L * 1024 * 1024)),
+@@ -472,7 +473,11 @@ public class Main {
+                 userQuotas = new HttpQuotaAdmin(poster);
+             }
+             CoreNode signupFilter = new SignUpFilter(core, userQuotas, nodeId);
+-            RamUsageStore usageStore = RamUsageStore.build(statePath);
++
++            Connection usageDb = usePostgres ?
++                        database :
++                        Sqlite.build(Sqlite.getDbPath(a, "space-usage-sql-file"));
++            UsageStore usageStore = new JdbcUsageStore(usageDb, sqlCommands);
+             Hasher hasher = crypto.hasher;
+             SpaceCheckingKeyFilter.update(usageStore, localPointers, localDht, hasher);
+             SpaceCheckingKeyFilter spaceChecker = new SpaceCheckingKeyFilter(core, localPointers, localDht,
+
+new file mode 100755
+
+
+
+@@ -0,0 +1,361 @@
++package peergos.server.space;
++
++import peergos.server.sql.*;
++import peergos.server.util.Logging;
++import peergos.shared.*;
++import peergos.shared.crypto.hash.*;
++import peergos.shared.io.ipfs.cid.*;
++
++import java.sql.*;
++import java.util.*;
++import java.util.logging.*;
++
++public class JdbcUsageStore implements UsageStore {
++	private static final Logger LOG = Logging.LOG();
++
++    private Connection conn;
++    private volatile boolean isClosed;
++
++    public JdbcUsageStore(Connection conn, SqlSupplier commands) {
++        this.conn = conn;
++        init(commands);
++    }
++
++    private synchronized void init(SqlSupplier commands) {
++        if (isClosed)
++            return;
++
++        try {
++            commands.createTable(commands.createUsageTablesCommand(), conn);
++        } catch (Exception e) {
++            throw new RuntimeException(e);
++        }
++    }
++
++    @Override
++    public void initialized() {
++        // TODO can we remove this method?
++    }
++
++    @Override
++    public void addUserIfAbsent(String username) {
++        try (PreparedStatement insert = conn.prepareStatement("INSERT OR IGNORE INTO users (name) VALUES(?);")) {
++            insert.setString(1, username);
++            insert.executeUpdate();
++        } catch (SQLException sqe) {
++            LOG.log(Level.WARNING, sqe.getMessage(), sqe);
++            throw new RuntimeException(sqe);
++        }
++        int userId = getUserId(username);
++        try (PreparedStatement insert = conn.prepareStatement("INSERT OR IGNORE INTO userusage (user_id, total_bytes, errored) VALUES(?, ?, ?);")) {
++            insert.setInt(1, userId);
++            insert.setLong(2, 0);
++            insert.setBoolean(3, false);
++            insert.executeUpdate();
++        } catch (SQLException sqe) {
++            LOG.log(Level.WARNING, sqe.getMessage(), sqe);
++            throw new RuntimeException(sqe);
++        }
++    }
++
++    private long getSpaceUsed(int userId) {
++        try (PreparedStatement insert = conn.prepareStatement("SELECT total_bytes FROM userusage WHERE user_id = ?;")) {
++            insert.setInt(1, userId);
++            ResultSet resultSet = insert.executeQuery();
++            return resultSet.getLong(1);
++        } catch (SQLExcept

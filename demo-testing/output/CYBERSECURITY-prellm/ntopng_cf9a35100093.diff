@@ -1,0 +1,99 @@
+@@ -42,6 +42,7 @@ class Prefs {
+   char **deferred_interfaces_to_register, *cli;
+   char *http_binding_address1, *http_binding_address2;
+   char *https_binding_address1, *https_binding_address2;
++  bool enable_https_auth;
+   char *lan_interface;
+   Ntop *ntop;
+   bool enable_dns_resolution, sniff_dns_responses,
+@@ -218,6 +219,7 @@ class Prefs {
+   inline char* get_cpu_affinity()                       { return(cpu_affinity);   };
+   inline u_int get_http_port()                          { return(http_port);      };
+   inline u_int get_https_port()                         { return(https_port);     };
++  inline bool  is_https_auth()                          { return(enable_https_auth); };
+   inline char* get_redis_host()                         { return(redis_host);     }
+   inline char* get_redis_password()                     { return(redis_password); }
+   inline u_int get_redis_port()                         { return(redis_port);     };
+
+
+
+
+@@ -127,6 +127,7 @@
+ #define HTTP_SESSION_DURATION     43200
+ #define EXTENDED_HTTP_SESSION_DURATION     604800 // 7d
+ #define CONST_HTTPS_CERT_NAME     "ntopng-cert.pem"
++#define CONST_HTTPS_AUTHCA_FILE   "ntopng-ca.crt"
+ #define CONST_NTOP_INTERFACE      "ntop_interface"
+ 
+ #define PCAP_MAGIC                0xa1b2c3d4
+@@ -518,6 +519,8 @@
+ #define HOST_POOL_SHAPERS_KEY               NTOPNG_PREFS_PREFIX".%u.l7_policies.%s"
+ #define HOST_POOL_DETAILS_KEY               NTOPNG_PREFS_PREFIX".%u.host_pools.details.%u"
+ 
++#define CONST_PREFS_AUTH_HTTPS			   NTOPNG_PREFS_PREFIX".is_https_auth"
++
+ #define CONST_USER_GROUP_ADMIN             "administrator"
+ #define CONST_USER_GROUP_UNPRIVILEGED      "unprivileged"
+ #define CONST_USER_GROUP_CAPTIVE_PORTAL    "captive_portal"
+
+
+
+
+@@ -658,6 +658,48 @@ static void redirect_to_password_change(struct mg_connection *conn,
+     free(referer_enc);
+ }
+ 
++static int ssl_authorize(struct mg_connection *conn,const struct mg_request_info *request_info,char *username,char *group,bool *localuser)
++{
++	long r;
++	X509 *cert=NULL;
++	X509_NAME *subj=NULL;
++	char subject[256],user[256];
++	char referer[256]={'\0'};
++	char key[64],val[64];
++	if((cert=SSL_get_peer_certificate(conn->ssl))) {
++		if((subj=X509_get_subject_name(cert))) {
++			X509_NAME_oneline(subj,subject,sizeof(subject));
++			if((r=SSL_get_verify_result(conn->ssl))==X509_V_OK) {
++				X509_NAME_get_text_by_NID(subj,NID_commonName,user,sizeof(user));
++				ntop->getTrace()->traceEvent(TRACE_NORMAL,"SSL user %s auth (%s)",user,subject);
++				for(int i=0;request_info->http_headers[i].name!=NULL;i++) {
++					if(!strcmp(request_info->http_headers[i].name,"Referer")) {
++	  					snprintf(referer,sizeof(referer),"%s",request_info->http_headers[i].value);
++	  					break;
++					}
++				}
++				if(referer[0]!='/') {
++					char *r=strchr(referer,'/');
++					if(r) memmove(referer,r,strlen(r)+1);
++					else strcpy(referer, "/");
++				}
++				*localuser=true;
++				snprintf(key,sizeof(key),CONST_STR_USER_GROUP,user);
++				strncpy(group,((ntop->getRedis()->get(key,val,sizeof(val))>= 0)?val:NTOP_UNKNOWN_GROUP),NTOP_GROUP_MAXLEN);
++				set_cookie(conn,user,group,*localuser,referer);
++    			strncpy(username, user, NTOP_USERNAME_MAXLEN);
++    			username[NTOP_USERNAME_MAXLEN - 1] = '\0';
++				X509_free(cert);
++				return 1;
++			}
++			else ntop->getTrace()->traceEvent(TRACE_NORMAL,"SSL user unauth: unknow certificate (err %i) %s",r,subject);
++		}
++		X509_free(cert);
++	}
++	else ntop->getTrace()->traceEvent(TRACE_NORMAL,"SSL user unauth: could not get certificate");
++	return 0;
++};
++
+ /* ****************************************** */
+ 
+ // A handler for the /authorize endpoint.
+@@ -667,6 +709,7 @@ static void authorize(struct mg_connection *conn,
+ 		      char *username, char *group, bool *localuser) {
+   char user[32] = { '\0' }, password[32] = { '\0' }, referer[256] = { '\0' };
+ 
++
+   if(!strcmp(request_info->request_method, "POST")) {
+     char post_data[1024];
+     int post_data_len = mg_read(conn, post_data, sizeof(post_data));
+@@ -8

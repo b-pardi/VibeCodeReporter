@@ -1,0 +1,147 @@
+@@ -43,6 +43,7 @@ static inline bool qemu_log_separate(void)
+ #define CPU_LOG_PAGE       (1 << 14)
+ #define LOG_TRACE          (1 << 15)
+ #define CPU_LOG_TB_OP_IND  (1 << 16)
++#define LOG_PANDA          (1 << 17)
+ #define CPU_LOG_TAINT_OPS  (1 << 28)
+ #define CPU_LOG_RR         (1 << 29)
+ #define CPU_LOG_LLVM_IR    (1 << 30)
+
+
+
+
+@@ -231,6 +231,11 @@ def compile(arch, bits, pypanda_headers, install, static_inc):
+     ffi.cdef("typedef uint"+str(bits)+"_t target_ulong;")
+     ffi.cdef("typedef int"+str(bits)+"_t target_long;")
+ 
++    # For direct access to -d logging flags
++    # unsigned is a lie. but it's the way QEMU treats it.
++    ffi.cdef("extern unsigned int qemu_loglevel;")
++    ffi.cdef("extern FILE* qemu_logfile;")
++
+     # PPP Headers
+     # Syscalls - load architecture-specific headers
+     if arch == "i386":
+@@ -269,6 +274,9 @@ def compile(arch, bits, pypanda_headers, install, static_inc):
+ 
+     # get some libc functionality
+     define_clean_header(ffi, include_dir + "/libc_includes.h")
++    
++    # QEMU logging functionality
++    define_clean_header(ffi, include_dir + "/qlog.h")
+ 
+     # Now syscalls2 common:
+     define_clean_header(ffi, include_dir + "/syscalls2_info.h")
+
+
+
+
+@@ -1,4 +1,8 @@
+ // Sometimes it is convenient to call C functions. They go here.
+ // from the C <stdio.h>
+ FILE *fdopen(int, const char *);   
+-int fclose(FILE *);
+\ No newline at end of file
++FILE *fopen(const char *, const char*);   
++int fileno(FILE *);
++int fclose(FILE *);
++extern FILE *stderr;
++extern FILE *stdout;
+\ No newline at end of file
+
+
+
+
+@@ -37,6 +37,7 @@ from .taint import TaintQuery
+ from .panda_expect import Expect
+ from .asyncthread import AsyncThread
+ from .qcows import Qcows
++from .qemu_logging import QEMU_Log_Manager
+ from .arch import ArmArch, Aarch64Arch, MipsArch, Mips64Arch, X86Arch, X86_64Arch
+ 
+ # Might be worth importing and auto-initilizing a PLogReader
+@@ -96,6 +97,7 @@ class Panda():
+         self.ending = False # True during end_analysis
+         self.cdrom = None
+         self.catch_exceptions=catch_exceptions
++        self.qlog = QEMU_Log_Manager(self)
+ 
+         self.serial_unconsumed_data = b''
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,151 @@
++class QEMU_Log_Manager:
++    '''
++    QEMU_Log_Manager
++
++    This class manages the QEMU log. It does so by manipulating two key QEMU
++    variables:
++    - qemu_loglevel: int mask of the log levels to be logged
++    - qemu_logfile: FILE* to the log file
++
++    It provides an equivalent method for setting the log file of the form:
++    - enable("[MEMBER_NAME]")
++    - disable("[MEMBER_NAME]")
++
++    It also accepts a comma separated list of strings:
++    - enable("[MEMBER_NAME],[MEMBER2_NAME],[MEMBER3_NAME]")
++    - enable("[MEMBER_NAME],[MEMBER2_NAME],[MEMBER3_NAME]")
++
++    It also provides methods for setting a file to log to and a method to remove
++    the current log file.
++    
++    The following log types are supported:
++    
++        - TB_OUT_ASM
++        - TB_IN_ASM
++        - TB_OP,
++        - TB_OP_OPT
++        - EXTERNAL
++        - INT
++        - EXEC
++        - PCALL
++        - TB_CPU
++        - RESET
++        - UNIMP
++        - GUEST_ERROR
++        - MMU
++        - TB_NOCHAIN
++        - PAGE
++        - TRACE
++        - TB_OP_IND
++        - PANDA
++        - TAINT_OPS
++        - RR
++        - LLVM_IR
++        - LLVM_ASM
++
++    '''
++    def __init__(self, panda):
++        self.panda = panda
++
++        log_members = {
++            "TB_OUT_ASM": 0,
++            "TB_IN_ASM": 1,
++            "TB_OP": 2,
++            "TB_OP_OPT": 3,
++            "INT": 4,
++            "EXEC": 5,
++            "PCALL": 6,
++            "TB_CPU": 8,
++            "RESET": 9,
++            "UNIMP":10,
++            "GUEST_ERROR":11,
++            "MMU":12,
++            "TB_NOCHAIN":13,
++            "PAGE":14,
++            "TRACE":15,
++            "TB_OP_IND":16,
++            "PANDA":17,
++            "TAINT_OPS":28,
++            "RR":29,
++            "LLVM_IR":30,
++            "LLVM_ASM":

@@ -1,0 +1,202 @@
+@@ -32,6 +32,7 @@ void MCInst_Init(MCInst *inst)
+ 	inst->ac_idx = 0;
+ 	inst->popcode_adjust = 0;
+ 	inst->assembly[0] = '\0';
++	inst->wasm_data.type = WASM_OP_INVALID;
+ }
+ 
+ void MCInst_clear(MCInst *inst)
+
+
+
+
+@@ -108,6 +108,7 @@ struct MCInst {
+ 	uint8_t popcode_adjust;   // Pseudo X86 instruction adjust
+ 	char assembly[8];	// for special instruction, so that we dont need printer
+ 	unsigned char evm_data[32];	// for EVM PUSH operand
++	cs_wasm_op wasm_data;    // for WASM operand
+ };
+ 
+ void MCInst_Init(MCInst *inst);
+
+
+
+
+@@ -66,8 +66,7 @@ void printInt64Bang(SStream *O, int64_t val)
+ 				SStream_concat(O, "#-0x%"PRIx64, (uint64_t)val);
+ 			else
+ 				SStream_concat(O, "#-0x%"PRIx64, (uint64_t)-val);
+-		}
+-		else
++		} else
+ 			SStream_concat(O, "#-%"PRIu64, -val);
+ 	}
+ }
+@@ -94,8 +93,7 @@ void printInt64(SStream *O, int64_t val)
+ 				SStream_concat(O, "-0x%"PRIx64, (uint64_t)val);
+ 			else
+ 				SStream_concat(O, "-0x%"PRIx64, (uint64_t)-val);
+-		}
+-		else
++		} else
+ 			SStream_concat(O, "-%"PRIu64, -val);
+ 	}
+ }
+@@ -105,11 +103,12 @@ void printInt32BangDec(SStream *O, int32_t val)
+ {
+ 	if (val >= 0)
+ 		SStream_concat(O, "#%u", val);
+-	else
++	else {
+ 		if (val == INT_MIN)
+ 			SStream_concat(O, "#-%u", val);
+ 		else
+ 			SStream_concat(O, "#-%u", (uint32_t)-val);
++	}
+ }
+ 
+ void printInt32Bang(SStream *O, int32_t val)
+@@ -125,8 +124,7 @@ void printInt32Bang(SStream *O, int32_t val)
+ 				SStream_concat(O, "#-0x%x", (uint32_t)val);
+ 			else
+ 				SStream_concat(O, "#-0x%x", (uint32_t)-val);
+-		}
+-		else
++		} else
+ 			SStream_concat(O, "#-%u", -val);
+ 	}
+ }
+@@ -144,8 +142,7 @@ void printInt32(SStream *O, int32_t val)
+ 				SStream_concat(O, "-0x%x", (uint32_t)val);
+ 			else
+ 				SStream_concat(O, "-0x%x", (uint32_t)-val);
+-			}
+-		else
++		} else
+ 			SStream_concat(O, "-%u", -val);
+ 	}
+ }
+@@ -165,24 +162,3 @@ void printUInt32(SStream *O, uint32_t val)
+ 	else
+ 		SStream_concat(O, "%u", val);
+ }
+-
+-/*
+-   int main()
+-   {
+-   SStream ss;
+-   int64_t i;
+-
+-   SStream_Init(&ss);
+-
+-   SStream_concat(&ss, "hello ");
+-   SStream_concat(&ss, "%d - 0x%x", 200, 16);
+-
+-   i = 123;
+-   SStream_concat(&ss, " + %ld", i);
+-   SStream_concat(&ss, "%s", "haaaaa");
+-
+-   printf("%s\n", ss.buffer);
+-
+-   return 0;
+-   }
+- */
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1041 @@
++/* Capstone Disassembly Engine */
++/* By Spike, xwings 2019 */
++
++#include <string.h>
++#include <stddef.h> // offsetof macro
++// alternatively #include "../../utils.h" like everyone else
++
++#include "WASMDisassembler.h"
++#include "WASMMapping.h"
++#include "../../cs_priv.h"
++
++static short opcodes[256] = {
++	WASM_INS_UNREACHABLE,
++	WASM_INS_NOP,
++	WASM_INS_BLOCK,
++	WASM_INS_LOOP,
++	WASM_INS_IF,
++	WASM_INS_ELSE,
++	-1,
++	-1,
++	-1,
++	-1,
++	-1,
++	WASM_INS_END,
++	WASM_INS_BR,
++	WASM_INS_BR_IF,
++	WASM_INS_BR_TABLE,
++	WASM_INS_RETURN,
++	WASM_INS_CALL,
++	WASM_INS_CALL_INDIRECT,
++	-1,
++	-1,
++	-1,
++	-1,
++	-1,
++	-1,
++	-1,
++	-1,
++	WASM_INS_DROP,
++	WASM_INS_SELECT,
++	-1,
++	-1,
++	-1,
++	-1,
++	WASM_INS_GET_LOCAL,
++	WASM_INS_SET_LOCAL,
++	WASM_INS_TEE_LOCAL,
++	WASM_INS_GET_GLOBAL,
++	WASM_INS_SET_GLOBAL,
++	-1,
++	-1,
++	-1,
++	WASM_INS_I32_LOAD,
++	WASM_INS_I64_LOAD,
++	WASM_INS_F32_LOAD,
++	WASM_INS_F64_LOAD,
++	WASM_INS_I32_LOAD8_S,
++	WASM_INS_I32_LOAD8_U,
++	WASM_INS_I32_LOAD16_S,
++	WASM_INS_I32_LOAD16_U,
++	WASM_INS_I64_LOAD8_S,
++	WASM_INS_I64_LOAD8_U,
++	WASM_INS_I64_LOAD16_S,
++	WASM_INS_I64_LOAD16_U,
++	WASM_INS_I64_LOAD32_S,
++	WASM_INS_I64_LOAD32_U,
++	WASM_INS_I32_STORE,
++	WASM_INS_I64_STORE,
++	WASM_INS_F32_STORE,
++	WASM_INS_F64_STORE,
++	WASM_INS_I32_STORE8,
++	WASM_INS_I32_STORE16,
++	WASM_INS_I64_STORE8,
++	WASM_INS_I64_STORE16,
++	WASM_INS_I64_STORE32,
++	WASM_INS_CURRENT_MEMORY,
++	WASM_INS_GROW_MEMORY,
++	WASM_INS_I32_CONST,
++	WASM_INS_I64_CONST,
++	WASM_INS_F32_CONST,
++	WASM_INS_F64_CONST,
++	WASM_INS_I32_EQZ,
++	WASM_INS_I32_EQ,
++	WASM_INS_I32_NE,
++	WASM_INS_I32_LT_S,
++	WASM_INS_I32_LT_U,
++	WASM_INS_I32_GT_S,
++	WASM_INS_I32_GT_U,
++	WASM_INS_I32_LE_S,
++	WASM_INS_I32_LE_U,
++	WASM_INS_I32_GE_S,
++	WASM_INS_I32_GE_U,
++	WA

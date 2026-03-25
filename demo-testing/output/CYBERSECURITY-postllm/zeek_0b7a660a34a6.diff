@@ -1,0 +1,101 @@
+@@ -213,7 +213,7 @@ std::string RenderEvent(const std::string& topic, const std::string& name, const
+ } // namespace
+ #endif
+ 
+-Manager::Manager(bool arg_use_real_time) : Backend(nullptr, nullptr) {
++Manager::Manager(bool arg_use_real_time) : Backend(nullptr, nullptr, nullptr) {
+     bound_port = 0;
+     use_real_time = arg_use_real_time;
+     peer_count = 0;
+
+
+
+
+@@ -15,8 +15,9 @@ zeek::plugin::Configuration Plugin::Configure() {
+     // instantiated in zeek-setup.cc. Don't even allow to instantiate
+     // a second one via the plugin mechanism. In the future, this could
+     // be changed so that broker is instantiated on demand only.
+-    auto fail_instantiate = [](std::unique_ptr<cluster::EventSerializer>,
+-                               std::unique_ptr<cluster::LogSerializer>) -> std::unique_ptr<cluster::Backend> {
++    auto fail_instantiate =
++        [](std::unique_ptr<cluster::EventSerializer>, std::unique_ptr<cluster::LogSerializer>,
++           std::unique_ptr<cluster::detail::EventHandlingStrategy>) -> std::unique_ptr<cluster::Backend> {
+         zeek::reporter->FatalError("do not instantiate broker explicitly");
+         return nullptr;
+     };
+
+
+
+
+@@ -13,9 +13,20 @@
+ #include "zeek/cluster/Serializer.h"
+ #include "zeek/iosource/Manager.h"
+ #include "zeek/logging/Manager.h"
++#include "zeek/util.h"
+ 
+ using namespace zeek::cluster;
+ 
++
++bool detail::LocalEventHandlingStrategy::DoHandleRemoteEvent(std::string_view topic, detail::Event e) {
++    zeek::event_mgr.Enqueue(e.Handler(), std::move(e.args), util::detail::SOURCE_BROKER, 0, nullptr, e.timestamp);
++    return true;
++}
++
++void detail::LocalEventHandlingStrategy::DoEnqueueLocalEvent(EventHandlerPtr h, zeek::Args args) {
++    zeek::event_mgr.Enqueue(h, std::move(args));
++}
++
+ std::optional<zeek::Args> detail::check_args(const zeek::FuncValPtr& handler, zeek::ArgsSpan args) {
+     const auto& func_type = handler->GetType<zeek::FuncType>();
+ 
+@@ -58,6 +69,10 @@ std::optional<zeek::Args> detail::check_args(const zeek::FuncValPtr& handler, ze
+     return result;
+ }
+ 
++Backend::Backend(std::unique_ptr<EventSerializer> es, std::unique_ptr<LogSerializer> ls,
++                 std::unique_ptr<detail::EventHandlingStrategy> ehs)
++    : event_serializer(std::move(es)), log_serializer(std::move(ls)), event_handling_strategy(std::move(ehs)) {}
++
+ std::optional<detail::Event> Backend::MakeClusterEvent(FuncValPtr handler, ArgsSpan args, double timestamp) const {
+     auto checked_args = detail::check_args(handler, args);
+     if ( ! checked_args )
+@@ -96,6 +111,10 @@ bool Backend::DoPublishLogWrites(const zeek::logging::detail::LogWriteHeader& he
+     return DoPublishLogWrites(header, log_serializer->Name(), buf);
+ }
+ 
++void Backend::EnqueueEvent(EventHandlerPtr h, zeek::Args args) {
++    event_handling_strategy->EnqueueLocalEvent(h, std::move(args));
++}
++
+ bool Backend::ProcessEventMessage(std::string_view topic, std::string_view format,
+                                   const detail::byte_buffer_span payload) {
+     if ( format != event_serializer->Name() ) {
+@@ -113,11 +132,7 @@ bool Backend::ProcessEventMessage(std::string_view topic, std::string_view forma
+         return false;
+     }
+ 
+-    auto& event = *r;
+-    zeek::event_mgr.Enqueue(event.Handler(), std::move(event.args), util::detail::SOURCE_BROKER, 0, nullptr,
+-                            event.timestamp);
+-
+-    return true;
++    return event_handling_strategy->HandleRemoteEvent(topic, std::move(*r));
+ }
+ 
+ bool Backend::ProcessLogMessage(std::string_view format, detail::byte_buffer_span payload) {
+
+
+
+
+@@ -53,6 +53,75 @@ public:
+     const EventHandlerPtr& Handler() const { return handler; }
+ };
+ 
++/**
++ * Interface for processing cluster::Event instances received
++ * on a given topic.
++ *
++ * An instances is injected into Backend instances to allow
++ * modifying the behavior for received events. For instance,
++ * for backends instantiated for WebSocket clients, events
++ * should not be raised as Zeek events local

@@ -1,0 +1,126 @@
+@@ -204,6 +204,9 @@ void MPI_ASM_DECL s_mpv_mul_d_add(const mp_digit *a, mp_size a_len,
+ void MPI_ASM_DECL s_mpv_mul_d_add_prop(const mp_digit *a,
+                                        mp_size a_len, mp_digit b,
+                                        mp_digit *c);
++void MPI_ASM_DECL s_mpv_mul_d_add_propCT(const mp_digit *a,
++                                         mp_size a_len, mp_digit b,
++                                         mp_digit *c, mp_size c_len);
+ void MPI_ASM_DECL s_mpv_sqr_add_prop(const mp_digit *a,
+                                      mp_size a_len,
+                                      mp_digit *sqrs);
+
+
+
+
+@@ -10,6 +10,8 @@
+ #include "mpi-priv.h"
+ #include "mplogic.h"
+ 
++#include <assert.h>
++
+ #if defined(__arm__) && \
+     ((defined(__thumb__) && !defined(__thumb2__)) || defined(__ARM_ARCH_3__))
+ /* 16-bit thumb or ARM v3 doesn't work inlined assember version */
+@@ -802,15 +804,18 @@ CLEANUP:
+ 
+ /* }}} */
+ 
+-/* {{{ mp_mul(a, b, c) */
++/* {{{ s_mp_mulg(a, b, c) */
+ 
+ /*
+-  mp_mul(a, b, c)
++  s_mp_mulg(a, b, c)
+ 
+-  Compute c = a * b.  All parameters may be identical.
++  Compute c = a * b.  All parameters may be identical. if constantTime is set,
++  then the operations are done in constant time. The original is mostly
++  constant time as long as s_mpv_mul_d_add() is constant time. This is true
++  of the x86 assembler, as well as the current c code.
+  */
+ mp_err
+-mp_mul(const mp_int *a, const mp_int *b, mp_int *c)
++s_mp_mulg(const mp_int *a, const mp_int *b, mp_int *c, int constantTime)
+ {
+     mp_digit *pb;
+     mp_int tmp;
+@@ -846,7 +851,14 @@ mp_mul(const mp_int *a, const mp_int *b, mp_int *c)
+         goto CLEANUP;
+ 
+ #ifdef NSS_USE_COMBA
+-    if ((MP_USED(a) == MP_USED(b)) && IS_POWER_OF_2(MP_USED(b))) {
++    /* comba isn't constant time because it clamps! If we cared
++     * (we needed a constant time version of multiply that was 'faster'
++     * we could easily pass constantTime down to the comba code and
++     * get it to skip the clamp... but here are assembler versions
++     * which add comba to platforms that can't compile the normal
++     * comba's imbedded assembler which would also need to change, so
++     * for now we just skip comba when we are running constant time. */
++    if (!constantTime && (MP_USED(a) == MP_USED(b)) && IS_POWER_OF_2(MP_USED(b))) {
+         if (MP_USED(a) == 4) {
+             s_mp_mul_comba_4(a, b, c);
+             goto CLEANUP;
+@@ -876,13 +888,15 @@ mp_mul(const mp_int *a, const mp_int *b, mp_int *c)
+         mp_digit b_i = *pb++;
+ 
+         /* Inner product:  Digits of a */
+-        if (b_i)
++        if (constantTime || b_i)
+             s_mpv_mul_d_add(MP_DIGITS(a), useda, b_i, MP_DIGITS(c) + ib);
+         else
+             MP_DIGIT(c, ib + useda) = b_i;
+     }
+ 
+-    s_mp_clamp(c);
++    if (!constantTime) {
++        s_mp_clamp(c);
++    }
+ 
+     if (SIGN(a) == SIGN(b) || s_mp_cmp_d(c, 0) == MP_EQ)
+         SIGN(c) = ZPOS;
+@@ -892,10 +906,54 @@ mp_mul(const mp_int *a, const mp_int *b, mp_int *c)
+ CLEANUP:
+     mp_clear(&tmp);
+     return res;
++} /* end smp_mulg() */
++
++/* }}} */
++
++/* {{{ mp_mul(a, b, c) */
++
++/*
++  mp_mul(a, b, c)
++
++  Compute c = a * b.  All parameters may be identical.
++ */
++
++mp_err
++mp_mul(const mp_int *a, const mp_int *b, mp_int *c)
++{
++    return s_mp_mulg(a, b, c, 0);
+ } /* end mp_mul() */
+ 
+ /* }}} */
+ 
++/* {{{ mp_mulCT(a, b, c) */
++
++/*
++  mp_mulCT(a, b, c)
++
++  Compute c = a * b. In constant time. Parameters may not be identical.
++  NOTE: a and b may be modified.
++ */
++
++mp_err
++mp_mulCT(mp_int *a, mp_int *b, mp_int *c, mp_size setSize)
++{
++    mp_err res;
++
++    /* make the multiply values fixed length so multiply
++     * doesn't leak the length. at this point all the
++     * values are blinded, but once we finish we want the
++     * output size to be hidden (so no clamping the out put) */
++    MP_CHECKOK(s_mp_pad(a, setSize));
++    MP_CHECKOK(s_mp_pad(b, setSize));
++    MP_CHECKOK(s_mp_pad(c, 2 * setSize));
++    MP_CHECKOK(s_mp_mulg(a, 

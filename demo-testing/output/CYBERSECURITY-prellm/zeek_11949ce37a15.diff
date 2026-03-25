@@ -1,0 +1,132 @@
+@@ -1170,6 +1170,11 @@ WriterFrontend* Manager::CreateWriter(zeek::EnumVal* id, zeek::EnumVal* writer,
+ 			winfo->interval = f->interval;
+ 			winfo->postprocessor = f->postprocessor;
+ 
++			if ( f->postprocessor )
++				{
++				delete [] winfo->info->post_proc_func;
++				winfo->info->post_proc_func = copy_string(f->postprocessor->Name());
++				}
+ 
+ 			break;
+ 			}
+@@ -1180,6 +1185,18 @@ WriterFrontend* Manager::CreateWriter(zeek::EnumVal* id, zeek::EnumVal* writer,
+ 		const auto& id = zeek::detail::global_scope()->Find("Log::default_rotation_interval");
+ 		assert(id);
+ 		winfo->interval = id->GetVal()->AsInterval();
++
++		if ( winfo->info->post_proc_func &&
++		     strlen(winfo->info->post_proc_func) )
++			{
++			auto func = zeek::id::find_func(winfo->info->post_proc_func);
++
++			if ( func )
++				winfo->postprocessor = func.get();
++			else
++				reporter->Warning("failed log postprocessor function lookup: %s\n",
++				                  winfo->info->post_proc_func);
++			}
+ 		}
+ 
+ 	stream->writers.insert(
+@@ -1466,23 +1483,32 @@ void Manager::InstallRotationTimer(WriterInfo* winfo)
+ 		}
+ 	}
+ 
+-void Manager::Rotate(WriterInfo* winfo)
++std::string Manager::FormatRotationTime(time_t t)
+ 	{
+-	DBG_LOG(DBG_LOGGING, "Rotating %s at %.6f",
+-		winfo->writer->Name(), network_time);
+-
+-	// Build a temporary path for the writer to move the file to.
+ 	struct tm tm;
+ 	char buf[128];
+ 	const char* const date_fmt = "%y-%m-%d_%H.%M.%S";
+-	time_t teatime = (time_t)winfo->open_time;
+-
+-	localtime_r(&teatime, &tm);
++	localtime_r(&t, &tm);
+ 	strftime(buf, sizeof(buf), date_fmt, &tm);
++	return buf;
++	}
++
++std::string Manager::FormatRotationPath(std::string_view path, time_t t)
++	{
++	auto rot_str = FormatRotationTime(t);
++	return fmt("%.*s-%s",
++	           static_cast<int>(path.size()), path.data(), rot_str.data());
++	}
+ 
+-	// Trigger the rotation.
+-	const char* tmp = fmt("%s-%s", winfo->writer->Info().path, buf);
+-	winfo->writer->Rotate(tmp, winfo->open_time, network_time, terminating);
++void Manager::Rotate(WriterInfo* winfo)
++	{
++	DBG_LOG(DBG_LOGGING, "Rotating %s at %.6f",
++		winfo->writer->Name(), network_time);
++
++	// Build a temporary path for the writer to move the file to.
++	auto tmp = FormatRotationPath(winfo->writer->Info().path,
++	                              (time_t)winfo->open_time);
++	winfo->writer->Rotate(tmp.data(), winfo->open_time, network_time, terminating);
+ 
+ 	++rotations_pending;
+ 	}
+
+
+
+
+@@ -4,6 +4,9 @@
+ 
+ #pragma once
+ 
++#include <ctime>
++#include <string_view>
++
+ #include "../Val.h"
+ #include "../Tag.h"
+ #include "../EventHandler.h"
+@@ -26,6 +29,19 @@ class RotationFinishedMessage;
+  */
+ class Manager : public plugin::ComponentManager<Tag, Component> {
+ public:
++
++	/**
++	 * Returns a formatted string representing the given time.  This
++	 * string is used in the log file rotation process.
++	 */
++	static std::string FormatRotationTime(time_t t);
++
++	/**
++	 * Returns a formatted string representing the file rotation path.  This
++	 * string is used in the log file rotation process.
++	 */
++	static std::string FormatRotationPath(std::string_view path, time_t t);
++
+ 	/**
+ 	 * Constructor.
+ 	 */
+
+
+
+
+@@ -80,7 +80,9 @@ broker::data WriterBackend::WriterInfo::ToBroker() const
+ 		t.insert(std::make_pair(key, value));
+ 		}
+ 
+-	return broker::vector({path, rotation_base, rotation_interval, network_time, std::move(t)});
++	auto bppf = post_proc_func ? post_proc_func : "";
++
++	return broker::vector({path, rotation_base, rotation_interval, network_time, std::move(t), bppf});
+ 	}
+ 
+ bool WriterBackend::WriterInfo::FromBroker(broker::data d)
+@@ -94,11 +96,13 @@ bool WriterBackend::WriterInfo::FromBroker(broker::data d)
+ 	auto brotation_interval = caf::get_if<double>(&v[2]);
+ 	auto bnetwork_time = caf::get_if<double>(&v[3]);
+ 	auto bconfig = caf::get_if<broker::table>(&v[4]);
++	auto bppf = caf::get_if<std::string>(&v[5]);
+ 
+-	if ( ! (bpath && brotation_base && brotation_interval && bnetwork_time && bconfig) )
++	if ( ! (bpath && brotation_base && brotat

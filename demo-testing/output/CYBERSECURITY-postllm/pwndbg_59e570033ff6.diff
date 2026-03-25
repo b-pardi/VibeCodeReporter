@@ -1,0 +1,116 @@
+@@ -5,6 +5,8 @@ standardized interface to registers like "sp" and "pc".
+ 
+ from __future__ import annotations
+ 
++import itertools
++from collections import defaultdict
+ from dataclasses import dataclass
+ from typing import Dict
+ from typing import Iterator
+@@ -14,13 +16,14 @@ from typing import Set
+ from typing import Tuple
+ from typing import Union
+ 
++import pwndbg.lib.disasm.helpers as bit_math
+ from pwndbg.lib.arch import PWNDBG_SUPPORTED_ARCHITECTURES_TYPE
+ 
+ BitFlags = OrderedDict[str, Union[int, Tuple[int, int]]]
+ 
+ 
+ @dataclass
+-class EmulatedRegister:
++class UnicornRegisterWrite:
+     """
+     Represent a register to write to the Unicorn emulator.
+     """
+@@ -29,6 +32,18 @@ class EmulatedRegister:
+     force_write: bool
+ 
+ 
++@dataclass
++class Reg:
++    name: str
++    size: int | None = None
++    """Register width in bytes. None if the register size is arch.ptrsize"""
++    offset: int = 0
++    """Relevant for subregisters - the offset of this register in the main register"""
++    zero_extend_writes: bool = False
++    """Upon writing a value to this subregister, are the higher bits of the full register zeroed out?"""
++    subregisters: tuple[Reg, ...] = ()
++
++
+ class RegisterSet:
+     #: Program counter register
+     pc: str
+@@ -63,49 +78,84 @@ class RegisterSet:
+     #: All valid registers
+     all: Set[str]
+ 
++    #: Reg objects containing information on each register
++    reg_definitions: Dict[str, Reg]
++
++    #: Map of register name to the full register it resides in. Example mapping: "eax" -> Reg("rax")
++    full_register_lookup: Dict[str, Reg]
++
+     def __init__(
+         self,
+-        pc: str = "pc",
+-        stack: str = "sp",
+-        frame: str | None = None,
+-        retaddr: Tuple[str, ...] = (),
++        pc: Reg = Reg("pc"),
++        stack: Reg = Reg("sp"),
++        frame: Reg | None = None,
++        retaddr: Tuple[Reg, ...] = (),
+         flags: Dict[str, BitFlags] = {},
+         extra_flags: Dict[str, BitFlags] = {},
+-        gpr: Tuple[str, ...] = (),
++        gpr: Tuple[Reg, ...] = (),
+         misc: Tuple[str, ...] = (),
+         args: Tuple[str, ...] = (),
+         retval: str | None = None,
+     ) -> None:
+-        self.pc = pc
+-        self.stack = stack
+-        self.frame = frame
+-        self.retaddr = retaddr
++        self.pc = pc.name
++        self.stack = stack.name
++        self.frame = frame.name if frame else None
++        self.retaddr = tuple(x.name for x in retaddr)
+         self.flags = flags
+         self.extra_flags = extra_flags
+-        self.gpr = gpr
++        self.gpr = tuple(x.name for x in gpr)
+         self.misc = misc
+         self.args = args
+         self.retval = retval
+ 
++        all_subregisters: List[str] = []
++
++        self.reg_definitions = {}
++        self.full_register_lookup = {}
++        for reg in itertools.chain(gpr, (stack, frame, pc), retaddr):
++            if reg:
++                self.reg_definitions[reg.name] = reg
++                self.full_register_lookup[reg.name] = reg
++                for subregister in reg.subregisters:
++                    self.reg_definitions[subregister.name] = subregister
++                    self.full_register_lookup[subregister.name] = reg
++                    all_subregisters.append(subregister.name)
++
+         # In 'common', we don't want to lose the ordering of:
+         self.common = []
+-        for reg in gpr + (frame, stack, pc) + tuple(flags):
+-            if reg and reg not in self.common:
+-                self.common.append(reg)
++        for regname in itertools.chain(
++            self.gpr, (self.frame, self.stack, self.pc), tuple(self.flags)
++        ):
++            if regname and regname not in self.common:
++                self.common.append(regname)
+ 
+         # The specific order of this list is very important:
+         # Due to the behavior of Arm in the Unicorn engine,
+         # we must write the flags register after PC, and the stack pointer after the flags register.
+         # Otherwise, the values will be clo

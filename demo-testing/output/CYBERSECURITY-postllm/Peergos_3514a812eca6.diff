@@ -1,0 +1,75 @@
+@@ -32,6 +32,7 @@ public class AggregatedMetrics {
+     public static final Counter STORAGE_TRANSACTION_START  = build("storage_transaction_start", "Total DHT transaction starts.");
+     public static final Counter STORAGE_TRANSACTION_CLOSE  = build("storage_transaction_close", "Total DHT transaction closes.");
+     public static final Counter STORAGE_CHAMP_GET  = build("storage_champ_get", "Total champ gets");
++    public static final Counter STORAGE_LINK_GET  = build("storage_link_get", "Total link gets");
+     public static final Counter STORAGE_IPNS_GET  = build("storage_ipns_get", "Total ipns gets");
+     public static final Histogram STORAGE_CHAMP_GET_DURATION = Histogram.build()
+             .labelNames("duration")
+@@ -40,6 +41,13 @@ public class AggregatedMetrics {
+             .exponentialBuckets(0.01, 2, 16)
+             .register();
+ 
++    public static final Histogram STORAGE_LINK_GET_DURATION = Histogram.build()
++            .labelNames("duration")
++            .name("link_get_duration")
++            .help("Time to respond to a link.get call")
++            .exponentialBuckets(0.01, 2, 16)
++            .register();
++
+     public static final Counter MUTABLE_POINTERS_SET  = build("mutable_pointers_set", "Total mutable-pointers set calls.");
+     public static final Counter MUTABLE_POINTERS_GET  = build("mutable_pointers_get", "Total mutable-pointers get calls.");
+ 
+
+
+
+
+@@ -525,15 +525,17 @@ public class Main extends Builder {
+ 
+             TransactionStore transactions = buildTransactionStore(a, dbConnectionPool);
+ 
+-            DeletableContentAddressedStorage localStorage = buildLocalStorage(a, meta, transactions, blockAuth,
++            DeletableContentAddressedStorage localStorageForLinks = buildLocalStorage(a, meta, transactions, blockAuth,
+                     ids, crypto.hasher);
+             JdbcIpnsAndSocial rawPointers = buildRawPointers(a,
+                     getDBConnector(a, "mutable-pointers-file", dbConnectionPool));
+ 
+-            List<Cid> nodeIds = localStorage.ids().get();
+ 
+-            MutablePointers localPointers = UserRepository.build(localStorage, rawPointers);
++            MutablePointers localPointers = UserRepository.build(localStorageForLinks, rawPointers);
+             MutablePointersProxy proxingMutable = new HttpMutablePointers(p2pHttpProxy, pkiServerNodeId);
++            DeletableContentAddressedStorage localStorage = new SecretLinkStorage(localStorageForLinks, localPointers, new RamLinkRetrievalCounter(), hasher);
++
++            List<Cid> nodeIds = localStorage.ids().get();
+ 
+             Supplier<Connection> usageDb = getDBConnector(a, "space-usage-sql-file", dbConnectionPool);
+             UsageStore usageStore = new JdbcUsageStore(usageDb, sqlCommands);
+
+
+
+
+@@ -15,6 +15,7 @@ import peergos.shared.io.ipfs.api.*;
+ import peergos.shared.storage.*;
+ import com.sun.net.httpserver.*;
+ import peergos.shared.storage.auth.*;
++import peergos.shared.user.fs.*;
+ import peergos.shared.util.*;
+ 
+ import static peergos.shared.storage.ContentAddressedStorage.HTTP.*;
+@@ -138,6 +139,21 @@ public class StorageHandler implements HttpHandler {
+                     }
+                     break;
+                 }
++                case LINK_GET: {
++                    AggregatedMetrics.STORAGE_LINK_GET.inc();
++                    Histogram.Timer timer = AggregatedMetrics.STORAGE_LINK_GET_DURATION.labels("duration").startTimer();
++                    PublicKeyHash ownerHash = PublicKeyHash.fromString(last.apply("owner"));
++                    long label = Long.parseLong(last.apply("label"));
++                    SecretLink lookup = new SecretLink(ownerHash, label);
++                    try {
++                        dht.getSecretLink(lookup).thenAccept(link -> {
++                            replyBytes(httpExchange, link.payload.serialize(), Optional.empty());
++                        }).exceptionally(Futures::logAndThrow).get();
++                    } finally {
++                        timer.observeDu

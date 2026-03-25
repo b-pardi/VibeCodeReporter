@@ -1,0 +1,149 @@
+@@ -1,4 +1,6 @@
+-﻿#include <r_core.h>
++/* radare - LGPL - Copyright 2019 - GustavoLCR */
++
++#include <r_core.h>
+ #include <TlHelp32.h>
+ #include <windows_heap.h>
+ #include "..\..\debug\p\native\maps\windows_maps.h"
+@@ -43,11 +45,11 @@
+ *		Maybe instead of using hardcoded structs we can get the offsets from ntdll.pdb
+ */
+ 
+-#define PDI_MODULES				0x01
+-#define PDI_HEAPS				0x04
+-#define PDI_HEAP_TAGS			0x08
+-#define PDI_HEAP_BLOCKS			0x10
+-#define PDI_HEAP_ENTRIES_EX		0x200
++#define PDI_MODULES         0x01
++#define PDI_HEAPS           0x04
++#define PDI_HEAP_TAGS       0x08
++#define PDI_HEAP_BLOCKS     0x10
++#define PDI_HEAP_ENTRIES_EX 0x200
+ 
+ #define CHECK_INFO(heapInfo)\
+ 	if (!heapInfo) {\
+@@ -60,14 +62,46 @@
+ 	}
+ 
+ #define UPDATE_FLAGS(hb, flags)\
+-	if ((flags & 0xf1) || (flags & 0x0200)) {\
++	if (((flags) & 0xf1) || ((flags) & 0x0200)) {\
+ 		hb->dwFlags = LF32_FIXED;\
+-	} else if ((flags & 0x20)) {\
++	} else if ((flags) & 0x20) {\
+ 		hb->dwFlags = LF32_MOVEABLE;\
+-	} else if ((flags & 0x0100)) {\
++	} else if ((flags) & 0x0100) {\
+ 		hb->dwFlags = LF32_FREE;\
+ 	}\
+-	hb->dwFlags |= (flags >> SHIFT) << SHIFT;\
++	hb->dwFlags |= ((flags) >> SHIFT) << SHIFT;
++
++static char *get_type(WPARAM flags) {
++	char *state = "";
++	switch (flags & 0xFFFF) {
++	case LF32_FIXED:
++		state = "(FIXED)";
++		break;
++	case LF32_FREE:
++		state = "(FREE)";
++		break;
++	case LF32_MOVEABLE:
++		state = "(MOVEABLE)";
++		break;
++	}
++	char *heaptype = "";
++	if (flags & SEGMENT_HEAP_BLOCK) {
++		heaptype = "Segment";
++	} else if (flags & NT_BLOCK) {
++		heaptype =  "NT";
++	}
++	char *type = "";
++	if (flags & LFH_BLOCK) {
++		type = "/LFH";
++	} else if (flags & LARGE_BLOCK) {
++		type = "/LARGE";
++	} else if (flags & BACKEND_BLOCK) {
++		type = "/BACKEND";
++	} else if (flags & VS_BLOCK) {
++		type = "/VS";
++	}
++	return r_str_newf ("%s %s%s", state, heaptype, type);
++}
+ 
+ static bool init_func() {
+ 	HANDLE ntdll = LoadLibrary (TEXT ("ntdll.dll"));
+@@ -175,7 +209,12 @@ static bool GetNextHeapBlock(PDEBUG_HEAP_INFORMATION heapInfo, PHeapBlock hb) {
+ 		hb->index++;
+ 	}
+ 
+-	WPARAM flags = block[index].flags;
++	WPARAM flags;
++	if (block[index].extra & EXTRA_FLAG) {
++		flags = block[index].flags;
++	} else {
++		flags = (USHORT)block[index].flags;
++	}
+ 	UPDATE_FLAGS (hb, flags);
+ 
+ 	return true;
+@@ -191,26 +230,66 @@ static void free_extra_info(PDEBUG_HEAP_INFORMATION heap) {
+ 	}
+ }
+ 
+-static bool DecodeHeapEntry(PHEAP heap, PHEAP_ENTRY entry) {
+-#if defined(_M_X64)
+-	(WPARAM)entry += sizeof (PVOID);
+-#endif
++static WPARAM GetNtDllOffset(RDebug *dbg) {
++	r_return_val_if_fail (dbg, 0);
++	RList *map_list = r_w32_dbg_maps (dbg);
++	RListIter *iter;
++	RDebugMap *map;
++	WPARAM ntdllOffset = 0;
++	// Get ntdll .data location
++	r_list_foreach (map_list, iter, map) {
++		if (strstr (map->name, "ntdll.dll | .data")) {
++			ntdllOffset = map->addr;
++			break;
++		}
++	}
++	r_list_free (map_list);
++	return ntdllOffset;
++}
++
++static WPARAM GetLFHKey(RDebug *dbg, HANDLE h_proc, bool segment) {
++	r_return_val_if_fail (dbg, 0);
++	WPARAM lfhKey = 0;
++	WPARAM lfhKeyLocation;
++	WPARAM ntdllOffset = GetNtDllOffset (dbg);
++
++	if (ntdllOffset) {
++		if (segment) {
++			WPARAM RtlpHpHeapGlobalsOffset = ntdllOffset + 0x44A0; // ntdll!RtlpHpHeapGlobals
++			lfhKeyLocation = RtlpHpHeapGlobalsOffset + sizeof (WPARAM);
++		} else {
++			lfhKeyLocation = ntdllOffset + 0x7508; // ntdll!RtlpLFHKey
++		}
++		if (!ReadProcessMemory (h_proc, (PVOID)lfhKeyLocation, &lfhKey, sizeof (WPARAM), NULL)) {
++			r_sys_perror ("ReadProcessMemory");
++			eprintf ("LFH key not found.\n");
++		}
++	}
++	return lfhKey;
++}
++
++static bool DecodeHeapEntry(RDebug *dbg, PHEAP heap, PHEAP_ENTRY entry) {
++	r_return_val_if_fail (heap && entry, false);
++	if (dbg->bits == R_SYS_BITS_64) {
++		(WPARAM)entry += dbg->bits;
++	}
+ 	if (heap->EncodeFlagMask && (*(UINT32 *)entry & heap->EncodeFlagMask)) {
+-#if defined(_M_X64)
+-		(WPARAM)heap += sizeof (PVOID);
+-#endif
++		if (dbg->bits == R_SYS_BITS_64) {
++			(WPARAM)heap += dbg->bits;
++		}
+ 		*(WPARAM *)entr

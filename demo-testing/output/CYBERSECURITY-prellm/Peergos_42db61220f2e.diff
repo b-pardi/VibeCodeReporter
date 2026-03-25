@@ -1,0 +1,82 @@
+@@ -650,6 +650,32 @@ public abstract class UserTests {
+         Assert.assertTrue("Correct used space", totalSpaceUsed > 10*1024*1024);
+     }
+ 
++    @Test
++    public void fileSeek() throws Exception {
++        String username = generateUsername();
++        String password = "test01";
++        UserContext context = PeergosNetworkUtils.ensureSignedUp(username, password, network, crypto);
++        FileWrapper userRoot = context.getUserRoot().get();
++
++        String filename = "mediumfile.bin";
++
++        int MB = 1024*1024;
++        byte[] data = new byte[15 * MB];
++        random.nextBytes(data);
++        uploadFileSection(userRoot, filename, new AsyncReader.ArrayBacked(data), 0, data.length, context.network,
++                context.crypto.random, hasher, l -> {}).join();
++        byte[] buf = new byte[2 * MB];
++
++        for (int offset: Arrays.asList(10, 4*MB, 6*MB, 11*MB)) {
++            AsyncReader reader = context.getByPath(Paths.get(username, filename)).join()
++                    .get().getInputStream(network, crypto.random, x -> { }).join();
++            AsyncReader seeked = reader.seek(offset).join();
++            seeked.readIntoArray(buf, 0, buf.length).join();
++            if (! Arrays.equals(buf, Arrays.copyOfRange(data, offset, offset + buf.length)))
++                throw new IllegalStateException("Seeked data incorrect! Offset: " + offset);
++        }
++    }
++
+     @Test
+     public void writeTiming() throws Exception {
+         String username = generateUsername();
+
+
+
+
+@@ -51,30 +51,47 @@ public class LazyInputStreamCombiner implements AsyncReader {
+     }
+ 
+     public CompletableFuture<Boolean> getNextStream(int len) {
+-        if (this.nextChunkPointer != null) {
+-            AbsoluteCapability nextCap = this.nextChunkPointer;
+-            return network.getMetadata(nextCap).thenCompose(meta -> {
+-                if (!meta.isPresent()) {
+-                    CompletableFuture<Boolean> err = new CompletableFuture<>();
+-                    err.completeExceptionally(new EOFException());
+-                    return err;
+-                }
+-                CryptreeNode access = meta.get();
+-                if (access.isDirectory())
+-                    throw new IllegalStateException("File linked to a directory for its next chunk!");
+-                FileRetriever nextRet = access.retriever(baseKey);
+-                AbsoluteCapability newNextChunkPointer = nextCap.withMapKey(access.getNextChunkLocation(baseKey));
+-                return nextRet.getChunk(network, random, 0, len, nextCap, access.committedHash(), monitor)
+-                        .thenApply(x -> {
+-                            byte[] nextData = x.get().chunk.data();
+-                            updateState(0,globalIndex + Chunk.MAX_SIZE, nextData, newNextChunkPointer);
+-                            return true;
+-                        });
+-            });
++        return getSubsequentMetadata(this.nextChunkPointer, 0)
++                .thenCompose(access -> getChunk(access, len))
++                .thenApply(p -> {
++                    updateState(0,globalIndex + Chunk.MAX_SIZE, p.left, p.right);
++                    return true;
++                });
++    }
++
++    private CompletableFuture<Pair<byte[], AbsoluteCapability>> getChunk(CryptreeNode access, int truncateTo) {
++        if (access.isDirectory())
++                throw new IllegalStateException("File linked to a directory for its next chunk!");
++        FileRetriever nextRet = access.retriever(baseKey);
++        AbsoluteCapability newNextChunkPointer = nextChunkPointer.withMapKey(access.getNextChunkLocation(baseKey));
++        return nextRet.getChunk(network, random, 0, truncateTo, nextChunkPointer, access.committedHash(), monitor)
++                .thenApply(x -> {
++                    byte[] nextData = x.get().chunk.data();
++                    return new Pair<>(nextData, newNextChunkPointer);
++                });
++    }
++
++    private CompletableFuture<CryptreeNode> getSubsequentMetadata

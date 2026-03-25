@@ -1,0 +1,110 @@
+@@ -2179,6 +2179,9 @@ void *MACH0_(mach0_free)(struct MACH0_(obj_t) *mo) {
+ 	free (mo->compiler);
+ 	r_list_free (mo->symbols_cache);
+ 	r_list_free (mo->sections_cache);
++	if (mo->imports_loaded) {
++		r_pvector_fini (&mo->imports_cache);
++	}
+ 	if (mo->chained_starts) {
+ 		for (i = 0; i < mo->nsegs && i < mo->segs_count; i++) {
+ 			if (mo->chained_starts[i]) {
+@@ -2593,7 +2596,7 @@ static bool parse_import_stub(struct MACH0_(obj_t) *bin, struct symbol_t *symbol
+ 	return false;
+ }
+ 
+-static int inSymtab(HtPP *hash, const char *name, ut64 addr) {
++static int hash_find_or_insert(HtPP *hash, const char *name, ut64 addr) {
+ 	bool found = false;
+ 	char *key = r_str_newf ("%"PFMT64x".%s", addr, name);
+ 	ht_pp_find (hash, key, &found);
+@@ -2827,7 +2830,7 @@ const RList *MACH0_(get_symbols_list)(struct MACH0_(obj_t) *bin) {
+ 		RListIter *it;
+ 		RBinSymbol *s;
+ 		r_list_foreach (list, it, s) {
+-			inSymtab (hash, s->name, s->vaddr);
++			hash_find_or_insert (hash, s->name, s->vaddr);
+ 		}
+ 	}
+ 
+@@ -2925,7 +2928,7 @@ const RList *MACH0_(get_symbols_list)(struct MACH0_(obj_t) *bin) {
+ 			} else {
+ 				sym->name = r_str_newf ("unk%u", (ut32)i);
+ 			}
+-			if (!inSymtab (hash, sym->name, sym->vaddr)) {
++			if (!hash_find_or_insert (hash, sym->name, sym->vaddr)) {
+ 				r_list_append (list, sym);
+ 			} else {
+ 				r_bin_symbol_free (sym);
+@@ -2976,7 +2979,7 @@ const RList *MACH0_(get_symbols_list)(struct MACH0_(obj_t) *bin) {
+ 			char *sym_name = get_name (bin, st->n_strx, false);
+ 			if (sym_name) {
+ 				sym->name = sym_name;
+-				if (inSymtab (hash, sym->name, sym->vaddr)) {
++				if (hash_find_or_insert (hash, sym->name, sym->vaddr)) {
+ 					r_bin_symbol_free (sym);
+ 					continue;
+ 				}
+@@ -3009,7 +3012,7 @@ static void assign_export_symbol_t(struct MACH0_(obj_t) *bin, const char *name,
+ 	if (j < sym_ctx->symbols_count) {
+ 		sym_ctx->symbols[j].offset = offset;
+ 		sym_ctx->symbols[j].addr = offset_to_vaddr (bin, offset);
+-		if (inSymtab (sym_ctx->hash, name, sym_ctx->symbols[j].addr)) {
++		if (hash_find_or_insert (sym_ctx->hash, name, sym_ctx->symbols[j].addr)) {
+ 			return;
+ 		}
+ 		sym_ctx->symbols[j].size = 0;
+@@ -3126,7 +3129,7 @@ const struct symbol_t *MACH0_(get_symbols)(struct MACH0_(obj_t) *bin) {
+ 						bin->main_addr = symbols[j].addr;
+ 					}
+ 				}
+-				if (inSymtab (hash, symbols[j].name, symbols[j].addr)) {
++				if (hash_find_or_insert (hash, symbols[j].name, symbols[j].addr)) {
+ 					free (symbols[j].name);
+ 					symbols[j].name = NULL;
+ 					j--;
+@@ -3169,7 +3172,7 @@ const struct symbol_t *MACH0_(get_symbols)(struct MACH0_(obj_t) *bin) {
+ 					symbols[j].name = r_str_newf ("entry%d", i);
+ 				}
+ 				symbols[j].last = 0;
+-				if (inSymtab (hash, symbols[j].name, symbols[j].addr)) {
++				if (hash_find_or_insert (hash, symbols[j].name, symbols[j].addr)) {
+ 					R_FREE (symbols[j].name);
+ 				} else {
+ 					j++;
+@@ -3263,10 +3266,45 @@ static int parse_import_ptr(struct MACH0_(obj_t) *bin, struct reloc_t *reloc, in
+ 	return false;
+ }
+ 
+-struct import_t *MACH0_(get_imports)(struct MACH0_(obj_t) *bin) {
++static RBinImport *import_from_name(RBin *rbin, const char *orig_name) {
++	RBinImport *ptr = R_NEW0 (RBinImport);
++	if (!ptr) {
++		return NULL;
++	}
++
++	char *name = (char*) orig_name;
++	const char *_objc_class = "_OBJC_CLASS_$";
++	const char *_objc_metaclass = "_OBJC_METACLASS_$";
++	const char * type = "FUNC";
++
++	if (r_str_startswith (name, _objc_class)) {
++		name += strlen (_objc_class);
++		type = "OBJC_CLASS";
++	} else if (r_str_startswith (name, _objc_metaclass)) {
++		name += strlen (_objc_metaclass);
++		type = "OBJC_METACLASS";
++	}
++
++	// Remove the extra underscore that every import seems to have in Mach-O.
++	if (*name == '_') {
++		name++;
++	}
++	ptr->name = r_str_ndup (name, R_BIN_MACH0_STRING_LENGTH - 1);
++	ptr->bind = "NONE";
++	ptr->type = r_str_constpool_get (&rbin->constpool, type);
++	return ptr;
++}
++
++const RPVector *MACH0_(load_imports)(RBinFile *bf, struct MACH0_(obj_t) *bin) {
+ 	r_return_val_if_fail (bin, NULL);
++	if (

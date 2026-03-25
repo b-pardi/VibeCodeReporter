@@ -1,0 +1,140 @@
+@@ -2472,7 +2472,7 @@ class VivWorkspace(e_mem.MemoryObject, viv_base.VivWorkspaceCore):
+         if fmtname is None:
+             fmtname = viv_parsers.guessFormatFilename(filename)
+ 
+-        if fmtname == 'viv':
++        if fmtname in ('viv', 'mpviv'):
+             self.loadWorkspace(filename)
+             return self.normFileName(filename)
+ 
+
+
+
+
+@@ -51,6 +51,9 @@ def guessFormat(bytes):
+     if bytes.startswith('VIV'):
+         return 'viv'
+ 
++    if b'MSGVIV' in bytes[:8]:
++        return 'mpviv'
++
+     if bytes.startswith("MZ"):
+         return 'pe'
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,64 @@
++import base64
++import logging
++
++import msgpack
++
++logger = logging.getLogger(__name__)
++
++loadargs = {'use_list': False, 'raw': False}
++if msgpack.version < (1, 0, 0):
++    loadargs['encoding'] = 'utf-8'
++else:
++    loadargs['strict_map_key'] = False
++
++VSIG = b'MSGVIV'.ljust(8, b'\x00')
++
++
++def vivEventsAppendFile(filename, events):
++    with open(filename, 'ab') as f:
++        for event in events:
++            if event[0] == 20:
++                mape = base64.b64encode(event[1][3])
++                event = (event[0], (event[1][0], event[1][1], event[1][2], mape))
++            msgpack.pack(event, f, use_bin_type=False)
++
++
++def saveWorkspaceChanges(vw, filename):
++    events = vw.exportWorkspaceChanges()
++    vivEventsAppendFile(filename, events)
++
++
++def vivEventsToFile(filename, events):
++    with open(filename, 'wb') as f:
++        msgpack.pack(VSIG, f, use_bin_type=False)
++        for event in events:
++            if event[0] == 20:
++                mape = base64.b64encode(event[1][3])
++                event = (event[0], (event[1][0], event[1][1], event[1][2], mape))
++            msgpack.pack(event, f, use_bin_type=False)
++
++
++def saveWorkspace(vw, filename):
++    events = vw.exportWorkspace()
++    vivEventsToFile(filename, events)
++
++
++def vivEventsFromFile(filename):
++    events = []
++    with open(filename, 'rb') as f:
++        unpacker = msgpack.Unpacker(f, **loadargs)
++        siggy = next(unpacker)
++        if siggy.encode('utf-8') != VSIG:
++            logger.warning('Invalid file signature of %s', str(siggy))
++            return
++        for event in unpacker:
++            if event[0] == 20:
++                mape = base64.b64decode(event[1][3])
++                event = (event[0], (event[1][0], event[1][1], event[1][2], mape))
++            events.append(event)
++    return events
++
++
++def loadWorkspace(vw, filename):
++    events = vivEventsFromFile(filename)
++    vw.importWorkspace(events)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,107 @@
++import hashlib
++import tempfile
++import unittest
++
++import vivisect
++from vivisect.const import *
++
++
++# Because u'foo' != 'foo' in python 2 and msgpack always unpacks to unicode :(
++def normUnicode(event):
++    prop = event[1]
++    if isinstance(prop, unicode):
++        prop = str(prop)
++    elif isinstance(prop, tuple) or isinstance(prop, list):
++        prop = [str(x) if isinstance(x, unicode) else x for x in prop]
++
++    return (event[0], prop)
++
++def add_events(vw):
++    # Call some APIs to populate the event list.
++    # Coherency is not the objective. Just get some events in there.
++    filehash = hashlib.md5(b'testfile').hexdigest()
++    vw.addFile('testfile', 0x1000, filehash)
++    vw.setMeta('Architecture', 'i386')
++    vw.setMeta('Format', 'pe')
++    vw.addMemoryMap(0x1000, 7, 'testfile', b'\x00' * 0x9000)
++    vw.addLocation(0x2000, 4, 4, tinfo='fakeptr')
++    vw.addLocation(0x3000, 16, 6, tinfo='oogieboogie')
++    vw.addLocation(0x4000, 3, 5)
++    vw.addLocation(0x5000, 3, 5)
++    vw.addLocation(0x6000, 3, 5)
++    vw.delLocation(0x4000)
++    vw.addXref(0x4000, 0x3000, 1)
++    vw.addXref(0x5000, 0x3000, 1)
++    vw.delXref((0x5000, 0x3000, 1, 0))
++    vw.setMeta('foo', 'bar')
++    vw.setFileMeta('testfile', 'neato', 'burrito')
++    vw.addVaSet('EmptySet', (('va', VASET_ADDRESS),))
++    vw.delVaSet('FuncWrappers')
++    vw.setComment(0x2000, 'test comment')
++    vw.addExport(0x7000

@@ -1,0 +1,87 @@
+@@ -920,6 +920,10 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+         exportCandidate.getRoute() instanceof GeneratedRoute
+             ? BgpProtocolHelper.convertGeneratedRouteToBgp(
+                     (GeneratedRoute) exportCandidate.getRoute(),
++                    Optional.ofNullable(
++                            ((GeneratedRoute) exportCandidate.getRoute()).getAttributePolicy())
++                        .map(p -> _c.getRoutingPolicies().get(p))
++                        .orElse(null),
+                     _process.getRouterId(),
+                     sessionProperties.getHeadIp(),
+                     false)
+
+
+
+
+@@ -754,10 +754,16 @@ public class VirtualRouter implements Serializable {
+     for (AbstractRoute grAbstract : _generatedRib.getRoutes()) {
+       GeneratedRoute gr = (GeneratedRoute) grAbstract;
+ 
+-      // Prevent route from being merged into the main RIB by marking it non-routing
+       Bgpv4Route br =
+           BgpProtocolHelper.convertGeneratedRouteToBgp(
+-              gr, _vrf.getBgpProcess().getRouterId(), Ip.ZERO, true);
++              gr,
++              Optional.ofNullable(gr.getAttributePolicy())
++                  .map(p -> _c.getRoutingPolicies().get(p))
++                  .orElse(null),
++              _vrf.getBgpProcess().getRouterId(),
++              Ip.ZERO,
++              // Prevent route from being merged into the main RIB by marking it non-routing
++              true);
+       /* TODO: tests for this */
+       RibDelta<Bgpv4Route> d1 = _bgpRoutingProcess._bgpv4Rib.mergeRouteGetDelta(br);
+       _bgpRoutingProcess._bgpv4DeltaBuilder.from(d1);
+@@ -1806,12 +1812,17 @@ public class VirtualRouter implements Serializable {
+       @Nonnull GeneratedRoute generatedRoute, Ip nextHopIp) {
+     String policyName = generatedRoute.getGenerationPolicy();
+     RoutingPolicy policy = policyName != null ? _c.getRoutingPolicies().get(policyName) : null;
++    @Nullable
++    RoutingPolicy attrPolicy =
++        generatedRoute.getAttributePolicy() != null
++            ? _c.getRoutingPolicies().get(generatedRoute.getAttributePolicy())
++            : null;
+     GeneratedRoute.Builder builder =
+         GeneratedRouteHelper.activateGeneratedRoute(
+             generatedRoute, policy, _mainRib.getTypedRoutes());
+     return builder != null
+         ? BgpProtocolHelper.convertGeneratedRouteToBgp(
+-            builder.build(), _vrf.getBgpProcess().getRouterId(), nextHopIp, false)
++            builder.build(), attrPolicy, _vrf.getBgpProcess().getRouterId(), nextHopIp, false)
+         : null;
+   }
+ 
+
+
+
+
+@@ -2,6 +2,7 @@ package org.batfish.dataplane.protocols;
+ 
+ import static org.batfish.datamodel.Route.UNSET_ROUTE_NEXT_HOP_IP;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
+ import java.util.Set;
+@@ -18,6 +19,7 @@ import org.batfish.datamodel.BgpProcess;
+ import org.batfish.datamodel.BgpRoute;
+ import org.batfish.datamodel.BgpSessionProperties;
+ import org.batfish.datamodel.Bgpv4Route;
++import org.batfish.datamodel.Bgpv4Route.Builder;
+ import org.batfish.datamodel.GeneratedRoute;
+ import org.batfish.datamodel.Ip;
+ import org.batfish.datamodel.OriginType;
+@@ -27,6 +29,8 @@ import org.batfish.datamodel.bgp.AddressFamily;
+ import org.batfish.datamodel.bgp.AddressFamily.Type;
+ import org.batfish.datamodel.bgp.BgpTopologyUtils.ConfedSessionType;
+ import org.batfish.datamodel.bgp.community.StandardCommunity;
++import org.batfish.datamodel.routing_policy.Environment.Direction;
++import org.batfish.datamodel.routing_policy.RoutingPolicy;
+ 
+ @ParametersAreNonnullByDefault
+ public final class BgpProtocolHelper {
+@@ -213,11 +217,38 @@ public final class BgpProtocolHelper {
+    * Convert an aggregate/generated route to a BGP route.
+    *
+    * @param generatedRoute a {@link GeneratedRoute} to convert to a {@link Bgpv4Route}.
++   * @param attributePolicy a {@link RoutingPolicy} to use to set

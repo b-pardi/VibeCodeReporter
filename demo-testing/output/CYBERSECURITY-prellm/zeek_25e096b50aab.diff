@@ -1,0 +1,219 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,1080 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/EventTrace.h"
++
++#include <regex>
++
++#include "zeek/Desc.h"
++#include "zeek/EventHandler.h"
++#include "zeek/Func.h"
++#include "zeek/IPAddr.h"
++#include "zeek/Reporter.h"
++#include "zeek/ZeekString.h"
++
++namespace zeek::detail
++	{
++
++std::unique_ptr<EventTraceMgr> etm;
++
++// Helper function for generating a correct script-level representation
++// of a string constant.
++static std::string escape_string(const u_char* b, int len)
++	{
++	std::string res = "\"";
++
++	for ( int i = 0; i < len; ++i )
++		{
++		unsigned char c = b[i];
++
++		switch ( c )
++			{
++			case '\a':
++				res += "\\a";
++				break;
++			case '\b':
++				res += "\\b";
++				break;
++			case '\f':
++				res += "\\f";
++				break;
++			case '\n':
++				res += "\\n";
++				break;
++			case '\r':
++				res += "\\r";
++				break;
++			case '\t':
++				res += "\\t";
++				break;
++			case '\v':
++				res += "\\v";
++				break;
++
++			case '\\':
++				res += "\\\\";
++				break;
++			case '"':
++				res += "\\\"";
++				break;
++
++			default:
++				if ( isprint(c) )
++					res += c;
++				else
++					{
++					char buf[8192];
++					snprintf(buf, sizeof buf, "%03o", c);
++					res += "\\";
++					res += buf;
++					}
++				break;
++			}
++		}
++
++	return res + "\"";
++	}
++
++ValTrace::ValTrace(const ValPtr& _v)
++	{
++	v = _v;
++	t = v->GetType();
++
++	switch ( t->Tag() )
++		{
++		case TYPE_LIST:
++			TraceList(cast_intrusive<ListVal>(v));
++			break;
++
++		case TYPE_RECORD:
++			TraceRecord(cast_intrusive<RecordVal>(v));
++			break;
++
++		case TYPE_TABLE:
++			TraceTable(cast_intrusive<TableVal>(v));
++			break;
++
++		case TYPE_VECTOR:
++			TraceVector(cast_intrusive<VectorVal>(v));
++			break;
++
++		default:
++			break;
++		}
++	}
++
++ValTrace::~ValTrace() { }
++
++bool ValTrace::operator==(const ValTrace& vt) const
++	{
++	auto& vt_v = vt.GetVal();
++	if ( vt_v == v )
++		return true;
++
++	auto tag = t->Tag();
++
++	if ( vt.GetType()->Tag() != tag )
++		return false;
++
++	switch ( tag )
++		{
++		case TYPE_BOOL:
++		case TYPE_INT:
++		case TYPE_ENUM:
++			return v->AsInt() == vt_v->AsInt();
++
++		case TYPE_COUNT:
++		case TYPE_PORT:
++			return v->AsCount() == vt_v->AsCount();
++
++		case TYPE_DOUBLE:
++		case TYPE_INTERVAL:
++		case TYPE_TIME:
++			return v->AsDouble() == vt_v->AsDouble();
++
++		case TYPE_STRING:
++			return (*v->AsString()) == (*vt_v->AsString());
++
++		case TYPE_ADDR:
++			return v->AsAddr() == vt_v->AsAddr();
++
++		case TYPE_SUBNET:
++			return v->AsSubNet() == vt_v->AsSubNet();
++
++		case TYPE_FUNC:
++			return v->AsFile() == vt_v->AsFile();
++
++		case TYPE_FILE:
++			return v->AsFile() == vt_v->AsFile();
++
++		case TYPE_PATTERN:
++			return v->AsPattern() == vt_v->AsPattern();
++
++		case TYPE_ANY:
++			return v->AsSubNet() == vt_v->AsSubNet();
++
++		case TYPE_TYPE:
++			return v->AsType() == vt_v->AsType();
++
++		case TYPE_OPAQUE:
++			return false; // needs pointer equivalence
++
++		case TYPE_LIST:
++			return SameList(vt);
++
++		case TYPE_RECORD:
++			return SameRecord(vt);
++
++		case TYPE_TABLE:
++			return SameTable(vt);
++
++		case TYPE_VECTOR:
++			return SameVector(vt);
++
++		default:
++			reporter->InternalError("bad type in ValTrace::operator==");
++		}
++	}
++
++void ValTrace::ComputeDelta(const ValTrace* prev, DeltaVector& deltas) const
++	{
++	auto tag = t->Tag();
++
++	if ( prev )
++		{
++		ASSERT(prev->GetType()->Tag() == tag);
++
++		auto& prev_v = prev->GetVal();
++
++		if ( prev_v != v )
++			{
++			if ( *this != *prev )
++				deltas.emplace_back(std::make_unique<DeltaReplaceValue>(this, v));
++			return;
++			}
++		}
++
++	switch ( tag )
++		{
++		case TYPE_BOOL:
++		case TYPE_INT:
++		case TYPE_ENUM:
++		case TYPE_COUNT:
++		case TYPE_PORT:
++		case TYPE_DOUBLE:
++		case TYPE_INTERVAL:
++		case TYPE_TIME:
++		case TYPE_STRING:
++		case TYPE_ADDR:
++		case TYPE_SUBNET:
++		case TYPE_FUNC:
++		case TYPE_PATTERN:
++		case TYPE_TYPE:
++			// These don't change in place.  No need to create
++			// them as stand-alone variables, since we can just
++			//

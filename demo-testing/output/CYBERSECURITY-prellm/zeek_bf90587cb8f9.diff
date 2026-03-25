@@ -1,0 +1,126 @@
+@@ -22,6 +22,12 @@ public:
+ 		config.description = "X509 and OCSP analyzer";
+ 		return config;
+ 		}
++
++	void Done() override
++		{
++		plugin::Plugin::Done();
++		::file_analysis::X509::FreeRootStore();
++		}
+ } plugin;
+ 
+ }
+
+
+
+
+@@ -18,6 +18,10 @@
+ #include <openssl/opensslconf.h>
+ #include <openssl/err.h>
+ 
++namespace file_analysis {
++std::map<Val*, X509_STORE*> X509::x509_stores;
++}
++
+ using namespace file_analysis;
+ 
+ file_analysis::X509::X509(RecordVal* args, file_analysis::File* file)
+@@ -213,6 +217,47 @@ RecordVal* file_analysis::X509::ParseCertificate(X509Val* cert_val, File* f)
+ 	return pX509Cert;
+ 	}
+ 
++X509_STORE* file_analysis::X509::GetRootStore(TableVal* root_certs)
++	{
++	// If this certificate store was built previously, just reuse the old one.
++	if ( x509_stores.count(root_certs) > 0 )
++		return x509_stores[root_certs];
++
++	X509_STORE* ctx = X509_STORE_new();
++	ListVal* idxs = root_certs->ConvertToPureList();
++
++	// Build the validation store
++	for ( int i = 0; i < idxs->Length(); ++i )
++		{
++		Val* key = idxs->Index(i);
++		StringVal *sv = root_certs->Lookup(key)->AsStringVal();
++		assert(sv);
++		const uint8_t* data = sv->Bytes();
++		::X509* x = d2i_X509(NULL, &data, sv->Len());
++		if ( ! x )
++			{
++			builtin_error(fmt("Root CA error: %s", ERR_error_string(ERR_get_error(),NULL)));
++			return 0;
++			}
++
++		X509_STORE_add_cert(ctx, x);
++		X509_free(x);
++		}
++
++	delete idxs;
++
++	// Save the newly constructed certificate store into the cacheing map.
++	x509_stores[root_certs] = ctx;
++
++	return ctx;
++	}
++
++void file_analysis::X509::FreeRootStore()
++	{
++	for ( const auto& e : x509_stores )
++		X509_STORE_free(e.second);
++	}
++
+ void file_analysis::X509::ParseBasicConstraints(X509_EXTENSION* ex)
+ 	{
+ 	assert(OBJ_obj2nid(X509_EXTENSION_get_object(ex)) == NID_basic_constraints);
+
+
+
+
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <string>
++#include <map>
+ 
+ #include "OpaqueVal.h"
+ #include "X509Common.h"
+@@ -89,6 +90,28 @@ public:
+ 	static file_analysis::Analyzer* Instantiate(RecordVal* args, File* file)
+ 		{ return new X509(args, file); }
+ 
++	/**
++	 * Retrieves OpenSSL's representation of an X509 certificate store
++	 * associated with a script-layer certificate root table variable/value.
++	 * The underlying X509 store will be created if it has not been already,
++	 * else the previously allocated one for the same table will be returned.
++	 *
++	 * @param root_certs  The script-layer certificate root table value.
++	 *
++	 * @return OpenSSL's X509 store associated with the table value.
++	 */
++	static X509_STORE* GetRootStore(TableVal* root_certs);
++
++	/**
++	 * Frees memory obtained from OpenSSL that is associated with the global
++	 * X509 certificate store used by the Zeek scripting-layer.  This primarily
++	 * exists so leak checkers like LeakSanitizer don't count the
++	 * globally-allocated mapping as a leak.  Would be easy to suppress/ignore
++	 * it, but that could accidentally silence cases where some new code
++	 * mistakenly overwrites a table element without freeing it.
++	 */
++	static void FreeRootStore();
++
+ protected:
+ 	X509(RecordVal* args, File* file);
+ 
+@@ -102,6 +125,8 @@ private:
+ 	// Helpers for ParseCertificate.
+ 	static StringVal* KeyCurve(EVP_PKEY *key);
+ 	static unsigned int KeyLength(EVP_PKEY *key);
++	/** X509 stores associated with global script-layer values */
++	static std::map<Val*, X509_STORE*> x509_stores;
+ };
+ 
+ /**

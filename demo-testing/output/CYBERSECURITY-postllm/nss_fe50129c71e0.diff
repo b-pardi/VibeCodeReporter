@@ -1,0 +1,125 @@
+@@ -199,11 +199,17 @@ TEST_F(Pkcs11EcdsaSha256Test, ImportPointNotOnCurve) {
+   EXPECT_EQ(handle, static_cast<decltype(handle)>(CK_INVALID_HANDLE));
+ };
+ 
+-// Importing a private key in PKCS#8 format must fail when no point is given.
+-// PK11 currently offers no APIs to derive raw public keys from private values.
++// Importing a private key in PKCS#8 without a public key will succeed
++// if NSS supports public key derivation for this curve (P-256, P-384, P-521).
+ TEST_F(Pkcs11EcdsaSha256Test, ImportNoPublicKey) {
+   DataBuffer k(kP256Pkcs8NoPublicKey, sizeof(kP256Pkcs8NoPublicKey));
+-  EXPECT_FALSE(ImportPrivateKey(k));
++  ScopedSECKEYPrivateKey privKey(ImportPrivateKey(k));
++  ASSERT_TRUE(privKey);
++
++  ScopedSECKEYPublicKey pubKey(SECKEY_ConvertToPublicKey(privKey.get()));
++  ASSERT_TRUE(pubKey);
++
++  ASSERT_NE(pubKey->u.ec.publicValue.len, 0ul);
+ };
+ 
+ // Importing a public key in SPKI format must fail when id-ecPublicKey is
+
+
+
+
+@@ -1942,7 +1942,10 @@ extern SECStatus ED_VerifyMessage(ECPublicKey *key, const SECItem *signature,
+  */
+ extern SECStatus ED_DerivePublicKey(const SECItem *privateKey, SECItem *publicKey);
+ 
+-extern SECStatus X25519_DerivePublicKey(SECItem *privateKey, SECItem *publicKey);
++extern SECStatus X25519_DerivePublicKey(const SECItem *privateKey, SECItem *publicKey);
++
++/* Public key derivation is supported only for the curves supporting pt_mul method. */
++extern SECStatus EC_DerivePublicKey(const SECItem *privateKey, const ECParams *ecParams, SECItem *publicKey);
+ 
+ SEC_END_PROTOS
+ 
+
+
+
+
+@@ -675,7 +675,7 @@ ED_DerivePublicKey(const SECItem *privateKey, SECItem *publicKey)
+ }
+ 
+ SECStatus
+-X25519_DerivePublicKey(SECItem *privateKey, SECItem *publicKey)
++X25519_DerivePublicKey(const SECItem *privateKey, SECItem *publicKey)
+ {
+     SECStatus rv = SECFailure;
+     /* Currently supporting only X25519.*/
+@@ -690,6 +690,23 @@ X25519_DerivePublicKey(SECItem *privateKey, SECItem *publicKey)
+         return SECFailure;
+     }
+ 
+-    rv = method->pt_mul(publicKey, privateKey, NULL);
++    rv = method->pt_mul(publicKey, (SECItem *) privateKey, NULL);
+     return rv;
+ }
++
++SECStatus
++EC_DerivePublicKey(const SECItem *privateKey, const ECParams *ecParams, SECItem *publicKey)
++{
++    if (!privateKey || privateKey->len == 0 || !publicKey || publicKey->len != EC_GetPointSize(ecParams)) {
++        PORT_SetError(SEC_ERROR_INVALID_ARGS);
++        return SECFailure;
++    }
++
++    const ECMethod *method = ec_get_method_from_name(ecParams->name);
++    if (method == NULL || method->pt_mul == NULL) {
++        PORT_SetError(SEC_ERROR_UNSUPPORTED_ELLIPTIC_CURVE);
++        return SECFailure;
++    }
++
++    return method->pt_mul(publicKey, (SECItem *) privateKey, NULL);
++}
+
+
+
+
+@@ -446,6 +446,9 @@ static const struct FREEBLVectorStr vector = {
+ 
+     X25519_DerivePublicKey,
+     /* End of version 3.029 */
++
++    EC_DerivePublicKey,
++    /* End of version 3.030 */
+ };
+ 
+ const FREEBLVector*
+
+
+
+
+@@ -2886,9 +2886,19 @@ ED_DerivePublicKey(const SECItem *privateKey, SECItem *publicKey)
+ /* ============== New for 3.0029 =============================== */
+ 
+ SECStatus
+-X25519_DerivePublicKey(SECItem *privateKey, SECItem *publicKey)
++X25519_DerivePublicKey(const SECItem *privateKey, SECItem *publicKey)
+ {
+     if (!vector && PR_SUCCESS != freebl_RunLoaderOnce())
+         return SECFailure;
+     return (vector->p_X25519_DerivePublicKey)(privateKey, publicKey);
+-}
+\ No newline at end of file
++}
++
++/* ============== New for 3.0030 =============================== */
++
++SECStatus
++EC_DerivePublicKey(const SECItem *privateKey, const ECParams *ecParams, SECItem *publicKey)
++{
++    if (!vector && PR_SUCCESS != freebl_RunLoaderOnce())
++        return SECFailure;
++    return (vector->p_EC_DerivePublicKey)(privateKey, ecParams, publicKey);
++}
+
+
+
+
+@@ -925,9 +925,12 @@ struct FREEBLVectorStr {
+     SECStatus (*p_ED_DerivePublicKey)(const SECItem *privateKey, SECItem *publicKey);
+     /* Version 3.028 came to here */
+ 
+-    SECStatus (*p_X25519_DerivePublic

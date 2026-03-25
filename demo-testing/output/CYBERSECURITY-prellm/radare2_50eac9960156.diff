@@ -1,0 +1,114 @@
+@@ -4,6 +4,7 @@
+ #include <r_lib.h>
+ #include <capstone.h>
+ #include <arm.h>
++#include <r_util/r_assert.h>
+ #include "./anal_arm_hacks.inc"
+ 
+ #define esilprintf(op, fmt, ...) r_strbuf_setf (&op->esil, fmt, ##__VA_ARGS__)
+@@ -714,6 +715,18 @@ static const char *decode_shift_64(arm64_shifter shift) {
+ #define DECODE_SHIFT(x) decode_shift(insn->detail->arm.operands[x].shift.type)
+ #define DECODE_SHIFT64(x) decode_shift_64(insn->detail->arm64.operands[x].shift.type)
+ 
++static unsigned int regsize32(cs_insn *insn, int n) {
++	r_return_val_if_fail(n >= 0 && n < insn->detail->arm.op_count, 0);
++	unsigned int reg = insn->detail->arm.operands[n].reg;
++	if (reg >= ARM_REG_D0 && reg <= ARM_REG_D31) {
++		return 8;
++	}
++	if (reg >= ARM_REG_Q0 && reg <= ARM_REG_Q15) {
++		return 16;
++	}
++	return 4; // s0-s31, r0-r15
++}
++
+ static int regsize64(cs_insn *insn, int n) {
+ 	unsigned int reg = insn->detail->arm64.operands[n].reg;
+ 	if ( (reg >= ARM64_REG_S0 && reg <= ARM64_REG_S31) ||
+@@ -734,6 +747,7 @@ static int regsize64(cs_insn *insn, int n) {
+ }
+ 
+ #define REGSIZE64(x) regsize64 (insn, x)
++#define REGSIZE32(x) regsize32 (insn, x)
+ 
+ // return postfix
+ const char* arm_prefix_cond(RAnalOp *op, int cond_type) {
+@@ -1887,6 +1901,7 @@ static int analop_esil(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len
+ 	int pcdelta = (thumb? 4: 8);
+ 	ut32 mask = UT32_MAX;
+ 	int str_ldr_bytes = 4;
++	unsigned int width = 0;
+ 
+ 	r_strbuf_init (&op->esil);
+ 	r_strbuf_set (&op->esil, "");
+@@ -2023,6 +2038,54 @@ PUSH { r4, r5, r6, r7, lr }
+ 				(insn->detail->arm.op_count - 1) * 4, ARG (0));
+ 		}
+ 		break;
++	case ARM_INS_VSTMIA:
++		r_strbuf_setf (&op->esil, "");
++		width = 0;
++		for (i = 1; i < insn->detail->arm.op_count; i++) {
++			r_strbuf_appendf (&op->esil, "%s,%d,%s,+,=[%d],",
++				REG (i), width, ARG (0), REGSIZE32(i));
++			width += REGSIZE32(i);
++		}
++		// increment if writeback
++		if (insn->detail->arm.writeback) {
++			r_strbuf_appendf (&op->esil, "%d,%s,+=,", width, ARG (0));
++		}
++		break;
++	case ARM_INS_VSTMDB:
++		r_strbuf_setf (&op->esil, "");
++		width = 0;
++		for (i = insn->detail->arm.op_count - 1; i > 0; i--) {
++			width += REGSIZE32(i);
++			r_strbuf_appendf (&op->esil, "%s,%d,%s,-,=[%d],",
++				REG (i), width, ARG (0), REGSIZE32(i));
++		}
++		// decrement writeback is mandatory for VSTMDB
++		r_strbuf_appendf (&op->esil, "%d,%s,-=,", width, ARG (0));
++		break;
++	case ARM_INS_VLDMIA:
++		r_strbuf_setf (&op->esil, "");
++		width = 0;
++		for (i = 1; i < insn->detail->arm.op_count; i++) {
++			r_strbuf_appendf (&op->esil, "%d,%s,+,[%d],%s,=,",
++				width, ARG (0), REGSIZE32(i), REG (i));
++			width += REGSIZE32(i);
++		}
++		// increment if writeback
++		if (insn->detail->arm.writeback) {
++			r_strbuf_appendf (&op->esil, "%d,%s,+=,", width, ARG (0));
++		}
++		break;
++	case ARM_INS_VLDMDB:
++		r_strbuf_setf (&op->esil, "");
++		width = 0;
++		for (i = insn->detail->arm.op_count - 1; i > 0; i--) {
++			width += REGSIZE32(i);
++			r_strbuf_appendf (&op->esil, "%d,%s,-,[%d],%s,=,",
++				width, ARG (0), REGSIZE32(i), REG (i));
++		}
++		// decrement writeback is mandatory for VLDMDB
++		r_strbuf_appendf (&op->esil, "%d,%s,-=,", width, ARG (0));
++		break;
+ 	case ARM_INS_ASR:
+ 		// suffix 'S' forces conditional flag to be updated
+ 		if (insn->detail->arm.update_flags) {
+@@ -2059,7 +2122,7 @@ r6,r5,r4,3,sp,[*],12,sp,+=
+ 		for (i = 1; i < insn->detail->arm.op_count; i++) {
+ 			r_strbuf_appendf (&op->esil, "%s,%d,+,[4],%s,=,", ARG (0), (i - 1) * 4, REG (i));
+ 		}
+-		if (insn->detail->arm.writeback == true) { //writeback, reg should be incremented
++		if (insn->detail->arm.writeback) { //writeback, reg should be incremented
+ 			r_strbuf_appendf (&op->esil, "%d,%s,+=,",
+ 				(insn->detail->arm.op_count - 1) * 4, ARG (0));
+ 		}
+@@ -3954,7 +4017,6 @@ static char *get_reg_profile(RAnal *anal) {
+ 		"gpr	r14	.32	56	0\n"
+ 		"gpr	r15	.32	60	0\n"
+ 		"flg	cpsr	.32	64	0\n"
+-		"gpr	blank	.32	68	0\n" // Hack, the bit fields below don't work on the last register??
+ 
+ 		  // CPSR bit field

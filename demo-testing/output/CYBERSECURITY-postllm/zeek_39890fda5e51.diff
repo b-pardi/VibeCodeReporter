@@ -1,0 +1,150 @@
+@@ -12,6 +12,7 @@
+ #include <vector>
+ 
+ #include "zeek/IntrusivePtr.h"
++#include "zeek/ZeekArgs.h"
+ 
+ namespace zeek {
+ 
+
+
+
+
+@@ -143,6 +143,11 @@ void Func::AddBody(detail::StmtPtr /* new_body */, const std::vector<detail::IDP
+     Internal("Func::AddBody called");
+ }
+ 
++void Func::AddBody(detail::StdFunctionStmt::FunctionVariant body, int priority) {
++    auto stmt = zeek::make_intrusive<detail::StdFunctionStmt>(std::move(body));
++    AddBody(stmt, {}, priority);
++}
++
+ void Func::SetScope(detail::ScopePtr newscope) { scope = std::move(newscope); }
+ 
+ FuncPtr Func::DoClone() {
+
+
+
+
+@@ -114,6 +114,7 @@ public:
+     void AddBody(detail::StmtPtr new_body, const std::vector<detail::IDPtr>& new_inits, size_t new_frame_size,
+                  int priority = 0);
+     void AddBody(detail::StmtPtr new_body, size_t new_frame_size);
++    void AddBody(detail::StdFunctionStmt::FunctionVariant body, int priority = 0);
+ 
+     virtual void SetScope(detail::ScopePtr newscope);
+     virtual detail::ScopePtr GetScope() const { return scope; }
+
+
+
+
+@@ -53,6 +53,7 @@ const char* stmt_name(StmtTag t) {
+         "null",
+         "assert",
+         "extern",
++        "std-function",
+     };
+ 
+ #pragma GCC diagnostic push
+@@ -2083,4 +2084,17 @@ TraversalCode WhenStmt::Traverse(TraversalCallback* cb) const {
+     HANDLE_TC_STMT_POST(tc);
+ }
+ 
++ValPtr StdFunctionStmt::Exec(Frame* f, StmtFlowType& flow) {
++    zeek::Args args = *f->GetFuncArgs();
++
++    if ( func.index() == 0 ) {
++        flow = FLOW_NEXT;
++        std::get<0>(func)(args);
++    }
++    else
++        std::get<1>(func)(args, flow);
++
++    return nullptr;
++}
++
+ } // namespace zeek::detail
+
+
+
+
+@@ -780,4 +780,25 @@ protected:
+     int expected_len;
+ };
+ 
++// Statement that calls a std::function. These can be added to a Func body
++// to directly all a C++ method.
++class StdFunctionStmt : public Stmt {
++public:
++    using FunctionVariant =
++        std::variant<std::function<void(const zeek::Args&)>, std::function<void(const zeek::Args&, StmtFlowType&)>>;
++    StdFunctionStmt(FunctionVariant f) : Stmt(STMT_STD_FUNCTION), func(std::move(f)) {}
++
++    ValPtr Exec(Frame* f, StmtFlowType& flow) override;
++
++    StmtPtr Duplicate() override {
++        reporter->Error("Duplicate() on StdFunctionStmt not implemented");
++        return {zeek::NewRef{}, this};
++    }
++
++    TraversalCode Traverse(TraversalCallback* cb) const override { return TC_CONTINUE; }
++
++private:
++    FunctionVariant func;
++};
++
+ } // namespace zeek::detail
+
+
+
+
+@@ -31,8 +31,9 @@ enum StmtTag {
+     STMT_ZAM,           // a ZAM function body
+     STMT_NULL,
+     STMT_ASSERT,
+-    STMT_EXTERN, // for custom Stmt subclasses provided by plugins
+-#define NUM_STMTS (int(STMT_EXTERN) + 1)
++    STMT_EXTERN,       // for custom Stmt subclasses provided by plugins
++    STMT_STD_FUNCTION, // statements that call a std::function from c++
++#define NUM_STMTS (int(STMT_STD_FUNCTION) + 1)
+ };
+ 
+ enum StmtFlowType {
+
+
+
+
+@@ -1,19 +1,34 @@
+ 
+ #include "Foo.h"
+ 
++#include "zeek/EventRegistry.h"
+ #include "zeek/analyzer/protocol/tcp/TCP_Reassembler.h"
+ 
+ #include "events.bif.h"
+ #include "foo_pac.h"
+ 
+ using namespace btest::plugin::Demo_Foo;
++using namespace std::placeholders;
+ 
+ Foo::Foo(zeek::Connection* conn) : zeek::analyzer::tcp::TCP_ApplicationAnalyzer("Foo", conn) {
+     interp = new binpac::Foo::Foo_Conn(this);
++
++    auto handler = zeek::event_registry->Lookup("connection_established");
++    if ( handler ) {
++        handler->GetFunc()->AddBody([](const zeek::Args& args) {
++            printf("c++ connection_established lambda handler, received %zu arguments\n", args.size());
++        });
++
++        handler->GetFunc()->AddBody(std::bind(&Foo::ConnectionEstablishedHandler, this, _1));
++    }
+ }
+ 
+ Foo::~Foo() { delete interp; }
+ 
++void Foo::ConnectionEstablishedHandler(const zeek::Args& args) {
++    printf("c++ connection_established member handler, received %zu arguments\n", args.size());
++}
++
+ void Foo::Done() {
+     zeek::analyzer::tcp::TCP_A

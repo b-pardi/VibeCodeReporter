@@ -1,0 +1,103 @@
+@@ -456,9 +456,13 @@ class Flow : public GenericHashEntry {
+   inline u_int32_t getFlowDeviceIp()       { return flow_device.device_ip; };
+   inline u_int16_t getFlowDeviceInIndex()  { return flow_device.in_index;  };
+   inline u_int16_t getFlowDeviceOutIndex() { return flow_device.out_index; };
+-  void setPacketsBytes(time_t now, u_int32_t s2d_pkts, u_int32_t d2s_pkts, u_int32_t s2d_bytes, u_int32_t d2s_bytes);  
+ 
+ #ifdef NTOPNG_PRO
++
++#ifdef HAVE_NETFILTER
++  void setPacketsBytes(time_t now, u_int32_t s2d_pkts, u_int32_t d2s_pkts, u_int64_t s2d_bytes, u_int64_t d2s_bytes);  
++#endif
++
+   void getFlowShapers(bool src2dst_direction, TrafficShaper **shaper_ingress, TrafficShaper **shaper_egress) {
+     if(src2dst_direction) {
+       *shaper_ingress = flowShaperIds.cli2srv.ingress,
+
+
+
+
+@@ -645,11 +645,6 @@ class NetworkInterface : public Checkpointable {
+   inline void decPoolNumL2Devices(u_int16_t id, bool isInlineCall) {
+     if (host_pools) host_pools->decNumL2Devices(id, isInlineCall);
+   };
+-  bool updateFlowStats(u_int8_t protocol,
+-		       u_int32_t srcHost, u_int16_t sport,
+-		       u_int32_t dstHost, u_int16_t dport,
+-		       u_int32_t s2d_pkts, u_int32_t d2s_pkts,
+-		       u_int32_t s2d_bytes, u_int32_t d2s_bytes);
+   Host* findHostByIP(AddressTree *allowed_hosts, char *host_ip, u_int16_t vlan_id);
+   inline bool do_dump_unknown_traffic() { return(dump_unknown_traffic); }
+ };
+
+
+
+
+@@ -3132,28 +3132,48 @@ void Flow::fixAggregatedFlowFields() {
+ }
+ 
+ /* ***************************************************** */
+-
++#if defined(NTOPNG_PRO) && defined(HAVE_NETFILTER)
+ void Flow::setPacketsBytes(time_t now, u_int32_t s2d_pkts, u_int32_t d2s_pkts,
+-			   u_int32_t s2d_bytes, u_int32_t d2s_bytes) {
+-#ifdef NTOPNG_PRO
++			   u_int64_t s2d_bytes, u_int64_t d2s_bytes) {
+   u_int16_t eth_proto = ETHERTYPE_IP;
+   u_int overhead = 0;
++  bool nf_existing_flow;
+ 
+   updateSeen();
+ 
+-  if(cli2srv_packets < s2d_pkts) {
+-    iface->incStats(isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol,
+-          s2d_bytes - cli2srv_bytes, s2d_pkts - cli2srv_packets, overhead, true);
+-    cli2srv_packets = s2d_pkts, cli2srv_bytes = s2d_bytes;
+-  }
++  /* netfilter (depending on configured timeouts) could expire a flow before than
++     ntopng. This heuristics attempt to detect such events.
++
++     Basically, if netfilter is sending counters for a new flow and ntopng
++     already have an existing flow matching the same 5-tuple, we sum counters
++     rather than overwriting them.
++
++     A complete solution would require the registration of a netfilter callback
++     and the detection of event NFCT_T_DESTROY.
++  */
++  nf_existing_flow = !(cli2srv_packets > s2d_pkts || cli2srv_packets > s2d_pkts
++		    || srv2cli_packets > d2s_pkts || srv2cli_bytes > d2s_bytes);
++
++  iface->incStats(isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol,
++		  nf_existing_flow ? s2d_bytes - cli2srv_bytes : s2d_bytes,
++		  nf_existing_flow ? s2d_pkts - cli2srv_packets : s2d_pkts,
++		  overhead, true);
++
++
++  iface->incStats(!isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol,
++		  nf_existing_flow ? d2s_bytes - srv2cli_bytes : d2s_bytes,
++		  nf_existing_flow ? d2s_pkts - srv2cli_packets : d2s_pkts,
++		  overhead, true);
++
++  if(nf_existing_flow)
++    cli2srv_packets = s2d_pkts, cli2srv_bytes = s2d_bytes,
++      srv2cli_packets = d2s_pkts, srv2cli_bytes = d2s_bytes;
++  else
++    cli2srv_packets += s2d_pkts, cli2srv_bytes += s2d_bytes,
++      srv2cli_packets += d2s_pkts, srv2cli_bytes += d2s_bytes;
+ 
+-  if(srv2cli_packets < d2s_pkts) {
+-    iface->incStats(!isIngress2EgressDirection(), now, eth_proto, ndpiDetectedProtocol.app_protocol,
+-          d2s_bytes - srv2cli_bytes, d2s_pkts - srv2cli_packets, overhead, true);
+-    srv2cli_packets = d2s_pkts, srv2cli_bytes = d2s_bytes;
+-  }
+-#endif
+ }
++#endif
+ 
+ /* ***************************************************** */
+ 
+
+
+
+
+@@ -6392,57 +6392,6 @@ 

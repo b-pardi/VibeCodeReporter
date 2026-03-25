@@ -1,0 +1,118 @@
+@@ -1,5 +1,5 @@
+ /* vi: set et ts=4: */
+-/* Copyright (C) 2007-2014 Open Information Security Foundation
++/* Copyright (C) 2007-2020 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -41,6 +41,9 @@
+ #include "util-log-redis.h"
+ #endif /* HAVE_LIBHIREDIS */
+ 
++static bool LogFileNewThreadedCtx(LogFileCtx *parent_ctx, const char *log_path, const char *append, int i);
++static bool SCLogOpenThreadedFileFp(const char *log_path, const char *append, LogFileCtx *parent_ctx, int slot_count);
++
+ #ifdef BUILD_WITH_UNIXSOCKET
+ /** \brief connect to the indicated local stream socket, logging any errors
+  *  \param path filesystem path to connect to
+@@ -175,6 +178,40 @@ tryagain:
+ }
+ #endif /* BUILD_WITH_UNIXSOCKET */
+ 
++/**
++ * \brief Write buffer to log file.
++ * \retval 0 on failure; otherwise, the return value of fwrite_unlocked (number of
++ * characters successfully written).
++ */
++static int SCLogFileWriteNoLock(const char *buffer, int buffer_len, LogFileCtx *log_ctx)
++{
++    int ret = 0;
++
++    BUG_ON(log_ctx->is_sock);
++
++    /* Check for rotation. */
++    if (log_ctx->rotation_flag) {
++        log_ctx->rotation_flag = 0;
++        SCConfLogReopen(log_ctx);
++    }
++
++    if (log_ctx->flags & LOGFILE_ROTATE_INTERVAL) {
++        time_t now = time(NULL);
++        if (now >= log_ctx->rotate_time) {
++            SCConfLogReopen(log_ctx);
++            log_ctx->rotate_time = now + log_ctx->rotate_interval;
++        }
++    }
++
++    if (log_ctx->fp) {
++        clearerr(log_ctx->fp);
++        ret = SCFwriteUnlocked(buffer, buffer_len, 1, log_ctx->fp);
++        fflush(log_ctx->fp);
++    }
++
++    return ret;
++}
++
+ /**
+  * \brief Write buffer to log file.
+  * \retval 0 on failure; otherwise, the return value of fwrite (number of
+@@ -239,12 +276,64 @@ static char *SCLogFilenameFromPattern(const char *pattern)
+     return filename;
+ }
+ 
+-static void SCLogFileClose(LogFileCtx *log_ctx)
++static void SCLogFileCloseNoLock(LogFileCtx *log_ctx)
+ {
+     if (log_ctx->fp)
+         fclose(log_ctx->fp);
+ }
+ 
++static void SCLogFileClose(LogFileCtx *log_ctx)
++{
++    SCMutexLock(&log_ctx->fp_mutex);
++    SCLogFileCloseNoLock(log_ctx);
++    SCMutexUnlock(&log_ctx->fp_mutex);
++}
++
++static bool
++SCLogOpenThreadedFileFp(const char *log_path, const char *append, LogFileCtx *parent_ctx, int slot_count)
++{
++        parent_ctx->threads = SCCalloc(1, sizeof(LogThreadedFileCtx));
++        if (!parent_ctx->threads) {
++            SCLogError(SC_ERR_MEM_ALLOC, "Unable to allocate threads container");
++            return false;
++        }
++        parent_ctx->threads->append = SCStrdup(append);
++        if (!parent_ctx->threads->append) {
++            SCLogError(SC_ERR_MEM_ALLOC, "Unable to allocate threads append setting");
++            goto error_exit;
++        }
++
++        parent_ctx->threads->slot_count = slot_count;
++        parent_ctx->threads->lf_slots = SCCalloc(slot_count, sizeof(LogFileCtx *));
++        if (!parent_ctx->threads->lf_slots) {
++            SCLogError(SC_ERR_MEM_ALLOC, "Unable to allocate thread slots");
++            goto error_exit;
++        }
++        SCLogDebug("Allocated %d file context pointers for threaded array",
++                    parent_ctx->threads->slot_count);
++        int slot = 1;
++        for (; slot < parent_ctx->threads->slot_count; slot++) {
++            if (!LogFileNewThreadedCtx(parent_ctx, log_path, append, slot)) {
++                /* TODO: clear allocated entries [1, slot) */
++                goto error_exit;
++            }
++        }
++        SCMutexInit(&parent_ctx->threads->mutex, NULL);
++        return true;
++
++error_exit:
++
++        if (parent_ctx->threads->lf_slots) {
++            SCFree(parent_ctx->threads->lf_slots);
++        }
++        if (parent_ctx->threads->append) {
++            SCFree(parent_ctx->threads->append);
++        }
++        SCFree(parent_ctx->threads);
++        parent_ct

@@ -1,0 +1,109 @@
+@@ -1,18 +1,46 @@
++import os
+ from dataclasses import dataclass
+ from typing import Optional
+ 
+ from boto3 import Session
+ from botocore.client import ClientError
++from botocore.exceptions import NoCredentialsError, ProfileNotFound
+ 
+ from prowler.config.config import timestamp_utc
+ from prowler.lib.logger import logger
+ from prowler.lib.outputs.asff.asff import AWSSecurityFindingFormat
+ from prowler.providers.aws.aws_provider import AwsProvider
++from prowler.providers.aws.config import (
++    AWS_STS_GLOBAL_ENDPOINT_REGION,
++    ROLE_SESSION_NAME,
++)
++from prowler.providers.aws.exceptions.exceptions import (
++    AWSAccessKeyIDInvalidError,
++    AWSArgumentTypeValidationError,
++    AWSAssumeRoleError,
++    AWSIAMRoleARNEmptyResourceError,
++    AWSIAMRoleARNInvalidAccountIDError,
++    AWSIAMRoleARNInvalidResourceTypeError,
++    AWSIAMRoleARNPartitionEmptyError,
++    AWSIAMRoleARNRegionNotEmtpyError,
++    AWSIAMRoleARNServiceNotIAMnorSTSError,
++    AWSNoCredentialsError,
++    AWSProfileNotFoundError,
++    AWSSecretAccessKeyInvalidError,
++    AWSSessionTokenExpiredError,
++    AWSSetUpSessionError,
++)
++from prowler.providers.aws.lib.arguments.arguments import (
++    validate_role_session_name,
++    validate_session_duration,
++)
++from prowler.providers.aws.lib.arn.arn import parse_iam_credentials_arn
+ from prowler.providers.aws.lib.security_hub.exceptions.exceptions import (
+     SecurityHubInvalidRegionError,
+     SecurityHubNoEnabledRegionsError,
+ )
+ from prowler.providers.aws.lib.session.aws_set_up_session import AwsSetUpSession
++from prowler.providers.aws.models import AWSAssumeRoleInfo
+ from prowler.providers.common.models import Connection
+ 
+ SECURITY_HUB_INTEGRATION_NAME = "prowler/prowler"
+@@ -26,10 +54,12 @@ class SecurityHubConnection(Connection):
+     Attributes:
+         enabled_regions (set): Set of regions where Security Hub is enabled.
+         disabled_regions (set): Set of regions where Security Hub is disabled.
++        partition (str): AWS partition (e.g., aws, aws-cn, aws-us-gov) where SecurityHub is deployed.
+     """
+ 
+     enabled_regions: set = None
+     disabled_regions: set = None
++    partition: str = ""
+ 
+ 
+ class SecurityHub:
+@@ -61,15 +91,15 @@ class SecurityHub:
+     def __init__(
+         self,
+         aws_account_id: str,
+-        aws_partition: str,
++        aws_partition: str = None,
+         aws_session: Session = None,
+         findings: list[AWSSecurityFindingFormat] = [],
+         aws_security_hub_available_regions: list[str] = [],
+         send_only_fails: bool = False,
+         role_arn: str = None,
+-        session_duration: int = None,
++        session_duration: int = 3600,
+         external_id: str = None,
+-        role_session_name: str = None,
++        role_session_name: str = ROLE_SESSION_NAME,
+         mfa: bool = None,
+         profile: str = None,
+         aws_access_key_id: str = None,
+@@ -116,8 +146,12 @@ class SecurityHub:
+                 retries_max_attempts=retries_max_attempts,
+                 regions=regions,
+             )
+-            self._session = aws_setup_session._session
++            self._session = aws_setup_session._session.current_session
+         self._aws_account_id = aws_account_id
++        if not aws_partition:
++            aws_partition = AwsProvider.validate_credentials(
++                self._session, AWS_STS_GLOBAL_ENDPOINT_REGION
++            ).arn.partition
+         self._aws_partition = aws_partition
+ 
+         self._enabled_regions = None
+@@ -126,7 +160,7 @@ class SecurityHub:
+         if aws_security_hub_available_regions:
+             self._enabled_regions = self.verify_enabled_per_region(
+                 aws_security_hub_available_regions,
+-                aws_session,
++                self._session,
+                 aws_account_id,
+                 aws_partition,
+             )
+@@ -363,34 +397,91 @@ class SecurityHub:
+ 
+     @staticmethod
+     def test_connection(
+-        session: Session,
+         aws_account_id: str,
+-        aws_partition: 

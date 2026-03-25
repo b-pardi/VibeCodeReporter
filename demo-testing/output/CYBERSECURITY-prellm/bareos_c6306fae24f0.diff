@@ -1,0 +1,105 @@
+@@ -488,6 +488,11 @@ typedef struct sql_field {
+ } SQL_FIELD;
+ #endif
+ 
++class BareosSqlError : public std::runtime_error {
++ public:
++  BareosSqlError(const char* what) : std::runtime_error(what) {}
++};
++
+ class BareosDb : public BareosDbQueryEnum {
+  protected:
+   brwlock_t lock_; /**< Transaction lock */
+@@ -740,6 +745,7 @@ class BareosDb : public BareosDbQueryEnum {
+   bool AccurateGetJobids(JobControlRecord* jcr,
+                          JobDbRecord* jr,
+                          db_list_ctx* jobids);
++  db_list_ctx FilterZeroFileJobs(db_list_ctx& jobids);
+   bool GetUsedBaseJobids(JobControlRecord* jcr,
+                          const char* jobids,
+                          db_list_ctx* result);
+@@ -1023,8 +1029,8 @@ struct SqlPoolEntry {
+   int id = 0; /**< Unique ID, connection numbering can have holes and the pool
+              is not sorted on it */
+   int reference_count = 0; /**< Reference count for this entry */
+-  time_t last_update = 0; /**< When was this connection last updated either used
+-                         or put back on the pool */
++  time_t last_update = 0;  /**< When was this connection last updated either
++                          used  or put back on the pool */
+   BareosDb* db_handle = nullptr; /**< Connection handle to the database */
+   dlink<SqlPoolEntry> link;      /**< list management */
+ };
+@@ -1040,8 +1046,8 @@ struct SqlPoolDescriptor {
+   int max_connections
+       = 0; /**< Maximum number of connections in the connection pool
+             */
+-  int increment_connections = 0; /**< Increase/Decrease the number of connection
+-                                in the pool with this value */
++  int increment_connections = 0; /**< Increase/Decrease the number of
++                                connection in the pool with this value */
+   int idle_timeout = 0;     /**< Number of seconds to wait before tearing down a
+                            connection */
+   int validate_timeout = 0; /**< Number of seconds after which an idle
+
+
+
+
+@@ -1293,6 +1293,27 @@ bool BareosDb::GetUsedBaseJobids(JobControlRecord* jcr,
+   return SqlQueryWithHandler(query.c_str(), DbListHandler, result);
+ }
+ 
++/*
++ * Remove the jobs that have JobFiles == 0 from the supplied jobid list
++ * and return them in another list
++ */
++db_list_ctx BareosDb::FilterZeroFileJobs(db_list_ctx& jobids)
++{
++  std::string query{"SELECT JobId FROM Job WHERE JobFiles = 0 AND JobId IN ("};
++  query += jobids.Join(",") + ")";
++
++  db_list_ctx zero_file_jobs;
++  if (!SqlQueryWithHandler(query.c_str(), DbListHandler, &zero_file_jobs)) {
++    throw new BareosSqlError(sql_strerror());
++  }
++  for (auto& remove_jobid : zero_file_jobs) {
++    jobids.erase(std::remove(jobids.begin(), jobids.end(), remove_jobid),
++                 jobids.end());
++  }
++
++  return zero_file_jobs;
++}
++
+ /**
+  * The decision do change an incr/diff was done before
+  * Full : do nothing
+
+
+
+
+@@ -1,7 +1,7 @@
+ /*
+    BAREOS® - Backup Archiving REcovery Open Sourced
+ 
+-   Copyright (C) 2016-2020 Bareos GmbH & Co. KG
++   Copyright (C) 2016-2022 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -177,13 +177,21 @@ bool DoConsolidate(JobControlRecord* jcr)
+       Dmsg1(10, "consolidate candidates:  %s.\n",
+             jobids_ctx.GetAsString().c_str());
+ 
++      db_list_ctx zero_file_jobs = jcr->db->FilterZeroFileJobs(jobids_ctx);
++      if (zero_file_jobs.size() > 0) {
++        Jmsg(jcr, M_INFO, 0, "%s: purging empty jobids %s\n",
++             job->resource_name_, zero_file_jobs.Join(", ").c_str());
++        jcr->db->PurgeJobs(zero_file_jobs.GetAsString().c_str());
++      }
++      incrementals_total = jobids_ctx.size() - 1;
+       /**
+-       * Consolidation of zero or one job does not make sense, we leave it like
+-       * it is
++       * Consolidation of zero or one job does not make sense, we leave it
++       * like it is
+        */
+       if (incremental

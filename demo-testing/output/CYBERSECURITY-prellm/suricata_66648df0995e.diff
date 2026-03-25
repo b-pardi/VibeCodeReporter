@@ -1,0 +1,125 @@
+@@ -97,6 +97,7 @@
+ #define TCP_GET_SACKOK(p)                    (TCP_HAS_SACKOK((p)) ? 1 : 0)
+ #define TCP_GET_SACK_PTR(p)                  TCP_HAS_SACK((p)) ? (p)->tcpvars.sack.data : NULL
+ #define TCP_GET_SACK_CNT(p)                  (TCP_HAS_SACK((p)) ? (((p)->tcpvars.sack.len - 2) / 8) : 0)
++#define TCP_GET_MSS(p)                       SCNtohs(*(uint16_t *)((p)->tcpvars.mss.data))
+ 
+ #define TCP_GET_OFFSET(p)                    TCP_GET_RAW_OFFSET((p)->tcph)
+ #define TCP_GET_X2(p)                        TCP_GET_RAW_X2((p)->tcph)
+
+
+
+
+@@ -167,6 +167,7 @@
+ #include "detect-app-layer-protocol.h"
+ #include "detect-template.h"
+ #include "detect-template2.h"
++#include "detect-tcpmss.h"
+ #include "detect-krb5-cname.h"
+ #include "detect-krb5-errcode.h"
+ #include "detect-krb5-msgtype.h"
+@@ -523,6 +524,7 @@ void SigTableSetup(void)
+     DetectBase64DataRegister();
+     DetectTemplateRegister();
+     DetectTemplate2Register();
++    DetectTcpmssRegister();
+     DetectKrb5CNameRegister();
+     DetectKrb5ErrCodeRegister();
+     DetectKrb5MsgTypeRegister();
+
+
+
+
+@@ -225,6 +225,7 @@ enum {
+ 
+     DETECT_TEMPLATE,
+     DETECT_TEMPLATE2,
++    DETECT_TCPMSS,
+     DETECT_FTPDATA,
+     DETECT_TARGET,
+     DETECT_AL_TEMPLATE_RUST_BUFFER,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,369 @@
++/* Copyright (C) 2007-2019 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Victor Julien <victor@inliniac.net>
++ *
++ */
++
++#include "suricata-common.h"
++
++#include "detect.h"
++#include "detect-parse.h"
++#include "detect-engine-prefilter-common.h"
++
++#include "detect-tcpmss.h"
++
++/**
++ * \brief Regex for parsing our options
++ */
++#define PARSE_REGEX  "^\\s*([0-9]*)?\\s*([<>=-]+)?\\s*([0-9]+)?\\s*$"
++
++static pcre *parse_regex;
++static pcre_extra *parse_regex_study;
++
++/* prototypes */
++static int DetectTcpmssMatch (ThreadVars *, DetectEngineThreadCtx *, Packet *,
++        const Signature *, const SigMatchCtx *);
++static int DetectTcpmssSetup (DetectEngineCtx *, Signature *, const char *);
++void DetectTcpmssFree (void *);
++#ifdef UNITTESTS
++void DetectTcpmssRegisterTests (void);
++#endif
++static int PrefilterSetupTcpmss(DetectEngineCtx *de_ctx, SigGroupHead *sgh);
++static _Bool PrefilterTcpmssIsPrefilterable(const Signature *s);
++
++/**
++ * \brief Registration function for tcpmss: keyword
++ */
++
++void DetectTcpmssRegister(void)
++{
++    sigmatch_table[DETECT_TCPMSS].name = "tcp.mss";
++    sigmatch_table[DETECT_TCPMSS].desc = "match on TCP MSS option field";
++    sigmatch_table[DETECT_TCPMSS].url = DOC_URL DOC_VERSION "/rules/header-keywords.html#tcpmss";
++    sigmatch_table[DETECT_TCPMSS].Match = DetectTcpmssMatch;
++    sigmatch_table[DETECT_TCPMSS].Setup = DetectTcpmssSetup;
++    sigmatch_table[DETECT_TCPMSS].Free = DetectTcpmssFree;
++#ifdef UNITTESTS
++    sigmatch_table[DETECT_TCPMSS].RegisterTests = DetectTcpmssRegisterTests;
++#endif
++    sigmatch_table[DETECT_TCPMSS].SupportsPrefilter = PrefilterTcpmssIsPrefilterable;
++    sigmatch_table[DETECT_TCPMSS].SetupPrefilter = PrefilterSetupTcpmss;
++
++    DetectSetupParseRegexes(PARSE_REGEX, &parse_regex, &parse_regex_study);
++    return;
++}
++
++static inline int TcpmssMatch(const uint16_t parg, const uint8_t mode,
++        const uint16_t darg1, const uint16_t darg2)
++{
++    if (mode == DETECT_TCPMSS_EQ && parg == darg1)
++        return 1;
++    else if (mo

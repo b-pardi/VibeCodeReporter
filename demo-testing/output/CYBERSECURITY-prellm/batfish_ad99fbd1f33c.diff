@@ -1,0 +1,81 @@
+@@ -207,6 +207,24 @@ public class Subnet implements AwsVpcEntity, Serializable {
+     Utils.newInterface(
+         instancesIfaceName, cfgNode, instancesIfaceAddress, "To instances " + _subnetId);
+ 
++    IpAccessList ingressAcl = null;
++    IpAccessList egressAcl = null;
++    {
++      // This network ACL should be applied to every subnet interface not facing an instance.
++      // NOTE: Every call to NetworkAcl#getIngressAcl or NetworkAcl#getEgressAcl returns a *new*
++      // IpAccessList object, which is why it's in a limited scope: they should only be called once.
++      Optional<NetworkAcl> networkAcl = getNetworkAcl(region, warnings);
++      if (networkAcl.isPresent()) {
++        ingressAcl = networkAcl.get().getIngressAcl();
++        egressAcl = networkAcl.get().getEgressAcl();
++        cfgNode.getIpAccessLists().put(ingressAcl.getName(), ingressAcl);
++        cfgNode.getIpAccessLists().put(egressAcl.getName(), egressAcl);
++      }
++    }
++    // defined separately so they can be final and thus used in lambda expressions
++    IpAccessList ingressNetworkAcl = ingressAcl;
++    IpAccessList egressNetworkAcl = egressAcl;
++
+     // connect to the VPC on each of its VRFs. add static routes on the VPC to this subnet.
+     Configuration vpcConfigNode = awsConfiguration.getNode(Vpc.nodeName(_vpcId));
+     vpcConfigNode
+@@ -223,14 +241,18 @@ public class Subnet implements AwsVpcEntity, Serializable {
+                   vrf.getName(),
+                   interfaceSuffix);
+ 
+-              // add a static route on the vpc router for this subnet;
++              String subnetToVpcIfaceName = interfaceNameToRemote(vpcConfigNode, interfaceSuffix);
++              Interface subnetIfaceToVpc = cfgNode.getAllInterfaces().get(subnetToVpcIfaceName);
++              subnetIfaceToVpc.setIncomingFilter(ingressNetworkAcl);
++              subnetIfaceToVpc.setOutgoingFilter(egressNetworkAcl);
++
++              // add a static route on the vpc router for this subnet
+               addStaticRoute(
+                   vrf,
+                   toStaticRoute(
+                       _cidrBlock,
+                       interfaceNameToRemote(cfgNode, interfaceSuffix),
+-                      getInterfaceLinkLocalIp(
+-                          cfgNode, interfaceNameToRemote(vpcConfigNode, interfaceSuffix))));
++                      getInterfaceLinkLocalIp(cfgNode, subnetToVpcIfaceName)));
+             });
+ 
+     @Nullable
+@@ -277,9 +299,8 @@ public class Subnet implements AwsVpcEntity, Serializable {
+                       warnings));
+     }
+ 
+-    addNlbInstanceTargetInterfaces(awsConfiguration, cfgNode, vpcConfigNode);
+-
+-    installNetworkAcls(cfgNode, region, warnings);
++    addNlbInstanceTargetInterfaces(
++        awsConfiguration, cfgNode, vpcConfigNode, ingressNetworkAcl, egressNetworkAcl);
+ 
+     // create LocationInfo for each link location on the node.
+     cfgNode.setLocationInfo(
+@@ -296,9 +317,18 @@ public class Subnet implements AwsVpcEntity, Serializable {
+     return cfgNode;
+   }
+ 
++  /**
++   * Adds VRFs and connected interfaces required for NLBs with instance targets, if this subnet is
++   * connected to any instance targets or NLBs with instance targets.
++   */
+   @VisibleForTesting
+   void addNlbInstanceTargetInterfaces(
+-      ConvertedConfiguration awsConfiguration, Configuration subnetCfg, Configuration vpcCfg) {
++      ConvertedConfiguration awsConfiguration,
++      Configuration subnetCfg,
++      Configuration vpcCfg,
++      // These ACLs should be applied to all subnet interfaces that don't face instances
++      @Nullable IpAccessList ingressNetworkAcl,
++      @Nullable IpAccessList egressNetworkAcl) {
+     Collection<Instance> instanceTargets = awsConfiguration.getSubnetsToInstanceTargets().get(this);
+     Collection<LoadBalancer> nlbs = awsConfiguration.getSubnetsToNlbs().get(this);
+     if (instanceTargets.isEmpty() && nlbs.isEmpty()) {
+@@ -321,8 +351,12 @@ public class Subnet implements AwsVpcEntity, Serializable {
+     // Add firewal

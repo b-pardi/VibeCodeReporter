@@ -1,0 +1,128 @@
+@@ -500,8 +500,11 @@ static void set_default_value_dynamic_info(ELFOBJ *eo) {
+ 	eo->dyn_info.dt_strtab = R_BIN_ELF_ADDR_MAX;
+ 	eo->dyn_info.dt_symtab = R_BIN_ELF_ADDR_MAX;
+ 	eo->dyn_info.dt_rela = R_BIN_ELF_ADDR_MAX;
++	eo->dyn_info.dt_relr = R_BIN_ELF_ADDR_MAX;
+ 	eo->dyn_info.dt_relasz = 0;
+ 	eo->dyn_info.dt_relaent = 0;
++	eo->dyn_info.dt_relrsz = 0;
++	eo->dyn_info.dt_relrent = 0;
+ 	eo->dyn_info.dt_strsz = 0;
+ 	eo->dyn_info.dt_syment = 0;
+ 	eo->dyn_info.dt_rel = R_BIN_ELF_ADDR_MAX;
+@@ -568,6 +571,15 @@ static void fill_dynamic_entries(ELFOBJ *eo, ut64 loaded_offset, ut64 dyn_size)
+ 		case DT_RELA:
+ 			eo->dyn_info.dt_rela = d.d_un.d_ptr;
+ 			break;
++		case DT_RELR:
++			eo->dyn_info.dt_relr = d.d_un.d_ptr;
++			break;
++		case DT_RELRSZ:
++			eo->dyn_info.dt_relrsz = d.d_un.d_val;
++			break;
++		case DT_RELRENT:
++			eo->dyn_info.dt_relrent = d.d_un.d_val;
++			break;
+ 		case DT_RELASZ:
+ 			eo->dyn_info.dt_relasz = d.d_un.d_val;
+ 			break;
+@@ -1759,6 +1771,9 @@ static size_t get_size_rel_mode(Elf_(Xword) mode) {
+ 		// CREL uses variable-length encoding, but we need to return a size for alignment
+ 		// This is just a placeholder - actual parsing will be different
+ 		return sizeof (Elf_(Rela));
++	} else if (mode == DT_RELR) {
++		// RELR entries are the size of an address
++		return sizeof (Elf_(Addr));
+ 	}
+ 	return 0;
+ }
+@@ -3299,7 +3314,72 @@ static bool read_crel_reloc(ELFOBJ *eo, RBinElfReloc *r, ut64 vaddr, ut64 *next_
+ 	return true;
+ }
+ 
++typedef struct {
++	ut64 next_addr;
++	bool has_next_addr;
++} RelrInfo;
++
++static bool read_relr_entry(ELFOBJ *eo, RBinElfReloc *r, ut64 vaddr, ut64 entry, RelrInfo *info) {
++	R_RETURN_VAL_IF_FAIL (eo && r && info, false);
++
++	// If entry is even (LSB == 0), it's an address to relocate
++	if ((entry & 1) == 0) {
++		r->mode = DT_RELR;
++		r->offset = entry;
++		r->rva = entry;
++		r->type = R_AARCH64_RELATIVE;
++		r->sym = 0; // RELR relocations don't refer to symbols
++		r->addend = 0;
++		// Set next_addr to the word after the one pointed to by entry
++		info->next_addr = entry + sizeof (Elf_(Addr));
++		info->has_next_addr = true;
++		return true;
++	}
++	// It's a bitmap - only process if we have a valid next_addr
++	if (!info->has_next_addr) {
++		return false;
++	}
++	// Find first set bit in bitmap (skipping LSB which is always 1)
++	ut64 bitmap = entry >> 1;
++	int bit_pos = 0;
++	while (bitmap) {
++		if (bitmap & 1) {
++			r->mode = DT_RELR;
++			r->offset = info->next_addr + (bit_pos * sizeof (Elf_(Addr)));
++			r->rva = r->offset;
++			r->type = R_AARCH64_RELATIVE;
++			r->sym = 0; // RELR relocations don't refer to symbols
++			r->addend = 0;
++			return true;
++		}
++		bitmap >>= 1;
++		bit_pos++;
++	}
++	// No bits set or all processed - update next_addr for next bitmap
++	info->next_addr += (sizeof (Elf_(Addr)) * 8 - 1) * sizeof (Elf_(Addr));
++	return false;
++}
++
+ static bool read_reloc(ELFOBJ *eo, RBinElfReloc *r, Elf_(Xword) rel_mode, ut64 vaddr) {
++	static RelrInfo relr_info = {0};
++	// Handle RELR entries
++	if (rel_mode == DT_RELR) {
++		size_t i;
++		ut64 offset = Elf_(v2p_new) (eo, vaddr);
++		if (offset == UT64_MAX) {
++			return false;
++		}
++		ut8 buf[sizeof (Elf_(Addr))] = {0};
++		int res = r_buf_read_at (eo->b, offset, buf, sizeof (Elf_(Addr)));
++		if (res != sizeof (Elf_(Addr))) {
++			return false;
++		}
++		ut64 entry = 0;
++		for (i = 0; i < sizeof (Elf_(Addr)); i++) {
++			entry |= (ut64)(buf[i]) << (i * 8);
++		}
++		return read_relr_entry (eo, r, vaddr, entry, &relr_info);
++	}
+ 	// Handle CREL entries differently
+ 	if (rel_mode == DT_CREL) {
+ 		ut64 next_offset = 0;
+@@ -3310,21 +3390,16 @@ static bool read_reloc(ELFOBJ *eo, RBinElfReloc *r, Elf_(Xword) rel_mode, ut64 v
+ 	if (offset == UT64_MAX) {
+ 		return false;
+ 	}
+-
+ 	size_t size_struct = get_size_rel_mode (rel_mode);
+-
+ 	ut8 buf[sizeof (Elf_(Rela))] = {0};
+ 	int res = r_buf_read_at (eo->b, offset, buf, size_struct);
+ 	if (res != size_struct) {
+ 		return false;
+ 	}
+-
+ 	size_t i = 0;
+ 	Elf_(Rela) reloc_info;
+-
+ 	reloc_info.r_offset = R_BIN_ELF_READWORD (buf, i

@@ -1,0 +1,144 @@
+@@ -114,6 +114,7 @@ static const char *getstr(RBinDexObj *dex, int idx) {
+ 	return NULL;
+ }
+ 
++//  TODO move to util
+ static int countOnes(ut32 val) {
+ 	if (!val) {
+ 		return 0;
+@@ -1577,16 +1578,15 @@ static bool is_class_idx_in_code_classes(RBinDexObj *bin, int class_idx) {
+ 	return false;
+ }
+ 
+-// XXX remove this second argument, must be implicit by the rbinfile
+ static bool dex_loadcode(RBinFile *bf) {
+-	RBin *rbin = bf->rbin;
++	r_return_val_if_fail (bf && bf->o && bf->o->bin_obj, false);
++
++	PrintfCallback cb_printf = bf->rbin->cb_printf;
+ 	RBinDexObj *bin = bf->o->bin_obj;
+-	int i;
++	size_t i;
+ 	int *methods = NULL;
+ 	int sym_count = 0;
+ 
+-	r_return_val_if_fail (bf && bin, false);
+-
+ 	// doublecheck??
+ 	if (bin->methods_list) {
+ 		return false;
+@@ -1643,7 +1643,7 @@ static bool dex_loadcode(RBinFile *bf) {
+ 		for (i = 0; i < bin->header.class_size; i++) {
+ 			struct dex_class_t *c = &bin->classes[i];
+ 			if (dexdump) {
+-				rbin->cb_printf ("Class #%d            -\n", i);
++				cb_printf ("Class #%d            -\n", i);
+ 			}
+ 			parse_class (bf, c, i, methods, &sym_count);
+ 		}
+@@ -1728,14 +1728,11 @@ static bool dex_loadcode(RBinFile *bf) {
+ }
+ 
+ static RList* imports(RBinFile *bf) {
++	r_return_val_if_fail (bf && bf->o && bf->o->bin_obj, NULL);
+ 	RBinDexObj *bin = (RBinDexObj*) bf->o->bin_obj;
+-	if (!bin) {
+-		return NULL;
+-	}
+-	if (bin && bin->imports_list) {
+-		return bin->imports_list;
++	if (!bin->imports_list) {
++		dex_loadcode (bf);
+ 	}
+-	dex_loadcode (bf);
+ 	return bin->imports_list;
+ }
+ 
+@@ -1879,117 +1876,134 @@ static char *getname(RBinFile *bf, int type, int idx, bool sd) {
+ 	return NULL;
+ }
+ 
+-static RList *sections(RBinFile *bf) {
+-	struct r_bin_dex_obj_t *bin = bf->o->bin_obj;
+-	RList *ml = methods (bf);
+-	RBinSection *ptr = NULL;
+-	int ns, fsymsz = 0;
+-	RList *ret = NULL;
++typedef struct {
++	ut64 addr;
++	ut64 size;
++} Section;
++
++static RBinSection *add_section(RList *ret, const char *name, Section s, int perm, char *format) {
++	r_return_val_if_fail (ret && name, NULL);
++	r_return_val_if_fail (s.addr < UT32_MAX, NULL);
++	r_return_val_if_fail (s.size > 0 && s.size < UT32_MAX, NULL);
++	RBinSection *ptr = R_NEW0 (RBinSection);
++	if (ptr) {
++		ptr->name = strdup (name);
++		ptr->paddr = ptr->vaddr = s.addr;
++		ptr->size = ptr->vsize = s.size;
++		ptr->perm = perm;
++		ptr->add = false;
++		if (format) {
++			ptr->format = format;
++		}
++		r_list_append (ret, ptr);
++	}
++	return ptr;
++}
++
++static void add_segment(RList *ret, const char *name, Section s, int perm) {
++	RBinSection *bs = add_section (ret, name, s, perm, NULL);
++	if (bs) {
++		bs->is_segment = true;
++		bs->add = true;
++	}
++}
++
++static bool validate_section(const char *name, Section *pre, Section *cur, Section *nex, Section *all) {
++	r_return_val_if_fail (cur && all, false);
++	if (pre && cur->addr < (pre->addr + pre->size)) {
++		eprintf ("Warning: %s Section starts before the previous.\n", name);
++	}
++	if (cur->addr >= all->size) {
++		eprintf ("Warning: %s section starts beyond the end of the file.\n", name);
++		return false;
++	}
++	if (cur->addr == UT64_MAX) {
++		eprintf ("Warning: %s invalid region size.\n", name);
++		return false;
++	}
++	if ((cur->addr + cur->size) > all->size) {
++		eprintf ("Warning: %s truncated section because of file size.\n", name);
++		cur->size = all->size - cur->addr;
++	}
++	if (nex) {
++		if (cur->addr >= nex->addr) {
++			eprintf ("Warning: invalid %s section address.\n", name);
++			return false;
++		}
++		if ((cur->addr + cur->size) > nex->addr) {
++			eprintf ("Warning: truncated %s with next section size.\n", name);
++			cur->size = nex->addr - cur->addr;
++		}
++	}
++	return cur->size > 0;
++}
++
++static void fast_code_size(RBinFile *bf) {
++	const size_t bs = r_buf_size (bf->buf);
++	ut64 ns;
++	ut64 fsym = 0LL;
++	ut64 fsymsz = 0LL;
+ 	RListIter *iter;
+ 	RBinSymbol *m;
+-	int fsym = 0;
+-
++	RList *ml = methods (bf);
+ 	r_list_foreach (ml, iter, m) {
+ 		if (!fsym || m->paddr < fsym) {
+ 			fsym = m->paddr;
+ 		}
+ 		ns = m->paddr + m->size;
+-		if (

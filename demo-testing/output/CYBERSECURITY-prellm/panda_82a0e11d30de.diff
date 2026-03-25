@@ -1,0 +1,150 @@
+@@ -28,21 +28,31 @@ PANDAENDCOMMENT */
+ 
+ #include "hooks2.h"
+ 
++#define MAX_PATHNAME 256
++
+ extern "C" {
+ bool init_plugin(void *);
+ void uninit_plugin(void *);
+-}
+ 
+-#if defined(TARGET_ARM) || defined(TARGET_I386) || defined(TARGET_X86_64)
++PPP_PROT_REG_CB(on_process_start);
++PPP_PROT_REG_CB(on_process_end);
++PPP_PROT_REG_CB(on_thread_start);
++PPP_PROT_REG_CB(on_thread_end);
+ 
+-extern "C" {
+-PPP_PROT_REG_CB(on_prog_start);
+-PPP_PROT_REG_CB(on_prog_end);
+ }
+ 
+-PPP_CB_BOILERPLATE(on_prog_start);
+-PPP_CB_BOILERPLATE(on_prog_end);
+-
++PPP_CB_BOILERPLATE(on_process_start);
++PPP_CB_BOILERPLATE(on_process_end);
++PPP_CB_BOILERPLATE(on_thread_start);
++PPP_CB_BOILERPLATE(on_thread_end);
++
++enum ThreadStartType {
++    NEW_THREAD,
++    FORK,
++    EXECVE,
++    SYS_BRK,
++    ASID_CHANGE,
++};
+ 
+ struct HashableOsiThread {
+     target_pid_t pid;
+@@ -95,6 +105,12 @@ struct active_trace {
+     target_ulong resolved_range_end;
+ };
+ 
++struct process_info {
++    std::string name;
++    std::unordered_set<HashableOsiThread> threads;
++    target_ulong asid;
++};
++
+ struct global_hooks2_data {
+     /* Configuration */
+     bool disable_chaining;
+@@ -110,7 +126,7 @@ struct global_hooks2_data {
+     std::list< std::shared_ptr<struct hook_cfg> > kernel_traces;
+     std::map<target_ulong, std::list< std::shared_ptr<struct active_trace> >> map_active_utraces;
+ 
+-    std::map<target_pid_t, std::string> pid_map;
++    std::map<target_pid_t, std::shared_ptr<process_info> > map_running_procs;
+ };
+ 
+ static struct global_hooks2_data plugin;
+@@ -138,16 +154,33 @@ disable_callback(struct callback_info &cb)
+     }
+ }
+ 
+-static bool
+-traces_empty()
++static void
++read_string(CPUState *cpu, target_ulong addr, char *buffer)
+ {
+-    for (auto &element : plugin.map_active_utraces) {
+-        if (!element.second.empty())
+-            return false;
++    bool done = false;
++    int idx = 0;
++
++    while (!done) {
++        panda_virtual_memory_read(
++            cpu,
++            addr,
++            (uint8_t *)(buffer + idx),
++            32);
++        for (int j = 0; j < 32; j++) {
++            if (buffer[idx] == 0) {
++                done = true;
++                break;
++            } else if (idx >= MAX_PATHNAME) {
++                buffer[idx - 1] = 0;
++                done = true;
++                break;
++            }
++            idx++;
++        }
+     }
+-    return true;
+ }
+ 
++
+ static bool
+ in_range(TranslationBlock *tb, target_ulong value)
+ {
+@@ -233,7 +266,9 @@ handle_kernel_traces(
+ 
+ 
+ static bool
+-update_active_userspace_traces(CPUState *cpu)
++update_active_userspace_traces(
++    CPUState *cpu,
++    target_ulong asid)
+ {
+     bool changed = false;
+ 
+@@ -241,8 +276,6 @@ update_active_userspace_traces(CPUState *cpu)
+     if (!proc)
+         return changed;
+ 
+-    target_ulong asid = panda_current_asid(cpu);
+-
+     auto &trace_list = plugin.map_active_utraces[asid];
+ 
+     if (!trace_list.empty()) {
+@@ -286,10 +319,14 @@ update_active_userspace_traces(CPUState *cpu)
+ }
+ 
+ static void
+-update_active_userspace_libs(CPUState *cpu)
++update_active_userspace_libs(CPUState *cpu, target_ulong asid)
+ {
+-    target_ulong asid = panda_current_asid(cpu);
+-    auto trace_list = plugin.map_active_utraces[asid];
++    auto it = plugin.map_active_utraces.find(asid);
++    if (it == plugin.map_active_utraces.end()) {
++        return;
++    }
++
++    auto trace_list = it->second;
+ 
+     bool do_get_mappings = false;
+     for (auto &trace: trace_list) {
+@@ -358,9 +395,9 @@ cb_tracing_before_block_exec(CPUState *cpu, TranslationBlock *tb)
+             handle_kernel_traces(cpu, tb, trace_ptr);
+         }
+     } else {
+-        auto trace_list = plugin.map_active_utraces.find(panda_current_asid(cpu));
+-        if (trace_list != plugin.map_active_utraces.end()) {
+-            for (auto &trace_ptr : trace_list->second) {
++        auto it = plugin.map_active_utraces.find(panda_current_asid(cpu));
++        if (it != plugin.map_active_utraces.end()) {
++            for (auto &trace_ptr : it->secon

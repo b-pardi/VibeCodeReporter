@@ -1,0 +1,100 @@
+@@ -1021,8 +1021,9 @@ void DecodeUnregisterCounters(void);
+ /** Packet is modified by the stream engine, we need to recalc the csum and       \
+                    reinject/replace */
+ #define PKT_STREAM_MODIFIED BIT_U32(10)
+-/** Packet mark is modified */
+-#define PKT_MARK_MODIFIED BIT_U32(11)
++
++// vacancy
++
+ /** Exclude packet from pcap logging as it's part of a stream that has reassembly \
+                    depth reached. */
+ #define PKT_STREAM_NOPCAPLOG BIT_U32(12)
+
+
+
+
+@@ -229,10 +229,15 @@ static int DetectMarkPacket(DetectEngineThreadCtx *det_ctx, Packet *p,
+     const DetectMarkData *nf_data = (const DetectMarkData *)ctx;
+     if (nf_data->mask) {
+         if (PacketIsNotTunnel(p)) {
++            /* for a non-tunnel packet we don't need a lock,
++             * and if we're here we can't turn into a tunnel
++             * packet anymore. */
++
+             /* coverity[missing_lock] */
+             p->nfq_v.mark = (nf_data->mark & nf_data->mask)
+                 | (p->nfq_v.mark & ~(nf_data->mask));
+-            p->flags |= PKT_MARK_MODIFIED;
++            /* coverity[missing_lock] */
++            p->nfq_v.mark_modified = true;
+         } else {
+             /* real tunnels may have multiple flows inside them, so marking
+              * might 'mark' too much. Rebuilt packets from IP fragments
+@@ -242,7 +247,7 @@ static int DetectMarkPacket(DetectEngineThreadCtx *det_ctx, Packet *p,
+                 SCSpinLock(&tp->persistent.tunnel_lock);
+                 tp->nfq_v.mark = (nf_data->mark & nf_data->mask)
+                     | (tp->nfq_v.mark & ~(nf_data->mask));
+-                tp->flags |= PKT_MARK_MODIFIED;
++                tp->nfq_v.mark_modified = true;
+                 SCSpinUnlock(&tp->persistent.tunnel_lock);
+             }
+         }
+
+
+
+
+@@ -142,7 +142,7 @@ static TmEcode DecodeNFQ(ThreadVars *, Packet *, void *);
+ static TmEcode DecodeNFQThreadInit(ThreadVars *, const void *, void **);
+ static TmEcode DecodeNFQThreadDeinit(ThreadVars *tv, void *data);
+ 
+-static TmEcode NFQSetVerdict(Packet *p);
++static TmEcode NFQSetVerdict(Packet *p, const uint32_t mark_value, const bool mark_modified);
+ static void NFQReleasePacket(Packet *p);
+ 
+ typedef enum NFQMode_ {
+@@ -324,7 +324,8 @@ static void NFQVerdictCacheFlush(NFQQueueVars *t)
+ #endif
+ }
+ 
+-static int NFQVerdictCacheAdd(NFQQueueVars *t, Packet *p, uint32_t verdict)
++static int NFQVerdictCacheAdd(NFQQueueVars *t, Packet *p, const uint32_t verdict,
++        const uint32_t mark_value, const bool mark_modified)
+ {
+ #ifdef HAVE_NFQ_SET_VERDICT_BATCH
+     if (t->verdict_cache.maxlen == 0)
+@@ -333,13 +334,13 @@ static int NFQVerdictCacheAdd(NFQQueueVars *t, Packet *p, uint32_t verdict)
+     if (p->flags & PKT_STREAM_MODIFIED || verdict == NF_DROP)
+         goto flush;
+ 
+-    if (p->flags & PKT_MARK_MODIFIED) {
++    if (mark_modified) {
+         if (!t->verdict_cache.mark_valid) {
+             if (t->verdict_cache.len)
+                 goto flush;
+             t->verdict_cache.mark_valid = 1;
+-            t->verdict_cache.mark = p->nfq_v.mark;
+-        } else if (t->verdict_cache.mark != p->nfq_v.mark) {
++            t->verdict_cache.mark = mark_value;
++        } else if (t->verdict_cache.mark != mark_value) {
+             goto flush;
+         }
+     } else if (t->verdict_cache.mark_valid) {
+@@ -439,6 +440,7 @@ static int NFQSetupPkt (Packet *p, struct nfq_q_handle *qh, void *data)
+     p->ReleasePacket = NFQReleasePacket;
+     p->nfq_v.ifi  = nfq_get_indev(tb);
+     p->nfq_v.ifo  = nfq_get_outdev(tb);
++    /* coverity[missing_lock] */
+     p->nfq_v.verdicted = false;
+ 
+ #ifdef NFQ_GET_PAYLOAD_SIGNED
+@@ -481,9 +483,28 @@ static int NFQSetupPkt (Packet *p, struct nfq_q_handle *qh, void *data)
+ 
+ static void NFQReleasePacket(Packet *p)
+ {
+-    if (unlikely(!p->nfq_v.verdicted)) {
+-        PacketDrop(p, ACTION_DROP, PKT_DROP_REASON_NFQ_ERROR);
+-        NFQSetVerdict(p);
++    if (PacketIsNotTunnel(p)) {
++        if (unlikely(!p->nfq_v.verdicted)) {
++            PacketDrop(p, 

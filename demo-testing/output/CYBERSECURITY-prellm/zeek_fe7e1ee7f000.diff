@@ -1,0 +1,176 @@
+@@ -259,9 +259,14 @@ class BroDomain(Domain):
+     }
+ 
+     def clear_doc(self, docname):
++        to_delete = []
++
+         for (typ, name), doc in self.data['objects'].items():
+             if doc == docname:
+-                del self.data['objects'][typ, name]
++                to_delete.append((typ, name))
++
++        for (typ, name) in to_delete:        
++            del self.data['objects'][typ, name]
+ 
+     def resolve_xref(self, env, fromdocname, builder, typ, target, node,
+                      contnode):
+
+
+
+
+@@ -54,6 +54,38 @@ void Event::Describe(ODesc* d) const
+ 		d->Add("(");
+ 	}
+ 
++void Event::Dispatch(bool no_remote)
++	{
++	if ( src == SOURCE_BROKER )
++		no_remote = true;
++
++	if ( event_serializer )
++		{
++		SerialInfo info(event_serializer);
++		event_serializer->Serialize(&info, handler->Name(), args);
++		}
++
++	if ( handler->ErrorHandler() )
++		reporter->BeginErrorHandler();
++
++	try
++		{
++		handler->Call(args, no_remote);
++		}
++
++	catch ( InterpreterException& e )
++		{
++		// Already reported.
++		}
++
++	if ( obj )
++		// obj->EventDone();
++		Unref(obj);
++
++	if ( handler->ErrorHandler() )
++		reporter->EndErrorHandler();
++	}
++
+ EventMgr::EventMgr()
+ 	{
+ 	head = tail = 0;
+
+
+
+
+@@ -34,34 +34,7 @@ protected:
+ 
+ 	// This method is protected to make sure that everybody goes through
+ 	// EventMgr::Dispatch().
+-	void Dispatch(bool no_remote = false)
+-		{
+-		if ( event_serializer )
+-			{
+-			SerialInfo info(event_serializer);
+-			event_serializer->Serialize(&info, handler->Name(), args);
+-			}
+-
+-		if ( handler->ErrorHandler() )
+-			reporter->BeginErrorHandler();
+-
+-		try
+-			{
+-			handler->Call(args, no_remote);
+-			}
+-
+-		catch ( InterpreterException& e )
+-			{
+-			// Already reported.
+-			}
+-
+-		if ( obj )
+-			// obj->EventDone();
+-			Unref(obj);
+-
+-		if ( handler->ErrorHandler() )
+-			reporter->EndErrorHandler();
+-		}
++	void Dispatch(bool no_remote = false);
+ 
+ 	EventHandlerPtr handler;
+ 	val_list* args;
+
+
+
+
+@@ -5,10 +5,8 @@
+ #include "RemoteSerializer.h"
+ #include "NetVar.h"
+ 
+-#ifdef ENABLE_BROKER
+ #include "broker/Manager.h"
+ #include "broker/Data.h"
+-#endif
+ 
+ EventHandler::EventHandler(const char* arg_name)
+ 	{
+@@ -32,19 +30,16 @@ EventHandler::operator bool() const
+ 	return enabled && ((local && local->HasBodies())
+ 			   || receivers.length()
+ 			   || generate_always
+-#ifdef ENABLE_BROKER
+-			   || ! auto_remote_send.empty()
+-			   // TODO: and require a subscriber interested in a topic or unsolicited flags?
+-#endif
+-	                   );
++			   || ! auto_publish.empty());
+ 	}
+ 
+-FuncType* EventHandler::FType()
++FuncType* EventHandler::FType(bool check_export)
+ 	{
+ 	if ( type )
+ 		return type;
+ 
+-	ID* id = lookup_ID(name, current_module.c_str());
++	ID* id = lookup_ID(name, current_module.c_str(), false, false,
++	                   check_export);
+ 
+ 	if ( ! id )
+ 		return 0;
+@@ -84,14 +79,11 @@ void EventHandler::Call(val_list* vl, bool no_remote)
+ 			remote_serializer->SendCall(&info, receivers[i], name, vl);
+ 			}
+ 
+-#ifdef ENABLE_BROKER
+-
+-		if ( ! auto_remote_send.empty() )
++		if ( ! auto_publish.empty() )
+ 			{
+-			// TODO: also short-circuit based on interested subscribers/flags?
+-			broker::message msg;
+-			msg.reserve(vl->length() + 1);
+-			msg.emplace_back(Name());
++			// Send event in form [name, xs...] where xs represent the arguments.
++			broker::vector xs;
++			xs.reserve(vl->length());
+ 			bool valid_args = true;
+ 
+ 			for ( auto i = 0; i < vl->length(); ++i )
+@@ -99,30 +91,33 @@ void EventHandler::Call(val_list* vl, bool no_remote)
+ 				auto opt_data = bro_broker::val_to_data((*vl)[i]);
+ 
+ 				if ( opt_data )
+-					msg.emplace_back(move(*opt_data));
++					xs.emplace_back(move(*opt_data));
+ 				else
+ 					{
+ 					valid_args = false;
+-					auto_remote_send.clear();
+-					reporter->Error("failed auto-remote event '%s', disabled",
+-					                Name());
++					auto_publish.clear();
++					reporter->Error("failed auto-remote event '%s', disabled", Name());
+ 					break;
+ 					}
+ 				}
+ 
+ 			if ( valid_a

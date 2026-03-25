@@ -1,0 +1,138 @@
+@@ -35,8 +35,9 @@ struct plugin_private_context {
+   char* link;                       // Target symlink points to
+   char* object_name;                // Restore Object Name
+   char* object;                     // Restore Object Content
+-  PyInterpreterState* interp;
+-  PyObject* pModule;                // Python Module entry point
++  PyInterpreterState*
++      interp;         // Python interpreter for this instance of the plugin
++  PyObject* pModule;  // Python Module entry point
+   PyObject* pyModuleFunctionsDict;  // Python Dictionary
+ };
+ 
+
+
+
+
+@@ -48,6 +48,9 @@
+ #include "module/bareosfd.h"
+ #include "lib/edit.h"
+ 
++#include <vector>
++#include <algorithm>
++
+ namespace filedaemon {
+ 
+ static const int debuglevel = 150;
+@@ -207,37 +210,106 @@ bRC unloadPlugin()
+  * plugin instance must be thread safe and keep its own
+  * local data.
+  */
+-thread_local PyThreadState* global_interpreter = nullptr;
+ 
+-// return if global_interpreter needs to be freed on release
+-static bool AcquireLock(PyInterpreterState* interp)
++// we use a vector instead of a set here since we expect that each thread
++// only accesses very few interpreters (<= 1) at the same time.
++thread_local std::vector<PyThreadState*> tl_threadstates{};
++
++/* Return this threads thread state for interp if it exists.  Returns
++ * nullptr otherwise */
++static PyThreadState* GetThreadStateForInterp(PyInterpreterState* interp)
+ {
+-  bool needs_free = false;
+-  if (!global_interpreter) {
+-    global_interpreter = PyThreadState_New(interp);
+-    needs_free = true;
++  for (auto* thread : tl_threadstates) {
++    if (thread->interp == interp) { return thread; }
+   }
+-  ASSERT(global_interpreter->interp == interp);
+-  PyEval_RestoreThread(global_interpreter);
+-
+-  return needs_free;
++  return nullptr;
+ }
+ 
+-static void ReleaseLock(bool needs_free)
++static PyThreadState* PopThreadStateForInterp(PyInterpreterState* interp)
+ {
+-  ASSERT(global_interpreter);
+-  if (needs_free) {
+-    PyThreadState_Clear(global_interpreter);
+-    PyThreadState_DeleteCurrent();
+-    global_interpreter = nullptr;
++  auto iter = std::find_if(
++      tl_threadstates.begin(), tl_threadstates.end(),
++      [interp](const auto& thread) { return thread->interp == interp; });
++
++  if (iter != tl_threadstates.end()) {
++    auto* thread = *iter;
++
++    tl_threadstates.erase(iter);
++
++    return thread;
+   } else {
+-    PyEval_ReleaseThread(global_interpreter);
++    return nullptr;
++  }
++}
++
++class locked_threadstate {
++ private:
++  locked_threadstate(PyThreadState* ts, bool owns) : ts{ts}, owns{owns}
++  {
++    // lock the gil and make ts active
++    PyEval_RestoreThread(ts);
++  }
++
++ public:
++  explicit locked_threadstate(PyThreadState* ts) : locked_threadstate(ts, false)
++  {
++  }
++
++  explicit locked_threadstate(PyInterpreterState* interp)
++      : locked_threadstate(PyThreadState_New(interp), true)
++  {
++  }
++
++  locked_threadstate(const locked_threadstate&) = delete;
++  locked_threadstate& operator=(const locked_threadstate&) = delete;
++
++  locked_threadstate(locked_threadstate&& other) { *this = std::move(other); }
++
++  locked_threadstate& operator=(locked_threadstate&& other)
++  {
++    std::swap(ts, other.ts);
++    std::swap(owns, other.owns);
++
++    return *this;
++  }
++
++  PyThreadState* get() { return ts; }
++
++  ~locked_threadstate()
++  {
++    if (ts) {
++      if (owns) {
++        // destroy the thread state and release the gil
++        PyThreadState_Clear(ts);  // required before delete
++        PyThreadState_DeleteCurrent();
++      } else {
++        // just release the gil and make ts inactive
++        PyEval_ReleaseThread(ts);
++      }
++    }
+   }
++
++ private:
++  PyThreadState* ts{nullptr};
++  bool owns{false};
++};
++
++/* Acquire the gil for this thread.  If this thread does not have a thread
++ * state for interp, a new one is created.  This newly created thread state
++ * is destroyed by locked_threadstates destructor. */
++static locked_threadstate AcquireLock(PyInterpreterState* interp)
++{
++  auto* ts

@@ -1,0 +1,81 @@
+@@ -51,7 +51,7 @@ import_parser.add_argument('--update',  dest='update',  action='store_true',  he
+ import_parser.add_argument('--users',  dest='users',  action='store_true',  help='Update shared folder user permissions only')
+ import_parser.add_argument('--old-domain', '-od', dest='old_domain', action='store',  help='old domain for changing user emails in permissions')
+ import_parser.add_argument('--new-domain', '-nd', dest='new_domain', action='store',  help='new domain for changing user emails in permissions')
+-import_parser.add_argument('--tmpdir', dest='tmpdir', action='store', help='Temp directory used to cache encrypted attachment imports')
++import_parser.add_argument('--file-cache', dest='tmpdir', action='store', help='Temp directory used to cache encrypted attachment imports')
+ import_parser.add_argument('name', type=str, help='file name (json, csv, keepass) or account name (lastpass)')
+ import_parser.error = raise_parse_exception
+ import_parser.exit = suppress_exit
+
+
+
+
+@@ -24,7 +24,6 @@ import logging
+ import math
+ import os
+ import re
+-import tempfile
+ 
+ from Cryptodome.Cipher import AES
+ import requests
+@@ -54,13 +53,74 @@ GCM_TAG_LEN = 16
+ RECORD_MAX_DATA_LEN = 32000
+ 
+ 
+-def exceed_max_data_len(data, title):
+-    data_size = len(data)
++def get_record_data_json_bytes(data):
++    """Get serialized and utf-8 encoded record data with padding"""
++    data_str = json.dumps(data)
++    padding = int(math.ceil(max(384, len(data_str)) / 16) * 16)
++    if padding:
++        data_str = data_str.ljust(padding)
++    return data_str.encode('utf-8')
++
++
++def exceed_max_data_len(data, rq, import_record, record_key):
++    data_size = len(rq.data)
+     if data_size > RECORD_MAX_DATA_LEN:
+-        logging.warning(f'Skipping record "{title}": Data size of {data_size} exceeds limit of {RECORD_MAX_DATA_LEN}')
+-        return True
+-    else:
+-        return False
++        field_sizes = [len(f['value']) for f in data['fields']]
++        custom_sizes = [len(f['value']) for f in data['custom']]
++        note_size = len(data['notes'])
++        attachment_filenames = [a.name for a in import_record.attachments or []]
++        while data_size > RECORD_MAX_DATA_LEN:
++            max_field_size = max(field_sizes) if field_sizes else 0
++            max_custom_size = max(custom_sizes) if custom_sizes else 0
++            max_size = max(note_size, max_field_size, max_custom_size)
++            if max_size == 0:
++                title = data['title']
++                logging.warning(
++                    f'Skipping record "{title}": Data size of {data_size} exceeds limit of {RECORD_MAX_DATA_LEN}'
++                )
++                return True
++
++            atta = ImportAttachment()
++            if max_field_size == max_size:
++                field_index = field_sizes.index(max_size)
++                field = data['fields'][field_index]
++                atta.name = field.get('label', field.get('type', 'unnamed_field')) + '.txt'
++                atta_data = field['value'][0].encode('utf-8')
++                field['value'][0] = f'This field is stored as attachment "{atta.name}" to avoid 32k record limit'
++                field_sizes[field_index] = 0
++            elif max_custom_size == max_size:
++                custom_index = custom_sizes.index(max_size)
++                field = data['custom'][custom_index]
++                atta.name = field.get('label', field.get('type', 'custom_field')) + '.txt'
++                atta_data = field['value'][0].encode('utf-8')
++                field['value'][0] = f'This field is stored as attachment "{atta.name}" to avoid 32k record limit'
++                custom_sizes[custom_index] = 0
++            else:  # note_size == max_size
++                atta.name = 'notes.txt'
++                atta_data = data['notes'].encode('utf-8')
++                data['notes'] = 'The notes field is stored as attachment "notes.txt" to avoid 32k record limit'
++                note_size = 0
++
++            def atta_open():
++                ret

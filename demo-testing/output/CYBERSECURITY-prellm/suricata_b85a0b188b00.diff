@@ -1,0 +1,111 @@
+@@ -26,6 +26,11 @@
+  */
+ 
+ #include "suricata-common.h"
++#include "util-fmemopen.h"
++
++#ifdef HAVE_LIBLZ4
++#include <lz4frame.h>
++#endif /* HAVE_LIBLZ4 */
+ 
+ #if defined(HAVE_DIRENT_H) && defined(HAVE_FNMATCH_H)
+ #define INIT_RING_BUFFER
+@@ -62,7 +67,7 @@
+ 
+ #define DEFAULT_LOG_FILENAME            "pcaplog"
+ #define MODULE_NAME                     "PcapLog"
+-#define MIN_LIMIT                       1 * 1024 * 1024
++#define MIN_LIMIT                       4 * 1024 * 1024
+ #define DEFAULT_LIMIT                   100 * 1024 * 1024
+ #define DEFAULT_FILE_LIMIT              0
+ 
+@@ -108,6 +113,26 @@ typedef struct PcapLogProfileData_ {
+ #define MAX_TOKS 9
+ #define MAX_FILENAMELEN 513
+ 
++enum PcapLogCompressionFormat {
++    PCAP_LOG_COMPRESSION_FORMAT_NONE,
++    PCAP_LOG_COMPRESSION_FORMAT_LZ4,
++};
++
++typedef struct PcapLogCompressionData_ {
++    enum PcapLogCompressionFormat format;
++    uint8_t *buffer;
++    uint64_t buffer_size;
++#ifdef HAVE_LIBLZ4
++    LZ4F_compressionContext_t lz4f_context;
++    LZ4F_preferences_t lz4f_prefs;
++#endif /* HAVE_LIBLZ4 */
++    FILE *file;
++    uint8_t *pcap_buf;
++    uint64_t pcap_buf_size;
++    FILE *pcap_buf_wrapper;
++    uint64_t bytes_in_block;
++} PcapLogCompressionData;
++
+ /**
+  * PcapLog thread vars
+  *
+@@ -145,11 +170,14 @@ typedef struct PcapLogData_ {
+     int use_ringbuffer;         /**< ring buffer mode enabled or disabled */
+     int timestamp_format;       /**< timestamp format sec or usec */
+     char *prefix;               /**< filename prefix */
++    const char *suffix;         /**< filename suffix */
+     char dir[PATH_MAX];         /**< pcap log directory */
+     int reported;
+     int threads;                /**< number of threads (only set in the global) */
+     char *filename_parts[MAX_TOKS];
+     int filename_part_cnt;
++
++    PcapLogCompressionData compression;
+ } PcapLogData;
+ 
+ typedef struct PcapLogThreadData_ {
+@@ -213,8 +241,24 @@ static int PcapLogCloseFile(ThreadVars *t, PcapLogData *pl)
+     if (pl != NULL) {
+         PCAPLOG_PROFILE_START;
+ 
+-        if (pl->pcap_dumper != NULL)
++        if (pl->pcap_dumper != NULL) {
+             pcap_dump_close(pl->pcap_dumper);
++#ifdef HAVE_LIBLZ4
++            PcapLogCompressionData *comp = &pl->compression;
++            if (comp->format == PCAP_LOG_COMPRESSION_FORMAT_LZ4) {
++                /* pcap_dump_close() has closed its output ``file'',
++                 * so we need to call fmemopen again. */
++
++                comp->pcap_buf_wrapper = SCFmemopen(comp->pcap_buf,
++                        comp->pcap_buf_size, "w");
++                if (comp->pcap_buf_wrapper == NULL) {
++                    SCLogError(SC_ERR_FOPEN, "SCFmemopen failed: %s",
++                            strerror(errno));
++                    return TM_ECODE_FAILED;
++                }
++            }
++#endif /* HAVE_LIBLZ4 */
++        }
+         pl->size_current = 0;
+         pl->pcap_dumper = NULL;
+ 
+@@ -222,6 +266,28 @@ static int PcapLogCloseFile(ThreadVars *t, PcapLogData *pl)
+             pcap_close(pl->pcap_dead_handle);
+         pl->pcap_dead_handle = NULL;
+ 
++#ifdef HAVE_LIBLZ4
++        PcapLogCompressionData *comp = &pl->compression;
++        if (comp->format == PCAP_LOG_COMPRESSION_FORMAT_LZ4) {
++            /* pcap_dump_close did not write any data because we call
++             * pcap_dump_flush() after every write when writing
++	     * compressed output. */
++            uint64_t bytes_written = LZ4F_compressEnd(comp->lz4f_context,
++                    comp->buffer, comp->buffer_size, NULL);
++            if (LZ4F_isError(bytes_written)) {
++                SCLogError(SC_ERR_PCAP_LOG_COMPRESS, "LZ4F_compressEnd: %s",
++                        LZ4F_getErrorName(bytes_written));
++                return TM_ECODE_FAILED;
++            }
++            if (fwrite(comp->buffer, 1, bytes_written, comp->file) < bytes_written) {
++                SCLogError(SC_ERR_FWRITE, "fwrite failed: %s", strerror(errno));
++                return TM_ECODE_FAILED;
++            }
++     

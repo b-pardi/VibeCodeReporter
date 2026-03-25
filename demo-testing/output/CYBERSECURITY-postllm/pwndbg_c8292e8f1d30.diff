@@ -1,0 +1,126 @@
+@@ -673,6 +673,7 @@ def load_commands() -> None:
+     import pwndbg.commands.mprotect
+     import pwndbg.commands.nearpc
+     import pwndbg.commands.next
++    import pwndbg.commands.onegadget
+     import pwndbg.commands.p2p
+     import pwndbg.commands.patch
+     import pwndbg.commands.peda
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,50 @@
++from __future__ import annotations
++
++import argparse
++import shutil
++
++import pwndbg.color.message as M
++import pwndbg.commands
++import pwndbg.gdblib.onegadget
++import pwndbg.glibc
++from pwndbg.commands import CommandCategory
++
++parser = argparse.ArgumentParser(
++    formatter_class=argparse.RawTextHelpFormatter,
++    description="""Show onegadget
++
++Examples:
++    onegadget
++    onegadget --show-unsat
++""",
++)
++parser.add_argument("--show-unsat", help="Show unsatisfiable gadgets.", action="store_true")
++parser.add_argument("--no-unknown", help="Do not show unknown gadgets.", action="store_true")
++parser.add_argument("-v", "--verbose", help="Show verbose output.", action="store_true")
++
++
++@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.LINUX)
++@pwndbg.commands.OnlyWithArch(["x86-64", "i386", "aarch64"])
++@pwndbg.commands.OnlyWhenRunning
++def onegadget(show_unsat: bool = False, no_unknown: bool = False, verbose: bool = False) -> None:
++    if not shutil.which("one_gadget"):
++        print(M.error("Could not find one_gadget. Please ensure it's installed and in $PATH."))
++        return
++
++    path = pwndbg.glibc.get_libc_filename_from_info_sharedlibrary()
++    if not path:
++        print(M.error("Could not find libc. Please ensure it's loaded."))
++        return
++    print(f"Using libc: {M.hint(path)}")
++    print()
++
++    gadgets_count = pwndbg.gdblib.onegadget.find_gadgets(show_unsat, no_unknown, verbose)
++    for result, count in gadgets_count.items():
++        print(f"Found {M.hint(count)} {result} gadgets.")
++    if not gadgets_count[pwndbg.gdblib.onegadget.SAT] and not show_unsat:
++        print(
++            M.warn(
++                "No valid gadgets found, you might want to run with --show-unsat again to check unsatisfiable gadgets.\n"
++                "To see why they are unsatisfiable, you might want to run with -v or --verbose."
++            )
++        )
+
+
+
+
+@@ -39,6 +39,7 @@ def load_gdblib() -> None:
+     import pwndbg.gdblib.hooks
+     import pwndbg.gdblib.kernel
+     import pwndbg.gdblib.memory
++    import pwndbg.gdblib.onegadget
+     import pwndbg.gdblib.prompt
+     import pwndbg.gdblib.regs as regs_mod
+     import pwndbg.gdblib.symbol
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,595 @@
++from __future__ import annotations
++
++import ctypes
++import hashlib
++import os
++import re
++import subprocess
++from enum import Enum
++
++import gdb
++from tabulate import tabulate
++
++import pwndbg.color.message as M
++import pwndbg.gdblib.arch
++import pwndbg.gdblib.file
++import pwndbg.gdblib.memory
++import pwndbg.gdblib.vmmap
++import pwndbg.glibc
++import pwndbg.lib.cache
++import pwndbg.lib.tempfile
++from pwndbg.color import colorize
++from pwndbg.color import generateColorFunction
++
++ADDRESS_WRITABLE_PATTERN = re.compile(r"address(?:es)? (.*) (?:is|are) writable")
++WRITABLE_COLON_PATTERN = re.compile(r"writable: (.*)")
++EQUAL_NULL_PATTERN = re.compile(r"(.*) == NULL")
++VALID_POSIX_SPAWN_FILE_ACTIONS_PATTERN = re.compile(r"(.*) <= 0")
++VALID_ARGV_PATTERN = re.compile(r"(.+) is a valid argv")
++VALID_ENVP_PATTERN = re.compile(r"(.+) is a valid envp")
++IS_ALIGNED_PATTERN = re.compile(r"(.+) & 0xf == (\d+)")
++IS_GOT_ADDRESS_PATTERN = re.compile(r"(.+) is the GOT address of libc")
++CAST_PATTERN = re.compile(r"^\([s|u]\d+\)")
++XMM_SHIFT = " >> "
++CONSTRAINT_SEPARATOR = " || "
++CAST_DEREF_MAPPING = {
++    "(u16)": pwndbg.gdblib.memory.u16,
++    "(s16)": pwndbg.gdblib.memory.s16,
++    "(u32)": pwndbg.gdblib.memory.u32,
++    "(s32)": pwndbg.gdblib.memory.s32,
++    "(u64)": pwndbg.gdblib.memory.u64,
++    "(s64)": pwndbg.gdblib.memory.s64,
++}
++CAST_MAPPING = {
++    "(u16)": lambda x: ctypes.c_uint16(x).valu

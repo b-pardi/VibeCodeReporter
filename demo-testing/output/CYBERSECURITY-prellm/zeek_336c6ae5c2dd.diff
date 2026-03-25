@@ -1,0 +1,146 @@
+@@ -4,30 +4,28 @@
+ 
+ #include "zeek/zeek-config.h"
+ 
++#include <errno.h>
++#include <netinet/in.h>
++#include <stdlib.h>
++#include <sys/select.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <sys/types.h>
++#include <unistd.h>
++#include <algorithm>
++#include <vector>
++
+ #ifdef TIME_WITH_SYS_TIME
+ #include <sys/time.h>
+ #include <time.h>
+-#else
+-#ifdef HAVE_SYS_TIME_H
++#elif defined(HAVE_SYS_TIME_H)
+ #include <sys/time.h>
+ #else
+ #include <time.h>
+ #endif
+-#endif
+ 
+-#include <errno.h>
+-#include <netinet/in.h>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <unistd.h>
+-#ifdef HAVE_MEMORY_H
+-#include <memory.h>
+-#endif
+-#include <stdlib.h>
+-#include <algorithm>
+-#include <vector>
++#include <ares.h>
++#include <ares_dns.h>
+ 
+ #include "zeek/3rdparty/doctest.h"
+ #include "zeek/DNS_Mapping.h"
+@@ -43,65 +41,116 @@
+ #include "zeek/ZeekString.h"
+ #include "zeek/iosource/Manager.h"
+ 
+-extern "C"
+-	{
+-	extern int select(int, fd_set*, fd_set*, fd_set*, struct timeval*);
++// Number of seconds we'll wait for a reply.
++constexpr int DNS_TIMEOUT = 5;
+ 
+-#include <netdb.h>
++namespace zeek::detail
++	{
+ 
+-#include "zeek/3rdparty/nb_dns.h"
++static void hostbyaddr_callback(void* arg, int status, int timeouts, struct hostent* hostent)
++	{
++	printf("host callback\n");
++	// TODO: implement this
++	// TODO: figure out how to get TTL info here
+ 	}
+ 
+-using namespace std;
++static void addrinfo_callback(void* arg, int status, int timeouts, struct ares_addrinfo* result)
++	{
++	printf("addrinfo callback\n");
+ 
+-namespace zeek::detail
++	if ( status != ARES_SUCCESS )
++		{
++		// TODO: error or something here, or just give up on it?
++		ares_freeaddrinfo(result);
++		return;
++		}
++
++	// TODO: the existing code doesn't handle hostname aliases at all. Should we?
++	// TODO: handle IPv6 mode
++
++	std::vector<in_addr*> addrs;
++	for ( ares_addrinfo_node* entry = result->nodes; entry != NULL; entry = entry->ai_next )
++		addrs.push_back(&reinterpret_cast<sockaddr_in*>(entry->ai_addr)->sin_addr);
++
++	// Push a null on the end so the addr list has a final point during later parsing.
++	addrs.push_back(NULL);
++
++	struct hostent he;
++	he.h_name = util::copy_string(result->name);
++	he.h_aliases = NULL;
++	he.h_addrtype = AF_INET;
++	he.h_length = sizeof(in_addr);
++	he.h_addr_list = reinterpret_cast<char**>(addrs.data());
++
++	auto req = reinterpret_cast<DNS_Mgr_Request*>(arg);
++	dns_mgr->AddResult(req, &he, result->nodes[0].ai_ttl);
++
++	delete[] he.h_name;
++
++	ares_freeaddrinfo(result);
++	}
++
++static void ares_sock_cb(void* data, int s, int read, int write)
+ 	{
++	printf("Change state fd %d read:%d write:%d\n", s, read, write);
++	if ( read == 1 )
++		iosource_mgr->RegisterFd(s, reinterpret_cast<DNS_Mgr*>(data));
++	else
++		iosource_mgr->UnregisterFd(s, reinterpret_cast<DNS_Mgr*>(data));
++	}
+ 
+ class DNS_Mgr_Request
+ 	{
+ public:
+ 	DNS_Mgr_Request(const char* h, int af, bool is_txt)
+-		: host(util::copy_string(h)), fam(af), qtype(is_txt ? 16 : 0), addr(), request_pending()
++		: host(util::copy_string(h)), fam(af), qtype(is_txt ? 16 : 0), addr()
+ 		{
+ 		}
+ 
+-	DNS_Mgr_Request(const IPAddr& a) : host(), fam(), qtype(), addr(a), request_pending() { }
++	DNS_Mgr_Request(const IPAddr& a) : addr(a) { }
+ 
+ 	~DNS_Mgr_Request() { delete[] host; }
+ 
+ 	// Returns nil if this was an address request.
+ 	const char* ReqHost() const { return host; }
+ 	const IPAddr& ReqAddr() const { return addr; }
++	int Family() const { return fam; }
+ 	bool ReqIsTxt() const { return qtype == 16; }
+ 
+-	int MakeRequest(nb_dns_info* nb_dns);
+-	int RequestPending() const { return request_pending; }
+-	void RequestDone() { request_pending = 0; }
++	void MakeRequest(ares_channel channel);
++
++	bool RequestPending() const { return request_pending; }
++	void RequestDone() { request_pending = false; }
+ 
+ protected:
+-	char* host; // if non-nil, this is a host request
+-	int fam; // address family query type for host requests
+-	int qtype; // Query type
++	char* host = nullptr; // if non-nil, this is a host request
++	int

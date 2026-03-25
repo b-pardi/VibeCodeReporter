@@ -1,0 +1,144 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,821 @@
++/* radare2 - LGPL - Copyright 2025 - Analysis plugin for Solana BPF */
++
++#include <r_anal.h>
++#include <r_lib.h>
++#include <r_bin.h>
++#include <r_util.h>
++#include <r_cons.h>
++#include <r_flag.h>
++#include <r_util/r_new_rbtree.h>
++
++#define SBPF_PROGRAM_ADDR 	0x100000000ULL
++#define SBPF_MAX_STRING_SIZE 0x100
++#define SBPF_COMMENT_SIZE 512
++
++typedef struct {
++	ut64 addr;
++	ut64 xref_addr;
++	bool is_pointer; // true if this is a pointer to a string structure
++	ut32 size; // for string pointers, this holds the size from the structure
++} SbpfStringRef;
++
++static bool sbpf_analyze_strings(RAnal *anal);
++
++static int sbpf_string_ref_cmp(const void *a, const void *b) {
++	const SbpfStringRef *sa = (const SbpfStringRef *)a;
++	const SbpfStringRef *sb = (const SbpfStringRef *)b;
++	if (sa->addr < sb->addr) {
++		return -1;
++	}
++	if (sa->addr > sb->addr) {
++		return 1;
++	}
++	return 0;
++}
++
++static bool is_printable_string(const ut8 *buf, ut32 size) {
++	if (size < 1) {
++		return false;
++	}
++
++	ut32 i;
++	ut32 printable_count = 0;
++
++	for (i = 0; i < size; i++) {
++		// Allow null terminator at the end
++		if (i == size - 1 && buf[i] == 0) {
++			return printable_count > 0;
++		}
++
++		// Check if character is printable ASCII or common whitespace
++		if ((buf[i] >= 0x20 && buf[i] <= 0x7e) ||
++		    buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r') {
++			printable_count++;
++		} else if (buf[i] != 0) {
++			return false;
++		}
++	}
++
++	return printable_count > 0;
++}
++
++// Check if a pointer points to a string structure (string ptr at +0, size at +8)
++static bool sbpf_check_string_pointer(RAnal *anal, ut64 ptr_addr, ut64 data_start, ut64 data_end, ut64 *out_str_addr, ut32 *out_str_size) {
++	R_RETURN_VAL_IF_FAIL (anal && anal->iob.io, false);
++
++	// First check if the address itself could be a direct string
++	ut8 struct_buf[16];
++	if (!anal->iob.read_at (anal->iob.io, ptr_addr, struct_buf, 16)) {
++		return false;
++	}
++
++	// Check if the first 4 bytes look like printable ASCII
++	int ascii_count = 0;
++	int i;
++	for (i = 0; i < 4; i++) {
++		if (struct_buf[i] >= 0x20 && struct_buf[i] <= 0x7e) {
++			ascii_count++;
++		}
++	}
++
++	// If the first 4 bytes are all printable ASCII, this is definitely a direct string
++	if (ascii_count == 4) {
++		R_LOG_DEBUG ("Rejecting string pointer at 0x%"PFMT64x": first 4 bytes are ASCII", ptr_addr);
++		return false;
++	}
++
++	// Get string pointer from offset 0
++	ut64 str_ptr = r_read_le64 (struct_buf);
++	// Get size from offset 8
++	ut64 size = r_read_le64 (struct_buf + 8);
++
++	// Validate size is reasonable (but not too small, and not a typical pointer value)
++	if (size == 0 || size > 0x100) {
++		return false;
++	}
++
++	// Check if string pointer is in data segment
++	if (str_ptr < data_start || str_ptr >= data_end) {
++		return false;
++	}
++
++	// Try to read the actual string to verify it's printable
++	ut8 sample[0x100];
++	ut32 sample_size = (size < 0x100) ? size : 0x100;
++	if (!anal->iob.read_at (anal->iob.io, str_ptr, sample, sample_size)) {
++		return false;
++	}
++	// Check if it's a printable string
++	if (!is_printable_string (sample, sample_size)) {
++		return false;
++	}
++	if (out_str_addr) {
++		*out_str_addr = str_ptr;
++	}
++	if (out_str_size) {
++		*out_str_size = (ut32)size;
++	}
++	R_LOG_DEBUG ("Found string pointer at 0x%"PFMT64x": size=%u, str_ptr=0x%"PFMT64x,
++	             ptr_addr, (ut32)size, str_ptr);
++
++	return true;
++}
++
++static RList *sbpf_find_string_xrefs(RAnal *anal, ut64 from, ut64 to, ut64 data_start, ut64 data_end) {
++	R_RETURN_VAL_IF_FAIL (anal && anal->iob.io, NULL);
++
++	RList *refs = r_list_new ();
++	if (!refs) {
++		return NULL;
++	}
++
++	R_LOG_DEBUG ("Looking for references to data segment 0x%"PFMT64x" - 0x%"PFMT64x, data_start, data_end);
++
++	// LDDW instructions are 16 bytes but can appear at any 8-byte alignment
++	ut64 addr;
++	ut8 buf[24]; // Read extra to handle unaligned reads
++
++	for (addr = from; addr < to - 15; addr++) {
++		if (!anal->iob.read_at (anal->iob.io, 

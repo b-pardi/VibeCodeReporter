@@ -1,0 +1,87 @@
+@@ -533,6 +533,10 @@ uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *bytes, size_t size);
+         we will emulate the code in infinite time, until the code is finished.
+  @count: the number of instructions to be emulated. When this value is 0,
+         we will emulate all the code available, until the code is finished.
++  
++ NOTE: The internal states of the engine is guranteed to be correct if and only
++       if uc_emu_start returns without any errors or errors have been handled in
++       the callbacks.
+ 
+  @return UC_ERR_OK on success, or other value on failure (refer to uc_err enum
+    for detailed error).
+
+
+
+
+@@ -327,17 +327,31 @@ static tcg_target_ulong cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr)
+          * or timer mode is in effect, since these already fix the PC.
+          */
+         if (!HOOK_EXISTS(env->uc, UC_HOOK_CODE) && !env->uc->timeout) {
+-            if (cc->synchronize_from_tb) {
+-                // avoid sync twice when helper_uc_tracecode() already did this.
+-                if (env->uc->emu_counter <= env->uc->emu_count &&
+-                        !env->uc->stop_request && !env->uc->quit_request)
+-                    cc->synchronize_from_tb(cpu, tb);
+-            } else {
+-                assert(cc->set_pc);
+-                // avoid sync twice when helper_uc_tracecode() already did this.
+-                if (env->uc->emu_counter <= env->uc->emu_count &&
+-                        !env->uc->stop_request && !env->uc->quit_request)
+-                    cc->set_pc(cpu, tb->pc);
++            // We should sync pc for R/W error.
++            switch (env->invalid_error) {
++                case UC_ERR_WRITE_PROT:
++                case UC_ERR_READ_PROT:
++                case UC_ERR_FETCH_PROT:
++                case UC_ERR_WRITE_UNMAPPED:
++                case UC_ERR_READ_UNMAPPED:
++                case UC_ERR_FETCH_UNMAPPED:
++                case UC_ERR_WRITE_UNALIGNED:
++                case UC_ERR_READ_UNALIGNED:
++                case UC_ERR_FETCH_UNALIGNED:
++                    break;
++                default:
++                    if (cc->synchronize_from_tb) {
++                        // avoid sync twice when helper_uc_tracecode() already did this.
++                        if (env->uc->emu_counter <= env->uc->emu_count &&
++                                !env->uc->stop_request && !env->uc->quit_request)
++                            cc->synchronize_from_tb(cpu, tb);
++                    } else {
++                        assert(cc->set_pc);
++                        // avoid sync twice when helper_uc_tracecode() already did this.
++                        if (env->uc->emu_counter <= env->uc->emu_count &&
++                                !env->uc->stop_request && !env->uc->quit_request)
++                            cc->set_pc(cpu, tb->pc);
++                    }
+             }
+         }
+     }
+
+
+
+
+@@ -15,6 +15,7 @@
+ #define X86_CODE32_LOOP "\x41\x4a\xeb\xfe" // INC ecx; DEC edx; JMP self-loop
+ #define X86_CODE32_MEM_WRITE "\x89\x0D\xAA\xAA\xAA\xAA\x41\x4a" // mov [0xaaaaaaaa], ecx; INC ecx; DEC edx
+ #define X86_CODE32_MEM_READ "\x8B\x0D\xAA\xAA\xAA\xAA\x41\x4a" // mov ecx,[0xaaaaaaaa]; INC ecx; DEC edx
++#define X86_CODE32_MEM_READ_IN_TB "\x40\x8b\x1d\x00\x00\x10\x00\x42" // inc eax; mov ebx, [0x100000]; inc edx
+ 
+ #define X86_CODE32_JMP_INVALID "\xe9\xe9\xee\xee\xee\x41\x4a" //  JMP outside; INC ecx; DEC edx
+ #define X86_CODE32_INOUT "\x41\xE4\x3F\x4a\xE6\x46\x43" // INC ecx; IN AL, 0x3f; DEC edx; OUT 0x46, AL; INC ebx
+@@ -81,6 +82,14 @@ static bool hook_mem_invalid(uc_engine *uc, uc_mem_type type,
+     }
+ }
+ 
++// dummy callback
++static bool hook_mem_invalid_dummy(uc_engine *uc, uc_mem_type type,
++        uint64_t address, int size, int64_t value, void *user_data)
++{
++    // Stop emulation.
++    return false;
++}
++
+ static void hook_mem64(uc_engine *uc, uc_mem_type type,
+         uint64_t address, int size, int64_t value, void *user_data)
+ {
+@@ -1026,6 +1035,63 @@ static void test_x86_16(void)
+     uc_clo

@@ -1,0 +1,108 @@
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,42 @@
++from prowler.lib.check.models import Check, Check_Report_AWS
++from prowler.providers.aws.services.ec2.ec2_client import ec2_client
++
++
++class ec2_launch_template_imdsv2_required(Check):
++    def execute(self):
++        findings = []
++        for template in ec2_client.launch_templates:
++            report = Check_Report_AWS(self.metadata())
++            report.region = template.region
++            report.resource_id = template.id
++            report.resource_arn = template.arn
++            report.resource_tags = template.tags
++
++            versions_with_imdsv2_required = []
++            versions_with_metadata_disabled = []
++            versions_with_no_imdsv2 = []
++
++            for version in template.versions:
++                if (
++                    version.template_data.http_endpoint == "enabled"
++                    and version.template_data.http_tokens == "required"
++                ):
++                    versions_with_imdsv2_required.append(str(version.version_number))
++                elif version.template_data.http_endpoint == "disabled":
++                    versions_with_metadata_disabled.append(str(version.version_number))
++                else:
++                    versions_with_no_imdsv2.append(str(version.version_number))
++
++            if versions_with_imdsv2_required:
++                report.status = "PASS"
++                report.status_extended = f"EC2 Launch Template {template.name} has IMDSv2 enabled and required in the following versions: {', '.join(versions_with_imdsv2_required)}."
++            elif versions_with_metadata_disabled:
++                report.status = "PASS"
++                report.status_extended = f"EC2 Launch Template {template.name} has metadata service disabled in the following versions: {', '.join(versions_with_metadata_disabled)}."
++            else:
++                report.status = "FAIL"
++                report.status_extended = f"EC2 Launch Template {template.name} has IMDSv2 disabled or not required in the following versions: {', '.join(versions_with_no_imdsv2)}."
++
++            findings.append(report)
++
++        return findings
+
+
+
+
+@@ -10,7 +10,6 @@ from prowler.lib.scan_filters.scan_filters import is_resource_filtered
+ from prowler.providers.aws.lib.service.service import AWSService
+ 
+ 
+-################## EC2
+ class EC2(AWSService):
+     def __init__(self, provider):
+         # Call AWSService's __init__
+@@ -569,6 +568,12 @@ class EC2(AWSService):
+                                 ),
+                                 network_interfaces=enis,
+                                 associate_public_ip_address=associate_public_ip,
++                                http_tokens=template_version["LaunchTemplateData"]
++                                .get("MetadataOptions", {})
++                                .get("HttpTokens", ""),
++                                http_endpoint=template_version["LaunchTemplateData"]
++                                .get("MetadataOptions", {})
++                                .get("HttpEndpoint", ""),
+                             ),
+                         )
+                     )
+@@ -763,6 +768,8 @@ class TemplateData(BaseModel):
+     user_data: str
+     network_interfaces: Optional[list[NetworkInterface]]
+     associate_public_ip_address: Optional[bool]
++    http_tokens: Optional[str]
++    http_endpoint: Optional[str]
+ 
+ 
+ class LaunchTemplateVersion(BaseModel):
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,195 @@
++from unittest import mock
++
++import botocore
++from boto3 import client
++from moto import mock_aws
++
++from tests.providers.aws.utils import AWS_REGION_US_EAST_1, set_mocked_aws_provider
++
++make_api_call = botocore.client.BaseClient._make_api_call
++
++
++def mock_make_api_call(self, operation_name, kwarg):
++    if operation_name == "DescribeLaunchTemplateVersions":
++        return {
++            "LaunchTemplateVersions": [
++                {
++                    "VersionNumber": 1,
++        

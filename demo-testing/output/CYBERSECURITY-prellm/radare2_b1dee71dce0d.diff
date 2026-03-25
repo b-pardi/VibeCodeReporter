@@ -1,0 +1,142 @@
+@@ -177,6 +177,14 @@ static RList *zign_types_to_list(RAnal *a, char *types) {
+ 	return ret;
+ }
+ 
++static void bytes_sig_free(RSignBytes *bytes) {
++	if (bytes) {
++		free (bytes->bytes);
++		free (bytes->mask);
++		free (bytes);
++	}
++}
++
+ R_API bool r_sign_deserialize(RAnal *a, RSignItem *it, const char *k, const char *v) {
+ 	char *refs = NULL;
+ 	char *vars = NULL;
+@@ -325,7 +333,7 @@ R_API bool r_sign_deserialize(RAnal *a, RSignItem *it, const char *k, const char
+ 			// allocate
+ 			size = atoi (token);
+ 			if (size > 0) {
+-				free (it->bytes);
++				bytes_sig_free (it->bytes);
+ 				it->bytes = R_NEW0 (RSignBytes);
+ 				if (!it->bytes) {
+ 					goto out;
+@@ -517,11 +525,7 @@ static void mergeItem(RSignItem *dst, RSignItem *src) {
+ 	char *ref, *var, *type;
+ 
+ 	if (src->bytes) {
+-		if (dst->bytes) {
+-			free (dst->bytes->bytes);
+-			free (dst->bytes->mask);
+-			free (dst->bytes);
+-		}
++		bytes_sig_free (dst->bytes);
+ 		dst->bytes = R_NEW0 (RSignBytes);
+ 		if (!dst->bytes) {
+ 			return;
+@@ -530,14 +534,13 @@ static void mergeItem(RSignItem *dst, RSignItem *src) {
+ 		dst->bytes->size = src->bytes->size;
+ 		dst->bytes->bytes = malloc (src->bytes->size);
+ 		if (!dst->bytes->bytes) {
+-			free (dst->bytes);
++			bytes_sig_free (dst->bytes);
+ 			return;
+ 		}
+ 		memcpy (dst->bytes->bytes, src->bytes->bytes, src->bytes->size);
+ 		dst->bytes->mask = malloc (src->bytes->size);
+ 		if (!dst->bytes->mask) {
+-			free (dst->bytes->bytes);
+-			free (dst->bytes);
++			bytes_sig_free (dst->bytes);
+ 			return;
+ 		}
+ 		memcpy (dst->bytes->mask, src->bytes->mask, src->bytes->size);
+@@ -604,7 +607,7 @@ static void mergeItem(RSignItem *dst, RSignItem *src) {
+ 	}
+ }
+ 
+-static bool addItem(RAnal *a, RSignItem *it) {
++R_API bool r_sign_anal_additem(RAnal *a, RSignItem *it) {
+ 	char key[R_SIGN_KEY_MAXSZ], val[R_SIGN_VAL_MAXSZ];
+ 	const char *curval = NULL;
+ 	bool retval = true;
+@@ -654,7 +657,7 @@ static bool addHash(RAnal *a, const char *name, int type, const char *val) {
+ 	switch (type) {
+ 	case R_SIGN_BBHASH:
+ 		it->hash->bbhash = strdup (val);
+-		retval = addItem (a, it);
++		retval = r_sign_anal_additem (a, it);
+ 		r_sign_item_free (it);
+ 		break;
+ 	}
+@@ -672,19 +675,11 @@ static bool addBBHash(RAnal *a, RAnalFunction *fcn, const char *name) {
+ 	if (!it->name) {
+ 		goto beach;
+ 	}
+-	it->hash = R_NEW0 (RSignHash);
+ 	it->space = r_spaces_current (&a->zign_spaces);
+-	if (!it->hash) {
+-		goto beach;
+-	}
+ 
+-	char *digest_hex = r_sign_calc_bbhash (a, fcn);
+-	if (!digest_hex) {
+-		free (digest_hex);
+-		goto beach;
++	if (r_sign_addto_item (a, it, fcn, R_SIGN_BBHASH)) {
++		retval = r_sign_anal_additem (a, it);
+ 	}
+-	it->hash->bbhash = digest_hex;
+-	retval = addItem (a, it);
+ beach:
+ 	r_sign_item_free (it);
+ 	return retval;
+@@ -724,16 +719,13 @@ static bool addBytes(RAnal *a, const char *name, ut64 size, const ut8 *bytes, co
+ 		goto fail;
+ 	}
+ 	memcpy (it->bytes->mask, mask, size);
+-	retval = addItem (a, it);
++	retval = r_sign_anal_additem (a, it);
+ 	r_sign_item_free (it);
+ 	return retval;
+ fail:
+ 	if (it) {
+ 		free (it->name);
+-		if (it->bytes) {
+-			free (it->bytes->bytes);
+-			free (it->bytes);
+-		}
++		bytes_sig_free (it->bytes);
+ 	}
+ 	free (it);
+ 	return false;
+@@ -774,6 +766,142 @@ R_API bool r_sign_add_anal(RAnal *a, const char *name, ut64 size, const ut8 *byt
+ 	return retval;
+ }
+ 
++static RSignGraph *r_sign_fcn_graph(RAnalFunction *fcn) {
++	r_return_val_if_fail (fcn, false);
++	RSignGraph *graph = R_NEW0 (RSignGraph);
++	if (graph) {
++		graph->cc = r_anal_function_complexity (fcn),
++		graph->nbbs = r_list_length (fcn->bbs);
++		graph->edges = r_anal_function_count_edges (fcn, &graph->ebbs);
++		graph->bbsum = r_anal_function_realsize (fcn);
++	}
++	return graph;
++}
++
++static int bb_sort_by_addr(const void *x, const void *y) {
++	RAnalBlock *a = (RAnalBlock *)x;
++	RAnalBlock *b = (RAnalBlock *)y;
++	if (a->addr > b->addr) {
++		return 1;
++	}
++	if (a->addr < b->addr) {
++		return -1;
++	}
++	return 0;
++}
++
++static RSignBytes *r_sign_fcn_bytes(RAnal *a, RAnalFunction *fcn) {

@@ -1,0 +1,99 @@
+@@ -430,6 +430,8 @@ class Packet(
+         clone.payload.add_underlayer(clone)
+         clone.time = self.time
+         clone.comment = self.comment
++        clone.direction = self.direction
++        clone.sniffed_on = self.sniffed_on
+         return clone
+ 
+     def _resolve_alias(self, attr):
+@@ -1140,6 +1142,8 @@ class Packet(
+         )
+         pkt.wirelen = self.wirelen
+         pkt.comment = self.comment
++        pkt.sniffed_on = self.sniffed_on
++        pkt.direction = self.direction
+         if payload is not None:
+             pkt.add_payload(payload)
+         return pkt
+
+
+
+
+@@ -1550,14 +1550,14 @@ class RawPcapNgReader(RawPcapReader):
+     PacketMetadata = collections.namedtuple("PacketMetadataNg",  # type: ignore
+                                             ["linktype", "tsresol",
+                                              "tshigh", "tslow", "wirelen",
+-                                             "comment"])
++                                             "comment", "ifname", "direction"])
+ 
+     def __init__(self, filename, fdesc=None, magic=None):  # type: ignore
+         # type: (str, IO[bytes], bytes) -> None
+         self.filename = filename
+         self.f = fdesc
+         # A list of (linktype, snaplen, tsresol); will be populated by IDBs.
+-        self.interfaces = []  # type: List[Tuple[int, int, int]]
++        self.interfaces = []  # type: List[Tuple[int, int, Dict[str, Any]]]
+         self.default_options = {
+             "tsresol": 1000000
+         }
+@@ -1600,6 +1600,7 @@ class RawPcapNgReader(RawPcapReader):
+         try:
+             blocklen = struct.unpack(self.endian + "I", self.f.read(4))[0]
+         except struct.error:
++            warning("PcapNg: Error reading blocklen before block body")
+             raise EOFError
+         if blocklen < 12:
+             warning("Invalid block length !")
+@@ -1621,10 +1622,12 @@ class RawPcapNgReader(RawPcapReader):
+                                          self.f.read(4))[0]:
+                 raise EOFError("PcapNg: Invalid pcapng block (bad blocklen)")
+         except struct.error:
++            warning("PcapNg: Could not read blocklen after block body")
+             raise EOFError
+ 
+     def _read_block_shb(self):
+         # type: () -> None
++        """Section Header Block"""
+         _blocklen = self.f.read(4)
+         endian = self.f.read(4)
+         if endian == b"\x1a\x2b\x3c\x4d":
+@@ -1636,10 +1639,21 @@ class RawPcapNgReader(RawPcapReader):
+             raise EOFError
+ 
+         blocklen = struct.unpack(self.endian + "I", _blocklen)[0]
+-        if blocklen < 16:
+-            warning("Invalid SHB block length!")
++        if blocklen < 28:
++            warning(f"Invalid SHB block length ({blocklen})!")
++            raise EOFError
++
++        # Major version must be 1
++        _major = self.f.read(2)
++        major = struct.unpack(self.endian + "H", _major)[0]
++        if major != 1:
++            warning(f"SHB Major version {major} unsupported !")
+             raise EOFError
+-        options = self.f.read(blocklen - 16)
++
++        # Skip minor version & section length
++        self.f.read(10)
++
++        options = self.f.read(blocklen - 28)
+         self._read_block_tail(blocklen)
+         self._read_options(options)
+ 
+@@ -1656,24 +1670,16 @@ class RawPcapNgReader(RawPcapReader):
+                 return res
+ 
+     def _read_options(self, options):
+-        # type: (bytes) -> Dict[str, Any]
+-        """Section Header Block"""
+-        opts = self.default_options.copy()  # type: Dict[str, Any]
++        # type: (bytes) -> Dict[int, bytes]
++        opts = dict()
+         while len(options) >= 4:
+             code, length = struct.unpack(self.endian + "HH", options[:4])
+-            # PCAP Next Generation (pcapng) Capture File Format
+-            # 4.2. - Interface Description Block
+-            # http://xml2rfc.tools.ietf.org/cgi-bin/xml2rfc.cgi?url=https://raw.githubusercontent.com/pcapng/pcapng/master/draft-tuexen-opsawg-pcapng.xml&modeAsFormat=html/ascii&

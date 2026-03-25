@@ -1,0 +1,106 @@
+@@ -28,6 +28,7 @@ try:
+ except ImportError:
+     # fallback to dict for Python 2.6
+     OrderedDict = dict
++from copy import deepcopy
+ import datetime
+ import json
+ import os
+@@ -61,6 +62,7 @@ class MongoDB(DB):
+     schema_migrations_indexes = {}
+     schema_latest_versions = {}
+     needunwind = []
++    ipaddr_fields = []
+ 
+     def __init__(self, host, dbname,
+                  username=None, password=None, mechanism=None,
+@@ -183,6 +185,31 @@ class MongoDB(DB):
+                 self._find_one = _find_one
+             return self._find_one
+ 
++    def _get_cursor(self, column, flt, **kargs):
++        """Like .get(), but returns a MongoDB cursor (suitable for use with
++e.g.  .explain()) based on the column and a filter.
++
++        """
++        if "fields" in kargs and any(fld in kargs["fields"]
++                                     for fld in self.ipaddr_fields):
++            fields = []
++            for fld in kargs["fields"]:
++                if fld in self.ipaddr_fields:
++                    fields.extend(['%s_0' % fld, '%s_1' % fld])
++                else:
++                    fields.append(fld)
++            kargs["fields"] = fields
++        if "sort" in kargs and any(fld in (field for field, _ in kargs["sort"])
++                                   for fld in self.ipaddr_fields):
++            sort = []
++            for fld, way in kargs["sort"]:
++                if fld in self.ipaddr_fields:
++                    sort.extend([('%s_0' % fld, way), ('%s_1' % fld, way)])
++                else:
++                    sort.append((fld, way))
++            kargs["sort"] = sort
++        return self.set_limits(self.find(column, flt, **kargs))
++
+     def count(self, *args, **kargs):
+         return self._get(*args, **kargs).count()
+ 
+@@ -335,7 +362,8 @@ class MongoDB(DB):
+             pipeline += [{"$limit": topnbr}]
+         return pipeline
+ 
+-    def _distinct(self, field, flt=None, sort=None, limit=None, skip=None):
++    def _distinct_pipeline(self, field, flt=None, sort=None, limit=None,
++                           skip=None, is_ipfield=False):
+         """This method makes use of the aggregation framework to
+         produce distinct values for a given field.
+ 
+@@ -356,9 +384,32 @@ class MongoDB(DB):
+             subfield = field.rsplit('.', i)[0]
+             if subfield in self.needunwind:
+                 pipeline += [{"$unwind": "$" + subfield}]
++        if is_ipfield:
++            pipeline.append(
++                {'$project': {field: ['$%s_0' % field, '$%s_1' % field]}}
++            )
+         pipeline.append({'$group': {'_id': '$%s' % field}})
+         return pipeline
+ 
++    def _distinct(self, column, field, flt=None, sort=None, limit=None,
++                  skip=None):
++        """This method makes use of the aggregation framework to
++        produce distinct values for a given field in a given column.
++
++        """
++        is_ipfield = field in self.ipaddr_fields
++        cursor = self.set_limits(
++            self.db[column].aggregate(
++                self._distinct_pipeline(field, flt=flt, sort=sort, limit=limit,
++                                        skip=skip, is_ipfield=is_ipfield),
++                cursor={}
++            )
++        )
++        if is_ipfield:
++            return (None if res['_id'][0] is None else res['_id']
++                    for res in cursor)
++        return (res['_id'] for res in cursor)
++
+     # filters
+     flt_empty = {}
+ 
+@@ -441,12 +492,15 @@ class MongoDB(DB):
+ 
+         """
+         addr = cls.ip2internal(addr)
+-        return {'addr': {'$ne': addr} if neg else addr}
++        if neg:
++            return {'$or': [{'addr_0': {'$ne': addr[0]}},
++                            {'addr_1': {'$ne': addr[1]}}]}
++        return {'addr_0': addr[0], 'addr_1': addr[1]}
+ 
+     @classmethod
+     def searchhosts(cls, hosts, neg=False):
+-        return {'addr': {'$nin' if neg else '$in': [cls.ip2internal(host)
+-                                                    for host in hosts]}}
++        return {

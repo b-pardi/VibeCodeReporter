@@ -1,0 +1,121 @@
+@@ -114,6 +114,10 @@ def register_commands(commands, aliases, command_info):
+     commands['2fa'] = TwoFaCommand()
+     command_info['2fa'] = '2FA management'
+ 
++    from . import device_management
++    device_management.register_commands(commands)
++    device_management.register_command_info(aliases, command_info)
++
+     if sys.version_info.major == 3 and sys.version_info.minor >= 10 and (utils.is_windows_11() or sys.platform == 'darwin'):
+         from ..biometric import BiometricCommand
+         commands['biometric'] = BiometricCommand()
+@@ -164,6 +168,10 @@ def register_enterprise_commands(commands, aliases, command_info):
+     commands['risk-management'] = RiskManagementReportCommand()
+     command_info['risk-management'] = 'Risk Management Reports'
+     aliases['rmd'] = 'risk-management'
++    
++    from . import device_management
++    device_management.register_enterprise_commands(commands)
++    device_management.register_enterprise_command_info(aliases, command_info)
+ 
+ 
+ def register_msp_commands(commands, aliases, command_info):
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1401 @@
++#  _  __
++# | |/ /___ ___ _ __  ___ _ _ ®
++# | ' </ -_) -_) '_ \/ -_) '_|
++# |_|\_\___\___| .__/\___|_|
++#              |_|
++#
++# Keeper Commander
++# Copyright 2025 Keeper Security Inc.
++# Contact: ops@keepersecurity.com
++#
++
++import argparse
++import json
++import logging
++import re
++from abc import ABC, abstractmethod
++from datetime import datetime
++from typing import Optional, Any, List, Dict, Union, Tuple
++
++from .. import api, utils
++from ..proto import DeviceManagement_pb2, APIRequest_pb2
++from .base import Command, dump_report_data
++from ..display import bcolors
++from ..params import KeeperParams
++from ..error import KeeperApiError
++
++
++class DeviceManagementError(Exception):
++    """Base exception for device management operations."""
++    pass
++
++
++class InvalidDeviceIdentifierError(DeviceManagementError):
++    """Raised when a device identifier is invalid or malformed."""
++    pass
++
++
++class DeviceNotFoundError(DeviceManagementError):
++    """Raised when a specified device cannot be found."""
++    pass
++
++
++class ValidationError(DeviceManagementError):
++    """Raised when input validation fails."""
++    pass
++
++
++class DeviceInputValidator:
++    """Centralized input validation and sanitization for device management."""
++    
++    @staticmethod
++    def validate_device_identifier(identifier: str) -> bool:
++        """Validate device identifier for security and format."""
++        if not isinstance(identifier, str):
++            return False
++        if not identifier or not identifier.strip():
++            return False
++        if re.search(r'[<>"\'\x00-\x1f\x7f-\x9f]', identifier):
++            return False
++        return True
++    
++    @staticmethod
++    def sanitize_device_name(name: str) -> str:
++        """Sanitize device name by removing dangerous characters."""
++        if not isinstance(name, str):
++            return ""
++        sanitized = re.sub(r'[<>"\'\x00-\x1f\x7f-\x9f]', '', name)
++        return sanitized.strip()
++    
++    @staticmethod
++    def validate_enterprise_user_id(user_id: Any) -> bool:
++        """Validate enterprise user ID."""
++        if not isinstance(user_id, int):
++            try:
++                user_id = int(user_id)
++            except (ValueError, TypeError):
++                return False
++        return user_id >= 1
++    
++    @staticmethod
++    def validate_action(action: str) -> bool:
++        """Validate action name."""
++        if not isinstance(action, str):
++            return False
++        if not action or not action.strip():
++            return False
++        return bool(re.match(r'^[a-z0-9-]+$', action.strip().lower()))
++    
++    @staticmethod
++    def validate_device_identifiers_list(identifiers: List[str]) -> List[str]:
++        """Validate and filter a list of device identifiers."""
++        if not isinstance(identifiers, list):
++            raise ValidationError("Device identifiers must

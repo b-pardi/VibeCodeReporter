@@ -1,0 +1,102 @@
+@@ -1097,19 +1097,17 @@ static const sslKeyUpdateReadEpochTV_t sslKeyUpdateReadEpochTV[26] = {
+ };
+ 
+ TEST_F(TlsConnectDatagram13, DTLS_EpochReconstruction) {
+-  ssl3CipherSpec* current_spec =
+-      (ssl3CipherSpec*)malloc(sizeof(ssl3CipherSpec));
+-  current_spec->version = SSL_LIBRARY_VERSION_TLS_1_3;
+-  PRUint8 header = 0x20;
++  PRUint8 header[5] = {0};
++  header[0] = 0x20;
++  DTLSEpoch epoch;
+ 
+   for (size_t i = 0; i < 26; i++) {
+-    current_spec->epoch = sslKeyUpdateReadEpochTV[i].epoch;
+-    header = (header & 0xfc) | (sslKeyUpdateReadEpochTV[i].header & 0x3);
++    epoch = sslKeyUpdateReadEpochTV[i].epoch;
++    header[0] = (header[0] & 0xfc) | (sslKeyUpdateReadEpochTV[i].header & 0x3);
++    // ReadEpoch (dtlscon.c#1339) uses only spec->version and spec->epoch.
+     ASSERT_EQ(sslKeyUpdateReadEpochTV[i].expected_reconstructed_epoch,
+-              dtls_ReadEpoch(current_spec, &header));
++              dtls_ReadEpoch(SSL_LIBRARY_VERSION_TLS_1_3, epoch, header));
+   }
+-
+-  free(current_spec);
+ }
+ 
+ // RFC 9147. A.2. Handshake Protocol
+@@ -1262,6 +1260,10 @@ class TLSACKDamager : public TlsRecordFilter {
+       return KEEP;
+     }
+ 
++    if (plaintext.data() == NULL || plaintext.len() == 0) {
++      return KEEP;
++    }
++
+     if (decrypting() && inner_content_type != ssl_ct_ack) {
+       return KEEP;
+     }
+@@ -1276,6 +1278,11 @@ class TLSACKDamager : public TlsRecordFilter {
+     EXPECT_EQ((uint64_t)0, acks % ack_message_len_one_ACK);
+     acks = acks / ack_message_len_one_ACK;
+ 
++    if (plaintext.len() <= ack_message_header_len + offset_ +
++                               (acks - 1) * ack_message_len_one_ACK) {
++      return KEEP;
++    }
++
+     for (size_t i = 0; i < acks; i++) {
+       // Here we replace the offset_-th byte after the header
+       // i.e. headerAck + ACK(0) + ACK(1) <-- the offset_-th byte
+
+
+
+
+@@ -1335,16 +1335,16 @@ dtls_IsDtls13Ciphertext(SSL3ProtocolVersion version, PRUint8 firstOctet)
+ }
+ 
+ DTLSEpoch
+-dtls_ReadEpoch(const ssl3CipherSpec *crSpec, const PRUint8 *hdr)
++dtls_ReadEpoch(const SSL3ProtocolVersion version, const DTLSEpoch specEpoch, const PRUint8 *hdr)
+ {
+-    if (dtls_IsLongHeader(crSpec->version, hdr[0])) {
++    if (dtls_IsLongHeader(version, hdr[0])) {
+         return ((DTLSEpoch)hdr[3] << 8) | hdr[4];
+     }
+ 
+-    DTLSEpoch epoch = (crSpec->epoch & ~3) | (hdr[0] & 3);
++    DTLSEpoch epoch = (specEpoch & ~3) | (hdr[0] & 3);
+     /* The epoch cannot be higher than the current read epoch,
+         though guard against underflow. */
+-    if (epoch > crSpec->epoch && epoch > 4) {
++    if (epoch > specEpoch && epoch > 4) {
+         epoch -= 4;
+     }
+ 
+
+
+
+
+@@ -41,7 +41,8 @@ extern SSL3ProtocolVersion
+ dtls_TLSVersionToDTLSVersion(SSL3ProtocolVersion tlsv);
+ extern SSL3ProtocolVersion
+ dtls_DTLSVersionToTLSVersion(SSL3ProtocolVersion dtlsv);
+-DTLSEpoch dtls_ReadEpoch(const ssl3CipherSpec *crSpec, const PRUint8 *hdr);
++DTLSEpoch dtls_ReadEpoch(const SSL3ProtocolVersion version, const DTLSEpoch specEpoch,
++                         const PRUint8 *hdr);
+ extern PRBool dtls_IsRelevant(sslSocket *ss, const ssl3CipherSpec *spec,
+                               const SSL3Ciphertext *cText,
+                               sslSequenceNumber *seqNum);
+
+
+
+
+@@ -13395,7 +13395,7 @@ ssl3_GetCipherSpec(sslSocket *ss, SSL3Ciphertext *cText)
+     if (!IS_DTLS(ss)) {
+         return crSpec;
+     }
+-    epoch = dtls_ReadEpoch(crSpec, cText->hdr);
++    epoch = dtls_ReadEpoch(crSpec->version, crSpec->epoch, cText->hdr);
+     if (crSpec->epoch == epoch) {
+         return crSpec;
+     }

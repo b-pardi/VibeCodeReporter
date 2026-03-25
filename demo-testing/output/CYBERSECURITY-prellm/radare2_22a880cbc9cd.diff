@@ -1,0 +1,127 @@
+@@ -1,6 +1,5 @@
+ /* Demangler for g++ V3 ABI.
+-   Copyright (C) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011
+-   Free Software Foundation, Inc.
++   Copyright (C) 2003-2018 Free Software Foundation, Inc.
+    Written by Ian Lance Taylor <ian@wasabisystems.com>.
+ 
+    This file is part of the libiberty library, which is part of GCC.
+@@ -31,7 +30,7 @@
+ 
+ /* This code implements a demangler for the g++ V3 ABI.  The ABI is
+    described on this web page:
+-       http://www.codesourcery.com/cxx-abi/abi.html#mangling
++       https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling
+ 
+    This code was written while looking at the demangler written by
+    Alex Samuel <samuel@codesourcery.com>.
+@@ -93,7 +92,15 @@
+    CP_DEMANGLE_DEBUG
+       If defined, turns on debugging mode, which prints information on
+       stdout about the mangled string.  This is not generally useful.
+-*/
++
++   CHECK_DEMANGLER
++      If defined, additional sanity checks will be performed.  It will
++      cause some slowdown, but will allow to catch out-of-bound access
++      errors earlier.  This macro is intended for testing and debugging.  */
++
++#if defined (_AIX) && !defined (__GNUC__)
++ #pragma alloca
++#endif
+ 
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
+@@ -104,6 +111,23 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifdef HAVE_ALLOCA_H
++# include <alloca.h>
++#else
++# ifndef alloca
++#  ifdef __GNUC__
++#   define alloca __builtin_alloca
++#  else
++extern char *alloca ();
++#  endif /* __GNUC__ */
++# endif /* alloca */
++#endif /* HAVE_ALLOCA_H */
++
++#include <limits.h>
++#ifndef INT_MAX
++# define INT_MAX       (int)(((unsigned int) ~0) >> 1)          /* 0x7FFFFFFF */ 
++#endif
++
+ #include "ansidecl.h"
+ #include "libiberty.h"
+ #include "demangle.h"
+@@ -142,10 +166,10 @@ static struct demangle_component *d_mangled_name (struct d_info *, int);
+ static struct demangle_component *d_type (struct d_info *);
+ 
+ #define cplus_demangle_print d_print
+-static char *d_print (int, const struct demangle_component *, int, size_t *);
++static char *d_print (int, struct demangle_component *, int, size_t *);
+ 
+ #define cplus_demangle_print_callback d_print_callback
+-static int d_print_callback (int, const struct demangle_component *,
++static int d_print_callback (int, struct demangle_component *,
+                              demangle_callbackref, void *);
+ 
+ #define cplus_demangle_init_info d_init_info
+@@ -234,7 +258,7 @@ struct d_print_mod
+      in which they appeared in the mangled string.  */
+   struct d_print_mod *next;
+   /* The modifier.  */
+-  const struct demangle_component *mod;
++  struct demangle_component *mod;
+   /* Whether this modifier was printed.  */
+   int printed;
+   /* The list of templates which applies to this modifier.  */
+@@ -255,6 +279,16 @@ struct d_growable_string
+   int allocation_failure;
+ };
+ 
++/* Stack of components, innermost first, used to avoid loops.  */
++
++struct d_component_stack
++{
++  /* This component.  */
++  const struct demangle_component *dc;
++  /* This component's parent.  */
++  const struct d_component_stack *parent;
++};
++
+ /* A demangle component and some scope captured when it was first
+    traversed.  */
+ 
+@@ -267,6 +301,21 @@ struct d_saved_scope
+   struct d_print_template *templates;
+ };
+ 
++/* Checkpoint structure to allow backtracking.  This holds copies
++   of the fields of struct d_info that need to be restored
++   if a trial parse needs to be backtracked over.  */
++
++struct d_info_checkpoint
++{
++  const char *n;
++  int next_comp;
++  int next_sub;
++  int expansion;
++};
++
++/* Maximum number of times d_print_comp may be called recursively.  */
++#define MAX_RECURSION_COUNT 1024
++
+ enum { D_PRINT_BUFFER_LENGTH = 256 };
+ struct d_print_info
+ {
+@@ -289,15 +338,33 @@ struct d_print_info
+   struct d_print_mod *modifiers;
+   /* Set to 1 if we saw a demangling error.  */
+   int demangle_failure;
++  /* Number of times d_print_comp was recursively called.  Should not
++     be bigger than MAX_RECURSION_COUNT.  */
++  int recursion;
++  

@@ -1,0 +1,101 @@
+@@ -125,7 +125,8 @@ enum calico_skb_mark {
+ 
+ /* bpf_exit inserts a BPF exit instruction with the given return value. In a fully-inlined
+  * BPF program this allows us to terminate early.  However(!) the exit instruction is also used
+- * for function return so we need to be careful if we ever start using functions in anger. */
++ * for function return so we need to be careful if we ever start using non-inlined
++ * functions in anger. */
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Winvalid-noreturn"
+ static CALI_BPF_INLINE _Noreturn void bpf_exit(int rc) {
+
+
+
+
+@@ -271,9 +271,10 @@ static CALI_BPF_INLINE int calico_ct_v4_create_nat(struct ct_ctx *ct_ctx, int na
+ 	return err;
+ }
+ 
+-/* skb_is_icmp_err_unpack fills in ctx, but only what needs to be changed. For instance, keeps the
+- * cxt->skb or ctx->tun_ip. It returns true if the original packet is an icmp error and all
+- * checks went well.
++/* skb_icmp_err_unpack tries to unpack the inner IP and TCP/UDP header from an ICMP error message.
++ * It updates the ct_ctx with the protocol/src/dst/ports of the inner packet.  If the unpack fails
++ * (due to packet too short, for example), it returns false and sets the RC in the cali_tc_ctx to
++ * TC_ACT_SHOT.
+  */
+ static CALI_BPF_INLINE bool skb_icmp_err_unpack(struct cali_tc_ctx *ctx, struct ct_ctx *ct_ctx)
+ {
+@@ -393,6 +394,10 @@ static CALI_BPF_INLINE void ct_tcp_entry_update(struct tcphdr *tcp_header,
+ 
+ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct cali_tc_ctx *tc_ctx)
+ {
++	// TODO: refactor the conntrack code to simply use the tc_ctx instead of its own.  This
++	// code is a direct translation of the pre-tc_ctx code so it has some duplication (but it
++	// needs a bit more analysis to sort out because the ct_ctx gets modified in place in
++	// ways that might not make sense to expose through the tc_ctx.
+ 	struct ct_ctx ct_lookup_ctx = {
+ 		.skb = tc_ctx->skb,
+ 		.proto	= tc_ctx->state->ip_proto,
+
+
+
+
+@@ -32,8 +32,8 @@ static CALI_BPF_INLINE int icmp_v4_reply(struct cali_tc_ctx *ctx,
+ 	int ret;
+ 
+ 	/* ICMP is on the slow path so we may as well revalidate here to keep calling code
+-	 * simple. */
+-	if (skb_refresh_validate_ptrs(ctx, UDP_SIZE)) {
++	 * simple.  We only need to look at the IP header before we resize the packet. */
++	if (skb_refresh_validate_ptrs(ctx, 0)) {
+ 		ctx->fwd.reason = CALI_REASON_SHORT;
+ 		CALI_DEBUG("ICMP v4 reply: too short\n");
+ 		return -1;
+
+
+
+
+@@ -36,15 +36,16 @@
+ static CALI_BPF_INLINE void *skb_start_ptr(struct __sk_buff *skb) {
+ 	void *ptr;
+ 	asm volatile (\
+-		"%0 = *(u32 *)(%1 + 76)" \
+-		: "=r" (ptr) /*out*/ \
+-		: "r" (skb) /*in*/ \
++		"%[ptr] = *(u32 *)(%[skb] + %[offset])" \
++		: [ptr] "=r" (ptr) /*out*/ \
++		: [skb] "r" (skb),
++		  [offset] "i" (offsetof(struct __sk_buff, data)) /*in*/ \
+ 		: /*clobber*/ \
+ 	);
+ 	return ptr;
+ }
+ 
+-/* skb_start_ptr is equivalent to (void*)((__u64)skb->data_end); the read is done
++/* skb_end_ptr is equivalent to (void*)((__u64)skb->data_end); the read is done
+  * in a way that is acceptable to the verifier and it is done as a volatile read
+  * ensuring that a fresh value is returned and the compiler cannot
+  * reorder/recalculate the value later.
+@@ -52,10 +53,11 @@ static CALI_BPF_INLINE void *skb_start_ptr(struct __sk_buff *skb) {
+ static CALI_BPF_INLINE void *skb_end_ptr(struct __sk_buff *skb) {
+  	void *ptr;
+  	asm volatile (\
+-	 	"%0 = *(u32 *)(%1 + 80)" \
+-	 	: "=r" (ptr) /*out*/ \
+-	 	: "r" (skb) /*in*/ \
+-	 	: /*clobber*/ \
++		"%[ptr] = *(u32 *)(%[skb] + %[offset])" \
++		: [ptr] "=r" (ptr) /*out*/ \
++		: [skb] "r" (skb),
++		  [offset] "i" (offsetof(struct __sk_buff, data_end)) /*in*/ \
++		: /*clobber*/ \
+ 	 );
+ 	return ptr;
+ }
+@@ -68,7 +70,7 @@ static CALI_BPF_INLINE void skb_refresh_start_end(struct cali_tc_ctx *ctx) {
+ 	ctx->data_end = skb_end_ptr(ctx->skb);
+ }
+ 
+-/* skb_iphdr_offset returns the expected offset of hte IP header for this type of program.
++/* skb_iphdr_offset returns the expected offset of the 

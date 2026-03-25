@@ -1,0 +1,121 @@
+@@ -129,7 +129,15 @@ class module(ModuleType):
+                 if self.cs is None:
+                     return None
+                 value += self.cs * 16
+-            return int(value) & pwndbg.aglib.arch.ptrmask
++
++            # The value that the native debugger returns can be negative.
++            # We convert this to the unsigned bit representation by masking it
++            reg_definition = pwndbg.aglib.regs.current.reg_definitions.get(reg.lower())
++            if reg_definition and reg_definition.mask is not None:
++                mask = reg_definition.mask
++            else:
++                mask = pwndbg.aglib.arch.ptrmask
++            return int(value) & mask
+         except (ValueError, pwndbg.dbg_mod.Error):
+             return None
+ 
+@@ -208,6 +216,12 @@ class module(ModuleType):
+         return reg_sets[pwndbg.aglib.arch.name].all
+ 
+     def fix(self, expression: str) -> str:
++        """
++        This is used in CLI parsing.
++        It takes in a string with a register name, "rax", and prefixes it with
++        a $ ("$rax") so that the underlying debugger can evaluate it to resolve the value
++        """
++        expression = pwndbg.aglib.regs.current.resolve_aliases(expression)
+         for regname in self.all:
+             expression = re.sub(rf"\$?\b{regname}\b", r"$" + regname, expression)
+         return expression
+
+
+
+
+@@ -1060,6 +1060,10 @@ def get_regs(in_regs: List[str | VisitableRegister | None] | None = None):
+             if desc is not None:
+                 result.append(desc)
+             continue
++
++        # Resolve "sp" and "pc" to the real architectural register names
++        reg = pwndbg.aglib.regs.current.resolve_aliases(reg)
++
+         desc = rc.register_context_default(reg)
+         if desc is not None:
+             result.append(desc)
+
+
+
+
+@@ -176,6 +176,12 @@ class Reg:
+     zero_extend_writes: bool = False
+     """Upon writing a value to this subregister, are the higher bits of the full register zeroed out?"""
+     subregisters: tuple[Reg, ...] = ()
++    """Bitmask for register. None if the register size is arch.ptrsize"""
++    mask: int | None = None
++
++    def __post_init__(self) -> None:
++        if self.size:
++            self.mask = (1 << (self.size * 8)) - 1
+ 
+ 
+ class RegisterSet:
+@@ -226,6 +232,13 @@ class RegisterSet:
+     A full size register maps to itself.
+     """
+ 
++    special_aliases: Dict[str, str]
++    """
++    Contains two values:
++    - "sp" -> stack pointer register name
++    - "pc" -> instruction pointer register name
++    """
++
+     def __init__(
+         self,
+         pc: Reg = Reg("pc"),
+@@ -315,6 +328,17 @@ class RegisterSet:
+         self.all -= {None}
+         self.all |= {"pc", "sp"}
+ 
++        self.special_aliases = {}
++        self.special_aliases["sp"] = self.stack
++        self.special_aliases["pc"] = self.pc
++
++    def resolve_aliases(self, reg: str) -> str:
++        """
++        Convert "sp" and "pc" to the real architectural registers.
++        For all others, returns `reg`
++        """
++        return self.special_aliases.get(reg, reg)
++
+     def __contains__(self, reg: str) -> bool:
+         return reg in self.all
+ 
+
+
+
+
+@@ -656,3 +656,62 @@ async def test_stack_variable_names_from_dwarf(ctrl: Controller) -> None:
+     # Test that telescope shows variable names
+     telescope_out = await ctrl.execute_and_capture(f"telescope {buffer_addr:#x} 1")
+     assert "{buffer}" in telescope_out
++
++
++@pwndbg_test
++async def test_regs_command_resolves_sp_pc_aliases(ctrl: Controller) -> None:
++    """
++    If running `regs pc` or `regs sp`, these aliases should be resolved
++    to the real architectural names of the registers.
++    """
++    import pwndbg.aglib.regs
++
++    await ctrl.launch(REFERENCE_BINARY)
++
++    sp_name = pwndbg.aglib.regs.current.stack
++    pc_name = pwndbg.aglib.regs.current.pc
++
++    real_sp_value = pwndbg.aglib.regs.read_reg(sp_name)
++    real_pc_value = pwndbg.aglib.regs.read_reg(pc_name)
++
++    regs_sp_output = await ctrl.execute_and_ca

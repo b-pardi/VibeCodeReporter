@@ -1,0 +1,103 @@
+@@ -126,14 +126,19 @@ final class BgpRoutingProcess implements RoutingProcess<BgpTopology, BgpRoute<?,
+   /** Builder for constructing {@link RibDelta} for routes in {@link #_evpnRib} */
+   @Nonnull private Builder<EvpnRoute<?, ?>> _evpnDeltaBuilder = RibDelta.builder();
+ 
+-  private RibDelta<EvpnType3Route> _evpnInitializationDelta;
++  /** Keep track of EVPN type 3 routes initialized from our own VNI settings */
++  @Nonnull private RibDelta<EvpnType3Route> _evpnInitializationDelta;
+ 
+   /** Delta builder for routes that must be propagated to the main RIB */
+   @Nonnull private RibDelta.Builder<BgpRoute<?, ?>> _changeSet = RibDelta.builder();
+ 
+-  /* Hacky way to non re-init the process across topology computations. Not a permanent solution */
++  /* Hacky way to not re-init the process across topology computations. Not a permanent solution */
+   private boolean _initialized = false;
+ 
++  /**
++   * Mapping from extended community route target patterns to VRF name. Used for determining where
++   * to merge EVPN routes
++   */
+   @Nonnull private final Map<String, String> _rtVrfMapping;
+ 
+   /**
+
+
+
+
+@@ -441,7 +441,7 @@ class IncrementalBdpEngine {
+           .values()
+           .parallelStream()
+           .flatMap(n -> n.getVirtualRouters().values().stream())
+-          .forEach(VirtualRouter::mergeBgpRoutes);
++          .forEach(VirtualRouter::mergeBgpRoutesToMainRib);
+       nodes
+           .values()
+           .parallelStream()
+
+
+
+
+@@ -2052,10 +2052,12 @@ public class VirtualRouter implements Serializable {
+     return _bgpRoutingProcess;
+   }
+ 
++  /** Return all OSPF processes for this VRF */
+   public Map<String, OspfRoutingProcess> getOspfProcesses() {
+     return _ospfProcesses;
+   }
+ 
++  /** Return the current set of {@link VniSettings} associated with this VRF */
+   public Set<VniSettings> getVniSettings() {
+     return _vniSettings;
+   }
+@@ -2078,6 +2080,7 @@ public class VirtualRouter implements Serializable {
+     _ospfProcesses.values().forEach(p -> p.executeIteration(allNodes));
+   }
+ 
++  /** Execute one iteration of BGP route propagation. */
+   void bgpIteration(Map<String, Node> allNodes) {
+     if (_bgpRoutingProcess != null) {
+       _bgpRoutingProcess.executeIteration(allNodes);
+@@ -2090,6 +2093,10 @@ public class VirtualRouter implements Serializable {
+    * necessary.
+    */
+   private void updateFloodLists() {
++    if (_bgpRoutingProcess == null) {
++      // an extra safe guard; should only be called from bgpIteration
++      return;
++    }
+     for (EvpnType3Route route : _bgpRoutingProcess.getEvpnType3Routes()) {
+       _vniSettings =
+           _vniSettings.stream()
+@@ -2098,8 +2105,13 @@ public class VirtualRouter implements Serializable {
+     }
+   }
+ 
+-  @VisibleForTesting
+-  static VniSettings updateVniFloodList(VniSettings vs, EvpnType3Route route) {
++  /**
++   * Update flood list for the given {@link VniSettings} based on information contained in {@code
++   * route}. Only updates the VNI if the route is <strong>not</strong> for the VNI's source address
++   * and if the {@link VniSettings#getBumTransportMethod()} is unicast flood group (otherwise
++   * returns the original {@code vs}).
++   */
++  private static VniSettings updateVniFloodList(VniSettings vs, EvpnType3Route route) {
+     if (vs.getBumTransportMethod() != BumTransportMethod.UNICAST_FLOOD_GROUP
+         || route.getVniIp().equals(vs.getSourceAddress())) {
+       // Only update settings if transport method is unicast.
+@@ -2132,7 +2144,7 @@ public class VirtualRouter implements Serializable {
+                     importRibDelta(_mainRib, p.getUpdatesForMainRib(), _name)));
+   }
+ 
+-  void mergeBgpRoutes() {
++  void mergeBgpRoutesToMainRib() {
+     if (_bgpRoutingProcess == null) {
+       return;
+     }
+@@ -2152,7 +2164,8 @@ public class VirtualRouter implements Serializable {
+     _bgpRoutingProcess.enqueueBgpMessages(edgeId, routes);
+   }
+ 
+-  public Set<EvpnRoute<?, ?>> getEvpnRoutes() {
++  /** Return all EVPN routes in this VRF */
++  Set

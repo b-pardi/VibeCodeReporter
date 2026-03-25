@@ -1,0 +1,96 @@
+@@ -92,6 +92,7 @@ public:
+   void countAlerts(grouped_alerts_counters *counters);
+   void getAlerts(lua_State* vm, ScriptPeriodicity p, AlertType type_filter,
+ 		 AlertLevel severity_filter, u_int *idx);
++  bool matchesAllowedNetworks(AddressTree *allowed_nets);
+ 
+   /* This must be called once per script and updates what the user see on the gui. */
+   inline void refreshAlerts() {
+
+
+
+
+@@ -58,7 +58,9 @@ class AlertsManager : public StoreManager {
+       bool ignore_disabled = false, bool check_maximum = true);
+ 
+   int storeFlowAlert(lua_State *L, int index, u_int64_t *rowid);
++
+   static void buildSqliteAllowedNetworksFilters(lua_State *vm);
++  static int parseEntityValueIp(const char *alert_entity_value, struct in6_addr *ip_raw);
+ 
+   bool hasAlerts();
+ 
+
+
+
+
+@@ -66,6 +66,8 @@ class IpAddress {
+   inline void set(u_int32_t _ipv4)                    { addr.ipVersion = 4, addr.ipType.ipv4 = _ipv4; compute_key(); }
+   inline void set(struct ndpi_in6_addr *_ipv6)        { addr.ipVersion = 6, memcpy(&addr.ipType.ipv6, _ipv6, sizeof(struct ndpi_in6_addr));
+ 							addr.privateIP = false; compute_key(); }
++  inline void set(struct in6_addr *_ipv6)             { addr.ipVersion = 6, memcpy(&addr.ipType.ipv6.u6_addr, _ipv6->s6_addr, sizeof(_ipv6->s6_addr));
++							addr.privateIP = false; compute_key(); }
+   inline void set(const IpAddress * const ip)         { memcpy(&addr, &ip->addr, sizeof(struct ipAddress)); ip_key = ip->ip_key; };
+   inline void set(const struct ipAddress * const ip)  { memcpy(&addr, ip, sizeof(struct ipAddress)); compute_key(); };
+   void set(union usa *ip);
+
+
+
+
+@@ -797,9 +797,12 @@ class NetworkInterface : public AlertableEntity {
+   inline bool hasAlerts()                                 { return(has_stored_alerts || (getNumEngagedAlerts() > 0)); }
+   inline void refreshHasAlerts()                          { has_stored_alerts = alertsManager ? alertsManager->hasAlerts() : false; }
+   inline void incNumDroppedAlerts(u_int32_t num_dropped)  { num_dropped_alerts += num_dropped; }
+-  void walkAlertables(int entity_type, const char *entity_value, std::set<int> *entity_excludes, alertable_callback *callback, void *user_data);
+-  void getEngagedAlertsCount(lua_State *vm, int entity_type, const char *entity_value, std::set<int> *entity_excludes);
+-  void getEngagedAlerts(lua_State *vm, int entity_type, const char *entity_value, AlertType alert_type, AlertLevel alert_severity, std::set<int> *entity_excludes);
++  void walkAlertables(int entity_type, const char *entity_value, std::set<int> *entity_excludes,
++	    AddressTree *allowed_nets, alertable_callback *callback, void *user_data);
++  void getEngagedAlertsCount(lua_State *vm, int entity_type, const char *entity_value,
++	    std::set<int> *entity_excludes, AddressTree *allowed_nets);
++  void getEngagedAlerts(lua_State *vm, int entity_type, const char *entity_value, AlertType alert_type,
++	    AlertLevel alert_severity, std::set<int> *entity_excludes, AddressTree *allowed_nets);
+   inline void incNumDroppedFlowScriptsCalls()             { num_dropped_flow_scripts_calls++; }
+   void computeHostsScore();
+ 
+
+
+
+
+@@ -269,3 +269,29 @@ u_int AlertableEntity::getNumTriggeredAlerts(ScriptPeriodicity p) const {
+ void AlertableEntity::syncReadonlyTriggeredAlerts() {
+   updateNumTriggeredAlerts();
+ }
++
++/* ****************************************** */
++
++bool AlertableEntity::matchesAllowedNetworks(AddressTree *allowed_nets) {
++  struct in6_addr ip_raw;
++  IpAddress addr;
++  int netbits;
++  const char *alert_entity_value = entity_val.c_str();
++
++  if(!allowed_nets)
++    return(true);
++
++  AlertsManager::parseEntityValueIp(alert_entity_value, &ip_raw);
++
++  if(strchr(alert_entity_value, ':')) {
++    // IPv6
++    addr.set(&ip_raw);
++    netbits = 128;
++  } else {
++    // IPv4
++    addr.set(*((u_int32_t*)&ip_raw.s6_addr[12]));
++    netbits = 32;
++  }
++
++  return(allowed_nets->match(&addr, netbits));
++}
+
+
+
+
+@@ -281,9 +281,15 @@ out:
+ 
+ /* **********************************************

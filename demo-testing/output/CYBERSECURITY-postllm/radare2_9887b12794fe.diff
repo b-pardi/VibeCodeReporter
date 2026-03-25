@@ -1,0 +1,111 @@
+@@ -4168,7 +4168,7 @@ R_API int r_core_config_init(RCore *core) {
+ 	SETCB ("dbg.threads", "false", &cb_stopthreads, "stop all threads when debugger breaks (see dbg.forks)");
+ 	SETCB ("dbg.clone", "false", &cb_dbg_clone, "stop execution if new thread is created");
+ 	SETCB ("dbg.aftersyscall", "true", &cb_dbg_aftersc, "stop execution before the syscall is executed (see dcs)");
+-	SETCB ("dbg.profile", "", &cb_runprofile, "path to RRunProfile file");
++	SETCB ("dbg.profile", "", &cb_runprofile, "path to RRunProfile file (or base64:string)");
+ 	SETCB ("dbg.args", "", &cb_dbg_args, "set the args of the program to debug");
+ 	SETCB ("dbg.follow.child", "false", &cb_dbg_follow_child, "continue tracing the child process on fork. By default the parent process is traced");
+ 	SETCB ("dbg.trace.continue", "true", &cb_dbg_trace_continue, "trace every instruction between the initial PC position and the PC position at the end of continue's execution");
+
+
+
+
+@@ -591,15 +591,15 @@ static void cmd_drn(RCore *core, const char *str) {
+ 	free (foo);
+ }
+ 
+-// XXX those tmp files are never removed and we shouldnt use files for this
+ static void setRarunProfileString(RCore *core, const char *str) {
+-	char *file = r_file_temp ("rarun2");
+-	char *s = strdup (str);
+-	r_config_set (core->config, "dbg.profile", file);
++	char *s = r_str_newf ("%s\n", str);
+ 	r_str_replace_char (s, ',', '\n');
+-	r_file_dump (file, (const ut8*)s, strlen (s), 0);
+-	r_file_dump (file, (const ut8*)"\n", 1, 1);
+-	free (file);
++	char *v = r_base64_encode_dyn ((const ut8*)s, -1);
++	char *rs = r_str_newf ("base64:%s", v);
++	r_config_set (core->config, "dbg.profile", rs);
++	free (rs);
++	free (v);
++	free (s);
+ }
+ 
+ static void cmd_debug_cont_syscall(RCore *core, const char *_str) {
+
+
+
+
+@@ -250,7 +250,8 @@ static RRunProfile* _get_run_profile(RIO *io, int bits, char **argv) {
+ 	}
+ 	rp->_program = strdup (argv[0]);
+ 
+-	if (io->runprofile && *io->runprofile) {
++	const char *runprofile = io->runprofile;
++	if (R_STR_ISNOTEMPTY (runprofile)) {
+ 		if (!r_run_parsefile (rp, io->runprofile)) {
+ 			R_LOG_ERROR ("Can't find profile '%s'", io->runprofile);
+ 			r_run_free (rp);
+
+
+
+
+@@ -237,7 +237,7 @@ static int main_help(int line) {
+ 		" -p [prj]     use project, list if no arg, load if no file\n"
+ 		" -P [file]    apply rapatch file and quit\n"
+ 		" -r [rarun2]  specify rarun2 profile to load (same as -e dbg.profile=X)\n"
+-		" -R [rr2rule] specify custom rarun2 directive\n"
++		" -R [rr2rule] specify custom rarun2 directive (uses base64 dbg.profile)\n"
+ 		" -s [addr]    initial seek\n"
+ 		" -S           start r2 in sandbox mode\n"
+ #if USE_THREADS && ALLOW_THREADED
+@@ -674,6 +674,33 @@ static void mainr2_fini(RMainRadare2 *mr) {
+ 	r_core_free (mr->r);
+ }
+ 
++static char *dp_read(RCore *core) {
++	const char *dbg_profile = r_config_get (core->config, "dbg.profile");
++	if (R_STR_ISNOTEMPTY (dbg_profile)) {
++		if (r_str_startswith (dbg_profile, "base64:")) {
++			int len;
++			char *s = (char *)r_base64_decode_dyn (dbg_profile + 7, -1, &len);
++			char *res = r_str_ndup (s, len);
++			free (s);
++			return res;
++		}
++		return r_file_slurp (dbg_profile, NULL);
++	}
++	return NULL;
++}
++
++static void dp_write(RCore *core, const char *s) {
++	if (R_STR_ISEMPTY (s)) {
++		r_config_set (core->config, "dbg.profile", "");
++	} else {
++		char *v = r_base64_encode_dyn ((const ut8*)s, -1);
++		char *rs = r_str_newf ("base64:%s", v);
++		r_config_set (core->config, "dbg.profile", rs);
++		free (rs);
++		free (v);
++	}
++}
++
+ R_API int r_main_radare2(int argc, const char **argv) {
+ 	int c, ret;
+ 	RMainRadare2 mr;
+@@ -1072,29 +1099,21 @@ R_API int r_main_radare2(int argc, const char **argv) {
+ 		}
+ 	}
+ 	{
+-		const char *dbg_profile = r_config_get (r->config, "dbg.profile");
+-		if (R_STR_ISNOTEMPTY (dbg_profile)) {
+-			char *msg = r_file_slurp (dbg_profile, NULL);
+-			if (msg) {
+-				char *program = strstr (msg, "program=");
+-				if (program) {
+-					program += 8;
+-					char *p = 0;
+-					p = strstr (program, "\r\n");
+-					if (!p) {

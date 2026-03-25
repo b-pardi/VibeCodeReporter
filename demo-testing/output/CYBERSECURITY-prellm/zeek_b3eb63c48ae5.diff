@@ -1,0 +1,137 @@
+@@ -318,7 +318,7 @@ public:
+ 	 * already checked that the static IPv6 header is not truncated.  If
+ 	 * the packet contains extension headers and they are truncated, that can
+ 	 * be checked afterwards by comparing \a len with \a TotalLen.  E.g.
+-	 * NetSessions::DoNextPacket does this to skip truncated packets.
++	 * The IP packet analyzer does this to skip truncated packets.
+ 	 * @param arg_ip6 pointer to memory containing an IPv6 packet.
+ 	 * @param arg_del whether to take ownership of \a arg_ip6 pointer's memory.
+ 	 * @param len the packet's length in bytes.
+
+
+
+
+@@ -81,11 +81,10 @@ void NetSessions::NextPacket(double t, Packet* pkt)
+ 	packet_mgr->ProcessPacket(pkt);
+ 	}
+ 
+-void NetSessions::DoNextPacket(double t, const Packet* pkt)
++void NetSessions::ProcessTransportLayer(double t, const Packet* pkt, size_t remaining)
+ 	{
+ 	const std::unique_ptr<IP_Hdr>& ip_hdr = pkt->ip_hdr;
+ 
+-	uint32_t caplen = pkt->cap_len - pkt->hdr_size;
+ 	uint32_t len = ip_hdr->TotalLen();
+ 	uint16_t ip_hdr_len = ip_hdr->HdrLen();
+ 
+@@ -95,18 +94,11 @@ void NetSessions::DoNextPacket(double t, const Packet* pkt)
+ 		return;
+ 		}
+ 
+-	if ( caplen < ip_hdr_len )
+-		{
+-		sessions->Weird("truncated_IP", pkt);
+-		return;
+-		}
+-
+ 	len -= ip_hdr_len;	// remove IP header
+-	caplen -= ip_hdr_len;	// remove IP header
+ 
+ 	int proto = ip_hdr->NextProto();
+ 
+-	if ( CheckHeaderTrunc(proto, len, caplen, pkt) )
++	if ( CheckHeaderTrunc(proto, len, remaining, pkt) )
+ 		return;
+ 
+ 	const u_char* data = ip_hdr->Payload();
+@@ -232,7 +224,7 @@ void NetSessions::DoNextPacket(double t, const Packet* pkt)
+ 		conn->EnqueueEvent(new_packet, nullptr, conn->ConnVal(), pkt_hdr_val ?
+ 		                   std::move(pkt_hdr_val) : ip_hdr->ToPktHdrVal());
+ 
+-	conn->NextPacket(t, is_orig, ip_hdr.get(), len, caplen, data,
++	conn->NextPacket(t, is_orig, ip_hdr.get(), len, remaining, data,
+ 	                 record_packet, record_content, pkt);
+ 
+ 	// We skip this block for reassembled packets because the pointer
+
+
+
+
+@@ -93,8 +93,13 @@ public:
+ 	 * Main entry point for processing packets destined for session analyzers. This
+ 	 * method is called by the packet analysis manager when after it has processed
+ 	 * an IP-based packet, and shouldn't be called directly from other places.
++	 *
++	 * @param t The timestamp for this packet.
++	 * @param pkt The packet being processed.
++	 * @param len The number of bytes that haven't been processed yet by packet
++	 * analysis.
+ 	 */
+-	void DoNextPacket(double t, const Packet *pkt);
++	void ProcessTransportLayer(double t, const Packet *pkt, size_t len);
+ 
+ 	/**
+ 	 * Returns a wrapper IP_Hdr object if \a pkt appears to be a valid IPv4
+
+
+
+
+@@ -75,25 +75,16 @@ void VXLAN_Analyzer::DeliverPacket(int len, const u_char* data, bool orig,
+ 	Packet pkt(DLT_EN10MB, &ts, caplen, len, data);
+ 	pkt.encap = outer;
+ 
+-	packet_mgr->ProcessPacket(&pkt);
+-
+-	if ( ! pkt.l2_valid )
++	if ( ! packet_mgr->ProcessInnerPacket(&pkt) )
+ 		{
+-		ProtocolViolation("VXLAN invalid inner ethernet frame",
+-		                  (const char*) data, len);
++		ProtocolViolation("VXLAN invalid inner packet");
+ 		return;
+ 		}
+ 
+-	data += pkt.hdr_size;
+-	len -= pkt.hdr_size;
+-	caplen -= pkt.hdr_size;
+-
++	// This isn't really an error. It's just that the inner packet wasn't an IP packet (like ARP).
++	// Just return without reporting a violation.
+ 	if ( ! pkt.ip_hdr )
+-		{
+-		ProtocolViolation("Truncated VXLAN or invalid inner IP",
+-		                  (const char*) data, len);
+ 		return;
+-		}
+ 
+ 	ProtocolConfirmation();
+ 
+
+
+
+
+@@ -49,7 +49,6 @@ void Packet::Init(int arg_link_type, pkt_timeval *arg_ts, uint32_t arg_caplen,
+ 	dump_packet = false;
+ 
+ 	time = ts.tv_sec + double(ts.tv_usec) / 1e6;
+-	hdr_size = 0;
+ 	eth_type = 0;
+ 	vlan = 0;
+ 	inner_vlan = 0;
+@@ -84,11 +83,6 @@ Packet::~Packet()
+ 		delete [] data;
+ 	}
+ 
+-const IP_Hdr Packet::IP() const
+-	{
+-	return IP_Hdr((struct ip *) (data + hdr_size), false);
+-	}
+-
+ void Packet::Weird(const char* name)
+ 	{
+ 	sessions->Weird(name, this);
+
+
+
+
+@@ -114,12 +1

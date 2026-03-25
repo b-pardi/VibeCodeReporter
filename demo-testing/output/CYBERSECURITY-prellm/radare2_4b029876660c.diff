@@ -1,0 +1,127 @@
+@@ -10,15 +10,18 @@
+ #undef GH
+ #undef GHT
+ #undef GHT_MAX
++#undef read_le
+ 
+ #if HEAP32
+ #define GH(x) x##_32
+ #define GHT ut32
+ #define GHT_MAX UT32_MAX
++#define read_le(x) r_read_le##32(x)
+ #else
+ #define GH(x) x##_64
+ #define GHT ut64
+ #define GHT_MAX UT64_MAX
++#define read_le(x) r_read_le##64(x)
+ #endif
+ 
+ /**
+@@ -80,6 +83,7 @@ static bool GH(is_tcache)(RCore *core) {
+ 	}
+ 	if (fp) {
+ 		v = r_num_get_float (NULL, fp + 5);
++		core->dbg->glibc_version = (int) (v * 100);
+ 	}
+ 	return (v > 2.25);
+ }
+@@ -849,109 +853,146 @@ void GH(print_heap_fastbin)(RCore *core, GHT m_arena, MallocState *main_arena, G
+ 	}
+ }
+ 
+-static void GH(print_tcache_instance)(RCore *core, GHT m_arena, MallocState *main_arena) {
+-	if (!core || !core->dbg || !core->dbg->maps) {
+-		return;
++static GH (RTcache)* GH (tcache_new) (RCore *core) {
++	r_return_val_if_fail (core, NULL);
++	GH (RTcache) *tcache = R_NEW0 (GH (RTcache));
++	if (core->dbg->glibc_version >= TCACHE_NEW_VERSION) {
++		tcache->type = NEW;
++		tcache->RHeapTcache.heap_tcache = R_NEW0(GH (RHeapTcache));
++	} else {
++		tcache->type = OLD;
++		tcache->RHeapTcache.heap_tcache_pre_230 = R_NEW0(GH (RHeapTcachePre230));
++	}
++	return tcache;
++}
++
++static void GH (tcache_free) (GH (RTcache)* tcache) {
++	r_return_if_fail (tcache);
++	tcache->type == NEW
++		? free(tcache->RHeapTcache.heap_tcache)
++		: free(tcache->RHeapTcache.heap_tcache_pre_230);
++	free(tcache);
++}
++
++static bool GH (tcache_read) (RCore *core, GHT tcache_start, GH (RTcache)* tcache) {
++	r_return_val_if_fail (core && tcache, false);
++	return tcache->type == NEW
++		? r_io_read_at (core->io, tcache_start, (ut8 *)tcache->RHeapTcache.heap_tcache, sizeof (GH (RHeapTcache)))
++		: r_io_read_at (core->io, tcache_start, (ut8 *)tcache->RHeapTcache.heap_tcache_pre_230, sizeof (GH (RHeapTcachePre230)));
++}
++
++static int GH (tcache_get_count) (GH (RTcache)* tcache, int index) {
++	r_return_val_if_fail (tcache, 0);
++	return tcache->type == NEW
++		? tcache->RHeapTcache.heap_tcache->counts[index]
++		: tcache->RHeapTcache.heap_tcache_pre_230->counts[index];
++}
++
++static GHT GH (tcache_get_entry) (GH (RTcache)* tcache, int index) {
++	r_return_val_if_fail (tcache, 0);
++	return tcache->type == NEW
++		? tcache->RHeapTcache.heap_tcache->entries[index]
++		: tcache->RHeapTcache.heap_tcache_pre_230->entries[index];
++}
++
++static void GH (tcache_print) (RCore *core, GH (RTcache)* tcache) {
++	r_return_if_fail (core && tcache);
++	GHT tcache_fd = GHT_MAX;
++	GHT tcache_tmp = GHT_MAX;
++	RConsPrintablePalette *pal = &r_cons_singleton ()->context->pal;
++	size_t i;
++	for (i = 0; i < TCACHE_MAX_BINS; i++) {
++		int count = GH (tcache_get_count) (tcache, i);
++		GHT entry = GH (tcache_get_entry) (tcache, i);
++		if (count > 0) {
++			PRINT_GA ("bin :");
++			PRINTF_BA ("%2d", i);
++			PRINT_GA (", items :");
++			PRINTF_BA ("%2d", count);
++			PRINT_GA (", fd :");
++
++			PRINTF_BA ("0x%"PFMT64x, entry - GH (HDR_SZ));
++			if (count > 1) {
++				tcache_fd = entry;
++				size_t n;
++				for (n = 1; n < count; n++) {
++					bool r = r_io_read_at (core->io, tcache_fd, (ut8 *)&tcache_tmp, sizeof (GHT));
++					if (!r) {
++						break;
++					}
++					tcache_tmp = read_le (&tcache_tmp);
++					PRINTF_BA ("->0x%"PFMT64x, tcache_tmp - TC_HDR_SZ);
++					tcache_fd = tcache_tmp;
++				}
++			}
++			PRINT_BA ("\n");
++		}
+ 	}
++}
++
++static void GH (print_tcache_instance)(RCore *core, GHT m_arena, MallocState *main_arena) {
++	r_return_if_fail (core && core->dbg && core->dbg->maps);
++
+ 	const int tcache = r_config_get_i (core->config, "dbg.glibc.tcache");
+ 	if (!tcache) {
+ 		return;
+ 	}
+-	GHT brk_start = GHT_MAX, brk_end = GHT_MAX, tcache_fd = GHT_MAX, initial_brk = GHT_MAX ;
+-	GH(get_brks) (core, &brk_start, &brk_end);
+-	GHT tcache_tmp = GHT_MAX, tcache_start = GHT_MAX;
++	GHT brk_start = GHT_MAX, brk_end = GHT_MAX, initial_brk = GHT_MAX;
++	GH (get_brks) (core, &brk_start, &brk_end);
++	GHT tcache_start = GHT_MAX;
+ 	RConsPrintablePalette *pal = &r_cons_singleton ()->context->pal;
+ 
+-	tcache_start = ((brk_start >> 1

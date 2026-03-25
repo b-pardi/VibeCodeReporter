@@ -1,0 +1,166 @@
+@@ -41,6 +41,8 @@ static const struct {
+ 	{ "fletcher32", R_HASH_FLETCHER32 },
+ 	{ "fletcher64", R_HASH_FLETCHER64 },
+ 
++	{ "sip", R_HASH_SIP },
++
+ 	{ "crc8smbus", R_HASH_CRC8_SMBUS },
+ #if R_HAVE_CRC8_EXTRA
+ 	{ /* CRC-8/CDMA2000     */ "crc8cdma2000", R_HASH_CRC8_CDMA2000 },
+@@ -278,6 +280,7 @@ R_API int r_hash_size(ut64 algo) {
+ 	ALGOBIT (CRC32_XFER);
+ #endif /* #if R_HAVE_CRC32_EXTRA */
+ 
++	ALGOBIT (SIP);
+ #if R_HAVE_CRC64
+ 	ALGOBIT (CRC64);
+ #endif /* #if R_HAVE_CRC64 */
+@@ -354,7 +357,7 @@ R_API void r_hash_do_spice(RHash *ctx, ut64 algo, int loops, R_NULLABLE RHashSee
+ 	free (buf);
+ }
+ 
+-R_API char *r_hash_to_string(R_NULLABLE RHash *ctx, const char *name, const ut8 *data, int len) {
++R_API R_MUSTUSE char *r_hash_to_string(R_NULLABLE RHash *ctx, const char *name, const ut8 *data, int len) {
+ 	r_return_val_if_fail (name && len >= 0, NULL);
+ 	ut64 algo = r_hash_name_to_bits (name);
+ 	char *digest_hex = NULL;
+
+
+
+
+@@ -20,6 +20,10 @@ R_API int r_hash_calculate(RHash *ctx, ut64 algobit, const ut8 *buf, int len) {
+ 		r_hash_do_ssdeep (ctx, buf, len);
+ 		return R_HASH_SIZE_SSDEEP;
+ 	}
++	if (algobit & R_HASH_SIP) {
++		r_hash_do_sip (ctx, buf, len);
++		return R_HASH_SIZE_SIP;
++	}
+ 	if (algobit & R_HASH_MD4) {
+ 		r_hash_do_md4 (ctx, buf, len);
+ 		return R_HASH_SIZE_MD4;
+
+
+
+
+@@ -190,6 +190,6 @@ void MD4(const ut8 *in, int n, ut8 *out) {
+ 
+ #else
+ void MD4(const ut8 *in, int n, ut8 *out) {
+-	eprintf ("md4: only available on GPL builds.\n");
++	R_LOG_ERROR ("md4 is only available on GPL builds");
+ }
+ #endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,62 @@
++/* radare2 - LGPL - Copyright 2022 - pancake,siguza */
++// Ripped from https://github.com/Siguza/iometa/blob/master/src/cxx.c
++
++#include <r_hash.h>
++
++#define ROTL(x, b) (ut64)(((x) << (b)) | ((x) >> (64 - (b))))
++
++#define SIPROUND do { \
++		v0 += v1;               \
++		v1 = ROTL(v1, 13) ^ v0; \
++		v0 = ROTL(v0, 32);      \
++		v2 += v3;               \
++		v3 = ROTL(v3, 16) ^ v2; \
++		v0 += v3;               \
++		v3 = ROTL(v3, 21) ^ v0; \
++		v2 += v1;               \
++		v1 = ROTL(v1, 17) ^ v2; \
++		v2 = ROTL(v2, 32);      \
++	} while (0)
++
++R_API ut64 r_hash_sip(const ut8 *in, ut64 inlen) {
++	const ut8 *end;
++	ut64 v0 = 0x0a257d1c9bbab1c0ULL;
++	ut64 v1 = 0xb0eef52375ef8302ULL;
++	ut64 v2 = 0x1533771c85aca6d4ULL;
++	ut64 v3 = 0xa0e4e32062ff891cULL;
++	for (end = in + (inlen & ~7ULL); in != end; in += 8) {
++		ut64 m = ((ut64)in[7] << 56)
++			| ((ut64)in[6] << 48)
++			| ((ut64)in[5] << 40)
++			| ((ut64)in[4] << 32)
++			| ((ut64)in[3] << 24)
++			| ((ut64)in[2] << 16)
++			| ((ut64)in[1] <<  8)
++			| ((ut64)in[0]);
++		v3 ^= m;
++		SIPROUND;
++		SIPROUND;
++		v0 ^= m;
++	}
++	ut64 b = inlen << 56;
++	switch (inlen & 7) {
++	case 7: b |= (ut64)in[6] << 48;
++	case 6: b |= (ut64)in[5] << 40;
++	case 5: b |= (ut64)in[4] << 32;
++	case 4: b |= (ut64)in[3] << 24;
++	case 3: b |= (ut64)in[2] << 16;
++	case 2: b |= (ut64)in[1] <<  8;
++	case 1: b |= (ut64)in[0];
++	case 0: break;
++	}
++	v3 ^= b;
++	SIPROUND;
++	SIPROUND;
++	v0 ^= b;
++	v2 ^= 0xff;
++	SIPROUND;
++	SIPROUND;
++	SIPROUND;
++	SIPROUND;
++	return v0 ^ v1 ^ v2 ^ v3;
++}
+
+
+
+
+@@ -39,6 +39,10 @@
+ #define CHKFLAG(x) if (!flags || flags & (x))
+ 
+ R_API RHash *r_hash_new(bool rst, ut64 flags) {
++	if (R_HASH_NUM_INDICES > 63) {
++		// needs a non-bitmask way to do that, maybe using RBitmap
++		R_LOG_WARN ("Too many hash algorithms registered, some may be unavailable");
++	}
+ 	RHash *ctx = R_NEW0 (RHash);
+ 	if (ctx) {
+ 		r_hash_do_begin (ctx, flags);
+@@ -69,6 +73,17 @@ R_API void r_hash_free(RHash *ctx) {
+ 	free (ctx);
+ }
+ 
++R_API ut8 *r_hash_do_sip(RHash *ctx, const ut8 *input, int len) {
++	if (len < 0) {
++		return NULL;
++	}
++	ut64 res = r_hash_sip (input, len);
++	if (res) {
++		memcpy (ctx->digest, &res, sizeof (res));
++	}
++	return ctx->digest;
++}
++
+ R_API ut8 *r_hash_do_ssdeep(RHash *ctx, const ut8 *input, int len) {
+ 	if (len < 0) {
+ 		return NULL;
+
+
+
+
+@@ -3,6 +3,7 @@
+ 
+ #include "r_types.h"
+ #include "r_util/r_mem.h"
++#include "r_util/r_log.h"
+ 
+ #ifdef __cplusplus
+ extern "C"

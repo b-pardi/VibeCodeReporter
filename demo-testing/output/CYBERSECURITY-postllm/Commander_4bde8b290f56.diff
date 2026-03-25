@@ -1,0 +1,71 @@
+@@ -7,7 +7,7 @@ from typing import Dict, Tuple
+ 
+ from .. import api, crypto, utils
+ from ..commands.helpers.enterprise import user_has_privilege, is_addon_enabled
+-from ..error import CommandError, Error
++from ..error import CommandError, Error, KeeperApiError
+ from ..params import KeeperParams
+ from ..proto import enterprise_pb2
+ from . import sqlite_storage, sox_data
+@@ -87,37 +87,71 @@ def get_prelim_data(params, enterprise_id=0, rebuild=False, min_updated=0, cache
+                               record_ents}
+             return user_ent, record_ents, user_rec_links
+ 
++        def print_status(users_loaded, users_total, records_loaded, records_total):
++            print('\r' + (100 * ' '), file=sys.stderr, end='', flush=True)
++            print(f'\rLoading record information - Users: {users_loaded}/{users_total}, Current Batch: {records_loaded}/{records_total}', file=sys.stderr, end='', flush=True)
++
+         def sync_all():
+-            print('Loading record information.', file=sys.stderr, end='', flush=True)
+             user_ids = list(user_lookup.keys())
++            users_total = len(user_ids)
++            records_total = 0
++            print_status(0, users_total, 0, records_total)
+             users, records, links = [], [], []
++            chunk_size = 1
++            problem_ids = set()
+             while user_ids:
+-                print('.', file=sys.stderr, end='', flush=True)
+                 token = b''
+-                chunk = user_ids[:API_SOX_REQUEST_USER_LIMIT]
+-                user_ids = user_ids[API_SOX_REQUEST_USER_LIMIT:]
++                chunk = user_ids[:chunk_size]
++                user_ids = user_ids[chunk_size:]
+                 rq = enterprise_pb2.PreliminaryComplianceDataRequest()
+                 rq.enterpriseUserIds.extend(chunk)
+                 rq.includeNonShared = not shared_only
+                 has_more = True
++                current_batch_loaded = 0
+                 while has_more:
+                     rq.continuationToken = token or rq.continuationToken
++                    rq.includeTotalMatchingRecordsInFirstResponse = True
+                     endpoint = 'enterprise/get_preliminary_compliance_data'
+                     rs_type = enterprise_pb2.PreliminaryComplianceDataResponse
+-                    rs = api.communicate_rest(params, rq, endpoint, rs_type=rs_type)
+-                    print('.', file=sys.stderr, end='', flush=True)
+-                    has_more = rs.hasMore
+-                    token = rs.continuationToken
+-                    for user_data in rs.auditUserData:
+-                        t_user, t_recs, t_links = to_storage_types(user_data, name_by_id)
+-                        users += [t_user]
+-                        records += t_recs
+-                        links += t_links
++                    try:
++                        rs = api.communicate_rest(params, rq, endpoint, rs_type=rs_type)
++                        has_more = rs.hasMore
++                        if rs.totalMatchingRecords:
++                            current_batch_loaded = 0
++                            records_total = rs.totalMatchingRecords
++                            if records_total < 20 * API_SOX_REQUEST_USER_LIMIT:
++                               # Adjust chunk size to optimize queries
++                               chunk_size = min(chunk_size * 2, API_SOX_REQUEST_USER_LIMIT)
++                        token = rs.continuationToken
++                        for user_data in rs.auditUserData:
++                            t_user, t_recs, t_links = to_storage_types(user_data, name_by_id)
++                            users += [t_user]
++                            records += t_recs
++                            current_batch_loaded += len(t_recs)
++                            print_status(users_total - len(user_ids), users_total, current_batch_loaded, records_total)
++                            links += t_links
++                        if not has_more:
++                            print_status(users_total -

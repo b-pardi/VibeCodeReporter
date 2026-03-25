@@ -1,0 +1,128 @@
+@@ -4,619 +4,955 @@
+ # This program is published under a GPLv2 license
+ 
+ """
+-Clone of p0f passive OS fingerprinting
++Clone of p0f v3 passive OS fingerprinting
+ """
+ 
+ from __future__ import absolute_import
+ from __future__ import print_function
+-import time
++import re
+ import struct
+-import os
+-import socket
+ import random
+ 
+ from scapy.data import KnowledgeBase, select_path
+ from scapy.config import conf
+-from scapy.compat import raw
++from scapy.compat import raw, orb
++from scapy.packet import NoPayload
+ from scapy.layers.inet import IP, TCP, TCPOptions
+-from scapy.packet import NoPayload, Packet
+-from scapy.error import warning, Scapy_Exception, log_runtime
+-from scapy.volatile import RandInt, RandByte, RandNum, RandShort, RandString
+-from scapy.sendrecv import sniff
+-from scapy.modules import six
+-if conf.route is None:
+-    # unused import, only to initialize conf.route
+-    import scapy.route  # noqa: F401
++from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
++from scapy.layers.inet6 import IPv6
++from scapy.volatile import RandByte, RandShort, RandString
++from scapy.error import warning
++from scapy.modules.six import integer_types, string_types
++from scapy.modules.six.moves import range
+ 
+ _p0fpaths = ["/etc/p0f", "/usr/share/p0f", "/opt/local"]
+-
+ conf.p0f_base = select_path(_p0fpaths, "p0f.fp")
+-conf.p0fa_base = select_path(_p0fpaths, "p0fa.fp")
+-conf.p0fr_base = select_path(_p0fpaths, "p0fr.fp")
+-conf.p0fo_base = select_path(_p0fpaths, "p0fo.fp")
+-
+-
+-###############
+-#  p0f stuff  #
+-###############
+-
+-# File format (according to p0f.fp) :
+-#
+-# wwww:ttt:D:ss:OOO...:QQ:OS:Details
+-#
+-# wwww    - window size
+-# ttt     - initial TTL
+-# D       - don't fragment bit  (0=unset, 1=set)
+-# ss      - overall SYN packet size
+-# OOO     - option value and order specification
+-# QQ      - quirks list
+-# OS      - OS genre
+-# details - OS description
+ 
+-class p0fKnowledgeBase(KnowledgeBase):
+-    def __init__(self, filename):
+-        KnowledgeBase.__init__(self, filename)
+-        # self.ttl_range=[255]
++MIN_TCP4 = 40  # Min size of IPv4/TCP headers
++MIN_TCP6 = 60  # Min size of IPv6/TCP headers
++MAX_DIST = 35  # Maximum TTL distance for non-fuzzy signature matching
++
++WIN_TYPE_NORMAL = 0  # Literal value
++WIN_TYPE_ANY = 1  # Wildcard
++WIN_TYPE_MOD = 2  # Modulo check
++WIN_TYPE_MSS = 3  # Window size MSS multiplier
++WIN_TYPE_MTU = 4  # Window size MTU multiplier
++
++# Convert TCP option num to p0f (nop is handled separately)
++tcp_options_p0f = {
++    2: "mss",  # maximum segment size
++    3: "ws",  # window scaling
++    4: "sok",  # selective ACK permitted
++    5: "sack",  # selective ACK (should not be seen)
++    8: "ts",  # timestamp
++}
++
++
++# Signatures
++class TCP_Signature(object):
++    __slots__ = ["olayout", "quirks", "ip_opt_len", "ip_ver", "ttl",
++                 "mss", "win", "win_type", "wscale", "pay_class", "ts1"]
++
++    def __init__(self, olayout, quirks, ip_opt_len, ip_ver, ttl,
++                 mss, win, win_type, wscale, pay_class, ts1):
++        self.olayout = olayout
++        self.quirks = quirks
++        self.ip_opt_len = ip_opt_len
++        self.ip_ver = ip_ver
++        self.ttl = ttl
++        self.mss = mss
++        self.win = win
++        self.win_type = win_type  # None for packet signatures
++        self.wscale = wscale
++        self.pay_class = pay_class
++        self.ts1 = ts1  # None for base signatures
++
++    @classmethod
++    def from_packet(cls, pkt):
++        """
++        Receives a TCP packet (assuming it's valid), and returns
++        a TCP_Signature object
++        """
++        ip_ver = pkt.version
++        quirks = set()
++
++        def addq(name):
++            quirks.add(name)
++
++        # IPv4/IPv6 parsing
++        if ip_ver == 4:
++            ttl = pkt.ttl
++            ip_opt_len = (pkt.ihl * 4) - 20
++            if pkt.tos & (0x01 | 0x02):
++                addq("ecn")
++            if pkt.flags.evil:
++                addq("0+")
++            if pkt.flags.DF:
++                addq(

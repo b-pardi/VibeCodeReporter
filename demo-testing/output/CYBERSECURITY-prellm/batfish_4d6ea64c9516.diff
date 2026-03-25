@@ -1,0 +1,91 @@
+@@ -330,7 +330,7 @@ class IncrementalBdpEngine {
+             .values()
+             .parallelStream()
+             .flatMap(n -> n.getVirtualRouters().values().stream())
+-            .forEach(vr -> vr.initIsisExports(allNodes, networkConfigurations));
++            .forEach(vr -> vr.initIsisExports(iteration, allNodes, networkConfigurations));
+       }
+ 
+       // IS-IS route propagation
+
+
+
+
+@@ -8,6 +8,7 @@ import static org.batfish.common.util.CollectionUtil.toOrderedHashCode;
+ import static org.batfish.datamodel.routing_policy.Environment.Direction.IN;
+ import static org.batfish.dataplane.protocols.BgpProtocolHelper.transformBgpRouteOnImport;
+ import static org.batfish.dataplane.protocols.IsisProtocolHelper.convertRouteLevel1ToLevel2;
++import static org.batfish.dataplane.protocols.IsisProtocolHelper.exportNonIsisRouteToIsis;
+ import static org.batfish.dataplane.protocols.IsisProtocolHelper.setOverloadOnAllRoutes;
+ import static org.batfish.dataplane.protocols.StaticRouteHelper.isInterfaceRoute;
+ import static org.batfish.dataplane.protocols.StaticRouteHelper.isNextVrfRoute;
+@@ -142,6 +143,9 @@ public class VirtualRouter implements Serializable {
+   /** Incoming messages into this router from each IS-IS circuit */
+   transient SortedMap<IsisEdge, Queue<RouteAdvertisement<IsisRoute>>> _isisIncomingRoutes;
+ 
++  /** Routes in main RIB to redistribute into IS-IS */
++  transient RibDelta.Builder<AnnotatedRoute<AbstractRoute>> _routesForIsisRedistribution;
++
+   transient IsisLevelRib _isisL1Rib;
+   transient IsisLevelRib _isisL2Rib;
+   private transient IsisLevelRib _isisL1StagingRib;
+@@ -203,6 +207,7 @@ public class VirtualRouter implements Serializable {
+     _mainRib = new Rib();
+     _mainRibs = ImmutableMap.of(RibId.DEFAULT_RIB_NAME, _mainRib);
+     _mainRibRouteDeltaBuilder = RibDelta.builder();
++    _routesForIsisRedistribution = RibDelta.builder();
+     // Init rest of the RIBs
+     initRibs();
+ 
+@@ -892,7 +897,7 @@ public class VirtualRouter implements Serializable {
+     return builder.build();
+   }
+ 
+-  void initIsisExports(Map<String, Node> allNodes, NetworkConfigurations nc) {
++  void initIsisExports(int numIterations, Map<String, Node> allNodes, NetworkConfigurations nc) {
+     /* TODO: https://github.com/batfish/batfish/issues/1703 */
+     IsisProcess proc = _vrf.getIsisProcess();
+     if (proc == null) {
+@@ -934,9 +939,56 @@ public class VirtualRouter implements Serializable {
+       d1.from(_isisL1Rib.mergeRouteGetDelta(defaultRoute));
+     }
+ 
++    if (numIterations == 1) {
++      // Add initial routes from main rib
++      _routesForIsisRedistribution.add(_mainRib.getTypedRoutes());
++    }
++    addRedistributedRoutesToDeltas(d1, d2, proc);
++    _routesForIsisRedistribution = RibDelta.builder();
++
+     queueOutgoingIsisRoutes(allNodes, nc, d1.build(), d2.build());
+   }
+ 
++  /**
++   * If IS-IS process redistributes routes, run the given routes through the IS-IS export policy and
++   * merge any redistributable routes into the IS-IS level RIBs. Any changes will be recorded in the
++   * given RIB deltas.
++   */
++  void addRedistributedRoutesToDeltas(
++      @Nonnull RibDelta.Builder<IsisRoute> l1Delta,
++      @Nonnull RibDelta.Builder<IsisRoute> l2Delta,
++      @Nonnull IsisProcess proc) {
++    if (proc.getExportPolicy() == null) {
++      return;
++    }
++    // If process has level 1 enabled, routes should be added to IS-IS rib as level 1.
++    // Otherwise if it has level 2 enabled, routes should be added as level 2.
++    IsisLevelSettings activeLevelSettings = proc.getLevel1();
++    boolean isLevel1 = activeLevelSettings != null;
++    if (!isLevel1) {
++      activeLevelSettings = proc.getLevel2();
++    }
++    if (activeLevelSettings == null) {
++      // Neither level enabled
++      return;
++    }
++    _routesForIsisRedistribution
++        .build()
++        .getActions()
++        // Don't redistribute IS-IS routes into IS-IS...
++        .filter(ra -> !(ra.getRoute().getRoute() instanceof IsisRoute))
++        .map(ra 

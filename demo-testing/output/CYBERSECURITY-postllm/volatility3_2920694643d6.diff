@@ -1,0 +1,81 @@
+@@ -20,6 +20,10 @@ class MFTScan(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
+ 
+     _required_framework_version = (2, 0, 0)
+ 
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._record_map = {}
++
+     @classmethod
+     def get_requirements(cls):
+         return [
+@@ -33,8 +37,10 @@ class MFTScan(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
+             ),
+         ]
+ 
+-    def _generator(self):
+-        layer = self.context.layers[self.config["primary"]]
++    def enumerate_mft_records(self, attr_callback):
++        phys_layer = self.context.layers[self.config["primary"]].config["memory_layer"]
++
++        layer = self.context.layers[phys_layer]
+ 
+         # Yara Rule to scan for MFT Header Signatures
+         rules = yarascan.YaraScan.process_yara_options(
+@@ -47,87 +53,36 @@ class MFTScan(interfaces.plugins.PluginInterface, timeliner.TimeLinerInterface):
+             config_path=self.config_path,
+             sub_path="windows",
+             filename="mft",
+-            class_types={"FILE_NAME_ENTRY": mft.MFTFileName, "MFT_ENTRY": mft.MFTEntry},
++            class_types={"FILE_NAME_ENTRY": mft.MFTFileName, "MFT_ENTRY": mft.MFTEntry, "ATTRIBUTE": mft.MFTAttribute},
+         )
+ 
+         # get each of the individual Field Sets
+-        mft_object = symbol_table + constants.BANG + "MFT_ENTRY"
+-        attribute_object = symbol_table + constants.BANG + "ATTRIBUTE"
+-        si_object = symbol_table + constants.BANG + "STANDARD_INFORMATION_ENTRY"
+-        fn_object = symbol_table + constants.BANG + "FILE_NAME_ENTRY"
++        self.mft_object = symbol_table + constants.BANG + "MFT_ENTRY"
++        self.attribute_object = symbol_table + constants.BANG + "ATTRIBUTE"
++        self.si_object = symbol_table + constants.BANG + "STANDARD_INFORMATION_ENTRY"
++        self.fn_object = symbol_table + constants.BANG + "FILE_NAME_ENTRY"
+ 
+         # Scan the layer for Raw MFT records and parse the fields
+-        for offset, _rule_name, _name, _value in layer.scan(
++        for offset, _, _, _ in layer.scan(
+             context=self.context, scanner=yarascan.YaraScanner(rules=rules)
+         ):
+-            with contextlib.suppress(exceptions.PagedInvalidAddressException):
++            with contextlib.suppress(exceptions.InvalidAddressException):
+                 mft_record = self.context.object(
+-                    mft_object, offset=offset, layer_name=layer.name
++                    self.mft_object, offset=offset, layer_name=layer.name
+                 )
+                 # We will update this on each pass in the next loop and use it as the new offset.
+                 attr_base_offset = mft_record.FirstAttrOffset
+                 attr = self.context.object(
+-                    attribute_object,
++                    self.attribute_object,
+                     offset=offset + attr_base_offset,
+                     layer_name=layer.name,
+                 )
+ 
+                 # There is no field that has a count of Attributes
+                 # Keep Attempting to read attributes until we get an invalid attr_header.AttrType
+-
+                 while attr.Attr_Header.AttrType.is_valid_choice:
+-                    vollog.debug(f"Attr Type: {attr.Attr_Header.AttrType.lookup()}")
+-
+-                    # MFT Flags determine the file type or dir
+-                    # If we don't have a valid enum, coerce to hex so we can keep the record
+-                    try:
+-                        mft_flag = mft_record.Flags.lookup()
+-                    except ValueError:
+-                        mft_flag = hex(mft_record.Flags)
+-
+-                    # Standard Information Attribute
+-                    if attr.Attr_Header.AttrType.lookup() == "STANDARD_INFORMATION":
+-                        attr_data = attr.Attr_Data.cast(si_object)
+-                        yield 0, (
+-                            format_hints.Hex(attr_data.vol.offset),
+-                            mft_r

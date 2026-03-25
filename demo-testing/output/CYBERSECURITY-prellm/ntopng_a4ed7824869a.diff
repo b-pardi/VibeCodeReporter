@@ -1,0 +1,90 @@
+@@ -127,7 +127,7 @@ class NetworkInterface : public Checkpointable {
+   int pcap_datalink_type; /**< Datalink type of pcap. */
+   pthread_t pollLoop;
+   bool pollLoopCreated, has_too_many_hosts, has_too_many_flows, mtuWarningShown;
+-  bool too_many_drops, slow_stats_update;
++  bool too_many_drops, slow_stats_update, flow_dump_disabled;
+   u_int32_t ifSpeed, numL2Devices, numHosts, numLocalHosts, scalingFactor;
+   u_int64_t checkpointPktCount, checkpointBytesCount, checkpointPktDropCount; /* Those will hold counters at checkpoints */
+   u_int16_t ifMTU;
+@@ -272,7 +272,7 @@ class NetworkInterface : public Checkpointable {
+   NetworkInterface(const char *name, const char *custom_interface_type = NULL);
+   virtual ~NetworkInterface();
+ 
+-  void finishInitialization(u_int8_t num_defined_interfaces);
++  bool initFlowDump(u_int8_t num_dump_interfaces);
+   virtual u_int32_t getASesHashSize();
+   virtual u_int32_t getCountriesHashSize();
+   virtual u_int32_t getVLANsHashSize();
+@@ -396,6 +396,7 @@ class NetworkInterface : public Checkpointable {
+   inline int isRunning()	   { return running;             };
+   inline bool isTrafficMirrored()  { return is_traffic_mirrored; };
+   void  updateTrafficMirrored();
++  void updateFlowDumpDisabled();
+   bool restoreHost(char *host_ip, u_int16_t vlan_id);
+   u_int printAvailableInterfaces(bool printHelp, int idx, char *ifname, u_int ifname_len);
+   void findFlowHosts(u_int16_t vlan_id,
+@@ -732,6 +733,7 @@ class NetworkInterface : public Checkpointable {
+   void tsLua(lua_State* vm);
+   void reloadDhcpRanges();
+   inline bool hasConfiguredDhcpRanges()      { return(dhcp_ranges && !dhcp_ranges->last_ip.isEmpty()); };
++  inline bool isFlowDumpDisabled()           { return(flow_dump_disabled); }
+   bool isInDhcpRange(IpAddress *ip);
+   void getPodsStats(lua_State* vm);
+   void getContainersStats(lua_State* vm, const char *pod_filter);
+
+
+
+
+@@ -46,6 +46,7 @@ class Ntop {
+   char *custom_ndpi_protos; /**< Pointer of a custom protocol for nDPI. */
+   NetworkInterface **iface; /**< Array of network interfaces. */
+   u_int8_t num_defined_interfaces; /**< Number of defined interfaces. */
++  uint8_t num_dump_interfaces;
+   HTTPserver *httpd; /**< Pointer of httpd server. */
+   NtopGlobals *globals; /**< Pointer of Ntop globals info and variables. */
+   u_int num_cpus; /**< Number of physical CPU cores. */
+
+
+
+
+@@ -518,6 +518,7 @@
+ #define CONST_TOP_TALKERS_ENABLED          NTOPNG_PREFS_PREFIX".host_top_sites_creation"
+ #define CONST_SUPPRESSED_ALERT_PREFS       NTOPNG_PREFS_PREFIX".alerts.ifid_%d"
+ #define CONST_MIRRORED_TRAFFIC_PREFS       NTOPNG_PREFS_PREFIX".ifid_%d.is_traffic_mirrored"
++#define CONST_DISABLED_FLOW_DUMP_PREFS     NTOPNG_PREFS_PREFIX".ifid_%d.is_flow_dump_disabled"
+ #define CONST_LBD_SERIALIZATION_PREFS      NTOPNG_PREFS_PREFIX".ifid_%d.serialize_local_broadcast_hosts_as_macs"
+ #define CONST_USE_NINDEX                   NTOPNG_PREFS_PREFIX".use_nindex"
+ #ifdef NTOPNG_PRO
+
+
+
+
+@@ -271,6 +271,7 @@ NetworkInterface::NetworkInterface(const char *name,
+   reloadHideFromTop(false);
+   reloadCompanion();
+   updateTrafficMirrored();
++  updateFlowDumpDisabled();
+   updateLbdIdentifier();
+ }
+ 
+@@ -295,7 +296,7 @@ void NetworkInterface::init() {
+     cpu_affinity = -1 /* no affinity */,
+     inline_interface = false, running = false, interfaceStats = NULL,
+     has_too_many_hosts = has_too_many_flows = too_many_drops = false,
+-    slow_stats_update = false,
++    slow_stats_update = false, flow_dump_disabled = false,
+     numL2Devices = 0, numHosts = 0, numLocalHosts = 0,
+     checkpointPktCount = checkpointBytesCount = checkpointPktDropCount = 0,
+     pollLoopCreated = false, bridge_interface = false,
+@@ -542,6 +543,25 @@ void NetworkInterface::updateTrafficMirrored() {
+ 
+ /* **************************************************** */
+ 
++void NetworkInterface::updateFlowDumpDisabled() {
++  char key[CONST_MAX_LEN_REDIS_KEY], rsp[2] = { 0 };
++  bool is_disabled = false;
++
++  if(!ntop->getRedis()) return;
++
++

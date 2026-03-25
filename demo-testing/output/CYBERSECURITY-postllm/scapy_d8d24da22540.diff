@@ -1,0 +1,131 @@
+@@ -573,7 +573,7 @@ class LdapPing_am(AnsweringMachine):
+         req = req.protocolOp
+         return (
+             req.attributes
+-            and req.attributes[0].type.val == b"Netlogon"
++            and req.attributes[0].type.val.lower() == b"netlogon"
+             and req.filter
+             and isinstance(req.filter.filter, LDAP_FilterAnd)
+             and any(
+
+
+
+
+@@ -279,7 +279,11 @@ class NBNSRegistrationRequest(Packet):
+         IPField("NB_ADDRESS", "127.0.0.1")
+     ]
+ 
++    def mysummary(self):
++        return self.sprintf("Register %G% %QUESTION_NAME% at %NB_ADDRESS%")
++
+ 
++bind_bottom_up(NBNSHeader, NBNSRegistrationRequest, OPCODE=0x5)
+ bind_layers(NBNSHeader, NBNSRegistrationRequest,
+             OPCODE=0x5, NM_FLAGS=0x11, QDCOUNT=1, ARCOUNT=1)
+ 
+@@ -312,7 +316,7 @@ class NBTDatagram(Packet):
+                    ShortField("ID", 0),
+                    IPField("SourceIP", "127.0.0.1"),
+                    ShortField("SourcePort", 138),
+-                   ShortField("Length", 272),
++                   ShortField("Length", None),
+                    ShortField("Offset", 0),
+                    NetBIOSNameField("SourceName", "windows"),
+                    ShortEnumField("SUFFIX1", 0x4141, _NETBIOS_SUFFIXES),
+@@ -321,6 +325,13 @@ class NBTDatagram(Packet):
+                    ShortEnumField("SUFFIX2", 0x4141, _NETBIOS_SUFFIXES),
+                    ByteField("NULL2", 0)]
+ 
++    def post_build(self, pkt, pay):
++        if self.Length is None:
++            length = len(pay) + 68
++            pkt = pkt[:10] + struct.pack("!H", length) + pkt[12:]
++        return pkt + pay
++
++
+ # SESSION SERVICE PACKETS
+ 
+ 
+
+
+
+
+@@ -684,8 +684,10 @@ _SMB_CONFIG = [
+ 
+ class _SMB_TransactionRequest_Data(PacketLenField):
+     def m2i(self, pkt, m):
+-        if pkt.WordCount == 0x11:
++        if pkt.Name == b"\\MAILSLOT\\NET\\NETLOGON":
+             return NETLOGON(m)
++        elif pkt.Name == b"\\MAILSLOT\\BROWSE" or pkt.name == b"\\MAILSLOT\\LANMAN":
++            return BRWS(m)
+         return conf.raw_layer(m)
+ 
+ 
+@@ -780,6 +782,11 @@ class SMBTransaction_Request(_NTLMPayloadPacket):
+             + pay
+         )
+ 
++    def mysummary(self):
++        if self.DataLen:
++            return self.sprintf("Tran %Name% ") + self.Data.mysummary()
++        return self.sprintf("Tran %Name%")
++
+ 
+ bind_top_down(SMB_Header, SMBTransaction_Request, Command=0x25)
+ 
+@@ -1084,6 +1091,84 @@ class NETLOGON_SAM_LOGON_RESPONSE_EX(NETLOGON, DNSCompressedPacket):
+         return self.original
+ 
+ 
++# [MS-BRWS] sect 2.2
++
++class BRWS(Packet):
++    fields_desc = [
++        ByteEnumField("OpCode", 0x00, {
++            0x01: "HostAnnouncement",
++            0x02: "AnnouncementRequest",
++            0x08: "RequestElection",
++            0x09: "GetBackupListRequest",
++            0x0A: "GetBackupListResponse",
++            0x0B: "BecomeBackup",
++            0x0C: "DomainAnnouncement",
++            0x0D: "MasterAnnouncement",
++            0x0E: "ResetStateRequest",
++            0x0F: "LocalMasterAnnouncement",
++        }),
++    ]
++
++    def mysummary(self):
++        return self.sprintf("%OpCode%")
++
++    registered_opcodes = {}
++
++    @classmethod
++    def register_variant(cls):
++        cls.registered_opcodes[cls.OpCode.default] = cls
++
++    @classmethod
++    def dispatch_hook(cls, _pkt=None, *args, **kargs):
++        if _pkt:
++            return cls.registered_opcodes.get(_pkt[0], cls)
++        return cls
++
++    def default_payload_class(self, payload):
++        return conf.padding_layer
++
++
++# [MS-BRWS] sect 2.2.1
++
++class BRWS_HostAnnouncement(BRWS):
++    OpCode = 0x01
++    fields_desc = [
++        BRWS,
++        ByteField("UpdateCount", 0),
++        LEIntField("Periodicity", 128000),
++        StrFixedLenField("ServerName", b"", length=16),
++        ByteField("OSVersionMajor", 6),
++        ByteField("OSVersionMinor", 1),
++        LEIntField("ServerType", 4611),
++        ByteField("BrowserConfigVersionMajor", 21),
++        ByteField("BrowserConfigVersionMinor",

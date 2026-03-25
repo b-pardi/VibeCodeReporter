@@ -1,0 +1,91 @@
+@@ -97,6 +97,8 @@ static CALI_BPF_INLINE enum cali_rt_flags cali_rt_lookup_flags(ipv46_addr_t *add
+ #define cali_rt_flags_is_in_pool(t) (((t) & CALI_RT_IN_POOL) == CALI_RT_IN_POOL)
+ #define cali_rt_flags_skip_ingress_redirect(t) (((t) & CALI_RT_SKIP_INGRESS_REDIRECT))
+ 
++#define cali_rt_flags_should_set_dscp(t) (!cali_rt_flags_is_in_pool(t) && !cali_rt_flags_local_host(t))
++
+ static CALI_BPF_INLINE bool rt_addr_is_local_host(ipv46_addr_t *addr)
+ {
+ 	return  cali_rt_flags_local_host(cali_rt_lookup_flags(addr));
+@@ -117,23 +119,13 @@ static CALI_BPF_INLINE bool rt_addr_is_local_tunneled_host(ipv46_addr_t *addr)
+ 	return cali_rt_flags_local_tunneled_host(cali_rt_lookup_flags(addr));
+ }
+ 
+-static CALI_BPF_INLINE bool rt_addr_is_local_host_or_in_pool(ipv46_addr_t *addr)
+-{
+-	__u32 flags = cali_rt_lookup_flags(addr);
+-	return cali_rt_flags_local_host(flags) || cali_rt_flags_is_in_pool(flags);
+-}
+-
+ // Don't perform SNAT if either:
+ // - packet is destined to an address in an IP pool;
+ // - packet is destined to local host; or
+ // - packet is destined to a host and the CALI_GLOBALS_NATOUTGOING_EXCLUDE_HOSTS global flag is set
+-static CALI_BPF_INLINE bool rt_flags_should_perform_nat_outgoing(enum cali_rt_flags flags, bool exclude_hosts)
++static CALI_BPF_INLINE bool cali_rt_flags_should_perform_nat_outgoing(__u32 flags, bool exclude_hosts)
+ {
+-    if cali_rt_flags_is_in_pool(flags) return false;
+-    if cali_rt_flags_host(flags) {
+-        if cali_rt_flags_local(flags) return false;
+-        if (exclude_hosts) return false;
+-    }
+-    return true;
++	return !(cali_rt_flags_is_in_pool(flags) ||
++			(cali_rt_flags_host(flags) && (exclude_hosts || cali_rt_flags_local(flags))));
+ }
+ #endif /* __CALI_ROUTES_H__ */
+
+
+
+
+@@ -510,9 +510,19 @@ syn_force_policy:
+ 		}
+ 	}
+ 
++	struct cali_rt *src_rt = cali_rt_lookup(&ctx->state->ip_src);
++	struct cali_rt *dst_rt = NULL;
++
++	if (CALI_F_TO_HEP || CALI_F_FROM_WEP) {
++		dst_rt = cali_rt_lookup(&ctx->state->post_nat_ip_dst);
++	}
++
++	__u32 src_flags = src_rt ? src_rt->flags : CALI_RT_UNKNOWN;
++	__u32 dst_flags = dst_rt ? dst_rt->flags : CALI_RT_UNKNOWN;
++
+ 	if (CALI_F_TO_WEP && (!skb_seen(ctx->skb) ||
+ 			skb_mark_equals(ctx->skb, CALI_SKB_MARK_FROM_NAT_IFACE_OUT, CALI_SKB_MARK_FROM_NAT_IFACE_OUT)) &&
+-			cali_rt_flags_local_host(cali_rt_lookup_flags(&ctx->state->ip_src))) {
++			cali_rt_flags_local_host(src_flags)) {
+ 		/* Host to workload traffic always allowed.  We discount traffic that was
+ 		 * seen by another program since it must have come in via another interface.
+ 		 */
+@@ -525,48 +535,44 @@ syn_force_policy:
+ 			&& !(ctx->state->ip_proto == IPPROTO_ICMPV6 && ip_link_local(ctx->state->ip_src))
+ #endif
+ 		) {
+-		struct cali_rt *r = cali_rt_lookup(&ctx->state->ip_src);
+ 		/* Do RPF check since it's our responsibility to police that. */
+-		if (wep_rpf_check(ctx, r) == RPF_RES_FAIL) {
++		if (wep_rpf_check(ctx, src_rt) == RPF_RES_FAIL) {
+ 			goto deny;
+ 		}
+ 
+-		if (cali_rt_flags_skip_ingress_redirect(r->flags)) {
++		if (cali_rt_flags_skip_ingress_redirect(src_flags)) {
+ 			ctx->state->flags |= CALI_ST_SKIP_REDIR_PEER;
+ 		}
+ 
+ 		// Check whether the workload needs outgoing NAT to this address.
+-		if (r->flags & CALI_RT_NAT_OUT) {
++		if (src_flags & CALI_RT_NAT_OUT) {
+ 			bool exclude_hosts = (GLOBAL_FLAGS & CALI_GLOBALS_NATOUTGOING_EXCLUDE_HOSTS);
+-			if (rt_flags_should_perform_nat_outgoing(cali_rt_lookup_flags(&ctx->state->post_nat_ip_dst), exclude_hosts)) {
++			if (cali_rt_flags_should_perform_nat_outgoing(dst_flags, exclude_hosts)) {
+ 				CALI_DEBUG("Source is in NAT-outgoing pool but dest is not, need to SNAT.");
+ 				ctx->state->flags |= CALI_ST_NAT_OUTGOING;
+ 			}
+ 		}
+-		// Check if traffic is leaving cluster. We might need to set DSCP later.
+-		if (cali_rt_flags_is_in_pool(r->flags) && !(rt_addr_is_local_host_or_in_pool(&ctx->state->post_nat_ip_dst))) {
+-			CALI_DEBUG("Remote host or outside cluster dest " IP_FMT "", debug_ip(ctx->state->post_nat_ip_dst));
+-			ctx->state->flags |= CALI_ST_CLU

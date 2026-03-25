@@ -1,0 +1,157 @@
+@@ -30,8 +30,10 @@ DEFINE_IPV6(ROUTER_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0,
+ DEFINE_IPV6(HOST_IP, 0xbe, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0xa, 0x0, 0x2, 0xf, 0xff, 0xff);
+ #endif
+ 
+-DEFINE_U32(SECCTX_FROM_IPCACHE, 1);
+-#define SECCTX_FROM_IPCACHE fetch_u32(SECCTX_FROM_IPCACHE)
++#ifndef SECCTX_FROM_IPCACHE
++ DEFINE_U32(SECCTX_FROM_IPCACHE, 1);
++ #define SECCTX_FROM_IPCACHE fetch_u32(SECCTX_FROM_IPCACHE)
++#endif
+ 
+ #define TUNNEL_PORT 8472
+ 
+@@ -193,7 +195,9 @@ DEFINE_U32(SECCTX_FROM_IPCACHE, 1);
+ #ifdef ENABLE_NODEPORT
+ # define DIRECT_ROUTING_DEV_IFINDEX 0
+ # ifdef ENABLE_IPV4
+-#  define IPV4_DIRECT_ROUTING 0
++#  ifndef IPV4_DIRECT_ROUTING
++#   define IPV4_DIRECT_ROUTING 0
++#  endif
+ #  define IPV4_RSS_PREFIX IPV4_DIRECT_ROUTING
+ #  define IPV4_RSS_PREFIX_BITS 32
+ # endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,227 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++/* Copyright Authors of Cilium */
++
++#include "common.h"
++
++#include <bpf/ctx/skb.h>
++#include "pktgen.h"
++
++/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
++#define ETH_HLEN 14
++
++/* Enable code paths under test */
++#define ENABLE_IPV4
++#define ENABLE_NODEPORT
++#define ENABLE_HOST_ROUTING
++
++#define DISABLE_LOOPBACK_LB
++
++/* Skip ingress policy checks, not needed to validate hairpin flow */
++#define USE_BPF_PROG_FOR_INGRESS_POLICY
++#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
++
++#define CLIENT_IP		v4_ext_one
++#define CLIENT_PORT		__bpf_htons(111)
++
++#define FRONTEND_IP		v4_svc_one
++#define FRONTEND_PORT		tcp_svc_one
++
++#define LB_IP			v4_node_one
++#define LB_PORT			__bpf_htons(222)
++
++#define BACKEND_IP		v4_pod_one
++#define BACKEND_PORT		__bpf_htons(8080)
++
++#define SECCTX_FROM_IPCACHE 1
++
++#include "bpf_host.c"
++
++__u8 node_mac[ETH_ALEN] = mac_three;
++__u8 backend_mac[ETH_ALEN] = mac_four;
++
++#define FROM_NETDEV	0
++#define TO_NETDEV	1
++
++struct {
++	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
++	__uint(key_size, sizeof(__u32));
++	__uint(max_entries, 2);
++	__array(values, int());
++} entry_call_map __section(".maps") = {
++	.values = {
++		[FROM_NETDEV] = &cil_from_netdev,
++		[TO_NETDEV] = &cil_to_netdev,
++	},
++};
++
++/* Test that a remote LB
++ * - doesn't touch a NATed request,
++ * - redirects it to the pod (as ENABLE_HOST_ROUTING is set)
++ */
++PKTGEN("tc", "tc_nodeport_nat_backend")
++int nodeport_nat_backend_pktgen(struct __ctx_buff *ctx)
++{
++	__u8 src[ETH_ALEN] = mac_one;
++	__u8 dst[ETH_ALEN] = mac_two;
++	struct pktgen builder;
++	struct tcphdr *l4;
++	struct ethhdr *l2;
++	struct iphdr *l3;
++	void *data;
++
++	/* Init packet builder */
++	pktgen__init(&builder, ctx);
++
++	/* Push ethernet header */
++	l2 = pktgen__push_ethhdr(&builder);
++	if (!l2)
++		return TEST_ERROR;
++
++	ethhdr__set_macs(l2, src, dst);
++
++	/* Push IPv4 header */
++	l3 = pktgen__push_default_iphdr(&builder);
++	if (!l3)
++		return TEST_ERROR;
++
++	l3->saddr = LB_IP;
++	l3->daddr = BACKEND_IP;
++
++	/* Push TCP header */
++	l4 = pktgen__push_default_tcphdr(&builder);
++	if (!l4)
++		return TEST_ERROR;
++
++	l4->source = LB_PORT;
++	l4->dest = BACKEND_PORT;
++
++	data = pktgen__push_data(&builder, default_data, sizeof(default_data));
++	if (!data)
++		return TEST_ERROR;
++
++	/* Calc lengths, set protocol fields and calc checksums */
++	pktgen__finish(&builder);
++
++	return 0;
++}
++
++SETUP("tc", "tc_nodeport_nat_backend")
++int nodeport_nat_backend_setup(struct __ctx_buff *ctx)
++{
++	/* Register a fake LB backend matching our packet. */
++	struct lb4_key lb_svc_key = {
++		.address = FRONTEND_IP,
++		.dport = FRONTEND_PORT,
++		.scope = LB_LOOKUP_SCOPE_EXT,
++	};
++	/* Create a service with only one backend */
++	struct lb4_service lb_svc_value = {
++		.count = 1,
++		.flags = SVC_FLAG_ROUTABLE,
++	};
++	map_update_elem(&LB4_SERVICES_MAP_V2, &lb_svc_key, &lb_svc_value, BPF_ANY);
++	/* We need to register both in the external and internal scopes for the
++	 * packet to be redirected to a neighboring node
++	 */
++	lb_svc_key.scope = LB_LOOKUP_SCOPE_INT;
++	map_update_elem(&LB4_SER

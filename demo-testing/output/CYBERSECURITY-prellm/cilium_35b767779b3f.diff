@@ -1,0 +1,148 @@
+@@ -711,14 +711,13 @@ int to_netdev(struct __sk_buff *skb)
+ 	 * workaround.
+ 	 */
+ 	int ret = TC_ACT_OK;
+-#if (defined(ENABLE_NODEPORT) && !defined(ENABLE_DSR)) || defined(ENABLE_MASQUERADE)
+-# if defined(ENABLE_NODEPORT) && !defined(ENABLE_DSR)
++#if defined(ENABLE_NODEPORT) && (!defined(ENABLE_DSR) || (defined(ENABLE_DSR) && defined(ENABLE_DSR_HYBRID)))
+ 	if ((skb->mark & MARK_MAGIC_SNAT_DONE) == MARK_MAGIC_SNAT_DONE)
+ 		return TC_ACT_OK;
+ 	ret = nodeport_nat_fwd(skb, false);
+ 	if (IS_ERR(ret))
+ 		return send_drop_notify_error(skb, 0, ret, TC_ACT_SHOT, METRIC_EGRESS);
+-# else
++#elif defined(ENABLE_MASQUERADE)
+ 	__u16 proto;
+ 	if (!validate_ethertype(skb, &proto))
+ 		/* Pass unknown traffic to the stack */
+@@ -727,8 +726,7 @@ int to_netdev(struct __sk_buff *skb)
+ 	ret = snat_process(skb, BPF_PKT_DIR);
+ 	if (!ret)
+ 		cilium_dbg_capture(skb, DBG_CAPTURE_SNAT_POST, skb->ifindex);
+-# endif
+-#endif
++#endif /* ENABLE_MASQUERADE */
+ 	return ret;
+ }
+ 
+
+
+
+
+@@ -57,7 +57,11 @@ struct nat_entry {
+ # define SNAT_SIGNAL_THRES		64
+ #else
+ # if defined ENABLE_IPV4 && defined ENABLE_IPV6
+-#  define SNAT_COLLISION_RETRIES	18
++#  ifdef ENABLE_DSR_HYBRID
++#   define SNAT_COLLISION_RETRIES	16
++#  else
++#   define SNAT_COLLISION_RETRIES	18
++#  endif
+ # else
+ #  define SNAT_COLLISION_RETRIES	20
+ # endif
+
+
+
+
+@@ -36,7 +36,6 @@
+ #endif
+ 
+ #ifdef ENABLE_NODEPORT
+-
+ #ifdef ENABLE_IPV4
+ struct bpf_elf_map __section_maps NODEPORT_NEIGH4 = {
+ 	.type		= BPF_MAP_TYPE_LRU_HASH,
+@@ -55,8 +54,8 @@ struct bpf_elf_map __section_maps NODEPORT_NEIGH6 = {
+ 	.pinning	= PIN_GLOBAL_NS,
+ 	.max_elem	= SNAT_MAPPING_IPV6_SIZE,
+ };
+-# ifdef ENABLE_DSR
+-// The IPv6 extension should be 8-bytes aligned
++
++/* The IPv6 extension should be 8-bytes aligned */
+ struct dsr_opt_v6 {
+ 	__u8 nexthdr;
+ 	__u8 len;
+@@ -65,9 +64,7 @@ struct dsr_opt_v6 {
+ 	union v6addr addr;
+ 	__be32 port;
+ };
+-# endif
+ #endif /* ENABLE_IPV6 */
+-
+ #endif /* ENABLE_NODEPORT */
+ 
+ static inline void bpf_clear_nodeport(struct __sk_buff *skb)
+@@ -78,6 +75,19 @@ static inline void bpf_clear_nodeport(struct __sk_buff *skb)
+ }
+ 
+ #ifdef ENABLE_NODEPORT
++static __always_inline bool nodeport_uses_dsr(__u8 nexthdr)
++{
++# if defined(ENABLE_DSR) && !defined(ENABLE_DSR_HYBRID)
++	return true;
++# elif defined(ENABLE_DSR) && defined(ENABLE_DSR_HYBRID)
++	if (nexthdr == IPPROTO_TCP)
++		return true;
++	return false;
++# else
++	return false;
++# endif
++}
++
+ static inline bool __inline__ bpf_skip_nodeport(struct __sk_buff *skb)
+ {
+ 	volatile __u32 tc_index = skb->tc_index;
+@@ -88,6 +98,11 @@ static inline bool __inline__ bpf_skip_nodeport(struct __sk_buff *skb)
+ 
+ #ifdef ENABLE_NODEPORT
+ #ifdef ENABLE_IPV6
++static inline bool nodeport_uses_dsr6(const struct ipv6_ct_tuple *tuple)
++{
++	return nodeport_uses_dsr(tuple->nexthdr);
++}
++
+ static __always_inline bool nodeport_nat_ipv6_needed(struct __sk_buff *skb,
+ 						     union v6addr *addr, int dir)
+ {
+@@ -96,6 +111,18 @@ static __always_inline bool nodeport_nat_ipv6_needed(struct __sk_buff *skb,
+ 
+ 	if (!revalidate_data(skb, &data, &data_end, &ip6))
+ 		return false;
++#ifdef ENABLE_DSR_HYBRID
++	{
++		__u8 nexthdr = ip6->nexthdr;
++		int ret;
++
++		ret = ipv6_hdrlen(skb, ETH_HLEN, &nexthdr);
++		if (ret > 0) {
++			if (nodeport_uses_dsr(nexthdr))
++				return false;
++		}
++	}
++#endif /* ENABLE_DSR_HYBRID */
+ 	/* See nodeport_nat_ipv4_needed(). */
+ 	if (dir == NAT_DIR_EGRESS)
+ 		return !ipv6_addrcmp((union v6addr *)&ip6->saddr, addr);
+@@ -130,7 +157,6 @@ static __always_inline int nodeport_nat_ipv6_rev(struct __sk_buff *skb,
+ }
+ 
+ # ifdef ENABLE_DSR
+-
+ static __always_inline int set_dsr_ext6(struct __sk_buff *skb,
+ 					struct ipv6hdr *ip6,
+ 					union v6addr *svc_addr, __be32 svc_port)
+@@ -221,9 +247,8 @@ static __always_inline int handle_dsr_v6(struct __sk_buff *skb, bool *dsr)
+ 		return ret;
+ 
+ 	if (*dsr) {
+-		if (snat_v6_create_dsr(skb, &opt.addr, opt.port) < 0) {
++		if (snat_v6_create_dsr(skb, &opt.addr, opt.port) < 0)
+ 			return DROP_INVALID;
+-		}
+ 	}
+ 
+ 	return 0;
+@@ -233,22 +258,18 @@ s

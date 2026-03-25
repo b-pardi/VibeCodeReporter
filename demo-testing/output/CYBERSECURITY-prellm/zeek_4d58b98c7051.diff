@@ -1,0 +1,135 @@
+@@ -46,7 +46,13 @@ const HashkeyMapPtr ordered_hashkeys(const TableVal* tv)
+ 	for ( const auto& entry : *tbl )
+ 		{
+ 		auto k = entry.GetHashKey();
+-		// Do we have to recreate here? Could we reuse the existing key?
++		// Potential optimization: we could do without the following if
++		// the caller uses k directly to determine key length &
++		// content. But: the way k got serialized might differ somewhat
++		// from how we'll end up doing it (e.g. singleton vs
++		// non-singleton), and looking up a table value with the hashkey
++		// is tricky in case of subnets (consider the special-casing in
++		// TableVal::Find()).
+ 		auto lv = tv->RecreateIndex(*k);
+ 		res->insert_or_assign(std::move(k), lv);
+ 		}
+@@ -56,571 +62,628 @@ const HashkeyMapPtr ordered_hashkeys(const TableVal* tv)
+ 
+ CompositeHash::CompositeHash(TypeListPtr composite_type) : type(std::move(composite_type))
+ 	{
+-	singleton_tag = TYPE_INTERNAL_ERROR;
++	if ( type->GetTypes().size() == 1 )
++		is_singleton = true;
++	}
+ 
+-	// If the only element is a record or vector, don't treat it as a
+-	// singleton, since it needs to be evaluated specially.
++std::unique_ptr<HashKey> CompositeHash::MakeHashKey(const Val& argv, bool type_check) const
++	{
++	auto res = std::make_unique<HashKey>();
++	const auto& tl = type->GetTypes();
+ 
+-	if ( type->GetTypes().size() == 1 )
++	if ( is_singleton )
+ 		{
+-		if ( type->GetTypes()[0]->Tag() == TYPE_RECORD ||
+-		     type->GetTypes()[0]->Tag() == TYPE_VECTOR )
+-			{
+-			is_complex_type = true;
+-			is_singleton = false;
+-			}
+-		else
++		const Val* v = &argv;
++
++		// This is the "singleton" case -- actually just a single value
++		// that may come bundled in a list. If so, unwrap it.
++		if ( v->GetType()->Tag() == TYPE_LIST )
+ 			{
+-			is_complex_type = false;
+-			is_singleton = true;
++			auto lv = v->AsListVal();
++
++			if ( type_check && lv->Length() != 1 )
++				return nullptr;
++
++			v = lv->Idx(0).get();
+ 			}
+-		}
+ 
+-	else
+-		{
+-		is_singleton = false;
+-		is_complex_type = false;
++		if ( SingleValHash(*res, v, tl[0].get(), type_check, false, true) )
++			return res;
++
++		return nullptr;
+ 		}
+ 
+-	if ( is_singleton )
++	if ( type_check && argv.GetType()->Tag() != TYPE_LIST )
++		return nullptr;
++
++	if ( ! ReserveKeySize(*res, &argv, type_check, false) )
++		return nullptr;
++
++	// Size computation has done requested type-checking, no further need
++	type_check = false;
++
++	// The size computation resulted in a requested buffer size; allocate it.
++	res->Allocate();
++
++	for ( auto i = 0u; i < tl.size(); ++i )
+ 		{
+-		// Don't do any further key computations - we'll do them
+-		// via the singleton later.
+-		singleton_tag = type->GetTypes()[0]->InternalType();
+-		size = 0;
+-		key = nullptr;
++		if ( ! SingleValHash(*res, argv.AsListVal()->Idx(i).get(), tl[i].get(), type_check, false,
++		                     false) )
++			return nullptr;
+ 		}
+ 
+-	else
++	return res;
++	}
++
++ListValPtr CompositeHash::RecoverVals(const HashKey& hk) const
++	{
++	auto l = make_intrusive<ListVal>(TYPE_ANY);
++	const auto& tl = type->GetTypes();
++
++	hk.ResetRead();
++
++	for ( const auto& type : tl )
+ 		{
+-		size = ComputeKeySize(nullptr, true, true);
++		ValPtr v;
++
++		if ( ! RecoverOneVal(hk, type.get(), &v, false, is_singleton) )
++			reporter->InternalError("value recovery failure in CompositeHash::RecoverVals");
+ 
+-		if ( size > 0 )
+-			// Fixed size.  Make sure what we get is fully aligned.
+-			key = reinterpret_cast<char*>(new double[size / sizeof(double) + 1]);
+-		else
+-			key = nullptr;
++		ASSERT(v);
++		l->Append(std::move(v));
+ 		}
+-	}
+ 
+-CompositeHash::~CompositeHash()
+-	{
+-	delete[] key;
++	return l;
+ 	}
+ 
+-// Computes the piece of the hash for Val*, returning the new kp.
+-char* CompositeHash::SingleValHash(bool type_check, char* kp0, Type* bt, Val* v,
+-                                   bool optional) const
++bool CompositeHash::RecoverOneVal(const HashKey& hk, Type* t, ValPtr* pval, bool optional,
++                                  bool singleton) const
+ 	{
+-	char* kp1 = nullp

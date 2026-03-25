@@ -1,0 +1,140 @@
+@@ -157,10 +157,19 @@ typedef enum uc_hook_idx {
+     UC_HOOK_MEM_FETCH_IDX,
+     UC_HOOK_MEM_READ_AFTER_IDX,
+     UC_HOOK_INSN_INVALID_IDX,
++    UC_HOOK_EDGE_GENERATED_IDX,
+ 
+     UC_HOOK_MAX,
+ } uc_hook_idx;
+ 
++// Copy the essential information from TranslationBlock
++#define UC_TB_COPY(uc_tb, tb)                                                  \
++    do {                                                                       \
++        (uc_tb)->pc = tb->pc;                                                  \
++        (uc_tb)->icount = tb->icount;                                          \
++        (uc_tb)->size = tb->size;                                              \
++    } while (0)
++
+ // The lowest 6 bits are used for hook type index.
+ #define UC_HOOK_IDX_MASK ((1 << 6) - 1)
+ 
+
+
+
+
+@@ -232,6 +232,22 @@ typedef uint32_t (*uc_cb_insn_in_t)(uc_engine *uc, uint32_t port, int size,
+ typedef void (*uc_cb_insn_out_t)(uc_engine *uc, uint32_t port, int size,
+                                  uint32_t value, void *user_data);
+ 
++// Represent a TranslationBlock.
++typedef struct uc_tb {
++    uint64_t pc;
++    uint16_t icount;
++    uint16_t size;
++} uc_tb;
++
++/*
++  Callback function for new edges between translation blocks.
++
++  @cur_tb: Current TB which is to be generated.
++  @prev_tb: The previous TB.
++*/
++typedef void (*uc_hook_edge_gen_t)(uc_engine *uc, uc_tb *cur_tb, uc_tb *prev_tb,
++                                   void *user_data);
++
+ /*
+   Callback function for MMIO read
+ 
+@@ -302,6 +318,12 @@ typedef enum uc_hook_type {
+     UC_HOOK_MEM_READ_AFTER = 1 << 13,
+     // Hook invalid instructions exceptions.
+     UC_HOOK_INSN_INVALID = 1 << 14,
++    // Hook on new edge generation. Could be useful in program analysis.
++    //
++    // NOTE: This is different from UC_HOOK_BLOCK in 2 ways:
++    //       1. The hook is called before executing code.
++    //       2. The hook is only called when generation is triggered.
++    UC_HOOK_EDGE_GENERATED = 1 << 15
+ } uc_hook_type;
+ 
+ // Hook type for all events of unmapped memory access
+@@ -391,13 +413,6 @@ typedef enum uc_query_type {
+                       // result = True)
+ } uc_query_type;
+ 
+-// Represent a TranslationBlock.
+-typedef struct uc_tb {
+-    uint64_t pc;
+-    uint16_t icount;
+-    uint16_t size;
+-} uc_tb;
+-
+ // The implementation of uc_ctl is like what Linux ioctl does but slightly
+ // different.
+ //
+
+
+
+
+@@ -245,6 +245,10 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
+     TranslationBlock *tb;
+     target_ulong cs_base, pc;
+     uint32_t flags;
++    uc_tb cur_tb, prev_tb;
++    uc_engine *uc = cpu->uc;
++    struct list_item *cur;
++    struct hook *hook;
+ 
+     tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+     if (tb == NULL) {
+@@ -265,6 +269,23 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
+     if (last_tb) {
+         tb_add_jump(last_tb, tb_exit, tb);
+     }
++
++    UC_TB_COPY(&cur_tb, tb);
++
++    if (last_tb) {
++        UC_TB_COPY(&prev_tb, last_tb);
++        for (cur = uc->hook[UC_HOOK_EDGE_GENERATED_IDX].head;
++            cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
++            if (hook->to_delete) {
++                continue;
++            }
++
++            if (HOOK_BOUND_CHECK(hook, (uint64_t)tb->pc)) {
++                ((uc_hook_edge_gen_t)hook->callback)(uc, &cur_tb, &prev_tb, hook->user_data);
++            }
++        }
++    }
++
+     return tb;
+ }
+ 
+
+
+
+
+@@ -1049,9 +1049,7 @@ static uc_err uc_gen_tb(struct uc_struct *uc, uint64_t addr, uc_tb *out_tb)
+     }
+ 
+     if (out_tb != NULL) {
+-        out_tb->pc = tb->pc;
+-        out_tb->size = tb->size;
+-        out_tb->icount = tb->icount;
++        UC_TB_COPY(out_tb, tb);
+     }
+ 
+     return UC_ERR_OK;
+
+
+
+
+@@ -73,10 +73,17 @@ static void test_uc_ctl_read(void)
+     uc_close(uc);
+ }
+ 
++static void trace_new_edge(uc_engine *uc, uc_tb *cur, uc_tb *prev, void *data)
++{
++    printf(">>> Getting a new edge from 0x%" PRIx64 " to 0x%" PRIx64 ".\n",
++           prev->p

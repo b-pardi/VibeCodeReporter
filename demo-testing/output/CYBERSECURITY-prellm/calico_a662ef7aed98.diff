@@ -1,0 +1,97 @@
+@@ -221,11 +221,13 @@ CALI_CONFIGURABLE_DEFINE(host_ip, 0x54534f48) /* be 0x54534f48 = ASCII(HOST) */
+ CALI_CONFIGURABLE_DEFINE(tunnel_mtu, 0x55544d54) /* be 0x55544d54 = ASCII(TMTU) */
+ CALI_CONFIGURABLE_DEFINE(vxlan_port, 0x52505856) /* be 0x52505856 = ASCII(VXPR) */
+ CALI_CONFIGURABLE_DEFINE(intf_ip, 0x46544e49) /*be 0x46544e49 = ASCII(INTF) */
++CALI_CONFIGURABLE_DEFINE(ext_to_svc_mark, 0x4b52414d) /*be 0x4b52414d = ASCII(MARK) */
+ 
+ #define HOST_IP		CALI_CONFIGURABLE(host_ip)
+ #define TUNNEL_MTU 	CALI_CONFIGURABLE(tunnel_mtu)
+ #define VXLAN_PORT 	CALI_CONFIGURABLE(vxlan_port)
+ #define INTF_IP		CALI_CONFIGURABLE(intf_ip)
++#define EXT_TO_SVC_MARK	CALI_CONFIGURABLE(ext_to_svc_mark)
+ 
+ #define MAP_PIN_GLOBAL	2
+ 
+
+
+
+
+@@ -617,6 +617,8 @@ static CALI_BPF_INLINE struct calico_ct_result calico_ct_v4_lookup(struct cali_t
+ 		result.tun_ip = v->tun_ip;
+ 		CALI_CT_DEBUG("tun_ip:%x\n", bpf_ntohl(v->tun_ip));
+ 
++		result.flags = v->flags;
++
+ 		if (ct_ctx->proto == IPPROTO_ICMP || (related && proto_orig == IPPROTO_ICMP)) {
+ 			result.rc =	CALI_CT_ESTABLISHED_SNAT;
+ 			result.nat_ip = v->orig_ip;
+
+
+
+
+@@ -40,6 +40,7 @@ enum cali_ct_type {
+ #define CALI_CT_FLAG_DSR_FWD	0x02 /* marks entry into the tunnel on the fwd node when dsr */
+ #define CALI_CT_FLAG_NP_FWD	0x04 /* marks entry into the tunnel on the fwd node */
+ #define CALI_CT_FLAG_SKIP_FIB	0x08 /* marks traffic that should pass through host IP stack */
++#define CALI_CT_FLAG_EXT_LOCAL	0x10 /* marks traffic from external client to a local serice */
+ 
+ struct calico_ct_leg {
+ 	__u32 seqno;
+
+
+
+
+@@ -204,13 +204,18 @@ skip_fib:
+ 		/* Packet is towards host namespace, mark it so that downstream
+ 		 * programs know that they're not the first to see the packet.
+ 		 */
++		ctx->fwd.mark |=  CALI_SKB_MARK_SEEN;
++		if (ctx->state->ct_result.flags & CALI_CT_FLAG_EXT_LOCAL) {
++			CALI_DEBUG("To host marked with FLAG_EXT_LOCAL\n");
++			ctx->fwd.mark |= EXT_TO_SVC_MARK;
++		}
+ 		CALI_DEBUG("Traffic is towards host namespace, marking with %x.\n", ctx->fwd.mark);
+ 		/* FIXME: this ignores the mask that we should be using.
+ 		 * However, if we mask off the bits, then clang spots that it
+ 		 * can do a 16-bit store instead of a 32-bit load/modify/store,
+ 		 * which trips up the validator.
+ 		 */
+-		ctx->skb->mark = ctx->fwd.mark | CALI_SKB_MARK_SEEN; /* make sure that each pkt has SEEN mark */
++		ctx->skb->mark = ctx->fwd.mark; /* make sure that each pkt has SEEN mark */
+ 	}
+ 
+ 	if (CALI_LOG_LEVEL >= CALI_LOG_LEVEL_INFO) {
+
+
+
+
+@@ -796,6 +796,21 @@ static CALI_BPF_INLINE struct fwd calico_tc_skb_accepted(struct cali_tc_ctx *ctx
+ 					nat_type = CT_CREATE_NAT_FWD;
+ 					ct_ctx_nat.tun_ip = rt->next_hop;
+ 					state->ip_dst = rt->next_hop;
++				} else if (cali_rt_is_workload(rt) && state->ip_dst != state->post_nat_ip_dst) {
++					/* Packet arrived from a HEP for a workload and we're
++					 * about to NAT it.  We can't rely on the kernel's RPF check
++					 * to do the right thing here in the presence of source
++					 * based routing because the kernel would do the RPF check
++					 * based on the post-NAT dest IP and that may give the wrong
++					 * result.
++					 *
++					 * Marking the packet allows us to influence which routing
++					 * rule is used.
++					 */
++
++					ct_ctx_nat.flags |= CALI_CT_FLAG_EXT_LOCAL;
++					ctx->state->ct_result.flags |= CALI_CT_FLAG_EXT_LOCAL;
++					CALI_DEBUG("CT_NEW marked with FLAG_EXT_LOCAL\n");
+ 				}
+ 			}
+ 
+@@ -1054,6 +1069,7 @@ nat_encap:
+ 
+ 	CALI_DEBUG("vxlan return %d ifindex_fwd %d\n",
+ 			dnat_return_should_encap(), state->ct_result.ifindex_fwd);
++
+ 	if (dnat_return_should_encap() && state->ct_result.ifindex_fwd != CT_INVALID_IFINDEX) {
+ 		rc = CALI_RES_REDIR_IFINDEX;
+ 	}

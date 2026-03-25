@@ -1,0 +1,159 @@
+@@ -52,14 +52,16 @@ static void print_string(RBinFile *bf, RBinString *string, int raw) {
+ 	// If raw string dump mode, use printf to dump directly to stdout.
+ 	//  PrintfCallback temp = io->cb_printf;
+ 	switch (mode) {
+-	case R_MODE_JSON: 
++	case R_MODE_JSON:
+ 		{
+ 			PJ *pj = pj_new ();
+-			pj_o (pj);
+-			pj_ks (pj, "string", string->string);
+-			pj_end (pj);
+-			io->cb_printf ("%s\n", pj_string (pj));
+-			pj_free (pj);
++			if (pj) {
++				pj_o (pj);
++				pj_ks (pj, "string", string->string);
++				pj_end (pj);
++				io->cb_printf ("%s\n", pj_string (pj));
++				pj_free (pj);
++			}
+ 		}
+ 		break;
+ 	case R_MODE_SIMPLEST: 
+@@ -493,33 +495,32 @@ R_IPI RBinFile *r_bin_file_find_by_id(RBin *bin, ut32 bf_id) {
+ 	return NULL;
+ }
+ 
+-R_API int r_bin_file_delete_all(RBin *bin) {
+-	int counter = 0;
++R_API ut64 r_bin_file_delete_all(RBin *bin) {
+ 	if (bin) {
+-		counter = r_list_length (bin->binfiles);
++		ut64 counter = r_list_length (bin->binfiles);
+ 		r_list_purge (bin->binfiles);
+ 		bin->cur = NULL;
++		return counter;
+ 	}
+-	return counter;
++	return 0;
+ }
+ 
+-R_API int r_bin_file_delete(RBin *bin, ut32 bin_fd) {
++R_API bool r_bin_file_delete(RBin *bin, ut32 bin_fd) {
+ 	RListIter *iter;
+-	RBinFile *bf;
+-	RBinFile *cur = r_bin_cur (bin);
+-	if (bin && cur) {
++	RBinFile *bf = r_bin_cur (bin);
++	if (bin && bf) {
+ 		r_list_foreach (bin->binfiles, iter, bf) {
+ 			if (bf && bf->fd == bin_fd) {
+-				if (cur->fd == bin_fd) {
++				if (bf->fd == bin_fd) {
+ 					//avoiding UaF due to dead reference
+ 					bin->cur = NULL;
+ 				}
+ 				r_list_delete (bin->binfiles, iter);
+-				return 1;
++				return true;
+ 			}
+ 		}
+ 	}
+-	return 0;
++	return false;
+ }
+ 
+ R_API RBinFile *r_bin_file_find_by_fd(RBin *bin, ut32 bin_fd) {
+@@ -643,6 +644,7 @@ R_API void r_bin_file_free(void /*RBinFile*/ *_bf) {
+ 		// TODO: use r_storage api
+ 		r_id_pool_kick_id (bf->rbin->ids->pool, bf->id);
+ 	}
++	(void) r_bin_object_delete (bf->rbin, bf->id);
+ 	free (bf);
+ }
+ 
+
+
+
+
+@@ -220,7 +220,6 @@ R_API bool r_bin_open(RBin *bin, const char *file, RBinOptions *opt) {
+ // XXX this function is full of mess, shuold be rewritten after the refactorings
+ R_API bool r_bin_reload(RBin *bin, int fd, ut64 baseaddr) {
+ 	RIOBind *iob = &(bin->iob);
+-	int res = false;
+ 	ut8 *buf_bytes = NULL;
+ 
+ 	r_return_val_if_fail (bin && iob && iob->io, false);
+@@ -267,7 +266,6 @@ R_API bool r_bin_reload(RBin *bin, int fd, ut64 baseaddr) {
+ 			iob->fd_close (iob->io, tfd);
+ 			goto error;
+ 		}
+-		res = r_bin_open_io (bin, &opt);
+ 		iob->fd_close (iob->io, tfd);
+ 		goto error;
+ 	} else {
+@@ -1448,3 +1446,17 @@ R_IPI void r_bin_section_free(RBinSection *bs) {
+ 		free (bs);
+ 	}
+ }
++
++R_API RBinFile *r_bin_file_at(RBin *bin, ut64 at) {
++	RListIter *it, *it2;
++	RBinFile *bf;
++	RBinSection *s;
++	r_list_foreach (bin->binfiles, it, bf) {
++		r_list_foreach (bf->o->sections, it2, s) {
++			if (at >= s->vaddr  && at < (s->vaddr + s->vsize)) {
++				return bf;
++			}
++		}
++	}
++	return NULL;
++}
+
+
+
+
+@@ -531,16 +531,3 @@ R_IPI void r_bin_object_filter_strings(RBinObject *bo) {
+ 	}
+ }
+ 
+-R_API RBinFile *r_bin_file_at(RBin *bin, ut64 at) {
+-	RListIter *it, *it2;
+-	RBinFile *bf;
+-	RBinSection *s;
+-	r_list_foreach (bin->binfiles, it, bf) {
+-		r_list_foreach (bf->o->sections, it2, s) {
+-			if (at >= s->vaddr  && at < (s->vaddr + s->vsize)) {
+-				return bf;
+-			}
+-		}
+-	}
+-	return NULL;
+-}
+
+
+
+
+@@ -3731,19 +3731,27 @@ R_API bool r_core_bin_raise(RCore *core, ut32 bfid) {
+ 	return bf && r_core_bin_set_env (core, bf) && r_core_block_read (core);
+ }
+ 
+-R_API bool r_core_bin_delete(RCore *core, ut32 binfile_idx) {
+-	if (binfile_idx == UT32_MAX) {
++R_API bool r_core_bin_delete(RCore *core, ut32 bf_id) {
++	if (bf_id == UT32_MAX) {
+ 		return false;
+ 	}
+-	if (!r_bin_object_delete (core->bin, binfile_idx)) {
++#if 0
++	if (!r_bin_object_delete (core->bin, bf_id)) {
+ 		return false;
+ 	}
+-	RBinFile *binfile = r_bin_cur (core->bin);
+-	if (binfile) {
+-		r_io_use_fd (core->io, binfile->fd);
++// TODO: use rbinat()
++	RBinFile *bf = r_bin_cur (core->bin);
++	if 

@@ -1,0 +1,154 @@
+@@ -7,59 +7,249 @@
+ #include "../../asm/arch/wasm/wasm.h"
+ #include "../../bin/format/wasm/wasm.h"
+ 
+-ut64 cf_stack [128] = { 0 };
+-int cf_stack_ptr = 0;
++#define WASM_STACK_SIZE 256
++#define WASM_END_SIZE (1)
+ 
+-static ut64 get_cf_offset(RAnal *anal, const ut8 *data)
+-{
+-	char flgname[64] = {0};
+-	st32 n;
+-	read_i32_leb128 (data, data + 1, &n);
+-	sprintf(flgname, "fcn.%d", n);
+-	RFlagItem *fi = anal->flb.get (anal->flb.f, flgname);
+-	if (fi) return fi->offset;
+-	return (ut64)-1;
++static struct wasm_stack_t {
++	ut64 loop;
++	ut64 end;
++	int size;
++} wasm_stack [WASM_STACK_SIZE];
++int wasm_stack_ptr = 0;
++WasmOpCodes op_old = 0;
++
++static ut64 get_cf_offset(RAnal *anal, const ut8 *data) {
++       char flgname[64] = {0};
++       snprintf(flgname, sizeof (flgname), "sym.fnc.%d", data[1]);
++       RFlagItem *fi = anal->flb.get (anal->flb.f, flgname);
++       if (fi) {
++               return fi->offset;
++       }
++       return UT64_MAX;
+ }
+ 
+-static int wasm_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len) {
++
++static ut64 find_if_else(ut64 addr, const ut8 *data, int len, bool is_loop) {
+ 	WasmOp wop = {0};
++	st32 count = 0;
++	ut32 offset = addr;
++	while (len > 0) {
++		int ret = wasm_dis (&wop, data, len);
++		switch (wop.op) {
++		/* Calls here are using index instead of address */
++		case WASM_OP_BLOCK:
++			count++;
++			break;
++		case WASM_OP_LOOP:
++			count++;
++			break;
++		case WASM_OP_IF:
++			count++;
++			break;
++		case WASM_OP_ELSE:
++			if (!count && !is_loop) {
++				return offset + ret;
++			}
++			break;
++		case WASM_OP_END:
++			if (!count) {
++				return offset;
++			} else {
++				count--;
++			}
++			break;
++		default:
++			break;
++		}
++		offset += ret;
++		data += ret;
++		len -= ret;
++	}
++	return UT64_MAX;
++}
++
++static void set_br_jump(RAnalOp *op, const ut8 *data) {
++	ut32 pos = wasm_stack_ptr - *(data  + 1);
++	if (pos < wasm_stack_ptr) {
++		ut64 jump = wasm_stack[pos].end;
++		if (jump != UT64_MAX) {
++			op->jump = jump + 1; // always pointing to an 'end'
++		}
++	}
++}
+ 
++static int wasm_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len) {
++	ut64 addr2 = UT64_MAX;
++	int i;
++	WasmOp wop = {0};
+ 	memset (op, '\0', sizeof (RAnalOp));
+ 	int ret = wasm_dis (&wop, data, len);
++	op->jump = UT64_MAX;
++	op->fail = UT64_MAX;
++	op->ptr = op->val = UT64_MAX;
+ 	op->size = ret;
+ 	op->addr = addr;
++	op->sign = true;
+ 	op->type = R_ANAL_OP_TYPE_UNK;
+ 	op->id = wop.op;
+-	switch (wop.op) {
+-	/* Calls here are using index instead of address */
+-	case WASM_OP_BLOCK:
+-		cf_stack_ptr++;
+-		break;
+-	case WASM_OP_CALL:
+-	case WASM_OP_CALLINDIRECT:
+-		op->type = R_ANAL_OP_TYPE_CALL;
+-		op->jump = get_cf_offset (anal, data);
+-		break;
+-	case WASM_OP_BR:
+-		op->type = R_ANAL_OP_TYPE_JMP;
+-		op->jump = get_cf_offset (anal, data);
+-		break;
+-	case WASM_OP_BRIF:
+-		op->type = R_ANAL_OP_TYPE_CJMP;
+-		op->jump = get_cf_offset (anal, data);
+-		break;
+-	default:
+-		break;
++
++	if (!strncmp(wop.txt, "invalid", 7)) {
++		op->type = R_ANAL_OP_TYPE_ILL;
++		return -1;
++	} else {
++		switch (wop.op) {
++		/* Calls here are using index instead of address */
++		case WASM_OP_LOOP:
++			//op->type = R_ANAL_OP_TYPE_CJMP;
++			addr2 = find_if_else (addr + op->size, data + op->size, len - op->size, true);
++			if (addr2 != UT64_MAX) {
++				wasm_stack[wasm_stack_ptr].loop = addr;
++				wasm_stack[wasm_stack_ptr].end = addr2;
++				wasm_stack[wasm_stack_ptr].size = wop.len;
++				wasm_stack_ptr++;
++				addr2 = UT64_MAX;
++			}
++			//op->fail = addr + op->size;
++			break;
++		case WASM_OP_BLOCK:
++			addr2 = find_if_else (addr + op->size, data + op->size, len - op->size, true);
++			if (addr2 != UT64_MAX) {
++				wasm_stack[wasm_stack_ptr].loop = UT64_MAX;
++				wasm_stack[wasm_stack_ptr].end = addr2;
++				wasm_stack[wasm_stack_ptr].size = wop.len;
++				wasm_stack_ptr++;
++				addr2 = UT64_MAX;
++			}
++			break;
++		case WASM_OP_IF:
++			op->type = R_ANAL_OP_TYPE_CJMP;
++			op->jump = find_if_else (addr + op->size, data + op->size, len - op->size, false);
++			op->fail =

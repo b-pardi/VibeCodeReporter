@@ -1,0 +1,108 @@
+@@ -326,6 +326,27 @@ TEST_P(TlsExtensionTestGeneric, AlpnMismatch) {
+   ClientHelloErrorTest(nullptr, kTlsAlertNoApplicationProtocol);
+ }
+ 
++TEST_P(TlsExtensionTestGeneric, AlpnDisabledServer) {
++  const uint8_t client_alpn[] = {0x01, 0x61};
++  client_->EnableAlpn(client_alpn, sizeof(client_alpn));
++  server_->EnableAlpn(nullptr, 0);
++
++  ClientHelloErrorTest(nullptr, kTlsAlertUnsupportedExtension);
++}
++
++TEST_P(TlsConnectGeneric, AlpnDisabled) {
++  server_->EnableAlpn(nullptr, 0);
++  Connect();
++
++  SSLNextProtoState state;
++  uint8_t buf[255] = {0};
++  unsigned int buf_len = 3;
++  EXPECT_EQ(SECSuccess, SSL_GetNextProto(client_->ssl_fd(), &state, buf,
++                                         &buf_len, sizeof(buf)));
++  EXPECT_EQ(SSL_NEXT_PROTO_NO_SUPPORT, state);
++  EXPECT_EQ(0U, buf_len);
++}
++
+ // Many of these tests fail in TLS 1.3 because the extension is encrypted, which
+ // prevents modification of the value from the ServerHello.
+ TEST_P(TlsExtensionTestPre13, AlpnReturnedEmptyList) {
+
+
+
+
+@@ -403,7 +403,14 @@ SSL_IMPORT SECStatus SSL_SetNextProtoCallback(PRFileDesc *fd,
+  * preferred. The other protocols should be in preference order.
+  *
+  * The supported protocols are specified in |data| in wire-format (8-bit
+- * length-prefixed). For example: "\010http/1.1\006spdy/2". */
++ * length-prefixed). For example: "\010http/1.1\006spdy/2".
++ *
++ * An empty value (i.e., where |length| is 0 and |data| is any value,
++ * including NULL) forcibly disables ALPN.  In this mode, the server will
++ * reject any ClientHello that includes the ALPN extension.
++ *
++ * Calling this function overrides the callback previously set by
++ * SSL_SetNextProtoCallback. */
+ SSL_IMPORT SECStatus SSL_SetNextProtoNego(PRFileDesc *fd,
+                                           const unsigned char *data,
+                                           unsigned int length);
+
+
+
+
+@@ -308,7 +308,7 @@ ssl3_SelectAppProtocol(const sslSocket *ss, TLSExtensionData *xtnData,
+     if (rv != SECSuccess) {
+         ssl3_ExtSendAlert(ss, alert_fatal, decode_error);
+         PORT_SetError(SSL_ERROR_NEXT_PROTOCOL_DATA_INVALID);
+-        return rv;
++        return SECFailure;
+     }
+ 
+     PORT_Assert(ss->nextProtoCallback);
+
+
+
+
+@@ -2212,12 +2212,18 @@ ssl_NextProtoNegoCallback(void *arg, PRFileDesc *fd,
+ {
+     unsigned int i, j;
+     sslSocket *ss = ssl_FindSocket(fd);
+-
+     if (!ss) {
+         SSL_DBG(("%d: SSL[%d]: bad socket in ssl_NextProtoNegoCallback",
+                  SSL_GETPID(), fd));
+         return SECFailure;
+     }
++    if (ss->opt.nextProtoNego.len == 0) {
++        SSL_DBG(("%d: SSL[%d]: ssl_NextProtoNegoCallback ALPN disabled",
++                 SSL_GETPID(), fd));
++        SSL3_SendAlert(ss, alert_fatal, unsupported_extension);
++        return SECFailure;
++    }
++
+     PORT_Assert(protoMaxLen <= 255);
+     if (protoMaxLen > 255) {
+         PORT_SetError(SEC_ERROR_OUTPUT_LEN);
+@@ -2257,7 +2263,7 @@ SSL_SetNextProtoNego(PRFileDesc *fd, const unsigned char *data,
+         return SECFailure;
+     }
+ 
+-    if (ssl3_ValidateAppProtocol(data, length) != SECSuccess) {
++    if (length > 0 && ssl3_ValidateAppProtocol(data, length) != SECSuccess) {
+         return SECFailure;
+     }
+ 
+@@ -2266,11 +2272,13 @@ SSL_SetNextProtoNego(PRFileDesc *fd, const unsigned char *data,
+      * first protocol to the end of the list. */
+     ssl_GetSSL3HandshakeLock(ss);
+     SECITEM_FreeItem(&ss->opt.nextProtoNego, PR_FALSE);
+-    SECITEM_AllocItem(NULL, &ss->opt.nextProtoNego, length);
+-    size_t firstLen = data[0] + 1;
+-    /* firstLen <= length is ensured by ssl3_ValidateAppProtocol. */
+-    PORT_Memcpy(ss->opt.nextProtoNego.data + (length - firstLen), data, firstLen);
+-    PORT_Memcpy(ss->opt.nextProtoNego.data, data + firstLen, length - firstLen);
++    if (length > 0) {
++        SECITEM_AllocItem(NULL, &ss->opt.nextProtoNego, length);
++        size_t firstLen = data[0] + 1;
++        /* firstLen <= length is ensured by ssl3_ValidateAppProtocol. */
++        PORT_Memcpy(ss->opt.

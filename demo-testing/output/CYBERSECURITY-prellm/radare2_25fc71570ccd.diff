@@ -1,0 +1,100 @@
+@@ -63,21 +63,21 @@ static void cmd_debug_reg(RCore *core, const char *str);
+ static const char *help_msg_dollar[] = {
+ 	"Usage:", "$alias[=cmd] [args...]", "Alias commands and strings (See ?$? for help on $variables)",
+ 	"$", "", "list all defined aliases",
+-	"$*", "", "list all the aliases as r2 commands in base64",
+-	"$**", "", "same as above, but using plain text",
++	"$*", "", "list all defined aliases and their respective values, unprintable characters escaped",
++	"$**", "", "same as above, but if an alias has unprintable characters, b64 encode it",
+ 	"$", "foo:=123", "alias for 'f foo=123'",
+ 	"$", "foo-=4", "alias for 'f foo-=4'",
+ 	"$", "foo+=4", "alias for 'f foo+=4'",
+ 	"$", "foo", "alias for 's foo' (note that command aliases can override flag resolution)",
+-	"$", "dis=base64:AAA==", "alias this base64 encoded text to be printed when $dis is called",
+-	"$", "dis=$hello world", "alias this text to be printed when $dis is called",
+-	"$", "dis=-", "open cfg.editor to set the new value for dis alias",
+-	"$", "dis=af;pdf", "create command - analyze to show function",
++	"$", "dis=base64:AAA=", "alias $dis to the raw byte output from decoding this base64 string",
++	"$", "dis=$hello world", "alias $dis to the string after '$' (accepts double-backslash and hex escaping)",
++	"$", "dis=-", "edit $dis in cfg.editor (accepts backslash and hex escaping)",
++	"$", "dis=af", "alias $dis to the af command",
++	"$", "dis=af;pdf", "alias $dis to the af command, then run pdf",
+ 	"$", "test=#!pipe node /tmp/test.js", "create command - rlangpipe script",
+ 	"$", "dis=", "undefine alias",
+-	"$", "dis", "execute the previously defined alias",
++	"$", "dis", "execute a defined command alias, or print a data alias with unprintable characters escaped",
+ 	"$", "dis?", "show commands aliased by $dis",
+-	"$", "dis?n", "show commands aliased by $dis, without a new line",
+ 	NULL
+ };
+ 
+@@ -463,6 +463,24 @@ static int r_core_cmd_nullcallback(void *data) {
+ 	return 1;
+ }
+ 
++/* Escape raw bytes if not using b64 */
++static bool print_aliases(void *use_b64, const void *key, const void *val){
++	const char *k = (char *) key;
++	RCmdAliasVal *v = (RCmdAliasVal *) val;
++	bool base64 = *(bool *)use_b64;
++	if (v->is_str) {
++		r_cons_printf ("$%s=%s\n", k, (char *)v->data);
++	} else {
++		char *val_str = base64
++			? r_cmd_alias_val_strdup_b64 (v)
++			: r_cmd_alias_val_strdup (v);
++
++		r_cons_printf ("$%s=%s%s\n", k, base64? "base64:": "", val_str);
++		free (val_str);
++	}
++	return true;
++}
++
+ static int cmd_uname(void *data, const char *input) { // "uniq"
+ 	RSysInfo *si = r_sys_info();
+ 	if (si) {
+@@ -624,17 +642,13 @@ static int cmd_alias(void *data, const char *input) {
+ 		r_core_cmd_help (core, help_msg_dollar);
+ 		return 0;
+ 	}
+-	int i = strlen (input);
+-	char *buf = malloc (i + 2);
++	char *buf = strdup (input);
+ 	if (!buf) {
+ 		return 0;
+ 	}
+-	*buf = '$'; // prefix aliases with a dollar
+-	memcpy (buf + 1, input, i + 1);
+ 	char *q = strchr (buf, ' ');
+ 	char *def = strchr (buf, '=');
+ 	char *desc = strchr (buf, '?');
+-	char *nonl = strchr (buf, 'n');
+ 
+ 	int defmode = 0;
+ 	if (def && def > buf) {
+@@ -663,15 +677,15 @@ static int cmd_alias(void *data, const char *input) {
+ 			ut64 at = r_num_math (core->num, def);
+ 			switch (defmode) {
+ 			case ':':
+-				r_flag_set (core->flags, buf + 1, at, 1);
++				r_flag_set (core->flags, buf, at, 1);
+ 				return 1;
+ 			case '+':
+ 				at = r_num_get (core->num, buf + 1) + at;
+-				r_flag_set (core->flags, buf + 1, at, 1);
++				r_flag_set (core->flags, buf, at, 1);
+ 				return 1;
+ 			case '-':
+ 				at = r_num_get (core->num, buf + 1) - at;
+-				r_flag_set (core->flags, buf + 1, at, 1);
++				r_flag_set (core->flags, buf, at, 1);
+ 				return 1;
+ 			}
+ 		}
+@@ -684,14 +698,44 @@ static int cmd_alias(void *data, const char *input) {
+ 		if (!q || (q && q > def)) {
+ 			if (*def) {
+ 				if (!strcmp (def, "-")) {
+-					const char *v = r_cmd_alias_get (core->rcmd, buf, 0);
+-					char *n = r_cons_editor (NULL, v);
++					RCmdAliasVal *v =

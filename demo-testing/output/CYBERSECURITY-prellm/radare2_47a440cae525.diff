@@ -1,0 +1,158 @@
+@@ -1,6 +1,7 @@
+ /* radare - LGPL - Copyright 2019 - MapleLeaf-X */
+ #include <string.h>
+ #include "windows_debug.h"
++#include <w32dbg_wrap.h>
+ 
+ const DWORD wait_time = 1000;
+ 
+@@ -500,7 +501,10 @@ int w32_attach(RDebug *dbg, int pid) {
+ 	if (!ph) {
+ 		return -1;
+ 	}
+-	if (!DebugActiveProcess (pid)) {
++	rio->inst->params->type = W32_ATTACH;
++	rio->inst->params->pid = pid;
++	w32dbg_wrap_wait_ret (rio->inst);
++	if (!rio->inst->params->ret) {
+ 		CloseHandle (ph);
+ 		return -1;
+ 	}
+@@ -529,7 +533,10 @@ int w32_detach(RDebug *dbg, int pid) {
+ 	RIOW32Dbg *rio = dbg->user;
+ 	bool ret = false;
+ 	if (rio->pi.hProcess) {
+-		ret = w32_DebugActiveProcessStop (pid);
++		rio->inst->params->type = W32_DETTACH;
++		rio->inst->params->pid = pid;
++		w32dbg_wrap_wait_ret (rio->inst);
++		ret = rio->inst->params->ret;
+ 	}
+ 	if (rio->pi.hProcess) {
+ 		CloseHandle (rio->pi.hProcess);
+@@ -755,7 +762,9 @@ int w32_kill(RDebug *dbg, int pid, int tid, int sig) {
+ 		return true;
+ 	}
+ 	
+-	DebugActiveProcessStop (pid);
++	rio->inst->params->type = W32_DETTACH;
++	rio->inst->params->pid = pid;
++	w32dbg_wrap_wait_ret (rio->inst);
+ 	
+ 	bool ret = false;
+ 	if (TerminateProcess (rio->pi.hProcess, 1)) {
+@@ -857,10 +866,14 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 			return R_DEBUG_REASON_DEAD;
+ 		}
+ 		memset (&de, 0, sizeof (DEBUG_EVENT));
+-
++		w32dbg_wrap_instance *inst = rio->inst;
+ 		do {
+-			if (!WaitForDebugEvent (&de, wait_time)) {
+-				if (GetLastError () != ERROR_SEM_TIMEOUT) {
++			inst->params->type = W32_WAIT;
++			inst->params->wait.de = &de;
++			inst->params->wait.wait_time = wait_time;
++			w32dbg_wrap_wait_ret (rio->inst);
++			if (!w32dbgw_intret (inst)) {
++				if (w32dbgw_err (inst) != ERROR_SEM_TIMEOUT) {
+ 					r_sys_perror ("w32_dbg_wait/WaitForDebugEvent");
+ 					return -1;
+ 				}
+@@ -913,7 +926,7 @@ int w32_dbg_wait(RDebug *dbg, int pid) {
+ 			next_event = 0;
+ 			if (de.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
+ 				exited_already = pid;
+-				ContinueDebugEvent (pid, tid, DBG_CONTINUE);
++				w32_continue (dbg, pid, tid, DBG_CONTINUE);
+ 				ret = pid == dbg->main_pid ? R_DEBUG_REASON_DEAD : R_DEBUG_REASON_EXIT_PID;
+ 			} else {
+ 				ret = R_DEBUG_REASON_EXIT_TID;
+@@ -1037,7 +1050,14 @@ int w32_continue(RDebug *dbg, int pid, int tid, int sig) {
+ 		breaked = false;
+ 		return tid;
+ 	}
+-	if (!ContinueDebugEvent (rio->pi.dwProcessId, rio->pi.dwThreadId, continue_status)) {
++	w32dbg_wrap_instance *inst = rio->inst;
++	inst->params->type = W32_CONTINUE;
++	inst->params->pid = rio->pi.dwProcessId;
++	inst->params->tid = rio->pi.dwThreadId;
++	inst->params->continue_status = continue_status;
++	w32dbg_wrap_wait_ret (inst);
++	if (!w32dbgw_intret (inst)) {
++		w32dbgw_err (inst);
+ 		r_sys_perror ("w32_continue/ContinueDebugEvent");
+ 		return false;
+ 	}
+
+
+
+
+@@ -15,6 +15,7 @@
+ #include <tlhelp32.h> // CreateToolhelp32Snapshot
+ #include <psapi.h> // GetModuleFileNameEx, GetProcessImageFileName
+ #include <tchar.h>
++#include <w32dbg_wrap.h>
+ 
+ #ifndef XSTATE_GSSE
+ #define XSTATE_GSSE 2
+@@ -96,11 +97,6 @@ typedef struct _OBJECT_TYPE_INFORMATION {
+ 	ULONG NonPagedPoolUsage;
+ } OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
+ 
+-typedef struct {
+-	ut64 winbase;
+-	PROCESS_INFORMATION pi;
+-} RIOW32Dbg;
+-
+ // thread list
+ typedef struct {
+ 	int pid;
+
+
+
+
+@@ -102,8 +102,11 @@ typedef struct r_io_t {
+ 	RIOUndo undo;
+ 	SdbList *plugins;
+ 	char *runprofile;
+-#ifdef USE_PTRACE_WRAP
++#if USE_PTRACE_WRAP
+ 	struct ptrace_wrap_instance_t *ptrace_wrap;
++#endif
++#if __WINDOWS__
++	struct w32dbg_wrap_instance_t *w32dbg_wrap;
+ #endif
+ 	char *args;
+ 	void *user;
+
+
+
+
+@@ -49,6 +49,7 @@
+ #include <tlhelp32.h>
+ #include <winbase.h>
+ #include <psapi.h>
++#include <w32dbg_wrap.h>
+ #endif
+ 
+ /*
+@@ -63,11 +64,6 @@ typedef struct {
+ 	ut64 winbase;
+ } RIOW32;
+ 
+-typedef struct {
+-	ut64 winbase;
+-	PROCESS_INFORMATION pi;
+-} RIOW32Dbg;
+-
+ static ut64 winbase;	//HACK
+ static int wintid;
+ 
+@@ -99,6 +95,20 @@ err_enable:
+ 	return err;
+ }
+ 
++struct __createprocess_params {
++	char *appname;
++	char *

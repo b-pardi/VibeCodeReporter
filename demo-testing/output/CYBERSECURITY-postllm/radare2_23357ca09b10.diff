@@ -1,0 +1,144 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,497 @@
++/* radare2 - LGPL - Copyright 2025 - pancake */
++
++// MCLF (MobiCore Load Format) loader based on public resources:
++// * https://github.com/quarkslab/sboot-binwalk/blob/master/plugins/mclf.py
++// * https://github.com/NeatMonster/mclf-ghidra-loader
++// * https://github.com/ghassani/mclf-ghidra-loader
++// * https://github.com/ghassani/mclf-ida-loader/blob/master/mclf_loader.py
++// * https://github.com/v-rzh/mclf-binja-loader
++// * https://android.googlesource.com/platform/hardware/samsung_slsi/exynos5/+/jb-mr1-dev/mobicore/common/MobiCore/inc/mcLoadFormat.h
++// * https://blog.quarkslab.com/a-deep-dive-into-samsungs-trustzone-part-2.html and
++// * https://github.com/quarkslab/samsung-trustzone-research to complete the implementation
++
++#include <r_bin.h>
++
++typedef struct {
++	bool be;
++	ut32 version;
++	ut32 flags;
++	ut32 memType;
++	ut32 serviceType;
++	ut32 numInstances;
++	ut8 uuid[16];
++	ut32 driverId;
++	ut32 numThreads;
++	ut32 text_va;
++	ut32 text_len;
++	ut32 data_va;
++	ut32 data_len;
++	ut32 bss_len;
++	ut32 entry;
++	ut32 serviceVersion; // optional in older samples, present in >= v2.0.1
++	// text header (descriptor) fields
++	ut32 text_hdr_version;
++	ut32 text_hdr_len;
++	ut32 requiredFeat;
++	ut32 mcLibEntry; // entry point to mcLib trampoline
++	ut32 tlApiVers;
++	ut32 drApiVers;
++} MclfHeader;
++
++/* Per-file MclfHeader stored in bf->bo->bin_obj. Helper to fetch it. */
++static MclfHeader *mclf_from_bf(RBinFile *bf) {
++	return (bf && bf->bo && bf->bo->bin_obj) ? (MclfHeader *)bf->bo->bin_obj : NULL;
++}
++
++static void mclf_destroy(RBinFile *bf) {
++	if (!bf || !bf->bo) {
++		return;
++	}
++	if (bf->bo->bin_obj) {
++		R_FREE (bf->bo->bin_obj);
++		bf->bo->bin_obj = NULL;
++	}
++}
++
++static bool parse_header(RBuffer *b, MclfHeader *h) {
++	ut8 buf[512];
++	int r = r_buf_read_at (b, 0, buf, sizeof (buf));
++	/* Single read: require at least the fixed header through entry (0x48)
++	 * so we can parse mandatory fields. Other fields are optional and
++	 * will be read only if present in the buffer. */
++	if (r <= 0 || (size_t)r < 0x48) {
++		return false;
++	}
++
++	h->be = false;
++	if (!memcmp (buf, "MCLF", 4)) {
++		h->be = false;
++	} else if (!memcmp (buf, "FLCM", 4)) {
++		h->be = true;
++	} else {
++		return false;
++	}
++
++/* Helper to read 32-bit values from the local buffer honoring endianness */
++#define READ32(off) (h->be ? r_read_be32 (buf + (off)) : r_read_le32 (buf + (off)))
++
++	h->version = READ32 (0x4);
++	h->flags = READ32 (0x8);
++	h->memType = READ32 (0xC);
++	h->serviceType = READ32 (0x10);
++	h->numInstances = READ32 (0x14);
++	memcpy (h->uuid, buf + 0x18, sizeof (h->uuid));
++	h->driverId = READ32 (0x28);
++	h->numThreads = READ32 (0x2C);
++	h->text_va = READ32 (0x30);
++	h->text_len = READ32 (0x34);
++	h->data_va = READ32 (0x38);
++	h->data_len = READ32 (0x3C);
++	h->bss_len = READ32 (0x40);
++	h->entry = READ32 (0x44);
++
++	/* serviceVersion may be missing in some early samples; only read if present */
++	if ( (size_t)r >= 0x48 + 4) {
++		h->serviceVersion = READ32 (0x48);
++	} else {
++		h->serviceVersion = 0;
++	}
++
++	/* Parse Text Header at paddr 0x80 if available */
++	if ( (size_t)r >= 0x80 + 4) {
++		h->text_hdr_version = READ32 (0x80);
++		if ( (size_t)r >= 0x84 + 4) {
++			h->text_hdr_len = READ32 (0x84);
++		} else {
++			h->text_hdr_len = 0;
++		}
++		if ( (size_t)r >= 0x88 + 4) {
++			h->requiredFeat = READ32 (0x88);
++		} else {
++			h->requiredFeat = 0;
++		}
++		if ( (size_t)r >= 0x8C + 4) {
++			h->mcLibEntry = READ32 (0x8C);
++		} else {
++			h->mcLibEntry = 0;
++		}
++		/* tlApi/drApi versions are placed after mcIMD; read if present */
++		if ( (size_t)r >= 0x9C + 4) {
++			h->tlApiVers = READ32 (0x9C);
++		} else {
++			h->tlApiVers = 0;
++		}
++		if ( (size_t)r >= 0xA0 + 4) {
++			h->drApiVers = READ32 (0xA0);
++		} else {
++			h->drApiVers = 0;
++		}
++	} else {
++		h->text_hdr_version = 0;
++		h->text_hdr_len = 0;
++		h->requiredFeat = 0;
++		h->mcLibEntry = 0;
++		h->tlApiVers = 0;
++		h->drApiVers = 0;
++	}
++
++#undef READ32
++	re

@@ -1,0 +1,110 @@
+@@ -138,6 +138,8 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   /* Queue containing the ip@vlan strings of the hosts to restore. */
+   StringFifoQueue *hosts_to_restore;
+ 
++  std::map<u_int16_t, bool> observationPoints;
++  
+   /* External alerts contain alertable entities other than host/interface/network
+    * which are dynamically allocated when an alert for them occurs.
+    * A lock is necessary to guard the insert/delete operations from lookup operations
+@@ -255,7 +257,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   CountriesHash *countries_hash;
+ 
+   /* VLANs */
+-  VLANHash *vlans_hash; /**< Hash used to store Vlans information. */
++  VLANHash *vlans_hash; /**< Hash used to store VLAN information. */
+ 
+   /* Hosts */
+   HostHash *hosts_hash; /**< Hash used to store hosts information. */
+@@ -1030,6 +1032,12 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   u_int64_t dequeueHostAlertsFromChecks(u_int budget);
+   inline HostChecksExecutor* getHostCheckExecutor() { return(host_checks_executor); }
+   HostCheck *getCheck(HostCheckID t);
++
++  inline void setObservationPointId(u_int16_t pointId) {
++    /* This is work in progress and it needs to be locked when read */
++    observationPoints[pointId] = true;
++  }
++  void getObservationPoints(lua_State* vm);
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -26,18 +26,28 @@ class AddressTree;
+ 
+ /*
+ typedef struct {
+-  // u_int32_t vlan_id:12, observation_domain_id:20;
++  // u_int32_t vlan_id:16, observation_point_id:16;
+ } VLANid; 
+ */
+ 
+-/* 
+-   vlan_id:               lower 12 bits
+-   observation_domain_id: upper 20 bits
+- */
++/*
++  VLANId is 12 bits but in order to avoid breaking bytes
++  boundaries we assign 16 bits each, also because the
++  observation_point_id is 16 bits
++  
++  vlan_id:              lower 16 bits
++  observation_point_id: upper 16 bits
++*/
+ typedef u_int32_t VLANid;
+ 
+-inline u_int16_t filterVLANid(VLANid id)              { return((u_int16_t)(id & 0xFFF)); }
+-inline u_int32_t filterObservationDomainId(VLANid id) { return((id >> 12) & 0xFFFFF);    }
++inline u_int16_t filterVLANid(VLANid id)             { return((u_int16_t)(id & 0xFFF)); }
++inline u_int16_t filterObservationPointId(VLANid id) { return((id >> 16) & 0xFFFFF);    }
++
++inline u_int32_t buildVLANId(u_int16_t vlan_id, u_int16_t observationPointId) {
++  u_int32_t ret = ((u_int32_t)observationPointId) << 16;
++
++  return(ret | (vlan_id & 0xFFF));
++}
+ 
+ class VLANAddressTree {
+  protected:
+
+
+
+
+@@ -2021,8 +2021,9 @@ void Flow::lua(lua_State* vm, AddressTree * ptree,
+ 
+     if(vrfId) lua_push_uint64_table_entry(vm, "vrfId", vrfId);
+ 
++    /* See VLANAddressTree.h for details */
+     lua_push_uint32_table_entry(vm, "vlan", filterVLANid(get_vlan_id()));
+-    lua_push_uint32_table_entry(vm, "observation_domain_id", filterObservationDomainId(get_vlan_id()));
++    lua_push_uint32_table_entry(vm, "observation_point_id", filterObservationPointId(get_vlan_id()));
+ 
+     if(srcAS)
+       lua_push_int32_table_entry(vm, "src_as", srcAS);
+@@ -2799,8 +2800,9 @@ void Flow::alert2JSON(FlowAlert *alert, ndpi_serializer *s) {
+   // flows don't have any pool for now
+   ndpi_serialize_string_int32(s, "pool_id", NO_HOST_POOL_ID);
+ 
++  /* See VLANAddressTree.h for details */
+   ndpi_serialize_string_int32(s, "vlan_id", filterVLANid(get_vlan_id()));
+-  ndpi_serialize_string_int32(s, "observation_domain_id", filterObservationDomainId(get_vlan_id()));
++  ndpi_serialize_string_int32(s, "observation_point_id", filterObservationPointId(get_vlan_id()));
+   
+   ndpi_serialize_string_int32(s, "proto", get_protocol());
+ 
+
+
+
+
+@@ -171,7 +171,9 @@ void Host::housekeep(time_t t) {
+ 
+ void Host::initialize(Mac *_mac, VLANid _vlanId) {
+   char buf[64];
+-
++  u_int16_t masked_vlanId = filterVLANid(_vlanId); /* Skip observationPointId (if any) */
++  u_int16_t observationPointId = filterObservationPointId(_vlanId);
++  
+   stats = NULL; /* it will be instantiated by specialize

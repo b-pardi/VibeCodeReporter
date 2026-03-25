@@ -1,0 +1,76 @@
+@@ -41,8 +41,10 @@ def pages_filter(s):
+ parser = argparse.ArgumentParser()
+ parser.description = '''Print virtual memory map pages. Results can be filtered by providing address/module name.
+ 
+-Please note that memory pages on QEMU targets are detected through AUXV (sometimes with finding AUXV on the stack first)
+-or by exploring values e.g. from registers.
++Memory pages on QEMU targets may be inaccurate. This is because:
++- for QEMU kernel on X86/X64 we fetch memory pages via `monitor info mem` and it doesn't inform if memory page is executable
++- for QEMU user emulation we detected memory pages through AUXV (sometimes by finding AUXV on the stack first)
++- for others, we create mempages by exploring current register values (this is least correct)
+ 
+ Memory pages can also be added manually, see vmmap_add, vmmap_clear and vmmap_load commands.'''
+ parser.add_argument('pages_filter', type=pages_filter, nargs='?', default=None,
+
+
+
+
+@@ -47,6 +47,9 @@ def get():
+     pages = []
+     pages.extend(proc_pid_maps())
+ 
++    if not pages and pwndbg.arch.current == 'i386' and pwndbg.qemu.is_qemu():
++        pages.extend(monitor_info_mem())
++
+     if not pages:
+         # If debugee is launched from a symlink the debugee memory maps will be
+         # labeled with symlink path while in normal scenario the /proc/pid/maps
+@@ -224,6 +227,48 @@ def proc_pid_maps():
+ 
+     return tuple(pages)
+ 
++@pwndbg.memoize.reset_on_stop
++def monitor_info_mem():
++    # NOTE: This works only on X86/X64/RISC-V
++    # See: https://github.com/pwndbg/pwndbg/pull/685
++    # (TODO: revisit with future QEMU versions)
++    #
++    # pwndbg> monitor info mem
++    # ffff903580000000-ffff903580099000 0000000000099000 -rw
++    # ffff903580099000-ffff90358009b000 0000000000002000 -r-
++    # ffff90358009b000-ffff903582200000 0000000002165000 -rw
++    # ffff903582200000-ffff903582803000 0000000000603000 -r-
++    try:
++        lines = gdb.execute('monitor info mem', to_string=True).splitlines()
++    except gdb.error:
++        # Likely a `gdb.error: "monitor" command not supported by this target.`
++        # TODO: add debug logging
++        return tuple()
++
++    pages = []
++    for line in lines:
++        dash_idx = line.index('-')
++        space_idx = line.index(' ')
++        rspace_idx = line.rindex(' ')
++
++        start = int(line[:dash_idx], 16)
++        end = int(line[dash_idx+1:space_idx], 16)
++        size = int(line[space_idx+1:rspace_idx], 16)
++        assert end-start == size, "monitor info mem output didn't pass a sanity check"
++        perm = line[rspace_idx+1:]
++
++        flags = 0
++        if 'r' in perm: flags |= 4
++        if 'w' in perm: flags |= 2
++        # QEMU does not expose X/NX bit, see #685
++        #if 'x' in perm: flags |= 1
++        flags |= 1
++
++        pages.append(pwndbg.memory.Page(start, size, flags, 0, '<qemu>'))
++
++    return pages
++
++
+ @pwndbg.memoize.reset_on_stop
+ def info_sharedlibrary():
+     """

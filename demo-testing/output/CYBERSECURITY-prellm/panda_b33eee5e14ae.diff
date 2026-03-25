@@ -1,0 +1,124 @@
+@@ -22,6 +22,8 @@ void taint2_enable_tainted_pointer(void);
+ // returns 1 if taint is on
+ int taint2_enabled(void);
+ 
++void taint2_label_addr(Addr a, int offset, uint32_t l);
++
+ // label this phys addr in memory with label l, and only label l. any previous
+ // labels applied to this address are removed.
+ void taint2_label_ram(uint64_t pa, uint32_t l);
+@@ -139,5 +141,6 @@ Panda__TaintQuery *taint2_query_pandalog (Addr addr, uint32_t offset);
+ void pandalog_taint_query_free(Panda__TaintQuery *tq);
+ 
+ 
++
+ #endif
+ 
+
+
+
+
+@@ -167,6 +167,15 @@ void taint2_label_io(uint64_t ia, uint32_t l) {
+     tp_label(a, l);
+ }
+ 
++void taint2_label_addr(Addr a, int offset, uint32_t l) {
++    a.off = offset;
++    if (a.typ == LADDR)
++        taint_log("LABEL: Laddr[%lx] offset=%d (%d)\n", a.val.la, offset, l);
++    if (a.typ == GREG)
++        taint_log("LABEL: Greg[%lx] offset=%d (%d)\n", a.val.gr, offset, l);
++    tp_label(a, l);
++}
++
+ void taint2_label_reg(int reg_num, int offset, uint32_t l) {
+     Addr a = make_greg(reg_num, offset);
+     tp_label(a, l);
+
+
+
+
+@@ -17,6 +17,7 @@ extern "C" {
+ void taint2_enable_taint(void);
+ void taint2_enable_tainted_pointer(void);
+ int taint2_enabled(void);
++void taint2_label_addr(Addr a, int offset, uint32_t l) ;
+ void taint2_label_ram(uint64_t pa, uint32_t l) ;
+ void taint2_label_reg(int reg_num, int offset, uint32_t l) ;
+ void taint2_label_io(uint64_t ia, uint32_t l);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,307 @@
++/* PANDABEGINCOMMENT
++ * 
++ * Authors:
++ *  Tim Leek               tleek@ll.mit.edu
++ *  Ryan Whelan            rwhelan@ll.mit.edu
++ *  Joshua Hodosh          josh.hodosh@ll.mit.edu
++ *  Michael Zhivich        mzhivich@ll.mit.edu
++ *  Brendan Dolan-Gavitt   brendandg@gatech.edu
++ * 
++ * This work is licensed under the terms of the GNU GPL, version 2. 
++ * See the COPYING file in the top-level directory. 
++ * 
++ PANDAENDCOMMENT */
++// This needs to be defined before anything is included in order to get
++// the PRIx64 macro
++#define __STDC_FORMAT_MACROS
++
++#include "panda/plugin.h"
++#include "taint2/taint2.h"
++#include "taint2/addr.h"
++
++extern "C" {   
++#include <assert.h>
++#include "taint2/taint2_ext.h"
++#include "panda/plog.h"
++}
++
++#include <sstream>
++#include <iostream>
++#include <fstream>
++#include <map>
++#include <set>
++
++/*
++  Tainted MMIO labeling.
++
++  This plugin's whole purpose in life is to apply taint labels to
++  reads (loads) from memory-mapped io regions.  The idea is to use this
++  to track taint for these and then employ other plugins such as
++  tainted_branch to tell when/where that mmio data is being used to
++  decide something.
++
++  How does all this work?  It's a bit Rube Goldberg...
++  
++  If we have called panda_enable_memcb(), then we have access to
++  callbacks that run in virtual memory load fns: 
++  helper_le_ldY_XXX_panda, before and after the
++  call to helper_le_ldY_XXX.  Great.
++
++  We also have a callback in unassigned_mem_read which runs whenever
++  there is a read attempted from an unassigned IO region. Excellent.
++
++  Now the not so great.
++
++  Recall that, the way the taint system works, its operation is
++  interleaved with emulation.  More precisely, we have code that
++  emulates a single guest instruction then code that updates the taint
++  system appropriately, then code that emulates the next instruction,
++  then more taint system updates for that instruction,
++  etc. Unfortunately, this means that these seemingly useful callbacks
++  (before & after load, as well as the unassigned mem io read one) all
++  run BEFORE the corresponding operations take place to update the
++  taint state.  Even the _after_ ones...  This means if we were to try
++  to label a read using the PANDA_CB_VIRT_MEM_AFTER_READ, that label
++  would be immediately wiped out, by the subsequent interleaved taint
++  system update.  Ugh.
++
++  We do have callbacks embedded in the taint system, however.  One of
++  these, on_after_load, runs just after the taint has been transferred
++  via a load instruc

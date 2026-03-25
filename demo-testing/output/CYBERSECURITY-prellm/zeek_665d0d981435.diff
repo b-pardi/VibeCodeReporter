@@ -1,0 +1,164 @@
+@@ -71,7 +71,6 @@ FragReassembler::~FragReassembler()
+ 	{
+ 	DeleteTimer();
+ 	delete [] proto_hdr;
+-	delete reassembled_pkt;
+ 	}
+ 
+ void FragReassembler::AddFragment(double t, const IP_Hdr* ip, const u_char* pkt)
+
+
+
+
+@@ -95,23 +95,8 @@ void VXLAN_Analyzer::DeliverPacket(int len, const u_char* data, bool orig,
+ 	len -= pkt.hdr_size;
+ 	caplen -= pkt.hdr_size;
+ 
+-	IP_Hdr* inner_hdr = nullptr;
+-	int res = 0;
+-
+-	switch ( pkt.l3_proto ) {
+-		case L3_IPV4:
+-			res = sessions->ParseIPPacket(len, data, IPPROTO_IPV4, inner_hdr);
+-			break;
+-		case L3_IPV6:
+-			res = sessions->ParseIPPacket(len, data, IPPROTO_IPV6, inner_hdr);
+-			break;
+-		default:
+-			return;
+-	}
+-
+-	if ( res < 0 )
++	if ( ! pkt.ip_hdr )
+ 		{
+-		delete inner_hdr;
+ 		if ( delete_outer )
+ 			delete outer;
+ 
+@@ -124,7 +109,7 @@ void VXLAN_Analyzer::DeliverPacket(int len, const u_char* data, bool orig,
+ 
+ 	if ( vxlan_packet )
+ 		Conn()->EnqueueEvent(vxlan_packet, nullptr, ConnVal(),
+-		                     inner_hdr->ToPktHdrVal(), val_mgr->Count(vni));
++		                     pkt.ip_hdr->ToPktHdrVal(), val_mgr->Count(vni));
+ 
+ 	if ( delete_outer )
+ 		delete outer;
+
+
+
+
+@@ -5,6 +5,7 @@
+ #include "iosource/Manager.h"
+ #include "packet_analysis/Manager.h"
+ #include "Var.h"
++#include "TunnelEncapsulation.h"
+ 
+ extern "C" {
+ #include <pcap.h>
+@@ -61,6 +62,16 @@ void Packet::Init(int arg_link_type, pkt_timeval *arg_ts, uint32_t arg_caplen,
+ 	l3_proto = L3_UNKNOWN;
+ 	l3_checksummed = false;
+ 
++	delete encap;
++	encap = nullptr;
++	delete ip_hdr;
++	ip_hdr = nullptr;
++
++	proto = -1;
++	tunnel_type = BifEnum::Tunnel::IP;
++	gre_version = -1;
++	gre_link_type = DLT_RAW;
++
+ 	if ( data )
+ 		{
+ 		// From here we assume that layer 2 is valid. If the packet analysis fails,
+@@ -69,6 +80,14 @@ void Packet::Init(int arg_link_type, pkt_timeval *arg_ts, uint32_t arg_caplen,
+ 		}
+ 	}
+ 
++Packet::~Packet()
++	{
++	if ( copy )
++		delete [] data;
++
++	delete ip_hdr;
++	}
++
+ const IP_Hdr Packet::IP() const
+ 	{
+ 	return IP_Hdr((struct ip *) (data + hdr_size), false);
+@@ -141,18 +160,10 @@ RecordValPtr Packet::ToRawPktHdrVal() const
+ 
+ 	pkt_hdr->Assign(0, std::move(l2_hdr));
+ 
+-	if ( l3_proto == L3_IPV4 )
+-		{
+-		IP_Hdr ip_hdr((const struct ip*)(data + hdr_size), false);
+-		return ip_hdr.ToPktHdrVal(std::move(pkt_hdr), 1);
+-		}
+-
+-	else if ( l3_proto == L3_IPV6 )
+-		{
+-		IP_Hdr ip6_hdr((const struct ip6_hdr*)(data + hdr_size), false, cap_len);
+-		return ip6_hdr.ToPktHdrVal(std::move(pkt_hdr), 1);
+-		}
+-
++	if ( l3_proto == L3_IPV4 || l3_proto == L3_IPV6 )
++		// Packet analysis will have stored the IP header in the packet, so we can use
++		// that to build the output.
++		return ip_hdr->ToPktHdrVal(std::move(pkt_hdr), 1);
+ 	else
+ 		return pkt_hdr;
+ 	}
+
+
+
+
+@@ -88,11 +88,7 @@ public:
+ 	/**
+ 	 * Destructor.
+ 	 */
+-	~Packet()
+-		{
+-		if ( copy )
+-			delete [] data;
+-		}
++	~Packet();
+ 
+ 	/**
+ 	 * (Re-)initialize from packet data.
+@@ -135,6 +131,9 @@ public:
+ 	[[deprecated("Remove in v4.1.  Use ToRawPktHdrval() instead.")]]
+ 	RecordVal* BuildPktHdrVal() const;
+ 
++	// Wrapper to generate a packet-level weird. Has to be public for llanalyzers to use it.
++	void Weird(const char* name, const EncapsulationStack* encap = nullptr);
++
+ 	/**
+ 	 * Maximal length of a layer 2 address.
+ 	 */
+@@ -227,9 +226,6 @@ public:
+ 	int gre_version = -1;
+ 	int gre_link_type = DLT_RAW;
+ 
+-	// Wrapper to generate a packet-level weird. Has to be public for llanalyzers to use it.
+-	void Weird(const char* name, const EncapsulationStack* encap = nullptr);
+-
+ private:
+ 	// Renders an MAC address into its ASCII representation.
+ 	ValPtr FmtEUI48(const u_char* mac) const;
+
+
+
+
+@@ -51,10 +51,10 @@ bool IPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet)
+ 	uint32_t protocol = ip->ip_v;
+ 
+ 	// This is a unique pointer because of the mass of early returns from this method.
+-	std::unique_ptr<IP_Hdr> ip_hdr = nullptr;
++	IP_Hdr* ip_hdr = nullptr;
+ 	if ( protocol == 4 )
+ 		{
+-		ip_hdr = std::make_unique<IP_Hdr>(ip, false);
++		ip_hdr = new 

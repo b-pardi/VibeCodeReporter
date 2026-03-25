@@ -1,0 +1,129 @@
+@@ -105,7 +105,7 @@ static void CleanupBnetThreadServerTcp(alist* sockfds, ThreadList& thread_list)
+     sockfds->destroy();
+   }
+ 
+-  if (!thread_list.WaitUntilThreadListIsEmpty()) {
++  if (!thread_list.ShutdownAndWaitForThreadsToFinish()) {
+     Emsg1(M_ERROR, 0, _("Could not destroy thread list.\n"));
+   }
+   Dmsg0(100, "CleanupBnetThreadServerTcp: finish\n");
+
+
+
+
+@@ -20,39 +20,46 @@
+ */
+ 
+ #include "include/bareos.h"
+-#include "thread_list.h"
+ #include "include/jcr.h"
+ #include "include/make_unique.h"
+ #include "lib/berrno.h"
+ #include "lib/bsock.h"
++#include "lib/thread_list.h"
+ #include "lib/thread_specific_data.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <condition_variable>
+-#include <thread>
++#include <memory>
+ #include <mutex>
+ #include <set>
++#include <thread>
++
++static constexpr int debuglevel{800};
+ 
+ struct ThreadListItem {
+-  std::thread WorkerThread_;
+-  void* data_ = nullptr;
+-  ConfigurationParser* config_ = nullptr;
+-  std::function<void*(ConfigurationParser* config_, void* data)>
+-      ThreadInvokedHandler_ = nullptr;
++  void* data_{};
+ };
+ 
+-struct ThreadListPrivate {
+-  std::size_t maximum_thread_count_ = 0;
+-
++struct ThreadListContainer {
+   std::set<ThreadListItem*> thread_list_;
+   std::mutex thread_list_mutex_;
+-
+   std::condition_variable wait_shutdown_condition;
++};
++
++class ThreadListPrivate {
++  friend class ThreadList;
++  friend class ThreadGuard;
++
++ private:
++  std::size_t maximum_thread_count_{};
+ 
+-  std::function<void*(ConfigurationParser* config, void* data)>
+-      ThreadInvokedHandler_ = nullptr;
++  std::shared_ptr<ThreadListContainer> l{
++      std::make_shared<ThreadListContainer>()};
+ 
+-  std::function<void*(void* data)> ShutdownCallback_ = nullptr;
++
++  ThreadList::ThreadHandler ThreadInvokedHandler_{};
++  ThreadList::ShutdownCallback ShutdownCallback_{};
+ 
+   void CallRegisteredShutdownCallbackForAllThreads();
+   bool WaitForThreadsToShutdown();
+@@ -62,22 +69,21 @@ ThreadList::ThreadList() : impl_(std::make_unique<ThreadListPrivate>()) {}
+ ThreadList::~ThreadList() = default;
+ 
+ void ThreadList::Init(int maximum_thread_count,
+-                      std::function<void*(ConfigurationParser* config,
+-                                          void* data)> ThreadInvokedHandler,
+-                      std::function<void*(void* data)> ShutdownCallback)
++                      ThreadHandler ThreadInvokedHandler,
++                      ShutdownCallback ShutdownCallback)
+ {
+-  if (impl_->thread_list_.size()) { return; }
++  if (!impl_->l->thread_list_.empty()) { return; }
+   impl_->maximum_thread_count_ = maximum_thread_count;
+-  impl_->ThreadInvokedHandler_ = ThreadInvokedHandler;
+-  impl_->ShutdownCallback_ = ShutdownCallback;
++  impl_->ThreadInvokedHandler_ = std::move(ThreadInvokedHandler);
++  impl_->ShutdownCallback_ = std::move(ShutdownCallback);
+ }
+ 
+ void ThreadListPrivate::CallRegisteredShutdownCallbackForAllThreads()
+ {
+-  std::lock_guard<std::mutex> l(thread_list_mutex_);
++  std::lock_guard<std::mutex> lg(l->thread_list_mutex_);
+ 
+-  for (auto item : thread_list_) {
+-    if (ShutdownCallback_) ShutdownCallback_(item->data_);
++  for (auto item : l->thread_list_) {
++    if (ShutdownCallback_) { ShutdownCallback_(item->data_); };
+   }
+ }
+ 
+@@ -85,18 +91,20 @@ bool ThreadListPrivate::WaitForThreadsToShutdown()
+ {
+   bool list_is_empty = false;
+ 
+-  std::unique_lock<std::mutex> l(thread_list_mutex_);
+-
+-  int timeout = 0;
++  int tries = 0;
+   do {
+-    list_is_empty = wait_shutdown_condition.wait_for(
+-        l, std::chrono::seconds(10), [&]() { return thread_list_.empty(); });
+-  } while (!list_is_empty && ++timeout < 3);
++    std::unique_lock<std::mutex> ul(l->thread_list_mutex_);
++    static constexpr auto timeout = std::chrono::seconds(10);
++
++    list_is_empty = l->wait_shutdown_condition.wait_for(
++        ul, timeout, [&]() { return l->thread_list_.empty(); });
++
++  } while (!list_is_empty && ++tries < 3);
+ 
+   return list_is_empty;
+ }
+ 
+-bool ThreadList::WaitUntilThre

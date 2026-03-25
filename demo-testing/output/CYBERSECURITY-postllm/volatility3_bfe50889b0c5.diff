@@ -1,0 +1,117 @@
+@@ -70,7 +70,7 @@ class ModuleGathererInterface(
+ class Modules(interfaces.configuration.VersionableInterface):
+     """Kernel modules related utilities."""
+ 
+-    _version = (3, 0, 0)
++    _version = (3, 0, 1)
+     _required_framework_version = (2, 0, 0)
+ 
+     framework.require_interface_version(*_required_framework_version)
+@@ -558,6 +558,231 @@ class Modules(interfaces.configuration.VersionableInterface):
+         """
+         return all(addr % address_alignment == 0 for addr in addresses)
+ 
++    @classmethod
++    def _get_param_handlers(
++        cls, context: interfaces.context.ContextInterface, vmlinux_name: str
++    ) -> Tuple[Dict[int, str], Dict[str, Optional[int]]]:
++        """
++        This function builds the dictionaries needed to map kernel parameters to their types
++        We need these values and information to properly decode each parameter to its input representation
++        """
++        kernel = context.modules[vmlinux_name]
++
++        # All the integer type parameters
++        pairs = {
++            "param_get_invbool": "int",
++            "param_get_bool": "int",
++            "param_get_int": "int",
++            "param_get_ulong": "long unsigned int",
++            "param_get_ullong": "long long unsigned int",
++            "param_get_long": "long int",
++            "param_get_uint": "unsigned int",
++            "param_get_ushort": "short unsigned int",
++            "param_get_short": "short int",
++            "param_get_byte": "char",
++        }
++
++        int_handlers: Dict[int, str] = {}
++
++        for sym_name, val_type in pairs.items():
++            try:
++                sym_address = kernel.get_absolute_symbol_address(sym_name)
++            except exceptions.SymbolError:
++                continue
++
++            int_handlers[sym_address] = val_type
++
++        # Strings, arrays, booleans
++        getters = {
++            "param_get_string": None,
++            "param_array_get": None,
++            "param_get_charp": None,
++            "param_get_bool": None,
++            "param_get_invbool": None,
++        }
++
++        for sym_name in getters:
++            try:
++                sym_address = kernel.get_absolute_symbol_address(sym_name)
++            except exceptions.SymbolError:
++                continue
++
++            getters[sym_name] = sym_address
++
++        return int_handlers, getters
++
++    @classmethod
++    def _get_param_val(
++        cls,
++        context: interfaces.context.ContextInterface,
++        vmlinux_name: str,
++        int_handlers,
++        getters,
++        module,
++        param,
++    ) -> Optional[Union[str, int]]:
++        """
++        Properly determines the type of a parameter and decodes based on the type.
++        The type is determined by examining its `get` function, which will be a pointer to
++        predefined operations handler for particular parameter types.
++        """
++
++        # Attempt to retrieve the `get` pointer. Bail if smeared
++        try:
++            if hasattr(param, "get"):
++                param_func = param.get
++            else:
++                param_func = param.ops.get
++
++        except exceptions.InvalidAddressException:
++            return None
++
++        if not param_func:
++            return None
++
++        kernel = context.modules[vmlinux_name]
++
++        # For arrays, recusively get the value of each member as the type can be different
++        if param_func == getters["param_array_get"]:
++            array = param.arr
++
++            if array.num:
++                max_index = array.num.dereference()
++            else:
++                max_index = array.member("max")
++
++            if max_index > 32:
++                vollog.debug(
++                    f"Skipping array parameter with invalid index for module {module.vol.offset:#x}"
++                )
++                return None
++
++            element_vals = []
++            for i in range(max_index):
++                kp = kernel.object(
++                    object_type="kernel_param",
++     

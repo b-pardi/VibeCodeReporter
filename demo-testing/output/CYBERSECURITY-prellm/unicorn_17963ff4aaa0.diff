@@ -1,0 +1,74 @@
+@@ -9,7 +9,7 @@ import os.path
+ import sys
+ import weakref
+ import functools
+-
++import gc
+ from . import x86_const, arm64_const, unicorn_const as uc
+ 
+ if not hasattr(sys.modules[__name__], "__file__"):
+@@ -120,6 +120,15 @@ class _uc_mem_region(ctypes.Structure):
+         ("perms", ctypes.c_uint32),
+     ]
+ 
++#typedef bool (*uc_afl_cb_place_input_t)(uc_engine *uc, char *input,
++#                                       size_t input_len, uint32_t persistent_round, void *data);
++AFL_PLACE_INPUT_CB = ctypes.CFUNCTYPE(ctypes.c_bool, uc_engine, ctypes.POINTER(ctypes.c_char),
++                                        ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
++
++#typedef bool (*uc_afl_cb_validate_crash_t)(uc_engine *uc, uc_err unicorn_result, char *input,
++#                                       int input_len, int persistent_round, void *data);
++AFL_VALIDATE_CRASH_CB = ctypes.CFUNCTYPE(ctypes.c_bool, uc_engine, ucerr, ctypes.POINTER(ctypes.c_char),
++                                        ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
+ 
+ _setup_prototype(_uc, "uc_version", ctypes.c_uint, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+ _setup_prototype(_uc, "uc_arch_supported", ctypes.c_bool, ctypes.c_int)
+@@ -151,6 +160,7 @@ _setup_prototype(_uc, "uc_context_free", ucerr, uc_context)
+ _setup_prototype(_uc, "uc_mem_regions", ucerr, uc_engine, ctypes.POINTER(ctypes.POINTER(_uc_mem_region)), ctypes.POINTER(ctypes.c_uint32))
+ # https://bugs.python.org/issue42880
+ _setup_prototype(_uc, "uc_hook_add", ucerr, uc_engine, ctypes.POINTER(uc_hook_h), ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64)
++_setup_prototype(_uc, "uc_afl_fuzz", ucerr, uc_engine, ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t, ctypes.c_void_p, ctypes.c_bool, ctypes.c_uint32, ctypes.c_void_p)
+ 
+ UC_HOOK_CODE_CB = ctypes.CFUNCTYPE(None, uc_engine, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p)
+ UC_HOOK_INSN_INVALID_CB = ctypes.CFUNCTYPE(ctypes.c_bool, uc_engine, ctypes.c_void_p)
+@@ -411,6 +421,8 @@ class Uc(object):
+         self._callback_count = 0
+         self._cleanup.register(self)
+ 
++        self.afl_called_before = False # type: bool
++
+     @staticmethod
+     def release_handle(uch):
+         if uch:
+@@ -432,6 +444,127 @@ class Uc(object):
+         status = _uc.uc_emu_stop(self._uch)
+         if status != uc.UC_ERR_OK:
+             raise UcError(status)
++    
++    def afl_fuzz(
++            self,                   # type: Uc
++            input_file,             # type: str
++            place_input_callback,   # type: Callable[[Uc, bytes, int, Any], Optional[bool]]
++            exits,                  # type: List[int]
++            validate_crash_callback=None,  # type: Optional[Callable[[Uc, UcError, bytes, int, Any], Optional[bool]]]
++            always_validate=False,  # type: bool
++            persistent_iters=1,     # type: int
++            data=None,              # type: Any
++    ):
++        # type: (...) -> bool
++        """
++        The main fuzzer.
++        Starts the forkserver, then beginns a persistent loop.
++        Reads input, calls the place_input callback, emulates, repeats.
++        If unicorn errors out, will call the validate_crash_callback, if set.
++        Will only return in the parent after the whole fuzz thing has been finished and afl died.
++        The child processes never return from here.
++
++        :param input_file: filename/path to the (AFL) inputfile. Usually supplied on the commandline.
++        :param place_input_callback: Callback function that will be called before each test runs.
++                This function needs to write the input from afl to the correct position on the unicorn object.
++                This function is mandatory.
++                It's purpose is to place the input at the right place in unicorn.
++
++                    @uc: (Uc) Unicorn instance
++                    @input: (bytes) The current input we're working on

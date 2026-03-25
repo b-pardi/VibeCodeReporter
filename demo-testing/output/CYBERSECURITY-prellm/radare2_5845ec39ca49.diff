@@ -1,0 +1,156 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,1660 @@
++/* radare - LGPL - Copyright 2012-2020 - houndthe */
++
++#include "base_types.h"
++#include <sdb.h>
++#include <r_anal.h>
++#include <r_bin_dwarf.h>
++#include <string.h>
++
++typedef struct dwarf_parse_context_t {
++	const RAnal *anal;
++	const RBinDwarfDie *all_dies;
++	const ut64 count;
++	Sdb *sdb;
++	HtUP/*<ut64 offset, DwarfDie *die>*/ *die_map;
++	HtUP/*<offset, RBinDwarfLocList*>*/  *locations;
++	char *lang; // for demangling
++} Context;
++
++typedef struct dwarf_function_t {
++	ut64 addr;
++	const char *name;
++	const char *signature;
++	bool is_external;
++	bool is_method;
++	bool is_virtual;
++	bool is_trampoline; // intermediary in making call to another func
++	ut8 access; // public = 1, protected = 2, private = 3, if not set assume private
++	ut64 vtable_addr; // location description
++	ut64 call_conv; // normal || program || nocall
++} Function;
++
++typedef enum dwarf_location_kind {
++	LOCATION_UNKNOWN = 0,
++	LOCATION_GLOBAL = 1,
++	LOCATION_BP = 2,
++	LOCATION_SP = 3,
++	LOCATION_REGISTER = 4,
++} VariableLocationKind;
++typedef struct dwarf_var_location_t {
++	VariableLocationKind kind;
++	ut64 address;
++	ut64 reg_num;
++	st64 offset;
++	const char *reg_name; /* string literal */
++} VariableLocation;
++
++typedef struct dwarf_variable_t {
++	VariableLocation *location;
++	const char *name;
++	char *type;
++} Variable;
++
++
++
++static inline bool is_parsable_tag(ut64 tag_code) {
++	return (tag_code == DW_TAG_structure_type ||
++		tag_code == DW_TAG_enumeration_type ||
++		tag_code == DW_TAG_class_type ||
++		tag_code == DW_TAG_subprogram ||
++		tag_code == DW_TAG_union_type ||
++		tag_code == DW_TAG_base_type ||
++		tag_code == DW_TAG_typedef);
++}
++
++/* return -1 if attr isn't found */
++static inline st32 find_attr_idx(const RBinDwarfDie *die, st32 attr_name) {
++	st32 i;
++	r_return_val_if_fail (die, -1);
++	for (i = 0; i < die->count; i++) {
++		if (die->attr_values[i].attr_name == attr_name) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++/* return NULL if attr isn't found */
++static RBinDwarfAttrValue *find_attr(const RBinDwarfDie *die, st32 attr_name) {
++	st32 i;
++	r_return_val_if_fail (die, NULL);
++	for (i = 0; i < die->count; i++) {
++		if (die->attr_values[i].attr_name == attr_name) {
++			return &die->attr_values[i];
++		}
++	}
++	return NULL;
++}
++
++/**
++ * @brief Pasted from r_strbuf_* 
++ *        Prepends string before a last occurence of character c
++ * 	      Used to replicate proper C declaration for function pointers
++ * @param sb 
++ * @param s 
++ * @param c 
++ */
++static bool strbuf_rev_prepend_char(RStrBuf *sb, const char *s, int c) {
++	r_return_val_if_fail (sb && s, false);
++	size_t l = strlen (s);
++	// fast path if no chars to append
++	if (l == 0) {
++		return true;
++	}
++	size_t newlen = l + sb->len;
++	char *ns = malloc (newlen + 1);
++	bool ret = false;
++	char *sb_str = sb->ptr ? sb->ptr : sb->buf;
++	char *pivot = strrchr (sb_str, c);
++	if (!pivot) {
++		return false;
++	}
++	size_t idx = pivot - sb_str;
++	if (ns) {
++		memcpy (ns, sb_str, idx);
++		memcpy (ns + idx, s, l);
++		memcpy (ns + idx + l, sb_str + idx, sb->len - idx);
++		ns[newlen] = 0;
++		ret = r_strbuf_set (sb, ns);
++		free (ns);
++	}
++	return ret;
++}
++/**
++ * @brief Pasted from r_strbuf_* 
++ * 	      Appends string after a first occurence of character c
++ * 	      Used to replicate proper C declaration for function pointers
++ * @param sb 
++ * @param s 
++ * @param needle 
++ */
++static bool strbuf_rev_append_char(RStrBuf *sb, const char *s, const char *needle) {
++	r_return_val_if_fail (sb && s, false);
++	size_t l = strlen (s);
++	// fast path if no chars to append
++	if (l == 0) {
++		return true;
++	}
++	bool ret = false;
++	char *sb_str = sb->ptr ? sb->ptr : sb->buf;
++	char *pivot = strstr (sb_str, needle);
++	if (!pivot) {
++		return false;
++	}
++	pivot += strlen (needle);
++	size_t idx = pivot - sb_str;
++	size_t newlen = l + sb->len;
++	char *ns = malloc (newlen + 1);
++	if (ns) {
++		memcpy (ns, sb_str, idx);
++		memcpy (ns + idx, s, l);
++		memcpy (ns + idx + l, sb_s

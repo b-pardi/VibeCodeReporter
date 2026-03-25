@@ -1,0 +1,148 @@
+@@ -34,7 +34,7 @@
+ #define ctx_load_bytes		skb_load_bytes
+ #define ctx_store_bytes		skb_store_bytes
+ 
+-#define ctx_adjust_room		skb_adjust_room
++#define ctx_adjust_hroom	skb_adjust_room
+ 
+ #define ctx_change_type		skb_change_type
+ #define ctx_change_proto	skb_change_proto
+@@ -62,6 +62,12 @@ ctx_redirect(struct __sk_buff *ctx __maybe_unused, int ifindex, __u32 flags)
+ 	return redirect(ifindex, flags);
+ }
+ 
++static __always_inline __maybe_unused int
++ctx_adjust_troom(struct __sk_buff *ctx, const __s32 len_diff)
++{
++	return skb_change_tail(ctx, ctx->len + len_diff, 0);
++}
++
+ static __always_inline __maybe_unused __u32
+ ctx_full_len(const struct __sk_buff *ctx)
+ {
+
+
+
+
+@@ -195,8 +195,14 @@ l4_csum_replace(const struct xdp_md *ctx, __u64 off, __u32 from, __u32 to,
+ }
+ 
+ static __always_inline __maybe_unused int
+-ctx_adjust_room(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
+-		const __u64 flags __maybe_unused)
++ctx_adjust_troom(struct xdp_md *ctx, const __s32 len_diff)
++{
++	return xdp_adjust_tail(ctx, len_diff);
++}
++
++static __always_inline __maybe_unused int
++ctx_adjust_hroom(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
++		 const __u64 flags __maybe_unused)
+ {
+ 	const __u32 move_len_v4 = 14 + 20;
+ 	const __u32 move_len_v6 = 14 + 40;
+@@ -216,6 +222,8 @@ ctx_adjust_room(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
+ 		data_end = ctx_data_end(ctx);
+ 		data = ctx_data(ctx);
+ 		switch (len_diff) {
++		case 28: /* struct {iphdr + icmphdr} */
++			break;
+ 		case 20: /* struct iphdr */
+ 		case 8:  /* __u32 opt[2] */
+ 			if (data + move_len_v4 + len_diff <= data_end)
+@@ -224,6 +232,8 @@ ctx_adjust_room(struct xdp_md *ctx, const __s32 len_diff, const __u32 mode,
+ 			else
+ 				ret = -EFAULT;
+ 			break;
++		case 48: /* struct {ipv6hdr + icmp6hdr} */
++			break;
+ 		case 40: /* struct ipv6hdr */
+ 		case 24: /* struct dsr_opt_v6 */
+ 			if (data + move_len_v6 + len_diff <= data_end)
+
+
+
+
+@@ -15,6 +15,7 @@
+ /* Packet misc meta data & encapsulation helper */
+ static int BPF_FUNC(xdp_adjust_meta, struct xdp_md *xdp, int delta);
+ static int BPF_FUNC(xdp_adjust_head, struct xdp_md *xdp, int delta);
++static int BPF_FUNC(xdp_adjust_tail, struct xdp_md *xdp, int delta);
+ 
+ /* Packet redirection */
+ static int BPF_STUB(redirect, int ifindex, __u32 flags);
+
+
+
+
+@@ -31,10 +31,21 @@
+ #define AF_INET6 10
+ #endif
+ 
++#ifndef IP_DF
++#define IP_DF 0x4000
++#endif
++
+ #ifndef EVENT_SOURCE
+ #define EVENT_SOURCE 0
+ #endif
+ 
++#ifndef THIS_MTU
++/* If not available, fall back to generically detected MTU instead of more
++ * fine-grained per-device MTU.
++ */
++# define THIS_MTU MTU
++#endif
++
+ #define PORT_UDP_VXLAN 4789
+ #define PORT_UDP_GENEVE 6081
+ #define PORT_UDP_VXLAN_LINUX 8472
+@@ -344,7 +355,7 @@ enum {
+ #define DROP_POLICY		-133
+ #define DROP_INVALID		-134
+ #define DROP_CT_INVALID_HDR	-135
+-#define DROP_UNUSED3		-136 /* unused */
++#define DROP_FRAG_NEEDED	-136
+ #define DROP_CT_UNKNOWN_PROTO	-137
+ #define DROP_UNUSED4		-138 /* unused */
+ #define DROP_UNKNOWN_L3		-139
+
+
+
+
+@@ -128,7 +128,7 @@ bpf_skip_recirculation(const struct __ctx_buff *ctx __maybe_unused)
+ #endif
+ }
+ 
+-static __always_inline __u64 ctx_adjust_room_dsr_flags(void)
++static __always_inline __u64 ctx_adjust_hroom_dsr_flags(void)
+ {
+ #ifdef BPF_HAVE_CSUM_LEVEL
+ 	return BPF_F_ADJ_ROOM_NO_CSUM_RESET;
+@@ -137,6 +137,25 @@ static __always_inline __u64 ctx_adjust_room_dsr_flags(void)
+ #endif
+ }
+ 
++static __always_inline bool dsr_fail_needs_reply(int code __maybe_unused)
++{
++#ifdef ENABLE_DSR_ICMP_ERRORS
++	if (code == DROP_FRAG_NEEDED)
++		return true;
++#endif
++	return false;
++}
++
++static __always_inline bool dsr_is_too_big(struct __ctx_buff *ctx __maybe_unused,
++					   __u16 expanded_len __maybe_unused)
++{
++#ifdef ENABLE_DSR_ICMP_ERRORS
++	if (expanded_len > THIS_MTU)
++		return true;
++#endif
++	return false;
++}
++
+ #ifdef ENABLE_IPV6
+ static __always_inline bool nodeport_uses_dsr6(const struct ipv6_ct_tuple *tuple)
+ {
+@@ -222,25 +241,30 @@ static __always_inline void rss_gen_sr

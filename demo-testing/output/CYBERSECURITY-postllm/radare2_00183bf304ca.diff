@@ -1,0 +1,128 @@
+@@ -9,6 +9,7 @@
+ R_LIB_VERSION (r_bin);
+ 
+ #define DB a->sdb;
++// R2_590 -> rename to R_LIST_FREE()
+ #define RBINLISTFREE(x)\
+ 	if (x) { \
+ 		r_list_free (x);\
+@@ -1498,3 +1499,15 @@ R_API RBinTrycatch *r_bin_trycatch_new(ut64 source, ut64 from, ut64 to, ut64 han
+ R_API void r_bin_trycatch_free(RBinTrycatch *tc) {
+ 	free (tc);
+ }
++
++R_API const char *r_bin_field_kindstr(RBinField *f) {
++	switch (f->kind) {
++	case R_BIN_FIELD_KIND_PROPERTY:
++		return "property";
++	case R_BIN_FIELD_KIND_FIELD:
++		return "field";
++	default:
++		return "var"; // maybe ivar for objc?
++	}
++}
++
+
+
+
+
+@@ -372,7 +372,9 @@ static void get_ivar_list_t(mach0_ut p, RBinFile *bf, RBinClass *klass) {
+ 				name[name_len] = 0;
+ 			}
+ 			// XXX the field name shouldnt contain the class name
+-			field->name = r_str_newf ("%s::%s%s", klass->name, "(ivar)", name);
++			// field->realname = r_str_newf ("%s::%s%s", klass->name, "(ivar)", name);
++			// field->name = r_str_newf ("%s::%s%s", klass->name, "(ivar)", name);
++			field->name = r_str_newf ("%s", name);
+ 			R_FREE (name);
+ 		} else {
+ 			R_LOG_WARN ("not parsing ivars, wrong va2pa");
+@@ -407,6 +409,7 @@ static void get_ivar_list_t(mach0_ut p, RBinFile *bf, RBinClass *klass) {
+ 				field->type = NULL;
+ 			}
+ 			if (field->name) {
++				field->kind = R_BIN_FIELD_KIND_VARIABLE;
+ 				r_list_append (klass->fields, field);
+ 				field = NULL;
+ 			} else {
+@@ -425,6 +428,7 @@ static void get_ivar_list_t(mach0_ut p, RBinFile *bf, RBinClass *klass) {
+ 		isa_field->name = strdup ("isa");
+ 		isa_field->size = sizeof (mach0_ut);
+ 		isa_field->type = strdup ("struct objc_class *");
++		isa_field->kind = R_BIN_FIELD_KIND_VARIABLE;
+ 		isa_field->vaddr = 0;
+ 		isa_field->offset = 0;
+ 		r_list_prepend (klass->fields, isa_field);
+@@ -539,11 +543,12 @@ static void get_objc_property_list(mach0_ut p, RBinFile *bf, RBinClass *klass) {
+ 					goto error;
+ 				}
+ 			}
+-			// R2_590 use :: or : syntax?
+-			property->name = r_str_newf ("%s::%s%s", klass->name, "(property)", name);
++			// property->name = r_str_newf ("%s::%s%s", klass->name, "(property)", name);
++			property->name = name;
++			name = NULL;
++			property->kind = R_BIN_FIELD_KIND_PROPERTY;
+ 			property->offset = j;
+ 			property->paddr = r;
+-			R_FREE (name);
+ 		}
+ #if 0
+ 		r = va2pa (op.attributes, NULL, &left, bf);
+@@ -1430,6 +1435,17 @@ static void parse_type(RList *list, RBinFile *bf, SwiftType st, HtUP *symbols_ht
+ 			} else {
+ 				method_name = r_str_newf ("%d", i);
+ 			}
++			// skip namespace
++			char *dot = strchr (method_name, '.');
++			if (dot) {
++				// skip classname
++				dot = strchr (dot + 1, '.');
++				if (dot) {
++					char *p = method_name;
++					method_name = strdup (dot + 1);
++					free (p);
++				}
++			}
+ 			sym = r_bin_symbol_new (method_name, method_addr, method_addr);
+ 			sym->lang = R_BIN_LANG_SWIFT;
+ 			r_list_append (klass->methods, sym);
+@@ -1470,6 +1486,7 @@ static void parse_type(RList *list, RBinFile *bf, SwiftType st, HtUP *symbols_ht
+ 				typename, field->name, bf->bo->baddr + field_method_addr);
+ #endif
+ 			free (field_name);
++			field->kind = R_BIN_FIELD_KIND_PROPERTY;
+ 			r_list_append (klass->fields, field);
+ 		}
+ 	}
+
+
+
+
+@@ -3489,19 +3489,35 @@ static char *objc_name_toc(const char *objc_name) {
+ }
+ 
+ static void classdump_c(RCore *r, RBinClass *c) {
+-	r_cons_printf ("typedef struct class_%s {\n", c->name);
++	r_cons_printf ("typedef struct {\n");
+ 	RListIter *iter2;
+ 	RBinField *f;
++	bool is_objc = false;
+ 	r_list_foreach (c->fields, iter2, f) {
+-		if (f->type && f->name) {
++		if (f->name) { //  && f->offset > 32) {
+ 			char *n = objc_name_toc (f->name);
+-			char *t = objc_type_toc (f->type);
+-			r_cons_printf ("    %s %s; // %d\n", t, n, f->offset);
++			char *t = f->type? objc_type_toc (f->type): NULL;
++			if (f->offset < 32 && !t) {
++				continue;
++			}
++			if (R_STR_ISEMPTY (t)) {
++				t = strdup ("void*");
++			}
++			if (!is_objc && !strcmp (n, "isa")) {
++				is_objc = true;
++			}
++			r_str_replace_char (n, ':', '_');
++			r_str_replace_char (n, 

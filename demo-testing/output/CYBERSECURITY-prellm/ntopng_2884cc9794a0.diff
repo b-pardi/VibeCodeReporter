@@ -1,0 +1,135 @@
+@@ -24,13 +24,35 @@
+ 
+ #include "ntop_includes.h"
+ 
++class DoHDoTStats {
++private:
++  IpAddress ip;
++  u_int16_t vlan_id;
++  u_int32_t num_uses;
++  
++public:
++  DoHDoTStats(IpAddress i, u_int16_t id) { ip = i, vlan_id = id, num_uses = 0; }
++
++  inline void incUses() { num_uses++; }
++
++  void lua(lua_State *vm) {
++    char buf[64];
++    
++    lua_push_str_table_entry(vm, "ip", ip.print(buf, sizeof(buf)));
++    lua_push_uint32_table_entry(vm, "vlan_id", vlan_id);
++    lua_push_uint32_table_entry(vm, "num_uses", num_uses);
++  }
++};
++
++/* ************************************************************ */
++
+ class LocalHost : public Host, public SerializableElement {
+  protected:
+   int16_t local_network_id;
+   bool systemHost;
+   time_t initialization_time;
+   LocalHostStats *initial_ts_point;
+-  std::unordered_map<u_int32_t, IpAddress_id_struct> doh_dot_map;
++  std::unordered_map<u_int32_t, DoHDoTStats*> doh_dot_map;
+  
+   /* LocalHost data: update LocalHost::deleteHostData when adding new fields */
+   OperatingSystem os;
+@@ -89,7 +111,6 @@ class LocalHost : public Host, public SerializableElement {
+   void custom_periodic_stats_update(const struct timeval *tv) {
+   }
+ 
+-  inline std::unordered_map<u_int32_t, IpAddress_id_struct>* getDohDotMap() { return(&doh_dot_map); };
+   virtual void incDohDoTUses(Host *srv_host);
+ };
+ 
+
+
+
+
+@@ -181,6 +181,7 @@ https://translate.google.co.uk/translate?sl=auto&tl=en&u=http%3A%2F%2Fbugsfixed.
+ #include <atomic>
+ #endif
+ 
++#include <utility>
+ #include <set>
+ #include <algorithm>
+ #include <vector>
+
+
+
+
+@@ -804,9 +804,4 @@ typedef struct _ntop_if_t {
+   _ntop_if_t *next;
+ } ntop_if_t;
+ 
+-typedef struct tmp {
+-  IpAddress address;
+-  u_int16_t vlan_id;
+-} IpAddress_id_struct;
+-
+ #endif /* _NTOP_TYPEDEFS_H_ */
+
+
+
+
+@@ -457,21 +457,20 @@ void Flow::processDetectedProtocol() {
+     if(cli_port == ntohs(53) && get_cli_host())       get_cli_host()->setDnsServer();
+     else if(srv_port == ntohs(53) && get_srv_host())  get_srv_host()->setDnsServer();
+   
+-  case NDPI_PROTOCOL_DOH_DOT:
+-    if(cli_host && srv_host && cli_host->isLocalHost())   cli_host->incDohDoTUses(srv_host);
+-    break;
+-  
+   case NDPI_PROTOCOL_IEC60870:
+     /* See Flow::processDNSPacket and Flow::processIEC60870Packet for dissection */
+     break;
+ 
+   case NDPI_PROTOCOL_TOR:
+   case NDPI_PROTOCOL_TLS:
+-    if(protos.tls.client_requested_server_name
+-       && cli_host
+-       && cli_host->isLocalHost())
+-      cli_host->incrVisitedWebSite(protos.tls.client_requested_server_name);
+-
++    if(ndpiDetectedProtocol.app_protocol == NDPI_PROTOCOL_DOH_DOT) {
++      if(cli_host && srv_host && cli_host->isLocalHost())
++	cli_host->incDohDoTUses(srv_host);
++    } else if(protos.tls.client_requested_server_name
++	      && cli_host
++	      && cli_host->isLocalHost())
++      cli_host->incrVisitedWebSite(protos.tls.client_requested_server_name);  
++  
+     if(cli_host) cli_host->incContactedService(protos.tls.client_requested_server_name);
+     break;
+ 
+
+
+
+
+@@ -91,9 +91,6 @@ void LocalHost::set_hash_entry_state_idle() {
+ void LocalHost::initialize() {
+   char buf[64], host[96], rsp[256];
+   
+-  doh_dot_map = std::unordered_map<u_int32_t, IpAddress_id_struct>(); 
+-  doh_dot_map.reserve(10 /* initialize at a standard max dim of 10 elements */);
+-
+   stats = allocateStats();
+   updateHostPool(true /* inline with packet processing */, true /* first inc */);
+ 
+@@ -338,6 +335,9 @@ void LocalHost::lua_get_timeseries(lua_State* vm) {
+ void LocalHost::freeLocalHostData() {
+   /* Better not to use a virtual function as it is called in the destructor as well */
+   if(os_detail) { free(os_detail); os_detail = NULL; }
++  
++  for(std::unordered_map<u_int32_t, DoHDoTStats*>::iterator it = doh_dot_map.begin(); it != doh_dot_map.end(); ++it)
++    delete it->second;
+ }
+ 
+ /* *************************************** */
+@@ -405,46 +405,50 @@ void LocalHost::reloadPrefs() {
+ 
+ /* *************************************** */
+ 
+-void LocalHost::incDohDoTUses(Host *srv_host) {
+-

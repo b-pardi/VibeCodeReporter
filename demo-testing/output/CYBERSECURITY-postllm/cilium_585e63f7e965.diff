@@ -1,0 +1,183 @@
+@@ -111,3 +111,6 @@ add_type(struct node_value);
+ #include "lib/lrp.h"
+ add_type(struct skip_lb4_key);
+ add_type(struct skip_lb6_key);
++
++#include "lib/network_device.h"
++add_type(struct device_state);
+
+
+
+
+@@ -86,3 +86,4 @@
+ #define DROP_EP_NOT_READY	-203
+ #define DROP_NO_EGRESS_IP	-204
+ #define DROP_PUNT_PROXY		-205 /* Mapped as drop code, though drop not necessary. */
++#define DROP_NO_DEVICE		-206
+
+
+
+
+@@ -7,6 +7,7 @@
+ #include <bpf/api.h>
+ 
+ #include "common.h"
++#include "network_device.h"
+ #include "neigh.h"
+ #include "l3.h"
+ 
+@@ -37,7 +38,7 @@ maybe_add_l2_hdr(struct __ctx_buff *ctx __maybe_unused,
+ 		 __u32 ifindex __maybe_unused,
+ 		 bool *l2_hdr_required __maybe_unused)
+ {
+-	if (IS_L3_DEV(ifindex)) {
++	if (device_is_l3(ifindex)) {
+ 		/* The packet is going to be redirected to L3 dev, so
+ 		 * skip L2 addr settings.
+ 		 */
+@@ -67,6 +68,7 @@ static __always_inline bool fib_ok(int ret)
+   *
+   * Returns:
+   *   - result of BPF redirect
++  *   - DROP_NO_DEVICE when SMAC couldn't be resolved
+   *   - DROP_NO_FIB when DMAC couldn't be resolved
+   *   - other DROP reasons
+   *
+@@ -126,9 +128,12 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
+ 		if (eth_store_saddr(ctx, fib_params->l.smac, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+ 	} else {
+-		union macaddr smac = NATIVE_DEV_MAC_BY_IFINDEX(oif);
++		union macaddr *smac = device_mac(oif);
+ 		const union macaddr *dmac = NULL;
+ 
++		if (!smac)
++			return DROP_NO_DEVICE;
++
+ 		if (allow_neigh_map) {
+ 			/* The neigh_record_ip{4,6} locations are mainly from
+ 			 * inbound client traffic on the load-balancer where we
+@@ -145,7 +150,7 @@ fib_do_redirect(struct __ctx_buff *ctx, const bool needs_l2_check,
+ 		}
+ 		if (eth_store_daddr_aligned(ctx, dmac->addr, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+-		if (eth_store_saddr_aligned(ctx, smac.addr, 0) < 0)
++		if (eth_store_saddr_aligned(ctx, smac->addr, 0) < 0)
+ 			return DROP_WRITE_ERROR;
+ 	}
+ out_send:
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++#pragma once
++
++#include <linux/bpf.h>
++#include <bpf/section.h>
++#include <bpf/loader.h>
++
++#include "eth.h"
++
++struct device_state {
++	union macaddr mac;
++	__u8 l3:1;
++	__u8 pad0:7;
++	__u8 pad1;
++	__u16 pad2;
++	__u32 pad3;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_ARRAY);
++	__type(key, __u32);
++	__type(value, struct device_state);
++	__uint(pinning, LIBBPF_PIN_BY_NAME);
++	__uint(max_entries, 4096);
++} cilium_devices __section_maps_btf;
++
++static __always_inline struct device_state *
++device_state_lookup(__u32 ifindex)
++{
++	return map_lookup_elem(&cilium_devices, &ifindex);
++}
++
++static __always_inline bool
++device_is_l3(__u32 ifindex)
++{
++	struct device_state *state = device_state_lookup(ifindex);
++
++	return state ? state->l3 : false;
++}
++
++static __always_inline union macaddr
++*device_mac(__u32 ifindex)
++{
++	struct device_state *state;
++
++	state = device_state_lookup(ifindex);
++	if (!state)
++		return NULL;
++	return &state->mac;
++}
+
+
+
+
+@@ -16,7 +16,6 @@
+ 
+ #define CILIUM_NET_IFINDEX 1
+ #define CILIUM_HOST_IFINDEX 1
+-#define NATIVE_DEV_MAC_BY_IFINDEX(_) { .addr = { 0xce, 0x72, 0xa7, 0x03, 0x88, 0x56 } }
+ 
+ #define LRU_MEM_FLAVOR 0
+ 
+@@ -162,10 +161,6 @@
+ # endif
+ #endif
+ 
+-#ifndef IS_L3_DEV
+-# define IS_L3_DEV(ifindex) false
+-#endif
+-
+ #define LB4_SRC_RANGE_MAP_SIZE	1000
+ #define LB6_SRC_RANGE_MAP_SIZE	1000
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright Authors of Cilium */
++
++static __always_inline void
++cilium_device_add_entry(__u32 ifindex, const __u8 *mac, __u8 l3)
++{
++	struct device_state state = {
++		.l3 = l3,
++	};
++
++	if (mac)
++		memcpy(&state.mac, mac, ETH_ALEN);
++
++	map_update_elem(&cilium_devices, &ifindex, &state, BPF_ANY);
++}
+
+
+
+
+@@ -28,6 +28,8 @@
+ #define BACKEND_IP_REMOTE	v4_pod_two
+ #define BACKEND_PORT		__bpf_htons(8080)
+ 
++#define DEFAULT_IFACE	24
++
+ #define fib_lookup mock_fib_lookup
+ 
+ static vola

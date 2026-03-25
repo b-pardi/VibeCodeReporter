@@ -1,0 +1,82 @@
+@@ -92,6 +92,10 @@ public final class ExprAclLine extends AclLine {
+     return accepting().setMatchCondition(expr).setName(name).build();
+   }
+ 
++  public static ExprAclLine accepting(@Nonnull TraceElement traceElement, AclLineMatchExpr expr) {
++    return accepting().setMatchCondition(expr).setTraceElement(traceElement).build();
++  }
++
+   /** Prefer {@link #acceptingHeaderSpace(String, HeaderSpace)}. */
+   @VisibleForTesting
+   public static ExprAclLine acceptingHeaderSpace(HeaderSpace headerSpace) {
+@@ -120,6 +124,10 @@ public final class ExprAclLine extends AclLine {
+     return rejecting().setMatchCondition(expr).setName(name).build();
+   }
+ 
++  public static ExprAclLine rejecting(@Nonnull TraceElement traceElement, AclLineMatchExpr expr) {
++    return rejecting().setMatchCondition(expr).setTraceElement(traceElement).build();
++  }
++
+   /** Prefer {@link #rejectingHeaderSpace(String, HeaderSpace)}. */
+   @VisibleForTesting
+   public static ExprAclLine rejectingHeaderSpace(HeaderSpace headerSpace) {
+
+
+
+
+@@ -2,10 +2,20 @@ package org.batfish.representation.aws;
+ 
+ import static com.google.common.base.MoreObjects.firstNonNull;
+ import static com.google.common.base.Preconditions.checkArgument;
++import static org.batfish.datamodel.Configuration.DEFAULT_VRF_NAME;
++import static org.batfish.datamodel.IpProtocol.ICMP;
++import static org.batfish.datamodel.IpProtocol.TCP;
++import static org.batfish.datamodel.IpProtocol.UDP;
++import static org.batfish.representation.aws.Subnet.findSubnetNetworkAcl;
++import static org.batfish.representation.aws.Utils.addNodeToSubnet;
++import static org.batfish.representation.aws.Utils.addStaticRoute;
++import static org.batfish.representation.aws.Utils.connect;
++import static org.batfish.representation.aws.Utils.toStaticRoute;
+ 
+ import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ import com.fasterxml.jackson.annotation.JsonProperty;
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import java.io.Serializable;
+@@ -18,12 +28,53 @@ import javax.annotation.ParametersAreNonnullByDefault;
+ import org.batfish.common.Warnings;
+ import org.batfish.datamodel.Configuration;
+ import org.batfish.datamodel.DeviceModel;
++import org.batfish.datamodel.ExprAclLine;
++import org.batfish.datamodel.FirewallSessionInterfaceInfo;
++import org.batfish.datamodel.HeaderSpace;
++import org.batfish.datamodel.Interface;
++import org.batfish.datamodel.Ip;
++import org.batfish.datamodel.IpAccessList;
++import org.batfish.datamodel.IpProtocol;
++import org.batfish.datamodel.IpWildcard;
++import org.batfish.datamodel.Prefix;
++import org.batfish.datamodel.TraceElement;
++import org.batfish.datamodel.Vrf;
++import org.batfish.datamodel.acl.MatchHeaderSpace;
++import org.batfish.datamodel.acl.NotMatchExpr;
++import org.batfish.datamodel.acl.TrueExpr;
++import org.batfish.datamodel.transformation.Transformation;
++import org.batfish.datamodel.transformation.TransformationStep;
+ 
+-/** Represents an AWS NAT gateway */
++/**
++ * Represents an AWS NAT gateway:
++ * https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html
++ *
++ * <p>Design doc on modeling is at
++ * https://docs.google.com/document/d/1QzwRM6XmTGQcJkmcbDfxSgNDGDIAhC7_B3w-JQy6RMM/, but the overall
++ * approach is: 1) NatGateways become nodes in their subnet (duh!); 2) In addition to connecting to
++ * their subnet node, they also connect to the VPC router directly; 3) On the VPC router the
++ * interface that connects to the NAT gateway is in its own VRF; 4) Subnets that send traffic to
++ * this NAT connect to the VPC on an interface that is also in this VRF. These subnet-to-VPC links
++ * are in addition subnet-to-VPC links that exist to connect subnets to other subnets and gateways.
++ * The VRF-based design helps isolate different flows at the VPC since different subnets send
++ * different types of traffic to diffe

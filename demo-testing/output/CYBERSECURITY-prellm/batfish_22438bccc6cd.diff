@@ -1,0 +1,75 @@
+@@ -7,6 +7,7 @@ import static org.batfish.common.topology.TopologyUtil.pruneUnreachableTunnelEdg
+ import static org.batfish.common.util.CollectionUtil.toImmutableSortedMap;
+ import static org.batfish.common.util.IpsecUtil.retainReachableIpsecEdges;
+ import static org.batfish.common.util.IpsecUtil.toEdgeSet;
++import static org.batfish.common.util.StreamUtil.toListInRandomOrder;
+ import static org.batfish.datamodel.bgp.BgpTopologyUtils.initBgpTopology;
+ import static org.batfish.datamodel.vxlan.VxlanTopologyUtils.computeVxlanTopology;
+ import static org.batfish.datamodel.vxlan.VxlanTopologyUtils.prunedVxlanTopology;
+@@ -19,6 +20,7 @@ import io.opentracing.Scope;
+ import io.opentracing.Span;
+ import io.opentracing.util.GlobalTracer;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Map.Entry;
+ import java.util.Optional;
+@@ -87,11 +89,12 @@ final class IncrementalBdpEngine {
+   private TopologyContext nextTopologyContext(
+       TopologyContext currentTopologyContext,
+       SortedMap<String, Node> nodes,
++      List<VirtualRouter> vrs,
+       TopologyContext initialTopologyContext,
+       NetworkConfigurations networkConfigurations,
+       Map<Ip, Map<String, Set<String>>> ipVrfOwners) {
+     // Force re-init of partial dataplane. Re-inits forwarding analysis, etc.
+-    computeFibs(nodes);
++    computeFibs(vrs);
+     PartialDataplane partialDataplane =
+         PartialDataplane.builder()
+             .setNodes(nodes)
+@@ -190,6 +193,12 @@ final class IncrementalBdpEngine {
+       // Generate our nodes, keyed by name, sorted for determinism
+       SortedMap<String, Node> nodes =
+           toImmutableSortedMap(configurations.values(), Configuration::getHostname, Node::new);
++      // A collection of all the virtual routers in random order enables parallelization across all
++      // VRs, and likely spreads nodes with similar hostnames across different cores. In contrast,
++      // nodes.values().parallelStream().flatMap(get vrs stream) is only node-parallel and clusters
++      // nodes by hostname. See https://github.com/batfish/batfish/pull/7054 description.
++      List<VirtualRouter> vrs =
++          toListInRandomOrder(nodes.values().stream().flatMap(n -> n.getVirtualRouters().stream()));
+       NetworkConfigurations networkConfigurations = NetworkConfigurations.of(configurations);
+ 
+       /*
+@@ -201,15 +210,14 @@ final class IncrementalBdpEngine {
+        */
+       IncrementalBdpAnswerElement answerElement = new IncrementalBdpAnswerElement();
+       // TODO: eventually, IGP needs to be part of fixed-point below, because tunnels.
+-      computeIgpDataPlane(nodes, initialTopologyContext, answerElement);
++      computeIgpDataPlane(nodes, vrs, initialTopologyContext, answerElement);
+ 
+       LOGGER.info("Initialize virtual routers before topology fixed point");
+       Span initializationSpan =
+           GlobalTracer.get().buildSpan("Initialize virtual routers for iBDP-external").start();
+       try (Scope innerScope = GlobalTracer.get().scopeManager().activate(initializationSpan)) {
+         assert innerScope != null; // avoid unused warning
+-        nodes.values().parallelStream()
+-            .flatMap(n -> n.getVirtualRouters().stream())
++        vrs.parallelStream()
+             .forEach(
+                 vr -> vr.initForEgpComputationBeforeTopologyLoop(externalAdverts, ipVrfOwners));
+       } finally {
+@@ -224,6 +232,7 @@ final class IncrementalBdpEngine {
+           nextTopologyContext(
+               initialTopologyContext /* current is just initial */,
+               nodes,
++              vrs,
+               initialTopologyContext,
+               networkConfigurations,
+               ipVrfOwners);
+@@ -238,7 +247,7 @@ final class IncrementalBdpEngine {
+ 
+           boolean isOscillating =
+               computeNonMonotonicPortionOfDataPlane(
+-                  nodes, answerElement, currentTopologyContext, networkConfigurations);
++                  nodes, vrs, answerElement, currentT

@@ -1,0 +1,149 @@
+@@ -1153,14 +1153,40 @@ R_API RList *r_bin_file_get_trycatch(RBinFile *bf) {
+ 
+ R_API RList *r_bin_file_get_symbols(RBinFile *bf) {
+ 	r_return_val_if_fail (bf, NULL);
+-	RBinObject *o = bf->o;
+-	return o? o->symbols: NULL;
++	RBinObject *bo = bf->o;
++	if (!bo->symbols) {
++		if (!RVecRBinSymbol_empty (&bo->symbols_vec)) {
++			R_LOG_DEBUG ("cloning symbols vector into a list"); // R2_600
++			RList *list = r_list_newf (NULL);
++			RBinSymbol *s;
++			R_VEC_FOREACH (&bo->symbols_vec, s) {
++				r_list_append (list, s);
++			}
++			bo->symbols = list;
++		}
++	}
++	return bo? bo->symbols: NULL;
+ }
+ 
+ R_API RVecRBinSymbol *r_bin_file_get_symbols_vec(RBinFile *bf) {
+ 	r_return_val_if_fail (bf, NULL);
+-	RBinObject *o = bf->o;
+-	return o? o->symbols_vec: NULL;
++	RBinObject *bo = bf->o;
++	if (bo) {
++		if (bo->symbols) {
++			if (RVecRBinSymbol_empty (&bo->symbols_vec)) {
++				R_LOG_DEBUG ("cloning symbols list into a vec"); // R2_600
++				RBinSymbol *symbol;
++				// Create a vector for those plugins not loading the rvec
++				RList *list = bo->symbols;
++				RListIter *iter;
++				r_list_foreach (list, iter, symbol) {
++					RVecRBinSymbol_push_back (&bo->symbols_vec, symbol);
++				}
++			}
++		}
++		return &bo->symbols_vec;
++	}
++	return NULL;
+ }
+ 
+ R_API RBinFile *r_bin_file_open(RBin *bin, const char *file, RBinFileOptions *opt) {
+
+
+
+
+@@ -200,12 +200,16 @@ R_API RBinSymbol *r_bin_symbol_clone(RBinSymbol *bs) {
+ 	return nbs;
+ }
+ 
++R_API void r_bin_symbol_fini(RBinSymbol *sym) {
++	free (sym->name);
++	free (sym->libname);
++	free (sym->classname);
++}
++
+ R_API void r_bin_symbol_free(void *_sym) {
+ 	RBinSymbol *sym = (RBinSymbol *)_sym;
+ 	if (sym) {
+-		free (sym->name);
+-		free (sym->libname);
+-		free (sym->classname);
++		r_bin_symbol_fini (sym);
+ 		free (sym);
+ 	}
+ }
+@@ -788,19 +792,18 @@ R_API RList *r_bin_get_strings(RBin *bin) {
+ // TODO: Deprecate because we must use the internal representation
+ R_API RList *r_bin_get_symbols(RBin *bin) {
+ 	r_return_val_if_fail (bin, NULL);
+-	RBinObject *o = r_bin_cur_object (bin);
+-	if (o) {
+-		if (o->symbols) {
+-			return o->symbols;
+-		}
+-		if (o->symbols_vec) {
+-			RList *list = r_list_newf (NULL);
+-			RBinSymbol *s;
+-			R_VEC_FOREACH (o->symbols_vec, s) {
+-				r_list_append (list, s);
+-			}
+-			return list;
+-		}
++	RBinFile *bf = bin->cur;
++	if (bf) {
++		return r_bin_file_get_symbols (bf);
++	}
++	return NULL;
++}
++
++R_API RVecRBinSymbol *r_bin_get_symbols_vec(RBin *bin) {
++	r_return_val_if_fail (bin, NULL);
++	RBinFile *bf = bin->cur;
++	if (bf) {
++		return r_bin_file_get_symbols_vec (bf);
+ 	}
+ 	return NULL;
+ }
+
+
+
+
+@@ -31,6 +31,7 @@ static int reloc_cmp(void *incoming, void *in, void *user) {
+ static void object_delete_items(RBinObject *o) {
+ 	r_return_if_fail (o);
+ 	ut32 i = 0;
++	r_strpool_free (o->pool);
+ 	ht_up_free (o->addr2klassmethod);
+ 	r_list_free (o->entries);
+ 	r_list_free (o->fields);
+@@ -40,7 +41,13 @@ static void object_delete_items(RBinObject *o) {
+ 	r_list_free (o->sections);
+ 	r_list_free (o->strings);
+ 	ht_up_free (o->strings_db);
++
++	if (!RVecRBinSymbol_empty (&o->symbols_vec)) {
++		RVecRBinSymbol_fini (&o->symbols_vec);
++		o->symbols->free = NULL;
++	}
+ 	r_list_free (o->symbols);
++
+ 	r_list_free (o->classes);
+ 	ht_pp_free (o->classes_ht);
+ 	ht_pp_free (o->methods_ht);
+@@ -143,21 +150,24 @@ R_IPI RBinObject *r_bin_object_new(RBinFile *bf, RBinPlugin *plugin, ut64 basead
+ 	bo->baddr_shift = 0;
+ 	bo->plugin = plugin;
+ 	bo->loadaddr = loadaddr != UT64_MAX ? loadaddr : 0;
++	RVecRBinSymbol_init (&bo->symbols_vec);
++	bo->pool = r_strpool_new (0);
++	bf->o = bo;
+ 
+ 	Sdb *sdb = bf->sdb; // should be bo->kv ?
+ 	if (plugin && plugin->load_buffer) {
+ 		if (!plugin->load_buffer (bf, &bo->bin_obj, bf->buf, loadaddr, sdb)) {
+-			if (bf->rbin->verbose) {
+-				R_LOG_ERROR ("r_bin_object_new: load_buffer failed for %s plugin", plugin->name);
+-			}
++			R_LOG_DEBUG ("load_buffer failed for %s plugin", plugin->name);
+ 			sdb_free (bo->kv);
+ 			free (bo);
++			bf->o = NULL;
+ 			return NULL;
+ 		}
+ 	} else {
+ 		R_LOG_WARN ("Plu

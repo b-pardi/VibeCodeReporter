@@ -1,0 +1,166 @@
+@@ -290,7 +290,6 @@ R_API void r_core_task_schedule(RCoreTask *current, RTaskState next_state) {
+ 
+ 	if (stop) {
+ 		scheduler->tasks_running--;
+-		r_th_lock_leave (current->dispatch_lock);
+ 	}
+ 
+ 	// oneshots always have priority.
+@@ -308,6 +307,7 @@ R_API void r_core_task_schedule(RCoreTask *current, RTaskState next_state) {
+ 
+ 	if (next && !stop) {
+ 		r_list_append (scheduler->tasks_queue, current);
++		r_th_lock_enter (current->dispatch_lock);
+ 	}
+ 
+ 	tasks_lock_leave (scheduler, &old_sigset);
+@@ -323,6 +323,7 @@ R_API void r_core_task_schedule(RCoreTask *current, RTaskState next_state) {
+ 				r_th_cond_wait (current->dispatch_cond, current->dispatch_lock);
+ 			}
+ 			current->dispatched = false;
++			r_th_lock_leave (current->dispatch_lock);
+ 		}
+ 	}
+ 
+@@ -333,8 +334,6 @@ R_API void r_core_task_schedule(RCoreTask *current, RTaskState next_state) {
+ 		} else {
+ 			r_cons_context_reset ();
+ 		}
+-	} else {
+-		r_cons_context_reset ();
+ 	}
+ }
+ 
+@@ -368,6 +367,8 @@ static void task_wakeup(RCoreTask *current) {
+ 		current->dispatched = false;
+ 	}
+ 
++	r_th_lock_leave (current->dispatch_lock);
++
+ 	scheduler->current_task = current;
+ 
+ 	if (current->cons_context) {
+
+
+
+
+@@ -57,7 +57,6 @@ typedef struct r_th_sem_t {
+ } RThreadSemaphore;
+ 
+ typedef struct r_th_lock_t {
+-	int refs;
+ 	R_TH_LOCK_T lock;
+ } RThreadLock;
+ 
+@@ -102,7 +101,6 @@ R_API void r_th_sem_wait(RThreadSemaphore *sem);
+ 
+ R_API RThreadLock *r_th_lock_new(bool recursive);
+ R_API int r_th_lock_wait(RThreadLock *th);
+-R_API int r_th_lock_check(RThreadLock *thl);
+ R_API int r_th_lock_tryenter(RThreadLock *thl);
+ R_API int r_th_lock_enter(RThreadLock *thl);
+ R_API int r_th_lock_leave(RThreadLock *thl);
+
+
+
+
+@@ -7,8 +7,6 @@
+ R_API RThreadLock *r_th_lock_new(bool recursive) {
+ 	RThreadLock *thl = R_NEW0 (RThreadLock);
+ 	if (thl) {
+-		// TODO: thl->refs is inconsistently guarded by mutexes and could race
+-		thl->refs = 0;
+ #if HAVE_PTHREAD
+ 		if (recursive) {
+ 			pthread_mutexattr_t attr;
+@@ -38,38 +36,28 @@ R_API int r_th_lock_wait(RThreadLock *thl) {
+ 
+ R_API int r_th_lock_enter(RThreadLock *thl) {
+ #if HAVE_PTHREAD
+-	pthread_mutex_lock (&thl->lock);
++	return pthread_mutex_lock (&thl->lock);
+ #elif __WINDOWS__
+ 	EnterCriticalSection (&thl->lock);
++	return 0;
+ #endif
+-	return ++thl->refs;
+ }
+ 
+ R_API int r_th_lock_tryenter(RThreadLock *thl) {
+ #if HAVE_PTHREAD
+-	if (pthread_mutex_trylock (&thl->lock) == 0) {
++	return pthread_mutex_trylock (&thl->lock);
+ #elif __WINDOWS__
+-	if (TryEnterCriticalSection (&thl->lock)) {
++	return TryEnterCriticalSection (&thl->lock) ? 0 : -1;
+ #endif
+-		return ++thl->refs;
+-	}
+-	return 0;
+ }
+ 
+ R_API int r_th_lock_leave(RThreadLock *thl) {
+ #if HAVE_PTHREAD
+-	pthread_mutex_unlock (&thl->lock);
++	return pthread_mutex_unlock (&thl->lock);
+ #elif __WINDOWS__
+ 	LeaveCriticalSection (&thl->lock);
++	return 0;
+ #endif
+-	if (thl->refs > 0) {
+-		thl->refs--;
+-	}
+-	return thl->refs;
+-}
+-
+-R_API int r_th_lock_check(RThreadLock *thl) {
+-	return thl->refs;
+ }
+ 
+ R_API void *r_th_lock_free(RThreadLock *thl) {
+
+
+
+
+@@ -189,6 +189,7 @@ typedef struct libgdbr_t {
+ 	libgdbr_stop_reason_t stop_reason;
+ 
+ 	RThreadLock *gdbr_lock;
++	int gdbr_lock_depth; // current depth inside the recursive lock
+ 
+ 	// parsed from target
+ 	struct {
+
+
+
+
+@@ -23,6 +23,8 @@
+ #include <signal.h>
+ #endif
+ 
++#include <assert.h>
++
+ #define QSUPPORTED_MAX_RETRIES 5
+ 
+ extern char hex2char (char *hex);
+@@ -94,6 +96,7 @@ bool gdbr_lock_tryenter(libgdbr_t *g) {
+ 	if (!r_th_lock_tryenter (g->gdbr_lock)) {
+ 		return false;
+ 	}
++	g->gdbr_lock_depth++;
+ 	r_cons_break_push (gdbr_break_process, g);
+ 	return true;
+ }
+@@ -102,6 +105,7 @@ bool gdbr_lock_enter(libgdbr_t *g) {
+ 	r_cons_break_push (gdbr_break_process, g);
+ 	void *bed = r_cons_sleep_begin ();
+ 	r_th_lock_enter (g->gdbr_lock);
++	g->gdbr_lock_depth++;
+ 	r_cons_sleep_end (bed);
+ 	if (g->isbreaked) {
+ 		return false;
+@@ -111,9 +115,11 @@ bool gdbr_lock_enter(libgdbr_t *g) {
+ 
+ void gdbr_lock_leave(libgdbr_t *g) {
+ 	r_cons_break_pop ();
++	assert (g->gd

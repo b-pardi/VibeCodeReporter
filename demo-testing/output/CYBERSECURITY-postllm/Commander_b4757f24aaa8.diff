@@ -1,0 +1,74 @@
+@@ -1,9 +1,9 @@
+ import argparse
++import base64
+ import json
+ import logging
+ from json import JSONDecodeError
+ from typing import Dict, List, Optional, Any
+-from charset_normalizer import detect, from_bytes
+ 
+ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+ 
+@@ -43,6 +43,10 @@ report_parser.add_argument('--format', dest='format', action='store', choices=['
+                            help='output format.')
+ report_parser.add_argument('--output', dest='output', action='store',
+                            help='output file name. (ignored for table format)')
++attempt_fix_help = ('do a "hard" sync for vaults with invalid security-data. Associated security scores are reset and '
++                    'will be inaccurate until affected vaults can re-calculate and update their security-data')
++report_parser.add_argument('--attempt-fix', action='store_true', help=attempt_fix_help)
++report_parser.add_argument('-f', '--force', action='store_true', help='skip confirmation prompts (non-interactive mode)')
+ report_parser.add_argument('--debug', action='store_true', help=argparse.SUPPRESS)
+ report_parser.error = raise_parse_exception
+ report_parser.exit = suppress_exit
+@@ -63,6 +67,11 @@ sync_parser.add_argument('email', type=str, nargs='+', help=sync_email_help)
+ sync_verbose_help = 'run and show the latest security-audit report immediately after sync'
+ sync_parser.add_argument('-v', '--verbose', action='store_true', help=sync_verbose_help)
+ sync_parser.add_argument('-f', '--force', action='store_true', help='do sync non-interactively')
++sync_parser.add_argument('--format', dest='format', action='store', choices=['csv', 'json', 'table'], default='table',
++                           help='output format. Valid only with --verbose.')
++sync_parser.add_argument('--output', dest='output', action='store',
++                           help='output file name. Ignore for table format, valid only with --verbose')
++
+ sync_parser.error = raise_parse_exception
+ sync_parser.exit = suppress_exit
+ 
+@@ -180,6 +189,8 @@ class SecurityAuditReportCommand(EnterpriseCommand):
+             logging.info(security_audit_report_description)
+             return
+ 
++        self.enterprise_private_rsa_key = None
++
+         show_breachwatch = kwargs.get('breachwatch')
+         if show_breachwatch:
+             BreachWatch.validate_reporting('security-audit-report', params)
+@@ -193,12 +204,14 @@ class SecurityAuditReportCommand(EnterpriseCommand):
+         self.clear_ancillary_report_data()
+         debug_mode = kwargs.get('debug')
+         self.debug_report_builder = debug_mode and self.DebugReportBuilder()
++        force = kwargs.get('force')
++        attempt_fix = kwargs.get('attempt_fix')
+ 
+         nodes = kwargs.get('node') or []
+         node_ids = [get_node_id(n) for n in nodes]
+         node_ids = [n for n in node_ids if n]
+         score_type = kwargs.get('score_type', 'default')
+-        save_report = kwargs.get('save')
++        save_report = kwargs.get('save') or attempt_fix
+         show_updated = save_report or kwargs.get('show_updated')
+         updated_security_reports = []
+         tree_key = (params.enterprise or {}).get('unencrypted_tree_key')
+@@ -315,7 +328,9 @@ class SecurityAuditReportCommand(EnterpriseCommand):
+ 
+         # Prioritize error-reports (created if any errors are encountered while parsing security score data) over others
+         if self.get_error_report_builder().has_errors_to_report():
+-            return self.get_error_report_builder().get_report(out, fmt)
++            error_report_builder = self.get_error_report_builder()
++            return error_report_builder.sync_problem_vaults(params, out, fmt=fmt, force=force) if attempt_fix \
++                else error_report_builder.get_report(out, fmt)
+         elif debug_mode:
+             return self.debug_report_builder.get_report(out, fmt)
+ 
+@@ -355,17 +370,11 @@ class SecurityAuditReportCommand(EnterpriseCommand):
+ 
+                     try:
+                    

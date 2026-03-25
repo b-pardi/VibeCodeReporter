@@ -1,0 +1,144 @@
+@@ -4,6 +4,7 @@
+ #include "bpf/types_mapper.h"
+ #include <bpf/ctx/skb.h>
+ #include <bpf/api.h>
++#include <linux/in.h>
+ 
+ #include <ep_config.h>
+ #include <node_config.h>
+@@ -1336,6 +1337,13 @@ static __always_inline int __tail_handle_ipv4(struct __ctx_buff *ctx,
+ 		 */
+ 		return mcast_ipv4_handle_igmp(ctx, ip4, data, data_end);
+ 	}
++
++	if (IN_MULTICAST(bpf_ntohl(ip4->daddr))) {
++		if (mcast_lookup_subscriber_map(&ip4->daddr)) {
++			ep_tail_call(ctx, CILIUM_CALL_MULTICAST_EP_DELIVERY);
++			return DROP_MISSED_TAIL_CALL;
++		}
++	}
+ #endif /* ENABLE_MULTICAST */
+ 
+ #ifdef ENABLE_PER_PACKET_LB
+
+
+
+
+@@ -6,6 +6,7 @@
+ 
+ #include <node_config.h>
+ #include <netdev_config.h>
++#include "lib/mcast.h"
+ 
+ #define IS_BPF_OVERLAY 1
+ 
+@@ -293,6 +294,15 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
+ 		return DROP_FRAG_NOSUPPORT;
+ #endif
+ 
++#ifdef ENABLE_MULTICAST
++	if (IN_MULTICAST(bpf_ntohl(ip4->daddr))) {
++		if (mcast_lookup_subscriber_map(&ip4->daddr)) {
++			ep_tail_call(ctx, CILIUM_CALL_MULTICAST_EP_DELIVERY);
++			return DROP_MISSED_TAIL_CALL;
++		}
++	}
++#endif /* ENABLE_MULTICAST */
++
+ #ifdef ENABLE_NODEPORT
+ 	if (!ctx_skip_nodeport(ctx)) {
+ 		int ret = nodeport_lb4(ctx, ip4, ETH_HLEN, *identity, ext_err, &is_dsr);
+
+
+
+
+@@ -37,6 +37,8 @@ static int BPF_FUNC(map_update_elem, const void *map, const void *key,
+ static int BPF_FUNC(map_delete_elem, const void *map, const void *key);
+ static void *BPF_FUNC(map_lookup_percpu_elem, void *map, const void *key,
+ 				unsigned int cpu);
++static long BPF_FUNC(for_each_map_elem, void *map, void *callback_fn,
++		     void *callback_ctx, __u64 flags);
+ 
+ /* Time access */
+ static __u64 BPF_FUNC(ktime_get_ns);
+
+
+
+
+@@ -17,6 +17,7 @@ static int BPF_FUNC(redirect, int ifindex, __u32 flags);
+ static int BPF_FUNC(redirect_neigh, int ifindex, struct bpf_redir_neigh *params,
+ 		    int plen, __u32 flags);
+ static int BPF_FUNC(redirect_peer, int ifindex, __u32 flags);
++static int BPF_FUNC(clone_redirect, struct __sk_buff *skb, __u32 ifindex, __u64 flags);
+ 
+ /* Packet manipulation */
+ static int BPF_FUNC(skb_load_bytes, struct __sk_buff *skb, __u32 off,
+
+
+
+
+@@ -135,7 +135,8 @@ enum {
+ #define CILIUM_CALL_IPV6_CONT_FROM_NETDEV	46
+ #define CILIUM_CALL_IPV4_NO_SERVICE		47
+ #define CILIUM_CALL_IPV6_NO_SERVICE		48
+-#define CILIUM_CALL_SIZE			49
++#define CILIUM_CALL_MULTICAST_EP_DELIVERY       49
++#define CILIUM_CALL_SIZE			50
+ 
+ typedef __u64 mac_t;
+ 
+@@ -641,6 +642,7 @@ enum {
+ #define DROP_RATE_LIMITED	-198
+ #define DROP_IGMP_HANDLED	-199
+ #define DROP_IGMP_SUBSCRIBED    -200
++#define DROP_MULTICAST_HANDLED  -201
+ 
+ #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+ #define NAT_NEEDED		CTX_ACT_OK
+
+
+
+
+@@ -10,7 +10,11 @@
+ 
+ #include "bpf/ctx/skb.h"
+ #include "bpf/helpers.h"
++#include "bpf/helpers_skb.h"
+ #include "lib/common.h"
++#include "lib/drop.h"
++#include "lib/eth.h"
++#include "linux/bpf.h"
+ 
+ /* the below structures are define outside of an IFDEF guard to satisfy
+  * enterprise_bpf_alignchecker.c requirement
+@@ -70,6 +74,14 @@ struct {
+ 	});
+ } cilium_mcast_group_outer_v4_map __section_maps_btf;
+ 
++/* lookup a subscriber map for the given ipv4 multicast group
++ * returns a void pointer to a inner subscriper map if one exists
++ */
++static __always_inline void *mcast_lookup_subscriber_map(__be32 *group)
++{
++	return map_lookup_elem(&cilium_mcast_group_outer_v4_map, group);
++}
++
+ /* returns 1 if ip4 header is followed by an IGMP payload, 0 if not */
+ static __always_inline bool mcast_ipv4_is_igmp(const struct iphdr *ip4)
+ {
+@@ -296,5 +308,131 @@ static __always_inline __s32 mcast_ipv4_handle_igmp(void *ctx,
+ 	return DROP_IGMP_HANDLED;
+ }
+ 
++/* encodes a multicast mac address given a ipv4 group address
++ * results are in big endian format and written directly into 'mac'
++ */
++static __always_inline void mcast_encode_ipv4_mac(union macaddr *mac,
++						  const __u8 group[4])
++{
++	mac->addr[0] = 0x01;
++	mac->addr[1] = 0x00;
++	mac->addr[2] = 0x0E;
++	mac->addr[3] = group[1] & 0x7F;
++	mac->addr[4] = group[2];
++

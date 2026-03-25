@@ -1,0 +1,135 @@
+@@ -78,14 +78,9 @@ R_API RAnal *r_anal_new() {
+ 	anal->sdb_fcns = sdb_ns (anal->sdb, "fcns", 1);
+ 	anal->sdb_meta = sdb_ns (anal->sdb, "meta", 1);
+ 	anal->sdb_hints = sdb_ns (anal->sdb, "hints", 1);
+-	anal->sdb_xrefs = sdb_ns (anal->sdb, "xrefs", 1);
+ 	anal->sdb_types = sdb_ns (anal->sdb, "types", 1);
+ 	anal->sdb_cc = sdb_ns (anal->sdb, "cc", 1);
+ 	anal->sdb_zigns = sdb_ns (anal->sdb, "zigns", 1);
+-#if USE_DICT
+-	anal->dict_refs = dict_new (100, dict_free);
+-	anal->dict_xrefs = dict_new (100, dict_free);
+-#endif
+ 	anal->zign_path = strdup ("");
+ 	anal->cb_printf = (PrintfCallback) printf;
+ 	(void)r_anal_pin_init (anal);
+@@ -141,6 +136,8 @@ R_API RAnal *r_anal_free(RAnal *a) {
+ 	r_reg_free (a->reg);
+ 	r_anal_op_free (a->queued);
+ 	r_list_free (a->bits_ranges);
++	ht_free (a->dict_refs);
++	ht_free (a->dict_xrefs);
+ 	a->sdb = NULL;
+ 	sdb_ns_free (a->sdb);
+ 	if (a->esil) {
+@@ -364,13 +361,6 @@ R_API RList* r_anal_get_fcns (RAnal *anal) {
+ 	return anal->fcns;
+ }
+ 
+-R_API bool r_anal_project_save(RAnal *anal, const char *prjfile) {
+-	if (prjfile && *prjfile) {
+-		return r_anal_xrefs_save (anal, prjfile);
+-	}
+-	return false;
+-}
+-
+ R_API RAnalOp *r_anal_op_hexstr(RAnal *anal, ut64 addr, const char *str) {
+ 	int len;
+ 	ut8 *buf;
+@@ -412,7 +402,6 @@ R_API int r_anal_purge (RAnal *anal) {
+ 	sdb_reset (anal->sdb_fcns);
+ 	sdb_reset (anal->sdb_meta);
+ 	sdb_reset (anal->sdb_hints);
+-	sdb_reset (anal->sdb_xrefs);
+ 	sdb_reset (anal->sdb_types);
+ 	sdb_reset (anal->sdb_zigns);
+ 	r_list_free (anal->fcns);
+
+
+
+
+@@ -144,7 +144,7 @@ R_API int r_anal_bb(RAnal *anal, RAnalBlock *bb, ut64 addr, ut8 *buf, ut64 len,
+ 					ut8 b[8];
+ 					ut64 ptr = idx+addr+src->delta;
+ 					anal->iob.read_at (anal->iob.io, ptr, b, memref);
+-					r_anal_ref_add (anal, ptr, addr+idx-op->size, 'd');
++					r_anal_xrefs_set (anal, addr+idx-op->size, ptr, R_ANAL_REF_TYPE_DATA);
+ 				}
+ 			}
+ 		}
+
+
+
+
+@@ -293,10 +293,6 @@ R_API RAnalFunction *r_anal_fcn_new() {
+ 	fcn->cc = NULL;
+ 	/* Function attributes: weak/noreturn/format/etc */
+ 	fcn->addr = UT64_MAX;
+-#if FCN_OLD
+-	fcn->refs = r_anal_ref_list_new ();
+-	fcn->xrefs = r_anal_ref_list_new ();
+-#endif
+ 	fcn->fcn_locs = NULL;
+ 	fcn->bbs = r_anal_bb_list_new ();
+ 	fcn->fingerprint = NULL;
+@@ -323,10 +319,6 @@ R_API void r_anal_fcn_free(void *_fcn) {
+ 	free (fcn->name);
+ 	free (fcn->attr);
+ 	r_tinyrange_fini (&fcn->bbr);
+-#if FCN_OLD
+-	r_list_free (fcn->refs);
+-	r_list_free (fcn->xrefs);
+-#endif
+ 	// all functions are freed in anal->fcns
+ 	fcn->fcn_locs = NULL;
+ 	if (fcn->bbs) {
+@@ -352,64 +344,6 @@ static bool refExists(RList *refs, RAnalRef *ref) {
+ 	return false;
+ }
+ 
+-R_API int r_anal_fcn_xref_add(RAnal *a, RAnalFunction *fcn, ut64 at, ut64 addr, int type) {
+-	RAnalRef *ref;
+-	if (!fcn || !a) {
+-		return false;
+-	}
+-	if (!a->iob.is_valid_offset (a->iob.io, addr, 0)) {
+-		return false;
+-	}
+-	ref = r_anal_ref_new ();
+-	if (!ref) {
+-		return false;
+-	}
+-	// set global reference
+-// r_cons_printf ("C 0x%llx  0x%llx\n", at, addr);
+-	r_anal_xrefs_set (a, type, at, addr);
+-	// set per-function reference
+-#if FCN_OLD
+-// TOO OLD we shouldnt be storing this.. or we do?
+-	ref->at = at; // from
+-	ref->addr = addr; // to
+-	ref->type = type;
+-	// TODO: ensure we are not dupping xrefs
+-	if (refExists (fcn->refs, ref)) {
+-		r_anal_ref_free (ref);
+-	} else {
+-		r_list_append (fcn->refs, ref);
+-	}
+-#endif
+-#if FCN_SDB
+-	sdb_add (DB, sdb_fmt ("fcn.0x%08"PFMT64x ".name", fcn->addr), fcn->name, 0);
+-	// encode the name in base64 ?
+-	sdb_num_add (DB, sdb_fmt ("fcn.name.%s", fcn->name), fcn->addr, 0);
+-	sdb_array_add_num (DB, sdb_fmt ("fcn.0x%08"PFMT64x ".xrefs", fcn->addr), at, 0);
+-#endif
+-	return true;
+-}
+-
+-R_API int r_anal_fcn_xref_del(RAnal *a, RAnalFunction *fcn, ut64 at, ut64 addr, int type) {
+-#if FCN_OLD
+-	RAnalRef *ref;
+-	RListIter *iter;
+-	/* No need for _safe loop coz we return immediately after the delete. */
+-	r_list_foreach (fcn->xrefs, iter, ref) {
+-		if ((type != -1 || type == ref->type) &&
+-		(at == 0LL || at == ref->at) &&
+-		(add

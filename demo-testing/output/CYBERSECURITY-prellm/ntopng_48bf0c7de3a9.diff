@@ -1,0 +1,117 @@
+@@ -106,6 +106,9 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   HostChecksExecutor *host_checks_executor, *prev_host_checks_executor;
+ 
+ #if defined(NTOPNG_PRO)
++  /* Logic for detecting packet protocol storms */
++  u_int32_t dhcp_last_sec_pkts, last_sec_epoch;
++
+   time_t nextMinPeriodicUpdate;
+   /* Behavioural analysis regarding the interface */
+   BehaviorAnalysis *score_behavior, *traffic_tx_behavior, *traffic_rx_behavior;
+@@ -369,6 +372,10 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   u_int16_t guessEthType(const u_char *p, u_int len, u_int8_t *is_ethernet);
+   void loadProtocolsAssociations(struct ndpi_detection_module_struct *ndpi_str);
+ 
++#ifdef NTOPNG_PRO
++  void checkDHCPStorm(time_t when, u_int32_t num_pkts);
++#endif
++  
+  public:
+   /**
+   * @brief A Constructor
+@@ -531,6 +538,12 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+ 		     ingressPacket ? num_pkts : 0, ingressPacket ? pkt_len : 0,
+ 		     !ingressPacket ? num_pkts : 0, !ingressPacket ? pkt_len : 0);
+ #endif
++
++#ifdef NTOPNG_PRO
++    /* Added DHCP storm detection */
++    if(ndpi_proto == NDPI_PROTOCOL_DHCP)
++      checkDHCPStorm(when, num_pkts);
++#endif
+   };
+ 
+   inline void incICMPStats(bool is_icmpv6, u_int32_t num_pkts, u_int8_t icmp_type, u_int8_t icmp_code, bool sent) {
+
+
+
+
+@@ -205,6 +205,8 @@
+ #define DOMAIN_WHITELIST_CAT    "ntopng.domain.whitelist"
+ #define DNS_CACHE               "ntopng.dns.cache"
+ #define DHCP_CACHE              "ntopng.dhcp.%d.cache.%s"
++#define DHCP_STORM_QUEUE_NAME   "ntopng.dhcp.storm.%d"
++#define DHCP_STORM_PPS_THSHOLD  2048
+ #define NTOPNG_TRACE            "ntopng.trace"
+ #define TRACES_PER_LOG_FILE_HIGH_WATERMARK 10000
+ #define MAX_NUM_NTOPNG_LOG_FILES           5
+
+
+
+
+@@ -335,6 +335,7 @@ void NetworkInterface::init() {
+   sub_interfaces = NULL;
+ #endif
+ #endif
++  dhcp_last_sec_pkts = 0, last_sec_epoch = 0;
+ 
+   dhcp_ranges = dhcp_ranges_shadow = NULL;
+ 
+@@ -4167,7 +4168,7 @@ struct flowHostRetriever {
+   FlowStats *stats;
+ 
+   /* Paginator */
+-  Paginator *pag; 
++  Paginator *pag;
+ };
+ 
+ /* **************************************************** */
+@@ -5160,7 +5161,7 @@ static bool flow_sum_stats(GenericHashEntry *flow, void *user_data, bool *matche
+     retriever->totBytesSent += f->get_bytes_cli2srv();
+     retriever->totBytesRcvd += f->get_bytes_srv2cli();
+     retriever->totThpt      += f->get_bytes_thpt();
+-    
++
+     if(!retriever->only_traffic_stats)
+       f->sumStats(ndpi_stats, stats);
+ 
+@@ -7351,7 +7352,7 @@ void NetworkInterface::allocateStructures() {
+ #endif
+ #endif
+       }
+-    }  
++    }
+ 
+     if(!isViewed()) {
+ #if defined(HAVE_CLICKHOUSE) && defined(HAVE_MYSQL)
+@@ -9860,3 +9861,30 @@ int NetworkInterface::walkActiveHosts(lua_State* vm,
+     return(m.info.size());
+   }
+ }
++
++/* *************************************** */
++
++#ifdef NTOPNG_PRO
++void NetworkInterface::checkDHCPStorm(time_t when, u_int32_t num_pkts) {
++  if(last_sec_epoch == when)
++    dhcp_last_sec_pkts += num_pkts;
++  else {
++    if(dhcp_last_sec_pkts > DHCP_STORM_PPS_THSHOLD) {
++      char value[32], key[32];
++
++#ifdef DEBUG
++      ntop->getTrace()->traceEvent(TRACE_NORMAL, "DHCP [iface: %d][when: %u][total: %u]",
++				   get_id(), last_sec_epoch, dhcp_last_sec_pkts);
++#endif
++
++      /* Queue alert for the DHCP storm plugin */
++      snprintf(key, sizeof(key), DHCP_STORM_QUEUE_NAME, get_id());
++
++      snprintf(value, sizeof(value), "%u;%u", last_sec_epoch, dhcp_last_sec_pkts);
++      ntop->getRedis()->rpush(DHCP_STORM_QUEUE_NAME, value, 32 /* trim size */);
++    }
++
++    last_sec_epoch = when, dhcp_last_sec_pkts = num_pkts; /* Reset counter */
++  }
++}
++#endif

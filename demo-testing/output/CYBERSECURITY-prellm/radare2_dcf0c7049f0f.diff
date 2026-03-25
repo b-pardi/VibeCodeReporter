@@ -1,0 +1,144 @@
+@@ -13,7 +13,7 @@ typedef struct {
+ static bool bb_from_offset_jmpmid_cb(RAnalBlock *block, void *user) {
+ 	BBFromOffsetJmpmidCtx *ctx = user;
+ 	// If an instruction starts exactly at the search addr, return that block immediately
+-	if (r_anal_bb_op_starts_at (block, ctx->addr)) {
++	if (r_anal_block_op_starts_at (block, ctx->addr)) {
+ 		ctx->ret = block;
+ 		return false;
+ 	}
+@@ -102,24 +102,6 @@ R_API ut64 r_anal_bb_opaddr_at(RAnalBlock *bb, ut64 off) {
+ 	return bb->addr + last_delta;
+ }
+ 
+-/* return true if an instruction starts at a given address of the given
+- * basic block. */
+-R_API bool r_anal_bb_op_starts_at(RAnalBlock *bb, ut64 addr) {
+-	int i;
+-
+-	if (!r_anal_block_contains (bb, addr)) {
+-		return false;
+-	}
+-	ut16 off = addr - bb->addr;
+-	for (i = 0; i < bb->ninstr; i++) {
+-		ut16 inst_off = r_anal_bb_offset_inst (bb, i);
+-		if (off == inst_off) {
+-			return true;
+-		}
+-	}
+-	return false;
+-}
+-
+ // returns the size of the i-th instruction in a basic block
+ R_API ut64 r_anal_bb_size_i(RAnalBlock *bb, int i) {
+ 	if (i < 0 || i >= bb->ninstr) {
+
+
+
+
+@@ -1,6 +1,7 @@
+ /* radare - LGPL - Copyright 2019-2020 - pancake, thestr4ng3r */
+ 
+ #include <r_anal.h>
++#include <sdb/ht_uu.h>
+ 
+ #include <assert.h>
+ 
+@@ -305,7 +306,7 @@ R_API RAnalBlock *r_anal_block_split(RAnalBlock *bbi, ut64 addr) {
+ }
+ 
+ R_API bool r_anal_block_merge(RAnalBlock *a, RAnalBlock *b) {
+-	if (a->addr + a->size != b->addr) {
++	if (!r_anal_block_is_contiguous (a, b)) {
+ 		return false;
+ 	}
+ 
+@@ -461,6 +462,23 @@ R_API void r_anal_block_add_switch_case(RAnalBlock *block, ut64 switch_addr, ut6
+ 	r_anal_switch_op_add_case (block->switch_op, case_addr, 0, case_addr);
+ }
+ 
++R_API bool r_anal_block_op_starts_at(RAnalBlock *bb, ut64 addr) {
++	if (!r_anal_block_contains (bb, addr)) {
++		return false;
++	}
++	ut64 off = addr - bb->addr;
++	if (off > UT16_MAX) {
++		return false;
++	}
++	size_t i;
++	for (i = 0; i < bb->ninstr; i++) {
++		ut16 inst_off = r_anal_bb_offset_inst (bb, i);
++		if (off == inst_off) {
++			return true;
++		}
++	}
++	return false;
++}
+ 
+ typedef struct {
+ 	RAnal *anal;
+@@ -543,3 +561,245 @@ beach:
+ 	return ret;
+ }
+ 
++typedef struct {
++	RAnalBlock *block;
++	bool reachable;
++} NoreturnSuccessor;
++
++static void noreturn_successor_free(HtUPKv *kv) {
++	NoreturnSuccessor *succ = kv->value;
++	r_anal_block_unref (succ->block);
++	free (succ);
++}
++
++static bool noreturn_successors_cb(RAnalBlock *block, void *user) {
++	HtUP *succs = user;
++	NoreturnSuccessor *succ = R_NEW0 (NoreturnSuccessor);
++	if (!succ) {
++		return false;
++	}
++	r_anal_block_ref (block);
++	succ->block = block;
++	succ->reachable = false; // reset for first iteration
++	ht_up_insert (succs, block->addr, succ);
++	return true;
++}
++
++static bool noreturn_successors_reachable_cb(RAnalBlock *block, void *user) {
++	HtUP *succs = user;
++	NoreturnSuccessor *succ = ht_up_find (succs, block->addr, NULL);
++	if (succ) {
++		succ->reachable = true;
++	}
++	return true;
++}
++
++static bool noreturn_remove_unreachable_cb(void *user, const ut64 k, const void *v) {
++	RAnalFunction *fcn = user;
++	NoreturnSuccessor *succ = (NoreturnSuccessor *)v;
++	if (!succ->reachable && r_list_contains (succ->block->fcns, fcn)) {
++		r_anal_function_remove_block (fcn, succ->block);
++	}
++	succ->reachable = false; // reset for next iteration
++	return true;
++}
++
++static bool noreturn_get_blocks_cb(void *user, const ut64 k, const void *v) {
++	RList *blocks = user;
++	NoreturnSuccessor *succ = (NoreturnSuccessor *)v;
++	r_anal_block_ref (succ->block);
++	r_list_push (blocks, succ->block);
++	return true;
++}
++
++R_API RAnalBlock *r_anal_block_chop_noreturn(RAnalBlock *block, ut64 addr) {
++	r_return_val_if_fail (block, NULL);
++	if (!r_anal_block_contains (block, addr) || addr == block->addr) {
++		return block;
++	}
++	r_anal_block_ref (block);
++
++	// Cache all recursive successors of block here.
++	// These are the candidates that we might have to remove from functions later.
++	HtUP *succs = ht_up_new (NULL, noreturn_successor_free, NULL); // maps block a

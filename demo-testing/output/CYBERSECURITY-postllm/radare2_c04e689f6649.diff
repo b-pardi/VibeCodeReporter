@@ -1,0 +1,139 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2022 - pancake, nibble */
++/* radare - LGPL - Copyright 2009-2023 - pancake, nibble */
+ 
+ #include <r_anal.h>
+ #include <r_util.h>
+@@ -324,9 +324,13 @@ R_API bool r_anal_set_triplet(RAnal *anal, R_NULLABLE const char *os, R_NULLABLE
+ 	if (bits < 1) {
+ 		bits = anal->config->bits;
+ 	}
+-	free (anal->config->os);
+-	anal->config->os = strdup (os);
+-	r_anal_set_bits (anal, bits);
++	if (anal->config && anal->config->os && !strcmp (anal->config->os, os)) {
++		free (anal->config->os);
++		anal->config->os = strdup (os);
++	}
++	if (bits != anal->config->bits) {
++		r_anal_set_bits (anal, bits);
++	}
+ 	return r_anal_use (anal, arch);
+ }
+ 
+
+
+
+
+@@ -74,8 +74,12 @@ R_API bool r_arch_use(RArch *arch, RArchConfig *config, const char *name) {
+ 		config = arch->cfg;
+ 	}
+ #if 0
++	if (arch->session && !strcmp (name, arch->session->plugin->name)) {
++		R_LOG_WARN ("already set%c", 10);
++		arch->cfg = config;
++		return true;
++	}
+ 	if (config && arch->cfg == config) {
+-		eprintf ("retur\n");
+ 		return true;
+ 	}
+ #endif
+@@ -85,6 +89,7 @@ R_API bool r_arch_use(RArch *arch, RArchConfig *config, const char *name) {
+ 		arch->session = NULL;
+ 		return false;
+ 	}
++	r_unref (arch->session);
+ 	arch->session = r_arch_session (arch, config, ap);
+ #if 0
+ 	RArchConfig *oconfig = arch->cfg;
+
+
+
+
+@@ -2501,9 +2501,14 @@ static void core_anal_bytes(RCore *core, const ut8 *buf, int len, int nops, int
+ 			}
+ 		} else {
+ 			char disasm[128] = {0};
++			char *text = r_asm_op_get_asm (&asmop);
++			if (!text) {
++				R_LOG_ERROR ("invalid");
++				break;
++			}
+ 			r_parse_subvar (core->parser, NULL,
+ 				core->offset + idx,
+-				asmop.size, r_asm_op_get_asm (&asmop),
++				asmop.size,  text,
+ 				disasm, sizeof (disasm));
+ 			ut64 killme = UT64_MAX;
+ 			if (r_io_read_i (core->io, op.ptr, &killme, op.refptr, be)) {
+
+
+
+
+@@ -519,37 +519,41 @@ R_API bool r_debug_set_arch(RDebug *dbg, const char *arch, int bits) {
+  * XXX: This function will advance your seek to the end of the injected code.
+  */
+ R_API bool r_debug_execute(RDebug *dbg, const ut8 *buf, int len, R_OUT ut64 *ret, bool restore, bool ignore_stack) {
+-	ut8 stack_backup[4096];
+-	ut8 *pc_backup = NULL, *reg_backup = NULL;
+-	int reg_backup_sz;
+-
+ 	r_return_val_if_fail (dbg && buf && len > 0, false);
++	ut8 stack_backup[1024];
+ 
+ 	if (r_debug_is_dead (dbg)) {
++		R_LOG_WARN ("Child is dead");
+ 		return false;
+ 	}
+ 
+-	const char *pc = dbg->reg->name[R_REG_NAME_PC];
+-	const char *sp = dbg->reg->name[R_REG_NAME_SP];
++#if 0
+ 	if (restore && !ignore_stack) {
+ 		R_LOG_ERROR ("r_debug_execute: Cannot get stack pointer");
+ 		return false;
+ 	}
+-
+-	r_debug_reg_sync (dbg, R_REG_TYPE_GPR, false);
+-	reg_backup = r_reg_get_bytes (dbg->reg, R_REG_TYPE_ALL, &reg_backup_sz);
+-
+-	if (!reg_backup) {
+-		R_LOG_ERROR ("Cannot get register arena bytes");
++#endif
++	if (!r_debug_reg_sync (dbg, R_REG_TYPE_GPR, false)) {
++		R_LOG_ERROR ("Cannot sync registers");
+ 		return false;
+ 	}
++	r_reg_arena_push (dbg->reg);
+ 
++	char *pc = strdup (r_reg_get_name (dbg->reg, R_REG_NAME_PC));
++	char *sp = strdup (r_reg_get_name (dbg->reg, R_REG_NAME_SP));
+ 	ut64 reg_pc = r_reg_getv (dbg->reg, pc);
+ 	ut64 reg_sp = r_reg_getv (dbg->reg, sp);
++	if (reg_pc == UT64_MAX || reg_sp == UT64_MAX) {
++		R_LOG_ERROR ("Invalid pc/sp values");
++		free (pc);
++		free (sp);
++		return false;
++	}
+ 
+-	pc_backup = malloc (len);
++	ut8 *pc_backup = calloc (1, len);
+ 	if (!pc_backup) {
+-		free (reg_backup);
++		free (pc);
++		free (sp);
+ 		return false;
+ 	}
+ 
+@@ -557,7 +561,7 @@ R_API bool r_debug_execute(RDebug *dbg, const ut8 *buf, int len, R_OUT ut64 *ret
+ 	dbg->iob.read_at (dbg->iob.io, reg_pc, pc_backup, len);
+ 	if (restore && !ignore_stack) {
+ 		/* Store bytes at stack */
+-		dbg->iob.read_at (dbg->iob.io, reg_sp, stack_backup, 4096);
++		dbg->iob.read_at (dbg->iob.io, reg_sp, stack_backup, sizeof (stack_backup));
+ 	}
+ 
+ 	ut64 bp_addr = reg_pc + len;
+@@ -567,36 +571,30 @@ R_API bool r_debug_execute(RDebug *dbg, const ut8 *buf, int len, R_OUT ut

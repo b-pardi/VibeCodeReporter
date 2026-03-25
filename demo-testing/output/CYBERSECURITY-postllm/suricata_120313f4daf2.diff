@@ -1,0 +1,105 @@
+@@ -145,8 +145,9 @@ enum {
+     ERR_EXTRACT_VALIDITY,
+ };
+ 
+-/* JA3 fingerprints are disabled by default */
++/* JA3 and JA4 fingerprints are disabled by default */
+ #define SSL_CONFIG_DEFAULT_JA3 0
++#define SSL_CONFIG_DEFAULT_JA4 0
+ 
+ enum SslConfigEncryptHandling {
+     SSL_CNF_ENC_HANDLE_DEFAULT = 0, /**< disable raw content, continue tracking */
+@@ -156,10 +157,12 @@ enum SslConfigEncryptHandling {
+ 
+ typedef struct SslConfig_ {
+     enum SslConfigEncryptHandling encrypt_mode;
+-    /** dynamic setting for ja3: can be enabled on demand if not explicitly
+-     *  disabled. */
++    /** dynamic setting for ja3 and ja4: can be enabled on demand if not
++     *  explicitly disabled. */
+     SC_ATOMIC_DECLARE(int, enable_ja3);
+     bool disable_ja3; /**< ja3 explicitly disabled. Don't enable on demand. */
++    SC_ATOMIC_DECLARE(int, enable_ja4);
++    bool disable_ja4; /**< ja4 explicitly disabled. Don't enable on demand. */
+ } SslConfig;
+ 
+ SslConfig ssl_config;
+@@ -693,6 +696,11 @@ static inline int TLSDecodeHSHelloVersion(SSLState *ssl_state,
+     uint16_t version = (uint16_t)(*input << 8) | *(input + 1);
+     ssl_state->curr_connp->version = version;
+ 
++    if (ssl_state->curr_connp->ja4 != NULL &&
++            ssl_state->current_flags & SSL_AL_FLAG_STATE_CLIENT_HELLO) {
++        SCJA4SetTLSVersion(ssl_state->curr_connp->ja4, version);
++    }
++
+     /* TLSv1.3 draft1 to draft21 use the version field as earlier TLS
+        versions, instead of using the supported versions extension. */
+     if ((ssl_state->current_flags & SSL_AL_FLAG_STATE_SERVER_HELLO) &&
+@@ -836,17 +844,25 @@ static inline int TLSDecodeHSHelloCipherSuites(SSLState *ssl_state,
+         goto invalid_length;
+     }
+ 
+-    if (SC_ATOMIC_GET(ssl_config.enable_ja3)) {
+-        JA3Buffer *ja3_cipher_suites = Ja3BufferInit();
+-        if (ja3_cipher_suites == NULL)
+-            return -1;
++    const bool enable_ja3 = SC_ATOMIC_GET(ssl_config.enable_ja3);
++
++    if (enable_ja3 || SC_ATOMIC_GET(ssl_config.enable_ja4)) {
++        JA3Buffer *ja3_cipher_suites = NULL;
++
++        if (enable_ja3) {
++            ja3_cipher_suites = Ja3BufferInit();
++            if (ja3_cipher_suites == NULL)
++                return -1;
++        }
+ 
+         uint16_t processed_len = 0;
+         /* coverity[tainted_data] */
+         while (processed_len < cipher_suites_length)
+         {
+             if (!(HAS_SPACE(2))) {
+-                Ja3BufferFree(&ja3_cipher_suites);
++                if (enable_ja3) {
++                    Ja3BufferFree(&ja3_cipher_suites);
++                }
+                 goto invalid_length;
+             }
+ 
+@@ -854,19 +870,25 @@ static inline int TLSDecodeHSHelloCipherSuites(SSLState *ssl_state,
+             input += 2;
+ 
+             if (TLSDecodeValueIsGREASE(cipher_suite) != 1) {
+-                int rc = Ja3BufferAddValue(&ja3_cipher_suites, cipher_suite);
+-                if (rc != 0) {
+-                    return -1;
++                if (ssl_state->curr_connp->ja4 != NULL &&
++                        ssl_state->current_flags & SSL_AL_FLAG_STATE_CLIENT_HELLO) {
++                    SCJA4AddCipher(ssl_state->curr_connp->ja4, cipher_suite);
++                }
++                if (enable_ja3) {
++                    int rc = Ja3BufferAddValue(&ja3_cipher_suites, cipher_suite);
++                    if (rc != 0) {
++                        return -1;
++                    }
+                 }
+             }
+-
+             processed_len += 2;
+         }
+ 
+-        int rc = Ja3BufferAppendBuffer(&ssl_state->curr_connp->ja3_str,
+-                                   &ja3_cipher_suites);
+-        if (rc == -1) {
+-            return -1;
++        if (enable_ja3) {
++            int rc = Ja3BufferAppendBuffer(&ssl_state->curr_connp->ja3_str, &ja3_cipher_suites);
++            if (rc == -1) {
++                return -1;
++            }
+         }
+ 
+     } else {
+@@ -1027,6 +1049,10 @@ static inline int TLSDecodeHSHelloExtensionSupportedVersions(SSLState *ssl_state
+             uint16

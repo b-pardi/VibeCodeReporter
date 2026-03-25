@@ -1,0 +1,134 @@
+@@ -47,6 +47,7 @@
+ #include "detect-engine-dcepayload.h"
+ #include "detect-dns-query.h"
+ #include "detect-tls-sni.h"
++#include "detect-tls-certs.h"
+ #include "detect-tls-cert-fingerprint.h"
+ #include "detect-tls-cert-issuer.h"
+ #include "detect-tls-cert-subject.h"
+@@ -432,6 +433,7 @@ void SigTableSetup(void)
+     DetectTlsSubjectRegister();
+     DetectTlsSerialRegister();
+     DetectTlsFingerprintRegister();
++    DetectTlsCertsRegister();
+ 
+     DetectTlsJa3HashRegister();
+     DetectTlsJa3StringRegister();
+
+
+
+
+@@ -194,6 +194,7 @@ enum {
+ 
+     DETECT_AL_DNS_QUERY,
+     DETECT_AL_TLS_SNI,
++    DETECT_AL_TLS_CERTS,
+     DETECT_AL_TLS_CERT_ISSUER,
+     DETECT_AL_TLS_CERT_SUBJECT,
+     DETECT_AL_TLS_CERT_SERIAL,
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,260 @@
++/* Copyright (C) 2019 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Mats Klepsland <mats.klepsland@gmail.com>
++ *
++ * Implements support for tls.certs keyword.
++ */
++
++#include "suricata-common.h"
++#include "threads.h"
++#include "debug.h"
++#include "decode.h"
++#include "detect.h"
++
++#include "detect-parse.h"
++#include "detect-engine.h"
++#include "detect-engine-mpm.h"
++#include "detect-engine-prefilter.h"
++#include "detect-engine-content-inspection.h"
++#include "detect-content.h"
++#include "detect-pcre.h"
++#include "detect-tls-certs.h"
++
++#include "flow.h"
++#include "flow-util.h"
++#include "flow-var.h"
++
++#include "util-debug.h"
++#include "util-unittest.h"
++#include "util-spm.h"
++#include "util-print.h"
++
++#include "stream-tcp.h"
++
++#include "app-layer.h"
++#include "app-layer-ssl.h"
++
++#include "util-unittest.h"
++#include "util-unittest-helper.h"
++
++static int DetectTlsCertsSetup(DetectEngineCtx *, Signature *, const char *);
++#ifdef UNITTESTS
++static void DetectTlsCertsRegisterTests(void);
++#endif
++static int DetectEngineInspectTlsCerts(DetectEngineCtx *de_ctx,
++	DetectEngineThreadCtx *det_ctx,
++	const DetectEngineAppInspectionEngine *engine,
++        const Signature *s, Flow *f, uint8_t flags, void *alstate, void *txv,
++	uint64_t tx_id);
++static int PrefilterMpmTlsCertsRegister(DetectEngineCtx *de_ctx,
++        SigGroupHead *sgh, MpmCtx *mpm_ctx,
++        const DetectMpmAppLayerRegistery *mpm_reg, int list_id);
++
++static int g_tls_certs_buffer_id = 0;
++
++struct TlsCertsGetDataArgs {
++    int local_id;  /**< used as index into thread inspect array */
++    SSLCertsChain *cert;
++};
++
++typedef struct PrefilterMpmTlsCerts {
++    int list_id;
++    const MpmCtx *mpm_ctx;
++    const DetectEngineTransforms *transforms;
++} PrefilterMpmTlsCerts;
++
++/**
++ * \brief Registration function for keyword: tls.certs
++ */
++void DetectTlsCertsRegister(void)
++{
++    sigmatch_table[DETECT_AL_TLS_CERTS].name = "tls.certs";
++    sigmatch_table[DETECT_AL_TLS_CERTS].desc = "content modifier to match the TLS certificate sticky buffer";
++    sigmatch_table[DETECT_AL_TLS_CERTS].url = DOC_URL DOC_VERSION "/rules/tls-keywords.html#tls-certs";
++    sigmatch_table[DETECT_AL_TLS_CERTS].Setup = DetectTlsCertsSetup;
++#ifdef UNITTESTS
++    sigmatch_table[DETECT_AL_TLS_CERTS].RegisterTests = DetectTlsCertsRegisterTests;
++#endif
++    sigmatch_table[DETECT_AL_TLS_CERTS].flags |= SIGMATCH_NOOPT;
++    sigmatch_table[DETECT_AL_TLS_CERTS].flags |= SIGMATCH_INFO_STICKY_BUFFER;
++
++    DetectAppLayerInspectEngineRegister2("tls.certs", ALPROTO_TLS,
++

@@ -1,0 +1,121 @@
+@@ -193,11 +193,29 @@ typedef struct r_io_map_t {
+ 	int fd;
+ 	int perm;
+ 	ut32 id;
++	ut64 ts;
+ 	RInterval itv;
+ 	ut64 delta; // paddr = vaddr - itv.addr + delta
+ 	char *name;
+ } RIOMap;
+ 
++typedef struct r_io_map_ref_t {
++	ut32 id;
++	ut64 ts;
++} RIOMapRef;
++
++typedef struct r_io_submap_t {
++	RIOMapRef mapref;
++	RInterval itv;
++} RIOSubMap;
++
++typedef struct r_io_bank_t {
++	RContRBTree *submaps;
++	RList *maprefs;	// references to maps, avoid double-free and dups
++	RQueue *todo;	// needed for operating on submap tree
++	ut32 id;	// for fast selection with RIDStorage
++} RIOBank;
++
+ typedef struct r_io_cache_t {
+ 	RInterval itv;
+ 	ut8 *data;
+@@ -298,6 +316,7 @@ R_API RIOMap *r_io_map_add(RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut
+ // same as r_io_map_add but used when many maps need to be added. Call r_io_update when all maps have been added.
+ R_API RIOMap *r_io_map_add_batch(RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut64 size);
+ R_API RIOMap *r_io_map_get_at(RIO *io, ut64 addr);		//returns the map at vaddr with the highest priority
++R_API RIOMap *r_io_map_get_by_ref(RIO *io, RIOMapRef *ref);
+ // update the internal state of RIO after a series of _batch operations
+ R_API void r_io_update(RIO *io);
+ R_API bool r_io_map_is_mapped(RIO* io, ut64 addr);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,30 @@
++/* radare2 - LGPL - Copyright 2021 - condret */
++
++#include <r_io.h>
++#include <r_util.h>
++
++R_API RIOBank *r_io_bank_new() {
++	RIOBank *bank = R_NEW0 (RIOBank);
++	if (!bank) {
++		return NULL;
++	}
++	bank->submaps = r_rbtree_cont_newf (free);
++	if (!bank->submaps) {
++		free (bank);
++		return NULL;
++	}
++	bank->maprefs = r_list_newf (free);
++	if (!bank->maprefs) {
++		r_rbtree_cont_free (bank->submaps);
++		free (bank);
++		return NULL;
++	}
++	bank->todo = r_queue_new (8);
++	if (!bank->todo) {
++		r_list_free (bank->maprefs);
++		r_rbtree_cont_free (bank->submaps);
++		free (bank);
++		return NULL;
++	}
++	return bank;
++}
+
+
+
+
+@@ -31,6 +31,7 @@ RIOMap* io_map_new(RIO* io, int fd, int perm, ut64 delta, ut64 addr, ut64 size)
+ 	}
+ 	map->fd = fd;
+ 	map->delta = delta;
++	map->ts = r_time_now();
+ 	if ((UT64_MAX - size + 1) < addr) {
+ 		/// XXX: this is leaking a map!!!
+ 		io_map_new (io, fd, perm, delta - addr, 0LL, size + addr);
+@@ -416,3 +417,16 @@ R_API ut64 r_io_map_location(RIO *io, ut64 size) {
+ 	}
+ 	return base;
+ }
++
++R_API RIOMap *r_io_map_get_by_ref(RIO *io, RIOMapRef *ref) {
++	r_return_val_if_fail (io && ref, NULL);
++	RIOMap *map = r_io_map_resolve (io, ref->id);
++	if (!map) {
++		return NULL;
++	}
++	if (map->ts != ref->ts) {
++		//trigger cleanup here?
++		return NULL;
++	}
++	return map;
++}
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,12 @@
++/* radare2 - LGPL - Copyright 2021 - condret */
++
++#include <r_io.h>
++
++R_API RIOSubMap *r_io_submap_new (RIO *io, RIOMapRef *mapref) {
++	r_return_val_if_fail (io && mapref, NULL);
++	RIOMap *map = r_io_map_get_by_ref (io, mapref);
++	RIOSubMap *sm = R_NEW (RIOSubMap);
++	sm->mapref = *mapref;
++	sm->itv = map->itv;
++	return sm;
++}

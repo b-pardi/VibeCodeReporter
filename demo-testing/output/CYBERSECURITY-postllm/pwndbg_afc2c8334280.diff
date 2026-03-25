@@ -1,0 +1,118 @@
+@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
+ T = TypeVar("T")
+ P = ParamSpec("P")
+ 
+-commands: List[Command] = []
++commands: List[CommandObj] = []
+ command_names: Set[str] = set()
+ 
+ 
+@@ -72,8 +72,20 @@ if pwndbg.dbg.is_gdblib_available():
+     pwndbg_is_reloading = getattr(gdb, "pwndbg_is_reloading", False)
+ 
+ 
+-class Command:
+-    """Generic command wrapper"""
++class InvalidDebuggerError(Exception):
++    """
++    Raised when a command is called in a debugger for which
++    it is disallowed.
++    """
++
++    pass
++
++
++class CommandObj:
++    """
++    Represents a command that can be invoked from the
++    debugger.
++    """
+ 
+     builtin_override_whitelist: Set[str] = {
+         "up",
+@@ -89,57 +101,111 @@ class Command:
+     def __init__(
+         self,
+         function: Callable[..., str | None],
+-        prefix: bool = False,
+-        command_name: str | None = None,
+-        shell: bool = False,
+-        is_alias: bool = False,
+-        aliases: List[str] = [],
+-        category: CommandCategory = CommandCategory.MISC,
+-        doc: str | None = None,
++        parser: argparse.ArgumentParser,
++        command_name: str | None,
++        category: CommandCategory,
++        aliases: List[str],
++        /,  # All parameters must be passed in positionally
+     ) -> None:
+-        self.is_alias = is_alias
+-        self.aliases = aliases
++        assert function
++        self.function = function
++
++        self.command_name = command_name
++        if self.command_name is None:
++            # Take the command name from the name of the function
++            # which defines it, but replace '_' with '-'.
++            self.command_name = function.__name__.replace("_", "-")
++
++        assert "_" not in self.command_name and "Use '-' instead of '_' in command names."
++        assert self.command_name not in command_names and "Command already exists."
++        assert (
++            not (
++                self.command_name in GDB_BUILTIN_COMMANDS
++                and self.command_name not in CommandObj.builtin_override_whitelist
++                and not pwndbg_is_reloading
++            )
++            and "Cannot override non-whitelisted built-in command."
++        )
++
++        assert category
+         self.category = category
+-        self.shell = shell
+-        self.doc = doc
+ 
+-        if command_name is None:
+-            command_name = function.__name__
++        self.aliases = aliases
++
++        assert parser
++        self.parser = parser
++        # Sets self.help_str and self.description (among other stuff).
++        self.initialize_parser()
++
++        # Let the debugger and pwndbg global state know about it.
++        self.register_command()
++
++        # For commands like hexdump where you get new output from
++        # continuous invocations.
++        self.repeat = False
++
++    def register_command(self):
++        """
++        Register this object command with the underlying debugger
++        and update pwndbg global state to know about this command.
++        """
+ 
+         def _handler(_debugger, arguments, is_interactive):
+             self.invoke(arguments, is_interactive)
+ 
+-        self.handle = pwndbg.dbg.add_command(command_name, _handler, doc)
+-        self.function = function
++        # Keep a handle to the command and its aliases so we can
++        # easily remove them if necessary (not supported with GDB).
++        self.handles = []
+ 
+-        if command_name in command_names:
+-            raise Exception(f"Cannot add command {command_name}: already exists.")
+-        if (
+-            command_name in GDB_BUILTIN_COMMANDS
+-            and command_name not in self.builtin_override_whitelist
+-            and not pwndbg_is_reloading
+-        ):
+-            raise Exception(f'Cannot override non-whitelisted built-in command "{command_name}"')
++        # Tell the debugger about the command...
++        self.handles.append(pwndbg.dbg.add_command(self.command_name, _handler, self.help_str))
++        # ...and all of its al

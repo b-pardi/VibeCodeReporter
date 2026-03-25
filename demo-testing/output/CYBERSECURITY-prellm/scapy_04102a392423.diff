@@ -1,0 +1,109 @@
+@@ -19,7 +19,7 @@ from ctypes.util import find_library
+ import struct
+ import socket
+ import time
+-from threading import Thread, Event, Lock
++from threading import Thread, Event, Lock, Semaphore
+ 
+ from scapy.packet import Packet
+ from scapy.fields import BitField, FlagsField, StrLenField, \
+@@ -28,6 +28,7 @@ from scapy.fields import BitField, FlagsField, StrLenField, \
+ from scapy.compat import chb, orb
+ from scapy.layers.can import CAN
+ import scapy.modules.six as six
++import six.moves.queue as queue
+ from scapy.error import Scapy_Exception, warning, log_loading
+ from scapy.supersocket import SuperSocket
+ from scapy.config import conf
+@@ -35,8 +36,7 @@ from scapy.consts import LINUX
+ 
+ __all__ = ["ISOTP", "ISOTPHeader", "ISOTPHeaderEA", "ISOTP_SF", "ISOTP_FF",
+            "ISOTP_CF", "ISOTP_FC", "ISOTPSniffer", "ISOTPSoftSocket",
+-           "ISOTPSocket", "ISOTPSocketImplementation", "ISOTPMessageBuilder",
+-           "ISOTPSoftSocketTimeoutElapsed"]
++           "ISOTPSocket", "ISOTPSocketImplementation", "ISOTPMessageBuilder"]
+ 
+ USE_CAN_ISOTP_KERNEL_MODULE = False
+ if six.PY3 and LINUX:
+@@ -498,10 +498,6 @@ class ISOTPSniffer:
+         return plist.PacketList(c.lst, "Sniffed")
+ 
+ 
+-class ISOTPSoftSocketTimeoutElapsed(Scapy_Exception):
+-    pass
+-
+-
+ class ISOTPSoftSocket(SuperSocket):
+     """
+     Implements an ISOTP socket using a CAN socket. A thread is used to
+@@ -509,8 +505,6 @@ class ISOTPSoftSocket(SuperSocket):
+     when calling the close() function or when this object is destructed.
+     """
+ 
+-    read_allowed_exceptions = (ISOTPSoftSocketTimeoutElapsed,)
+-
+     def __init__(self,
+                  can_socket=None,
+                  sid=0,
+@@ -554,7 +548,6 @@ class ISOTPSoftSocket(SuperSocket):
+         self.dst = did
+         self.exsrc = extended_addr
+         self.exdst = extended_rx_addr
+-        self.timeout = timeout
+         self.filter_warning_emitted = False
+ 
+         def can_send(load):
+@@ -562,8 +555,13 @@ class ISOTPSoftSocket(SuperSocket):
+                 load += bytearray(CAN_MAX_DLEN - len(load))
+             can_socket.send(CAN(identifier=sid, data=load))
+ 
++        self.tx_timer = ISOTPSocketImplementation.Timer()
++        self.rx_timer = ISOTPSocketImplementation.Timer()
++
+         impl = ISOTPSocketImplementation(
+             can_send,
++            tx_timer=self.tx_timer,
++            rx_timer=self.rx_timer,
+             extended_addr=extended_addr,
+             extended_rx_addr=extended_rx_addr,
+             rx_block_size=rx_block_size,
+@@ -582,6 +580,7 @@ class ISOTPSoftSocket(SuperSocket):
+ 
+         self.ins = impl
+         self.outs = impl
++        self.impl = impl
+ 
+         self.can_socket = can_socket
+         self.rx_thread = CANReceiverThread(can_socket, can_on_recv)
+@@ -593,6 +592,8 @@ class ISOTPSoftSocket(SuperSocket):
+         self.basecls = basecls
+ 
+     def close(self):
++        self.rx_timer.kill()
++        self.tx_timer.kill()
+         self.rx_thread.stop()
+         self.outs = None
+         self.ins = None
+@@ -608,15 +609,24 @@ class ISOTPSoftSocket(SuperSocket):
+ 
+         return self.outs.begin_send(bytes(p))
+ 
++    def recv_with_timeout(self, timeout=1):
++        """Receive a complete ISOTP message, blocking until a message is
++        received or the specified timeout is reached.
++        If timeout is 0, then this function doesn't block and returns the
++        first frame in the receive buffer or None if there isn't any."""
++        msg = self.ins.recv(timeout)
++        t = time.time()
++        if msg is None:
++            raise Scapy_Exception("Timeout")
++        return self.basecls, msg, t
++
+     def recv_raw(self, x=0xffff):
+         """Receive a complete ISOTP message, blocking until a message is
+         received or the specified timeout is reached.
+         If self.timeout is 0, then this function doesn't block and returns the
+         first frame in the receive buffer or None if there isn't any."""
++        msg = self.ins.recv()
+         t = time.time()
+-   

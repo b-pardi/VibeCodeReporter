@@ -1,0 +1,104 @@
+@@ -212,10 +212,10 @@ bool PandaTaintFunctionPass::doInitialization(Module &M) {
+         (void *) &taint_breadcrumb, argTys, PTV->voidT, false, ES, symbols);
+ 
+     argTys = { PTV->shadP, PTV->int64T, PTV->int64T, PTV->int64T,
+-        PTV->int64T, PTV->instrP };
++        PTV->int64T, PTV->int64T, PTV->int64T, PTV->int64T };
+ 
+     PTV->mixF = TaintOpsFunction("taint_mix", (void *) &taint_mix,
+-        argTys, PTV->voidT, false, ES, symbols);
++        argTys, PTV->voidT, true, ES, symbols);
+ 
+     argTys = { PTV->shadP, PTV->int64T, PTV->shadP, PTV->int64T,
+         PTV->int64T, PTV->shadP, PTV->int64T, PTV->int64T, PTV->int64T };
+@@ -700,17 +700,27 @@ void PandaTaintVisitor::insertTaintPointer(Instruction &I,
+ void PandaTaintVisitor::insertTaintMix(Instruction &I, Value *src) {
+     insertTaintMix(I, &I, src);
+ }
+-void PandaTaintVisitor::insertTaintMix(Instruction &I, Value *dest, Value *src) {
++
++void PandaTaintVisitor::insertTaintMix(Instruction &I, Value *dest,
++        Value *src) {
+     if (isa<Constant>(src)) return;
+ 
+     if (!dest) dest = &I;
+     Constant *dest_size = const_uint64(getValueSize(dest));
+     Constant *src_size = const_uint64(getValueSize(src));
+ 
+-    vector<Value *> args{ llvConst,
+-        constSlot(dest), dest_size, constSlot(src), src_size, constInstr(&I) };
++    Constant *opcode = const_uint64(I.getOpcode());
++    Constant *instruction_flags = const_uint64(getInstructionFlags(I));
++
++    vector<Value *> args{ llvConst, constSlot(dest), dest_size,
++        constSlot(src), src_size, opcode, instruction_flags,
++        const_uint64(I.getNumOperands()) };
++
++    Instruction *next = I.getNextNonDebugInstruction();
++
++    addOperandsToArgumentList(args, I, next);
+ 
+-    insertCallAfter(I, mixF, args);
++    insertCallBefore(*next, mixF, args);
+ }
+ 
+ void PandaTaintVisitor::insertTaintCompute(Instruction &I, Value *src1,
+
+
+
+
+@@ -153,9 +153,6 @@ struct CBMasks {
+     }
+ };
+ 
+-static void update_cb_legacy(Shad *shad_dest, uint64_t dest, Shad *shad_src,
+-                      uint64_t src, uint64_t size, llvm::Instruction *I);
+-
+ static void update_cb(Shad *shad_dest, uint64_t dest, Shad *shad_src,
+         uint64_t src, uint64_t size, uint64_t opcode,
+         uint64_t instruction_flags,
+@@ -357,7 +354,8 @@ void taint_set(Shad *shad_dest, uint64_t dest, uint64_t dest_size,
+ }
+ 
+ void taint_mix(Shad *shad, uint64_t dest, uint64_t dest_size, uint64_t src,
+-               uint64_t src_size, llvm::Instruction *I)
++        uint64_t src_size, uint64_t opcode, uint64_t instruction_flags,
++        uint64_t num_operands, ...)
+ {
+     TaintData td = mixed_labels(shad, src, src_size, true);
+     bulk_set(shad, dest, dest_size, td);
+@@ -365,7 +363,14 @@ void taint_mix(Shad *shad, uint64_t dest, uint64_t dest_size, uint64_t src,
+             shad->name(), dest, dest_size, src, src_size);
+     taint_log_labels(shad, dest, dest_size);
+ 
+-    if (I) update_cb_legacy(shad, dest, shad, src, dest_size, I);
++    va_list ap;
++    va_start(ap, num_operands);
++    std::vector<const llvm::ConstantInt *> operands = getOperands(num_operands,
++        ap);
++    va_end(ap);
++
++    update_cb(shad, dest, shad, src, dest_size, opcode, instruction_flags,
++        operands);
+ }
+ 
+ static const uint64_t ones = ~0UL;
+@@ -653,24 +658,6 @@ static inline void write_cb_masks(Shad *shad, uint64_t addr, uint64_t size,
+     }
+ }
+ 
+-static void update_cb_legacy(Shad *shad_dest, uint64_t dest, Shad *shad_src,
+-                      uint64_t src, uint64_t size, llvm::Instruction *I) {
+-
+-    if(!I) return;
+-
+-    uint64_t opcode = (uint64_t) I->getOpcode();
+-    uint64_t instruction_flags = 0;
+-    std::vector<const llvm::ConstantInt *> operands;
+-
+-    for (auto it = I->value_op_begin(); it != I->value_op_end(); it++) {
+-        const llvm::Value *arg = *it;
+-        const llvm::ConstantInt *CI = llvm::dyn_cast<llvm::ConstantInt>(arg);
+-        operands.push_back(CI);
+-    }
+-    update_cb(shad_dest, dest, shad_src, src, size, opcode, instruction_f

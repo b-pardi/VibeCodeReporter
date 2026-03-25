@@ -1,0 +1,116 @@
+@@ -131,7 +131,10 @@ def build_libraries():
+             os.mkdir(BUILD_DIR)
+         conf = 'Debug' if os.getenv('DEBUG', '') else 'Release'
+ 
+-        subprocess.check_call(["cmake", '-B', BUILD_DIR, "-DCMAKE_BUILD_TYPE=" + conf])
++        cmake_args = ["cmake", '-B', BUILD_DIR, "-DCMAKE_BUILD_TYPE=" + conf]
++        if os.getenv("TRACE", ""):
++            cmake_args += ["-DUNICORN_TRACER=on"]
++        subprocess.check_call(cmake_args)
+         os.chdir(BUILD_DIR)
+         threads = os.getenv("THREADS", "4")
+         subprocess.check_call(["cmake", "--build", ".", "-j" + threads])
+
+
+
+
+@@ -398,5 +398,31 @@ static inline int uc_addr_is_exit(uc_engine *uc, uint64_t addr)
+     return g_tree_lookup(uc->exits, (gpointer)(&addr)) == (gpointer)1;
+ }
+ 
++#ifdef UNICORN_TRACER
++#define UC_TRACE_START(loc) trace_start(get_tracer(), loc)
++#define UC_TRACE_END(loc, fmt, ...)                                            \
++    trace_end(get_tracer(), loc, fmt, __VA_ARGS__)
++
++typedef enum trace_loc {
++    UC_TRACE_TB_EXEC = 0,
++    UC_TRACE_TB_TRANS,
++    UC_TRACER_MAX
++} trace_loc;
++
++typedef struct uc_tracer {
++    int64_t starts[UC_TRACER_MAX];
++} uc_tracer;
++
++uc_tracer *get_tracer();
++
++void trace_start(uc_tracer *tracer, trace_loc loc);
++
++void trace_end(uc_tracer *tracer, trace_loc loc, const char *fmt, ...);
++
++#else
++#define UC_TRACE_START(loc)
++#define UC_TRACE_END(loc, fmt, ...)
++#endif
++
+ #endif
+ /* vim: set ts=4 noet:  */
+
+
+
+
+@@ -55,9 +55,12 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
+     int tb_exit;
+     uint8_t *tb_ptr = itb->tc.ptr;
+ 
++    UC_TRACE_START(UC_TRACE_TB_EXEC);
+     tb_exec_lock(cpu->uc->tcg_ctx);
+     ret = tcg_qemu_tb_exec(env, tb_ptr);
+     tb_exec_unlock(cpu->uc->tcg_ctx);
++    UC_TRACE_END(UC_TRACE_TB_EXEC, "[uc] exec tb 0x%" PRIx64 ": ", itb->pc);
++
+     cpu->can_do_io = 1;
+     last_tb = (TranslationBlock *)(ret & ~TB_EXIT_MASK);
+     tb_exit = ret & TB_EXIT_MASK;
+
+
+
+
+@@ -1619,7 +1619,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
+     tcg_func_start(tcg_ctx);
+ 
+     tcg_ctx->cpu = env_cpu(env);
++    UC_TRACE_START(UC_TRACE_TB_TRANS);
+     gen_intermediate_code(cpu, tb, max_insns);
++    UC_TRACE_END(UC_TRACE_TB_TRANS, "[uc] translate tb 0x%" PRIx64 ": ", tb->pc);
+     tcg_ctx->cpu = NULL;
+ 
+     /* generate machine code */
+
+
+
+
+@@ -2196,3 +2196,31 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
+ 
+     return err;
+ }
++
++#ifdef UNICORN_TRACER
++uc_tracer *get_tracer()
++{
++    static uc_tracer tracer;
++    return &tracer;
++}
++
++void trace_start(uc_tracer *tracer, trace_loc loc)
++{
++    tracer->starts[loc] = get_clock();
++}
++
++void trace_end(uc_tracer *tracer, trace_loc loc, const char *fmt, ...)
++{
++    va_list args;
++    int64_t end = get_clock();
++
++    va_start(args, fmt);
++
++    vfprintf(stderr, fmt, args);
++
++    va_end(args);
++
++    fprintf(stderr, "%.6fms\n",
++            (double)(end - tracer->starts[loc]) / (double)(1000000));
++}
++#endif
+\ No newline at end of file

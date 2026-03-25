@@ -1,0 +1,135 @@
+@@ -565,13 +565,11 @@ RList *bsd_thread_list(RDebug *dbg, int pid, RList *list) {
+ 	max = len / sizeof(*kp);
+ 	for (i = 0; i < max; i ++) {
+ 		RDebugPid *pid_info;
+-		char tpath[64];
+ 		int pid_stat;
+ 
+-		snprintf(tpath, sizeof (tpath), "%lx:%s", (long)kp[i].ki_wchan, kp[i].ki_comm);
+ 		pid_stat = get_r2_status (kp[i].ki_stat);
+-		pid_info = r_debug_pid_new (tpath, kp[i].ki_tid,
+-			kp[i].ki_uid, pid_stat, 0);
++		pid_info = r_debug_pid_new (kp[i].ki_comm, kp[i].ki_tid,
++			kp[i].ki_uid, pid_stat, (ut64)kp[i].ki_wchan);
+ 		r_list_append (list, pid_info);
+ 	}
+ 
+
+
+
+
+@@ -8,7 +8,6 @@
+ #include <r_reg.h>
+ #include <r_lib.h>
+ #include <r_anal.h>
+-#include <r_core.h>
+ #include <signal.h>
+ #include <sys/uio.h>
+ #include <errno.h>
+@@ -675,6 +674,7 @@ RDebugPid *fill_pid_info(const char *info, const char *path, int tid) {
+ 	if (ptr) {
+ 		pid_info->gid = atoi (ptr + 5);
+ 	}
++
+ 	pid_info->pid = tid;
+ 	pid_info->path = path ? strdup (path) : NULL;
+ 	pid_info->runnable = true;
+@@ -723,10 +723,7 @@ RList *linux_thread_list(RDebug *dbg, int pid, RList *list) {
+ 	int i = 0, thid = 0;
+ 	char *ptr, buf[PATH_MAX];
+ 	RDebugPid *pid_info = NULL;
+-	RCore *core = (RCore *)dbg->corebind.core;
+ 	ut64 pc = 0;
+-	RAnalFunction *fcn = NULL;
+-	RDebugMap *map = NULL;
+ 	int prev_tid = dbg->tid;
+ 
+ 	if (!pid) {
+@@ -741,12 +738,11 @@ RList *linux_thread_list(RDebug *dbg, int pid, RList *list) {
+ 		struct dirent *de;
+ 		DIR *dh = opendir (buf);
+ 		// Update the process' memory maps to set correct paths
+-		r_debug_map_sync (core->dbg);
++		dbg->corebind.syncDebugMaps (dbg->corebind.core);
+ 		while ((de = readdir (dh))) {
+ 			if (!strcmp (de->d_name, ".") || !strcmp (de->d_name, "..")) {
+ 				continue;
+ 			}
+-			RStrBuf *path = r_strbuf_new (NULL);
+ 			int tid = atoi (de->d_name);
+ 			char info[PATH_MAX];
+ 			int uid = 0;
+@@ -774,26 +770,14 @@ RList *linux_thread_list(RDebug *dbg, int pid, RList *list) {
+ 			r_debug_reg_sync (dbg, R_REG_TYPE_GPR, false);
+ 			pc = r_debug_reg_get (dbg, "PC");
+ 
+-			map = r_debug_map_get (dbg, pc);
+-			if (map && map->name && map->name[0]) {
+-				r_strbuf_appendf (path, "%s ", map->name);
+-			}
+-
+-			r_strbuf_appendf (path, "(0x%" PFMT64x")", pc);
+-
+-			fcn = r_anal_get_fcn_in (core->anal, pc, 0);
+-			if (fcn) {
+-				r_strbuf_appendf (path, " in %s+0x%" PFMT64x, fcn->name, (pc - fcn->addr));
+-			}
+-
+ 			if (!procfs_pid_slurp (tid, "status", info, sizeof (info))) {
+ 				// Get information about pid (status, pc, etc.)
+-				pid_info = fill_pid_info (info, r_strbuf_get (path), tid);
++				pid_info = fill_pid_info (info, NULL, tid);
++				pid_info->pc = pc;
+ 			} else {
+-				pid_info = r_debug_pid_new (r_strbuf_get (path), tid, uid, 's', 0);
++				pid_info = r_debug_pid_new (NULL, tid, uid, 's', pc);
+ 			}
+ 			r_list_append (list, pid_info);
+-			r_strbuf_free (path);
+ 		}
+ 		closedir (dh);
+ 		// Return to the original thread
+
+
+
+
+@@ -74,6 +74,9 @@ R_API int r_debug_thread_list(RDebug *dbg, int pid, char fmt) {
+ 	RList *list;
+ 	RListIter *iter;
+ 	RDebugPid *p;
++	RAnalFunction *fcn = NULL;
++	RDebugMap *map = NULL;
++	RStrBuf *path = NULL;
+ 	if (pid == -1) {
+ 		return false;
+ 	}
+@@ -85,21 +88,36 @@ R_API int r_debug_thread_list(RDebug *dbg, int pid, char fmt) {
+ 		PJ *j = pj_new ();
+ 		pj_a (j);
+ 		r_list_foreach (list, iter, p) {
++			path = r_strbuf_new ("");
++			if (p->pc != 0) {
++				map = r_debug_map_get (dbg, p->pc);
++				if (map && map->name && map->name[0]) {
++					r_strbuf_appendf (path, "%s ", map->name);
++				}
++
++				r_strbuf_appendf (path, "(0x%" PFMT64x ")", p->pc);
++
++				fcn = r_anal_get_fcn_in (dbg->anal, p->pc, 0);
++				if (fcn) {
++					r_strbuf_appendf (path, " in %s+0x%" PFMT64x, fcn->name, (p->pc - fcn->addr));
++				}
++			}
+ 			switch (fmt) {
+ 			case 'j':
+ 				pj_o (j);
+ 				pj_kb (j, "current", dbg->tid == p->pid);
+ 				pj_ki (j, "pid", p->pid);
+ 				pj_ks (j, "status", &p->status);
+-				pj_ks (j, "path", p->path);
++				pj_ks (j, "path", r_strbuf_get (path));
+ 				pj_end (j);
+ 				break;
+ 			default:
+ 				dbg->cb_printf (" %c

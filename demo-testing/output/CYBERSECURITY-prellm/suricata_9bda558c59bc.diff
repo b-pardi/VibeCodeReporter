@@ -1,0 +1,87 @@
+@@ -111,6 +111,8 @@ typedef struct TcpStream_ {
+     StreamingBuffer sb;
+     struct TCPSEG seg_tree;         /**< red black tree of TCP segments. Data is stored in TcpStream::sb */
+ 
++    uint32_t sack_size;             /**< combined size of the SACK ranges currently in our tree. Updated
++                                     *   at INSERT/REMOVE time. */
+     struct TCPSACK sack_tree;       /**< red back tree of TCP SACK records. */
+ } TcpStream;
+ 
+
+
+
+
+@@ -49,9 +49,10 @@ int TcpSackCompare(struct StreamTcpSackRecord *a, struct StreamTcpSackRecord *b)
+ #ifdef DEBUG
+ static void StreamTcpSackPrintList(TcpStream *stream)
+ {
++    SCLogDebug("size %u", stream->sack_size);
+     StreamTcpSackRecord *rec = NULL;
+     RB_FOREACH(rec, TCPSACK, &stream->sack_tree) {
+-        SCLogDebug("record %8u - %8u", rec->le, rec->re);
++        SCLogDebug("- record %8u - %8u", rec->le, rec->re);
+     }
+ }
+ #endif /* DEBUG */
+@@ -75,7 +76,7 @@ static inline void StreamTcpSackRecordFree(StreamTcpSackRecord *rec)
+     StreamTcpDecrMemuse((uint64_t)sizeof(*rec));
+ }
+ 
+-static inline void ConsolidateFwd(struct TCPSACK *tree, struct StreamTcpSackRecord *sa)
++static inline void ConsolidateFwd(TcpStream *stream, struct TCPSACK *tree, struct StreamTcpSackRecord *sa)
+ {
+     struct StreamTcpSackRecord *tr, *s = sa;
+     RB_FOREACH_FROM(tr, TCPSACK, s) {
+@@ -87,8 +88,11 @@ static inline void ConsolidateFwd(struct TCPSACK *tree, struct StreamTcpSackReco
+             break; // entirely before
+ 
+         if (SEQ_GEQ(sa->le, tr->le) && SEQ_LEQ(sa->re, tr->re)) {
++            stream->sack_size -= (tr->re - tr->le);
++            stream->sack_size -= (sa->re - sa->le);
+             sa->re = tr->re;
+             sa->le = tr->le;
++            stream->sack_size += (sa->re - sa->le);
+             SCLogDebug("-> (fwd) tr %p %u/%u REMOVED ECLIPSED2", tr, tr->le, tr->re);
+             TCPSACK_RB_REMOVE(tree, tr);
+             StreamTcpSackRecordFree(tr);
+@@ -102,6 +106,7 @@ static inline void ConsolidateFwd(struct TCPSACK *tree, struct StreamTcpSackReco
+         */
+         } else if (SEQ_LEQ(sa->le, tr->le) && SEQ_GEQ(sa->re, tr->re)) {
+             SCLogDebug("-> (fwd) tr %p %u/%u REMOVED ECLIPSED", tr, tr->le, tr->re);
++            stream->sack_size -= (tr->re - tr->le);
+             TCPSACK_RB_REMOVE(tree, tr);
+             StreamTcpSackRecordFree(tr);
+         /*
+@@ -114,7 +119,10 @@ static inline void ConsolidateFwd(struct TCPSACK *tree, struct StreamTcpSackReco
+                    SEQ_GEQ(sa->re, tr->le) && SEQ_LT(sa->re, tr->re) // ends inside
+             ) {
+             // merge
++            stream->sack_size -= (tr->re - tr->le);
++            stream->sack_size -= (sa->re - sa->le);
+             sa->re = tr->re;
++            stream->sack_size += (sa->re - sa->le);
+             SCLogDebug("-> (fwd) tr %p %u/%u REMOVED MERGED", tr, tr->le, tr->re);
+             TCPSACK_RB_REMOVE(tree, tr);
+             StreamTcpSackRecordFree(tr);
+@@ -122,7 +130,8 @@ static inline void ConsolidateFwd(struct TCPSACK *tree, struct StreamTcpSackReco
+     }
+ }
+ 
+-static inline void ConsolidateBackward(struct TCPSACK *tree, struct StreamTcpSackRecord *sa)
++static inline void ConsolidateBackward(TcpStream *stream,
++        struct TCPSACK *tree, struct StreamTcpSackRecord *sa)
+ {
+     struct StreamTcpSackRecord *tr, *s = sa;
+     RB_FOREACH_REVERSE_FROM(tr, TCPSACK, s) {
+@@ -133,8 +142,11 @@ static inline void ConsolidateBackward(struct TCPSACK *tree, struct StreamTcpSac
+         if (SEQ_GT(sa->le, tr->re))
+             break; // entirely after
+         if (SEQ_GEQ(sa->le, tr->le) && SEQ_LEQ(sa->re, tr->re)) {
++            stream->sack_size -= (tr->re - tr->le);
++            stream->sack_size -= (sa->re - sa->le);
+             sa->re = tr->re;
+             sa->le = tr->le;
++            stream->sack_size += (sa->re - sa->le);
+             SCLogDebug("-> (bwd) tr %p %u/%u REMOVED ECLIPSED2", tr, tr->le, tr->re);
+             TCPSACK_RB_REMOVE(tree, tr);
+             StreamTcpSackRecordFree

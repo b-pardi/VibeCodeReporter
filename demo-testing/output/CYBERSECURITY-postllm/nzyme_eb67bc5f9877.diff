@@ -1,0 +1,107 @@
+@@ -1,6 +1,7 @@
+ package app.nzyme.core.events;
+ 
+ import app.nzyme.core.NzymeNode;
++import app.nzyme.core.events.actions.EventActionFactory;
+ import app.nzyme.core.events.db.EventActionEntry;
+ import app.nzyme.core.events.db.EventEntry;
+ import app.nzyme.core.events.db.SubscriptionEntry;
+@@ -40,10 +41,37 @@ public class EventEngineImpl implements EventEngine {
+         );
+ 
+         // Find all subscribers of event.
++        List<UUID> actionIds = nzyme.getDatabase().withHandle(handle ->
++                handle.createQuery("SELECT action_id FROM event_subscriptions " +
++                                "WHERE event_type = :event_type AND reference = :reference")
++                        .bind("event_type", EventType.SYSTEM)
++                        .bind("reference", event.type())
++                        .mapTo(UUID.class)
++                        .list()
++        );
+ 
+         // Process.
++        for (UUID actionId : actionIds) {
++            Optional<EventActionEntry> ea = findEventAction(actionId);
++
++            if (ea.isEmpty()) {
++                LOG.warn("Event action [{}] referenced by event [{}] not found.", actionId, event.type());
++                continue;
++            }
++
++            try {
++                EventActionFactory.build(nzyme, ea.get())
++                        .execute(event);
++            } catch (Exception e) {
++                LOG.error("Could not execute event action [{}/{}] referenced by event [{}]",
++                        ea.get().actionType(), ea.get().uuid(), event.type(), e);
++            }
++        }
++
+     }
+ 
++    //void processEvent(DetectionEvent event, @Nullable UUID organizationId, @Nullable UUID tenantId);
++
+     public long countAllEventsOfAllOrganizations() {
+         return nzyme.getDatabase().withHandle(handle ->
+                 handle.createQuery("SELECT COUNT(*) FROM events")
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,27 @@
++package app.nzyme.core.events.actions;
++
++import app.nzyme.core.NzymeNode;
++import app.nzyme.core.events.actions.email.EmailAction;
++import app.nzyme.core.events.actions.email.EmailActionConfiguration;
++import app.nzyme.core.events.db.EventActionEntry;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++
++public class EventActionFactory {
++
++    @SuppressWarnings("SwitchStatementWithTooFewBranches")
++    public static Action build(NzymeNode nzyme, EventActionEntry ea) throws NoSuchActionTypeException, JsonProcessingException{
++        ObjectMapper om = new ObjectMapper();
++
++        switch (ea.actionType()) {
++            case "EMAIL":
++                EmailActionConfiguration config = om.readValue(ea.configuration(), EmailActionConfiguration.class);
++                return new EmailAction(nzyme, config);
++            default:
++                throw new NoSuchActionTypeException();
++        }
++    }
++
++    public static final class NoSuchActionTypeException extends Exception { }
++
++}
+
+
+
+
+@@ -1,14 +1,187 @@
+ package app.nzyme.core.events.actions.email;
+ 
++import app.nzyme.core.NzymeNode;
+ import app.nzyme.core.events.actions.Action;
+ import app.nzyme.core.events.actions.ActionExecutionResult;
+ import app.nzyme.core.events.types.SystemEvent;
++import app.nzyme.core.events.types.SystemEventType;
++import app.nzyme.core.integrations.smtp.SMTPConfigurationRegistryKeys;
++import app.nzyme.plugin.RegistryCryptoException;
++import com.google.common.base.Strings;
++import com.google.common.collect.Lists;
++import com.google.common.collect.Maps;
++import freemarker.template.Template;
++import freemarker.template.TemplateExceptionHandler;
++import jakarta.annotation.Nullable;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++import org.simplejavamail.api.email.Email;
++import org.simplejavamail.api.email.Recipient;
++import org.simplejavamail.api.mailer.Mailer;
++import org.simplejavamail.api.mailer.config.TransportStrategy;
++import org.simplejavamail.email.EmailBuilder;
++import org.si

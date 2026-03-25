@@ -1,0 +1,97 @@
+@@ -3,10 +3,14 @@ Faraday Penetration Test IDE
+ Copyright (C) 2016  Infobyte LLC (https://faradaysec.com/)
+ See the file 'doc/LICENSE' for the license information
+ """
++import json
++from json import JSONDecodeError
+ 
++import flask
+ # Related third party imports
+-from flask import Blueprint, abort, make_response, jsonify
++from flask import Blueprint, abort, make_response, jsonify, request
+ from filteralchemy import FilterSet, operators  # pylint:disable=unused-import
++from flask_classful import route
+ from marshmallow import fields, post_load, ValidationError
+ from marshmallow.validate import OneOf, Range
+ from sqlalchemy.orm.exc import NoResultFound
+@@ -26,7 +30,7 @@ from faraday.server.api.base import (
+     FilterSetMeta,
+     FilterAlchemyMixin,
+     BulkDeleteWorkspacedMixin,
+-    BulkUpdateWorkspacedMixin
++    BulkUpdateWorkspacedMixin, get_workspace, get_filtered_data
+ )
+ from faraday.server.schemas import (
+     MetadataSchema,
+@@ -35,6 +39,8 @@ from faraday.server.schemas import (
+     SelfNestedField,
+ )
+ from faraday.server.utils.command import set_command_id
++from faraday.server.utils.filters import FlaskRestlessSchema
++from faraday.server.utils.search import search
+ 
+ services_api = Blueprint('services_api', __name__)
+ 
+@@ -134,7 +140,11 @@ class ServiceFilterSet(FilterSet):
+         operators = (operators.Equal,)
+ 
+ 
+-class ServiceView(PaginatedMixin, FilterAlchemyMixin, ReadWriteWorkspacedView, BulkDeleteWorkspacedMixin, BulkUpdateWorkspacedMixin):
++class ServiceView(PaginatedMixin,
++                  FilterAlchemyMixin,
++                  ReadWriteWorkspacedView,
++                  BulkDeleteWorkspacedMixin,
++                  BulkUpdateWorkspacedMixin):
+ 
+     route_base = 'services'
+     model_class = Service
+@@ -186,5 +196,162 @@ class ServiceView(PaginatedMixin, FilterAlchemyMixin, ReadWriteWorkspacedView, B
+         if workspace_name:
+             debounce_workspace_update(workspace_name)
+ 
++    def _hostname_filters(self, filters):
++        res_filters = []
++        hostname_filters = []
++        for search_filter in filters:
++            if 'or' not in search_filter and 'and' not in search_filter:
++                fieldname = search_filter.get('name')
++                operator = search_filter.get('op')
++                argument = search_filter.get('val')
++                otherfield = search_filter.get('field')
++                field_filter = {
++                    "name": fieldname,
++                    "op": operator,
++                    "val": argument,
++
++                }
++                if otherfield:
++                    field_filter.update({"field": otherfield})
++                if fieldname == 'hostnames':
++                    hostname_filters.append(field_filter)
++                else:
++                    res_filters.append(field_filter)
++            elif 'or' in search_filter:
++                or_filters, deep_hostname_filters = self._hostname_filters(search_filter['or'])
++                if or_filters:
++                    res_filters.append({"or": or_filters})
++                hostname_filters += deep_hostname_filters
++            elif 'and' in search_filter:
++                and_filters, deep_hostname_filters = self._hostname_filters(search_filter['and'])
++                if and_filters:
++                    res_filters.append({"and": and_filters})
++                hostname_filters += deep_hostname_filters
++
++        return res_filters, hostname_filters
++
++    @staticmethod
++    def _generate_filter_query(model,
++                               filters,
++                               hostname_filters,
++                               workspace,
++                               marshmallow_params,
++                               is_csv=False):
++        hosts_os_filter = [host_os_filter for host_os_filter in filters.get('filters', []) if
++                           host_os_filter.get('name') == 'host__os']
++
++        if hosts_os_filter:
++            # remove host__os filters from filters due t

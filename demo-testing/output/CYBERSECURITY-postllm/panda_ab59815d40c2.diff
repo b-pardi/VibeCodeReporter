@@ -1,0 +1,93 @@
+@@ -24,7 +24,9 @@ PANDAENDCOMMENT */
+ #include "osi/osi_types.h"
+ #include "osi/osi_ext.h"
+ #include <unordered_map>
++#include <unordered_set>
+ #include "osi_linux/endian_helpers.h"
++#include "hw_proc_id/hw_proc_id_ext.h"
+ 
+ 
+ // These need to be extern "C" so that the ABI is compatible with
+@@ -46,10 +48,14 @@ using namespace std;
+ 
+ map<target_ulong, map<string, target_ulong>> mapping;
+ 
++#define error_case(A,B,C) // printf("%s %s %s\n", A, B, C)
++
+ #if TARGET_LONG_BITS == 32
+ #define ELF(r) Elf32_ ## r
++#define ELFD(r) ELF32_ ## r
+ #else
+ #define ELF(r) Elf64_ ## r
++#define ELFD(r) ELF64_ ## r
+ #endif
+ 
+ #define DT_INIT_ARRAY	   25		  ,  /* Array with addresses of init fct */
+@@ -78,6 +84,7 @@ panda_cb before_block_translate_hook_adder_callback;
+ 
+ vector<int> possible_tags{ DT_PLTGOT , DT_HASH , DT_STRTAB , DT_SYMTAB , DT_RELA , DT_INIT , DT_FINI , DT_REL , DT_DEBUG , DT_JMPREL, 25, 26, 32, DT_SUNW_RTLDINF , DT_CONFIG , DT_DEPAUDIT , DT_AUDIT , DT_PLTPAD , DT_MOVETAB , DT_SYMINFO , DT_VERDEF , DT_VERNEED };
+ 
++
+ inline bool operator<(const struct symbol& s, const struct symbol& p){
+     return s.address < p.address;
+ }
+@@ -112,6 +119,8 @@ struct pair_hash {
+ 
+ // [section name, address] -> map of symbol name to symbols 
+ unordered_map<pair<target_ulong,string>, unordered_map<string,struct symbol>, pair_hash> seen_libraries;
++// these are section names we've tried and confirmed are not libraries
++unordered_set<string> seen_nonlibraries;
+ // asid -> section_name ->  symbols map pointer
+ unordered_map<target_ulong, unordered_map<string, unordered_map<string,struct symbol>*>> symbols;
+ 
+@@ -132,7 +141,7 @@ void hook_symbol_resolution(struct hook_symbol_resolve *h){
+ }
+ 
+ 
+-void new_assignment_check_symbols(CPUState* cpu, unordered_map<string, struct symbol> ss, OsiModule* m){
++void new_assignment_check_symbols(CPUState* cpu, char* procname, unordered_map<string, struct symbol> ss, OsiModule* m){
+     string module(m->name);
+     vector<tuple<struct hook_symbol_resolve, struct symbol, OsiModule>> symbols_to_flush;
+ 
+@@ -178,7 +187,7 @@ void new_assignment_check_symbols(CPUState* cpu, unordered_map<string, struct sy
+     }
+     if (!symbols_to_flush.empty()){
+         //panda_do_flush_tb();
+-        //printf("%s hooking %d symbols in %s\n", procname, (int)symbols_to_flush.size(), m->name);
++        // printf("%s hooking %d symbols in %s\n", procname, (int)symbols_to_flush.size(), m->name);
+     }
+     while (!symbols_to_flush.empty()){
+         auto p = symbols_to_flush.back();
+@@ -272,7 +281,6 @@ int get_numelements_hash(CPUState* cpu, target_ulong dt_hash){
+     if (panda_virtual_memory_read(cpu, dt_hash, (uint8_t*) &dt, sizeof(struct dt_hash_section))!= MEMTX_OK){
+         //printf("got error 2\n");
+         return -1;
+-        //goto nextloop;
+     }
+     fixupendian(dt.nbuckets);
+     //printf("Nbucks: 0x%x\n", dt.nbuckets);
+@@ -331,23 +339,16 @@ int get_numelements_gnu_hash(CPUState* cpu, target_ulong gnu_hash){
+ }
+ 
+ int get_numelements_symtab(CPUState* cpu, target_ulong base, target_ulong dt_hash, target_ulong gnu_hash, target_ulong dynamic_section, target_ulong symtab, int numelements_dyn){
+-    //printf("Get numelembs symtab 0x%x, 0x%x\n", base, dt_hash);
+     if (base != dt_hash){
+         int result = get_numelements_hash(cpu, dt_hash);
+         if (result != -1)
+             return result;
+     }
+     if (base != gnu_hash){
+-        //printf("trying gnu_hash\n");
+         int result = get_numelements_gnu_hash(cpu, gnu_hash);
+         if (result != -1)
+             return result;
+     }
+-    // we don't actually have the size of these things 
+-    // (not included) so we find it by finding the next
+-    // closest section
+-    //  target_ulong strtab_min = strtab + 0x100000;
+-    //printf("continuing onto the end\n");
+     target_ulong symtab_min = symtab + 0x100000;
+     ELF(Dyn) tag;
+     for (int j=0; j< numelements_dyn; j++){
+@@ -366,240 +367,280 @@ int get_numelements_symtab(CPUState* cpu, target_ulong base, tar

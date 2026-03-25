@@ -1,0 +1,90 @@
+@@ -30,6 +30,9 @@ PANDAENDCOMMENT */
+ #include <llvm/IR/Instructions.h>
+ #include <llvm/IR/Value.h>
+ 
++#include "qemu/osdep.h"        // needed for host-utils.h
++#include "qemu/host-utils.h"   // needed for clz64 and ctz64
++
+ #include "panda/plugin.h"
+ #include "panda/plugin_plugin.h"
+ 
+@@ -50,9 +53,11 @@ void detaint_on_cb0(Shad *shad, uint64_t addr, uint64_t size);
+ void taint_delete(FastShad *shad, uint64_t dest, uint64_t size);
+ 
+ // Remove the taint marker from any bytes whose control mask bits go to 0.
+-// A 0 control mask bit means that bit does not impact the value in the byte.
+-// This reduces false positives by removing taint from bytes which were formerly
+-// tainted, but whose values are no longer controlled by any tainted data.
++// A 0 control mask bit means that bit does not impact the value in the byte (or
++// impacts it in an irreversible fashion, so they gave up on calculating the
++// mask).  This reduces false positives by removing taint from bytes which were
++// formerly tainted, but whose values are no longer (reversibly) controlled by
++// any tainted data.
+ void detaint_on_cb0(Shad *shad, uint64_t addr, uint64_t size)
+ {
+     uint64_t curAddr = 0;
+@@ -60,7 +65,10 @@ void detaint_on_cb0(Shad *shad, uint64_t addr, uint64_t size)
+     {
+         curAddr = addr + i;
+         TaintData td = shad->query_full(curAddr);
+-        if (td.cb_mask == 0)
++        
++        // query_full ALWAYS returns a TaintData object - but there's not really
++        // any taint (controlled or not) unless there are labels too
++        if ((td.cb_mask == 0) && (td.ls != NULL) && (td.ls->size() > 0))
+         {
+             taint_delete(shad, curAddr, 1);
+             taint_log("detaint: control bits 0 for 0x%lx\n", curAddr);
+@@ -496,6 +504,9 @@ void taint_host_delete(uint64_t env_ptr, uint64_t dest_addr, Shad *greg,
+ // to reconstruct and deconstruct the full mask.
+ static inline CBMasks compile_cb_masks(Shad *shad, uint64_t addr, uint64_t size)
+ {
++    // as our masks are only 64 bits in size, can't handle more than 8 bytes
++    tassert(size <= 8);
++    
+     CBMasks result = {0};
+     for (int i = size - 1; i >= 0; i--) {
+         TaintData td = shad->query_full(addr + i);
+@@ -550,162 +561,11 @@ static void update_cb(Shad *shad_dest, uint64_t dest, Shad *shad_src,
+     }
+     int log2 = 0;
+ 
+-    switch (I->getOpcode()) {
+-        // Totally reversible cases.
+-        case llvm::Instruction::Sub:
+-            if (literals[1] == ~0UL) {
+-                tassert(last_literal != ~0UL);
+-                // first operand is a variable. so negate.
+-                // throw out ones/zeroes info.
+-                // FIXME: handle better.
+-                one_mask = zero_mask = 0;
+-                break;
+-            } // otherwise fall through.
+-        case llvm::Instruction::Add:
+-            tassert(last_literal != ~0UL);
+-            log2 = 64 - __builtin_clz(last_literal);
+-            // FIXME: this isn't quite right. for example, if all bits ones,
+-            // adding one makes all bits zero.
+-            one_mask &= ~((1 << log2) - 1);
+-            zero_mask &= ~((1 << log2) - 1);
+-            break;
+-
+-        case llvm::Instruction::Xor:
+-            one_mask &= ~last_literal;
+-            one_mask |= last_literal & orig_zero_mask;
+-            zero_mask &= ~last_literal;
+-            zero_mask |= last_literal & orig_one_mask;
+-            break;
+-
+-        case llvm::Instruction::ZExt:
+-        case llvm::Instruction::IntToPtr:
+-        case llvm::Instruction::PtrToInt:
+-        case llvm::Instruction::BitCast:
+-        // This one copies the existing bits and adds non-controllable bits.
+-        // One and zero masks too complicated to compute. Bah.
+-        case llvm::Instruction::SExt:
+-        // Copies. These we ignore (the copy will copy the CB data for us)
+-        case llvm::Instruction::Store:
+-        case llvm::Instruction::Load:
+-        case llvm::Instruction::ExtractValue:
+-        case llvm::Instruction::Insert

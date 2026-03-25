@@ -1,0 +1,126 @@
+@@ -52,6 +52,7 @@
+ #define CALI_XDP_PROG 	(1<<6)
+ #define CALI_TC_NAT_IF	(1<<7)
+ #define CALI_TC_LO	(1<<8)
++#define CALI_CT_CLEANUP	(1<<9)
+ 
+ #ifndef CALI_DROP_WORKLOAD_TO_HOST
+ #define CALI_DROP_WORKLOAD_TO_HOST false
+@@ -70,6 +71,7 @@
+ #define CALI_F_L3_DEV    (((CALI_COMPILE_FLAGS) & CALI_TC_L3_DEV) != 0)
+ #define CALI_F_NAT_IF    (((CALI_COMPILE_FLAGS) & CALI_TC_NAT_IF) != 0)
+ #define CALI_F_LO        (((CALI_COMPILE_FLAGS) & CALI_TC_LO) != 0)
++#define CALI_F_CT_CLEANUP (((CALI_COMPILE_FLAGS) & CALI_CT_CLEANUP) != 0)
+ 
+ #define CALI_F_MAIN	(CALI_F_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF && !CALI_F_LO)
+ 
+@@ -111,6 +113,7 @@ static CALI_BPF_INLINE void __compile_asserts(void) {
+ 	/* Either CALI_CGROUP is set or the other TC flags */
+ 	COMPILE_TIME_ASSERT(
+ 		CALI_COMPILE_FLAGS == 0 ||
++		CALI_F_CT_CLEANUP ||
+ 		!!(CALI_COMPILE_FLAGS & CALI_CGROUP) !=
+ 		!!(CALI_COMPILE_FLAGS & (CALI_TC_HOST_EP | CALI_TC_INGRESS | CALI_TC_TUNNEL | CALI_TC_DSR | CALI_XDP_PROG))
+ 	);
+@@ -274,9 +277,14 @@ extern const volatile struct cali_xdp_preamble_globals __globals;
+ #define CALI_CONFIGURABLE(name) 1 /* any value will do, it is not configured */
+ #define CALI_CONFIGURABLE_IP(name) 1
+ 
+-#elif (!CALI_F_CGROUP) || defined(UNITTEST)
++#elif !CALI_F_CGROUP || defined(UNITTEST)
+ 
++#if CALI_F_CT_CLEANUP
++extern const volatile struct cali_ct_cleanup_globals __globals;
++#else
+ extern const volatile struct cali_tc_preamble_globals __globals;
++#endif
++
+ #define CALI_CONFIGURABLE(name) ctx->globals->data.name
+ #ifdef IPVER6
+ #define CALI_CONFIGURABLE_IP(name) CALI_CONFIGURABLE(name)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,268 @@
++// Project Calico BPF dataplane programs.
++// Copyright (c) 2024 Tigera, Inc. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
++
++#include <linux/types.h>
++#include <linux/bpf.h>
++#include <linux/pkt_cls.h>
++
++#include <stdbool.h>
++
++#define CALI_LOG(fmt, ...) bpf_log("CT-CLEANER------: " fmt, ## __VA_ARGS__)
++#include "log.h"
++
++#include "conntrack_cleanup.h"
++
++const volatile struct cali_ct_cleanup_globals __globals;
++
++// Context for the conntrack map iteration functions.
++//
++// WARNING: this struct is returned to user space as the result of the BPF
++// program and so must be kept in sync with the equivalent struct in
++// bpf_scanner.go.
++struct ct_iter_ctx {
++	__u64 now;
++	__u64 end_time;
++
++	__u64 num_kvs_seen_normal;
++	__u64 num_kvs_seen_nat_fwd;
++	__u64 num_kvs_seen_nat_rev;
++	__u64 num_kvs_deleted_normal;
++	__u64 num_kvs_deleted_nat_fwd;
++	__u64 num_kvs_deleted_nat_rev;
++};
++
++// sub_age calculates now-then assuming that the difference is less than
++// 1<<63.  Values larger than that are assumed to have wrapped (then>now) and
++// 0 is returned in that case.
++static __u64 sub_age(__u64 now, __u64 then)
++{
++	__u64 age = now - then;
++	if (age > (1ull<<63)) {
++		// Wrapped, assume that means then > now.
++		return 0;
++	}
++	return age;
++}
++
++// max_age returns the maximum age for the given conntrack "tracking" entry.
++static __u64 calculate_max_age(const struct calico_ct_key *key, const struct calico_ct_value *value)
++{
++	__u64 max_age;
++	switch (key->protocol) {
++	case IPPROTO_TCP:
++		if (value->a_to_b.rst_seen || value->b_to_a.rst_seen) {
++			max_age = __globals.tcp_reset_seen;
++		} else if (((value->flags & CALI_CT_FLAG_DSR_FWD) &&
++					(value->a_to_b.fin_seen || value->b_to_a.fin_seen)) ||
++				   (value->a_to_b.fin_seen && value->b_to_a.fin_seen)) {
++			max_age = __globals.tcp_fins_seen;
++		} else if (value->a_to_b.syn_seen && value->a_to_b.ack_seen &&
++				   value->b_to_a.syn_seen && value->b_to_a.ack_seen ) {
++			max_age = __globals.tcp_established;
++		} else {
++			max_age = __globals.tcp_pre_established;
++		}
++		break;
++	case IPPROTO_UDP:
++		max_age = __globals.udp_last_seen;
++		break;
++	case IPPROTO_ICMP_46:
++		max_age = __globals.icmp_last_seen;
++		break;
++	default:
++		max_age = __globals.generic_last_seen;
++		break;
++	}
++	return max_age;
++}
++
++static bool entry_expire

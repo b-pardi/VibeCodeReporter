@@ -1,0 +1,95 @@
+@@ -78,7 +78,7 @@ class Host : public GenericHashEntry,
+   /* END Host data: */
+ 
+   /* Counters used by host alerts */
+-  AttackVictimCounter syn_flood, flow_flood, icmp_flood, dns_flood, snmp_flood, rst_scan;
++  AttackVictimCounter flow_flood, icmp_flood, dns_flood, snmp_flood, rst_scan;
+ 
+   struct {
+     u_int32_t syn_sent_last_min, synack_recvd_last_min; /* (attacker) */
+@@ -90,6 +90,11 @@ class Host : public GenericHashEntry,
+     u_int32_t fin_recvd_last_min, finack_sent_last_min; /* (victim) */
+   } fin_scan;
+ 
++  struct {
++    std::atomic<u_int32_t> num_active_tcp_flows_as_client, num_established_tcp_flows_as_client; /* (attacker) */
++    std::atomic<u_int32_t> num_active_tcp_flows_as_server, num_established_tcp_flows_as_server; /* (victim) */
++  } syn_flood;
++
+   /* Need atomic as inc/dec done on different threads */
+   std::atomic<u_int32_t> num_active_flows_as_client, num_active_flows_as_server;
+   u_int32_t asn;
+@@ -592,14 +597,10 @@ class Host : public GenericHashEntry,
+   };
+ 
+   inline u_int16_t syn_flood_victim_hits() const {
+-    return syn_flood.victim_counter ? syn_flood.victim_counter->hits() : 0;
++    return syn_flood.num_active_tcp_flows_as_server - syn_flood.num_established_tcp_flows_as_server;
+   };
+   inline u_int16_t syn_flood_attacker_hits() const {
+-    return syn_flood.attacker_counter ? syn_flood.attacker_counter->hits() : 0;
+-  };
+-  inline void reset_syn_flood_hits() {
+-    if (syn_flood.victim_counter) syn_flood.victim_counter->reset_hits();
+-    if (syn_flood.attacker_counter) syn_flood.attacker_counter->reset_hits();
++    return syn_flood.num_active_tcp_flows_as_client - syn_flood.num_established_tcp_flows_as_client;
+   };
+ 
+   inline u_int16_t flow_flood_victim_hits() const {
+@@ -656,7 +657,10 @@ class Host : public GenericHashEntry,
+   };
+ 
+   void incNumFlows(time_t t, bool as_client);
+-  void decNumFlows(time_t t, bool as_client);
++  void decNumFlows(time_t t, bool as_client, bool isTCP, u_int16_t isTwhOver);
++  void incNumActiveTCPFlows(bool as_client);
++  void incNumEstablishedTCPFlows(bool as_client);
++  
+   inline void incNumAlertedFlows(bool as_client) {
+     active_alerted_flows++;
+     if (stats) stats->incNumAlertedFlows(as_client);
+
+
+
+
+@@ -421,7 +421,7 @@ Flow::~Flow() {
+ 
+   if (cli_u) {
+     cli_u->decUses(); /* Decrease the number of uses */
+-    cli_u->decNumFlows(get_last_seen(), true);
++    cli_u->decNumFlows(get_last_seen(), true, isTCP(), twh_over);
+ 
+     if (is_oneway_tcp_udp_flow) cli_u->incUnidirectionalEgressTCPUDPFlows();
+   }
+@@ -432,7 +432,7 @@ Flow::~Flow() {
+ 
+   if (srv_u) {
+     srv_u->decUses(); /* Decrease the number of uses */
+-    srv_u->decNumFlows(get_last_seen(), false);
++    srv_u->decNumFlows(get_last_seen(), false, isTCP(), twh_over);
+ 
+     if (is_oneway_tcp_udp_flow) {
+       srv_u->incUnidirectionalIngressTCPUDPFlows();
+@@ -5332,8 +5332,11 @@ void Flow::updateTcpFlags(const struct bpf_timeval *when, u_int8_t flags,
+   }
+ 
+   if ((flags & TH_SYN) &&
+-      (((src2dst_tcp_flags | dst2src_tcp_flags) & TH_SYN) != TH_SYN))
+-    iface->getTcpFlowStats()->incSyn();
++      (((src2dst_tcp_flags | dst2src_tcp_flags) & TH_SYN) != TH_SYN)) {
++        iface->getTcpFlowStats()->incSyn();
++        cli_host->incNumActiveTCPFlows(true);
++        srv_host->incNumActiveTCPFlows(false);
++      }
+ 
+   if ((flags & TH_RST) &&
+       (((src2dst_tcp_flags | dst2src_tcp_flags) & TH_RST) != TH_RST)) {
+@@ -5375,8 +5378,11 @@ void Flow::updateTcpFlags(const struct bpf_timeval *when, u_int8_t flags,
+   if (cumulative_flags) {
+     if (!twh_over) {
+       if ((src2dst_tcp_flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK) &&
+-          ((dst2src_tcp_flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK)))
+-        twh_ok = twh_over = 1, iface->getTcpFlowStats()->incEstablished();
++          ((dst2src_tcp_flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK))){
++            twh_ok = twh_over = 1, iface->getTcpFlowStats()->incEstablished();
++            cli_host->incNumEstablishedTCPFlows(true

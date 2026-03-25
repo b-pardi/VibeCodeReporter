@@ -1,0 +1,148 @@
+@@ -503,6 +503,10 @@ static R2RProcessOutput *print_runner(const char *file, const char *args[], size
+ }
+ 
+ static void print_result_diff(R2RRunConfig *config, R2RTestResultInfo *result) {
++	if (result->run_failed) {
++		printf (Color_RED "RUN FAILED (e.g. wrong radare2 path)" Color_RESET "\n");
++		return;
++	}
+ 	switch (result->test->type) {
+ 	case R2R_TEST_TYPE_CMD: {
+ 		r2r_run_cmd_test (config, result->test->cmd_test, print_runner, NULL);
+
+
+
+
+@@ -140,6 +140,7 @@ typedef struct r2r_test_result_info_t {
+ 	R2RTest *test;
+ 	R2RTestResult result;
+ 	bool timeout;
++	bool run_failed; // something went seriously wrong (e.g. r2 not found)
+ 	union {
+ 		R2RProcessOutput *proc_out; // for test->type == R2R_TEST_TYPE_CMD or R2R_TEST_TYPE_JSON
+ 		R2RAsmTestOutput *asm_out;  // for test->type == R2R_TEST_TYPE_ASM
+
+
+
+
+@@ -6,31 +6,365 @@
+ #define NSEC_PER_MSEC 1000000
+ #define USEC_PER_SEC  1000000
+ #define NSEC_PER_USEC 1000
++#define USEC_PER_MSEC 1000
+ 
+ #if __WINDOWS__
+ struct r2r_subprocess_t {
++	HANDLE stdin_write;
++	HANDLE stdout_read;
++	HANDLE stderr_read;
++	HANDLE proc;
+ 	int ret;
+ 	RStrBuf out;
+ 	RStrBuf err;
+ };
+ 
++static volatile long pipe_id = 0;
++
++static bool create_pipe_overlap(HANDLE *pipe_read, HANDLE *pipe_write, LPSECURITY_ATTRIBUTES attrs, DWORD sz, DWORD read_mode, DWORD write_mode) {
++	// see https://stackoverflow.com/a/419736
++	if (!sz) {
++		sz = 4096;
++	}
++	char name[MAX_PATH];
++	snprintf (name, sizeof (name), "\\\\.\\pipe\\r2r-subproc.%d.%ld", (int)GetCurrentProcessId (), (long)InterlockedIncrement (&pipe_id));
++	*pipe_read = CreateNamedPipeA (name, PIPE_ACCESS_INBOUND | read_mode, PIPE_TYPE_BYTE | PIPE_WAIT, 1, sz, sz, 120 * 1000, attrs);
++	if (!*pipe_read) {
++		return FALSE;
++	}
++	*pipe_write = CreateFileA (name, GENERIC_WRITE, 0, attrs, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | write_mode, NULL);
++	if (*pipe_write == INVALID_HANDLE_VALUE) {
++		CloseHandle (*pipe_read);
++		return FALSE;
++	}
++	return true;
++}
++
+ R_API bool r2r_subprocess_init(void) { return true; }
+ R_API void r2r_subprocess_fini(void) {}
+ 
++// Create an env block that inherits the current vars but overrides the given ones
++static LPWCH override_env(const char *envvars[], const char *envvals[], size_t env_size) {
++	LPWCH ret = NULL;
++	LPWCH parent_env = NULL;
++	size_t i;
++	LPWSTR *wenvvars = calloc (env_size, sizeof (LPWSTR));
++	LPWSTR *wenvvals = calloc (env_size, sizeof (LPWSTR));
++	parent_env = GetEnvironmentStringsW ();
++	if (!wenvvars || !wenvvals || !parent_env) {
++		goto error;
++	}
++
++	for (i = 0; i < env_size; i++) {
++		wenvvars[i] = r_utf8_to_utf16 (envvars[i]);
++		wenvvals[i] = r_utf8_to_utf16 (envvals[i]);
++		if (!wenvvars[i] || !wenvvals[i]) {
++			goto error;
++		}
++	}
++
++	RVector buf;
++	r_vector_init (&buf, sizeof (wchar_t), NULL, NULL);
++	LPWCH cur = parent_env;
++	while (true) {
++		LPWCH var_begin = cur;
++		//wprintf (L"ENV: %s\n", cur);
++		while (*cur && *cur != L'=') {
++			cur++;
++		}
++		if (!*cur) {
++			cur++;
++			if (!*cur) {
++				break;
++			}
++			continue;
++		}
++		bool overridden = false;
++		for (i = 0; i < env_size; i++) {
++			size_t overlen = lstrlenW (wenvvars[i]);
++			size_t curlen = cur - var_begin;
++			if (overlen == curlen && !memcmp (var_begin, wenvvars[i], overlen)) {
++				overridden = true;
++				break;
++			}
++		}
++		while (*cur) {
++			cur++;
++		}
++		if (!overridden) {
++			r_vector_insert_range (&buf, buf.len, var_begin, cur - var_begin + 1);
++		}
++		cur++;
++		if (!*cur) {
++			// \0\0 marks the end
++			break;
++		}
++	}
++
++	wchar_t c;
++	for (i = 0; i < env_size; i++) {
++		r_vector_insert_range (&buf, buf.len, wenvvars[i], lstrlenW (wenvvars[i]));
++		c = L'=';
++		r_vector_push (&buf, &c);
++		r_vector_insert_range (&buf, buf.len, wenvvals[i], lstrlenW (wenvvals[i]));
++		c = L'\0';
++		r_vector_push (&buf, &c);
++	}
++	c = '\0';
++	r_vector_push (&buf, &c);
++	ret = buf.a;
++
++error:
++	if (parent_env) {
++		FreeEnvironmentStringsW (parent_env);
++	}
++	for (i = 0; i < env_size; i++) {
++		if (wenvvars) {
++			free (wenvvars[i]);
++		}
++		if (w

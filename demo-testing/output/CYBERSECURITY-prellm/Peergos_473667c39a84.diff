@@ -1,0 +1,92 @@
+@@ -198,6 +198,46 @@ public class SocialBenchmark {
+         Assert.assertTrue(afterGc < 4_000);
+     }
+ 
++    @Test
++    public void readingSharedFiles() {
++        String username = generateUsername();
++        String password = "password";
++        Pair<UserContext, Long> initial = time(() -> ensureSignedUp(username, password, network, crypto));
++        UserContext us = initial.left;
++
++        int nFriends = 1;
++        List<Pair<String, String>> otherUsers = IntStream.range(0, nFriends)
++                .mapToObj(x -> new Pair<>(generateUsername(), password))
++                .collect(Collectors.toList());
++        List<UserContext> friends = otherUsers.stream()
++                .map(p -> ensureSignedUp(p.left, p.right, network, crypto))
++                .collect(Collectors.toList());
++
++        PeergosNetworkUtils.friendBetweenGroups(Arrays.asList(us), friends);
++
++        // Add a few files, shared read only with a random friend friend
++        int nFiles = 40;
++        for (int i=0; i < nFiles; i++) {
++            byte[] fileData = "dataaaa".getBytes();
++            String filename = "File" + i;
++            us.getUserRoot().join().uploadOrReplaceFile(filename, AsyncReader.build(fileData),
++                    fileData.length, network, crypto, x -> {}, crypto.random.randomBytes(32)).join();
++            String sharee = otherUsers.get(random.nextInt(otherUsers.size())).left;
++            us.shareReadAccessWith(Paths.get(username, filename), Collections.singleton(sharee)).join();
++        }
++
++        int reps = 100;
++        long start = System.currentTimeMillis();
++        for (int j=0; j < reps; j++) {
++            for (int i = 0; i < nFiles; i++) {
++                String name = "File" + i;
++                System.out.println("getByPath took " + time(() -> friends.get(0).getByPath(Paths.get(username, name)).join()).right);
++            }
++        }
++        long end = System.currentTimeMillis();
++        System.out.println("Took " + (end - start) + "mS");
++    }
++
+     private String generateUsername() {
+         return "test" + (random.nextInt() % 10000);
+     }
+
+
+
+
+@@ -40,7 +40,7 @@ public class FriendSourcedTrieNode implements TrieNode {
+      * @param network
+      * @return Any new capabilities from the friend and the previously processed size of caps in bytes
+      */
+-    public synchronized CompletableFuture<CapsDiff> ensureUptodate(Crypto crypto,
++    public synchronized CompletableFuture<Boolean> ensureUptodate(Crypto crypto,
+                                                                    NetworkAccess network) {
+         return cache.ensureFriendUptodate(ownerName, sharedDir, network);
+     }
+
+
+
+
+@@ -31,6 +31,7 @@ public class IncomingCapCache {
+     private static final String DIR_STATE = "items.cbor";
+ 
+     private FileWrapper cacheRoot, worldRoot;
++    private final Map<PublicKeyHash, byte[]> pointerCache;
+     private final Crypto crypto;
+     private final Hasher hasher;
+ 
+@@ -39,6 +40,7 @@ public class IncomingCapCache {
+         this.worldRoot = worldRoot;
+         this.crypto = crypto;
+         this.hasher = crypto.hasher;
++        this.pointerCache = new HashMap<>();
+     }
+ 
+     public static CompletableFuture<IncomingCapCache> build(FileWrapper cacheRoot, Crypto crypto, NetworkAccess network) {
+@@ -362,16 +364,29 @@ public class IncomingCapCache {
+         return worldRoot.version;
+     }
+ 
+-    public CompletableFuture<CapsDiff> ensureFriendUptodate(String friend, EntryPoint sharedDir, NetworkAccess network) {
+-        return getAndUpdateRoot(network)
+-                .thenCompose(root -> root.getDescendentByPath(friend + FRIEND_STATE_SUFFIX, hasher, network)
+-                        .thenCompose(stateOpt -> {
+-                            if (stateOpt.isEmpty())
+-                                return Futures.of(ProcessedCaps.empty());
+-                            return Serialize.readFully(stateOpt.get(), crypto, network)
+-                                    .thenApply(arr -> ProcessedC

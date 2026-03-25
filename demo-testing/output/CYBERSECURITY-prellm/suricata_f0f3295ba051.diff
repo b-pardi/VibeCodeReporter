@@ -1,0 +1,106 @@
+@@ -42,9 +42,6 @@ enum {
+ typedef struct DetectParseRegex_ {
+     pcre *regex;
+     pcre_extra *study;
+-#ifdef PCRE_HAVE_JIT_EXEC
+-    pcre_jit_stack *jit_stack;
+-#endif
+     struct DetectParseRegex_ *next;
+ } DetectParseRegex;
+ 
+
+
+
+
+@@ -74,36 +74,20 @@ static int pcre_match_limit_recursion = 0;
+ static DetectParseRegex parse_regex;
+ static DetectParseRegex parse_capture_regex;
+ 
+-#ifdef PCRE_HAVE_JIT
+-static int pcre_use_jit = 1;
++#ifdef PCRE2_HAVE_JIT
++static int pcre2_use_jit = 1;
+ #endif
+ 
+-#ifdef PCRE_HAVE_JIT_EXEC
+-#define PCRE_JIT_MIN_STACK 32*1024
+-#define PCRE_JIT_MAX_STACK 512*1024
+-
+-#endif
++// TODOpcre2 pcre2_jit_stack_create ?
+ 
+ /* \brief Helper function for using pcre_exec with/without JIT
+  */
+-static inline int DetectPcreExec(DetectEngineThreadCtx *det_ctx, DetectPcreData *pd, DetectParseRegex *regex,
+-        const char *str, const size_t strlen, int start_offset, int options,  int *ovector, int ovector_size)
++static inline int DetectPcreExec(DetectEngineThreadCtx *det_ctx, DetectPcreData *pd,
++        const char *str, const size_t strlen, int start_offset, int options)
+ {
+-#ifdef PCRE_HAVE_JIT_EXEC
+-    if (pd->thread_ctx_jit_stack_id != -1) {
+-        pcre_jit_stack *jit_stack = (pcre_jit_stack *)
+-            DetectThreadCtxGetKeywordThreadCtx(det_ctx, pd->thread_ctx_jit_stack_id);
+-        if (jit_stack) {
+-            SCLogDebug("Using jit_stack %p", jit_stack);
+-            return pcre_jit_exec(regex->regex, regex->study, str, strlen,
+-                                start_offset, options, ovector, ovector_size,
+-                                jit_stack);
+-        }
+-    }
+-#endif
+     /* Fallback if registration during setup failed */
+-    return pcre_exec(regex->regex, regex->study, str, strlen,
+-                     start_offset, options, ovector, ovector_size);
++    return pcre2_match(pd->parse_regex.regex, (PCRE2_SPTR8)str, strlen, start_offset, options,
++            pd->parse_regex.match, NULL);
+ }
+ 
+ static int DetectPcreSetup (DetectEngineCtx *, Signature *, const char *);
+@@ -163,10 +147,10 @@ void DetectPcreRegister (void)
+         FatalError(SC_ERR_PCRE_COMPILE, "pcre compile and study failed");
+     }
+ 
+-#ifdef PCRE_HAVE_JIT
++#ifdef PCRE2_HAVE_JIT
+     if (PageSupportsRWX() == 0) {
+-        SCLogConfig("PCRE won't use JIT as OS doesn't allow RWX pages");
+-        pcre_use_jit = 0;
++        SCLogConfig("PCRE2 won't use JIT as OS doesn't allow RWX pages");
++        pcre2_use_jit = 0;
+     }
+ #endif
+ 
+@@ -193,10 +177,9 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+ {
+     SCEnter();
+     int ret = 0;
+-    int ov[MAX_SUBSTRINGS];
+     const uint8_t *ptr = NULL;
+     uint16_t len = 0;
+-    uint16_t capture_len = 0;
++    PCRE2_SIZE capture_len = 0;
+ 
+     DetectPcreData *pe = (DetectPcreData *)smd->ctx;
+ 
+@@ -214,10 +197,10 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+     }
+ 
+     /* run the actual pcre detection */
+-    ret = DetectPcreExec(det_ctx, pe, &pe->parse_regex, (char *) ptr, len, start_offset, 0, ov, MAX_SUBSTRINGS);
++    ret = DetectPcreExec(det_ctx, pe, (char *)ptr, len, start_offset, 0);
+     SCLogDebug("ret %d (negating %s)", ret, (pe->flags & DETECT_PCRE_NEGATE) ? "set" : "not set");
+ 
+-    if (ret == PCRE_ERROR_NOMATCH) {
++    if (ret == PCRE2_ERROR_NOMATCH) {
+         if (pe->flags & DETECT_PCRE_NEGATE) {
+             /* regex didn't match with negate option means we
+              * consider it a match */
+@@ -241,28 +224,47 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, const Signature *s,
+                 uint8_t x;
+                 for (x = 0; x < pe->idx; x++) {
+                     SCLogDebug("capturing %u", x);
+-                    const char *str_ptr = NULL;
+-                    ret = pcre_get_substring((char *)ptr, ov, MAX_SUBSTRINGS, x+1, &str_ptr);
+-                    if (unlikely(ret == 0)) {
+-                        pcre_free_substring(str_ptr);
++                    const char *p

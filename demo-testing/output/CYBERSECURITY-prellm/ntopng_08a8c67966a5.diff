@@ -1,0 +1,116 @@
+@@ -682,6 +682,7 @@ class NetworkInterface : public Checkpointable {
+ 
+   virtual void sendTermination()             { ; }
+   virtual bool read_from_pcap_dump()         { return(false); };
++  virtual void updateDirectionStats()        { ; }
+   void makeTsPoint(NetworkInterfaceTsPoint *pt);
+   void tsLua(lua_State* vm);
+ #ifdef HAVE_EBPF
+
+
+
+
+@@ -27,7 +27,8 @@
+ class PcapInterface : public NetworkInterface {
+  private:
+   pcap_t *pcap_handle;
+-  bool read_pkts_from_pcap_dump;
++  bool read_pkts_from_pcap_dump, emulate_traffic_directions;
++  ProtoStats initial_stats_in, initial_stats_out;
+   FILE *pcap_list;
+ 
+   pcap_stat last_pcap_stat;
+@@ -41,6 +42,7 @@ class PcapInterface : public NetworkInterface {
+   virtual InterfaceType getIfType() { return(read_pkts_from_pcap_dump ? interface_type_PCAP_DUMP : interface_type_PCAP); }
+   inline const char* get_type()     { return(read_pkts_from_pcap_dump ? CONST_INTERFACE_TYPE_PCAP_DUMP : CONST_INTERFACE_TYPE_PCAP); };
+   inline pcap_t* get_pcap_handle()  { return(pcap_handle);   };
++  inline virtual bool areTrafficDirectionsSupported() { return(emulate_traffic_directions); };
+   inline void set_pcap_handle(pcap_t *p) { pcap_handle = p; };
+   inline FILE*   get_pcap_list()   { return(pcap_list);     };
+   void startPacketPolling();
+@@ -48,6 +50,7 @@ class PcapInterface : public NetworkInterface {
+   bool set_packet_filter(char *filter);
+   inline bool read_from_pcap_dump() { return(read_pkts_from_pcap_dump); };
+   inline void sendTermination()     { pcap_breakloop(pcap_handle); }
++  virtual void updateDirectionStats();
+ };
+ 
+ #endif /* _PCAP_INTERFACE_H_ */
+
+
+
+
+@@ -110,6 +110,7 @@ class Utils {
+   static u_int32_t stringHash(const char *s);
+   static const char* policySource2Str(L7PolicySource_t policy_source);
+   static const char* captureDirection2Str(pcap_direction_t dir);
++  static bool readInterfaceStats(const char* ifname, ProtoStats *in_stats, ProtoStats *out_stats);
+   static bool shouldResolveHost(const char *host_ip);
+   static bool mg_write_retry(struct mg_connection *conn, u_char *b, int len);
+   static bool parseAuthenticatorJson(HTTPAuthenticator *auth, char *content);
+
+
+
+
+@@ -208,6 +208,7 @@ using namespace std;
+ #include "FrequentTrafficItems.h"
+ #include "HostPools.h"
+ #include "Prefs.h"
++#include "ProtoStats.h"
+ #include "Utils.h"
+ #include "CommunityIdFlowHash.h"
+ #include "DnsStats.h"
+@@ -220,7 +221,6 @@ using namespace std;
+ #include "Grouper.h"
+ #include "FlowGrouper.h"
+ #include "PacketStats.h"
+-#include "ProtoStats.h"
+ #include "TcpPacketStats.h"
+ #include "EthStats.h"
+ 
+
+
+
+
+@@ -5300,6 +5300,7 @@ void lua_push_float_table_entry(lua_State *L, const char *key, float value) {
+ 
+ static int ntop_get_interface_stats(lua_State* vm) {
+   NetworkInterface *ntop_interface = getCurrentInterface(vm);
++  bool get_direction_stats = false;
+ 
+   /*
+     ntop_interface->getAlertsManager()->engageAlert(alert_entity_host, "127.0.0.1",
+@@ -5316,9 +5317,15 @@ static int ntop_get_interface_stats(lua_State* vm) {
+ 
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+-  if(ntop_interface)
++  if(lua_type(vm, 1) == LUA_TBOOLEAN)
++    get_direction_stats = lua_toboolean(vm, 1);
++
++  if(ntop_interface) {
++    if(get_direction_stats)
++      ntop_interface->updateDirectionStats();
++
+     ntop_interface->lua(vm);
+-  else
++  } else
+     lua_pushnil(vm);
+ 
+   return(CONST_LUA_OK);
+
+
+
+
+@@ -39,6 +39,7 @@ PcapInterface::PcapInterface(const char *name) : NetworkInterface(name) {
+ 
+   pcap_handle = NULL, pcap_list = NULL;
+   memset(&last_pcap_stat, 0, sizeof(last_pcap_stat));
++  emulate_traffic_directions = false;
+   
+   if((stat(name, &buf) == 0) || (name[0] == '-') || !strncmp(name, "stdin", 5)) {
+     /*
+@@ -97,6 +98,9 @@ PcapInterface::PcapInterface(const char *name) : NetworkInterface(name) {
+ #ifndef WIN32
+       if(pcap_setdirection(pcap_handle, ntop->getPrefs()->getCaptureDirection()) != 0)
+ 		ntop->getTrace()->traceEvent(TRACE_WARNING, "Unable to set packet capture dire

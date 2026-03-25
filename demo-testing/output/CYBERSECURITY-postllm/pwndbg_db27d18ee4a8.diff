@@ -1,0 +1,143 @@
+@@ -1,9 +1,29 @@
+ from __future__ import annotations
+ 
++from typing import Any
++
+ 
+ class MemoryAllocator:
+     """Heap abstraction layer."""
+ 
++    # This function isn't actually implemented anywhere. It originally returned
++    # `gdb.Breakpoint`, but, in order to facilitate the port to aglib, that
++    # type association was removed. It should be put back as soon as the
++    # Debugger-agnostic API gains the ability to set breakpoints.
++    #
++    # TODO: Change `Any` to the Debugger-agnostic breakpoint type when it gets created
++
++    def summarize(self, address: int, **kwargs: Any) -> str:
++        """Returns a textual summary of the specified address.
++
++        Arguments:
++            address: Address of the heap block to summarize.
++
++        Returns:
++            A string.
++        """
++        raise NotImplementedError()
++
+     def containing(self, address: int) -> int:
+         """Returns the address of the allocation which contains 'address'.
+ 
+
+deleted file mode 100644
+
+
+
+@@ -1,537 +0,0 @@
+-"""
+-Implements handling of musl's allocator mallocng.
+-https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng
+-"""
+-
+-from __future__ import annotations
+-
+-from typing import List
+-
+-import pwndbg
+-import pwndbg.aglib.arch
+-import pwndbg.aglib.memory as memory
+-import pwndbg.aglib.typeinfo
+-
+-# https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L14
+-# Slot granularity.
+-UNIT = 16
+-# Size of in-band metadata.
+-IB = 4
+-
+-# https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L12
+-# Describes the possible sizes a slot can be. These are `/ UNIT`.
+-# fmt: off
+-size_classes: List[int] = [
+-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 18, 20,
+-    25, 31, 36, 42, 50, 63, 72, 84, 102, 127, 146,
+-    170, 204, 255, 292, 340, 409, 511, 584, 682, 818,
+-    1023, 1169, 1364, 1637, 2047, 2340, 2730, 3276,
+-    4095, 4680, 5460, 6552, 8191,
+-]
+-# fmt: on
+-
+-
+-# Shorthand
+-def int_size():
+-    return pwndbg.aglib.typeinfo.sint.sizeof
+-
+-
+-class Group:
+-    """
+-    A group is an array of slots.
+-
+-    https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L17
+-    struct group {
+-      struct meta *meta;
+-      unsigned char active_idx:5;
+-      char pad[UNIT - sizeof(struct meta *) - 1];
+-      unsigned char storage[];
+-    };
+-    """
+-
+-    def __init__(self, addr: int) -> None:
+-        self.addr = addr
+-
+-        self._meta = None
+-        self._active_idx = None
+-
+-    def preload(self) -> None:
+-        """
+-        Read all the necessary process memory to populate the group's
+-        fields.
+-
+-        Do this if you know you will be using most of the
+-        fields of the group. It will be faster, since we can do one
+-        reads instead of two small ones. You may also catch
+-        inaccessible memory exceptions here and not worry about it later.
+-
+-        Raises:
+-            pwndbg.dbg_mod.Error: When reading memory fails.
+-        """
+-        data = memory.read(self.addr, pwndbg.aglib.arch.ptrsize + 1)
+-        self._meta = Meta(pwndbg.aglib.arch.unpack(data[: pwndbg.aglib.arch.ptrsize]))
+-        self._active_idx = data[-1] & 0b11111
+-
+-    @property
+-    def meta(self) -> Meta:
+-        """
+-        Raises:
+-            pwndbg.dbg_mod.Error: When reading memory fails.
+-        """
+-        if self._meta is None:
+-            self._meta = Meta(memory.read_pointer_width(self.addr))
+-
+-        return self._meta
+-
+-    @property
+-    def active_idx(self) -> int:
+-        """
+-        Raises:
+-            pwndbg.dbg_mod.Error: When reading memory fails.
+-        """
+-        if self._active_idx is None:
+-            self._active_idx = memory.u8(self.addr + pwndbg.aglib.arch.ptrsize) & 0b11111
+-
+-        return self._active_idx
+-
+-    @property
+-    def storage(self) -> int:
+-        return self.addr + UNIT
+-
+-    @property
+-    def group_size(self) -> int:
+-        """
+-        The size of this group, in bytes.
+-
+-        Raises:
+-            pwndbg.dbg_m

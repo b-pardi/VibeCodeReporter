@@ -1,0 +1,162 @@
+@@ -1263,17 +1263,10 @@ R_API void r_cons_invert(int set, int color) {
+ */
+ R_API void r_cons_set_cup(int enable) {
+ #if __UNIX__ || __CYGWIN__
+-	if (enable) {
+-		const char *code =
+-			"\x1b[?1049h" // xterm
+-			"\x1b" "7\x1b[?47h"; // xterm-color
+-		write (2, code, strlen (code));
+-	} else {
+-		const char *code =
+-			"\x1b[?1049l" // xterm
+-			"\x1b[?47l""\x1b""8"; // xterm-color
+-		write (2, code, strlen (code));
+-	}
++	const char *code = enable
++		? "\x1b[?1049h" "\x1b" "7\x1b[?47h"
++		: "\x1b[?1049l" "\x1b[?47l" "\x1b" "8";
++	write (2, code, strlen (code));
+ 	fflush (stdout);
+ #elif __WINDOWS__ && !__CYGWIN__
+ 	if (I.ansicon) {
+@@ -1557,3 +1550,9 @@ R_API void r_cons_cmd_help(const char *help[], bool use_color) {
+ 		}
+ 	}
+ }
++
++R_API void r_cons_clear_buffer(void) {
++#if __UNIX__ || __CYGWIN__
++	write (1, "\x1b" "c\x1b[3J",  6);
++#endif
++}
+
+
+
+
+@@ -170,7 +170,7 @@ static int r_line_readchar_utf8(ut8 *s, int slen) {
+ 	} else {
+ 		return -1;
+ 	}
+-	if (slen < len) {
++	if (len > slen) {
+ 		return -1;
+ 	}
+ 	for (i = 1; i < len; i++) {
+
+
+
+
+@@ -546,14 +546,51 @@ R_API int r_cons_yesno(int def, const char *fmt, ...) {
+ 	return key == 'y';
+ }
+ 
++R_API char *r_cons_password(const char *msg) {
++	int i = 0;
++	char buf[256] = {0};
++	printf ("\r%s", msg);
++	fflush (stdout);
++	r_cons_set_raw (1);
++#if __UNIX__
++	RCons *a = r_cons_singleton();
++	a->term_raw.c_lflag &= ~(ECHO | ECHONL);
++	// //  required to make therm/iterm show the key
++	// // cannot read when enabled in this way
++	// a->term_raw.c_lflag |= ICANON;
++	tcsetattr (0, TCSADRAIN, &a->term_raw);
++	signal (SIGTSTP, SIG_IGN);
++#endif
++	while (i < sizeof (buf)) {
++		int ch = r_cons_readchar ();
++		if (ch == 127) { // backspace
++			if (i < 1) {
++				break;
++			}
++			i--;
++			continue;
++		}
++		if (ch == '\r' || ch == '\n') {
++			break;
++		}
++		buf[i++] = ch;
++	}
++	buf[i] = 0;
++	r_cons_set_raw (0);
++	printf ("\n");
++#if __UNIX__
++	signal (SIGTSTP, SIG_DFL);
++#endif
++	return strdup (buf);
++}
++
+ R_API char *r_cons_input(const char *msg) {
+-	char *oprompt = r_line_get_prompt (); //r_cons_singleton ()->line->prompt);
++	char *oprompt = r_line_get_prompt ();
+ 	if (!oprompt) {
+ 		return NULL;
+ 	}
+ 	char buf[1024];
+ 	if (msg) {
+-		//r_cons_printf ("%s\n", msg);
+ 		r_line_set_prompt (msg);
+ 	} else {
+ 		r_line_set_prompt ("");
+
+
+
+
+@@ -2249,7 +2249,9 @@ static int bin_sections(RCore *r, int mode, ut64 laddr, int va, ut64 at, const c
+ 	int fd = -1;
+ 	bool printHere = false;
+ 	sections = r_bin_get_sections (r->bin);
++#if LOAD_BSS_MALLOC
+ 	bool inDebugger = r_config_get_i (r->config, "cfg.debug");
++#endif
+ 	SdbHt *dup_chk_ht = ht_new (NULL, dup_chk_free_kv, NULL);
+ 	bool ret = false;
+ 	const char *type = print_segments ? "segment" : "section";
+
+
+
+
+@@ -11,6 +11,7 @@ static const char *help_msg_L[] = {
+ 	"L",  "", "show this help",
+ 	"L", " blah."R_LIB_EXT, "load plugin file",
+ 	"L-", "duk", "unload core plugin by name",
++	"LL", "", "lock screen",
+ 	"La", "", "list asm/anal plugins (aL, e asm.arch=" "??" ")",
+ 	"Lc", "", "list core plugins",
+ 	"Ld", "", "list debug plugins (same as dL)",
+@@ -43,6 +44,51 @@ static void cmd_log_init(RCore *core) {
+ 	DEFINE_CMD_DESCRIPTOR (core, T);
+ }
+ 
++static void screenlock(RCore *core) {
++	//  char *pass = r_cons_input ("Enter new password: ");
++	char *pass = r_cons_password (Color_INVERT "Enter new password:"Color_INVERT_RESET);
++	if (!pass || !*pass) {
++		return;
++	}
++	char *again = r_cons_password (Color_INVERT "Type it again:"Color_INVERT_RESET);
++	if (!again || !*again) {
++		return;
++	}
++	if (strcmp (pass, again)) {
++		eprintf ("Password mismatch!\n");
++		return;
++	}
++	bool running = true;
++	r_cons_clear_buffer ();
++	ut64 begin = r_sys_now ();
++	ut64 last = UT64_MAX;
++	ut64 tries = 0;
++	do {
++		r_cons_clear00 ();
++		r_cons_printf ("Retries: %d\n", tries);
++		r_cons_printf ("Locked ts: %s\n", r_time_to_string (begin));
++		if (last != UT64_MAX) {
++			r_cons_printf ("Last try: %s\n", r_time_to_string (last));
++		}
++		r_cons_newline ();
++		r_cons_flush ();
++		cha

@@ -1,0 +1,146 @@
+@@ -43,6 +43,12 @@
+ #include <algorithm>
+ #include <cmath>
+ 
++using std::hex;
++using std::dec;
++using std::setw;
++using std::setfill;
++using std::endl;
++
+ #include "panda/plugin.h"
+ #include "panda/plugin_plugin.h"
+ 
+@@ -69,9 +75,11 @@ PPP_CB_BOILERPLATE(on_proc_change);
+ 
+ /*
+ 
+-How does asidstory work?
++Process info stability.  asidstory needs to know what process is at
++each bb but that information as provided by Osi is unstable.
+ 
+-Here is a picture of what seems to happen during a replay.
++Here is a picture of what we observe happen wrt asid changing and
++processes infor from Osi
+ 
+ *      |            |              |             |      !
+ sggggggbbbggggggggggbbbbbbbbbbbbbbbbbggggggggggggbbbggggg
+@@ -80,21 +88,42 @@ s - start
+ g - we have a good proc (pid & name reasonable)
+ b - we have a bad proc (pid or name bad)
+ 
++Where the '|' indicate an asid change.  
++
++So here is how we handle that.  With a finite state machine.  At asid
++change, we move to mode 'Process_unknown' which means are looking for
++the first good process.  We also start in that mode.  We'll ask Osi
++what the current process is at the beginning of each basic block until
++we see a good one (pid and name make sense).  At which point, we'll
++move to 'Process_suspicious' mode, which means we saw a good process
++after asid change but we don't believe it yet.  If we see that same
++process for PROCESS_GOOD_NUM basic blocks, then we believe it and move
++to 'Process_known' mode.  If we observe a bad process (or just
++different) whilst in the 'Process_suspicious' mode, we'll revert back to
++'Process_unknown'.  We stay in 'Process_known' until asid changes which
++moves us back into 'Process_unknown'.
++
+ */
+ 
++enum Mode {Process_unknown, Process_suspicious, Process_known};
++
++Mode process_mode = Process_unknown;
++
++#define PROCESS_GOOD_NUM 10
+ 
++// use to count how many bb in a row have same proc name
++// if that is changing we won't believe it
++int process_counter=PROCESS_GOOD_NUM;
++
++// used to control spit_asidstory printout frequency
+ bool *status_c=NULL;
++
++// divide replay up into this many temporal cells
+ uint32_t num_cells = 80;
+ uint64_t min_instr;
+ uint64_t max_instr = 0;
+ double scale = 0;
+ 
+-bool pid_ok(int pid) {
+-    if (pid < 4) {
+-        return false;
+-    }
+-    return true;
+-}
+  
+ #define MILLION 1000000
+ //#define NAMELEN 10
+@@ -112,6 +141,19 @@ typedef uint64_t Asid;
+ typedef uint32_t Cell;
+ typedef uint64_t Count;
+ typedef uint64_t Instr;
++    
++// if we see svchost more than once, e.g., we use this to append 1, 2, 3, etc to the name in our output
++static std::map<std::string, unsigned> name_count;
++
++//bool spit_out_total_instr_once = false;
++
++
++bool proc_ok = false;
++bool asid_just_changed = false;
++OsiProc *first_good_proc = NULL;
++uint64_t instr_first_good_proc;
++
++target_ulong asid_at_asid_changed;
+ 
+     
+ struct NamePid {
+@@ -145,12 +187,6 @@ static unsigned digits(uint64_t num) {
+     return std::to_string(num).size();
+ }
+ 
+-using std::hex;
+-using std::dec;
+-using std::setw;
+-using std::setfill;
+-using std::endl;
+-
+ void spit_asidstory() {
+     FILE *fp = fopen("asidstory", "w");
+ 
+@@ -213,25 +249,15 @@ void spit_asidstory() {
+ }
+ 
+ 
+-    
+-char last_name[256];
+-target_ulong last_pid = 0;
+-target_ulong last_asid = 0;
+-
+-static std::map<std::string, unsigned> name_count;
+-
+-bool spit_out_total_instr_once = false;
+-
+-int num_ok = 0;
+-int num_not_ok = 0;
++static inline bool pid_ok(int pid) {
++    if (pid < 4) {
++        return false;
++    }
++    return true;
++}
+ 
+-bool proc_ok = false;
+-bool asid_just_changed = false;
+-OsiProc *proc_at_asid_changed = NULL;
+-uint64_t instr_count_at_asid_changed;
+-target_ulong asid_at_asid_changed;
+ 
+-bool check_proc(OsiProc *proc) {
++static inline bool check_proc(OsiProc *proc) {
+     if (proc && pid_ok(proc->pid)) {
+         int l = strlen(proc->name);
+         for (int i=0; i<l; i++) 
+@@ -249,8 +275,6 @@ bool check_proc(OsiProc *proc) {
+    updating first / last instr and cell counts
+ */
+ void saw_proc(

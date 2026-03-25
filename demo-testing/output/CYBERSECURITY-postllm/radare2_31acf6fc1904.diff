@@ -1,0 +1,120 @@
+@@ -1131,7 +1131,7 @@ void rqsort(void *base, size_t nmemb, size_t size, cmp_f cmp, void *opaque)
+ 
+ #ifdef _WIN32
+  // From: https://stackoverflow.com/a/26085827
+-static int gettimeofday_msvc(struct timeval *tp, struct timezone *tzp)
++static int gettimeofday_msvc(struct timeval *tp)
+ {
+   static const uint64_t EPOCH = ((uint64_t)116444736000000000ULL);
+ 
+@@ -1185,7 +1185,7 @@ uint64_t js__hrtime_ns(void) {
+ int64_t js__gettimeofday_us(void) {
+     struct timeval tv;
+ #ifdef _WIN32
+-    gettimeofday_msvc(&tv, NULL);
++    gettimeofday_msvc(&tv);
+ #else
+     gettimeofday(&tv, NULL);
+ #endif
+
+
+
+
+@@ -712,9 +712,13 @@ typedef enum JSIteratorKindEnum {
+ 
+ typedef enum JSIteratorHelperKindEnum {
+     JS_ITERATOR_HELPER_KIND_DROP,
++    JS_ITERATOR_HELPER_KIND_EVERY,
+     JS_ITERATOR_HELPER_KIND_FILTER,
++    JS_ITERATOR_HELPER_KIND_FIND,
+     JS_ITERATOR_HELPER_KIND_FLAT_MAP,
++    JS_ITERATOR_HELPER_KIND_FOR_EACH,
+     JS_ITERATOR_HELPER_KIND_MAP,
++    JS_ITERATOR_HELPER_KIND_SOME,
+     JS_ITERATOR_HELPER_KIND_TAKE,
+ } JSIteratorHelperKindEnum;
+ 
+@@ -11347,6 +11351,7 @@ static int js_ecvt(double d, int n_digits,
+         }
+     } else {
+ #if defined(FE_DOWNWARD) && defined(FE_TONEAREST)
++        int i;
+         /* generate 2 extra digits: 99% chances to avoid 2 calls */
+         js_ecvt1(d, n_digits + 2, dest, size, decpt);
+         if (dest[n_digits + 1] < '5')
+@@ -11360,7 +11365,7 @@ static int js_ecvt(double d, int n_digits,
+                 return n_digits;    /* truncate the 2 extra digits */
+         }
+         /* round up in the string */
+-        for(int i = n_digits;; i--) {
++        for(i = n_digits;; i--) {
+             /* ignore the locale specific decimal point */
+             if (is_digit(dest[i])) {
+                 if (dest[i]++ < '9')
+@@ -40185,237 +40190,265 @@ fail:
+     return JS_EXCEPTION;
+ }
+ 
+-static JSValue js_create_iterator_helper(JSContext *ctx, JSValue iterator,
+-                                         JSIteratorHelperKindEnum kind, JSValue func, int64_t count);
+-
+-static JSValue js_iterator_proto_drop(JSContext *ctx, JSValue this_val,
+-                                      int argc, JSValue *argv)
++static int check_iterator(JSContext *ctx, JSValue obj)
+ {
+-    JSValue v;
+-    double dlimit;
+-    int64_t limit;
+-    if (!JS_IsObject(this_val))
+-        return JS_ThrowTypeError(ctx, "Iterator.prototype.drop called on non-object");
+-    v = JS_ToNumber(ctx, argv[0]);
+-    if (JS_IsException(v))
+-        return JS_EXCEPTION;
+-    // Check for Infinity.
+-    if (JS_ToFloat64(ctx, &dlimit, v)) {
+-        JS_FreeValue(ctx, v);
+-        return JS_EXCEPTION;
+-    }
+-    if (isnan(dlimit)) {
+-        JS_FreeValue(ctx, v);
+-        goto fail;
+-    }
+-    if (!isfinite(dlimit)) {
+-        JS_FreeValue(ctx, v);
+-        if (dlimit < 0)
+-            goto fail;
+-        else
+-            limit = MAX_SAFE_INTEGER;
+-    } else {
+-        v = JS_ToIntegerFree(ctx, v);
+-        if (JS_IsException(v))
+-            return JS_EXCEPTION;
+-        if (JS_ToInt64Free(ctx, &limit, v))
+-            return JS_EXCEPTION;
+-    }
+-    if (limit < 0) {
+-    fail:
+-        return JS_ThrowRangeError(ctx, "must be positive");
++    if (!JS_IsObject(obj)) {
++        JS_ThrowTypeErrorNotAnObject(ctx);
++        return -1;
+     }
+-    return js_create_iterator_helper(ctx, this_val, JS_ITERATOR_HELPER_KIND_DROP, JS_UNDEFINED, limit);
++    return 0;
+ }
+ 
+-static JSValue js_iterator_proto_every(JSContext *ctx, JSValue this_val,
+-                                       int argc, JSValue *argv)
++typedef struct JSIteratorHelperData {
++    JSValue obj;
++    JSValue next;
++    JSValue func; // predicate (filter) or mapper (flatMap, map)
++    JSValue inner; // innerValue (flatMap)
++    int64_t count; // limit (drop, take) or counter (filter, map, flatMap)
++    JSIteratorHelperKindEnum kind : 8;
++    uint8_t executing : 1;
++    uint8_t done : 1;
++} JSIteratorHelperData;
++
++static JSValue js_create_iterator_helper(JSContext *ctx, JSValue this_val,
++        

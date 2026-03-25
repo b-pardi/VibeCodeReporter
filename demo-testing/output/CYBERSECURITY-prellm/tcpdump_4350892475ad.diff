@@ -1,0 +1,132 @@
+@@ -568,7 +568,7 @@ extern const char *bgp_vpn_rd_print(netdissect_options *, const u_char *);
+ extern void bootp_print(netdissect_options *, const u_char *, u_int);
+ extern void calm_fast_print(netdissect_options *, const u_char *, u_int, const struct lladdr_info *);
+ extern void carp_print(netdissect_options *, const u_char *, u_int, u_int);
+-extern void cdp_print(netdissect_options *, const u_char *, u_int, u_int);
++extern void cdp_print(netdissect_options *, const u_char *, u_int);
+ extern void cfm_print(netdissect_options *, const u_char *, u_int);
+ extern u_int chdlc_print(netdissect_options *, const u_char *, u_int);
+ extern void cisco_autorp_print(netdissect_options *, const u_char *, u_int);
+
+
+
+
+@@ -34,6 +34,7 @@
+ 
+ #include <string.h>
+ 
++#define ND_LONGJMP_FROM_TCHECK
+ #include "netdissect.h"
+ #include "addrtoname.h"
+ #include "extract.h"
+@@ -49,31 +50,6 @@
+ #define CDP_TLV_TYPE_OFFSET 0
+ #define CDP_TLV_LEN_OFFSET  2
+ 
+-static const struct tok cdp_tlv_values[] = {
+-    { 0x01,             "Device-ID"},
+-    { 0x02,             "Address"},
+-    { 0x03,             "Port-ID"},
+-    { 0x04,             "Capability"},
+-    { 0x05,             "Version String"},
+-    { 0x06,             "Platform"},
+-    { 0x07,             "Prefixes"},
+-    { 0x08,             "Protocol-Hello option"},
+-    { 0x09,             "VTP Management Domain"},
+-    { 0x0a,             "Native VLAN ID"},
+-    { 0x0b,             "Duplex"},
+-    { 0x0e,             "ATA-186 VoIP VLAN assignment"},
+-    { 0x0f,             "ATA-186 VoIP VLAN request"},
+-    { 0x10,             "power consumption"},
+-    { 0x11,             "MTU"},
+-    { 0x12,             "AVVID trust bitmap"},
+-    { 0x13,             "AVVID untrusted ports CoS"},
+-    { 0x14,             "System Name"},
+-    { 0x15,             "System Object ID (not decoded)"},
+-    { 0x16,             "Management Addresses"},
+-    { 0x17,             "Physical Location"},
+-    { 0, NULL}
+-};
+-
+ static const struct tok cdp_capability_values[] = {
+     { 0x01,             "Router" },
+     { 0x02,             "Transparent Bridge" },
+@@ -85,207 +61,268 @@ static const struct tok cdp_capability_values[] = {
+     { 0, NULL }
+ };
+ 
+-static int cdp_print_addr(netdissect_options *, const u_char *, u_int);
+-static int cdp_print_prefixes(netdissect_options *, const u_char *, u_int);
+-static unsigned int cdp_get_number(netdissect_options *, const u_char *, u_int);
++static void cdp_print_addr(netdissect_options *, const u_char *, u_int);
++static void cdp_print_prefixes(netdissect_options *, const u_char *, u_int);
++
++static void
++cdp_print_string(netdissect_options *ndo,
++                 const u_char *cp, const u_int len)
++{
++	ND_PRINT("'");
++	(void)nd_printn(ndo, cp, len, NULL);
++	ND_PRINT("'");
++}
++
++static void
++cdp_print_power(netdissect_options *ndo,
++                const u_char *cp, const u_int len)
++{
++	u_int val = 0;
++
++	switch (len) {
++	case 1:
++		val = GET_U_1(cp);
++		break;
++	case 2:
++		val = GET_BE_U_2(cp);
++		break;
++	case 3:
++		val = GET_BE_U_3(cp);
++		break;
++	}
++	ND_PRINT("%1.2fW", val / 1000.0);
++}
++
++static void
++cdp_print_capability(netdissect_options *ndo,
++                     const u_char *cp, const u_int len _U_)
++{
++	uint32_t val = GET_BE_U_4(cp);
++
++	ND_PRINT("(0x%08x): %s", val,
++	         bittok2str(cdp_capability_values, "none", val));
++}
++
++/* Rework the version string to get a nice indentation. */
++static void
++cdp_print_version(netdissect_options *ndo,
++                  const u_char *cp, const u_int len)
++{
++	unsigned i;
++
++	ND_PRINT("\n\t  ");
++	for (i = 0; i < len; i++) {
++		u_char c = GET_U_1(cp + i);
++
++		if (c == '\n')
++			ND_PRINT("\n\t  ");
++		else
++			fn_print_char(ndo, c);
++	}
++}
++
++static void
++cdp_print_uint16(netdissect_options *ndo,
++                 const u_char *cp, const u_int len _U_)
++{
++	ND_PRINT("%u", GET_BE_U_2(cp));
++}
++
++static void
++cdp_print_duplex(netdissect_options *ndo,
++                 const u_char *cp, const u_int len _U_)
++{
++	ND_PRINT("%s",

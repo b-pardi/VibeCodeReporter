@@ -1,0 +1,111 @@
+@@ -1086,6 +1086,19 @@ out:
+ 	 (defined(ENABLE_DSR) && defined(ENABLE_DSR_HYBRID)) || \
+ 	 defined(ENABLE_MASQUERADE) || \
+ 	 defined(ENABLE_EGRESS_GATEWAY))
++
++#ifdef NETFILTER_COMPAT_MODE
++
++	/* For a packet which is a reply from a local endpoint to NodePort request,
++	 * do rev-DNAT.To determine if it is Nodeport traffic, do conntrack lookup for
++	 * all reply packets.
++	 */
++	ret = rev_nodeport_lb(ctx);
++	if (IS_ERR(ret))
++		return send_drop_notify_error(ctx, 0, ret,
++						CTX_ACT_DROP,
++						METRIC_EGRESS);
++#endif /* NETFILTER_COMPAT_MODE */
+ 	if ((ctx->mark & MARK_MAGIC_SNAT_DONE) != MARK_MAGIC_SNAT_DONE) {
+ 		/*
+ 		 * handle_nat_fwd tail calls in the majority of cases,
+
+
+
+
+@@ -269,6 +269,9 @@ ct_recreate6:
+ #ifdef ENABLE_NODEPORT
+ 		/* See comment in handle_ipv4_from_lxc(). */
+ 		if (ct_state.node_port) {
++#ifdef NETFILTER_COMPAT_MODE
++			return CTX_ACT_OK;
++#endif /* NETFILTER_COMPAT_MODE */
+ 			ctx->tc_index |= TC_INDEX_F_SKIP_RECIRCULATION;
+ 			ep_tail_call(ctx, CILIUM_CALL_IPV6_NODEPORT_REVNAT);
+ 			return DROP_MISSED_TAIL_CALL;
+@@ -705,6 +708,12 @@ ct_recreate4:
+ 		 * perform the reverse DNAT.
+ 		 */
+ 		if (ct_state.node_port) {
++#ifdef NETFILTER_COMPAT_MODE
++			/* Pass the packet to the stack and let bpf_host perform
++			 * rev-DNAT at egress of the native device.
++			 */
++			return CTX_ACT_OK;
++#endif /* NETFILTER_COMPAT_MODE */
+ 			ctx->tc_index |= TC_INDEX_F_SKIP_RECIRCULATION;
+ 			ep_tail_call(ctx, CILIUM_CALL_IPV4_NODEPORT_REVNAT);
+ 			return DROP_MISSED_TAIL_CALL;
+
+
+
+
+@@ -919,7 +919,8 @@ redo_local:
+ }
+ 
+ /* See comment in tail_rev_nodeport_lb4(). */
+-static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, int *ifindex)
++static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, int *ifindex,
++					    const bool rev_dnat_at_netdev)
+ {
+ 	int ret, ret2, l3_off = ETH_HLEN, l4_off, hdrlen;
+ 	struct ipv6_ct_tuple tuple = {};
+@@ -949,6 +950,10 @@ static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, int *ifindex
+ 	ret = ct_lookup6(get_ct_map6(&tuple), &tuple, ctx, l4_off, CT_INGRESS, &ct_state,
+ 			 &monitor);
+ 
++	/* See ipv4 equivalent for details */
++	if (rev_dnat_at_netdev && !ct_state.node_port)
++		return CTX_ACT_OK;
++
+ 	if (ret == CT_REPLY && ct_state.node_port == 1 && ct_state.rev_nat_index != 0) {
+ 		ret2 = lb6_rev_nat(ctx, l4_off, &csum_off, ct_state.rev_nat_index,
+ 				   &tuple, REV_NAT_F_TUPLE_SADDR);
+@@ -1052,7 +1057,7 @@ int tail_rev_nodeport_lb6(struct __ctx_buff *ctx)
+ 	 */
+ 	ctx_skip_host_fw_set(ctx);
+ #endif
+-	ret = rev_nodeport_lb6(ctx, &ifindex);
++	ret = rev_nodeport_lb6(ctx, &ifindex, false);
+ 	if (IS_ERR(ret))
+ 		return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, METRIC_EGRESS);
+ 
+@@ -1918,7 +1923,8 @@ redo_local:
+  * CILIUM_CALL_IPV{4,6}_NODEPORT_REVNAT is plugged into CILIUM_MAP_CALLS
+  * of the bpf_host, bpf_overlay and of the bpf_lxc.
+  */
+-static __always_inline int rev_nodeport_lb4(struct __ctx_buff *ctx, int *ifindex)
++static __always_inline int rev_nodeport_lb4(struct __ctx_buff *ctx, int *ifindex,
++					    const bool rev_dnat_at_netdev)
+ {
+ 	struct ipv4_ct_tuple tuple = {};
+ 	void *data, *data_end;
+@@ -1944,6 +1950,14 @@ static __always_inline int rev_nodeport_lb4(struct __ctx_buff *ctx, int *ifindex
+ 	ret = ct_lookup4(get_ct_map4(&tuple), &tuple, ctx, l4_off, CT_INGRESS, &ct_state,
+ 			 &monitor);
+ 
++	/* When we do the rev-DNAT for a NodePort reply from a local service endpoint
++	 * on the bpf_host's "to-netdev" instead of bpf_lxc, then this function is
++	 * executed on all packets. Return early if we detect that a packet is not
++	 * the reply to avoid unnecessary waste of resources.
++	 */
++	if (rev_dnat_at_netdev && !ct_state.node_port)
++		return CTX_ACT_OK;
++
+ 	if (ret == CT_REPLY && ct_state.node_port == 1 && ct_state.rev_nat_index != 0) {
+ 		ret2 = lb4_rev_nat(ctx, l3_off, l4_off, &csum_off,
+ 				   &ct_state, &tuple,
+@@ -2048,7 +2062,7 @@ int tail_rev_nodeport_lb4(struct __ctx_buff *ctx)
+ 	 */
+ 	ctx_skip_host_fw_set(ctx);
+ #endif
+-	r

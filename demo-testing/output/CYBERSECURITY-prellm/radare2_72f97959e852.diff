@@ -1,0 +1,156 @@
+@@ -54,6 +54,10 @@ static bool __fcn_exists(RAnal *anal, const char *name, ut64 addr) {
+ 
+ R_IPI void r_anal_var_free(RAnalVar *av);
+ 
++static void inst_vars_kv_free(HtUPKv *kv) {
++	r_pvector_free (kv->value);
++}
++
+ R_API RAnalFunction *r_anal_function_new(RAnal *anal) {
+ 	RAnalFunction *fcn = R_NEW0 (RAnalFunction);
+ 	if (!fcn) {
+@@ -70,7 +74,7 @@ R_API RAnalFunction *r_anal_function_new(RAnal *anal) {
+ 	fcn->is_noreturn = false;
+ 	fcn->meta._min = UT64_MAX;
+ 	r_pvector_init (&fcn->vars, NULL);
+-	fcn->inst_vars = ht_up_new0 ();
++	fcn->inst_vars = ht_up_new (NULL, inst_vars_kv_free, NULL);
+ 	return fcn;
+ }
+ 
+@@ -202,11 +206,13 @@ R_API bool r_anal_function_relocate(RAnalFunction *fcn, ut64 addr) {
+ 		}
+ 	}
+ 	InstVarsRelocateCtx ctx = {
+-		.inst_vars_new  = ht_up_new0 (),
++		.inst_vars_new = ht_up_new (NULL, inst_vars_kv_free, NULL),
+ 		.delta = delta
+ 	};
+ 	if (ctx.inst_vars_new) {
+ 		ht_up_foreach (fcn->inst_vars, inst_vars_relocate_cb, &ctx);
++		// Do not free the elements of the Ht, because they were moved to ctx.inst_vars_new
++		fcn->inst_vars->opt.freefn = NULL;
+ 		ht_up_free (fcn->inst_vars);
+ 		fcn->inst_vars = ctx.inst_vars_new;
+ 	}
+
+
+
+
+@@ -71,15 +71,6 @@ R_API RCmd *r_cmd_new () {
+ 	return cmd;
+ }
+ 
+-static void free_cmd_desc_tree(RCmdDesc *cd) {
+-	void **it;
+-	r_cmd_desc_children_foreach (cd, it) {
+-		RCmdDesc *in_cd = *(RCmdDesc **)it;
+-		free_cmd_desc_tree (in_cd);
+-	}
+-	r_cmd_desc_free (cd);
+-}
+-
+ R_API RCmd *r_cmd_free(RCmd *cmd) {
+ 	int i;
+ 	if (!cmd) {
+@@ -98,7 +89,7 @@ R_API RCmd *r_cmd_free(RCmd *cmd) {
+ 			R_FREE (cmd->cmds[i]);
+ 		}
+ 	}
+-	free_cmd_desc_tree (cmd->root_cmd_desc);
++	r_cmd_desc_free (cmd->root_cmd_desc);
+ 	free (cmd);
+ 	return NULL;
+ }
+@@ -983,6 +974,8 @@ R_API void r_cmd_desc_free(RCmdDesc *cd) {
+ 	if (!cd) {
+ 		return;
+ 	}
++
++	r_pvector_clear (&cd->children);
+ 	free (cd->name);
+ 	free (cd);
+ }
+
+
+
+
+@@ -483,14 +483,16 @@ R_API void r_io_map_cleanup(RIO* io) {
+ 	size_t i;
+ 	for (i = 0; i < r_pvector_len (&io->maps);) {
+ 		RIOMap *map = r_pvector_at (&io->maps, i);
+-		//remove iter if the map is a null-ptr, this may fix some segfaults
+ 		if (!map) {
++			// remove iter if the map is a null-ptr, this may fix some segfaults. This should never happen.
++			r_warn_if_reached ();
+ 			r_pvector_remove_at (&io->maps, i);
+ 			del = true;
+ 		} else if (!r_io_desc_get (io, map->fd)) {
+ 			//delete map and iter if no desc exists for map->fd in io->files
+ 			r_id_pool_kick_id (io->map_ids, map->id);
+-			r_pvector_remove_at (&io->maps, i);
++			map = r_pvector_remove_at (&io->maps, i);
++			_map_free (map);
+ 			del = true;
+ 		} else {
+ 			i++;
+
+
+
+
+@@ -216,6 +216,9 @@ bool test_r_anal_var() {
+ 	mu_assert_eq (r_pvector_len (used_vars), 1, "used vars count");
+ 	mu_assert ("used vars", r_pvector_contains (used_vars, b));
+ 
++	r_anal_var_delete (b);
++	r_anal_var_delete (c);
++
+ 	r_anal_free (anal);
+ 	mu_end;
+ }
+
+
+
+
+@@ -124,6 +124,7 @@ bool test_r_flag_get_at() {
+ 	fi = r_flag_get_at (flag, 2048, true);
+ 	mu_assert_ptreq (fi, foo, "non-interference of spaces");
+ 
++	r_flag_free (flag);
+ 	mu_end;
+ }
+ 
+
+
+
+
+@@ -402,7 +402,7 @@ bool test_r_list_clone(void) {
+ 	char *test[] = { "aa", "bb", "cc", "dd", "ee", "ff" };
+ 
+ 	RList *list1 = r_list_new ();
+-	RList *list2 = r_list_new ();
++	RList *list2;
+ 
+ 	int i;
+ 	for (i = 0; i < R_ARRAY_SIZE (test); ++i) {
+
+
+
+
+@@ -157,8 +157,6 @@ static void simple_merge(RTableRow *acc, RTableRow *new_row, int nth) {
+ 	RListIter *iter_rhs;
+ 
+ 	char *item_lhs;
+-	char *item_rhs;
+-	int tmp;
+ 
+ 	int i = 0;
+ 
+@@ -167,7 +165,6 @@ static void simple_merge(RTableRow *acc, RTableRow *new_row, int nth) {
+ 		iter_lhs = iter_lhs->n, iter_rhs = iter_rhs->n) {
+ 
+ 		item_lhs = iter_lhs->data;
+-		item_rhs = iter_rhs->data;
+ 
+ 		if (i != nth) {
+ 			if (!strcmp (item_lhs, "a")) {

@@ -1,0 +1,145 @@
+similarity index 100%
+rename from libr/asm/arch/dalvik/opcode.h
+rename to libr/anal/arch/dalvik/opcode.h
+
+
+
+
+@@ -1,16 +1,28 @@
+ /* radare - LGPL - Copyright 2010-2019 - pancake */
+ 
+-#include <r_types.h>
+-#include <r_lib.h>
+-#include <r_asm.h>
+ #include <r_anal.h>
+-
+-#include "../../asm/arch/dalvik/opcode.h"
+-#include "../../bin/format/dex/dex.h"
++#include <dalvik/opcode.h>
+ 
+ #define GETWIDE "32,v%u,<<,v%u,|"
+ #define SETWIDE "DUP,v%u,=,32,SWAP,>>,v%u,="
+ 
++static inline int _anal_get_offset(RAnal *a, int type, int idx) {
++	if (a && a->binb.bin && a->binb.get_offset) {
++		return a->binb.get_offset (a->binb.bin, type, idx);
++	}
++
++	return -1;
++}
++
++static inline const char *_anal_get_name(RAnal *a, int type, int idx) {
++	if (a && a->binb.bin && a->binb.get_name) {
++		return a->binb.get_name (a->binb.bin, type, idx,
++				(bool)a->coreb.cfggeti (a->coreb.core, "asm.pseudo"));
++	}
++
++	return NULL;
++}
++
+ static const char *getCond(ut8 cond) {
+ 	switch (cond) {
+ 	case 0x32: // if-eq
+@@ -257,14 +269,531 @@ static void dalvik_math_op(RAnalOp* op, const unsigned char* data, int len,
+ 	}
+ }
+ 
++static int dalvik_disassemble(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len, int size) {
++	r_return_val_if_fail  (a && op && buf && len > 0, -1);
++
++	int vA, vB, vC, vD, vE, vF, vG, vH, payload = 0, opcode = (int) buf[0];
++	char str[1024], *strasm = NULL;
++	const char *flag_str = NULL;
++	ut64 offset;
++
++	a->config->dataalign = 2;
++
++	if (buf[0] == 0x00) { /* nop */
++		if (len < 2) {
++			return -1;
++		}
++		op->nopcode = 2;
++		switch (buf[1]) {
++		case 0x01: /* packed-switch-payload */
++			// ushort size
++			// int first_key
++			// int[size] = relative offsets
++			{
++				ut16 array_size = buf[2] | (buf[3] << 8);
++				int first_key = buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24);
++				op->mnemonic = r_str_newf ("packed-switch-payload %d, %d", array_size, first_key);
++				size = 8;
++				payload = 2 * (array_size * 2);
++				len = 0;
++			}
++			break;
++		case 0x02: /* sparse-switch-payload */
++			// ushort size
++			// int[size] keys
++			// int[size] relative offsets
++			{
++				ut16 array_size = buf[2] | (buf[3] << 8);
++				op->mnemonic = r_str_newf ("sparse-switch-payload %d", array_size);
++				size = 4;
++				payload = 2 * (array_size * 4);
++				len = 0;
++			}
++			break;
++		case 0x03: /* fill-array-data-payload */
++			// element_width = 2 bytes ushort little endian
++			// size = 4 bytes uint
++			// ([size*element_width+1)/2)+4
++			if (len > 7) {
++				ut16 elem_width = buf[2] | (buf[3] << 8);
++				ut32 array_size = buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24);
++				op->mnemonic = r_str_newf ("fill-array-data-payload %d, %d", elem_width, array_size);
++				payload = array_size * elem_width;
++			}
++			size = 8;
++			len = 0;
++			break;
++		default:
++			/* nop */
++			break;
++		}
++	}
++
++	strasm = NULL;
++	if (size <= len) {
++		strasm = strdup (dalvik_opcodes[opcode].name);
++		size = dalvik_opcodes[opcode].len;
++		switch (dalvik_opcodes[opcode].fmt) {
++		case fmtop: break;
++		case fmtopvAvB:
++			vA = buf[1] & 0x0f;
++			vB = (buf[1] & 0xf0) >> 4;
++			snprintf (str, sizeof (str), " v%i, v%i", vA, vB);
++			strasm = r_str_append (strasm, str);
++			break;
++		case fmtopvAAvBBBB:
++			vA = (int) buf[1];
++			vB = (buf[3] << 8) | buf[2];
++			snprintf (str, sizeof (str), " v%i, v%i", vA, vB);
++			strasm = r_str_append (strasm, str);
++			break;
++		case fmtopvAAAAvBBBB: // buf[1] seems useless :/
++			vA = (buf[3] << 8) | buf[2];
++			vB = (buf[5] << 8) | buf[4];
++			snprintf (str, sizeof (str), " v%i, v%i", vA, vB);
++			strasm = r_str_append (strasm, str);
++			break;
++		case fmtopvAA:
++			vA = (int) buf[1];
++			snprintf (str, sizeof (str), " v%i", vA);
++			strasm = r_str_append (strasm, str);
++			break;
++		case fmtopvAcB:
++			vA = buf[1] & 0x0f;
++			vB = (buf[1] & 0xf0) >> 4;
++			snprintf (str, sizeof (str), " v%i, %#x", vA, vB);
++			strasm = r_str_append (strasm, str);
++			break;
++		case fmtopvAAcBBBB:
++			vA = (int) buf[1];
++			{
++				short

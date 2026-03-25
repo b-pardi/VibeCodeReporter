@@ -1,0 +1,145 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,45 @@
++#ifndef __CALI_BPF_JUMP_H__
++#define __CALI_BPF_JUMP_H__
++
++#include "../include/conntrack.h"
++
++// struct cali_tc_state holds state that is passed between the BPF programs.
++// WARNING: must be kept in sync with the definitions in bpf/polprog/pol_prog_builder.go.
++struct cali_tc_state {
++	__be32 ip_src;
++	__be32 ip_dst;
++	__be32 post_nat_ip_dst;
++	__be32 nat_tun_src;
++	enum calico_policy_result pol_rc;
++	__u16 sport;
++	__u16 dport;
++	__u16 post_nat_dport;
++	__u8 ip_proto;
++	__u8 pad;
++	struct calico_ct_result ct_result;
++	struct calico_nat_dest nat_dest;
++	__u64 prog_start_time;
++};
++
++struct bpf_map_def_extended __attribute__((section("maps"))) cali_v4_state = {
++	.type           = BPF_MAP_TYPE_PERCPU_ARRAY,
++	.key_size       = sizeof(uint32_t),
++	.value_size     = sizeof(struct cali_tc_state),
++	.max_entries    = 1,
++#ifndef __BPFTOOL_LOADER__
++	.pinning_strategy = 2 /* global namespace */,
++#endif
++};
++
++struct bpf_map_def_extended __attribute__((section("maps"))) cali_jump = {
++	.type = BPF_MAP_TYPE_PROG_ARRAY,
++	.key_size = 4,
++	.value_size = 4,
++	.max_entries = 8,
++#ifndef __BPFTOOL_LOADER__
++	.map_id = 1,
++	.pinning_strategy = 1 /* object namespace */,
++#endif
++};
++
++#endif /* __CALI_BPF_JUMP_H__ */
+
+
+
+
+@@ -1,6 +1,12 @@
+ #ifndef __CALI_POLICY_H__
+ #define __CALI_POLICY_H__
+ 
++enum calico_policy_result {
++	CALI_POL_NO_MATCH,
++	CALI_POL_ALLOW,
++	CALI_POL_DENY,
++};
++
+ struct port_range {
+        __u64 ip_set_id;
+        __u16 min, max;
+@@ -12,6 +18,8 @@ struct cidr {
+ 
+ // IP sets, all stored in one big map with a prefix to identify the set.
+ 
++// WARNING: must be kept in sync with the definitions in bpf/polprog/pol_prog_builder.go.
++// WARNING: must be kept in sync with the definitions in bpf/ipsets/map.go.
+ struct ip4_set_key {
+ 	__u32 mask;
+ 	__be64 set_id;
+
+
+
+
+@@ -20,6 +20,7 @@
+ #include "../include/conntrack.h"
+ #include "../include/nat.h"
+ #include "../include/routes.h"
++#include "../include/jump.h"
+ #include "../include/reasons.h"
+ 
+ #ifndef CALI_FIB_LOOKUP_ENABLED
+@@ -30,12 +31,6 @@
+ #define CALI_DROP_WORKLOAD_TO_HOST false
+ #endif
+ 
+-enum calico_policy_result {
+-	CALI_POL_NO_MATCH,
+-	CALI_POL_ALLOW,
+-	CALI_POL_DENY,
+-};
+-
+ #ifdef CALI_DEBUG_ALLOW_ALL
+ 
+ /* If we want to just compile the code without defining any policies and to
+@@ -49,11 +44,11 @@ enum calico_policy_result {
+ 
+ #else
+ 
+-static CALI_BPF_INLINE enum calico_policy_result execute_policy_norm(struct __sk_buff *skb,__u8 ip_proto, __u32 saddr, __u32 daddr, __u16 sport, __u16 dport) {
++static CALI_BPF_INLINE enum calico_policy_result execute_policy_aof(struct __sk_buff *skb,__u8 ip_proto, __u32 saddr, __u32 daddr, __u16 sport, __u16 dport) {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wunused-label"
+ 
+-	// __NORMAL_POLICY__
++	// __AOF_POLICY__
+ 
+ 	return CALI_POL_NO_MATCH;
+ 	deny:
+@@ -63,11 +58,11 @@ static CALI_BPF_INLINE enum calico_policy_result execute_policy_norm(struct __sk
+ #pragma clang diagnostic pop
+ }
+ 
+-static CALI_BPF_INLINE enum calico_policy_result execute_policy_aof(struct __sk_buff *skb,__u8 ip_proto, __u32 saddr, __u32 daddr, __u16 sport, __u16 dport) {
++static CALI_BPF_INLINE enum calico_policy_result execute_policy_norm(struct __sk_buff *skb,__u8 ip_proto, __u32 saddr, __u32 daddr, __u16 sport, __u16 dport) {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wunused-label"
+ 
+-	// __AOF_POLICY__
++	// __NORMAL_POLICY__
+ 
+ 	return CALI_POL_NO_MATCH;
+ 	deny:
+@@ -77,6 +72,28 @@ static CALI_BPF_INLINE enum calico_policy_result execute_policy_aof(struct __sk_
+ #pragma clang diagnostic pop
+ }
+ 
++__attribute__((section("1/0")))
++int calico_tc_norm_pol_tail(struct __sk_buff *skb) {
++	CALI_DEBUG("Entering normal policy tail call\n");
++
++	__u32 key = 0;
++	struct cali_tc_state *state = bpf_map_lookup_elem(&cali_v4_state, &key);
++	if (!state) {
++	        CALI_DEBUG("State map lookup failed: DROP\n");
++	        goto deny;
++	}
++
++	enum calico_policy_result pol_rc = exec

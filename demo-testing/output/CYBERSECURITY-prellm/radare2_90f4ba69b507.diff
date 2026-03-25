@@ -1,0 +1,139 @@
+@@ -322,6 +322,17 @@ typedef struct {
+ 	uint32_t nlistCount;
+ } cache_locsym_entry_t;
+ 
++typedef struct {
++	uint64_t address;
++	uint64_t size;
++	uint64_t fileOffset;
++	uint64_t slideInfoOffset;
++	uint64_t slideInfoSize;
++	uint64_t unknown;
++	uint32_t maxProt;
++	uint32_t initProt;
++} cache_mapping_slide;
++
+ #define DYLD_CACHE_SLIDE_PAGE_ATTRS 0xC000
+ #define DYLD_CACHE_SLIDE_PAGE_ATTR_EXTRA 0x8000
+ #define DYLD_CACHE_SLIDE_PAGE_ATTR_NO_REBASE 0x4000
+
+
+
+
+@@ -21,6 +21,17 @@ typedef struct {
+ 	ut64 start_of_data;
+ } RDyldRebaseInfo;
+ 
++typedef struct {
++	ut64 start;
++	ut64 end;
++	RDyldRebaseInfo *info;
++} RDyldRebaseInfosEntry;
++
++typedef struct {
++	RDyldRebaseInfosEntry *entries;
++	size_t length;
++} RDyldRebaseInfos;
++
+ typedef struct {
+ 	ut8 version;
+ 	ut64 slide;
+@@ -76,7 +87,7 @@ typedef struct _r_dyldcache {
+ 	RList *bins;
+ 	RBuffer *buf;
+ 	int (*original_io_read)(RIO *io, RIODesc *fd, ut8 *buf, int count);
+-	RDyldRebaseInfo *rebase_info;
++	RDyldRebaseInfos *rebase_infos;
+ 	cache_hdr_t *hdr;
+ 	cache_map_t *maps;
+ 	cache_accel_t *accel;
+@@ -234,6 +245,21 @@ static void r_dyld_locsym_free(RDyldLocSym *locsym) {
+ 	free (locsym);
+ }
+ 
++static ut64 rebase_infos_get_slide(RDyldCache *cache) {
++	if (!cache->rebase_infos || !cache->rebase_infos->length) {
++		return 0;
++	}
++
++	size_t i;
++	for (i = 0; i < cache->rebase_infos->length; i++) {
++		if (cache->rebase_infos->entries[i].info) {
++			return cache->rebase_infos->entries[i].info->slide;
++		}
++	}
++
++	return 0;
++}
++
+ static void r_dyld_locsym_entries_by_offset(RDyldCache *cache, RList *symbols, HtPP *hash, ut64 bin_header_offset) {
+ 	RDyldLocSym *locsym = cache->locsym;
+ 	if (!locsym->entries) {
+@@ -273,7 +299,8 @@ static void r_dyld_locsym_entries_by_offset(RDyldCache *cache, RList *symbols, H
+ 			}
+ 			sym->type = "LOCAL";
+ 			sym->vaddr = nlist->n_value;
+-			sym->paddr = va2pa (nlist->n_value, cache->hdr, cache->maps, cache->buf, cache->rebase_info->slide, NULL, NULL);
++			ut64 slide = rebase_infos_get_slide (cache);
++			sym->paddr = va2pa (nlist->n_value, cache->hdr, cache->maps, cache->buf, slide, NULL, NULL);
+ 
+ 			int len = locsym->strings_size - nlist->n_strx;
+ 			ut32 k;
+@@ -304,8 +331,15 @@ static void r_dyldcache_free(RDyldCache *cache) {
+ 	cache->bins = NULL;
+ 	r_buf_free (cache->buf);
+ 	cache->buf = NULL;
+-	rebase_info_free (cache->rebase_info);
+-	cache->rebase_info = NULL;
++	if (cache->rebase_infos) {
++		int i;
++		for (i = 0; i < cache->rebase_infos->length; i++) {
++			rebase_info_free (cache->rebase_infos->entries[i].info);
++			cache->rebase_infos->entries[i].info = NULL;
++		}
++		R_FREE (cache->rebase_infos->entries);
++		R_FREE (cache->rebase_infos);
++	}
+ 	R_FREE (cache->hdr);
+ 	R_FREE (cache->maps);
+ 	R_FREE (cache->accel);
+@@ -345,7 +379,8 @@ static ut64 bin_obj_va2pa(ut64 p, ut32 *offset, ut32 *left, RBinFile *bf) {
+ 		return 0;
+ 	}
+ 
+-	ut64 res = va2pa (p, cache->hdr, cache->maps, cache->buf, cache->rebase_info->slide, offset, left);
++	ut64 slide = rebase_infos_get_slide (cache);
++	ut64 res = va2pa (p, cache->hdr, cache->maps, cache->buf, slide, offset, left);
+ 	if (res == UT64_MAX) {
+ 		res = 0;
+ 	}
+@@ -490,28 +525,13 @@ beach:
+ 	return slide;
+ }
+ 
+-static RDyldRebaseInfo *get_rebase_info(RBinFile *bf, RDyldCache *cache) {
++static RDyldRebaseInfo *get_rebase_info(RBinFile *bf, RDyldCache *cache, ut64 slideInfoOffset, ut64 slideInfoSize, ut64 start_of_data, ut64 slide) {
+ 	ut8 *tmp_buf_1 = NULL;
+ 	ut8 *tmp_buf_2 = NULL;
+ 	ut8 *one_page_buf = NULL;
+ 	RBuffer *cache_buf = cache->buf;
+ 
+-	ut64 start_of_data = 0;
+-
+-	int i;
+-	for (i = 0; i < cache->hdr->mappingCount; i++) {
+-		int perm = prot2perm (cache->maps[i].initProt);
+-		if (!(perm & R_PERM_X)) {
+-			start_of_data = cache->maps[i].fileOffset;// + bf->o->boffset;
+-			break;
+-		}
+-	}
+-
+-	if (!start_of_data) {
+-		return NULL;
+-	}
+-
+-	ut64 offset = cache->hdr->slideInfoOffset;
++	ut64 offset = slideInfoOffset;
+ 	ut32 slide_info_version = 0;
+ 	if (r_buf_read_at (cache_buf, offset, (ut8*) &slide_info_version, 4) != 4) 

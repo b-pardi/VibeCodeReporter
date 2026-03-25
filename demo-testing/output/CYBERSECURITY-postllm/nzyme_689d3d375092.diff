@@ -1,0 +1,80 @@
+@@ -8,7 +8,8 @@ import app.nzyme.core.distributed.database.metrics.GaugeHistogramBucketMapper;
+ import app.nzyme.core.distributed.database.metrics.TimerSnapshotMapper;
+ import app.nzyme.core.distributed.messaging.postgres.PostgresMessageEntryMapper;
+ import app.nzyme.core.distributed.tasksqueue.postgres.PostgresTasksQueueEntryMapper;
+-import app.nzyme.core.dot11.db.BSSIDEntryMapper;
++import app.nzyme.core.dot11.db.BSSIDSummaryMapper;
++import app.nzyme.core.dot11.db.SSIDSummaryMapper;
+ import app.nzyme.core.events.db.EventActionEntryMapper;
+ import app.nzyme.core.events.db.EventEntryMapper;
+ import app.nzyme.core.events.db.SubscriptionEntryMapper;
+@@ -107,7 +108,8 @@ public class DatabaseImpl implements Database {
+                 .registerRowMapper(new EventEntryMapper())
+                 .registerRowMapper(new EventActionEntryMapper())
+                 .registerRowMapper(new SubscriptionEntryMapper())
+-                .registerRowMapper(new BSSIDEntryMapper());
++                .registerRowMapper(new BSSIDSummaryMapper())
++                .registerRowMapper(new SSIDSummaryMapper());
+ 
+         // Run migrations against underlying JDBC connection.
+         JdbcConnection connection = new JdbcConnection(jdbi.open().getConnection());
+
+
+
+
+@@ -1,55 +1,90 @@
+ package app.nzyme.core.dot11;
+ 
+ import app.nzyme.core.NzymeNode;
+-import app.nzyme.core.dot11.db.BSSIDEntry;
+-import org.apache.logging.log4j.LogManager;
+-import org.apache.logging.log4j.Logger;
++import app.nzyme.core.dot11.db.BSSIDSummary;
++import app.nzyme.core.dot11.db.SSIDSummary;
+ import org.joda.time.DateTime;
+ 
+ import java.util.List;
++import java.util.Optional;
+ import java.util.UUID;
+ 
+ public class Dot11 {
+ 
+-    private static final Logger LOG = LogManager.getLogger(Dot11.class);
+-
+     private final NzymeNode nzyme;
+ 
+     public Dot11(NzymeNode nzyme) {
+         this.nzyme = nzyme;
+     }
+ 
+-    public List<BSSIDEntry> findBSSIDs(int minutes, List<UUID> taps) {
++    public List<BSSIDSummary> findBSSIDs(int minutes, List<UUID> taps) {
+         return nzyme.getDatabase().withHandle(handle ->
+-                handle.createQuery("SELECT bssid, AVG(signal_strength_average) AS signal_strength_average, " +
+-                                "MAX(created_at) AS last_seen, SUM(hidden_ssid_frames) as hidden_ssid_frames " +
+-                                "FROM dot11_bssids WHERE created_at > :cutoff AND tap_uuid IN (<taps>) " +
+-                                "GROUP BY bssid")
++                handle.createQuery("SELECT b.bssid, AVG(b.signal_strength_average) AS signal_strength_average, " +
++                                "MAX(b.created_at) AS last_seen, SUM(b.hidden_ssid_frames) as hidden_ssid_frames, " +
++                                "ARRAY_AGG(DISTINCT(COALESCE(s.security_protocol, 'None'))) AS security_protocols, " +
++                                "ARRAY_AGG(DISTINCT(s.ssid)) AS ssids FROM dot11_bssids AS b " +
++                                "LEFT JOIN dot11_ssids AS s ON b.id = s.bssid_id " +
++                                "WHERE b.created_at > :cutoff AND b.tap_uuid IN (<taps>) " +
++                                "GROUP BY b.bssid")
+                         .bind("cutoff", DateTime.now().minusMinutes(minutes))
+                         .bindList("taps", taps)
+-                        .mapTo(BSSIDEntry.class)
++                        .mapTo(BSSIDSummary.class)
+                         .list()
+         );
+     }
+ 
+-    public List<String> findFingerprintsOfBSSID(int minutes, String bssid) {
++    public boolean bssidExist(String bssid, int minutes, List<UUID> taps) {
++        return nzyme.getDatabase().withHandle(handle ->
++                handle.createQuery("SELECT COUNT(*) FROM dot11_bssids " +
++                                "WHERE created_at > :cutoff AND tap_uuid IN (<taps>)")
++                        .bind("cutoff", DateTime.now().minusMinutes(minutes))
++                        .bindList("taps", taps)
++                        .mapTo(Long.class)
++       

@@ -1,0 +1,109 @@
+@@ -1002,6 +1002,78 @@ int OutputJsonBuilderBuffer(JsonBuilder *js, OutputJsonThreadCtx *ctx)
+     return 0;
+ }
+ 
++static inline enum LogFileType FileTypeFromConf(const char *typestr)
++{
++    enum LogFileType log_filetype = LOGFILE_TYPE_NOTSET;
++
++    if (typestr == NULL) {
++        log_filetype = LOGFILE_TYPE_FILE;
++    } else if (strcmp(typestr, "file") == 0 || strcmp(typestr, "regular") == 0) {
++        log_filetype = LOGFILE_TYPE_FILE;
++    } else if (strcmp(typestr, "unix_dgram") == 0) {
++        log_filetype = LOGFILE_TYPE_UNIX_DGRAM;
++    } else if (strcmp(typestr, "unix_stream") == 0) {
++        log_filetype = LOGFILE_TYPE_UNIX_STREAM;
++    } else if (strcmp(typestr, "redis") == 0) {
++#ifdef HAVE_LIBHIREDIS
++        log_filetype = LOGFILE_TYPE_REDIS;
++#else
++        FatalError(SC_ERR_FATAL, "redis JSON output option is not compiled");
++#endif
++    }
++    SCLogDebug("type %s, file type value %d", typestr, log_filetype);
++    return log_filetype;
++}
++
++static int LogFileTypePrepare(
++        OutputJsonCtx *json_ctx, enum LogFileType log_filetype, ConfNode *conf)
++{
++
++    if (log_filetype == LOGFILE_TYPE_FILE || log_filetype == LOGFILE_TYPE_UNIX_DGRAM ||
++            log_filetype == LOGFILE_TYPE_UNIX_STREAM) {
++        if (SCConfLogOpenGeneric(conf, json_ctx->file_ctx, DEFAULT_LOG_FILENAME, 1) < 0) {
++            return -1;
++        }
++        OutputRegisterFileRotationFlag(&json_ctx->file_ctx->rotation_flag);
++    }
++#ifdef HAVE_LIBHIREDIS
++    else if (log_filetype == LOGFILE_TYPE_REDIS) {
++        SCLogRedisInit();
++        ConfNode *redis_node = ConfNodeLookupChild(conf, "redis");
++        if (!json_ctx->file_ctx->sensor_name) {
++            char hostname[1024];
++            gethostname(hostname, 1023);
++            json_ctx->file_ctx->sensor_name = SCStrdup(hostname);
++        }
++        if (json_ctx->file_ctx->sensor_name == NULL) {
++            return -1;
++        }
++
++        if (SCConfLogOpenRedis(redis_node, json_ctx->file_ctx) < 0) {
++            return -1;
++        }
++    }
++#endif
++    else if (log_filetype == LOGFILE_TYPE_PLUGIN) {
++        if (json_ctx->file_ctx->threaded) {
++            /* Prepare for threaded log output. */
++            if (!SCLogOpenThreadedFile(NULL, NULL, json_ctx->file_ctx, 1)) {
++                return -1;
++            }
++        }
++        ConfNode *plugin_conf = ConfNodeLookupChild(conf, json_ctx->plugin->name);
++        void *init_data = NULL;
++        if (json_ctx->plugin->Init(json_ctx->plugin->internal ? conf : plugin_conf,
++                    json_ctx->file_ctx->threaded, &init_data) < 0) {
++            return -1;
++        }
++        json_ctx->file_ctx->plugin.plugin = json_ctx->plugin;
++        json_ctx->file_ctx->plugin.init_data = init_data;
++    }
++
++    return 0;
++}
++
+ /**
+  * \brief Create a new LogFileCtx for "fast" output style.
+  * \param conf The configuration node for this output.
+@@ -1010,6 +1082,7 @@ int OutputJsonBuilderBuffer(JsonBuilder *js, OutputJsonThreadCtx *ctx)
+ OutputInitResult OutputJsonInitCtx(ConfNode *conf)
+ {
+     OutputInitResult result = { NULL, false };
++    OutputCtx *output_ctx = NULL;
+ 
+     OutputJsonCtx *json_ctx = SCCalloc(1, sizeof(OutputJsonCtx));
+     if (unlikely(json_ctx == NULL)) {
+@@ -1038,20 +1111,16 @@ OutputInitResult OutputJsonInitCtx(ConfNode *conf)
+ 
+     if (sensor_name) {
+         json_ctx->file_ctx->sensor_name = SCStrdup(sensor_name);
+-        if (json_ctx->file_ctx->sensor_name  == NULL) {
+-            LogFileFreeCtx(json_ctx->file_ctx);
+-            SCFree(json_ctx);
+-            return result;
++        if (json_ctx->file_ctx->sensor_name == NULL) {
++            goto error_exit;
+         }
+     } else {
+         json_ctx->file_ctx->sensor_name = NULL;
+     }
+ 
+-    OutputCtx *output_ctx = SCCalloc(1, sizeof(OutputCtx));
++    output_ctx = SCCalloc(1, sizeof(OutputCtx));
+     if (unlikely(output_ctx == NULL)) {
+-        LogFileFreeCtx(json_ctx->file_ctx);
+-        SCFree(json_ctx);
+-        return result;
++        goto er

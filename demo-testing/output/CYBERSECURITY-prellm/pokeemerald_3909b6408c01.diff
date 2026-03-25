@@ -1,0 +1,149 @@
+similarity index 85%
+rename from include/malloc.h
+rename to include/alloc.h
+
+
+
+@@ -1,5 +1,5 @@
+-#ifndef GUARD_MALLOC_H
+-#define GUARD_MALLOC_H
++#ifndef GUARD_ALLOC_H
++#define GUARD_ALLOC_H
+ 
+ #define HEAP_SIZE 0x1C000
+ #define malloc Alloc
+@@ -19,4 +19,4 @@ void *AllocZeroed(u32 size);
+ void Free(void *pointer);
+ void InitHeap(void *pointer, u32 size);
+ 
+-#endif // GUARD_MALLOC_H
++#endif // GUARD_ALLOC_H
+
+
+
+
+@@ -25,6 +25,14 @@
+ #define INCBIN_S32 {0}
+ #endif // IDE support
+ 
++// Invalid / Out of Bound Placeholder values
++#define INVALID_U8 0xFF
++#define INVALID_U16 0xFFFF
++#define INVALID_U32 0xFFFFFFFF
++#define INVALID_S8 -1
++#define INVALID_S16 -1
++#define INVALID_S32 -1
++
+ #define ARRAY_COUNT(array) (size_t)(sizeof(array) / sizeof((array)[0]))
+ 
+ #define SWAP(a, b, temp)    \
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,210 @@
++#include "global.h"
++
++static void *sHeapStart;
++static u32 sHeapSize;
++static u32 malloc_c_unused_0300000c; // needed to align dma3_manager.o(.bss)
++
++#define MALLOC_SYSTEM_ID 0xA3A3
++
++struct MemBlock {
++    // Whether this block is currently allocated.
++    bool16 flag;
++
++    // Magic number used for error checking. Should equal MALLOC_SYSTEM_ID.
++    u16 magic;
++
++    // Size of the block (not including this header struct).
++    u32 size;
++
++    // Previous block pointer. Equals sHeapStart if this is the first block.
++    struct MemBlock *prev;
++
++    // Next block pointer. Equals sHeapStart if this is the last block.
++    struct MemBlock *next;
++
++    // Data in the memory block. (Arrays of length 0 are a GNU extension.)
++    u8 data[0];
++};
++
++void PutMemBlockHeader(void *block, struct MemBlock *prev, struct MemBlock *next, u32 size)
++{
++    struct MemBlock *header = (struct MemBlock *)block;
++
++    header->flag = FALSE;
++    header->magic = MALLOC_SYSTEM_ID;
++    header->size = size;
++    header->prev = prev;
++    header->next = next;
++}
++
++void PutFirstMemBlockHeader(void *block, u32 size)
++{
++    PutMemBlockHeader(block, (struct MemBlock *)block, (struct MemBlock *)block, size - sizeof(struct MemBlock));
++}
++
++void *AllocInternal(void *heapStart, u32 size)
++{
++    struct MemBlock *pos = (struct MemBlock *)heapStart;
++    struct MemBlock *head = pos;
++    struct MemBlock *splitBlock;
++    u32 foundBlockSize;
++
++    // Alignment
++    if (size & 3)
++        size = 4 * ((size / 4) + 1);
++
++    for (;;) {
++        // Loop through the blocks looking for unused block that's big enough.
++
++        if (!pos->flag) {
++            foundBlockSize = pos->size;
++
++            if (foundBlockSize >= size) {
++                if (foundBlockSize - size < 2 * sizeof(struct MemBlock)) {
++                    // The block isn't much bigger than the requested size,
++                    // so just use it.
++                    pos->flag = TRUE;
++                } else {
++                    // The block is significantly bigger than the requested
++                    // size, so split the rest into a separate block.
++                    foundBlockSize -= sizeof(struct MemBlock);
++                    foundBlockSize -= size;
++
++                    splitBlock = (struct MemBlock *)(pos->data + size);
++
++                    pos->flag = TRUE;
++                    pos->size = size;
++
++                    PutMemBlockHeader(splitBlock, pos, pos->next, foundBlockSize);
++
++                    pos->next = splitBlock;
++
++                    if (splitBlock->next != head)
++                        splitBlock->next->prev = splitBlock;
++                }
++
++                return pos->data;
++            }
++        }
++
++        if (pos->next == head)
++            return NULL;
++
++        pos = pos->next;
++    }
++}
++
++void FreeInternal(void *heapStart, void *pointer)
++{
++    if (pointer) {
++        struct MemBlock *head = (struct MemBlock *)heapStart;
++        struct MemBlock *block = (struct MemBlock *)((u8 *)pointer - sizeof(struct MemBlock));
++        block->flag = FALSE;
++
++        // If the freed block isn't the last one, merge with the next

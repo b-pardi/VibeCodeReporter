@@ -1,0 +1,123 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,2309 @@
++/* Copyright (C) 2025 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * Detect keyword for DNS response: dns.response
++ */
++
++#include "detect.h"
++#include "detect-parse.h"
++#include "detect-engine.h"
++#include "detect-engine-prefilter.h"
++#include "detect-engine-content-inspection.h"
++#include "detect-dns-response.h"
++#include "util-profiling.h"
++#include "rust.h"
++
++#ifdef UNITTESTS
++static void DetectDnsResponseRegisterTests(void);
++#endif
++
++static int detect_buffer_id = 0;
++typedef struct PrefilterMpm {
++    int list_id;
++    const MpmCtx *mpm_ctx;
++    const DetectEngineTransforms *transforms;
++} PrefilterMpm;
++
++enum DnsResponseSection {
++    DNS_RESPONSE_QUERY = 0,
++    DNS_RESPONSE_ANSWER,
++    DNS_RESPONSE_AUTHORITY,
++    DNS_RESPONSE_ADDITIONAL,
++
++    /* always last */
++    DNS_RESPONSE_MAX,
++};
++
++struct DnsResponseGetDataArgs {
++    enum DnsResponseSection response_section; /**< query, answer, authority, additional */
++    uint32_t response_id;                     /**< index into response resource records */
++    uint32_t local_id;                        /**< used as index into thread inspect array */
++};
++
++static int DetectSetup(DetectEngineCtx *de_ctx, Signature *s, const char *str)
++{
++    if (DetectBufferSetActiveList(de_ctx, s, detect_buffer_id) < 0) {
++        return -1;
++    }
++    if (DetectSignatureSetAppProto(s, ALPROTO_DNS) < 0) {
++        return -1;
++    }
++
++    return 0;
++}
++
++static InspectionBuffer *GetBuffer(DetectEngineThreadCtx *det_ctx, uint8_t flags,
++        const DetectEngineTransforms *transforms, void *txv, struct DnsResponseGetDataArgs *cbdata,
++        int list_id, bool get_rdata)
++{
++    InspectionBuffer *buffer =
++            InspectionBufferMultipleForListGet(det_ctx, list_id, cbdata->local_id);
++    if (buffer == NULL) {
++        return NULL;
++    }
++    if (buffer->initialized) {
++        return buffer;
++    }
++
++    const uint8_t *data = NULL;
++    uint32_t data_len = 0;
++
++    if (get_rdata) {
++        /* Get rdata values that are formatted as resource names.  */
++        switch (cbdata->response_section) {
++            case DNS_RESPONSE_ANSWER:
++                if (!SCDnsTxGetAnswerRdata(txv, cbdata->response_id, &data, &data_len)) {
++                    InspectionBufferSetupMultiEmpty(buffer);
++                    return NULL;
++                }
++                break;
++            case DNS_RESPONSE_AUTHORITY:
++                if (!SCDnsTxGetAuthorityRdata(txv, cbdata->response_id, &data, &data_len)) {
++                    InspectionBufferSetupMultiEmpty(buffer);
++                    return NULL;
++                }
++                break;
++            case DNS_RESPONSE_ADDITIONAL:
++                if (!SCDnsTxGetAdditionalRdata(txv, cbdata->response_id, &data, &data_len)) {
++                    InspectionBufferSetupMultiEmpty(buffer);
++                    return NULL;
++                }
++                break;
++            default:
++                InspectionBufferSetupMultiEmpty(buffer);
++                return NULL;
++        }
++    } else {
++        /* Get name values. */
++        switch (cbdata->response_section) {
++            case DNS_RESPONSE_QUERY:
++                if (!SCDnsTxGetQueryName(txv, true, cbdata->response_id, &data, &data_len)) {
++                   

@@ -1,0 +1,114 @@
+@@ -35,7 +35,7 @@ extern "C" {
+ }
+ 
+ // TODO: make these optional commandline params
+-#define MAX_STRLEN 256
++#define MAX_STRLEN 1024
+ #define STRUCT_RECURSION_LIMIT 256
+ 
+ std::vector<void*> tmp_single_ptrs;
+@@ -93,6 +93,26 @@ int is_likely_string(CPUState *cpu, target_ulong addr) {
+     return -1;
+ }
+ 
++void get_n_buf(CPUState *cpu, target_ulong addr, uint8_t *buf, uint64_t size) {
++    // Populate buf with data at addr of the provided size
++
++    uint8_t* dest;
++
++    // Read buffer, one character at a time (slower than a big read, but can handle failures)
++    //
++    for (int len=0; len < size; len++) {
++
++        dest = &buf[len];
++
++        if (panda_virtual_memory_read(cpu, addr + len, dest, 1) == -1) {
++            // read failed
++            buf[len] = '.'; // Might also want to warn that data is unavailable
++        //}else if (!isprint(buf[len])) {
++            //buf[len] = '.'; // Only printable characters?
++        }
++    }
++}
++
+ // Validate string
+ bool check_str(char* s) {
+     for (int i = 0; i < MAX_STRLEN; i++) {
+@@ -564,25 +584,92 @@ void log_argument(CPUState* cpu, const syscall_info_t *call, int i, Panda__Named
+         std::cout << call->argn[i] << "=";
+     }
+ 
++    // Special case: if an arg is named 'buf' and is a pointer
++    // and the next arg is a size_t, unsigned long, or
++    // with a name that contains 'size', 'len', or 'count'
++    // we read the length and then capture that many bytes of the buf
++
++    bool know_buf_len = false;
++    uint64_t buf_len = 0;
++
++    if (strcasestr(call->argn[i], "buf") != NULL // arg named buf
++        && i < call->nargs-1 // has a next arg
++        && (strcasestr(call->argn[i+1], "size")  != NULL ||
++            strcasestr(call->argn[i+1], "len")   != NULL ||
++            strcasestr(call->argn[i+1], "count") != NULL
++           ) // next arg name contains size, len, or count
++        ) {
++        know_buf_len = true;
++
++        // Some syscalls will have a max size as an arg and we'll need to calculate the actual size as a special-case
++        // e.g., sys_read which has the actual buffer size in the return value
++        if (strcmp(call->name, "sys_read") == 0) {
++          buf_len = get_syscall_retval(cpu);
++        } else {
++            switch (call->argt[i+1]) {
++              // Assume it will always be unsigned
++              case SYSCALL_ARG_U64:
++                  buf_len = (uint64_t) *((target_ulong *) rp->args[i+1]);
++                  break;
++
++              case SYSCALL_ARG_U32:
++                  buf_len = (uint64_t) *((uint32_t *) rp->args[i+1]);
++                  break;
++
++              case SYSCALL_ARG_U16:
++                  buf_len = (uint64_t) *((uint16_t *) rp->args[i+1]);
++                  break;
++
++              default:
++                  printf("Unknown buffer size type for field %s %d\n", call->argn[i+1],
++                                                                       call->argt[i+1]);
++            }
++        }
++    }
++
++    // Buf is a fixed size - ensure we don't overflow it
++    buf_len = std::min(buf_len, (uint64_t)MAX_STRLEN);
++
++
+     switch (call->argt[i]) {
+ 
+         case SYSCALL_ARG_STR_PTR:
+         {
+             target_ulong addr = *((target_ulong *)rp->args[i]);
+-            int len = get_string(cpu, addr, buf);
+-            if (sa) {
+-                if (len > 0) {
+-                    sa->str = strdup((const char *) buf);
++
++            if (know_buf_len) {
++              // It's a buffer of a fixed length
++              if (buf_len == 0) {
++                if (sa) {
++                  sa->bytes_val.data = NULL;
++                } else {
++                  std::cout << "\"\"";
+                 }
+-                else {
+-                    sa->str = strdup("n/a");
++              } else {
++                get_n_buf(cpu, addr, buf, buf_len);
++
++                if (sa) {
++                  unsigned char* data = (unsigned char*)malloc(sizeof(unsigned char)*buf_len);
++                  assert(data != NULL);
++       

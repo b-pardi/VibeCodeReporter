@@ -1,0 +1,71 @@
+@@ -38,6 +38,10 @@ public class UserContext {
+     public final Fragmenter fragmenter;
+ 
+     private CompletableFuture<CommittedWriterData> userData;
++
++    private HashMap<String, List<RetrievedCapability>> friendToRetrievedCapabilityCache = new HashMap<>(); // files shared with me
++    private HashMap<String, Set<String>> sharedWithCache = new HashMap<>(); //path to friends SharedWith
++
+     @JsProperty
+     public TrieNode entrie; // ba dum che!
+ 
+@@ -75,8 +79,10 @@ public class UserContext {
+         return entrie.hasWriteAccess();
+     }
+     @JsMethod
+-    public boolean isShared(FileTreeNode file) {
+-        return false;
++    public CompletableFuture<Boolean> isShared(FileTreeNode file) {
++        return file.getPath(network).thenApply(pathString -> {
++            return sharedWithCache.containsKey(pathString);
++        });
+     }
+     
+     public boolean isJavascript() {
+@@ -287,18 +293,37 @@ public class UserContext {
+         progressCallback.accept("Retrieving Friends");
+         CompletableFuture<CommittedWriterData> lock = new CompletableFuture<>();
+         return addToUserDataQueue(lock)
+-                .thenCompose(wd -> createFileTree(entrie, username, wd.props, network, crypto.random)
++                .thenCompose(wd -> createFileTree(entrie, username, wd.props, friendToRetrievedCapabilityCache, network, crypto.random)
+                         .thenCompose(root -> {
+                             this.entrie = root;
+                             return getByPath("/" + username + "/" + "shared")
+-                                    .thenApply(sharedOpt -> {
++                                    .thenCompose(sharedOpt -> {
+                                         if (!sharedOpt.isPresent())
+                                             throw new IllegalStateException("Couldn't find shared folder!");
+                                         lock.complete(wd);
+-                                        return this;
+-                                    });
++                                        return buildSharedWithCache(sharedOpt.get()).thenApply(res -> res);
++                                    }).thenApply(res -> this);
+                         }));
+     }
++    public CompletableFuture<Boolean> buildSharedWithCache(FileTreeNode sharedFolder) {
++        return sharedFolder.getChildren(network)
++                .thenCompose(children ->
++                        Futures.reduceAll(children,
++                                true,
++                                (x, friendDirectory) -> {
++                                    List<RetrievedCapability> retrievedCapabilityCache = new ArrayList<>();
++                                    return getSharingLinks(friendDirectory, retrievedCapabilityCache, network, crypto.random)
++                                            .thenApply( res -> {
++                                                String friendName = friendDirectory.getName();
++                                                retrievedCapabilityCache.stream().forEach(rc -> {
++                                                    Set<String> existingEntries = sharedWithCache.getOrDefault(rc.path, new HashSet<>());
++                                                    sharedWithCache.put(rc.path, existingEntries);
++                                                    existingEntries.add(friendName);
++                                                });
++                                                return res;
++                                            });
++                                }, (a, b) -> a && b).thenApply(done -> done));
++    }
+ 
+     public CompletableFuture<Boolean> cleanEntryPoints() {
+         CompletableFuture<CommittedWriterData> lock = new CompletableFuture<>();
+@@ -778,154 +803,49 @@ public class UserContext {
+ 
+     public CompletableFuture<Boolean> unShare(Path path, Set<String> readersToRemove) {
+         String pathString = path.toString();
+-        CompletableFuture<Optional<FileTreeNode>> byP

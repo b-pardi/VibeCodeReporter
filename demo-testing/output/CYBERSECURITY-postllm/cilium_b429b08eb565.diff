@@ -1,0 +1,133 @@
+@@ -42,6 +42,7 @@
+ #include "lib/l4.h"
+ #include "lib/drop.h"
+ #include "lib/encap.h"
++#include "lib/encrypt.h"
+ #include "lib/nat.h"
+ #include "lib/lb.h"
+ #include "lib/nodeport.h"
+@@ -1333,31 +1334,6 @@ int cil_from_host(struct __ctx_buff *ctx)
+ 	return handle_netdev(ctx, true);
+ }
+ 
+-#if defined(ENABLE_ENCRYPTED_OVERLAY)
+-/*
+- * If the traffic should be encrypted then CTX_ACT_REDIRECT is returned.
+- * Unless an error occurred, and the caller can return this code to TC.
+- *
+- * CTX_ACT_OK is returned if the traffic should continue normal processing.
+- *
+- * IS_ERR can be used to determine if this function ran into an error.
+- */
+-static __always_inline int do_encrypt_overlay(struct __ctx_buff *ctx)
+-{
+-	int ret = CTX_ACT_OK;
+-	struct iphdr __maybe_unused *ipv4;
+-	void __maybe_unused *data, *data_end = NULL;
+-
+-	if (!revalidate_data(ctx, &data, &data_end, &ipv4))
+-		return DROP_INVALID;
+-
+-	if (vxlan_get_vni(data, data_end, ipv4) == ENCRYPTED_OVERLAY_ID)
+-		ret = encrypt_overlay_and_redirect(ctx, data, data_end, ipv4);
+-
+-	return ret;
+-};
+-#endif /* ENABLE_ENCRYPTED_OVERLAY */
+-
+ /*
+  * to-netdev is attached as a tc egress filter to one or more physical devices
+  * managed by Cilium (e.g., eth0).
+@@ -1466,11 +1442,11 @@ skip_host_firewall:
+ #endif
+ 
+ #if defined(ENABLE_ENCRYPTED_OVERLAY)
+-	if (ctx_is_overlay(ctx)) {
+-		/* Determine if this is overlay traffic that should be recirculated
++	if (ctx_is_overlay(ctx) && get_identity(ctx) == ENCRYPTED_OVERLAY_ID) {
++		/* This is overlay traffic that should be recirculated
+ 		 * to the stack for XFRM encryption.
+ 		 */
+-		ret = do_encrypt_overlay(ctx);
++		ret = encrypt_overlay_and_redirect(ctx);
+ 		if (ret == CTX_ACT_REDIRECT) {
+ 			/* we are redirecting back into the stack, so TRACE_TO_STACK
+ 			 * for tracepoint
+
+
+
+
+@@ -745,6 +745,8 @@ int cil_to_overlay(struct __ctx_buff *ctx)
+ {
+ 	bool snat_done __maybe_unused = ctx_snat_done(ctx);
+ 	struct trace_ctx __maybe_unused trace;
++	struct bpf_tunnel_key tunnel_key = {};
++	__u32 src_sec_identity = UNKNOWN_ID;
+ 	int ret = TC_ACT_OK;
+ 	__u32 cluster_id __maybe_unused = 0;
+ 	__s8 ext_err = 0;
+@@ -773,7 +775,14 @@ int cil_to_overlay(struct __ctx_buff *ctx)
+ 	cluster_id = ctx_get_cluster_id_mark(ctx);
+ #endif
+ 
+-	ctx_set_overlay_mark(ctx);
++	/* We might see some unexpected packets without tunnel_key (eg. IPv6 ND).
++	 * No need to worry, the geneve/vxlan kernel drivers will drop them.
++	 */
++	if (!ctx_get_tunnel_key(ctx, &tunnel_key, TUNNEL_KEY_WITHOUT_SRC_IP, 0))
++		src_sec_identity = get_id_from_tunnel_id(tunnel_key.tunnel_id,
++							 ctx_get_protocol(ctx));
++
++	set_identity_mark(ctx, src_sec_identity, MARK_MAGIC_OVERLAY);
+ 
+ #ifdef ENABLE_NODEPORT
+ 	if (snat_done) {
+@@ -785,7 +794,7 @@ int cil_to_overlay(struct __ctx_buff *ctx)
+ out:
+ #endif
+ 	if (IS_ERR(ret))
+-		return send_drop_notify_error_ext(ctx, UNKNOWN_ID, ret, ext_err,
++		return send_drop_notify_error_ext(ctx, src_sec_identity, ret, ext_err,
+ 						  CTX_ACT_DROP, METRIC_EGRESS);
+ 	return ret;
+ }
+
+
+
+
+@@ -227,14 +227,17 @@ do_decrypt(struct __ctx_buff *ctx, __u16 proto)
+  *   - net.ipv4.conf.default.accept_local = 1
+  */
+ static __always_inline int
+-encrypt_overlay_and_redirect(struct __ctx_buff *ctx, void *data,
+-			     void *data_end, struct iphdr *ip4)
++encrypt_overlay_and_redirect(struct __ctx_buff *ctx)
+ {
++	struct iphdr *ip4, *inner_ipv4 = NULL;
+ 	struct endpoint_info *ep_info = NULL;
+-	struct iphdr *inner_ipv4 = NULL;
++	void *data, *data_end;
+ 	__u8 dst_mac = 0;
+ 	int ret = 0;
+ 
++	if (!revalidate_data(ctx, &data, &data_end, &ip4))
++		return DROP_INVALID;
++
+ 	ret = vxlan_get_inner_ipv4(data, data_end, ip4, &inner_ipv4);
+ 	if (!ret)
+ 		return DROP_INVALID;
+
+
+
+
+@@ -236,12 +236,6 @@ static __always_inline bool ctx_snat_done(const struct __sk_buff *ctx)
+ 	return (ctx->mark & MARK_MAGIC_HOST_MASK) == MARK_MAGIC_SNAT_DONE;
+ }
+ 
+-static __always_inline void ctx_set_overlay_mark(struct __sk_buff *ctx)
+-{
+-	ctx->mark &= ~MARK_MAGIC_HOST_MASK;
+-	ctx->mark |= MARK_MAGIC_OVERLAY;
+-}
+-
+ st

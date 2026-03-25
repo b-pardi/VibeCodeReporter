@@ -1,0 +1,144 @@
+new file mode 100755
+
+
+
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++/** A class to compute byte entropy of 256 bytes buffer**/
++class ShannonEntropyTest {
++    uint32_t bytecount[256] = {0};
++    uint32_t length = 0;
++
++public:
++    void add(uint8_t byte){
++        bytecount[byte]++;
++        length++;
++    }
++    float get(){
++        float entropy = 0;
++        for (int i = 0; i < 256; i++){
++            if (bytecount[i]){
++                float frequency = static_cast<float>(bytecount[i]) / static_cast<float>(length);
++                entropy += -frequency * log2f(frequency);
++             }
++        }
++        return entropy;
++    }
++    void reset(){
++        memset(bytecount, 0, sizeof(bytecount));
++        length = 0;
++    }
++};
+
+new file mode 100755
+
+
+
+@@ -0,0 +1,806 @@
++// This plugin logs the N calls to the functions in asids.
++// Then extracts and logs synthetic information about the called functions, including memory access information.
++
++#ifndef __STDC_FORMAT_MACROS
++#define __STDC_FORMAT_MACROS
++#endif
++
++#include "panda/plugin.h"
++#include "panda/plugin_plugin.h"
++
++#include "panda/tcg-llvm.h"
++#include <llvm/InstVisitor.h>
++#include <llvm/IR/InstrTypes.h>
++
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <fstream>
++#include <map>
++#include <set>
++#include <utility>
++#include <unordered_set>
++#include <unordered_map>
++#include <vector>
++
++#include <bits/stdc++.h> 
++#include <algorithm>
++
++#include <stdio.h>
++#include "json.hpp"
++#include <cctype>
++#include <regex>
++#include "callstack_instr/callstack_instr.h"
++#include "callstack_instr/callstack_instr_ext.h"
++
++#include "ShannonEntropyTest.hpp"
++
++#include <capstone/capstone.h>
++#if defined(TARGET_I386)
++#include <capstone/x86.h>
++#elif defined(TARGET_ARM)
++#include <capstone/arm.h>
++#elif defined(TARGET_PPC)
++#include <capstone/ppc.h>
++#endif
++
++// ############ llvm_visiting ############
++#include <inttypes.h>
++#include <stdint.h>
++// ############ llvm_visiting ############
++
++extern "C" {
++  bool init_plugin(void *);
++  void uninit_plugin(void *);
++}
++
++using namespace std;
++using Asid = target_ulong;
++using Address = target_ulong;
++using Funid = std::pair<Asid, Address>;
++static std::ofstream outfstream;
++static std::set<Asid> tracked_asids;
++
++static std::map<Funid, int> n_calls; //number of calls per function
++static int calls_to_monitor_per_fn_entrypoint = 1;
++static int enteries_from_callstack_per_fn_entrypoint = 1;
++static bool print_addr_as_hex = false;
++static uint64_t target_end_count = 0;
++
++// Stores the LLVM visiting information of the called function.
++struct LLVMVisitCount {
++    uint32_t insn_arit = 0;
++    uint32_t insn_tot = 0;
++    uint32_t bb = 0; //visitor for basic blocks
++    uint32_t insn_load = 0;
++    uint32_t insn_store = 0;
++    uint32_t insn_intrinsic = 0;
++    uint32_t insn_call = 0;
++    uint32_t insn_alloc = 0;
++    uint32_t modules = 0; //visitor for modules
++    uint32_t fn = 0; //visitor for functions
++};
++
++// Stores the data byte for a memory address (pc).
++struct PCData{
++    target_ulong pc;
++    uint8_t data;
++};
++
++// Stores the information about the called function.
++struct CallInfo {
++    // Writeset and readset tracking 
++    // Log the calls to any given function, together with their writeset, readset, etc
++    std::map<Address, PCData> writeset; //memory write set, including memory addresses and data, one byte of data per addr
++    std::map<Address, PCData> readset; //memory write set, including memory addresses and data, one byte of data per addr
++    std::map<Address, int> block_executions;
++    Asid asid;
++    uint64_t entrypoint; //the function identifier / entrypoint (the start program counter) / current function
++    int writes = 0; //total bytes written to memory
++    int reads = 0; //total bytes read from memory
++    uint64_t caller;   //the caller addr which is the same as the return address of the stack_entry
++    std::vector<Addre

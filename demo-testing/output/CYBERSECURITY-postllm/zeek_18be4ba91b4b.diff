@@ -1,0 +1,126 @@
+@@ -776,7 +776,7 @@ private:
+ 	std::string GenConstExpr(const ConstExpr* c, GenType gt);
+ 	std::string GenIncrExpr(const Expr* e, GenType gt, bool is_incr, bool top_level);
+ 	std::string GenCondExpr(const Expr* e, GenType gt);
+-	std::string GenCallExpr(const CallExpr* c, GenType gt);
++	std::string GenCallExpr(const CallExpr* c, GenType gt, bool top_level);
+ 	std::string GenInExpr(const Expr* e, GenType gt);
+ 	std::string GenFieldExpr(const FieldExpr* fe, GenType gt);
+ 	std::string GenHasFieldExpr(const HasFieldExpr* hfe, GenType gt);
+
+
+
+
+@@ -114,7 +114,7 @@ string CPPCompile::GenExpr(const Expr* e, GenType gt, bool top_level)
+ 		case EXPR_COND:
+ 			return GenCondExpr(e, gt);
+ 		case EXPR_CALL:
+-			return GenCallExpr(e->AsCallExpr(), gt);
++			return GenCallExpr(e->AsCallExpr(), gt, top_level);
+ 		case EXPR_LIST:
+ 			return GenListExpr(e, gt, false);
+ 		case EXPR_IN:
+@@ -291,7 +291,7 @@ string CPPCompile::GenCondExpr(const Expr* e, GenType gt)
+ 	return string("(") + gen1 + ") ? (" + gen2 + ") : (" + gen3 + ")";
+ 	}
+ 
+-string CPPCompile::GenCallExpr(const CallExpr* c, GenType gt)
++string CPPCompile::GenCallExpr(const CallExpr* c, GenType gt, bool top_level)
+ 	{
+ 	const auto& t = c->GetType();
+ 	auto f = c->Func();
+@@ -347,7 +347,18 @@ string CPPCompile::GenCallExpr(const CallExpr* c, GenType gt)
+ 		// Indirect call.
+ 		gen = string("(") + gen + ")->AsFunc()";
+ 
+-	string invoke_func = is_async ? "when_invoke__CPP" : "invoke__CPP";
++	string invoke_func;
++
++	if ( is_async )
++		invoke_func = "when_invoke__CPP";
++	else if ( t->Tag() == TYPE_VOID )
++		{
++		ASSERT(top_level);
++		invoke_func = "invoke_void__CPP";
++		}
++	else
++		invoke_func = "invoke__CPP";
++
+ 	auto args_list = string(", {") + GenExpr(args_l, GEN_VAL_PTR) + "}";
+ 	auto invoker = invoke_func + "(" + gen + args_list + ", f__CPP";
+ 
+@@ -356,6 +367,10 @@ string CPPCompile::GenCallExpr(const CallExpr* c, GenType gt)
+ 
+ 	invoker += ")";
+ 
++	if ( top_level )
++		// No need to use accessor.
++		return invoker;
++
+ 	if ( IsNativeType(t) && gt != GEN_VAL_PTR )
+ 		return invoker + NativeAccessor(t);
+ 
+
+
+
+
+@@ -51,9 +51,13 @@ ValPtr index_table__CPP(const TableValPtr& t, vector<ValPtr> indices)
+ 
+ ValPtr index_vec__CPP(const VectorValPtr& vec, int index)
+ 	{
++	if ( index < 0 )
++		index += vec->Size();
++
+ 	auto v = vec->ValAt(index);
+ 	if ( ! v )
+ 		reporter->CPPRuntimeError("no such index");
++
+ 	return v;
+ 	}
+ 
+
+
+
+
+@@ -48,12 +48,28 @@ extern ValPtr when_index_vec__CPP(const VectorValPtr& vec, int index);
+ // custom one for those occurring inside a "when" clause.
+ extern ValPtr when_index_slice__CPP(VectorVal* vec, const ListVal* lv);
+ 
++// Calls out to the given script or BiF function, which does not return
++// a value.
++inline ValPtr invoke_void__CPP(Func* f, std::vector<ValPtr> args, Frame* frame)
++	{
++	return f->Invoke(&args, frame);
++	}
++
++// Used for error propagation by failed calls.
++class CPPInterpreterException : public InterpreterException
++	{
++	};
++
+ // Calls out to the given script or BiF function.  A separate function because
+ // of the need to (1) construct the "args" vector using {} initializers,
+ // but (2) needing to have the address of that vector.
+ inline ValPtr invoke__CPP(Func* f, std::vector<ValPtr> args, Frame* frame)
+ 	{
+-	return f->Invoke(&args, frame);
++	auto v = f->Invoke(&args, frame);
++	if ( ! v )
++		throw CPPInterpreterException();
++
++	return v;
+ 	}
+ 
+ // The same, but raises an interpreter exception if the function does
+
+
+
+
+@@ -26,12 +26,17 @@ static bool check_vec_sizes__CPP(const VectorValPtr& v1, const VectorValPtr& v2)
+ // (for example, adding one vector of "interval" to another), which
+ // we want to do using the low-level representations.  We'll later
+ // convert the vector to the high-level representation if needed.
+-static VectorTypePtr base_vector_type__CPP(const VectorTypePtr& vt)
++//
++// One exception: for booleans ("is_bool" is true), we use those directly.
++static VectorTypePtr base_vector_type__CPP(const VectorTypePtr& vt, bool is_bool = false

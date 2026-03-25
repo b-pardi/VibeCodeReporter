@@ -1,0 +1,96 @@
+@@ -1,37 +1,42 @@
++import base64
++import hashlib
+ import re
+ from http import HTTPStatus
++from http.server import HTTPServer, BaseHTTPRequestHandler
+ from os import environ
+ from time import sleep
+-from urllib.parse import urlencode
++from urllib.parse import urlparse, parse_qs
+ import logging
++import uuid
+ import requests
++import threading
++import webbrowser
+ from prompt_toolkit import HTML, print_formatted_text, prompt
++from tabulate import tabulate
+ 
+ 
+ from ..importer import BaseImporter, Record, RecordField
++import secrets
++import string
+ 
+ 
+ class CyberArkPortalImporter(BaseImporter):
+     """CyberArk Portal Importer
+-    This importer allows users to import records from the CyberArk User Portal.
+-    Users authenticate using their (personal) CyberArk credentials then the importer
+-    retrieves applications and secured items data and yields them as Keeper records.
+-    Authentication uses the CyberArk Identity Portal API but may be redirected to an SSO provider.
+-    CyberArk Identity Portal API authentication is a multi-step process that may require
+-    entering a one-time password (OTP) or other out-of-band (OOB) authentication
+-    mechanisms depending on the user's security settings.
++    This importer enables users to import Applications and SecuredItems from the CyberArk User Portal.
++    If the User is authenticated via SSO, it will use OAuth2 with PKCE for authorization.
++    Otherwise it will attempt to authenticate using the CyberArk Identity API.
++    After successful authentication, it creates a Keeper record for each Application,
++    and Secured Item in the user's portal.
+ 
+     The API documentation can be found at
+     https://api-docs.cyberark.com/docs/identity-api-reference/
+ 
+     Yields:
+-        Record: Login type Keeper Records for applications and Secure Notes for secured items data.
++        Keeper login type records for Applications and Passwords and secure note records for SecuredItems.
+     """
+ 
+-    # Delay between requests to avoid hitting the API rate limits
+-    LOOP_DELAY = 0.025
+-    # Request timeout in seconds
+-    TIMEOUT = 10
++    LOOP_DELAY = 0.025  # Use quarter millisecond delay between requests to avoid hitting the API rate limits
++    TIMEOUT = 10  # Wait up to 10 seconds for CyberArk API requests
+ 
+     @staticmethod
+     def get_url(id_tenant, endpoint):
+@@ -49,13 +54,14 @@ class CyberArkPortalImporter(BaseImporter):
+             },
+             timeout=self.TIMEOUT,
+         )
++
+         if response.status_code != HTTPStatus.OK:
+             logging.error(f"Error starting authentication: {response.text}")
+             return
+-
+         start_auth_result = response.json().get("Result")
+         logging.debug(f"Authentication Result: {start_auth_result}")
+         redirect = start_auth_result.get("PodFqdn")
++
+         if redirect:
+             print_formatted_text(
+                 HTML(
+@@ -63,81 +69,243 @@ class CyberArkPortalImporter(BaseImporter):
+                 )
+             )
+             return
+-        idp_redirect_url = start_auth_result.get("IdpRedirectUrl")
+-        if idp_redirect_url:
+-            print_formatted_text(HTML("<ansired>Federated login</ansired> is not supported."))
+-            return
+ 
+-        password_operation = {
+-            "MechanismId": start_auth_result["Challenges"][0]["Mechanisms"][0]["MechanismId"],
+-            "Action": "Answer",
+-            "Answer": environ.get("KEEPER_CYBERARK_PASSWORD")
+-            or prompt("CyberArk Identity Portal password: ", is_password=True),
+-        }
+-        session_id = start_auth_result.get("SessionId")
+-        advance_auth_request = {
+-            "TenantId": id_tenant,
+-            "SessionId": session_id,
+-        }
+-        if len(start_auth_result["Challenges"]) > 1:
+-            challenge_mechs = list(start_auth_result["Challenges"][1]["Mechanisms"])
+-            # Use a batch-operation to send the password and start OOB authentication in one request
+-            advance_auth_request["Multip

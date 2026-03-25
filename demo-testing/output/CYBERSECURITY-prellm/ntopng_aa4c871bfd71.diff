@@ -1,0 +1,150 @@
+@@ -628,6 +628,8 @@ public:
+   inline AssetManagement* get_am()                          { return(&am);              }
+ #endif
+   inline Mutex* get_pools_lock()                            { return(&pools_lock);      }
++
++  bool createPcapInterface(const char *path, int *iface_id);
+ };
+ 
+ extern Ntop *ntop;
+
+
+
+
+@@ -27,7 +27,9 @@
+ class PcapInterface : public NetworkInterface {
+  private:
+   pcap_t *pcap_handle;
+-  bool read_pkts_from_pcap_dump, read_pkts_from_pcap_dump_done, emulate_traffic_directions, read_from_stdin_pipe;
++  char *pcap_path;
++  bool read_pkts_from_pcap_dump, read_pkts_from_pcap_dump_done,
++    emulate_traffic_directions, read_from_stdin_pipe, delete_pcap_when_done;
+   ProtoStats prev_stats_in, prev_stats_out;
+   FILE *pcap_list;
+ 
+@@ -44,7 +46,7 @@ class PcapInterface : public NetworkInterface {
+   };
+ 
+  public:
+-  PcapInterface(const char *name, u_int8_t ifIdx);
++  PcapInterface(const char *name, u_int8_t ifIdx, bool _delete_pcap_when_done);
+   virtual ~PcapInterface();
+ 
+   bool isDiscoverableInterface()    { return(getMDNS() != NULL  && !isTrafficMirrored()); };
+
+
+
+
+@@ -87,7 +87,6 @@ static int ntop_dump_file(lua_State* vm) {
+   if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TSTRING) != CONST_LUA_OK) return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_ERROR));
+   if((fname = (char*)lua_tostring(vm, 1)) == NULL)     return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_PARAM_ERROR));
+ 
+-  ntop->fixPath(fname);
+   if((fd = fopen(fname, "r")) != NULL) {
+     char tmp[1024];
+ 
+@@ -1217,7 +1216,8 @@ static int ntop_unlink_file(lua_State* vm) {
+ 
+ static int ntop_register_pcap_interface(lua_State* vm) {
+   char *path = NULL;
+-
++  int if_id = -99;
++  
+   ntop->getTrace()->traceEvent(TRACE_DEBUG, "%s() called", __FUNCTION__);
+ 
+   if(lua_type(vm, 1) == LUA_TSTRING)
+@@ -1226,32 +1226,18 @@ static int ntop_register_pcap_interface(lua_State* vm) {
+   if((!ntop->isUserAdministrator(vm))
+      || (path == NULL)
+      || (ntop->get_num_interfaces() >= MAX_NUM_DEFINED_INTERFACES)) {
+-    lua_pushinteger(vm, -99);
++    ; /* No way */
+   } else {
+-    NetworkInterface *iface;
++    int id;
++    bool rc;
+ 
+     ntop->fixPath(path);
+-     
+-    try {
+-      errno = 0;
+-      iface = new PcapInterface(path, ntop->get_num_interfaces());
+-      if(ntop->registerInterface(iface)) {
+-	ntop->initInterface(iface);
+-	iface->allocateStructures();
+-	iface->startPacketPolling();
+-	lua_pushinteger(vm, iface->get_id());
+-      } else {
+-	lua_pushinteger(vm, -99);
+-      }
+-    } catch(int err) {
+-      ntop->getTrace()->traceEvent(TRACE_ERROR, "Unable to open interface %s with pcap [%d]: %s",
+-				   path, err, strerror(err));
+-      if(iface) delete iface;
+-      iface = NULL;
+-      lua_pushinteger(vm, -99);
+-    }
++    rc = ntop->createPcapInterface((const char*)path, &id);
++
++    if(rc) if_id = id;
+   }
+ 
++  lua_pushinteger(vm, if_id);
+   return(ntop_lua_return_value(vm, __FUNCTION__, CONST_LUA_OK));
+ }
+ 
+
+
+
+
+@@ -3679,3 +3679,43 @@ void Ntop::speedtest(lua_State *vm) {
+ 
+   speedtest_m.unlock(__FILE__, __LINE__);
+ }
++
++/* ******************************************* */
++
++bool Ntop::createPcapInterface(const char *path, int *iface_id) {
++#ifndef HAVE_NEDGE
++  NetworkInterface *iface;
++#endif
++  bool ret;
++  
++  *iface_id = -99;
++
++#ifndef HAVE_NEDGE
++  try {
++    errno = 0;
++    iface = new PcapInterface((const char*)path,
++			      (u_int8_t)ntop->get_num_interfaces(),
++			      true /* delete pcap when done */);
++    
++    if(ntop->registerInterface(iface)) {
++      ntop->initInterface(iface);
++      iface->allocateStructures();
++      iface->startPacketPolling();
++      *iface_id = iface->get_id();
++    }
++
++    ret = true;
++    
++  } catch(int err) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR,
++				 "Unable to open interface %s with pcap [%d]: %s",
++				 path, err, strerror(err));
++
++    ret = false;
++  }
++#else
++  ret = false;
++#endif
++  
++  return(ret);
++}
+
+
+
+
+@@ -29,15 +29,17 @@
+ 
+ /* ************************************

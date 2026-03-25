@@ -1,0 +1,143 @@
+@@ -337,13 +337,23 @@ typedef struct {
+ 	uint32_t nlistCount;
+ } cache_locsym_entry_large_t;
+ 
++enum {
++	DYLD_CACHE_MAPPING_AUTH_DATA = 1 << 0U,
++	DYLD_CACHE_MAPPING_DIRTY_DATA = 1 << 1U,
++	DYLD_CACHE_MAPPING_CONST_DATA = 1 << 2U,
++	DYLD_CACHE_MAPPING_TEXT_STUBS = 1 << 3U,
++	DYLD_CACHE_DYNAMIC_CONFIG_DATA = 1 << 4U,
++	DYLD_CACHE_READ_ONLY_DATA = 1 << 5U,
++	DYLD_CACHE_MAPPING_CONST_TPRO_DATA = 1 << 6U
++};
++
+ typedef struct {
+ 	uint64_t address;
+ 	uint64_t size;
+ 	uint64_t fileOffset;
+ 	uint64_t slideInfoOffset;
+ 	uint64_t slideInfoSize;
+-	uint64_t unknown;
++	uint64_t flags;
+ 	uint32_t maxProt;
+ 	uint32_t initProt;
+ } cache_mapping_slide;
+
+
+
+
+@@ -21,6 +21,7 @@ typedef struct _r_dyldcache {
+ 	ut64 *hdr_offset;
+ 	ut64 *hdr_overhead;
+ 	ut32 *maps_index;
++	ut64 *maps_flags;
+ 	ut32 n_hdr;
+ 	cache_map_t *maps;
+ 	ut32 n_maps;
+@@ -33,6 +34,7 @@ typedef struct _r_dyldcache {
+ 	RDyldLocSym *locsym;
+ 	objc_cache_opt_info *oi;
+ 	bool objc_opt_info_loaded;
++	bool images_are_global;
+ } RDyldCache;
+ 
+ typedef struct _r_bin_image {
+@@ -90,7 +92,7 @@ static cache_img_t *read_cache_images(RBuffer *cache_buf, cache_hdr_t *hdr, ut64
+ 		return NULL;
+ 	}
+ 
+-	if (r_buf_fread_at (cache_buf, hdr->imagesOffset, (ut8*) images, "3l2i", hdr->imagesCount) != size) {
++	if (r_buf_fread_at (cache_buf, (ut64) hdr->imagesOffset + hdr_offset, (ut8*) images, "3l2i", hdr->imagesCount) != size) {
+ 		R_FREE (images);
+ 		return NULL;
+ 	}
+@@ -281,6 +283,7 @@ static void r_dyldcache_free(RDyldCache *cache) {
+ 	R_FREE (cache->hdr);
+ 	R_FREE (cache->maps);
+ 	R_FREE (cache->maps_index);
++	R_FREE (cache->maps_flags);
+ 	R_FREE (cache->hdr_offset);
+ 	R_FREE (cache->hdr_overhead);
+ 	R_FREE (cache->accel);
+@@ -587,15 +590,25 @@ static void create_cache_bins(RBinFile *bf, RDyldCache *cache) {
+ 		eprintf ("bin.dyldcache: list of names to avoid loading all the files in memory.\n");
+ 	}
+ 
++	cache_img_t *img = NULL;
++	if (cache->images_are_global) {
++		img = read_cache_images (cache->buf, cache->hdr, 0);
++		if (!img) {
++			return;
++		}
++	}
++
+ 	ut32 i;
+ 	for (i = 0; i < cache->n_hdr; i++) {
+ 		cache_hdr_t *hdr = &cache->hdr[i];
+ 		ut64 hdr_offset = cache->hdr_offset[i];
+ 		ut64 hdr_overhead = cache->hdr_overhead[i];
+ 		ut32 maps_index = cache->maps_index[i];
+-		cache_img_t *img = read_cache_images (cache->buf, hdr, hdr_offset);
+ 		if (!img) {
+-			goto next;
++			img = read_cache_images (cache->buf, hdr, hdr_offset);
++			if (!img) {
++				goto next;
++			}
+ 		}
+ 
+ 		ut32 j;
+@@ -732,8 +745,11 @@ static void create_cache_bins(RBinFile *bf, RDyldCache *cache) {
+ next:
+ 		R_FREE (depArray);
+ 		R_FREE (extras);
+-		R_FREE (img);
++		if (!cache->images_are_global) {
++			R_FREE (img);
++		}
+ 	}
++	R_FREE (img);
+ end:
+ 	if (r_list_empty (bins)) {
+ 		r_list_free (bins);
+@@ -788,6 +804,7 @@ static void populate_cache_headers(RDyldCache *cache) {
+ 	ut64 overheads[MAX_N_HDR];
+ 	ut64 offset = 0, overhead = 0;
+ 	ut64 buf_size = r_buf_size (cache->buf);
++	ut32 n_zero_images = 0;
+ 	do {
+ 		offsets[cache->n_hdr] = offset;
+ 		overheads[cache->n_hdr] = overhead;
+@@ -796,6 +813,10 @@ static void populate_cache_headers(RDyldCache *cache) {
+ 			break;
+ 		}
+ 
++		if (!h->imagesCount && !h->imagesOffset) {
++			n_zero_images++;
++		}
++
+ 		ut64 size = h->codeSignatureOffset + h->codeSignatureSize;
+ 		if (!size || size > buf_size) {
+ 			break;
+@@ -808,12 +829,9 @@ static void populate_cache_headers(RDyldCache *cache) {
+ 		x += offset; \
+ 	}
+ 
+-		SHIFT_MAYBE (h->mappingOffset);
+-		SHIFT_MAYBE (h->imagesOffset);
+ 		SHIFT_MAYBE (h->codeSignatureOffset);
+ 		SHIFT_MAYBE (h->slideInfoOffset);
+ 		SHIFT_MAYBE (h->localSymbolsOffset);
+-		SHIFT_MAYBE (h->branchPoolsOffset);
+ 		SHIFT_MAYBE (h->imagesTextOffset);
+ 
+ 		offset += size;
+@@ -843,13 +861,23 @@ static void populate_cache_headers(RDyldCache *cache) {
+ 	memcpy (cache->hdr_offset, offsets, cache->n_hdr * sizeof (ut64));
+ 	memcpy (cache->hdr_overhead, overheads, cache->n_hdr * sizeof (ut64));
+ 
++	cache->images_are_global = n_zero_images == cache->n_hdr - 1;
++
+ 	ut32 i = 0;
+ 	

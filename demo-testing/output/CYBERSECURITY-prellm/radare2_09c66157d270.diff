@@ -1,0 +1,135 @@
+@@ -1,4 +1,4 @@
+-/* radare2 - LGPL - Copyright 2019 - pancake */
++/* radare2 - LGPL - Copyright 2019-2020 - pancake */
+ 
+ /* This code has been written by pancake which has been based on Alvaro's
+  * r2pipe-python script which was based on FireEye script for IDA Pro.
+@@ -11,49 +11,76 @@
+ 
+ typedef struct {
+ 	RCore *core;
+-	Sdb *db;
+-	int word_size;
++	HtUP *up;
++	size_t word_size;
+ 	RBinSection *_selrefs;
+ 	RBinSection *_msgrefs;
+ 	RBinSection *_const;
+ 	RBinSection *_data;
+ } RCoreObjc;
+ 
+-static bool isInvalid (ut64 addr) {
+-	return (!addr || addr == UT64_MAX);
++
++const size_t objc2ClassSize = 0x28;
++const size_t objc2ClassInfoOffs = 0x20;
++const size_t objc2ClassMethSize = 0x18;
++const size_t objc2ClassBaseMethsOffs = 0x20;
++const size_t objc2ClassMethImpOffs = 0x10;
++
++static void array_add(RCoreObjc *o, ut64 va, ut64 xrefs_to) {
++	bool found = false;
++	RVector *vec = ht_up_find (o->up, va, &found);
++	if (!found || !vec) {
++		vec = r_vector_new (sizeof (ut64), NULL, NULL);
++		ht_up_insert (o->up, va, vec);
++	}
++	ut64 *addr;
++	r_vector_foreach (vec, addr) {
++		if (xrefs_to == *addr) {
++			return;
++		}
++	}
++	// extend vector and insert new element
++	r_vector_push (vec, &xrefs_to);
++}
++
++static void kv_array_free(HtUPKv *kv) {
++	r_vector_free (kv->value);
++}
++
++static inline bool isValid(ut64 addr) {
++	return (addr != 0LL && addr != UT64_MAX);
+ }
+ 
+-static const char *addr_key (ut64 va) {
+-	return sdb_fmt ("refs.0x%08"PFMT64x, va);
++static inline bool isInvalid(ut64 addr) {
++	return !isValid (addr);
+ }
+ 
+-static bool inBetween(RBinSection *s, ut64 addr) {
+-	if (!s || addr == UT64_MAX) {
++static inline bool inBetween(RBinSection *s, ut64 addr) {
++	if (!s || isInvalid (addr)) {
+ 		return false;
+ 	}
+-	ut64 from = s->vaddr;
+-	ut64 to = from + s->vsize;
++	const ut64 from = s->vaddr;
++	const ut64 to = from + s->vsize;
+ 	return R_BETWEEN (from, addr, to);
+ }
+ 
+-static ut32 readDword (RCoreObjc *objc, ut64 addr, bool *success) {
++static ut32 readDword(RCoreObjc *objc, ut64 addr, bool *success) {
+ 	ut8 buf[4];
+ 	*success = r_io_read_at (objc->core->io, addr, buf, sizeof (buf));
+ 	return r_read_le32 (buf);
+ }
+ 
+-static ut64 readQword (RCoreObjc *objc, ut64 addr, bool *success) {
+-	ut8 buf[8];
++static ut64 readQword(RCoreObjc *objc, ut64 addr, bool *success) {
++	ut8 buf[8] = {0};
+ 	*success = r_io_read_at (objc->core->io, addr, buf, sizeof (buf));
+ 	return r_read_le64 (buf);
+ }
+ 
+ static void objc_analyze(RCore *core) {
+-	static const char *oldstr = NULL;
+-	oldstr = r_print_rowlog (core->print, "Analyzing searching references to selref");
++	const char *oldstr = r_print_rowlog (core->print, "Analyzing code to find selref references");
+ 	r_core_cmd0 (core, "aar");
+ 	if (!strcmp ("arm", r_config_get (core->config, "asm.arch"))) {
+-		bool emu_lazy = r_config_get_i (core->config, "emu.lazy");
++		const bool emu_lazy = r_config_get_i (core->config, "emu.lazy");
+ 		r_config_set_i (core->config, "emu.lazy", true);
+ 		r_core_cmd0 (core, "aae");
+ 		r_config_set_i (core->config, "emu.lazy", emu_lazy);
+@@ -61,92 +88,93 @@ static void objc_analyze(RCore *core) {
+ 	r_print_rowlog_done (core->print, oldstr);
+ }
+ 
+-static ut64 getRefPtr(RCoreObjc *objc, ut64 classMethodsVA, bool *res) {
+-	*res = false;
++static ut64 getRefPtr(RCoreObjc *o, ut64 classMethodsVA, bool *rfound) {
++	*rfound = false;
+ 
+ 	bool readSuccess;
+-	ut64 namePtr = readQword (objc, classMethodsVA, &readSuccess);
++	ut64 namePtr = readQword (o, classMethodsVA, &readSuccess);
+ 	if (!readSuccess) {
+ 		return UT64_MAX;
+ 	}
+ 
+-	int i, cnt = 0;
+-	ut64 res_at = 0LL;
+-	const char *k = addr_key (namePtr);
++	size_t cnt = 0;
++	ut64 ref = UT64_MAX;
++	bool isMsgRef = false;
+ 
+-	for (i = 0; ; i++) {
+-		ut64 at = sdb_array_get_num (objc->db, k, i, NULL);
+-		if (!at) {
+-			break;
+-		}
+-		if (inBetween (objc->_selrefs, at)) {
+-			*res = false;
+-			res_at = at;
+-		} else if (inBetween (objc->_msgrefs, at)) {
+-			*res = true;
+-			res_at = at;
+-		} else if (inBetween (objc->_const, at)) {
++	RVector *vec = ht

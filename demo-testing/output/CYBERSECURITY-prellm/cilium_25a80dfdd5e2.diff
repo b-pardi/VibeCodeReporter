@@ -1,0 +1,131 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,41 @@
++/*
++ *  Copyright (C) 2019 Authors of Cilium
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++#include <linux/if_packet.h>
++
++#include <node_config.h>
++#include <netdev_config.h>
++#include <bpf/api.h>
++
++#include <stdint.h>
++#include <stdio.h>
++
++#include "lib/common.h"
++
++__section("to-host")
++int to_host(struct __sk_buff *skb)
++{
++	// Upper 16 bits may carry proxy port number, clear it out
++	__u32 magic = skb->cb[0] & 0xFFFF;
++	if (magic == MARK_MAGIC_TO_PROXY) {
++		skb->mark = skb->cb[0];
++		skb->cb[0] = 0;
++	}
++	return TC_ACT_OK;
++}
++
++BPF_LICENSE("GPL");
+
+
+
+
+@@ -800,7 +800,7 @@ ipv6_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding
+ 	return TC_ACT_OK;
+ }
+ 
+-declare_tailcall_if(__and(is_defined(ENABLE_IPV4), is_defined(ENABLE_IPV6)), CILIUM_CALL_IPV6_TO_LXC)
++declare_tailcall_if(__and(is_defined(ENABLE_IPV4), is_defined(ENABLE_IPV6)), CILIUM_CALL_IPV6_TO_LXC_POLICY_ONLY)
+ int tail_ipv6_policy(struct __sk_buff *skb)
+ {
+ 	int ret, ifindex = skb->cb[CB_IFINDEX];
+@@ -822,11 +822,73 @@ int tail_ipv6_policy(struct __sk_buff *skb)
+ 	skb->cb[0] = skb->mark; // essential for proxy ingress, see bpf_ipsec.c
+ 	return ret;
+ }
++
++declare_tailcall_if(__and(is_defined(ENABLE_IPV4), is_defined(ENABLE_IPV6)), CILIUM_CALL_IPV6_TO_ENDPOINT)
++int tail_ipv6_to_endpoint(struct __sk_buff *skb)
++{
++	__u32 src_identity = skb->cb[CB_SRC_LABEL];
++	struct ep_config *cfg = lookup_ep_config();
++	int ret, forwarding_reason;
++	void *data, *data_end;
++	struct ipv6hdr *ip6;
++
++	if (!revalidate_data(skb, &data, &data_end, &ip6)) {
++		ret = DROP_INVALID;
++		goto out;
++	}
++
++	if (cfg == NULL) {
++		ret = DROP_NO_CONFIG;
++		goto out;
++	}
++
++	/* Packets from the proxy will already have a real identity. */
++	if (identity_is_reserved(src_identity)) {
++		union v6addr *src = (union v6addr *) &ip6->saddr;
++		struct remote_endpoint_info *info;
++
++		info = ipcache_lookup6(&IPCACHE_MAP, src, V6_CACHE_KEY_LEN);
++		if (info != NULL) {
++			__u32 sec_label = info->sec_label;
++			if (sec_label) {
++				/* When SNAT is enabled on traffic ingressing
++				 * into Cilium, all traffic from the world will
++				 * have a source IP of the host. It will only
++				 * actually be from the host if "src_identity"
++				 * (passed into this function) reports the src
++				 * as the host. So we can ignore the ipcache
++				 * if it reports the source as HOST_ID.
++				 */
++				if (sec_label != HOST_ID)
++					src_identity = sec_label;
++			}
++		}
++		cilium_dbg(skb, info ? DBG_IP_ID_MAP_SUCCEED6 : DBG_IP_ID_MAP_FAILED6,
++			   ((__u32 *) src)[3], src_identity);
++	}
++
++	cilium_dbg(skb, DBG_LOCAL_DELIVERY, LXC_ID, SECLABEL);
++
++#if defined LOCAL_DELIVERY_METRICS
++	update_metrics(skb->len, METRIC_INGRESS, REASON_FORWARDED);
++#endif
++
++	skb->cb[CB_SRC_LABEL] = 0;
++	ret = ipv6_policy(skb, 0, src_identity, &forwarding_reason, cfg);
++
++out:
++	if (IS_ERR(ret))
++		return send_drop_notify(skb, src_identity, SECLABEL, LXC_ID,
++					ret, TC_ACT_SHOT, METRIC_INGRESS);
++
++	return ret;
++}
++
+ #endif /* ENABLE_IPV6 */
+ 
+ #ifdef ENABLE_IPV4
+ static inline int __inline__
+-ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding_reason, struct ep_config *cfg)
++ipv4_policy(struct __sk_buff *skb, int ifindex, __u32 src_label, int *forwarding_re

@@ -1,0 +1,139 @@
+@@ -1,10 +1,13 @@
+ from __future__ import annotations
+ 
+ from pwndbg.aglib import arch as arch_mod
+-from pwndbg.aglib.arch import arch as arch
++from pwndbg.aglib.arch import PwndbgArchitecture
++from pwndbg.aglib.arch import get_pwndbg_architecture
+ 
+ regs = None
+ 
++arch: PwndbgArchitecture = get_pwndbg_architecture("i386")
++
+ 
+ def load_aglib():
+     import pwndbg.aglib.argv
+@@ -34,3 +37,8 @@ def load_aglib():
+     regs_: regs_mod.module = regs_mod
+     global regs
+     regs = regs_
++
++
++def set_arch(pwndbg_arch: PwndbgArchitecture):
++    global arch
++    arch = pwndbg_arch
+
+
+
+
+@@ -1,39 +1,380 @@
+ from __future__ import annotations
+ 
++import struct
++from typing import Dict
++from typing import List
+ from typing import Literal
++from typing import Tuple
+ 
+ import pwnlib
++from capstone import CS_ARCH_AARCH64
++from capstone import CS_ARCH_ARM
++from capstone import CS_ARCH_LOONGARCH
++from capstone import CS_ARCH_MIPS
++from capstone import CS_ARCH_PPC
++from capstone import CS_ARCH_RISCV
++from capstone import CS_ARCH_SPARC
++from capstone import CS_ARCH_SYSTEMZ
++from capstone import CS_ARCH_X86
++from capstone import CS_MODE_16
++from capstone import CS_MODE_32
++from capstone import CS_MODE_64
++from capstone import CS_MODE_ARM
++from capstone import CS_MODE_LOONGARCH64
++from capstone import CS_MODE_MCLASS
++from capstone import CS_MODE_MIPS32
++from capstone import CS_MODE_MIPS64
++from capstone import CS_MODE_RISCV32
++from capstone import CS_MODE_RISCV64
++from capstone import CS_MODE_RISCVC
++from capstone import CS_MODE_THUMB
++from capstone import CS_MODE_V9
++from typing_extensions import override
+ 
+ import pwndbg
++import pwndbg.aglib
++import pwndbg.aglib.disasm
++from pwndbg.aglib import typeinfo
++from pwndbg.lib.abi import ABI
++from pwndbg.lib.abi import DEFAULT_ABIS
++from pwndbg.lib.abi import SIGRETURN_ABIS
++from pwndbg.lib.abi import SYSCALL_ABIS
++from pwndbg.lib.abi import SyscallABI
++from pwndbg.lib.arch import PWNDBG_SUPPORTED_ARCHITECTURES_TYPE
+ from pwndbg.lib.arch import PWNLIB_ARCH_MAPPINGS
+-from pwndbg.lib.arch import Arch
++from pwndbg.lib.arch import ArchAttribute
++from pwndbg.lib.arch import ArchDefinition
++from pwndbg.lib.arch import Platform
+ 
++EndianType = Literal["little", "big"]
+ 
+-def read_thumb_bit() -> int | None:
++FMT_LITTLE_ENDIAN = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}
++FMT_BIG_ENDIAN = {1: "B", 2: ">H", 4: ">I", 8: ">Q"}
++
++
++registered_architectures: Dict[PWNDBG_SUPPORTED_ARCHITECTURES_TYPE, PwndbgArchitecture] = {}
++
++
++def register_arch(arch: PwndbgArchitecture):
++    registered_architectures[arch.name] = arch
++
++
++def get_pwndbg_architecture(name: PWNDBG_SUPPORTED_ARCHITECTURES_TYPE) -> PwndbgArchitecture | None:
++    if name not in registered_architectures:
++        return None
++
++    return registered_architectures[name]
++
++
++class PwndbgArchitecture(ArchDefinition):
++    """
++    This class defines the context of the currently debugged architecture as well as other related information of the platform.
++
++    This includes the following information:
++    - Capstone/Unicorn constants
++    - ABI information
++    """
++
++    ### All subclasses must provide values for the following attributes
++
++    max_instruction_size: int
++
++    ###
++
++    name: PWNDBG_SUPPORTED_ARCHITECTURES_TYPE
++    endian: EndianType
++    ptrsize: int
++    """Pointer size in bytes"""
++    ptrbits: int
++    """Pointer size in bits"""
++    ptrmask: int
++    function_abi: ABI | None
++    syscall_abi: SyscallABI | None
++    sigreturn_abi: SyscallABI | None
++    platform: Platform
++    attributes: List[ArchAttribute]
++
++    fmts: Dict[int, str]
++    fmt: str
++
++    def __init__(self, name: PWNDBG_SUPPORTED_ARCHITECTURES_TYPE) -> None:
++        self.name: PWNDBG_SUPPORTED_ARCHITECTURES_TYPE = name
++
++        # We have to set some values by default
++        # These will be set again by the code that detects the global architecture
++        self.update(
++            ArchDefinition(
++                name=name,
++                ptrsize=typeinfo.ptrsize

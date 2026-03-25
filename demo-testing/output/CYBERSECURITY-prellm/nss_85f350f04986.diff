@@ -1,0 +1,120 @@
+@@ -1035,27 +1035,6 @@ ssl3_config_match(const ssl3CipherSuiteCfg *suite, PRUint8 policy,
+     return ssl3_CipherSuiteAllowedForVersionRange(suite->cipher_suite, vrange);
+ }
+ 
+-/* Return the number of cipher suites that are usable. */
+-/* called from ssl3_SendClientHello */
+-static unsigned int
+-count_cipher_suites(sslSocket *ss, PRUint8 policy)
+-{
+-    unsigned int i, count = 0;
+-
+-    if (SSL_ALL_VERSIONS_DISABLED(&ss->vrange)) {
+-        return 0;
+-    }
+-    for (i = 0; i < ssl_V3_SUITES_IMPLEMENTED; i++) {
+-        if (ssl3_config_match(&ss->cipherSuites[i], policy, &ss->vrange, ss)) {
+-            count++;
+-        }
+-    }
+-    if (count == 0) {
+-        PORT_SetError(SSL_ERROR_SSL_DISABLED);
+-    }
+-    return count;
+-}
+-
+ /* For TLS 1.3, when resuming, check for a ciphersuite that is both compatible
+  * with the identified ciphersuite and enabled. */
+ static PRBool
+@@ -4903,6 +4882,201 @@ ssl_SetClientHelloSpecVersion(sslSocket *ss, ssl3CipherSpec *spec)
+     ssl_ReleaseSpecWriteLock(ss);
+ }
+ 
++static SECStatus
++ssl3_InsertChHeaderSize(const sslSocket *ss, sslBuffer *preamble, const sslBuffer *extensions)
++{
++    SECStatus rv;
++    unsigned int msgLen = preamble->len;
++    msgLen += extensions->len ? (2 + extensions->len) : 0;
++    unsigned int headerLen = IS_DTLS(ss) ? 12 : 4;
++
++    /* Record the message length. */
++    rv = sslBuffer_InsertNumber(preamble, 1, msgLen - headerLen, 3);
++    if (rv != SECSuccess) {
++        return SECFailure; /* code set */
++    }
++    if (IS_DTLS(ss)) {
++        /* Record the (unfragmented) fragment length. */
++        unsigned int offset = 1 /* ch */ + 3 /* len */ +
++                              2 /* seq */ + 3 /* fragment offset */;
++        rv = sslBuffer_InsertNumber(preamble, offset, msgLen - headerLen, 3);
++        if (rv != SECSuccess) {
++            return SECFailure; /* code set */
++        }
++    }
++
++    return SECSuccess;
++}
++
++static SECStatus
++ssl3_AppendCipherSuites(sslSocket *ss, PRBool fallbackSCSV, sslBuffer *buf)
++{
++    SECStatus rv;
++    unsigned int offset;
++    unsigned int i;
++    unsigned int saveLen;
++
++    rv = sslBuffer_Skip(buf, 2, &offset);
++    if (rv != SECSuccess) {
++        return SECFailure;
++    }
++
++    if (ss->ssl3.hs.sendingSCSV) {
++        /* Add the actual SCSV */
++        rv = sslBuffer_AppendNumber(buf, TLS_EMPTY_RENEGOTIATION_INFO_SCSV,
++                                    sizeof(ssl3CipherSuite));
++        if (rv != SECSuccess) {
++            return SECFailure;
++        }
++    }
++    if (fallbackSCSV) {
++        rv = sslBuffer_AppendNumber(buf, TLS_FALLBACK_SCSV,
++                                    sizeof(ssl3CipherSuite));
++        if (rv != SECSuccess) {
++            return SECFailure;
++        }
++    }
++
++    saveLen = SSL_BUFFER_LEN(buf);
++    /* CipherSuites are appended to Hello message here */
++    for (i = 0; i < ssl_V3_SUITES_IMPLEMENTED; i++) {
++        ssl3CipherSuiteCfg *suite = &ss->cipherSuites[i];
++        if (ssl3_config_match(suite, ss->ssl3.policy, &ss->vrange, ss)) {
++            rv = sslBuffer_AppendNumber(buf, suite->cipher_suite,
++                                        sizeof(ssl3CipherSuite));
++            if (rv != SECSuccess) {
++                return SECFailure;
++            }
++        }
++    }
++    if (SSL_ALL_VERSIONS_DISABLED(&ss->vrange) ||
++        (SSL_BUFFER_LEN(buf) - saveLen) == 0) {
++        PORT_SetError(SSL_ERROR_SSL_DISABLED);
++        return SECFailure;
++    }
++
++    return sslBuffer_InsertLength(buf, offset, 2);
++}
++
++static SECStatus
++ssl3_CreateClientHelloPreamble(sslSocket *ss, const sslSessionID *sid,
++                               PRBool realSid, PRUint16 version,
++                               const sslBuffer *extensions, sslBuffer *preamble)
++{
++    SECStatus rv;
++    sslBuffer constructed = SSL_BUFFER_EMPTY;
++    PORT_Assert(sid);
++    PRBool fallbackSCSV = ss->opt.enableFallbackSCSV &&
++                          (!realSid || version < sid->version);
++
++    rv = sslBuffer_AppendNumber(&c

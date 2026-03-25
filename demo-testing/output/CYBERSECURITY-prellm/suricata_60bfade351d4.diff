@@ -1,0 +1,153 @@
+@@ -38,6 +38,8 @@ enum {
+ #define FRAME_FLAG_TX_ID_SET BIT_U8(FRAME_FLAGE_TX_ID_SET)
+     FRAME_FLAGE_ENDS_AT_EOF,
+ #define FRAME_FLAG_ENDS_AT_EOF BIT_U8(FRAME_FLAGE_ENDS_AT_EOF)
++    FRAME_FLAGE_LOGGED,
++#define FRAME_FLAG_LOGGED BIT_U8(FRAME_FLAGE_LOGGED)
+ };
+ 
+ typedef struct Frame {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,419 @@
++/* Copyright (C) 2013-2021 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Victor Julien <victor@inliniac.net>
++ *
++ * Logs frames in JSON format.
++ *
++ */
++
++#include "suricata-common.h"
++#include "debug.h"
++#include "detect.h"
++#include "flow.h"
++#include "conf.h"
++
++#include "threads.h"
++#include "tm-threads.h"
++#include "threadvars.h"
++#include "util-debug.h"
++
++#include "util-logopenfile.h"
++#include "util-misc.h"
++#include "util-unittest.h"
++#include "util-unittest-helper.h"
++
++#include "detect-parse.h"
++#include "detect-engine.h"
++#include "detect-engine-mpm.h"
++#include "detect-reference.h"
++#include "detect-metadata.h"
++#include "app-layer-parser.h"
++#include "app-layer-frames.h"
++#include "app-layer-dnp3.h"
++#include "app-layer-htp.h"
++#include "app-layer-htp-xff.h"
++#include "app-layer-ftp.h"
++#include "util-classification-config.h"
++#include "stream-tcp.h"
++
++#include "output.h"
++#include "output-json.h"
++#include "output-json-frame.h"
++
++#include "util-byte.h"
++#include "util-privs.h"
++#include "util-print.h"
++#include "util-proto-name.h"
++#include "util-optimize.h"
++#include "util-buffer.h"
++#include "util-validate.h"
++
++#define MODULE_NAME "JsonFrameLog"
++
++#define JSON_STREAM_BUFFER_SIZE 4096
++
++typedef struct FrameJsonOutputCtx_ {
++    LogFileCtx *file_ctx;
++    uint16_t flags;
++    uint32_t payload_buffer_size;
++    OutputJsonCtx *eve_ctx;
++} FrameJsonOutputCtx;
++
++typedef struct JsonFrameLogThread_ {
++    MemBuffer *payload_buffer;
++    FrameJsonOutputCtx *json_output_ctx;
++    OutputJsonThreadCtx *ctx;
++} JsonFrameLogThread;
++
++#if 0 // TODO see if this is useful in some way
++static inline bool NeedsAsHex(uint8_t c)
++{
++    if (!isprint(c))
++        return true;
++
++    switch (c) {
++        case '/':
++        case ';':
++        case ':':
++        case '\\':
++        case ' ':
++        case '|':
++        case '"':
++        case '`':
++        case '\'':
++            return true;
++    }
++    return false;
++}
++
++static void PayloadAsHex(const uint8_t *data, uint32_t data_len, char *str, size_t str_len)
++{
++    bool hex = false;
++    for (uint32_t i = 0; i < data_len; i++) {
++        if (NeedsAsHex(data[i])) {
++            char hex_str[4];
++            snprintf(hex_str, sizeof(hex_str), "%s%02X", !hex ? "|" : " ", data[i]);
++            strlcat(str, hex_str, str_len);
++            hex = true;
++        } else {
++            char p_str[3];
++            snprintf(p_str, sizeof(p_str), "%s%c", hex ? "|" : "", data[i]);
++            strlcat(str, p_str, str_len);
++            hex = false;
++        }
++    }
++    if (hex) {
++        strlcat(str, "|", str_len);
++    }
++}
++#endif
++
++static void FrameAddPayload(JsonBuilder *js, const TcpStream *stream, const Frame *frame)
++{
++    uint32_t sb_data_len = 0;
++    const uint8_t *data = NULL;
++    uint64_t data_offset = 0;
++
++    // TODO consider ACK'd
++
++    if (frame->rel_offset < 0) {
++        if (StreamingBufferGetData(&stream->sb, &data, &sb_data_len, &data_offset) == 0) {

@@ -1,0 +1,122 @@
+@@ -3,7 +3,7 @@
+ 
+    Copyright (C) 2002-2013 Free Software Foundation Europe e.V.
+    Copyright (C) 2011-2012 Planets Communications B.V.
+-   Copyright (C) 2013-2013 Bareos GmbH & Co. KG
++   Copyright (C) 2013-2018 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -496,6 +496,24 @@ bool release_device(DCR *dcr)
+    now = (utime_t)time(NULL);
+    update_job_statistics(jcr, now);
+ 
++   /*
++    * Some devices do cache write operations (e.g. droplet_device).
++    * Therefore flushing the cache is required to determine
++    * if a job have been written successfully.
++    * As a flush operation can take quite a long time,
++    * this must be done before acquiring locks.
++    * A previous implementation did the flush inside dev->close(),
++    * which resulted in various locking problems.
++    */
++   if (!job_canceled(jcr)) {
++      Jmsg(jcr, M_INFO, 0, "Flushing device %s.\n", dev->print_name());
++      if (!dev->flush(dcr)) {
++         Jmsg(jcr, M_FATAL, 0, "Failed to flush device %s.\n", dev->print_name());
++      } else {
++         Jmsg(jcr, M_INFO, 0, "Device %s flushed.\n", dev->print_name());
++      }
++   }
++
+    dev->Lock();
+    if (!dev->is_blocked()) {
+       block_device(dev, BST_RELEASING);
+
+
+
+
+@@ -2,6 +2,7 @@
+    BAREOS® - Backup Archiving REcovery Open Sourced
+ 
+    Copyright (C) 2015-2017 Planets Communications B.V.
++   Copyright (C) 2017-2018 Bareos GmbH & Co. KG
+ 
+    This program is Free Software; you can redistribute it and/or
+    modify it under the terms of version three of the GNU Affero General Public
+@@ -71,7 +72,7 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  *
+  * flush_remote_chunk() - Flush a chunk to the remote backing store.
+  * read_remote_chunk() - Read a chunk from the remote backing store.
+- * chunked_remote_volume_size - Return the current size of a volume.
++ * chunked_remote_volume_size() - Return the current size of a volume.
+  * truncate_remote_chunked_volume() - Truncate a chunked volume on the
+  *                                    remote backing store.
+  */
+@@ -657,16 +658,26 @@ bool chunked_device::read_chunk()
+ 
+ /*
+  * Setup a chunked volume for reading or writing.
++ * return:
++ *  -1: failure
++ *   0: success
+  */
+ int chunked_device::setup_chunk(const char *pathname, int flags, int mode)
+ {
++   int retval = -1;
+    /*
+     * If device is (re)opened and we are put into readonly mode because
+     * of problems flushing chunks to the backing store we return EROFS
+     * to the upper layers.
+     */
+    if ((flags & O_RDWR) && m_readonly) {
+-      dev_errno = EROFS;
++      dev_errno = EROFS; /**< Read-only file system */
++      return -1;
++   }
++
++   if (!check_remote()) {
++      Dmsg0(100, "setup_chunk failed, as remote device is not available\n");
++      dev_errno = EIO; /**< I/O error */
+       return -1;
+    }
+ 
+@@ -698,7 +709,6 @@ int chunked_device::setup_chunk(const char *pathname, int flags, int mode)
+       m_current_chunk->writing = true;
+    }
+ 
+-   m_current_chunk->opened = true;
+    m_current_chunk->chunk_setup = false;
+ 
+    /*
+@@ -727,7 +737,23 @@ int chunked_device::setup_chunk(const char *pathname, int flags, int mode)
+ 
+    m_current_volname = bstrdup(getVolCatName());
+ 
+-   return 0;
++   /*
++    * in principle it is not required to load_chunk(),
++    * but we need a secure way to determine,
++    * if the chunk already exists.
++    */
++   if (load_chunk()) {
++      m_current_chunk->opened = true;
++      retval = 0;
++   } else if (flags & O_CREAT) {
++      /* create a chunk */
++      if (flush_chunk(false /* release */, false /* move_to_next_chunk */)) {
++         m_current_chunk->opened = true;
++         retval = 0;
++      }
++   }
++
++   return retval;
+ }
+ 
+ /*
+@@ -1013,6 +1039,7 @@ int chunked_device::close_chunk()
+       m_current_chunk->buflen = 0;
+       m_current_chunk->start_offset = -1;
+       m_current_chunk->end_offset = -1;
++
+   

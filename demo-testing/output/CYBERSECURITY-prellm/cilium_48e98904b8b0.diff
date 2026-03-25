@@ -1,0 +1,115 @@
+@@ -12,6 +12,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "linux/bpf.h"
++
+ namespace Envoy {
+ namespace Cilium {
+ 
+@@ -109,6 +111,15 @@ bool Bpf::insert(const void *key, const void *value) {
+   return bpfSyscall(BPF_MAP_UPDATE_ELEM, &attr) == 0;
+ }
+ 
++bool Bpf::remove(const void *key) {
++  union bpf_attr attr = {};
++  attr.map_fd = uint32_t(fd_);
++  attr.key = uintptr_t(key);
++  attr.flags = BPF_ANY;
++
++  return bpfSyscall(BPF_MAP_DELETE_ELEM, &attr) == 0;
++}
++
+ bool Bpf::lookup(const void *key, void *value) {
+   union bpf_attr attr = {};
+   attr.map_fd = uint32_t(fd_);
+
+
+
+
+@@ -11,7 +11,7 @@
+ #include <string>
+ #include <vector>
+ 
+-#include "linux/bpf.h"
++union bpf_attr;
+ 
+ namespace Envoy {
+ namespace Cilium {
+@@ -70,6 +70,13 @@ public:
+    */
+   bool insert(const void *key, const void *value);
+ 
++  /**
++   * Delete the entry identified with the key from the map, if it exists.
++   * @param key pointer to the key identifying the new entry to be inserted.
++   * @returns boolean for success of the operation.
++   */
++  bool remove(const void *key);
++
+   /**
+    * Lookup an entry from the bpf map identified with the key, storing the found
+    * value, if any.
+
+
+
+
+@@ -3,11 +3,11 @@
+ 
+ #include <string>
+ 
++#include "common/common/assert.h"
++#include "common/common/fmt.h"
+ #include "envoy/network/listen_socket.h"
+ #include "envoy/registry/registry.h"
+-#include "envoy/server/filter_config.h"
+-
+-#include "common/common/assert.h"
++#include "envoy/singleton/manager.h"
+ 
+ #include "cilium_socket_option.h"
+ 
+@@ -25,9 +25,7 @@ public:
+   Configuration::ListenerFilterFactoryCb
+   createFilterFactoryFromProto(const Protobuf::Message& proto_config,
+ 			       Configuration::ListenerFactoryContext& context) override {
+-    Filter::BpfMetadata::ConfigSharedPtr config(
+-	new Filter::BpfMetadata::Config(MessageUtil::downcastAndValidate<const ::cilium::BpfMetadata&>(proto_config),
+-					context.scope()));
++    auto config = std::make_shared<Filter::BpfMetadata::Config>(MessageUtil::downcastAndValidate<const ::cilium::BpfMetadata&>(proto_config), context);
+     // Set the socket mark option for the listen socket.
+     // Can use identity 0 on the listen socket option, as the bpf datapath is only interested
+     // in whether the proxy is ingress, egress, or if there is no proxy at all.
+@@ -58,18 +56,35 @@ static Registry::RegisterFactory<BpfMetadataConfigFactory,
+ namespace Filter {
+ namespace BpfMetadata {
+ 
+-Config::Config(const ::cilium::BpfMetadata &config, Stats::Scope &scope)
+-    : bpf_root_(config.bpf_root().length() ? config.bpf_root() : "/sys/fs/bpf"),
+-      stats_{ALL_BPF_METADATA_STATS(POOL_COUNTER(scope))}, is_ingress_(config.is_ingress()),
+-      maps_(bpf_root_, *this) {}
++// Singleton registration via macro defined in envoy/singleton/manager.h
++SINGLETON_MANAGER_REGISTRATION(cilium_bpf_proxymap);
++
++Config::Config(const ::cilium::BpfMetadata &config, Server::Configuration::ListenerFactoryContext& context)
++    : is_ingress_(config.is_ingress()) {
++  // Note: all instances use the bpf root of the first filter instantiated!
++  std::string bpf_root = config.bpf_root().length() ? config.bpf_root() : "/sys/fs/bpf";
++  maps_ = context.singletonManager().getTyped<Cilium::ProxyMap>(
++    SINGLETON_MANAGER_REGISTERED_NAME(cilium_bpf_proxymap), [&bpf_root] {
++      return std::make_shared<Cilium::ProxyMap>(bpf_root);
++    });
++  if (bpf_root != maps_->bpfRoot()) {
++    throw EnvoyException(fmt::format("cilium.bpf_metadata: Invalid bpf_root: {}", bpf_root));
++  }
++}
+ 
+-bool Instance::getBpfMetadata(Network::ConnectionSocket &socket) {
+-  return config_->maps_.getBpfMetadata(socket);
++bool Config::getBpfMetadata(Network::ConnectionSocket& socket) {
++  uint32_t identity;
++  uint16_t orig_dport, proxy_port;
++  bool ok = maps_->getBpfMetadata(socket, &identity, &orig_dport, &proxy_port);
++  if (ok) {
++    socket.setOptions(std::make_shared<Cilium::SocketOption>(maps_, getMark(identity), identity, is_ingress_, orig_dport, proxy_port));
++ 

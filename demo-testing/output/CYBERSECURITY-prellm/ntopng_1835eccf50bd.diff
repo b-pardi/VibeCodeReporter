@@ -1,0 +1,126 @@
+@@ -34,36 +34,44 @@ typedef struct {
+   char ip_str[INET_ADDRSTRLEN];
+ } syslog_client;
+ 
++typedef struct {
++  bool enable;
++  struct sockaddr_in addr;
++  int sock;
++} syslog_socket;
++
+ class SyslogCollectorInterface : public SyslogParserInterface {
+  private:
+   char *endpoint;
+-  struct sockaddr_in listen_addr;
+-  int listen_sock;
+-  bool use_udp;
+-  syslog_client connections[MAX_SYSLOG_SUBSCRIBERS];
++  syslog_socket udp_socket;
++  syslog_socket tcp_socket;
++  syslog_client tcp_connections[MAX_SYSLOG_SUBSCRIBERS];
+ 
+   struct {
+     u_int32_t num_flows;
+   } recvStats;
+ 
++  bool openSocket(syslog_socket *ss, const char *server_address, int server_port, int protocol);
++  void closeSocket(syslog_socket *ss, int protocol);
++  int  initFDSetsSocket(syslog_socket *ss, fd_set *read_fds, fd_set *write_fds, fd_set *except_fds, int protocol);
++  int  initFDSets(fd_set *read_fds, fd_set *write_fds, fd_set *except_fds);
++
+  public:
+   SyslogCollectorInterface(const char *_endpoint);
+   ~SyslogCollectorInterface();
+ 
+-  int initFDSets(fd_set *read_fds, fd_set *write_fds, fd_set *except_fds);
+-
+   int handleNewConnection();
+   void closeConnection(syslog_client *client);
+   int receiveFromClient(syslog_client *client);
+ 
+   int receive(int socket, char *client_ip);
+ 
+-  inline const char* get_type()         { return(CONST_INTERFACE_TYPE_SYSLOG); };
++  inline const char* get_type()           { return(CONST_INTERFACE_TYPE_SYSLOG); };
+   virtual InterfaceType getIfType() const { return(interface_type_SYSLOG); }
+   virtual bool is_ndpi_enabled() const    { return(false);      };
+   inline char* getEndpoint(u_int8_t id)   { return(endpoint);   };
+   virtual bool isPacketInterface() const  { return(false);      };
+-  void collect_flows();
++  void collect_events();
+ 
+   void startPacketPolling();
+   void shutdown();
+
+
+
+
+@@ -25,13 +25,77 @@
+ 
+ /* **************************************************** */
+ 
++bool SyslogCollectorInterface::openSocket(syslog_socket *ss, const char *server_address, int server_port, int protocol) {
++  struct sockaddr_in listen_addr;
++  int reuse = 1;
++
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Starting %s syslog collector on %s:%d", 
++    protocol == SOCK_DGRAM ? "UDP" : "TCP", server_address, server_port);
++
++  ss->sock = socket(AF_INET, protocol, 0);
++
++  if(ss->sock < 0) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "socket error");
++    return false;
++  }
++
++  /* Allow to re-bind in case previous instance died */ 
++  if(setsockopt(ss->sock, SOL_SOCKET, SO_REUSEADDR,
++#ifdef WIN32
++  (const char*)
++#endif
++	  &reuse, sizeof(reuse)) != 0) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "setsockopt error");
++    return false;
++  }
++  
++  memset(&listen_addr, 0, sizeof(listen_addr));
++
++  listen_addr.sin_family = AF_INET;
++  listen_addr.sin_addr.s_addr = inet_addr(server_address);
++  listen_addr.sin_port = htons(server_port);
++ 
++  if(bind(ss->sock, (struct sockaddr *) &listen_addr, sizeof(struct sockaddr)) != 0) {
++    ntop->getTrace()->traceEvent(TRACE_ERROR, "bind error");
++    return false;
++  }
++
++  if (protocol == SOCK_STREAM) { 
++    if(listen(ss->sock, MAX_SYSLOG_SUBSCRIBERS) != 0) {
++      ntop->getTrace()->traceEvent(TRACE_ERROR, "listen error");
++      return false;
++    }
++
++    memset(tcp_connections, 0, sizeof(tcp_connections));
++  }
++
++  ntop->getTrace()->traceEvent(TRACE_NORMAL, "Accepting %s connections on %s:%d",
++    protocol == SOCK_DGRAM ? "UDP" : "TCP", server_address, server_port);
++
++  return true;
++}
++
++/* **************************************************** */
++
++void SyslogCollectorInterface::closeSocket(syslog_socket *ss, int protocol) {
++  close(ss->sock);
++
++  if (protocol == SOCK_STREAM) { 
++    for(int i = 0; i < MAX_SYSLOG_SUBSCRIBERS; ++i)
++      if(tcp_connections[i].socket != 0)
++        close(tcp_connections[i].socket);
++  }
++}
++
++/* **************************************************** */
++
+ SyslogCollectorInterface::SyslogCollectorInterface(const char *_endpoint) : SyslogPa

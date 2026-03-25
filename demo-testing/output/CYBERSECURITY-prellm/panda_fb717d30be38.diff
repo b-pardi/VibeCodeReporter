@@ -1,0 +1,116 @@
+@@ -811,6 +811,8 @@ static uint64_t io_readx(CPUArchState *env, CPUIOTLBEntry *iotlbentry,
+         /* replay= */ rr_input_8(&val),
+         /* location= */ RR_CALLSITE_IO_READ_ALL);
+ 
++    panda_callbacks_after_mmio_read((CPUState*)env, physaddr, size, val);
++
+     return val;
+ }
+ 
+@@ -829,7 +831,7 @@ static void io_writex(CPUArchState *env, CPUIOTLBEntry *iotlbentry,
+ 
+     cpu->mem_io_vaddr = addr;
+     cpu->mem_io_pc = retaddr;
+-    
++
+     if (mr->name && !strcmp(mr->name, "watch")){
+         memory_region_dispatch_write(mr, physaddr, val, size, iotlbentry->attrs);
+         return;
+@@ -845,6 +847,8 @@ static void io_writex(CPUArchState *env, CPUIOTLBEntry *iotlbentry,
+     } else {
+         memory_region_dispatch_write(mr, physaddr, val, size, iotlbentry->attrs);
+     }
++
++    panda_callbacks_after_mmio_write((CPUState*)env, physaddr, size, val);
+ }
+ 
+ /* Return true if ADDR is present in the victim tlb, and has been copied
+
+
+
+
+@@ -26,6 +26,10 @@ void panda_callbacks_before_mem_write(CPUState *env, target_ulong pc, target_ulo
+                                       uint32_t data_size, uint64_t result, void *ram_ptr);
+ void panda_callbacks_after_mem_write(CPUState *env, target_ulong pc, target_ulong addr,
+                                      uint32_t data_size, uint64_t val, void *ram_ptr);
++// cputlb.c
++void panda_callbacks_after_mmio_read(CPUState *env, target_ulong addr, int size, uint64_t val);
++void panda_callbacks_after_mmio_write(CPUState *env, target_ulong addr, int size, uint64_t val);
++
+ // target-i386/misc_helper.c
+ void panda_callbacks_cpuid(CPUState *env);
+ // translate-all.c
+
+
+
+
+@@ -53,6 +53,9 @@ typedef enum panda_cb_type {
+     PANDA_CB_PHYS_MEM_AFTER_READ,
+     PANDA_CB_PHYS_MEM_AFTER_WRITE,
+ 
++    PANDA_CB_MMIO_AFTER_READ,       // After each MMIO read
++    PANDA_CB_MMIO_AFTER_WRITE,      // After each MMIO write
++
+     PANDA_CB_HD_READ,              // Each HDD read
+     PANDA_CB_HD_WRITE,             // Each HDD write
+     PANDA_CB_GUEST_HYPERCALL,      // Hypercall from the guest (e.g. CPUID)
+@@ -215,7 +218,7 @@ typedef union panda_cb {
+         false otherwise
+ 
+        Notes:
+-        See `insn_translate`, callbacks are registered via PANDA_CB_AFTER_INSN_EXEC 
++        See `insn_translate`, callbacks are registered via PANDA_CB_AFTER_INSN_EXEC
+     */
+     bool (*after_insn_translate)(CPUState *env, target_ulong pc);
+ 
+@@ -421,6 +424,36 @@ typedef union panda_cb {
+     */
+     int (*phys_mem_after_write)(CPUState *env, target_ulong pc, target_ulong addr, target_ulong size, void *buf);
+ 
++    /* Callback ID: PANDA_CB_MMIO_AFTER_READ
++
++       after_mmio_read: called after MMIO memory is read
++
++       Arguments:
++        CPUState *env: the current CPU state
++        target_ulong addr: the (physical) address being read from
++        target_ulong size: the size of the read
++        uin64_t val: the value being read
++
++       Return value:
++        unused
++    */
++    int (*after_mmio_read)(CPUState *env, target_ulong addr, int size, uint64_t val);
++
++    /* Callback ID: PANDA_CB_MMIO_AFTER_WRITE
++
++       after_mmio_write: called after MMIO memory is written to
++
++       Arguments:
++        CPUState *env: the current CPU state
++        target_ulong addr: the (physical) address being written to
++        target_ulong size: the size of the write
++        uin64_t val: the value being written
++
++       Return value:
++        unused
++    */
++    int (*after_mmio_write)(CPUState *env, target_ulong addr, int size, uint64_t val);
++
+     /* Callback ID: PANDA_CB_CPU_RESTORE_STATE
+ 
+        cb_cpu_restore_state: called inside of cpu_restore_state(), when there is
+
+
+
+
+@@ -248,6 +248,24 @@ void panda_callbacks_after_mem_write(CPUState *env, target_ulong pc,
+     }
+ }
+ 
++// These are used in cputlb.c
++void panda_callbacks_after_mmio_read(CPUState *env, target_ulong addr, int size, uint64_t val) {
++
++    panda_cb_list *plist;
++    for(plist = panda_cbs[PANDA_CB_MMIO_AFTER_READ]; plist != NULL;
++        plist = panda_c

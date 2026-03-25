@@ -1,0 +1,101 @@
+@@ -2,6 +2,7 @@
+ """
+ 
+ """
++import atexit
+ import csv
+ import fcntl
+ import io
+@@ -12,6 +13,7 @@ import re
+ import signal
+ import sys
+ import time
++import threading
+ import traceback
+ import types
+ import warnings
+@@ -48,7 +50,10 @@ class Bot(object):
+ 
+     _message_processed_verb = 'Processed'
+ 
+-    def __init__(self, bot_id: str):
++    # True for (non-main) threads of a bot instance
++    is_multithreaded = False
++
++    def __init__(self, bot_id: str, start=False, sighup_event=None):
+         self.__log_buffer = []
+         self.parameters = Parameters()
+ 
+@@ -80,8 +85,9 @@ class Bot(object):
+ 
+             self.__load_defaults_configuration()
+ 
+-            self.__check_bot_id(bot_id)
+-            self.__bot_id = bot_id
++            self.__bot_id_full, self.__bot_id, self.__instance_id = self.__check_bot_id(bot_id)
++            if self.__instance_id:
++                self.is_multithreaded = True
+             self.__init_logger()
+         except Exception:
+             self.__log_buffer.append(('critical', traceback.format_exc()))
+@@ -93,16 +99,52 @@ class Bot(object):
+         try:
+             self.logger.info('Bot is starting.')
+             self.__load_runtime_configuration()
++
++            """ Multithreading """
++            if hasattr(self.parameters, 'instances_threads') and not self.is_multithreaded:
++                self.logger.handlers = []
++                num_instances = int(self.parameters.instances_threads)
++                instances = []
++                sighup_events = []
++
++                def handle_sighup_signal_threading(signum: int,
++                                                   stack: Optional[object]):
++                    for event in sighup_events:
++                        event.set()
++                signal.signal(signal.SIGHUP, handle_sighup_signal_threading)
++
++                for i in range(num_instances):
++                    sighup_events.append(threading.Event())
++                    threadname = '%s.%d' % (bot_id, i)
++                    instances.append(threading.Thread(target=self.__class__,
++                                                      kwargs={'bot_id': threadname,
++                                                              'start': True,
++                                                              'sighup_event': sighup_events[-1]},
++                                                      name=threadname,
++                                                      daemon=False))
++                    instances[i].start()
++                for i, thread in enumerate(instances):
++                    thread.join()
++                return
++
+             self.__load_pipeline_configuration()
+             self.__load_harmonization_configuration()
+ 
+             self.init()
+ 
+-            self.__sighup = False
+-            signal.signal(signal.SIGHUP, self.__handle_sighup_signal)
+-            # system calls should not be interrupted, but restarted
+-            signal.siginterrupt(signal.SIGHUP, False)
+-            signal.signal(signal.SIGTERM, self.__handle_sigterm_signal)
++            if not self.__instance_id:
++                self.__sighup = threading.Event()
++                signal.signal(signal.SIGHUP, self.__handle_sighup_signal)
++                # system calls should not be interrupted, but restarted
++                signal.siginterrupt(signal.SIGHUP, False)
++                signal.signal(signal.SIGTERM, self.__handle_sigterm_signal)
++                signal.signal(signal.SIGINT, self.__handle_sigterm_signal)
++            else:
++                self.__sighup = sighup_event
++
++                @atexit.register
++                def catch_shutdown():
++                    self.stop()
+         except Exception as exc:
+             if self.parameters.error_log_exception:
+                 self.logger.exception('Bot initialization failed.')
+@@ -124,6 +166,8 @@ class Bot(object):
+                                                           None),
+                                          tt

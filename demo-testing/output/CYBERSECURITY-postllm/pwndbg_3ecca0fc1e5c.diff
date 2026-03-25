@@ -1,0 +1,122 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,551 @@
++from __future__ import annotations
++
++import gdb
++
++import pwndbg.gdblib.info
++import pwndbg.gdblib.memory
++import pwndbg.gdblib.typeinfo
++
++# adapted from jemalloc source 5.3.0
++LG_VADDR = 48
++LG_PAGE = 12
++# https://github.com/jemalloc/jemalloc/blob/a25b9b8ba91881964be3083db349991bbbbf1661/include/jemalloc/internal/jemalloc_internal_types.h#L42
++MALLOCX_ARENA_BITS = 12
++# https://github.com/jemalloc/jemalloc/blob/a25b9b8ba91881964be3083db349991bbbbf1661/include/jemalloc/jemalloc_defs.h.in#L51
++LG_SIZEOF_PTR = 3
++
++RTREE_NHIB = (1 << (LG_SIZEOF_PTR + 3)) - LG_VADDR  # Number of high insignificant bits
++RTREE_NLIB = LG_PAGE  # Number of low insigificant bits
++RTREE_NSB = LG_VADDR - RTREE_NLIB  # Number of significant bits
++
++# Number of levels in radix tree
++if RTREE_NSB <= 10:
++    RTREE_HEIGHT = 1
++elif RTREE_NSB <= 36:
++    RTREE_HEIGHT = 2
++elif RTREE_NSB <= 52:
++    RTREE_HEIGHT = 3
++else:
++    raise ValueError("Unsupported number of significant virtual address bits")
++
++
++# TODO: RTREE_LEAF_COMPACT should be enabled otherwise rtree_leaf_elm_s would change
++
++# TODO: Move to relevant place
++# https://github.com/jemalloc/jemalloc/blob/a25b9b8ba91881964be3083db349991bbbbf1661/include/jemalloc/internal/edata.h#L145
++
++
++def mask(current_field_width, current_field_shift):
++    return ((1 << current_field_width) - 1) << current_field_shift
++
++
++# For size class related explanation and calculations, refer to https://github.com/jemalloc/jemalloc/blob/a25b9b8ba91881964be3083db349991bbbbf1661/include/jemalloc/internal/sc.h#L8
++
++LG_QUANTUM = 4  # LG_QUANTUM ensures correct platform alignment and necessary to ensure we never return improperly aligned memory
++
++SC_LG_TINY_MIN = 3
++SC_NTINY = (
++    LG_QUANTUM - SC_LG_TINY_MIN
++)  # Number of tiny size classes for alloations smaller than (1 << LG_QUANTUM)
++
++# Size classes
++SC_LG_NGROUP = 2  # Number of size classes group
++SC_NGROUP = (
++    1 << SC_LG_NGROUP
++)  # Number of size classes in each group, equally spaced in the range, so that * each one covers allocations for base / SC_NGROUP possible allocation sizes
++SC_NPSEUDO = SC_NGROUP
++SC_PTR_BITS = (1 << LG_SIZEOF_PTR) * 8
++SC_LG_BASE_MAX = SC_PTR_BITS - 2
++SC_LG_FIRST_REGULAR_BASE = LG_QUANTUM + SC_LG_NGROUP
++SC_NREGULAR = SC_NGROUP * (SC_LG_BASE_MAX - SC_LG_FIRST_REGULAR_BASE + 1) - 1
++
++SC_NSIZES = SC_NTINY + SC_NPSEUDO + SC_NREGULAR
++
++SC_LG_SLAB_MAXREGS = LG_PAGE - SC_LG_TINY_MIN
++
++
++# Source: https://github.com/jemalloc/jemalloc/blob/dev/include/jemalloc/internal/bit_util.h#L400-L419
++def lg_floor_1(x):
++    return 0
++
++
++def lg_floor_2(x):
++    return lg_floor_1(x) if x < (1 << 1) else 1 + lg_floor_1(x >> 1)
++
++
++def lg_floor_4(x):
++    return lg_floor_2(x) if x < (1 << 2) else 2 + lg_floor_2(x >> 2)
++
++
++def lg_floor_8(x):
++    return lg_floor_4(x) if x < (1 << 4) else 4 + lg_floor_4(x >> 4)
++
++
++def lg_floor_16(x):
++    return lg_floor_8(x) if x < (1 << 8) else 8 + lg_floor_8(x >> 8)
++
++
++def lg_floor_32(x):
++    return lg_floor_16(x) if x < (1 << 16) else 16 + lg_floor_16(x >> 16)
++
++
++def lg_floor_64(x):
++    return lg_floor_32(x) if x < (1 << 32) else 32 + lg_floor_32(x >> 32)
++
++
++def lg_floor(x):
++    return lg_floor_32(x) if LG_SIZEOF_PTR == 2 else lg_floor_64(x)
++
++
++def lg_ceil(x):
++    return lg_floor(x) + (0 if (x & (x - 1)) == 0 else 1)
++
++
++# Arena width and mask definitions
++EDATA_BITS_ARENA_WIDTH = MALLOCX_ARENA_BITS
++EDATA_BITS_ARENA_SHIFT = 0
++EDATA_BITS_ARENA_MASK = mask(EDATA_BITS_ARENA_WIDTH, EDATA_BITS_ARENA_SHIFT)
++
++# Slab width and mask definitions
++EDATA_BITS_SLAB_WIDTH = 1
++EDATA_BITS_SLAB_SHIFT = EDATA_BITS_ARENA_WIDTH + EDATA_BITS_ARENA_SHIFT
++EDATA_BITS_SLAB_MASK = mask(EDATA_BITS_SLAB_WIDTH, EDATA_BITS_SLAB_SHIFT)
++
++# Committed width and mask definitions
++EDATA_BITS_COMMITTED_WIDTH = 1
++EDATA_BITS_COMMITTED_SHIFT = EDATA_BITS_SLAB_WIDTH + EDATA_BITS_SLAB_SHIFT
++EDATA_BITS_COMMITTED_MASK = mask(EDATA_BITS_COMMITTED_WIDTH, EDATA_BITS_COMMITTED_SHIFT)

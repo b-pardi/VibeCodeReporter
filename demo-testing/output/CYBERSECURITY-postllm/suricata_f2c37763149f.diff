@@ -1,0 +1,92 @@
+@@ -257,6 +257,8 @@ typedef struct PacketAlert_ {
+ #define PACKET_ALERT_RATE_FILTER_MODIFIED   0x10
+ /** alert is in a frame, frame_id set */
+ #define PACKET_ALERT_FLAG_FRAME 0x20
++/** alert in a tx was forced */
++#define PACKET_ALERT_FLAG_TX_GUESSED 0x040
+ 
+ extern uint16_t packet_alert_max;
+ #define PACKET_ALERT_MAX 15
+
+
+
+
+@@ -2940,6 +2940,12 @@ static int DetectEngineCtxLoadConf(DetectEngineCtx *de_ctx)
+                          "and 255, will default to 4");
+         }
+     }
++    int guess_applayer = 0;
++    if ((ConfGetBool("detect.guess-applayer-tx", &guess_applayer)) == 1) {
++        if (guess_applayer == 1) {
++            de_ctx->guess_applayer = true;
++        }
++    }
+ 
+     /* parse port grouping priority settings */
+ 
+
+
+
+
+@@ -813,15 +813,15 @@ static inline void DetectRulePacketRules(
+         DetectRunPostMatch(tv, det_ctx, p, s);
+ 
+         uint64_t txid = PACKET_ALERT_NOTX;
+-        if ((alert_flags & PACKET_ALERT_FLAG_STREAM_MATCH) ||
+-                (s->alproto != ALPROTO_UNKNOWN && pflow->proto == IPPROTO_UDP)) {
+-            // if there is a stream match (TCP), or
+-            // a UDP specific app-layer signature,
+-            // try to use the good tx for the packet direction
+-            if (pflow->alstate) {
+-                uint8_t dir =
+-                        (p->flowflags & FLOW_PKT_TOCLIENT) ? STREAM_TOCLIENT : STREAM_TOSERVER;
+-                txid = AppLayerParserGetTransactionInspectId(pflow->alparser, dir);
++        if (pflow && pflow->alstate) {
++            uint8_t dir = (p->flowflags & FLOW_PKT_TOCLIENT) ? STREAM_TOCLIENT : STREAM_TOSERVER;
++            txid = AppLayerParserGetTransactionInspectId(pflow->alparser, dir);
++            if ((s->alproto != ALPROTO_UNKNOWN && pflow->proto == IPPROTO_UDP) ||
++                    (de_ctx->guess_applayer &&
++                            AppLayerParserGetTxCnt(pflow, pflow->alstate) == txid + 1)) {
++                // if there is a UDP specific app-layer signature,
++                // or only one live transaction
++                // try to use the good tx for the packet direction
+                 void *tx_ptr =
+                         AppLayerParserGetTx(pflow->proto, pflow->alproto, pflow->alstate, txid);
+                 AppLayerTxData *txd =
+@@ -829,6 +829,9 @@ static inline void DetectRulePacketRules(
+                                : NULL;
+                 if (txd && txd->stream_logged < de_ctx->stream_tx_log_limit) {
+                     alert_flags |= PACKET_ALERT_FLAG_TX;
++                    if (pflow->proto != IPPROTO_UDP) {
++                        alert_flags |= PACKET_ALERT_FLAG_TX_GUESSED;
++                    }
+                     txd->stream_logged++;
+                 }
+             }
+
+
+
+
+@@ -889,6 +889,9 @@ typedef struct DetectEngineCtx_ {
+     /* maximum number of times a tx will get logged for a stream-only rule match */
+     uint8_t stream_tx_log_limit;
+ 
++    /* force app-layer tx finding for alerts with signatures not having app-layer keywords */
++    bool guess_applayer;
++
+     /* registration id for per thread ctx for the filemagic/file.magic keywords */
+     int filemagic_thread_ctx_id;
+ 
+
+
+
+
+@@ -221,6 +221,9 @@ void AlertJsonHeader(const Packet *p, const PacketAlert *pa, JsonBuilder *js, ui
+     if (pa->flags & PACKET_ALERT_FLAG_TX) {
+         jb_set_uint(js, "tx_id", pa->tx_id);
+     }
++    if (pa->flags & PACKET_ALERT_FLAG_TX_GUESSED) {
++        jb_set_bool(js, "tx_guessed", true);
++    }
+ 
+     jb_open_object(js, "alert");

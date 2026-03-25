@@ -1,0 +1,184 @@
+@@ -61,6 +61,8 @@ int main() {
+     DECLARE_STRUCT(ep_config, iter);
+     DECLARE_STRUCT(policy_key, iter);
+     DECLARE_STRUCT(policy_entry, iter);
++    DECLARE_STRUCT(ipv4_nat_entry, iter);
++    DECLARE_STRUCT(ipv6_nat_entry, iter);
+ 
+     return 0;
+ }
+
+
+
+
+@@ -47,7 +47,7 @@
+ #include "lib/policy.h"
+ #include "lib/drop.h"
+ #include "lib/encap.h"
+-
++#include "lib/nat.h"
+ 
+ #if defined FROM_HOST && (defined ENABLE_IPV4 || defined ENABLE_IPV6)
+ static inline int rewrite_dmac_to_host(struct __sk_buff *skb)
+@@ -530,8 +530,7 @@ static inline bool __inline__ handle_identity_from_host(struct __sk_buff *skb, _
+ }
+ #endif
+ 
+-__section("from-netdev")
+-int from_netdev(struct __sk_buff *skb)
++static __always_inline int do_netdev(struct __sk_buff *skb)
+ {
+ 	__u32 identity = 0;
+ 	__u16 proto;
+@@ -617,4 +616,34 @@ int from_netdev(struct __sk_buff *skb)
+ 	return ret;
+ }
+ 
++__section("from-netdev")
++int from_netdev(struct __sk_buff *skb)
++{
++	return do_netdev(skb);
++}
++
++__section("masq")
++int do_masq(struct __sk_buff *skb)
++{
++	return snat_process(skb, BPF_PKT_DIR);
++}
++
++__section("masq-pre")
++int do_masq_pre(struct __sk_buff *skb)
++{
++	int ret = snat_process(skb, BPF_PKT_DIR);
++	if (!ret)
++		ret = do_netdev(skb);
++	return ret;
++}
++
++__section("masq-post")
++int do_masq_post(struct __sk_buff *skb)
++{
++	int ret = do_netdev(skb);
++	if (!ret)
++		ret = snat_process(skb, BPF_PKT_DIR);
++	return ret;
++}
++
+ BPF_LICENSE("GPL");
+
+
+
+
+@@ -304,6 +304,8 @@ enum {
+ #define DROP_HOST_UNREACHABLE		-164
+ #define DROP_NO_CONFIG		-165
+ #define DROP_UNSUPPORTED_L2		-166
++#define DROP_NAT_NO_MAPPING	-167
++#define DROP_NAT_UNSUPP_PROTO	-168
+ 
+ /* Cilium metrics reason for forwarding packet.
+  * If reason > 0 then this is a drop reason and value corresponds to -(DROP_*)
+@@ -396,6 +398,11 @@ enum {
+ 	NAT46,
+ };
+ 
++#define TUPLE_F_OUT		0	/* Outgoing flow */
++#define TUPLE_F_IN		1	/* Incoming flow */
++#define TUPLE_F_RELATED		2	/* Flow represents related packets */
++#define TUPLE_F_SERVICE		4	/* Flow represents service/slave map */
++
+ #define CT_EGRESS 0
+ #define CT_INGRESS 1
+ #define CT_SERVICE 2
+
+
+
+
+@@ -59,12 +59,6 @@
+ #endif
+ 
+ #ifdef CONNTRACK
+-
+-#define TUPLE_F_OUT		0	/* Outgoing flow */
+-#define TUPLE_F_IN		1	/* Incoming flow */
+-#define TUPLE_F_RELATED		2	/* Flow represents related packets */
+-#define TUPLE_F_SERVICE		4	/* Flow represents service/slave map */
+-
+ enum {
+ 	ACTION_UNSPEC,
+ 	ACTION_CREATE,
+
+
+
+
+@@ -15,6 +15,7 @@
+  *  along with this program; if not, write to the Free Software
+  *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+  */
++/* Simple NAT engine in BPF. */
+ #ifndef __LIB_NAT__
+ #define __LIB_NAT__
+ 
+@@ -30,6 +31,802 @@
+ #include "conntrack.h"
+ #include "conntrack_map.h"
+ 
++enum {
++	NAT_DIR_EGRESS  = TUPLE_F_OUT,
++	NAT_DIR_INGRESS = TUPLE_F_IN,
++};
++
++struct nat_entry {
++	__u64 created;
++	__u64 host_local;	/* Only single bit used. */
++	__u64 pad1;		/* Future use. */
++	__u64 pad2;		/* Future use. */
++};
++
++#define NAT_CONTINUE_XLATE 	0
++#define NAT_PUNT_TO_STACK	1
++
++static __always_inline __be16 __snat_get_port_range(__u16 start, __u16 end)
++{
++	return (get_prandom_u32() % (end - start) + start);
++}
++
++static __always_inline void *__snat_lookup(void *map, void *tuple)
++{
++	return map_lookup_elem(map, tuple);
++}
++
++static __always_inline int __snat_update(void *map, void *otuple, void *ostate,
++					 void *rtuple, void *rstate)
++{
++	int ret = map_update_elem(map, rtuple, rstate, BPF_NOEXIST);
++	if (!ret) {
++		ret = map_update_elem(map, otuple, ostate, BPF_NOEXIST);
++		if (ret)
++			map_delete_elem(map, rtuple);
++	}
++	return ret;
++}
++
++static __always_inline void __snat_delete(void *map, void *otuple,
++					  void *rtuple)
++{
++	map_delete_elem(map, otuple);
++	map_delete_elem(map, rtuple);
++}
++
++struct ipv4_nat_entry {
++	struct nat_entry common;
++	union {
++		struct {
++			__be32 to_saddr;
++			__be16 to_sport;
++		};
++		struct {
++			__be32 to_daddr;
++			__be16 to_dport;
++		};
++	};
++};
++
++#if defined ENABLE_IPV4 && defined 

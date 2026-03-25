@@ -1,0 +1,128 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,772 @@
++#!/usr/bin/env python3
++# 
++#  PANDA Snapshot Diff Tool
++# 
++#  Copyright (c) 2021 Brendan Dolan-Gavitt <brendandg@nyu.edu>
++# 
++#  Based on: Migration Stream Analyzer
++#
++#  Copyright (c) 2015 Alexander Graf <agraf@suse.de>
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2 of the License, or (at your option) any later version.
++#
++# This library is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this library; if not, see <http://www.gnu.org/licenses/>.
++
++import json
++import io
++import os
++import argparse
++import collections
++import pickle
++import struct
++import sys
++import numpy as np
++from pathlib import Path
++from itertools import groupby, count
++
++def mkdir_p(path):
++    try:
++        os.makedirs(path)
++    except OSError:
++        pass
++
++class MigrationFile(object):
++    def __init__(self, filename):
++        self.filename = filename
++        self.file = open(self.filename, "rb")
++
++    def read64(self):
++        return int.from_bytes(self.file.read(8), byteorder='big', signed=True)
++
++    def read32(self):
++        return int.from_bytes(self.file.read(4), byteorder='big', signed=True)
++
++    def read16(self):
++        return int.from_bytes(self.file.read(2), byteorder='big', signed=True)
++
++    def read8(self):
++        return int.from_bytes(self.file.read(1), byteorder='big', signed=True)
++
++    def readstr(self, len = None):
++        return self.readvar(len).decode('utf-8')
++
++    def readvar(self, size = None):
++        if size is None:
++            size = self.read8()
++        if size == 0:
++            return ""
++        value = self.file.read(size)
++        if len(value) != size:
++            raise Exception("Unexpected end of %s at 0x%x" % (self.filename, self.file.tell()))
++        return value
++
++    def tell(self):
++        return self.file.tell()
++
++    # The VMSD description is at the end of the file, after EOF. Look for
++    # the last NULL byte, then for the beginning brace of JSON.
++    def read_migration_debug_json(self):
++        QEMU_VM_VMDESCRIPTION = 0x06
++
++        # Remember the offset in the file when we started
++        entrypos = self.file.tell()
++
++        # Read the last 10MB
++        self.file.seek(0, os.SEEK_END)
++        endpos = self.file.tell()
++        self.file.seek(max(-endpos, -10 * 1024 * 1024), os.SEEK_END)
++        datapos = self.file.tell()
++        data = self.file.read()
++        # The full file read closed the file as well, reopen it
++        self.file = open(self.filename, "rb")
++
++        # Find the last NULL byte, then the first brace after that. This should
++        # be the beginning of our JSON data.
++        nulpos = data.rfind(b'\0')
++        jsonpos = data.find(b'{', nulpos)
++
++        # Check backwards from there and see whether we guessed right
++        self.file.seek(datapos + jsonpos - 5, 0)
++        if self.read8() != QEMU_VM_VMDESCRIPTION:
++            raise Exception("No Debug Migration device found")
++
++        jsonlen = self.read32()
++
++        # Seek back to where we were at the beginning
++        self.file.seek(entrypos, 0)
++
++        return data[jsonpos:jsonpos + jsonlen]
++
++    def close(self):
++        self.file.close()
++
++class RamSection(object):
++    RAM_SAVE_FLAG_COMPRESS = 0x02
++    RAM_SAVE_FLAG_MEM_SIZE = 0x04
++    RAM_SAVE_FLAG_PAGE     = 0x08
++    RAM_SAVE_FLAG_EOS      = 0x10
++    RAM_SAVE_FLAG_CONTINUE = 0x20
++    RAM_SAVE_FLAG_XBZRLE   = 0x40
++    RAM_SAVE_FLAG_HOOK     = 0x80
++
++    def __init__(self, file, version_id, ramargs, section_key):
++        if version_id != 4:
++

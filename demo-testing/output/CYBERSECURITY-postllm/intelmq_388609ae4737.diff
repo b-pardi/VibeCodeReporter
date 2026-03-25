@@ -1,0 +1,107 @@
+@@ -75,8 +75,6 @@ class MISPFeedOutputBot(OutputBot, CacheMixin):
+     # do not create objects in the MISP events, add data directly as event attributes
+     flat_events: bool = False
+ 
+-    # Delaying reloading would delay saving eventually long-awaiting messages
+-    _sighup_delay = False
+     _is_multithreadable: bool = False
+ 
+     @staticmethod
+@@ -108,6 +106,10 @@ class MISPFeedOutputBot(OutputBot, CacheMixin):
+                 minutes=parse_relative(self.interval_event)
+             )
+ 
++        if self.bulk_save_count:
++            # Delaying reloading would delay saving eventually long-awaiting messages
++            self._sighup_delay = False
++
+         self.min_time_current = datetime.datetime.max
+         self.max_time_current = datetime.datetime.min
+ 
+@@ -404,6 +406,15 @@ class MISPFeedOutputBot(OutputBot, CacheMixin):
+                                     ]
+                                 )
+ 
++        flat_events = parameters.get("flat_events")
++        if flat_events and not attribute_mapping:
++            results.append(
++                [
++                    "error",
++                    "When using flat_events, you have to provide attribute_mapping",
++                ]
++            )
++
+         tagging = parameters.get("tagging")
+         if tagging:
+             tagging_error = (
+
+
+
+
+@@ -74,8 +74,8 @@ class CacheMixin:
+     def cache_llen(self, key: str) -> int:
+         return self.__redis.llen(key)
+ 
+-    def cache_rpop(self) -> Any:
+-        return self.__redis.rpop(self.bot_id)
++    def cache_rpop(self, key: str) -> Any:
++        return self.__redis.rpop(key)
+ 
+     def cache_flush(self):
+         """
+
+
+
+
+@@ -72,11 +72,11 @@ class TestMISPFeedOutputBot(test.BotTestCase, unittest.TestCase):
+             info: str = json.load(f).get("Event", {}).get("info", "")
+         assert info.startswith("This is my custom info. IntelMQ event ")
+ 
+-    def test_additional_info_with_separator(self):
++    def test_additional_info_with_grouping_key(self):
+         self.run_bot(
+             parameters={
+-                "additional_info": "Event related to {separator}.",
+-                "event_separator": "malware.name",
++                "additional_info": "Event related to {key}.",
++                "grouping_key": "malware.name",
+             }
+         )
+ 
+@@ -94,6 +94,9 @@ class TestMISPFeedOutputBot(test.BotTestCase, unittest.TestCase):
+ 
+         current_event = open(f"{self.directory.name}/.current").read()
+ 
++        # bot has to disable delayed reload when accumulating events
++        assert self.bot._sighup_delay is False
++
+         # The first event is always immediately dumped to the MISP feed
+         # But the second wait until bulk saving size is achieved
+         with open(current_event) as f:
+@@ -118,8 +121,9 @@ class TestMISPFeedOutputBot(test.BotTestCase, unittest.TestCase):
+ 
+         # Simulating leftovers in the queue when it's time to generate new event
+         Path(f"{self.directory.name}/.current").unlink()
+-        self.bot.cache_put(
+-            MessageFactory.from_dict(EXAMPLE_EVENT).to_dict(jsondict_as_string=True)
++        self.bot.cache_lpush(
++            self.bot_id,
++            json.dumps(MessageFactory.from_dict(EXAMPLE_EVENT).to_dict(jsondict_as_string=True))
+         )
+         self.run_bot(parameters={"bulk_save_count": 3})
+ 
+@@ -197,7 +201,7 @@ class TestMISPFeedOutputBot(test.BotTestCase, unittest.TestCase):
+         )
+         assert source_ip["value"] == "152.166.119.2"
+ 
+-    def test_event_separation(self):
++    def test_events_grouping(self):
+         """Tests that based on the value of the given field, incoming messages are put in separated
+         MISP events."""
+         self.input_message = [
+@@ -205,7 +209,7 @@ class TestMISPFeedOutputBot(test.BotTestCase, unittest.TestCase):
+             {**EXAMPLE_EVENT, "malware.name": "another_malware"},
+             EXAMPLE_EVENT,
+         ]
+-        self.run_bot(iterations=3, parameters={"event_separator": "malware.name"})
++    

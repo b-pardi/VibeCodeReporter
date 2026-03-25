@@ -1,0 +1,112 @@
+@@ -20,18 +20,58 @@
+ #  VulnerableCode is a free software code scanning tool from nexB Inc. and others.
+ #  Visit https://github.com/nexB/vulnerablecode/ for support and download.
+ 
++import dataclasses
++import os
++import shutil
++import tempfile
+ from datetime import datetime
++from pathlib import Path
+ from typing import Any
+ from typing import ContextManager
++from typing import List
+ from typing import Mapping
+ from typing import Optional
+ from typing import Sequence
+-import dataclasses
++from typing import Set
+ 
++import pygit2
+ from packageurl import PackageURL
+ 
+ 
+ @dataclasses.dataclass
++class Advisory:
++    """
++    This data class expresses the contract between data sources and the import runner.
++    Data sources are expected to be usable as context managers and generators, yielding batches of Advisory sequences.
++
++    NB: There are two representations for package URLs that are commonly used by code consuming this data class;
++        PackageURL objects and strings. As a convention, the former is referred to in variable names, etc. as
++        "package_urls" and the latter as "purls".
++    """
++    summary: str
++    impacted_package_urls: Sequence[PackageURL]
++    resolved_package_urls: Sequence[PackageURL] = dataclasses.field(default_factory=list)
++    references: Sequence[str] = dataclasses.field(default_factory=list)
++    cve_id: Optional[str] = None
++
++    @property
++    def impacted_purls(self) -> Set[str]:
++        return {str(p) for p in self.impacted_package_urls}
++
++    @property
++    def resolved_purls(self) -> Set[str]:
++        return {str(p) for p in self.resolved_package_urls}
++
++
++class InvalidConfigurationError(Exception):
++    pass
++
++
++@dataclasses.dataclass
++class DataSourceConfiguration:
++    batch_size: int
++
++
+ class DataSource(ContextManager):
+     """
+     This class defines how importers consume advisories from a data source.
+@@ -39,15 +79,41 @@ class DataSource(ContextManager):
+     It makes a distinction between newly added records since the last run and modified records. This allows the import
+     logic to pick appropriate database operations.
+     """
+-    batch_size: int
+-    cutoff_date: Optional[datetime] = None
+-    config: Optional[Mapping[str, Any]] = dataclasses.field(default_factory=dict)
++
++    CONFIG_CLASS = DataSourceConfiguration
++
++    def __init__(
++            self,
++            batch_size: int,
++            last_run_date: Optional[datetime] = None,
++            cutoff_date: Optional[datetime] = None,
++            config: Optional[Mapping[str, Any]] = None,
++    ):
++        """
++        Create a DataSource instance.
++
++        :param batch_size: Maximum number of records to return from added_advisories() and updated_advisories()
++        :param last_run_date: Optional timestamp when this data source was last inspected
++        :param cutoff_date: Optional timestamp, records older than this will be ignored
++        :param config: Optional dictionary with subclass-specific configuration
++        """
++        config = config or {}
++        try:
++            self.config = self.__class__.CONFIG_CLASS(batch_size, **config)
++            # These really should be declared in DataSourceConfiguration above but that would prevent DataSource
++            # subclasses from declaring mandatory parameters (i.e. positional arguments)
++            setattr(self.config, 'last_run_date', last_run_date)
++            setattr(self.config, 'cutoff_date', cutoff_date)
++        except Exception as e:
++            raise InvalidConfigurationError(str(e))
++
++        self.validate_configuration()
+ 
+     def __enter__(self):
+         """
+         Subclasses acquire per-run resources, such as network connections, file downloads, etc. here.
+         """
+-        return self
++        pass
+ 
+     def __exit__(self, exc_type, exc_val, exc_tb):
+         """
+@@ -55,45 +121,226 @@ class DataSource(ContextManager):
+         """
+         pass
+ 
+-    def added_advisories(self):
++    def validate_configuration(self) -> 

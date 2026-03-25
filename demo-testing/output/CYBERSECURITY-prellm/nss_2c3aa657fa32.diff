@@ -1,0 +1,116 @@
+@@ -30,6 +30,7 @@ struct ScopedDelete {
+   void operator()(PK11Context* context) { PK11_DestroyContext(context, true); }
+   void operator()(PK11GenericObject* obj) { PK11_DestroyGenericObject(obj); }
+   void operator()(PK11SlotInfo* slot) { PK11_FreeSlot(slot); }
++  void operator()(PK11SlotList* slots) { PK11_FreeSlotList(slots); }
+   void operator()(PK11SymKey* key) { PK11_FreeSymKey(key); }
+   void operator()(PK11URI* uri) { PK11URI_DestroyURI(uri); }
+   void operator()(PLArenaPool* arena) { PORT_FreeArena(arena, PR_FALSE); }
+@@ -72,6 +73,7 @@ SCOPED(CERTSubjectPublicKeyInfo);
+ SCOPED(PK11Context);
+ SCOPED(PK11GenericObject);
+ SCOPED(PK11SlotInfo);
++SCOPED(PK11SlotList);
+ SCOPED(PK11SymKey);
+ SCOPED(PK11URI);
+ SCOPED(PLArenaPool);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,69 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include <memory>
++#include "nss.h"
++#include "pk11pub.h"
++#include "prerror.h"
++#include "prsystem.h"
++#include "secoid.h"
++
++#include "nss_scoped_ptrs.h"
++#include "gtest/gtest.h"
++#include "databuffer.h"
++
++namespace nss_test {
++
++class Pkcs11ModuleTest : public ::testing::Test {
++ public:
++  Pkcs11ModuleTest() {}
++
++  void SetUp() override {
++    ASSERT_EQ(SECSuccess, SECMOD_AddNewModule("Pkcs11ModuleTest", DLL_PREFIX
++                                              "pkcs11testmodule." DLL_SUFFIX,
++                                              0, 0))
++        << PORT_ErrorToName(PORT_GetError());
++  }
++
++  void TearDown() override {
++    int type;
++    ASSERT_EQ(SECSuccess, SECMOD_DeleteModule("Pkcs11ModuleTest", &type));
++    ASSERT_EQ(SECMOD_EXTERNAL, type);
++  }
++};
++
++TEST_F(Pkcs11ModuleTest, LoadUnload) {
++  ScopedSECMODModule module(SECMOD_FindModule("Pkcs11ModuleTest"));
++  EXPECT_NE(nullptr, module);
++}
++
++TEST_F(Pkcs11ModuleTest, ListSlots) {
++  ScopedPK11SlotList slots(
++      PK11_GetAllTokens(CKM_INVALID_MECHANISM, PR_FALSE, PR_FALSE, nullptr));
++  EXPECT_NE(nullptr, slots);
++
++  PK11SlotListElement* element = PK11_GetFirstSafe(slots.get());
++  EXPECT_NE(nullptr, element);
++
++  // These tokens are always present.
++  const std::vector<std::string> kSlotsWithToken = {
++      "NSS Internal Cryptographic Services",
++      "NSS User Private Key and Certificate Services", "Test PKCS11 Slot 二"};
++  std::vector<std::string> foundSlots;
++
++  do {
++    std::string name = PK11_GetSlotName(element->slot);
++    foundSlots.push_back(name);
++    std::cerr << "loaded slot: " << name << std::endl;
++  } while ((element = PK11_GetNextSafe(slots.get(), element, PR_FALSE)) !=
++           nullptr);
++
++  std::sort(foundSlots.begin(), foundSlots.end());
++  EXPECT_TRUE(std::equal(kSlotsWithToken.begin(), kSlotsWithToken.end(),
++                         foundSlots.begin()));
++}
++
++}  // namespace nss_test
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,579 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// This is a testing PKCS #11 module that simulates a token being inserted and
++// removed from a slot every 50ms. This is achieved mainly in
++// Test_C_WaitForSlotEvent. If the application that loaded this module calls
++// C_WaitForSlotEvent, this module waits for 50ms and returns, having changed
++// its internal state to report that the token has either been inserted or
++// removed, as appropriate.
++// This module also provides an alternate token that is always present for tests
++// that don't want the cyclic behavior described above.
++
++#include <assert.h>
++#include <string.h>
++
++#ifdef _WIN32
++#  include <windows.

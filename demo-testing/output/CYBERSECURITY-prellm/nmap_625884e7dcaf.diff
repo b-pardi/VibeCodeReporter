@@ -1,0 +1,117 @@
+@@ -187,37 +187,41 @@ void addrset_init(struct addrset *set)
+     set->trie = (struct trie_node *) safe_zalloc(sizeof(struct trie_node));
+ }
+ 
++void trie_free(struct trie_node *curr)
++{
++  /* Since we descend only down one side, we at most accumulate one tree's-depth, or 128.
++   * Add 4 for safety to account for special root node and special empty stack position 0.
++   */
++  struct trie_node *stack[128+4];
++  int i = 1;
++
++  while (i > 0 && curr != NULL && curr != TRIE_NODE_TRUE) {
++    /* stash next_bit_one */
++    if (curr->next_bit_one != NULL && curr->next_bit_one != TRIE_NODE_TRUE) {
++      stack[i++] = curr->next_bit_one;
++    }
++    /* if next_bit_zero is valid, descend */
++    if (curr->next_bit_zero != NULL && curr->next_bit_zero != TRIE_NODE_TRUE) {
++      curr = curr->next_bit_zero;
++    }
++    else {
++      /* next_bit_one was stashed, next_bit_zero is invalid. Free it and move back up the stack. */
++      free(curr);
++      curr = stack[--i];
++    }
++  }
++}
++
+ void addrset_free(struct addrset *set)
+ {
+     struct addrset_elem *elem, *next;
+-    /* Since we descend only down one side, we at most accumulate one tree's-depth, or 128.
+-     * Add 4 for safety to account for special root node and special empty stack position 0.
+-     */
+-    struct trie_node *stack[128+4];
+-    struct trie_node *curr;
+-    int i = 1;
+ 
+     for (elem = set->head; elem != NULL; elem = next) {
+         next = elem->next;
+         free(elem);
+     }
+ 
+-    curr = set->trie;
+-    while (i > 0) {
+-      /* stash next_bit_one */
+-      if (curr->next_bit_one != NULL && curr->next_bit_one != TRIE_NODE_TRUE) {
+-        stack[i++] = curr->next_bit_one;
+-      }
+-      /* if next_bit_zero is valid, descend */
+-      if (curr->next_bit_zero != NULL && curr->next_bit_zero != TRIE_NODE_TRUE) {
+-        curr = curr->next_bit_zero;
+-      }
+-      else {
+-        /* next_bit_one was stashed, next_bit_zero is invalid. Free it and move back up the stack. */
+-        free(curr);
+-        curr = stack[--i];
+-      }
+-    }
++    trie_free(set->trie);
+ }
+ 
+ 
+@@ -315,6 +319,8 @@ struct trie_node *new_trie_node(const u32 *addr, const u32 *mask)
+     new_node->addr[i] = addr[i];
+     new_node->mask[i] = mask[i];
+   }
++  /* New nodes default to matching true. Override if not. */
++  new_node->next_bit_one = new_node->next_bit_zero = TRIE_NODE_TRUE;
+   return new_node;
+ }
+ 
+@@ -349,14 +355,10 @@ void trie_split (struct trie_node *this, const u32 *addr)
+   }
+ }
+ 
+-/* Convenient static mask used for new addresses.
+- * Will be replaced with user-supplied mask when we support netmasks */
+-static const u32 MASK_ALL_ONES[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+-
+ /* Tail-recursive helper for address insertion */
+-void _trie_insert (struct trie_node *this, const u32 *addr)
++void _trie_insert (struct trie_node *this, const u32 *addr, const u32 *mask)
+ {
+-  if (this == TRIE_NODE_TRUE) {
++  if (this == NULL || this == TRIE_NODE_TRUE) {
+     /* Anything below this point always matches; no need to insert */
+     return;
+   }
+@@ -370,24 +372,41 @@ void _trie_insert (struct trie_node *this, const u32 *addr)
+     /* Split the netmask to ensure a match */
+     trie_split(this, addr);
+   }
++
++  for (size_t i=0; i < 4; i++) {
++    if (this->mask[i] > mask[i]) {
++      /* broader mask, truncate this one */
++      this->mask[i] = mask[i];
++      for (; i < 4; i++) {
++        this->mask[i] = 0;
++      }
++      /* The longer mask is superseded. Delete following nodes. */
++      trie_free(this->next_bit_one);
++      trie_free(this->next_bit_zero);
++      /* Anything below here will always match. */
++      this->next_bit_one = this->next_bit_zero = TRIE_NODE_TRUE;
++      return;
++    }
++  }
++
+   if (addr_next_bit_is_one(this->mask, addr)) {
+     /* next bit is one: insert on the one branch */
+     if (this->next_bit_one == NULL) {
+       /* Previously unmatching branch, always the case when splitting */
+-      this->next_bit_one = new_trie_node(addr, MASK_ALL_ONES);
++

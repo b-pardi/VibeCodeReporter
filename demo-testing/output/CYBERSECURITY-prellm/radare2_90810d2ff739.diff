@@ -1,0 +1,141 @@
+@@ -1823,9 +1823,12 @@ R_API bool r_core_init(RCore *core) {
+ 	core->print->use_comments = false;
+ 	core->rtr_n = 0;
+ 	core->blocksize_max = R_CORE_BLOCKSIZE_MAX;
+-	core->tasks = r_list_newf (free);
++	core->task_id_next = 0;
++	core->tasks = r_list_newf (free); // TODO: free tasks properly
+ 	core->tasks_queue = r_list_new ();
+ 	core->tasks_lock = r_th_lock_new (false);
++	core->main_task = r_core_task_new (core, NULL, NULL, NULL);
++	r_list_append (core->tasks, core->main_task);
+ 	core->watchers = r_list_new ();
+ 	core->watchers->free = (RListFree)r_core_cmpwatch_free;
+ 	core->scriptstack = r_list_new ();
+@@ -2215,7 +2218,11 @@ R_API int r_core_prompt(RCore *r, int sync) {
+ }
+ 
+ R_API int r_core_prompt_exec(RCore *r) {
+-	int ret = r_core_cmd (r, r->cmdqueue, true);
++	RCoreTask *task = r->main_task;
++	task->msg->text = r->cmdqueue;
++	task->state = R_CORE_TASK_STATE_BEFORE_START;
++	r_core_task_run_sync (r, task);
++	//int ret = r_core_cmd (r, r->cmdqueue, true);
+ 	if (r->cons && r->cons->use_tts) {
+ 		const char *buf = r_cons_get_buffer();
+ 		r_sys_tts (buf, true);
+@@ -2225,7 +2232,7 @@ R_API int r_core_prompt_exec(RCore *r) {
+ 	if (r->cons && r->cons->line && r->cons->line->zerosep) {
+ 		r_cons_zero ();
+ 	}
+-	return ret;
++	return 0;
+ }
+ 
+ R_API int r_core_seek_size(RCore *core, ut64 addr, int bsize) {
+
+
+
+
+@@ -69,7 +69,7 @@ R_API RCoreTask *r_core_task_new (RCore *core, const char *cmd, RCoreTaskCallbac
+ 		goto hell;
+ 	}
+ 
+-	task->id = r_list_length (core->tasks)+1;
++	task->id = core->task_id_next++;
+ 	task->state = R_CORE_TASK_STATE_BEFORE_START;
+ 	task->core = core;
+ 	task->user = user;
+@@ -92,12 +92,15 @@ static void schedule_tasks(RCoreTask *current, bool end) {
+ 		r_th_lock_leave (current->dispatch_lock);
+ 	}
+ 
+-	RCoreTask *next = r_list_pop_head (current->core->tasks);
+-	r_list_append (current->core->tasks, current);
++	RCoreTask *next = r_list_pop_head (current->core->tasks_queue);
++
++	if (next) {
++		r_list_append (current->core->tasks_queue, current);
++	}
+ 
+ 	r_th_lock_leave (current->core->tasks_lock);
+ 
+-	if (next != NULL) {
++	if (next) {
+ 		r_th_lock_enter (next->dispatch_lock);
+ 		r_th_cond_signal (next->dispatch_cond);
+ 		r_th_lock_leave (next->dispatch_lock);
+@@ -155,8 +158,15 @@ static int task_run(RCoreTask *task) {
+ 	task_begin (task);
+ 
+ 	// close (2); // no stderr
+-	char *res = r_core_cmd_str (core, task->msg->text);
++	char *res;
++	if (task == task->core->main_task) {
++		r_core_cmd0 (core, task->msg->text);
++		res = NULL;
++	} else {
++		res = r_core_cmd_str (core, task->msg->text);
++	}
+ 	task->msg->res = res;
++
+ 	eprintf ("\nTask %d finished\n", task->id);
+ 
+ 	task_end (task);
+@@ -170,16 +180,12 @@ static int task_run_thread(RThread *th) {
+ R_API void r_core_task_enqueue(RCore *core, RCoreTask *task) {
+ 	r_th_lock_enter (core->tasks_lock);
+ 	r_list_append (core->tasks, task);
++	task->msg->th = r_th_new (task_run_thread, task, 0);
+ 	r_th_lock_leave (core->tasks_lock);
+-
+-	r_th_new (task_run_thread, task, 0);
+ }
+ 
+ R_API void r_core_task_run_sync(RCore *core, RCoreTask *task) {
+-	r_th_lock_enter (core->tasks_lock);
+-	r_list_append (core->tasks, task);
+-	r_th_lock_enter (core->tasks_lock);
+-
++	task->msg->th = NULL;
+ 	task_run (task);
+ }
+ 
+
+
+
+
+@@ -135,6 +135,8 @@ typedef struct r_core_asmsteps_t {
+ 	int cols;
+ } RCoreAsmsteps;
+ 
++typedef struct r_core_task_t RCoreTask;
++
+ typedef struct r_core_t {
+ 	RBin *bin;
+ 	RConfig *config;
+@@ -199,8 +201,10 @@ typedef struct r_core_t {
+ 	bool in_search;
+ 	RList *watchers;
+ 	RList *scriptstack;
++	int task_id_next;
+ 	RList *tasks;
+ 	RList *tasks_queue;
++	RCoreTask *main_task;
+ 	RThreadLock *tasks_lock;
+ 	int cmd_depth;
+ 	int max_cmd_depth;
+
+
+
+
+@@ -5,7 +5,7 @@
+ R_API RThreadMsg* r_th_msg_new (const char *cmd, void *cb) {
+ 	RThreadMsg *msg = R_NEW0 (RThreadMsg);
+ 	if (msg) {
+-		msg->text = strdup (cmd);
++		msg->text = cmd ? strdup (cmd) : NULL;
+ 		//msg->cb = cb;
+ 		msg->done = 0;
+ 	}

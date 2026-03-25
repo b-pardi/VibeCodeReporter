@@ -1,0 +1,115 @@
+@@ -908,7 +908,7 @@ static void selection_widget_erase(RLine *line) {
+ 			cons->event_resize (cons->event_data);
+ 			RCore *core = (RCore *) (cons->user);
+ 			if (core) {
+-				cons->cb_task_oneshot (&core->tasks, print_rline_task, core);
++				print_rline_task (core);
+ 			}
+ 		}
+ 		printf ("%s", R_CONS_CLEAR_FROM_CURSOR_TO_END);
+
+
+
+
+@@ -3752,8 +3752,8 @@ static int agraph_refresh(struct agraph_refresh_data *grd) {
+ 	return res;
+ }
+ 
+-static void agraph_refresh_oneshot(struct agraph_refresh_data *grd) {
+-	r_core_task_enqueue_oneshot (&grd->core->tasks, (RCoreTaskOneShot) agraph_refresh, grd);
++static void agraph_refresh_queued(struct agraph_refresh_data *grd) {
++	agraph_refresh (grd);
+ }
+ 
+ static void agraph_set_need_reload_nodes(struct agraph_refresh_data *grd) {
+@@ -4214,7 +4214,7 @@ find_next:
+ 				r_core_visual_prompt_input (core);
+ 				g->can->flags = r_cons_canvas_flags (cons);
+ 				r_cons_set_raw (cons, true);
+-				cons->event_resize = (RConsEvent)agraph_refresh_oneshot;
++				cons->event_resize = (RConsEvent)agraph_refresh_queued;
+ 			}
+ 			if (c == 'n' || c == 'j') {
+ 				goto find_next;
+@@ -4546,7 +4546,7 @@ R_API bool r_core_visual_graph(RCore *core, RAGraph *g, RAnalFunction *_fcn, int
+ 
+ 	core->cons->event_resize = NULL; // avoid running old event with new data
+ 	core->cons->event_data = grd;
+-	core->cons->event_resize = (RConsEvent) agraph_refresh_oneshot;
++	core->cons->event_resize = (RConsEvent) agraph_refresh_queued;
+ 
+ 	r_cons_break_push (core->cons, NULL, NULL);
+ 	if (mode == 3) { // XXX wrong usage or buggy RGraph.domTree()
+@@ -5170,7 +5170,7 @@ R_API bool r_core_visual_graph(RCore *core, RAGraph *g, RAnalFunction *_fcn, int
+ 			r_core_visual_prompt_input (core);
+ 			g->can->flags = r_cons_canvas_flags (core->cons);
+ 			r_cons_set_raw (core->cons, true);
+-			core->cons->event_resize = (RConsEvent)agraph_refresh_oneshot;
++			core->cons->event_resize = (RConsEvent)agraph_refresh_queued;
+ 			if (!g) {
+ 				g->need_reload_nodes = true; // maybe too slow and unnecessary sometimes? better be safe and reload
+ 				get_bbupdate (g, core, fcn);
+
+
+
+
+@@ -1587,6 +1587,33 @@ static bool cb_cmdtimes(void *user, void *data) {
+ 	return true;
+ }
+ 
++static RCoreTaskMode taskmode_from_string(const char *s) {
++	if (s) {
++		if (r_str_startswith (s, "coop")) {
++			return R_CORE_TASK_MODE_COOP;
++		}
++		if (r_str_startswith (s, "thread")) {
++			return R_CORE_TASK_MODE_THREAD;
++		}
++		if (r_str_startswith (s, "fork")) {
++			return R_CORE_TASK_MODE_FORK;
++		}
++	}
++	return R_CORE_TASK_MODE_COOP; // default
++}
++
++static bool cb_cfg_taskmode(void *user, void *data) {
++	RCore *core = (RCore *) user;
++	RConfigNode *node = (RConfigNode *) data;
++	if (*node->value == '?') {
++		r_cons_printf (core->cons, "coop\nthread\nfork\n");
++		return false;
++	}
++	RCoreTaskMode mode = taskmode_from_string (node->value);
++	r_core_task_set_default_mode (&core->tasks, mode);
++	return true;
++}
++
+ static bool cb_prefix_marker(void *user, void *data) {
+ 	RCore *core = (RCore *) user;
+ 	RConfigNode *node = (RConfigNode *) data;
+@@ -3627,6 +3654,7 @@ R_API int r_core_config_init(RCore *core) {
+ 	}
+ #endif
+ 	SETCB ("cmd.times", "", &cb_cmdtimes, "run when a command is repeated (number prefix)");
++	SETCB ("cfg.taskmode", "thread", &cb_cfg_taskmode, "default execution mode for new core tasks (core, thread, fork)");
+ 	/* pdb */
+ 	SETS ("pdb.useragent", "microsoft-symbol-server/6.11.0001.402", "User agent for Microsoft symbol server");
+ 	SETS ("pdb.server", "https://msdl.microsoft.com/download/symbols", "Space separated list of base URLs for Microsoft symbol servers");
+
+
+
+
+@@ -69,6 +69,7 @@ R_VEC_TYPE(RVecAnalRef, RAnalRef);
+ #include "cmd_quit.inc.c"
+ #include "cmd_hash.inc.c"
+ #include "cmd_debug.inc.c"
++#include "cmd_task.inc.c"
+ #include "cmd_log.inc.c"
+ #include "cmd_yank.inc.c"
+ #include "cmd_flag.inc.c"
+@@ -3133,90 +3134,8 @@ static int cmd_pipein(void *user, const char *input) {
+ 	return 0;
+ }
+ 
+-static int cmd_tasks(void *data, const char *input) {
+-	RCore *co

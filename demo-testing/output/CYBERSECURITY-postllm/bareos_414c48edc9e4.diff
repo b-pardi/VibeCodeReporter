@@ -1,0 +1,144 @@
+@@ -28,6 +28,7 @@
+ 
+ #include "include/bareos.h"
+ #include "crypto_openssl.h"
++#include "xxhash.h"
+ 
+ /*
+  * BAREOS ASN.1 Syntax
+@@ -138,6 +139,8 @@ const char* crypto_digest_name(crypto_digest_t type)
+       return "SHA256";
+     case CRYPTO_DIGEST_SHA512:
+       return "SHA512";
++    case CRYPTO_DIGEST_XXH128:
++      return "XXH128";
+     case CRYPTO_DIGEST_NONE:
+       return "None";
+     default:
+@@ -160,6 +163,8 @@ crypto_digest_t CryptoDigestStreamType(int stream)
+       return CRYPTO_DIGEST_SHA256;
+     case STREAM_SHA512_DIGEST:
+       return CRYPTO_DIGEST_SHA512;
++    case STREAM_XXH128_DIGEST:
++      return CRYPTO_DIGEST_XXH128;
+     default:
+       return CRYPTO_DIGEST_NONE;
+   }
+@@ -202,6 +207,8 @@ DIGEST* crypto_digest_new(JobControlRecord* jcr, crypto_digest_t type)
+     case CRYPTO_DIGEST_SHA256:
+     case CRYPTO_DIGEST_SHA512:
+       return OpensslDigestNew(jcr, type);
++    case CRYPTO_DIGEST_XXH128:
++      return XxhashDigestNew(jcr, type);
+     case CRYPTO_DIGEST_NONE:
+       Jmsg1(jcr, M_ERROR, 0, _("Unsupported digest type: %d\n"), type);
+       return nullptr;
+
+
+
+
+@@ -32,6 +32,7 @@
+ #include <string>
+ 
+ template <typename T> class alist;
++class JobControlRecord;
+ 
+ /* Opaque X509 Public/Private Key Pair Structure */
+ typedef struct X509_Keypair X509_KEYPAIR;
+@@ -67,7 +68,8 @@ typedef enum
+   CRYPTO_DIGEST_MD5 = 1,
+   CRYPTO_DIGEST_SHA1 = 2,
+   CRYPTO_DIGEST_SHA256 = 3,
+-  CRYPTO_DIGEST_SHA512 = 4
++  CRYPTO_DIGEST_SHA512 = 4,
++  CRYPTO_DIGEST_XXH128 = 5
+ } crypto_digest_t;
+ 
+ /* Cipher Types */
+@@ -105,6 +107,7 @@ typedef enum
+ #define CRYPTO_DIGEST_SHA1_SIZE 20   /* 160 bits */
+ #define CRYPTO_DIGEST_SHA256_SIZE 32 /* 256 bits */
+ #define CRYPTO_DIGEST_SHA512_SIZE 64 /* 512 bits */
++#define CRYPTO_DIGEST_XXH128_SIZE 16 /* 128 bits */
+ 
+ /* Maximum Message Digest Size */
+ #ifdef HAVE_OPENSSL
+@@ -132,6 +135,8 @@ typedef enum
+ 
+ #endif /* HAVE_OPENSSL */
+ 
++class DigestInitException : public std::exception {};
++
+ struct Digest {
+   JobControlRecord* jcr;
+   crypto_digest_t type;
+
+
+
+
+@@ -277,8 +277,6 @@ struct X509_Keypair {
+   EVP_PKEY* privkey;
+ };
+ 
+-class DigestInitException : public std::exception {};
+-
+ /* Message Digest Structure */
+ struct EvpDigest : public Digest {
+ #    if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,72 @@
++/*
++   BAREOS® - Backup Archiving REcovery Open Sourced
++
++   Copyright (C) 2023-2023 Bareos GmbH & Co. KG
++
++   This program is Free Software; you can redistribute it and/or
++   modify it under the terms of version three of the GNU Affero General Public
++   License as published by the Free Software Foundation and included
++   in the file LICENSE.
++
++   This program is distributed in the hope that it will be useful, but
++   WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++   Affero General Public License for more details.
++
++   You should have received a copy of the GNU Affero General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++   02110-1301, USA.
++*/
++#include <cstring>
++#include <xxh3.h>
++
++#include "crypto.h"
++#include "xxhash.h"
++
++class XxhashDigestState {
++  XXH3_state_t* state;
++
++ public:
++  XxhashDigestState() : state(XXH3_createState())
++  {
++    if (state == nullptr) throw DigestInitException{};
++  }
++  ~XxhashDigestState() { XXH3_freeState(state); }
++  XXH3_state_t* operator*() { return state; }
++};
++
++class XxhashDigest : public Digest {
++  XxhashDigestState state{};
++
++ public:
++  XxhashDigest(JobControlRecord* jcr, crypto_digest_t type);
++  virtual bool Update(const uint8_t* data, uint32_t length) override;
++  virtual bool Finalize(uint8_t* data, uint32_t* length) override;
++};
++
++XxhashDigest::XxhashDigest(JobControlRecord* jcr, crypto_digest_t type)
++    : Digest(jcr, type)
++{
++  if (XXH3_128bits_reset(*state) == XXH_ERRO

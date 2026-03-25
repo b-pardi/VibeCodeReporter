@@ -1,0 +1,87 @@
+@@ -6,6 +6,7 @@
+ #include <glob.h>
+ 
+ #include <exception>
++#include <iterator>
+ #include <limits>
+ #include <utility>
+ 
+@@ -32,6 +33,7 @@
+ #include "zeek/spicy/file-analyzer.h"
+ #include "zeek/spicy/packet-analyzer.h"
+ #include "zeek/spicy/protocol-analyzer.h"
++#include "zeek/spicy/runtime-support.h"
+ #include "zeek/zeek-config-paths.h"
+ 
+ using namespace zeek;
+@@ -74,9 +76,13 @@ void Manager::registerProtocolAnalyzer(const std::string& name, hilti::rt::Proto
+     info.name_zeek = hilti::rt::replace(name, "::", "_");
+     info.name_zeekygen = hilti::rt::fmt("<Spicy-%s>", name);
+     info.protocol = proto;
+-    info.ports = ports;
+     info.linker_scope = linker_scope;
+ 
++    // Store ports in a deterministic order. We can't (easily) sort the
++    // `hilti::rt::Vector` unfortunately.
++    std::copy(ports.begin(), ports.end(), std::back_inserter(info.ports));
++    std::sort(info.ports.begin(), info.ports.end());
++
+     // We may have that analyzer already iff it was previously pre-registered
+     // without a linker scope. We'll then only set the scope now.
+     if ( auto t = _analyzer_name_to_tag_type.find(info.name_zeek); t != _analyzer_name_to_tag_type.end() ) {
+@@ -701,14 +707,25 @@ void Manager::InitPostScript() {
+         if ( ! tag )
+             reporter->InternalError("cannot get analyzer tag for '%s'", p.name_analyzer.c_str());
+ 
++        auto register_analyzer_for_port = [&](auto tag, const hilti::rt::Port& port_) {
++            SPICY_DEBUG(hilti::rt::fmt("  Scheduling analyzer for port %s", port_));
++
++            // Well-known ports are registered in scriptland, so we'll raise an
++            // event that will do it for us through a predefined handler.
++            zeek::Args vals = Args();
++            vals.emplace_back(tag.AsVal());
++            vals.emplace_back(zeek::spicy::rt::to_val(port_, base_type(TYPE_PORT)));
++            EventHandlerPtr handler = event_registry->Register("spicy_analyzer_for_port");
++            event_mgr.Enqueue(handler, vals);
++        };
++
+         for ( const auto& ports : p.ports ) {
+             const auto proto = ports.begin.protocol();
+ 
+             // Port ranges are closed intervals.
+             for ( auto port = ports.begin.port(); port <= ports.end.port(); ++port ) {
+                 const auto port_ = hilti::rt::Port(port, proto);
+-                SPICY_DEBUG(hilti::rt::fmt("  Scheduling analyzer for port %s", port_));
+-                analyzer_mgr->RegisterAnalyzerForPort(tag, transport_protocol(port_), port);
++                register_analyzer_for_port(tag, port_);
+ 
+                 // Don't double register in case of single-port ranges.
+                 if ( ports.begin.port() == ports.end.port() )
+@@ -727,7 +744,7 @@ void Manager::InitPostScript() {
+                     continue;
+ 
+                 SPICY_DEBUG(hilti::rt::fmt("  Scheduling analyzer for port %s", port.port));
+-                analyzer_mgr->RegisterAnalyzerForPort(tag, transport_protocol(port.port), port.port.port());
++                register_analyzer_for_port(tag, port.port);
+             }
+         }
+     }
+
+
+
+
+@@ -85,7 +85,7 @@ public:
+      *
+      * @param name name of the analyzer as defined in its EVT file
+      * @param proto analyzer's transport-layer protocol
+-     * @param prts well-known ports for the analyzer; it'll be activated automatically for these
++     * @param ports well-known ports for the analyzer; it'll be activated automatically for these
+      * @param parser_orig name of the Spicy parser for the originator side; must match the name that
+      * Spicy registers the unit's parser with
+      * @param parser_resp name of the Spicy parser for the originator side; must match the name that
+@@ -343,7 +343,7 @@ private:
+         std::string name_parser_resp;
+         std::string name_replaces;
+         hilti::rt::Protocol protocol = hilti::rt::Protocol::Undef;
+-        hilti::rt::Vector<::zeek::spicy::rt::PortRange> ports;
++        std::vector<::zeek::spicy::rt::PortRange> ports; // we

@@ -1,0 +1,90 @@
+@@ -223,14 +223,14 @@ enum calico_skb_mark {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Winvalid-noreturn"
+ static CALI_BPF_INLINE __attribute__((noreturn)) void bpf_exit(int rc) {
+-	// Need volatile here because we don't use rc after this assembler fragment.
+-	// The BPF assembler rejects an input-only operand so we make r0 an in/out operand.
+-	asm volatile ( \
+-		"exit" \
+-		: "=r0" (rc) /*out*/ \
+-		: "0" (rc) /*in*/ \
+-		: /*clobber*/ \
++	asm volatile (
++		"r0 = %[rc_arg]\n" //Explicitly move the value of 'rc' into register R0 to prohibit excessive compiler optimization and make the verifier happy
++		"exit"
++		: // No output operands
++		: [rc_arg] "r" (rc) // Input: rc to a general purpose register
++		: "r0" // Clobber list: R0 is modified by the assembly code
+ 	);
++	__builtin_unreachable(); // Tell the compiler that this function never returns
+ }
+ #pragma clang diagnostic pop
+ 
+
+
+
+
+@@ -87,7 +87,7 @@ int calico_tc_main(struct __sk_buff *skb)
+ 			/* If we are on vxlan and we do not have the key set, we cannot short-cirquit */
+ 			!(CALI_F_VXLAN &&
+ 			 !skb_mark_equals(skb, CALI_SKB_MARK_TUNNEL_KEY_SET, CALI_SKB_MARK_TUNNEL_KEY_SET))) {
+-		if  (CALI_LOG_LEVEL >= CALI_LOG_LEVEL_DEBUG) {
++		if (CALI_LOG_LEVEL >= CALI_LOG_LEVEL_DEBUG) {
+ 			/* This generates a bit more richer output for logging */
+ 			DECLARE_TC_CTX(_ctx,
+ 				.skb = skb,
+@@ -101,11 +101,6 @@ int calico_tc_main(struct __sk_buff *skb)
+ 
+ 			CALI_DEBUG("New packet at ifindex=%d; mark=%x", skb->ifindex, skb->mark);
+ 			parse_packet_ip(ctx);
+-			if (CALI_F_WEP && qos_enforce_packet_rate(ctx) == TC_ACT_SHOT) {
+-				CALI_DEBUG("Final result=DENY (%d). Dropped due to packet rate QoS.", CALI_REASON_DROPPED_BY_QOS);
+-				deny_reason(ctx, CALI_REASON_DROPPED_BY_QOS);
+-				return TC_ACT_SHOT;
+-			}
+ 			CALI_DEBUG("Final result=ALLOW (%d). Bypass mark set.", CALI_REASON_BYPASS);
+ 		}
+ 		return TC_ACT_UNSPEC;
+@@ -166,6 +161,13 @@ int calico_tc_main(struct __sk_buff *skb)
+ 
+ 	counter_inc(ctx, COUNTER_TOTAL_PACKETS);
+ 
++	if (CALI_F_WEP && qos_enforce_packet_rate(ctx) == TC_ACT_SHOT) {
++		CALI_DEBUG("Drop packet due to QoS packet rate limit.");
++		deny_reason(ctx, CALI_REASON_DROPPED_BY_QOS);
++		ctx->fwd.res = TC_ACT_SHOT;
++		goto finalize;
++	}
++
+ 	if (CALI_LOG_LEVEL >= CALI_LOG_LEVEL_INFO || PROFILING) {
+ 		ctx->state->prog_start_time = bpf_ktime_get_ns();
+ 	}
+@@ -1344,10 +1346,6 @@ int calico_tc_skb_accepted_entrypoint(struct __sk_buff *skb)
+ 	}
+ #endif
+ 
+-	if (CALI_F_WEP && qos_enforce_packet_rate(ctx) == TC_ACT_SHOT) {
+-		deny_reason(ctx, CALI_REASON_DROPPED_BY_QOS);
+-		goto deny;
+-	}
+ 	if ((CALI_F_FROM_WEP || CALI_F_TO_HEP) && qos_dscp_needs_update(ctx) && !qos_dscp_set(ctx)) {
+ 		goto deny;
+ 	}
+
+
+
+
+@@ -55,6 +55,13 @@ int  cali_tc_preamble(struct __sk_buff *skb)
+ 	/* We do the copy once here so keep the program smaller */
+ 	globals->data = *globals_data;
+ 
++	// Clear bypass mark from packet if ingress packet rate QoS is configured
++	if (globals->data.flags & CALI_GLOBALS_INGRESS_PACKET_RATE_CONFIGURED) {
++		if (skb->mark == CALI_SKB_MARK_BYPASS) {
++			skb->mark = CALI_SKB_MARK_SEEN;
++		}
++	}
++
+ #if EMIT_LOGS
+ 	CALI_LOG("tc_preamble iface %s", globals->data.iface_name);
+ #endif

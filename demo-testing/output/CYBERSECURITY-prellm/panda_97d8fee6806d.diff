@@ -1,0 +1,124 @@
+@@ -140,8 +140,23 @@ bool init_plugin(void *self)
+     panda_arg_list *args = panda_get_args("ida_taint2");
+     filename = panda_parse_string(args, "filename", "ida_taint2.csv");
+ 
+-    // Open up a CSV file and write the header.
++    // Open up a CSV file and write the metadata and header.
++    // get build date in ISO 8601 format
++    struct tm build_tm;
++    memset(&build_tm, 0, sizeof(struct tm));
++    strptime(__DATE__, "%b %d %Y", &build_tm);
++    char build_date[16];
++    strftime(build_date, 16, "%Y-%m-%d", &build_tm);
++    
++    // need UTC execution time in ISO 8601 format
++    time_t s_since_epoch = time(NULL);
++    struct tm exec_tm;
++    gmtime_r(&s_since_epoch, &exec_tm);
++    char time_string[64];
++    strftime(time_string, 64, "%FT%TZ", &exec_tm);
+     pidpclog = fopen(filename, "w");
++    fprintf(pidpclog, "PANDA Build Date,%s\n", build_date);
++    fprintf(pidpclog, "Execution Timestamp,%s\n", time_string);
+     fprintf(pidpclog, "process name,pid,pc,label\n");
+ 
+     return true;
+
+
+
+
+@@ -90,6 +90,16 @@ def read_semantic_labels(filename):
+ 
+     return semantic_labels
+ 
++def skip_csv_header(reader, show_metadata):
++    # newer ida_taint2 output files have some metadata before the header
++    line1 = next(reader, None)
++    if (line1[0].startswith("PANDA Build Date")):
++        exec_time = next(reader, None)
++        if (show_metadata):
++            idaapi.msg(line1[0] + ":  " + line1[1] + "\n")
++            idaapi.msg(exec_time[0] + ":  " + exec_time[1] + "\n")
++        next(reader, None)
++        
+ def main():
+     filename, _ = QFileDialog.getOpenFileName(None, "Open file", ".", "CSV Files(*.csv)")
+     if filename == "":
+@@ -98,7 +108,8 @@ def main():
+     processes = set()
+     input_file = open(filename, "r")
+     reader = csv.reader(input_file)
+-    next(reader, None)
++    
++    skip_csv_header(reader, True)
+     for row in reader:
+         processes.add((row[0], int(row[1])))
+     input_file.close()
+@@ -117,8 +128,7 @@ def main():
+     input_file = open(filename, "r")
+     reader = csv.reader(input_file)
+     labels_for_pc = {}
+-    # skip header
+-    next(reader, None)
++    skip_csv_header(reader, False)
+     for row in reader:
+         pid = int(row[1])
+         pc = int(row[2], 16)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,722 @@
++"""
++IDAPython plugin to let the user indicate tainted instructions and functions
++using data collected by PANDA's ida_taint2 plugin.  These indications are
++made only by changing the view of the data, not the IDA database for a binary.
++"""
++import csv
++import ctypes
++
++import idaapi
++
++from PyQt5 import QtCore
++from PyQt5 import QtGui
++from PyQt5 import QtWidgets
++from PyQt5.QtCore import Qt
++from PyQt5.QtWidgets import (QDialog, QPushButton, QTableWidget, QHeaderView, QAbstractItemView,
++        QTableWidgetItem, QCheckBox, QHBoxLayout, QVBoxLayout, QGridLayout, QFileDialog, QLabel)
++
++import ida_funcs
++import ida_kernwin
++import idautils
++
++FUNCS_WINDOW_CAPTION = "Functions window"
++
++# an orangish shade
++INST_COLOR = 0x55AAFF
++
++# dialog to let user enable old taint info, disable current taint info, or
++# change file and process from which taint information is acquired
++class ReuseTaintDialog(QDialog):
++    GET_NEW_FILE = 1
++    GET_NEW_PROCESS = 2
++    CANCEL_REQUEST = -1
++    
++    def __init__(self, filename, selected_process):
++        super(ReuseTaintDialog, self).__init__()
++        
++        self.setWindowTitle("Reuse ida_taint2 Settings?")
++        
++        btn_ok = QPushButton("OK")
++        btn_ok.clicked.connect(self.accept)
++        btn_ok.setDefault(True)
++        
++        btn_cancel = QPushButton("Cancel")
++        btn_cancel.clicked.connect(self.reject)
++        
++        self.lbl_file = QLabel()
++        self.lbl_file.setText("File:  " + filename)
++        self.lbl_process = QLabel()
++        self.lbl_process.setText("Process:  " + selected_process['process_name'] +
++        " (ID=" + str(selected_process['process_id']) + ")")
++        
++        self.chkbx

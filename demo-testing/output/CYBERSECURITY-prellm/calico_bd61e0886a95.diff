@@ -1,0 +1,84 @@
+@@ -106,11 +106,12 @@ struct bpf_map_def_extended {
+ };
+ 
+ /* These constants must be kept in sync with the calculate-flags script. */
+-#define CALI_TC_HOST_EP	(1<<0)
+-#define CALI_TC_INGRESS	(1<<1)
+-#define CALI_TC_TUNNEL	(1<<2)
+-#define CALI_CGROUP	(1<<3)
+-#define CALI_TC_DSR	(1<<4)
++#define CALI_TC_HOST_EP		(1<<0)
++#define CALI_TC_INGRESS		(1<<1)
++#define CALI_TC_TUNNEL		(1<<2)
++#define CALI_CGROUP		(1<<3)
++#define CALI_TC_DSR		(1<<4)
++#define CALI_TC_WIREGUARD	(1<<5)
+ 
+ #ifndef CALI_COMPILE_FLAGS
+ #define CALI_COMPILE_FLAGS 0
+@@ -119,9 +120,10 @@ struct bpf_map_def_extended {
+ #define CALI_F_INGRESS ((CALI_COMPILE_FLAGS) & CALI_TC_INGRESS)
+ #define CALI_F_EGRESS  (!CALI_F_INGRESS)
+ 
+-#define CALI_F_HEP     ((CALI_COMPILE_FLAGS) & CALI_TC_HOST_EP)
+-#define CALI_F_WEP     (!CALI_F_HEP)
+-#define CALI_F_TUNNEL  ((CALI_COMPILE_FLAGS) & CALI_TC_TUNNEL)
++#define CALI_F_HEP     	 ((CALI_COMPILE_FLAGS) & CALI_TC_HOST_EP)
++#define CALI_F_WEP     	 (!CALI_F_HEP)
++#define CALI_F_TUNNEL  	 ((CALI_COMPILE_FLAGS) & CALI_TC_TUNNEL)
++#define CALI_F_WIREGUARD ((CALI_COMPILE_FLAGS) & CALI_TC_WIREGUARD)
+ 
+ #define CALI_F_FROM_HEP (CALI_F_HEP && CALI_F_INGRESS)
+ #define CALI_F_TO_HEP   (CALI_F_HEP && !CALI_F_INGRESS)
+@@ -133,6 +135,7 @@ struct bpf_map_def_extended {
+ #define CALI_F_FROM_HOST     (!CALI_F_TO_HOST)
+ #define CALI_F_L3            (CALI_F_TO_HEP && CALI_F_TUNNEL)
+ #define CALI_F_IPIP_ENCAPPED (CALI_F_INGRESS && CALI_F_TUNNEL)
++#define CALI_F_WG_INGRESS    (CALI_F_INGRESS && CALI_F_WIREGUARD)
+ 
+ #define CALI_F_CGROUP	(((CALI_COMPILE_FLAGS) & CALI_CGROUP) != 0)
+ #define CALI_F_DSR	(CALI_COMPILE_FLAGS & CALI_TC_DSR)
+
+
+
+
+@@ -46,7 +46,7 @@ static CALI_BPF_INLINE bool skb_too_short(struct __sk_buff *skb)
+ {
+ 	if (CALI_F_IPIP_ENCAPPED) {
+ 		return skb_shorter(skb, ETH_IPV4_UDP_SIZE + sizeof(struct iphdr));
+-	} else if (CALI_F_L3) {
++	} else if (CALI_F_L3 | CALI_F_WIREGUARD) {
+ 		return skb_shorter(skb, IPV4_UDP_SIZE);
+ 	} else {
+ 		return skb_shorter(skb, ETH_IPV4_UDP_SIZE);
+@@ -59,8 +59,9 @@ static CALI_BPF_INLINE long skb_iphdr_offset(struct __sk_buff *skb)
+ 	if (CALI_F_IPIP_ENCAPPED) {
+ 		// Ingress on an IPIP tunnel: skb is [ether|outer IP|inner IP|payload]
+ 		return sizeof(struct ethhdr) + sizeof(struct iphdr);
+-	} else if (CALI_F_L3) {
+-		// Egress on an IPIP tunnel: skb is [inner IP|payload]
++	} else if (CALI_F_L3 | CALI_F_WIREGUARD) {
++		// Egress on an IPIP tunnel, or Wireguard both directions:
++		// skb is [inner IP|payload]
+ 		return 0;
+ 	} else {
+ 		// Normal L2 interface: skb is [ether|IP|payload]
+
+
+
+
+@@ -211,6 +211,14 @@ static CALI_BPF_INLINE int forward_or_drop(struct __sk_buff *skb,
+ #if FIB_ENABLED
+ 	// Try a short-circuit FIB lookup.
+ 	if (fwd_fib(fwd)) {
++		if (CALI_F_WG_INGRESS) {
++			// Don't try redirect from Wireguard ingress, because it doesn't work.
++			// Wireguard SKBs are L3 and we think we need to add on an Ethernet header
++			// before redirecting to a local cali* veth, so that the veth doesn't drop
++			// the packet.
++			goto cancel_fib;
++		}
++
+ 		/* XXX we might include the tot_len in the fwd, set it once when
+ 		 * we get the ip_header the first time and only adjust the value
+ 		 * when we modify the packet - to avoid geting the header here

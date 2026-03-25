@@ -1,0 +1,116 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,399 @@
++#!/usr/bin/env python3
++"""
++wsdl_recon.py
++
++Usage:
++  python wsdl_recon.py --wsdl https://example.com/service?wsdl             # dry-run (no SOAP calls)
++  python wsdl_recon.py --wsdl /path/to/local.wsdl --send                 # actively POST SOAP calls (explicit opt-in)
++  python wsdl_recon.py --wsdl https://... --send --op getTimerDetails    # send only that operation
++"""
++
++import argparse
++import json
++import re
++import sys
++import time
++from collections import defaultdict
++
++import requests
++from zeep import Client, Settings
++from zeep.exceptions import XMLSyntaxError, Fault
++from zeep.transports import Transport
++from zeep.plugins import HistoryPlugin
++from requests.adapters import HTTPAdapter
++from urllib3.util.retry import Retry
++
++SUSPICIOUS_KEYWORDS = [
++    "password", "passwd", "credential", "secret", "token", "key", "username", "user", "admin",
++    "provider_url", "providerurl", "initial_context_factory", "security_credentials",
++    "security_principal", "PROVIDER_URL", "SECURITY_CREDENTIALS", "SECURITY_PRINCIPAL",
++    "connectionFactory", "connection_factory", "destinationName", "destinationType",
++    "customProcessor", "customReader", "customWriter", "customPropertyFile", "msgSource",
++]
++
++def requests_session_with_retries(timeout=10, retries=2, backoff=0.5):
++    """
++    Create a requests.Session with retry logic and default timeout handling.
++    This version fixes the previous 'multiple values for timeout' error by
++    not forcing timeout twice (zeep handles it internally).
++    """
++    from requests.adapters import HTTPAdapter
++    from urllib3.util.retry import Retry
++    import requests
++
++    s = requests.Session()
++    retry = Retry(
++        total=retries,
++        backoff_factor=backoff,
++        status_forcelist=(500, 502, 503, 504),
++        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
++    )
++    s.mount("http://", HTTPAdapter(max_retries=retry))
++    s.mount("https://", HTTPAdapter(max_retries=retry))
++    s.headers.update({"User-Agent": "wsdl-recon/1.0"})
++
++    # ✅ FIX: patched request wrapper to prevent duplicate timeout kwarg
++    original_request = s.request
++
++    def patched_request(*args, **kwargs):
++        # only add timeout if caller did not already include one
++        if "timeout" not in kwargs:
++            kwargs["timeout"] = timeout
++        return original_request(*args, **kwargs)
++
++    s.request = patched_request
++    return s
++
++
++def load_client(wsdl_url_or_path, verify=True, timeout=15):
++    """
++    Initialize Zeep SOAP client with fixed transport, session and timeouts.
++    """
++    from zeep import Client, Settings
++    from zeep.transports import Transport
++    from zeep.plugins import HistoryPlugin
++
++    session = requests_session_with_retries(timeout=timeout)
++    # Respect SSL verification
++    session.verify = verify
++
++    transport = Transport(session=session, timeout=timeout, operation_timeout=timeout)
++    settings = Settings(strict=False, xml_huge_tree=True)
++    history = HistoryPlugin()
++
++    try:
++        client = Client(wsdl=wsdl_url_or_path, transport=transport,
++                        settings=settings, plugins=[history])
++    except Exception as e:
++        raise RuntimeError(f"Failed to parse WSDL: {e}")
++
++    return client, history
++
++def detect_axis_version_from_comments(wsdl_text):
++    # naive: look for "Apache Axis"
++    if wsdl_text is None:
++        return None
++    m = re.search(r"Apache Axis version[:\s]*([0-9\.]+)", wsdl_text, re.I)
++    if m:
++        return m.group(1)
++    if "Apache Axis" in wsdl_text:
++        return "axis (unknown version)"
++    return None
++
++def find_suspicious_elements(client):
++    findings = []
++    # walk types/elements
++    for schema in client.wsdl.types.schemas.values():
++        for name, element in schema.elements.items():
++            n = name.lower()
++            for kw in SUSPICIOUS_KEYWORDS:
++                if kw.lower() in n:
++                 

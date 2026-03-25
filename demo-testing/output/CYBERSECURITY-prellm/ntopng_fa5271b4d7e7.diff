@@ -1,0 +1,121 @@
+@@ -8,6 +8,20 @@ $(function() {
+         toggleSystemInterface($('#switch_interface_form_' + selectedValue));
+     });
+ 
++    const toggleObservationPoint = ($form = null) => {
++	if($form != null) {
++	    $form.submit();
++	}
++	else {
++	    console.error("An error has occurred when switching interface!");
++	}
++    }
++    
++    $(`#observationpoint-dropdown`).on('change', function(e) {
++        const selectedValue = $(this).val();
++        $('#switch_interface_form_observation_point_'+selectedValue).submit();
++    });
++
+     $("#interfaces-dropdown").on("changed.bs.select", function(e, clickedIndex, isSelected, oldValue) {
+         
+         if (clickedIndex == null && isSelected == null) {
+
+
+
+
+@@ -138,7 +138,7 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   /* Queue containing the ip@vlan strings of the hosts to restore. */
+   StringFifoQueue *hosts_to_restore;
+ 
+-  std::map<u_int16_t, bool> observationPoints;
++  std::map<u_int16_t /* observationPointId */, u_int32_t /* # of collected flows */> observationPoints;
+   
+   /* External alerts contain alertable entities other than host/interface/network
+    * which are dynamically allocated when an alert for them occurs.
+@@ -1033,11 +1033,18 @@ class NetworkInterface : public NetworkInterfaceAlertableEntity {
+   inline HostChecksExecutor* getHostCheckExecutor() { return(host_checks_executor); }
+   HostCheck *getCheck(HostCheckID t);
+ 
+-  inline void setObservationPointId(u_int16_t pointId) {
++  inline void incObservationPointIdFlows(u_int16_t pointId) {
+     /* This is work in progress and it needs to be locked when read */
+     observationPoints[pointId] = true;
+   }
++
++  inline bool hasObservationPointId(u_int16_t pointId) {
++    /* This is work in progress and it needs to be locked when read */
++    return((observationPoints.find(pointId) == observationPoints.end()) ? false : true);
++  }
++  
+   void getObservationPoints(lua_State* vm);
++  inline bool haveObservationPointsDefined() { return(observationPoints.size() == 0 ? false : true); }
+ };
+ 
+ #endif /* _NETWORK_INTERFACE_H_ */
+
+
+
+
+@@ -793,7 +793,8 @@ struct ntopngLuaContext {
+   NetworkStats *network;
+   Flow *flow;
+   bool localuser;
+-
++  u_int16_t observationPointId;
++  
+   /* Capabilities bitmap */
+   u_int64_t capabilities;
+ 
+
+
+
+
+@@ -195,7 +195,7 @@ void Host::initialize(Mac *_mac, VLANid _vlanId) {
+     mac->incUses();
+ 
+   if(observationPointId != 0)
+-    iface->setObservationPointId(observationPointId);
++    iface->incObservationPointIdFlows(observationPointId);
+       
+   if((vlan = iface->getVLAN(masked_vlanId, true, true /* Inline call */)) != NULL)
+     vlan->incUses();
+
+
+
+
+@@ -721,6 +721,8 @@ void LuaEngine::setInterface(const char * user, char * const ifname,
+ 			     u_int16_t ifname_len, bool * const is_allowed) const {
+   NetworkInterface *iface = NULL;
+   char key[CONST_MAX_LEN_REDIS_KEY];
++  u_int16_t observationPointId = 0;
++  
+   ifname[0] = '\0';
+ 
+   if((user == NULL) || (user[0] == '\0'))
+@@ -756,6 +758,24 @@ void LuaEngine::setInterface(const char * user, char * const ifname,
+ 
+     ntop->getTrace()->traceEvent(TRACE_DEBUG, "Interface found [Interface: %s][user: %s]", iface->get_name(), user);
+   }
++
++  if(iface && iface->haveObservationPointsDefined()) {
++    char buf[16];
++    
++    snprintf(key, sizeof(key), NTOPNG_PREFS_PREFIX ".%s.observationPointId", user);
++    
++    if(ntop->getRedis()->get(key, buf, sizeof(buf)) != -1) {
++      observationPointId = atoi(buf);
++
++      if(!iface->hasObservationPointId(observationPointId))
++	observationPointId = 0; /* Not existing: set it to 0 */
++    }
++  }
++
++  /* Set the observationPointId in the VM */
++  getLuaVMUservalue(L, observationPointId) = observationPointId;
++  
++  lua_push_uint32_table_entry(L, "observationPointId", observationPointId);
+ }
+ 
+ /* ****************************************** */
+@@ -902,7 +922,7 @@ int LuaEngine::handle_script_request(struct mg_connection *conn,
+   if((strcmp(request_info->request_method, "POST") ==

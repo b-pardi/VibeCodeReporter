@@ -1,0 +1,156 @@
+@@ -18,6 +18,7 @@
+ #include "common.h"
+ #include "utils.h"
+ #include "metrics.h"
++#include "ratelimit.h"
+ 
+ #ifdef DROP_NOTIFY
+ struct drop_notify {
+@@ -59,8 +60,21 @@ int __send_drop_notify(struct __ctx_buff *ctx)
+ 	__u16 line = (__u16)(meta4 >> 16);
+ 	__u8 file = (__u8)(meta4 >> 8);
+ 	__u8 exitcode = (__u8)meta4;
++	struct ratelimit_key rkey = {
++		.usage = RATELIMIT_USAGE_EVENTS_MAP,
++	};
++	struct ratelimit_settings settings = {
++		.topup_interval_ns = NSEC_PER_SEC,
++	};
+ 	struct drop_notify msg;
+ 
++	if (EVENTS_MAP_RATE_LIMIT > 0) {
++		settings.bucket_size = EVENTS_MAP_BURST_LIMIT;
++		settings.tokens_per_topup = EVENTS_MAP_RATE_LIMIT;
++		if (!ratelimit_check_and_take(&rkey, &settings))
++			return exitcode;
++	}
++
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_DROP, (__u8)error),
+ 		__notify_pktcap_hdr(ctx_len, (__u16)cap_len),
+
+
+
+
+@@ -12,3 +12,10 @@ struct {
+ 	__uint(pinning, LIBBPF_PIN_BY_NAME);
+ 	__uint(max_entries, __NR_CPUS__);
+ } EVENTS_MAP __section_maps_btf;
++
++#ifdef EVENTS_MAP_RATE_LIMIT
++#ifndef EVENTS_MAP_BURST_LIMIT
++#define EVENTS_MAP_BURST_LIMIT EVENTS_MAP_RATE_LIMIT
++#endif
++#endif
++
+
+
+
+
+@@ -1877,7 +1877,9 @@ int __tail_no_service_ipv6(struct __ctx_buff *ctx)
+ 	union macaddr dmac = {};
+ 	struct in6_addr saddr;
+ 	struct in6_addr daddr;
+-	struct ratelimit_key rkey = {};
++	struct ratelimit_key rkey = {
++		.usage = RATELIMIT_USAGE_ICMPV6,
++	};
+ 	/* Rate limit to 100 ICMPv6 replies per second, burstable to 1000 responses/s */
+ 	struct ratelimit_settings settings = {
+ 		.bucket_size = 1000,
+@@ -1891,7 +1893,7 @@ int __tail_no_service_ipv6(struct __ctx_buff *ctx)
+ 	const int inner_offset = sizeof(struct ethhdr) + sizeof(struct ipv6hdr) +
+ 		sizeof(struct icmp6hdr);
+ 
+-	rkey.netdev_idx = ctx_get_ifindex(ctx);
++	rkey.key.icmpv6.netdev_idx = ctx_get_ifindex(ctx);
+ 	if (!ratelimit_check_and_take(&rkey, &settings))
+ 		return DROP_RATE_LIMITED;
+ 
+
+
+
+
+@@ -13,6 +13,7 @@
+ #pragma once
+ 
+ #include "common.h"
++#include "ratelimit.h"
+ 
+ #ifdef POLICY_VERDICT_NOTIFY
+ 
+@@ -54,6 +55,12 @@ send_policy_verdict_notify(struct __ctx_buff *ctx, __u32 remote_label, __u16 dst
+ {
+ 	__u64 ctx_len = ctx_full_len(ctx);
+ 	__u64 cap_len = min_t(__u64, TRACE_PAYLOAD_LEN, ctx_len);
++	struct ratelimit_key rkey = {
++		.usage = RATELIMIT_USAGE_EVENTS_MAP,
++	};
++	struct ratelimit_settings settings = {
++		.topup_interval_ns = NSEC_PER_SEC,
++	};
+ 	struct policy_verdict_notify msg;
+ 
+ #if defined(IS_BPF_HOST)
+@@ -78,6 +85,13 @@ send_policy_verdict_notify(struct __ctx_buff *ctx, __u32 remote_label, __u16 dst
+ 	if (verdict == 0)
+ 		verdict = (int)proxy_port;
+ 
++	if (EVENTS_MAP_RATE_LIMIT > 0) {
++		settings.bucket_size = EVENTS_MAP_BURST_LIMIT;
++		settings.tokens_per_topup = EVENTS_MAP_RATE_LIMIT;
++		if (!ratelimit_check_and_take(&rkey, &settings))
++			return;
++	}
++
+ 	msg = (typeof(msg)) {
+ 		__notify_common_hdr(CILIUM_NOTIFY_POLICY_VERDICT, 0),
+ 		__notify_pktcap_hdr(ctx_len, (__u16)cap_len),
+
+
+
+
+@@ -6,8 +6,16 @@
+ #include "common.h"
+ #include "bpf/helpers.h"
+ 
++#define RATELIMIT_USAGE_ICMPV6 1
++#define RATELIMIT_USAGE_EVENTS_MAP 2
++
+ struct ratelimit_key {
+-	__u32 netdev_idx;
++	__u32 usage;
++	union {
++		struct {
++			__u32 netdev_idx;
++		} icmpv6;
++	} key;
+ };
+ 
+ struct ratelimit_value {
+@@ -23,8 +31,25 @@ struct {
+ 	__uint(max_entries, 1024);
+ } RATELIMIT_MAP __section_maps_btf;
+ 
++struct ratelimit_metrics_key {
++	__u32 usage;
++};
++
++struct ratelimit_metrics_value {
++	__u64 dropped;
++};
++
++struct {
++	__uint(type, BPF_MAP_TYPE_HASH);
++	__type(key, struct ratelimit_metrics_key);
++	__type(value, struct ratelimit_metrics_value);
++	__uint(pinning, LIBBPF_PIN_BY_NAME);
++	__uint(max_entries, 64);
++	__uint(map_flags, CONDITIONAL_PREALLOC);
++} RATELIMIT_METRICS_MAP __section_maps_btf;
++
+ struct ratelimit_settings {
+-	/* A bucket will never have more than X amount of tokens, limits burt size */
++	/* A bucket will never have more than X amount of tokens, limits burst size */
+ 	__u64 bucket_size;
+ 	/* The amount of tokens added to a bucket for every topu

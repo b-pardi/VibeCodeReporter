@@ -1,0 +1,125 @@
+@@ -5,20 +5,22 @@
+ #include <r_anal.h>
+ #include <r_cons.h>
+ #include <r_vec.h>
+-#include <sdb/ht_up.h>
+-#include <sdb/ht_uu.h>
++#include <cwisstable.h>
+ 
+ R_VEC_TYPE (RVecAnalRef, RAnalRef);
+ 
+ // xrefs are stored as an adjacency list (in both directions),
+ // as a hastable mapping at (from) to hashtables mapping addr (at) to a ref type.
+-typedef HtUU Edges;
+-typedef HtUP AdjacencyList;
++CWISS_DECLARE_FLAT_HASHMAP(Edges, ut64, RAnalRefType);
++// TODO store Edges directly in other hashmap, but how to hash & compare the hashmap itself?
++CWISS_DECLARE_FLAT_HASHMAP(AdjacencyList, ut64, Edges*);
++
++#define INITIAL_CAPACITY 0
+ 
+ // NOTE: this is heavy in memory usage, but needed due to performance reasons for large amounts of xrefs..
+ typedef struct r_ref_manager_t {
+-	AdjacencyList *refs;   // forward refs
+-	AdjacencyList *xrefs;  // backward refs
++	AdjacencyList refs;   // forward refs
++	AdjacencyList xrefs;  // backward refs
+ } RefManager;
+ 
+ static inline int compare_ref(const RAnalRef *a, const RAnalRef *b) {
+@@ -37,122 +39,99 @@ static inline int compare_ref(const RAnalRef *a, const RAnalRef *b) {
+ 	return 0;
+ }
+ 
+-static void adjacency_list_free(HtUPKv *kv) {
+-	ht_uu_free (kv->value);
+-}
+-
+ static RefManager *ref_manager_new(void) {
+ 	RefManager *rm = R_NEW0 (RefManager);
+ 	if (R_LIKELY (rm)) {
+-		rm->refs = ht_up_new (NULL, adjacency_list_free, NULL);
+-		if (R_UNLIKELY (!rm->refs)) {
+-			free (rm);
+-			return NULL;
+-		}
+-		rm->xrefs = ht_up_new (NULL, adjacency_list_free, NULL);
+-		if (R_UNLIKELY (!rm->xrefs)) {
+-			free (rm->refs);
+-			free (rm);
+-			return NULL;
+-		}
++		rm->refs = AdjacencyList_new (INITIAL_CAPACITY);
++		rm->xrefs = AdjacencyList_new (INITIAL_CAPACITY);
+ 	}
+ 	return rm;
+ }
+ 
++static inline void adjacency_list_fini(AdjacencyList *adj_list) {
++	AdjacencyList_CIter iter;
++	const AdjacencyList_Entry *entry;
++	for (iter = AdjacencyList_citer (adj_list);
++		(entry = AdjacencyList_CIter_get (&iter)) != NULL;
++		AdjacencyList_CIter_next (&iter)) {
++		Edges *edges = entry->val;
++		Edges_destroy (edges);
++		free (edges);
++	}
++
++	AdjacencyList_destroy (adj_list);
++}
++
+ static void ref_manager_free(RefManager *rm) {
+ 	if (R_LIKELY (rm)) {
+-		ht_up_free (rm->refs);
+-		ht_up_free (rm->xrefs);
++		adjacency_list_fini (&rm->refs);
++		adjacency_list_fini (&rm->xrefs);
+ 	}
+ 	free (rm);
+ }
+ 
+ static void _add_ref(AdjacencyList *adj_list, ut64 from, ut64 to, RAnalRefType type) {
+-	bool found;
+-	Edges *edges = ht_up_find (adj_list, from, &found);
+-	if (!found) {
++	AdjacencyList_Iter iter = AdjacencyList_find (adj_list, &from);
++	AdjacencyList_Entry *entry = AdjacencyList_Iter_get (&iter);
++	Edges *edges = entry ? entry->val : NULL;
++	if (!edges) {
+ 		// optionally add a hashtable if missing
+-		edges = ht_uu_new0 ();
++		edges = R_NEW0 (Edges);
+ 		if (!edges) {
+-			R_LOG_WARN ("failed to create hashtable for xrefs");
++			R_LOG_WARN ("failed to allocate hashtable for xrefs");
+ 			return;
+ 		}
+ 
+-		ht_up_insert (adj_list, from, edges); // adds the new (empty) hashtable
++		*edges = Edges_new (INITIAL_CAPACITY);
++		AdjacencyList_Entry new_entry = { .key = from, .val = edges };
++		AdjacencyList_insert (adj_list, &new_entry); // adds the new (empty) hashtable
++	}
++	Edges_Entry edge_entry = { .key = to, .val = type };
++	Edges_Insert result = Edges_insert (edges, &edge_entry); // and adds the ref
++	if (!result.inserted) {
++		Edges_Entry *existing_entry = Edges_Iter_get (&result.iter);
++		existing_entry->val = type;
+ 	}
+-	ht_uu_update (edges, to, (ut64) type); // and adds the ref
+ }
+ 
+ static void ref_manager_add_entry(RefManager *rm, ut64 from, ut64 to, RAnalRefType type) {
+-	_add_ref (rm->refs, from, to, type);
+-	_add_ref (rm->xrefs, to, from, type);
++	_add_ref (&rm->refs, from, to, type);
++	_add_ref (&rm->xrefs, to, from, type);
+ }
+ 
+ static void _delete_ref(AdjacencyList *adj_list, ut64 from, ut64 to) {
+-	bool found;
+-	Edges *edges = ht_up_find (adj_list, from, &found);
+-	if (found && edges) {
+-		if (edges->count == 1) {
+-			// ht_uu

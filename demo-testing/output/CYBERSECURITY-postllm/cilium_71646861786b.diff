@@ -1,0 +1,137 @@
+@@ -421,10 +421,12 @@ not_esp:
+ 
+ #if defined(ENABLE_EGRESS_GATEWAY_COMMON)
+ 	{
++		__u32 egress_ifindex = 0;
+ 		__be32 snat_addr, daddr;
+ 
+ 		daddr = ip4->daddr;
+-		if (egress_gw_snat_needed_hook(ip4->saddr, daddr, &snat_addr)) {
++		if (egress_gw_snat_needed_hook(ip4->saddr, daddr, &snat_addr,
++					       &egress_ifindex)) {
+ 			if (snat_addr == EGRESS_GATEWAY_NO_EGRESS_IP)
+ 				return DROP_NO_EGRESS_IP;
+ 
+@@ -436,7 +438,8 @@ not_esp:
+ 
+ 			/* to-netdev@bpf_host handles SNAT, so no need to do it here. */
+ 			ret = egress_gw_fib_lookup_and_redirect(ctx, snat_addr,
+-								daddr, ext_err);
++								daddr, egress_ifindex,
++								ext_err);
+ 			if (ret != CTX_ACT_OK)
+ 				return ret;
+ 
+
+
+
+
+@@ -31,12 +31,18 @@
+ 
+ static __always_inline
+ int egress_gw_fib_lookup_and_redirect(struct __ctx_buff *ctx, __be32 egress_ip, __be32 daddr,
+-				      __s8 *ext_err)
++				      __u32 egress_ifindex, __s8 *ext_err)
+ {
+ 	struct bpf_fib_lookup_padded fib_params = {};
+ 	int oif = 0;
+ 	int ret;
+ 
++	/* Immediate redirect to egress_ifindex requires L2 resolution.
++	 * Fall back to FIB lookup on older kernels.
++	 */
++	if (egress_ifindex && neigh_resolver_available())
++		return redirect_neigh(egress_ifindex, NULL, 0, 0);
++
+ 	ret = (__s8)fib_lookup_v4(ctx, &fib_params, egress_ip, daddr, 0);
+ 
+ 	switch (ret) {
+@@ -115,7 +121,8 @@ egress_gw_request_needs_redirect(struct ipv4_ct_tuple *rtuple __maybe_unused,
+ static __always_inline
+ bool egress_gw_snat_needed(__be32 saddr __maybe_unused,
+ 			   __be32 daddr __maybe_unused,
+-			   __be32 *snat_addr __maybe_unused)
++			   __be32 *snat_addr __maybe_unused,
++			   __u32 *egress_ifindex __maybe_unused)
+ {
+ #if defined(ENABLE_EGRESS_GATEWAY)
+ 	struct egress_gw_policy_entry *egress_gw_policy;
+@@ -129,6 +136,10 @@ bool egress_gw_snat_needed(__be32 saddr __maybe_unused,
+ 		return false;
+ 
+ 	*snat_addr = egress_gw_policy->egress_ip;
++#ifdef EGRESS_IFINDEX
++	*egress_ifindex = EGRESS_IFINDEX;
++#endif
++
+ 	return true;
+ #else
+ 	return false;
+@@ -173,7 +184,8 @@ egress_gw_request_needs_redirect_hook(struct ipv4_ct_tuple *rtuple,
+ }
+ 
+ static __always_inline
+-bool egress_gw_snat_needed_hook(__be32 saddr, __be32 daddr, __be32 *snat_addr)
++bool egress_gw_snat_needed_hook(__be32 saddr, __be32 daddr, __be32 *snat_addr,
++				__u32 *egress_ifindex)
+ {
+ 	struct remote_endpoint_info *remote_ep;
+ 
+@@ -186,7 +198,7 @@ bool egress_gw_snat_needed_hook(__be32 saddr, __be32 daddr, __be32 *snat_addr)
+ 	    identity_is_cluster(remote_ep->sec_identity))
+ 		return false;
+ 
+-	return egress_gw_snat_needed(saddr, daddr, snat_addr);
++	return egress_gw_snat_needed(saddr, daddr, snat_addr, egress_ifindex);
+ }
+ 
+ static __always_inline
+
+
+
+
+@@ -108,6 +108,7 @@ struct ipv4_nat_target {
+ 	bool egress_gateway; /* NAT is needed because of an egress gateway policy */
+ 	__u32 cluster_id;
+ 	bool needs_ct;
++	__u32 ifindex; /* Obtained from EGW policy */
+ };
+ 
+ #if defined(ENABLE_IPV4) && defined(ENABLE_NODEPORT)
+@@ -635,7 +636,8 @@ snat_v4_needs_masquerade(struct __ctx_buff *ctx __maybe_unused,
+ 	if (is_reply)
+ 		goto skip_egress_gateway;
+ 
+-	if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr, &target->addr)) {
++	if (egress_gw_snat_needed_hook(tuple->saddr, tuple->daddr, &target->addr,
++				       &target->ifindex)) {
+ 		if (target->addr == EGRESS_GATEWAY_NO_EGRESS_IP)
+ 			return DROP_NO_EGRESS_IP;
+ 
+
+
+
+
+@@ -353,9 +353,14 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
+ 
+ #if defined(ENABLE_EGRESS_GATEWAY_COMMON) && defined(IS_BPF_HOST)
+ 	if (target.egress_gateway) {
++		/* Stay on the desired egress interface: */
++		if (target.ifindex && target.ifindex == NATIVE_DEV_IFINDEX)
++			goto apply_snat;
++
+ 		/* Send packet to the correct egress interface, and SNAT it there. */
+ 		ret = egress_gw_fib_lookup_and_redirect(ctx, target.addr,
+-							tuple.daddr, ext_err);
++							tuple.daddr, target.ifindex,
++							ext_err);
+ 		if (ret != CTX_ACT_OK)
+ 			return ret;
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,117 @@
++// SPDX-License-Id

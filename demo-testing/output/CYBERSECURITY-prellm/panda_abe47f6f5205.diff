@@ -1,0 +1,120 @@
+@@ -34,6 +34,7 @@
+ // between this and END_PYPANDA_NEEDS_THIS except includes of other
+ // files in this directory that contain subsections like this one.
+ 
++int panda_vm_quit(void);
+ int panda_record_begin(const char *name, const char *snapshot);
+ int panda_record_end(void);
+ int panda_replay_begin(const char *name);
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,261 @@
++/*!
++ * @file recctrl.c
++ * @brief Recording controller plugin for PANDA.
++ *
++ * @author Manolis Stamatogiannakis manolis.stamatogiannakis@vu.nl
++ *
++ * @copyright This work is licensed under the terms of the GNU GPL, version 2.
++ * See the COPYING file in the top-level directory.
++ */
++#include <stdio.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <glib.h>
++#include "panda/plugin.h"
++#include "panda/rr/rr_api.h"
++#include "recctrl.h"
++
++bool init_plugin(void *);
++void uninit_plugin(void *);
++bool start_stop_recording(CPUState *cpu);
++gboolean timeout_cb(gpointer data);
++
++static bool dry = false; /** dry-run mode flag */
++static rr_control_t rr_control_dry = {.mode = RR_OFF, .next = RR_NOCHANGE}; /** dry-run state */
++static bool session_rec = false; /** session recoding mode flag */
++static uint32_t nsessions = 0;   /** number of active sessions */
++static uint32_t nrec_max = 0;    /** maximum number of session recordings to produce */
++static uint32_t nrec = 0;        /** number of recodings produced so far */
++static uint32_t timeout = 0;     /** maximum numbers of seconds for a recording */
++static uint32_t timeout_id = 0;  /** id for the last recording timeout callback */
++
++/**
++ * @brief Reads a printable string from the guest up to \p maxlen bytes long.
++ * The length includes the terminating \0 byte. Returns a dynamically allocated
++ * copy of the string.
++ */
++static inline char *read_guest_string(CPUState *cpu, target_ptr_t addr, uint32_t maxlen) {
++    uint8_t *buf = g_malloc0(maxlen*sizeof(char));
++    uint32_t i = 0;
++    if (panda_virtual_memory_read(cpu, addr, buf, maxlen) > 0) {
++        LOG_ERROR("could not read string from " TARGET_PTR_FMT, addr);
++        goto error;
++    }
++    while (i < maxlen && g_ascii_isprint(buf[i])) { i++; }
++    if (i < maxlen && buf[i] == '\0') {
++        return (char *)buf;
++    } else {
++        LOG_ERROR("malformed string read from " TARGET_PTR_FMT, addr);
++        goto error;
++    }
++error:
++    g_free(buf);
++    return NULL;
++}
++
++/**
++ * @brief Callback for unconditionally toggling panda PANDA recording.
++ * Returns a status code whether the toggle was successful.
++ */
++static recctrl_ret_t record_toggler(CPUState *cpu, rr_control_t *rrcp, target_ptr_t rnamep) {
++    recctrl_ret_t ret = RECCTRL_RET_ERROR;
++
++    switch (rrcp->mode) {
++	case RR_OFF: {
++        LOG_INFO("start of recording requested");
++        char *guest_string = read_guest_string(cpu, rnamep, RECCTRL_RNAME_MAX);
++        char *rname = guest_string;
++        if (rname != NULL) {
++            if (nrec_max != 1) {
++                rname = g_strdup_printf("%s_%03u", guest_string, nrec);
++                g_free(guest_string);
++            }
++            if (!dry) {
++                panda_record_begin(rname, NULL);
++                g_free(rname);
++            } else {
++                rrcp->mode = RR_RECORD;
++                rrcp->name = rname;
++            }
++            ret = RECCTRL_RET_START;
++        } else {
++            LOG_ERROR("start of recording aborted (couldn't get recording name)");
++        }
++	} break;
++
++	case RR_RECORD: {
++        LOG_INFO("end of recording requested");
++        if (!dry) {
++            panda_record_end();
++        } else {
++            rrcp->mode = RR_OFF;
++            g_free(rrcp->name);
++            rrcp->name = NULL;
++        }
++        ret = RECCTRL_RET_STOP;
++	} break;
++
++	case RR_REPLAY: {
++        LOG_WARNING("ignoring record request during replay");
++        ret = RECCTRL_RET_NOOP;
++	} break;
++
++	default: {
++        LOG_ERROR("unknown rr mode=%d", rrcp->mode);
++        ret = RECCTRL_RET_NOOP;
++        

@@ -1,0 +1,83 @@
+@@ -3,17 +3,23 @@ package org.batfish.datamodel.interface_dependency;
+ import static org.batfish.datamodel.Interface.DependencyType.AGGREGATE;
+ import static org.batfish.datamodel.Interface.DependencyType.BIND;
+ 
++import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterables;
+ import com.google.common.graph.Network;
+ import java.util.HashSet;
+ import java.util.LinkedList;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Queue;
+ import java.util.Set;
+ import java.util.function.Consumer;
++import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ import javax.annotation.Nullable;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
+ import org.batfish.common.topology.Layer1Edge;
+ import org.batfish.common.topology.Layer1Node;
+ import org.batfish.common.topology.Layer1Topologies;
+@@ -40,6 +46,7 @@ public class InterfaceDependencies {
+     return deps._interfacesToDeactivate;
+   }
+ 
++  private final Logger _logger = LogManager.getLogger(InterfaceDependencies.class);
+   private final Map<String, Configuration> _configs;
+   private final Layer1Topologies _layer1Topologies;
+   private final Graph<NodeInterfacePair, DependencyEdge> _depGraph;
+@@ -59,8 +66,9 @@ public class InterfaceDependencies {
+     for (Configuration config : _configs.values()) {
+       Map<String, Interface> allIfaces = config.getAllInterfaces();
+       for (Interface iface : allIfaces.values()) {
++        NodeInterfacePair ifaceId = NodeInterfacePair.of(iface);
+         if (!iface.getActive()) {
+-          _inactiveInterfaces.add(NodeInterfacePair.of(iface));
++          _inactiveInterfaces.add(ifaceId);
+           continue;
+         }
+ 
+@@ -74,7 +82,7 @@ public class InterfaceDependencies {
+               // non-local dependencies
+               @Nullable NodeInterfacePair neighbor = getL1Neighbor(iface);
+               if (neighbor != null) {
+-                addDependencyEdge(neighbor, NodeInterfacePair.of(iface), BIND);
++                addDependencyEdge(neighbor, ifaceId, BIND);
+               }
+               break;
+             }
+@@ -83,12 +91,53 @@ public class InterfaceDependencies {
+             {
+               // if the aggregate has no AGGREGATE dependencies, deactivate it.
+               if (iface.getDependencies().stream().noneMatch(dep -> dep.getType() == AGGREGATE)) {
+-                _interfacesToDeactivate.add(NodeInterfacePair.of(iface));
++                _logger.warn(
++                    "deactivating AGGREGATE/REDUNDANT interface {} with no dependencies", ifaceId);
++                _interfacesToDeactivate.add(ifaceId);
++                break;
+               }
+ 
+               // non-local dependencies
+-              @Nullable NodeInterfacePair neighbor = getL1Neighbor(iface);
+-              if (neighbor == null) {
++              Set<Layer1Node> neighbors = getL1Neighbors(iface);
++              if (neighbors.size() == 1) {
++                /* if the neighbor is inactive, iface must be too. e.g. if all member interfaces are up, but the
++                 * neighbor is admin-down, iface will be down
++                 * TODO sanity check: neighbor is a portchannel and its members are neighbors of iface's members
++                 */
++                addDependencyEdge(
++                    Iterables.getOnlyElement(neighbors).asNodeInterfacePair(), ifaceId, BIND);
++                break;
++              } else if (neighbors.size() == 2) {
++                // check if this is likely a virtual portchannel: assume if the neighbors are on two
++                // devices, and our members have neighbors on those same two devices, it's probably
++                // a virtual portchannel
++
++                // TODO this check could be more strict, i.e. check that:
++                // iface --> members --> neighbors == iface --> neighbors --> members
++                Set<String> memberInterfaceN

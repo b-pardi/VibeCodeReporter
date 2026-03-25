@@ -1,0 +1,131 @@
+@@ -8,6 +8,7 @@
+ #include "zeek/Desc.h"
+ #include "zeek/Event.h"
+ #include "zeek/EventRegistry.h"
++#include "zeek/EventTrace.h"
+ #include "zeek/Frame.h"
+ #include "zeek/Func.h"
+ #include "zeek/Hash.h"
+@@ -4323,7 +4324,14 @@ ValPtr ScheduleExpr::Eval(Frame* f) const
+ 	auto args = eval_list(f, event->Args());
+ 
+ 	if ( args )
+-		timer_mgr->Add(new ScheduleTimer(event->Handler(), std::move(*args), dt));
++		{
++		auto handler = event->Handler();
++
++		if ( etm )
++			etm->ScriptEventQueued(handler);
++
++		timer_mgr->Add(new ScheduleTimer(handler, std::move(*args), dt));
++		}
+ 
+ 	return nullptr;
+ 	}
+@@ -4862,7 +4870,12 @@ ValPtr EventExpr::Eval(Frame* f) const
+ 	auto v = eval_list(f, args.get());
+ 
+ 	if ( handler )
++		{
++		if ( etm )
++			etm->ScriptEventQueued(handler);
++
+ 		event_mgr.Enqueue(handler, std::move(*v));
++		}
+ 
+ 	return nullptr;
+ 	}
+
+
+
+
+@@ -33,6 +33,7 @@
+ #include "zeek/Debug.h"
+ #include "zeek/Desc.h"
+ #include "zeek/Event.h"
++#include "zeek/EventTrace.h"
+ #include "zeek/Expr.h"
+ #include "zeek/File.h"
+ #include "zeek/Frame.h"
+@@ -401,6 +402,9 @@ ValPtr ScriptFunc::Invoke(zeek::Args* args, Frame* parent) const
+ 	const CallExpr* call_expr = parent ? parent->GetCall() : nullptr;
+ 	call_stack.emplace_back(CallInfo{call_expr, this, *args});
+ 
++	if ( etm && Flavor() == FUNC_FLAVOR_EVENT )
++		etm->StartEvent(this, args);
++
+ 	if ( g_trace_state.DoTrace() )
+ 		{
+ 		ODesc d;
+@@ -481,6 +485,9 @@ ValPtr ScriptFunc::Invoke(zeek::Args* args, Frame* parent) const
+ 			result = val_mgr->True();
+ 		}
+ 
++	else if ( etm && Flavor() == FUNC_FLAVOR_EVENT )
++		etm->EndEvent(this, args);
++
+ 	// Warn if the function returns something, but we returned from
+ 	// the function without an explicit return, or without a value.
+ 	else if ( GetType()->Yield() && GetType()->Yield()->Tag() != TYPE_VOID &&
+
+
+
+
+@@ -8,6 +8,7 @@
+ #include "zeek/Debug.h"
+ #include "zeek/Desc.h"
+ #include "zeek/Event.h"
++#include "zeek/EventTrace.h"
+ #include "zeek/Expr.h"
+ #include "zeek/File.h"
+ #include "zeek/Frame.h"
+@@ -1076,11 +1077,17 @@ EventStmt::EventStmt(EventExprPtr arg_e) : ExprStmt(STMT_EVENT, arg_e), event_ex
+ ValPtr EventStmt::Exec(Frame* f, StmtFlowType& flow)
+ 	{
+ 	RegisterAccess();
++
+ 	auto args = eval_list(f, event_expr->Args());
+ 	auto h = event_expr->Handler();
+ 
+ 	if ( args && h )
++		{
++		if ( etm )
++			etm->ScriptEventQueued(h);
++
+ 		event_mgr.Enqueue(h, std::move(*args));
++		}
+ 
+ 	flow = FLOW_NEXT;
+ 	return nullptr;
+
+
+
+
+@@ -26,6 +26,7 @@
+ #include "zeek/Desc.h"
+ #include "zeek/Event.h"
+ #include "zeek/EventRegistry.h"
++#include "zeek/EventTrace.h"
+ #include "zeek/File.h"
+ #include "zeek/Frag.h"
+ #include "zeek/Frame.h"
+@@ -299,8 +300,19 @@ static void terminate_zeek()
+ 		event_mgr.Enqueue(zeek_done, Args{});
+ 
+ 	timer_mgr->Expire();
++
++	// Drain() limits how many "generations" of newly created events
++	// it will process.  When we're terminating, however, we're okay
++	// with long chains of events, and this makes the workings of
++	// event-tracing simpler.
++	//
++	// That said, we also need to ensure that it runs at least once,
++	// as it has side effects such as tickling triggers.
+ 	event_mgr.Drain();
+ 
++	while ( event_mgr.HasEvents() )
++		event_mgr.Drain();
++
+ 	if ( profiling_logger )
+ 		{
+ 		// FIXME: There are some occasional crashes in the memory

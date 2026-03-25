@@ -1,0 +1,154 @@
+@@ -320,6 +320,10 @@ extern const volatile struct cali_tc_preamble_globals __globals;
+ #define NATIN_IFACE	CALI_CONFIGURABLE(natin_idx)
+ #define PROFILING	CALI_CONFIGURABLE(profiling)
+ #define OVERLAY_TUNNEL_ID CALI_CONFIGURABLE(overlay_tunnel_id)
++#define INGRESS_PACKET_RATE CALI_CONFIGURABLE(ingress_packet_rate)
++#define INGRESS_PACKET_BURST CALI_CONFIGURABLE(ingress_packet_burst)
++#define EGRESS_PACKET_RATE CALI_CONFIGURABLE(egress_packet_rate)
++#define EGRESS_PACKET_BURST CALI_CONFIGURABLE(egress_packet_burst)
+ 
+ #define FLOWLOGS_ENABLED (GLOBAL_FLAGS & CALI_GLOBALS_FLOWLOGS_ENABLED)
+ 
+
+
+
+
+@@ -7,7 +7,7 @@
+ 
+ #include "bpf.h"
+ 
+-#define MAX_COUNTERS_SIZE 22
++#define MAX_COUNTERS_SIZE 23
+ 
+ typedef __u64 counters_t[MAX_COUNTERS_SIZE];
+ 
+@@ -20,12 +20,12 @@ struct counters_key {
+ #define COUNTERS_TC_EGRESS	1
+ #define COUNTERS_XDP		2
+ 
+-CALI_MAP(cali_counters, 3,
++CALI_MAP(cali_counters, 4,
+ 		BPF_MAP_TYPE_PERCPU_HASH,
+ 		struct counters_key, counters_t, 20000,
+ 		0)
+ 
+-CALI_MAP(cali_counters_scratch, 2,
++CALI_MAP(cali_counters_scratch, 3,
+ 		BPF_MAP_TYPE_PERCPU_ARRAY,
+ 		__u32, counters_t, 1, 0)
+ 
+
+
+
+
+@@ -501,7 +501,7 @@ skip_fib:
+ 	goto allow;
+ 
+ deny:
+-	rc =  TC_ACT_SHOT;
++	rc = TC_ACT_SHOT;
+ 
+ allow:
+ 	if (CALI_LOG_LEVEL_INFO >= CALI_LOG_LEVEL_INFO || PROFILING) {
+
+
+
+
+@@ -7,25 +7,29 @@
+ 
+ #include "ip_addr.h"
+ 
+-#define DECLARE_TC_GLOBAL_DATA(name, ip_t)	\
+-struct name {				\
+-	ip_t host_ip;			\
+-	__be16 tunnel_mtu;		\
+-	__be16 vxlan_port;		\
+-	ip_t intf_ip;			\
+-	__be32 ext_to_svc_mark;		\
+-	__be16 psnat_start;		\
+-	__be16 psnat_len;		\
+-	ip_t host_tunnel_ip;		\
+-	__be32 flags;			\
+-	__be16 wg_port;			\
+-	__be16 profiling;		\
+-	__u32 natin_idx;		\
+-	__u32 natout_idx;		\
+-	__u32 overlay_tunnel_id;	\
+-	__u8 iface_name[16];		\
+-	__u32 log_filter_jmp;		\
+-	__u32 jumps[40];		\
++#define DECLARE_TC_GLOBAL_DATA(name, ip_t) \
++struct name {                              \
++	ip_t host_ip;                          \
++	__be16 tunnel_mtu;                     \
++	__be16 vxlan_port;                     \
++	ip_t intf_ip;                          \
++	__be32 ext_to_svc_mark;                \
++	__be16 psnat_start;                    \
++	__be16 psnat_len;                      \
++	ip_t host_tunnel_ip;                   \
++	__be32 flags;                          \
++	__be16 wg_port;                        \
++	__be16 profiling;                      \
++	__u32 natin_idx;                       \
++	__u32 natout_idx;                      \
++	__u32 overlay_tunnel_id;               \
++	__u8 iface_name[16];                   \
++	__u32 log_filter_jmp;                  \
++	__u32 jumps[40];                       \
++	__s16 ingress_packet_rate;             \
++	__s16 ingress_packet_burst;            \
++	__s16 egress_packet_rate;              \
++	__s16 egress_packet_burst;             \
+ }
+ 
+ DECLARE_TC_GLOBAL_DATA(cali_tc_global_data, ipv6_addr_t);
+
+
+
+
+@@ -16,9 +16,13 @@ struct ifstate_val {
+ 	__s32 egress_policy_v6;
+ 	__s32 tc_filter_ingress;
+ 	__s32 tc_filter_egress;
++	__s16 ingress_packet_rate_tokens;
++	__s16 egress_packet_rate_tokens;
++	__u64 ingress_packet_rate_last_update;
++	__u64 egress_packet_rate_last_update;
+ };
+ 
+-CALI_MAP(cali_iface, 4,
++CALI_MAP(cali_iface, 5,
+ 		BPF_MAP_TYPE_HASH,
+ 		__u32, struct ifstate_val,
+ 		1000, BPF_F_NO_PREALLOC)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,113 @@
++// Project Calico BPF dataplane programs.
++// Copyright (c) 2025 Tigera, Inc. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
++
++#ifndef __CALI_QOS_H__
++#define __CALI_QOS_H__
++
++#include "bpf.h"
++#include "counters.h"
++#include "ifstate.h"
++
++static CALI_BPF_INLINE int enforce_packet_rate_qos(struct cali_tc_ctx *ctx)
++{
++#if !CALI_F_WEP
++		return TC_ACT_UNSPEC;
++#endif
++
++	// Retrieve ifstate map where TBF state is kept
++	struct ifstate_val *ifstate;
++	__u32 ifindex = ctx->skb->ifindex;
++	if (!(ifstate = cali_iface_lookup_elem(&ifindex))) {
++		CALI_DEBUG("packet rate QoS: ifstate not found, accepting packet");
++		return TC_ACT_UNSPEC;
++

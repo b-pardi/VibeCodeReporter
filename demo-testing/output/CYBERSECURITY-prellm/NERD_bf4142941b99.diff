@@ -1,0 +1,88 @@
+@@ -17,6 +17,7 @@ import traceback
+ 
+ import g
+ import core.scheduler
++from common import task_queue
+ 
+ ENTITY_TYPES = ['ip', 'asn', 'bgppref', 'ipblock', 'org']
+ 
+@@ -242,8 +243,12 @@ class UpdateManager:
+         self.log = logging.getLogger("UpdateManager")
+         #self.log.setLevel('DEBUG')
+         
++        self.process_index = 1 # TODO: pass process index here when everything is ready for real multiprocessing
++        
+         self.db = db
+         
++        self.rabbit_params = config.get('rabbitmq', {})
++        
+         # Mapping of names of attributes to a list of functions that should be 
+         # called when the attribute is updated
+         # (One such mapping for each entity type)
+@@ -260,8 +265,12 @@ class UpdateManager:
+         self._workers = []
+         self.num_workers = g.config.get('worker_threads', 8)
+         
+-        # Queues for pending update requests (one for each worker)
+-        self._request_queues = [queue.Queue() for _ in range(self.num_workers)]
++        # Connections to main task queue (RabbitMQ channel),
++        # one for each worker thread for consuming tasks and one global for writing new requests
++        self.task_queues = [task_queue.TaskQueue(self.rabbit_params) for _ in range(self.num_workers)]
++        self.write_task_queue = task_queue.TaskQueue(self.rabbit_params)
++        # Lock for the queue writer
++        self.write_task_queue_lock = threading.Lock()
+         
+         # Number of restarts of threads by watchdog
+         self._watchdog_restarts = 0
+@@ -269,6 +278,7 @@ class UpdateManager:
+         g.scheduler.register(self.watchdog, second="*/30")
+ 
+         # Count of update requests processed (per update type)
++        # TODO: reimplement using EventCountLogger
+         self._update_counter = OrderedDict([
+             ('ip_new_entity',0), # New entity (usually because of new event)
+             ('ip_event',0), # New event added to existing entity
+@@ -292,11 +302,13 @@ class UpdateManager:
+             self.logging_scheduler.register(self.log_update_counter, second="*/2")
+             self.logging_scheduler.start()
+ 
++        # This is here for performance debugging - measuring the time spent in each handler function
+ #        self.t_handlers = Counter()
+ #        self.logging_scheduler.register(self.log_t_handlers, second="*/60")
+ 
+ 
+     def log_update_counter(self):
++        # TODO: won't be needed when EventCountLogger is used
+         # Write update counter to file (every 2 sec)
+         # Lines 1-5: (IP) total number of updates (per update type)
+         # Lines 6-10: (ASN) total number of updates (per update type)
+@@ -313,7 +325,7 @@ class UpdateManager:
+                 f.write('{}\n'.format(cnt))
+             for (_,last),(_,cnt) in zip(self._last_update_counter.items(), self._update_counter.items()):
+                 f.write('{}\n'.format(cnt-last))
+-            f.write("{}\n".format(self.get_queue_size()))
++            f.write("{}\n".format(0))# sum(self.get_queue_size(i) for i in range(self.num_workers)))) # Takes a long time - disabled
+         os.replace(tmp_filename, filename)
+         self._last_update_counter = self._update_counter.copy()
+     
+@@ -379,30 +391,31 @@ class UpdateManager:
+                 self._attr2func[etype][attr] = [func]
+ 
+ 
+-    def get_queue_sizes(self):
+-        """Return current number of requests in each queue."""
+-        return [q.qsize() for q in self._request_queues]
++    def get_queue_size(self, thread_index=0):
++        """Return current total number of requests in a worker queue."""
++        return 0
++        #return self.task_queues[thread_index].get_worker_queue_length(self.process_index, thread_index)
+ 
+-    def get_queue_size(self):
+-        """Return current total number of requests in all queues."""
+-        return sum(q.qsize() for q in self._request_queues)    
+ 
+-
+-    def update(self, ekey, update_spec):
++    def update(self, ekey, update_requests):
+         """
+         Request an update of one or more attri

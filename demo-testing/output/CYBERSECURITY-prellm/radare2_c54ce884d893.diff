@@ -1,0 +1,133 @@
+@@ -133,7 +133,7 @@ R_API RAnal *r_anal_new(void) {
+ 	anal->fcns = r_list_newf ((RListFree)r_anal_function_free);
+ 	anal->leaddrs = NULL;
+ 	anal->imports = r_list_newf (free);
+-// 	r_anal_set_bits (anal, 32);
++/// 	r_anal_set_bits (anal, 32);
+ 	anal->plugins = r_list_newf ((RListFree) r_anal_plugin_free);
+ 	if (anal->plugins) {
+ 		for (i = 0; anal_static_plugins[i]; i++) {
+@@ -164,7 +164,7 @@ R_API void r_anal_free(RAnal *a) {
+ 	set_u_free (a->visited);
+ 	r_anal_hint_storage_fini (a);
+ 	r_interval_tree_fini (&a->meta);
+-	// R2_570 r_arch_config_free (a->config); // may cause UAF because this struct must be refcounted
++	r_unref (a->config);
+ 	free (a->zign_path);
+ 	r_list_free (a->plugins);
+ 	r_rbtree_free (a->bb_tree, __block_free_rb, NULL);
+@@ -312,14 +312,13 @@ R_API bool r_anal_set_os(RAnal *anal, const char *os) {
+ }
+ 
+ R_API bool r_anal_set_bits(RAnal *anal, int bits) {
+-	if (anal->config)
+ 	switch (bits) {
+ 	case 8:
+ 	case 16:
+ 	case 27:
+ 	case 32:
+ 	case 64:
+-		if (anal->config->bits != bits) {
++		if (anal->config && anal->config->bits != bits) {
+ 			anal->config->bits = bits;
+ 			r_anal_set_reg_profile (anal, NULL);
+ 		}
+
+
+
+
+@@ -110,7 +110,8 @@ R_API int r_anal_op(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int le
+ 		if (anal && anal->coreb.archbits) {
+ 			anal->coreb.archbits (anal->coreb.core, addr);
+ 		}
+-		if (anal->config->pcalign && addr % anal->config->pcalign) {
++		int pcalign = anal->config->pcalign;
++		if (pcalign && addr % pcalign) {
+ 			op->type = R_ANAL_OP_TYPE_ILL;
+ 			op->addr = addr;
+ 			// eprintf ("Unaligned instruction for %d bits at 0x%"PFMT64x"\n", anal->bits, addr);
+
+
+
+
+@@ -1,19 +1,15 @@
+-/* radare - LGPL3 - Copyright 2016-2021 - FXTi */
++/* radare - LGPL3 - Copyright 2016-2022 - FXTi */
+ 
+-#include <r_types.h>
+ #include <r_lib.h>
+-#include <r_util.h>
+ #include <r_asm.h>
+-
+ #include "../../asm/arch/pyc/pyc_dis.h"
+ 
+-static pyc_opcodes *ops = NULL;
++static R_TH_LOCAL pyc_opcodes *ops = NULL;
+ 
+ static int archinfo(RAnal *anal, int query) {
+-	if (!strcmp (anal->config->cpu, "x86")) {
++	if (!strcmp (anal->config->arch, "x86")) {
+ 		return -1;
+ 	}
+-
+ 	switch (query) {
+ 	case R_ANAL_ARCHINFO_MIN_OP_SIZE:
+ 		return (anal->config->bits == 16)? 1: 2;
+
+
+
+
+@@ -382,9 +382,10 @@ static const char *reg32_to_name(ut8 reg) {
+ }
+ 
+ static void anop_esil(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len, csh *handle, cs_insn *insn) {
+-	int rs = a->config->bits / 8;
++	const int bits = a->config->bits;
++	int rs = bits / 8;
+ 	const char *pc, *sp, *bp, *si;
+-	switch (a->config->bits) {
++	switch (bits) {
+ 	case 16:
+ 		pc = "ip";
+ 		sp = "sp";
+@@ -408,7 +409,7 @@ static void anop_esil(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 	struct Getarg gop = {
+ 		.handle = *handle,
+ 		.insn = insn,
+-		.bits = a->config->bits
++		.bits = bits
+ 	};
+ 	char *src;
+ 	char *src2;
+@@ -421,7 +422,6 @@ static void anop_esil(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 	char *arg1;
+ 	char *arg2;
+ 
+-	const int bits = gop.bits;
+ 	// counter for rep prefix
+ 	const char *counter = (bits == 16)?"cx": (bits == 32)? "ecx": "rcx";
+ 
+@@ -681,14 +681,14 @@ static void anop_esil(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 	}
+ 		break;
+ 	case X86_INS_STOSB:
+-		if (bits<32) {
++		if (bits < 32) {
+ 			r_strbuf_appendf (&op->esil, "al,di,=[1],df,?{,1,di,-=,},df,!,?{,1,di,+=,}");
+ 		} else {
+ 			r_strbuf_appendf (&op->esil, "al,edi,=[1],df,?{,1,edi,-=,},df,!,?{,1,edi,+=,}");
+ 		}
+ 		break;
+ 	case X86_INS_STOSW:
+-		if (bits<32) {
++		if (bits < 32) {
+ 			r_strbuf_appendf (&op->esil, "ax,di,=[2],df,?{,2,di,-=,},df,!,?{,2,di,+=,}");
+ 		} else {
+ 			r_strbuf_appendf (&op->esil, "ax,edi,=[2],df,?{,2,edi,-=,},df,!,?{,2,edi,+=,}");
+@@ -1120,9 +1120,9 @@ static void anop_esil(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len,
+ 	case X86_INS_PUSH:
+ 		{
+ 			dst = getarg (&gop, 0, 0, NULL, DST_AR, NULL);
+-			rs = INSOP(0).size;
++			int oprs = INSOP(0).size;
+ 			esilprintf (op, "%s,%d,%s,-,=[%d],%d,

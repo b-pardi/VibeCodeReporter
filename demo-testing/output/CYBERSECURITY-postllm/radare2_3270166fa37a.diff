@@ -1,0 +1,123 @@
+@@ -11,7 +11,9 @@ static int cmd_search(void *data, const char *input);
+ 
+ #define AES_SEARCH_LENGTH 40
+ #define SM4_SEARCH_LENGTH 24
+-#define PRIVATE_KEY_SEARCH_LENGTH 11
++#define ASN1_PRIVATE_KEY_SEARCH_LENGTH 11
++#define RAW_PRIVATE_KEY_SEARCH_LENGTH 32
++#define ED25519_PUBKEY_LENGTH 32*2
+ 
+ static RCoreHelpMessage help_msg_slash_wide_string = {
+ 	"Usage: /w[ij]", "[str]", "Wide string search subcommands",
+@@ -171,6 +173,7 @@ static RCoreHelpMessage help_msg_slash_c = {
+ 	"/cd", "", "search for ASN1/DER certificates",
+ 	"/cg", "", "search for GPG/PGP keys and signatures (Plaintext and binary form)",
+ 	"/ck", "", "find well known constant tables from different hash and crypto algorithms",
++	"/cp", "[?] [algo] [pubkey]", "search for a private key matching a given public key",
+ 	"/cr", "", "search for ASN1/DER private keys (RSA and ECC)",
+ 	NULL
+ };
+@@ -4507,13 +4510,50 @@ reread:
+ 				}
+ 				kw = r_search_keyword_new_hexmask ("00", NULL);
+ 				// Private key search is at least 11 bytes
+-				kw->keyword_length = PRIVATE_KEY_SEARCH_LENGTH;
+-				r_search_reset (core->search, R_SEARCH_PRIV_KEY);
++				kw->keyword_length = ASN1_PRIVATE_KEY_SEARCH_LENGTH;
++				r_search_reset (core->search, R_SEARCH_ASN1_PRIV_KEY);
+ 				r_search_kw_add (search, kw);
+ 				r_search_begin (core->search);
+ 				param.key_search = true;
+ 				break;
+ 			}
++		case 'p': // "/cp"
++			{
++				RSearchKeyword *kw;
++				char *space = strchr (input, ' ');
++				const char *arg = space? r_str_trim_head_ro (space + 1): NULL;
++				if (!arg || *(space - 1) == '?') {
++					r_core_cmd_help_match (core, help_msg_slash_c, "/cp");
++					goto beach;
++				}
++
++				char *pubkey = strdup (r_str_trim_head_ro (strchr (arg, ' ')));
++				char *algo = strdup (arg);
++				r_str_split (algo, ' ');
++				if (input[2] == 'j') {
++					param.outmode = R_MODE_JSON;
++				}
++				if (!strcmp (algo, "ed25519")) {
++					r_search_reset (core->search, R_SEARCH_RAW_PRIV_KEY);
++				} else {
++					R_LOG_ERROR ("Unsupported signature: %s", arg);
++					goto beach;
++				}
++				if (strlen (pubkey) == ED25519_PUBKEY_LENGTH) {
++					core->search->data = (void *)pubkey;
++				} else {
++					R_LOG_ERROR ("Wrong key length");
++					goto beach;
++				}
++				kw = r_search_keyword_new_hexmask ("00", NULL);
++				// Private key search is at least 32 bytes
++				kw->keyword_length = RAW_PRIVATE_KEY_SEARCH_LENGTH;
++				r_search_kw_add (search, kw);
++				r_search_begin (core->search);
++				param.key_search = true;
++				free (algo);
++				break;
++			}
+ 		default: {
+ 			dosearch = false;
+ 			r_core_cmd_help (core, help_msg_slash_c);
+
+
+
+
+@@ -4,27 +4,41 @@
+ 
+ #include <r_lib.h>
+ #include <r_crypto.h>
++#include <r_crypto/r_ed25519.h>
+ #include <r_util/r_log.h>
+ #include "../signature/ed25519/ge.h"
+ #include "../signature/ed25519/sc.h"
+ #include "../hash/sha2.h"
+ 
+-#define ED25519_SIG_LEN 64
++R_API void ed25519_create_keypair(const ut8 *seed, ut8 *privkey, ut8 *pubkey) {
++	RHash *ctx = r_hash_new (true, R_HASH_SHA512);
++	ge_p3 A;
++
++	r_hash_do_sha512 (ctx, seed, ED25519_SEED_LENGTH);
++	memcpy (privkey, ctx->digest, ED25519_PRIVKEY_LENGTH);
++	r_hash_free (ctx);
++	privkey[0] &= 248;
++	privkey[31] &= 63;
++	privkey[31] |= 64;
++	ge_scalarmult_base (&A, privkey);
++	ge_p3_tobytes (pubkey, &A);
++}
+ 
+ static bool ed25519_set_key(RCryptoJob *cj, const ut8 *key, int keylen, int mode, int direction) {
+ 	if (keylen != 32 && keylen != 64) {
+ 		return false;
+ 	}
+-	if (keylen == 32) {
++	cj->data = malloc (ED25519_PUBKEY_LENGTH);
++	if (keylen == ED25519_SEED_LENGTH) {
+ 		// Using a seed
+-		RHash *ctx = r_hash_new (true, R_HASH_SHA512);
+-		r_hash_do_sha512 (ctx, key, keylen);
+-		keylen = 64;
+-		cj->key = calloc (1, keylen);
+-		memcpy (cj->key, ctx->digest, keylen);
+-		r_hash_free (ctx);
+-	} else if (keylen == 64) {
++		keylen = ED25519_PRIVKEY_LENGTH;
++		cj->key = malloc (keylen);
++		ed25519_create_keypair (key, cj->key, (ut8 *)cj->data);
++	} else if (keylen == ED25519_PRIVKEY_LENGTH) {
++		ge_p3 A;
+ 		memcpy (cj->key, key, keylen);
++		ge_scalarmult

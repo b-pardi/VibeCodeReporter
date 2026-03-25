@@ -1,0 +1,115 @@
+@@ -712,9 +712,9 @@ R_API RDebugReasonType r_debug_wait(RDebug *dbg, RBreakpointItem **bp) {
+ 		}
+ 
+ #if __linux__
+-		// Letting other threads running after the debugger has breaked will cause
+-		// ptrace commands to fail when writing the process memory to set/unset
+-		// breakpoints and is problematic in Linux.
++		// Letting other threads running will cause ptrace commands to fail
++		// when writing to the same process memory to set/unset breakpoints
++		// and is problematic in Linux.
+ 		if (dbg->continue_all_threads) {
+ 			r_debug_stop (dbg);
+ 		}
+
+
+
+
+@@ -207,9 +207,8 @@ static void interrupt_process(RDebug *dbg) {
+ 
+ static int r_debug_native_stop(RDebug *dbg) {
+ #if __linux__
+-	// Stop all running threads except the current thread
+-	// which is already stopped by linux_dbg_wait_break
+-	return linux_stop_threads (dbg, dbg->tid);
++	// Stop all running threads except the thread reported by waitpid
++	return linux_stop_threads (dbg, dbg->reason.tid);
+ #else
+ 	return 0;
+ #endif
+@@ -242,36 +241,22 @@ static int r_debug_native_continue(RDebug *dbg, int pid, int tid, int sig) {
+ 		r_cons_break_push ((RConsBreak)interrupt_process, dbg);
+ 	}
+ 
+-	ret = r_debug_ptrace (dbg, PTRACE_CONT, tid, NULL, (r_ptrace_data_t)(size_t)contsig);
+-	if (ret == -1) {
+-		r_sys_perror ("PTRACE_CONT");
+-	}
+ 
+-	// Continue all threads that are stopped by the debugger only
+-	// to keep other signals in the queue for the next waitpid
+-	// by checking for SIGSTOP signals sent by the debugger
+-	if (dbg->continue_all_threads && dbg->threads) {
++	if (dbg->continue_all_threads && dbg->n_threads && dbg->threads) {
+ 		RDebugPid *th;
+ 		RListIter *it;
+-		pid_t dbgpid = getpid ();
+ 		r_list_foreach (dbg->threads, it, th) {
+-			if (th->pid == tid) {
+-				continue;
+-			}
+-			siginfo_t siginfo = { 0 };
+-			ret = r_debug_ptrace (dbg, PTRACE_GETSIGINFO, th->pid, 0, (r_ptrace_data_t)(size_t)&siginfo);
+-			// Skip if the thread is already running to prevent error
++			ret = r_debug_ptrace (dbg, PTRACE_CONT, th->pid, 0, 0);
+ 			if (ret == -1) {
+-				continue;
+-			}
+-			if (siginfo.si_signo == SIGSTOP && siginfo.si_pid == dbgpid) {
+-				ret = r_debug_ptrace (dbg, PTRACE_CONT, th->pid, 0, 0);
+-				if (ret == -1) {
+-					eprintf ("Error: %d is not traced or already running.\n", th->pid);
+-					r_sys_perror ("PTRACE_CONT");
+-				}
++				eprintf ("Error: (%d) is already running.\n", th->pid);
++				r_sys_perror ("PTRACE_CONT");
+ 			}
+ 		}
++	} else {
++		ret = r_debug_ptrace (dbg, PTRACE_CONT, tid, NULL, (r_ptrace_data_t)(size_t)contsig);
++		if (ret) {
++			r_sys_perror ("PTRACE_CONT");
++		}
+ 	}
+ 	//return ret >= 0 ? tid : false;
+ 	return tid;
+
+
+
+
+@@ -87,9 +87,8 @@ int linux_handle_signals(RDebug *dbg, int tid) {
+ 	}
+ 
+ 	if (siginfo.si_signo > 0) {
+-		// Switch the target thread to the signaled thread to allow access
+-		// to its registers later.
+-		dbg->tid = tid;
++		// Select the signaled thread to allow access to its info later.
++		r_debug_select (dbg, dbg->pid, tid);
+ 
+ 		//siginfo_t newsiginfo = {0};
+ 		//ptrace (PTRACE_SETSIGINFO, dbg->pid, 0, &siginfo);
+@@ -98,7 +97,7 @@ int linux_handle_signals(RDebug *dbg, int tid) {
+ 		dbg->stopaddr = (ut64)siginfo.si_addr;
+ 		//dbg->errno = siginfo.si_errno;
+ 		// siginfo.si_code -> HWBKPT, USER, KERNEL or WHAT
+-		// TODO: DO MORE RDEBUGREASON HERE
++// TODO: DO MORE RDEBUGREASON HERE
+ 		switch (dbg->reason.signum) {
+ 		case SIGTRAP:
+ 		{
+@@ -150,11 +149,12 @@ int linux_handle_signals(RDebug *dbg, int tid) {
+ 		default:
+ 			break;
+ 		}
+-		if (dbg->reason.signum != SIGTRAP) {
+-			eprintf ("[+] Child stopped with SIGNAL %d errno=%d addr=0x%08"PFMT64x
++		if (dbg->reason.signum != SIGTRAP &&
++			(dbg->reason.signum != SIGINT || !r_cons_is_breaked ())) {
++			eprintf ("[+] SIGNAL %d errno=%d addr=0x%08"PFMT64x
+ 				" code=%d si_pid=%d ret=%d\n",
+ 				siginfo.si_signo, siginfo.si_errno,
+-				(ut64)(size_t)siginfo.si_addr, siginfo.si_code, siginfo.si_pid, ret);
++				(ut64) (size_t)siginfo.si_addr, siginfo.si_code, siginfo.si_pid, ret);
+ 		}
+ 		retur

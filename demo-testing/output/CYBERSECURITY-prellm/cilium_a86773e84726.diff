@@ -1,0 +1,122 @@
+@@ -777,7 +777,8 @@ drop_err:
+ static __always_inline int
+ do_netdev_encrypt_fib(struct __ctx_buff *ctx __maybe_unused,
+ 		      __u16 proto __maybe_unused,
+-		      int *encrypt_iface __maybe_unused)
++		      int *encrypt_iface __maybe_unused,
++		      int *ext_err __maybe_unused)
+ {
+ 	int ret = 0;
+ 	/* Only do FIB lookup if both the BPF helper is supported and we know
+@@ -820,6 +821,7 @@ do_netdev_encrypt_fib(struct __ctx_buff *ctx __maybe_unused,
+ 	err = fib_lookup(ctx, &fib_params, sizeof(fib_params),
+ 		    BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
+ 	if (err != 0) {
++		*ext_err = err;
+ 		ret = DROP_NO_FIB;
+ 		goto drop_err_fib;
+ 	}
+@@ -841,6 +843,7 @@ static __always_inline int do_netdev_encrypt(struct __ctx_buff *ctx, __u16 proto
+ 					     __u32 src_id)
+ {
+ 	int encrypt_iface = 0;
++	int ext_err = 0;
+ 	int ret = 0;
+ #if defined(ENCRYPT_IFACE) && defined(BPF_HAVE_FIB_LOOKUP)
+ 	encrypt_iface = ENCRYPT_IFACE;
+@@ -849,9 +852,10 @@ static __always_inline int do_netdev_encrypt(struct __ctx_buff *ctx, __u16 proto
+ 	if (ret)
+ 		return send_drop_notify_error(ctx, src_id, ret, CTX_ACT_DROP, METRIC_INGRESS);
+ 
+-	ret = do_netdev_encrypt_fib(ctx, proto, &encrypt_iface);
++	ret = do_netdev_encrypt_fib(ctx, proto, &encrypt_iface, &ext_err);
+ 	if (ret)
+-		return send_drop_notify_error(ctx, src_id, ret, CTX_ACT_DROP, METRIC_INGRESS);
++		return send_drop_notify_error_ext(ctx, src_id, ret, ext_err,
++						  CTX_ACT_DROP, METRIC_INGRESS);
+ 
+ 	bpf_clear_meta(ctx);
+ #ifdef BPF_HAVE_FIB_LOOKUP
+
+
+
+
+@@ -505,6 +505,7 @@ int tail_nodeport_ipv6_dsr(struct __ctx_buff *ctx)
+ 	struct ipv6hdr *ip6;
+ 	union v6addr addr;
+ 	int ret, ohead = 0;
++	int ext_err = 0;
+ 	bool l2_hdr_required = true;
+ 
+ 	if (!revalidate_data(ctx, &data, &data_end, &ip6)) {
+@@ -543,6 +544,7 @@ int tail_nodeport_ipv6_dsr(struct __ctx_buff *ctx)
+ 
+ 	ret = fib_lookup(ctx, &fib_params.l, sizeof(fib_params), 0);
+ 	if (ret != 0) {
++		ext_err = ret;
+ 		ret = DROP_NO_FIB;
+ 		goto drop_err;
+ 	}
+@@ -565,7 +567,7 @@ out_send:
+ 	cilium_capture_out(ctx);
+ 	return ctx_redirect(ctx, fib_params.l.ifindex, 0);
+ drop_err:
+-	return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP, METRIC_EGRESS);
++	return send_drop_notify_error_ext(ctx, 0, ret, ext_err, CTX_ACT_DROP, METRIC_EGRESS);
+ }
+ #endif /* ENABLE_DSR */
+ 
+@@ -589,7 +591,7 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 	bool l2_hdr_required = true;
+ 	void *data, *data_end;
+ 	struct ipv6hdr *ip6;
+-	int ret;
++	int ret, ext_err = 0;
+ 
+ 	if (nat_46x64)
+ 		build_v4_in_v6(&tmp, IPV4_DIRECT_ROUTING);
+@@ -683,6 +685,7 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 
+ 	ret = fib_lookup(ctx, &fib_params.l, sizeof(fib_params), 0);
+ 	if (ret != 0) {
++		ext_err = ret;
+ 		ret = DROP_NO_FIB;
+ 		goto drop_err;
+ 	}
+@@ -705,7 +708,7 @@ out_send:
+ 	cilium_capture_out(ctx);
+ 	return ctx_redirect(ctx, fib_params.l.ifindex, 0);
+ drop_err:
+-	return send_drop_notify_error(ctx, 0, ret, CTX_ACT_DROP,
++	return send_drop_notify_error_ext(ctx, 0, ret, ext_err, CTX_ACT_DROP,
+ 				      dir == NAT_DIR_INGRESS ?
+ 				      METRIC_INGRESS : METRIC_EGRESS);
+ }
+@@ -877,7 +880,8 @@ redo:
+ }
+ 
+ /* See comment in tail_rev_nodeport_lb4(). */
+-static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, int *ifindex)
++static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, int *ifindex,
++					    int *ext_err)
+ {
+ 	int ret, fib_ret, ret2, l3_off = ETH_HLEN, l4_off, hdrlen;
+ 	struct ipv6_ct_tuple tuple = {};
+@@ -967,13 +971,17 @@ static __always_inline int rev_nodeport_lb6(struct __ctx_buff *ctx, int *ifindex
+ 				NATIVE_DEV_MAC_BY_IFINDEX(*ifindex);
+ 			union macaddr *dmac;
+ 
+-			if (fib_ret != BPF_FIB_LKUP_RET_NO_NEIGH)
++			if (fib_ret != BPF_FIB_LKUP_RET_NO_NEIGH) {
++				*ext_err = fib_ret;
+ 				return DROP_NO_FIB;
++			}
+ 
+ 			/* See comment in rev_nodeport_lb4(). */
+ 			dmac = map_lookup_elem(&NODEPORT_NEIGH6, &tuple.daddr);
+-			if (unlikely(!dmac))
++			if (unlikely(!dmac)) {
++				*ext_err = fib_ret;
+ 				return DROP_NO_FIB;
++			}
+ 			if (et

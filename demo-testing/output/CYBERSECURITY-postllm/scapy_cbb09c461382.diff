@@ -1,0 +1,153 @@
+@@ -88,6 +88,7 @@ from scapy.layers.gssapi import (
+     GSSAPI_BLOB,
+     GSSAPI_BLOB_SIGNATURE,
+     GSS_C_FLAGS,
++    GSS_C_NO_CHANNEL_BINDINGS,
+     GSS_S_COMPLETE,
+     GssChannelBindings,
+     SSP,
+@@ -1808,7 +1809,7 @@ class LDAP_Client(object):
+         self.sign = False
+         # Session status
+         self.sasl_wrap = False
+-        self.chan_bindings = None
++        self.chan_bindings = GSS_C_NO_CHANNEL_BINDINGS
+         self.bound = False
+         self.messageID = 0
+ 
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,2043 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# This file is part of Scapy
++# See https://scapy.net/ for more information
++# Copyright (C) Gabriel Potter <gabriel[]potter[]fr>
++
++"""
++LDAP Hero: a LDAP browser based on the Scapy LDAP client
++"""
++
++import uuid
++
++from scapy.layers.ldap import (
++    LDAP_AttributeValue,
++    LDAP_BIND_MECHS,
++    LDAP_Client,
++    LDAP_CONTROL_ACCESS_RIGHTS,
++    LDAP_Control,
++    LDAP_DS_ACCESS_RIGHTS,
++    LDAP_Exception,
++    LDAP_ModifyRequestChange,
++    LDAP_PartialAttribute,
++    LDAP_PROPERTY_SET,
++    LDAP_serverSDFlagsControl,
++)
++from scapy.layers.dcerpc import (
++    DCERPC_Transport,
++    NDRUnion,
++    DCE_C_AUTHN_LEVEL,
++    find_dcerpc_interface,
++)
++from scapy.layers.gssapi import SSP
++from scapy.layers.msrpce.rpcclient import (
++    DCERPC_Client,
++)
++from scapy.layers.msrpce.msdrsr import (
++    DRS_EXTENSIONS_INT,
++    DRS_EXTENSIONS,
++    DRS_MSG_CRACKREQ_V1,
++    IDL_DRSBind_Request,
++    IDL_DRSCrackNames_Request,
++    NTDSAPI_CLIENT_GUID,
++)
++from scapy.layers.ntlm import NTLMSSP
++from scapy.layers.kerberos import KerberosSSP
++from scapy.layers.spnego import SPNEGOSSP
++from scapy.layers.smb2 import (
++    SECURITY_DESCRIPTOR,
++    WELL_KNOWN_SIDS,
++    WINNT_ACE_FLAGS,
++    WINNT_ACE_HEADER,
++    WINNT_SID,
++    WINNT_ACCESS_ALLOWED_ACE,
++    WINNT_ACCESS_ALLOWED_OBJECT_ACE,
++    WINNT_ACCESS_DENIED_OBJECT_ACE,
++    WINNT_ACCESS_DENIED_ACE,
++    WINNT_SYSTEM_AUDIT_OBJECT_ACE,
++    WINNT_SYSTEM_AUDIT_ACE,
++)
++from scapy.utils import valid_ip
++
++try:
++    import tkinter as tk
++    from tkinter import ttk, messagebox
++except ImportError:
++    raise ImportError("tkinter is not installed (`apt install python3-tk` on debian)")
++
++
++class AutoHideScrollbar(ttk.Scrollbar):
++    def __init__(self, *args, **kwargs):
++        self.shown = False
++        super(AutoHideScrollbar, self).__init__(*args, **kwargs)
++
++    def set(self, first, last):
++        show = float(first) > 0 or float(last) < 1
++        if show and not self.shown:
++            self.grid(row=0, column=1, sticky="nsew")
++        elif not show and self.shown:
++            self.grid_forget()
++        self.shown = show
++        super(AutoHideScrollbar, self).set(first, last)
++
++
++class BasePopup:
++    """
++    A tkinter wrapper used to have a popup window with basic controls
++    """
++
++    def __init__(self, parent):
++        # Get dialog
++        self.dlg = tk.Toplevel(parent)
++        self.parent = parent
++        self.cancelled = False
++
++        # Configure some bindings
++        self.dlg.bind("<Return>", self.dismiss)
++        self.dlg.bind("<KP_Enter>", self.dismiss)
++
++    def dismiss(self, *_) -> None:
++        """
++        Close the popup
++        """
++        self.dlg.grab_release()
++        self.dlg.destroy()
++
++    def cancel(self) -> None:
++        """
++        Cancel the popup
++        """
++        self.cancelled = True
++        self.dismiss()
++
++    def run(self) -> False:
++        """
++        Show the popup. Returns True if cancelled, False otherwise.
++        """
++        self.dlg.protocol("WM_DELETE_WINDOW", self.dismiss)
++        self.dlg.transient(self.parent)
++        self.dlg.wait_visibility()
++        self.dlg.grab_set()
++        self.dlg.wait_window()
++
++        return self.cancelled
++
++
++class LDAPHero:
++    """
++    LDAP Hero - LDAP GUI browser over Scapy's LDAP_Client
++
++    :param ssp: the SSP object to use when binding.
++    :param mech: the LDAP_BIND_MECHS to use when b

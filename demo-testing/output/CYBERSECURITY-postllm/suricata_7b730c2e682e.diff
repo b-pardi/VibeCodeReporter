@@ -1,0 +1,116 @@
+@@ -45,6 +45,8 @@ static TmEcode PcapDirectoryPopulateBuffer(PcapFileDirectoryVars *ptv,
+ static TmEcode PcapDirectoryDispatchForTimeRange(PcapFileDirectoryVars *pv,
+                                                  struct timespec *older_than);
+ 
++extern PcapFileGlobalVars pcap_g;
++
+ void GetTime(struct timespec *tm)
+ {
+     struct timeval now;
+@@ -414,7 +416,8 @@ TmEcode PcapDirectoryDispatchForTimeRange(PcapFileDirectoryVars *pv,
+             } else {
+                 SCLogDebug("Processing file %s", current_file->filename);
+ 
+-                PcapFileFileVars *pftv = SCCalloc(1, sizeof(PcapFileFileVars));
++                const size_t toalloc = sizeof(PcapFileFileVars) + pcap_g.read_buffer_size;
++                PcapFileFileVars *pftv = SCCalloc(1, toalloc);
+                 if (unlikely(pftv == NULL)) {
+                     SCLogError("Failed to allocate PcapFileFileVars");
+                     SCReturnInt(TM_ECODE_FAILED);
+
+
+
+
+@@ -208,10 +208,15 @@ TmEcode InitPcapFile(PcapFileFileVars *pfv)
+         SCReturnInt(TM_ECODE_FAILED);
+     }
+ 
+-    errno = 0;
+-    if (setvbuf(pcap_file(pfv->pcap_handle), pfv->buffer, _IOFBF, sizeof(pfv->buffer)) < 0) {
+-        SCLogWarning("Failed to setvbuf on PCAP file handle: %s", strerror(errno));
++#if defined(HAVE_SETVBUF) && !defined(OS_WIN32)
++    if (pcap_g.read_buffer_size > 0) {
++        errno = 0;
++        if (setvbuf(pcap_file(pfv->pcap_handle), pfv->buffer, _IOFBF, pcap_g.read_buffer_size) <
++                0) {
++            SCLogWarning("Failed to setvbuf on PCAP file handle: %s", strerror(errno));
++        }
+     }
++#endif
+ 
+     if (pfv->shared != NULL && pfv->shared->bpf_string != NULL) {
+         SCLogInfo("using bpf-filter \"%s\"", pfv->shared->bpf_string);
+
+
+
+
+@@ -32,6 +32,7 @@ typedef struct PcapFileGlobalVars_ {
+     ChecksumValidationMode conf_checksum_mode;
+     ChecksumValidationMode checksum_mode;
+     SC_ATOMIC_DECLARE(unsigned int, invalid_checksums);
++    uint32_t read_buffer_size;
+ } PcapFileGlobalVars;
+ 
+ /**
+@@ -81,7 +82,11 @@ typedef struct PcapFileFileVars_
+     struct pcap_pkthdr *first_pkt_hdr;
+     struct timeval first_pkt_ts;
+ 
+-    char buffer[131072];
++    /** flex array member for the libc io read buffer. Size controlled by
++     * PcapFileGlobalVars::read_buffer_size. */
++#if defined(HAVE_SETVBUF) && !defined(OS_WIN32)
++    char buffer[];
++#endif
+ } PcapFileFileVars;
+ 
+ /**
+
+
+
+
+@@ -32,6 +32,7 @@
+ #include "runmode-unix-socket.h"
+ #include "suricata.h"
+ #include "conf.h"
++#include "util-misc.h"
+ 
+ extern uint32_t max_pending_packets;
+ PcapFileGlobalVars pcap_g;
+@@ -136,10 +137,33 @@ void TmModuleDecodePcapFileRegister (void)
+     tmm_modules[TMM_DECODEPCAPFILE].flags = TM_FLAG_DECODE_TM;
+ }
+ 
++#define PCAP_FILE_BUFFER_SIZE_DEFAULT 131072U   // 128 KiB
++#define PCAP_FILE_BUFFER_SIZE_MIN     4096U     // 4 KiB
++#define PCAP_FILE_BUFFER_SIZE_MAX     67108864U // 64MiB
++
+ void PcapFileGlobalInit(void)
+ {
+     memset(&pcap_g, 0x00, sizeof(pcap_g));
+     SC_ATOMIC_INIT(pcap_g.invalid_checksums);
++
++#if defined(HAVE_SETVBUF) && !defined(OS_WIN32)
++    pcap_g.read_buffer_size = PCAP_FILE_BUFFER_SIZE_DEFAULT;
++
++    const char *str = NULL;
++    if (ConfGet("pcap-file.buffer-size", &str) == 1) {
++        uint32_t value = 0;
++        if (ParseSizeStringU32(str, &value) < 0) {
++            SCLogWarning("failed to parse pcap-file.buffer-size %s", str);
++        }
++        if (value >= PCAP_FILE_BUFFER_SIZE_MIN && value <= PCAP_FILE_BUFFER_SIZE_MAX) {
++            SCLogInfo("Pcap-file will use %u buffer size", value);
++            pcap_g.read_buffer_size = value;
++        } else {
++            SCLogWarning("pcap-file.buffer-size value of %u is invalid. Valid range is %u-%u",
++                    value, PCAP_FILE_BUFFER_SIZE_MIN, PCAP_FILE_BUFFER_SIZE_MAX);
++        }
++    }
++#endif
+ }
+ 
+ TmEcode PcapFileExit(TmEcode status, struct timespec *last_processed)
+@@ -250,7 +274,8 @@ TmEcode ReceivePcapFileThreadInit(ThreadVars *tv, const void *initdata, void **d
+ 
+     i

@@ -1,0 +1,145 @@
+@@ -691,6 +691,9 @@ R_API void r_anal_bind(RAnal *anal, RAnalBind *b) {
+ 		b->anal = anal;
+ 		b->get_fcn_in = r_anal_get_fcn_in;
+ 		b->get_hint = r_anal_hint_get;
++		b->decode = (RAnalDecode)r_anal_op;
++		b->opinit = r_anal_op_init;
++		b->opfini = r_anal_op_fini;
+ 	}
+ }
+ 
+
+
+
+
+@@ -31,9 +31,9 @@ R_API void r_anal_op_init(RAnalOp *op) {
+ 	}
+ }
+ 
+-R_API bool r_anal_op_fini(RAnalOp *op) {
++R_API void r_anal_op_fini(RAnalOp *op) {
+ 	if (!op) {
+-		return false;
++		return;
+ 	}
+ 	r_anal_value_free (op->src[0]);
+ 	r_anal_value_free (op->src[1]);
+@@ -50,7 +50,6 @@ R_API bool r_anal_op_fini(RAnalOp *op) {
+ 	r_anal_switch_op_free (op->switch_op);
+ 	op->switch_op = NULL;
+ 	R_FREE (op->mnemonic);
+-	return true;
+ }
+ 
+ R_API void r_anal_op_free(void *_op) {
+
+
+
+
+@@ -5,6 +5,7 @@
+ #include <r_types.h>
+ #include <r_util.h>
+ #include <r_asm.h>
++#include <r_anal.h> // for RAnalBind
+ #define USE_R2 1
+ #include <spp/spp.h>
+ #include <config.h>
+@@ -26,7 +27,8 @@ static void parseHeap(RParse *p, RStrBuf *s) {
+ 	if (out) {
+ 		*out = 0;
+ 		strcpy (out , op_buf_asm);
+-	// XXX we shouldn't pad here because we have t orefactor the RParse API to handle boundaries and chunks properly
++		// XXX we shouldn't pad here because we have to refactor
++		// the RParse API to handle boundaries and chunks properly
+ 		r_parse_parse (p, op_buf_asm, out);
+ 		r_strbuf_set (s, out);
+ 		free (out);
+@@ -475,6 +477,14 @@ R_API int r_asm_disassemble(RAsm *a, RAsmOp *op, const ut8 *buf, int len) {
+ 		} else {
+ 			ret = a->cur->disassemble (a, op, buf, len);
+ 		}
++	} else if (a->analb.anal) {
++		// disassemble using the analysis plugin if found
++		RAnalOp aop;
++		a->analb.opinit (&aop);
++		ret = a->analb.decode (a->analb.anal, &aop, a->pc, buf, len, R_ANAL_OP_MASK_DISASM);
++		op->size = aop.size;
++		r_strbuf_set (&op->buf_asm, aop.mnemonic);
++		a->analb.opfini (&aop);
+ 	}
+ 	if (ret < 0) {
+ 		ret = 0;
+
+
+
+
+@@ -2863,6 +2863,7 @@ R_API bool r_core_init(RCore *core) {
+ 	core->rasm->num = core->num;
+ 	r_asm_set_user_ptr (core->rasm, core);
+ 	core->anal = r_anal_new ();
++	r_anal_bind (core->anal, &core->rasm->analb);
+ 	core->gadgets = r_list_newf ((RListFree)r_core_gadget_free);
+ 	core->anal->ev = core->ev;
+ 	core->anal->log = r_core_anal_log;
+
+
+
+
+@@ -747,15 +747,6 @@ typedef struct r_anal_hint_t {
+ 	ut64 stackframe;
+ } RAnalHint;
+ 
+-typedef RAnalFunction *(* RAnalGetFcnIn)(RAnal *anal, ut64 addr, int type);
+-typedef RAnalHint *(* RAnalGetHint)(RAnal *anal, ut64 addr);
+-
+-typedef struct r_anal_bind_t {
+-	RAnal *anal;
+-	RAnalGetFcnIn get_fcn_in;
+-	RAnalGetHint get_hint;
+-} RAnalBind;
+-
+ typedef const char *(*RAnalLabelAt) (RAnalFunction *fcn, ut64);
+ 
+ typedef enum {
+@@ -896,6 +887,21 @@ typedef struct r_anal_op_t {
+ 	RAnalDataType datatype;
+ } RAnalOp;
+ 
++typedef RAnalFunction *(* RAnalGetFcnIn)(RAnal *anal, ut64 addr, int type);
++typedef RAnalHint *(* RAnalGetHint)(RAnal *anal, ut64 addr);
++typedef int (* RAnalDecode)(RAnal *anal, RAnalOp *op, ut64 addr, const ut8 *data, int len, RAnalOpMask mask);
++typedef void (* RAnalOpInit)(RAnalOp *op);
++typedef void (* RAnalOpFini)(RAnalOp *op);
++
++typedef struct r_anal_bind_t {
++	RAnal *anal;
++	RAnalGetFcnIn get_fcn_in;
++	RAnalGetHint get_hint;
++	RAnalDecode decode;
++	RAnalOpInit opinit;
++	RAnalOpFini opfini;
++} RAnalBind;
++
+ #define R_ANAL_COND_SINGLE(x) (!x->arg[1] || x->arg[0]==x->arg[1])
+ 
+ typedef struct r_anal_cond_t {
+@@ -1560,7 +1566,7 @@ R_API const char *r_anal_stackop_tostring(int s);
+ R_API RAnalOp *r_anal_op_new(void);
+ R_API void r_anal_op_free(void *op);
+ R_API void r_anal_op_init(RAnalOp *op);
+-R_API bool r_anal_op_fini(RAnalOp *op);
++R_API void r_anal_op_fini(RAnalOp *op);
+ R_API int r_anal_op_reg_delta(RAnal *anal, ut64 addr, const char *name);
+ R_API bool r_anal_op_is_eob(RAnalOp *op);
+ R_API RList *r_anal_op_list_new(void);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2009-2020 - nibble, pancake */
++/* radare - LGPL - Copyright 2009-2021 - nibble, pancake */
+ 
+ #ifndef R2_ASM_H
+ #define R2_ASM_H
+@@ -103,6 +103,7 @@ typedef

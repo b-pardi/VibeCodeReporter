@@ -1,0 +1,136 @@
+@@ -1340,48 +1340,28 @@ R_API int r_cons_get_size(int *rows) {
+ }
+ 
+ #if __WINDOWS__
++R_API os_info *r_sys_get_osinfo();
+ R_API int r_cons_get_ansicon() {
+-	HKEY key;
+-	DWORD type;
+-	DWORD size;
+ 	DWORD major;
+ 	DWORD minor;
+-	char release[25];
+ 	bool win_support = false;
+-	if (RegOpenKeyExA (HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0,
+-	                   KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+-		goto ANSICON;
+-	}
+-	size = sizeof (major);
+-	if (RegQueryValueExA (key, "CurrentMajorVersionNumber", NULL, &type,
+-	                     (LPBYTE)&major, &size) != ERROR_SUCCESS
+-	    || type != REG_DWORD) {
+-		goto beach;
+-	}
+-	size = sizeof (minor);
+-	if (RegQueryValueExA (key, "CurrentMinorVersionNumber", NULL, &type,
+-	                     (LPBYTE)&minor, &size) != ERROR_SUCCESS
+-	    || type != REG_DWORD) {
+-		goto beach;
+-	}
+-	size = sizeof (release);
+-	if (RegQueryValueExA (key, "ReleaseId", NULL, &type,
+-	                     (LPBYTE)release, &size) != ERROR_SUCCESS
+-	    || type != REG_SZ) {
+-		goto beach;
+-	}
+-	if (major > 10
+-	    || major == 10 && minor > 0
+-	    || major == 10 && minor == 0 && atoi (release) >= 1703) {
++	os_info *info = r_sys_get_osinfo ();
++	if (info) {
++		major = info->major;
++		minor = info->minor;
++		if (major > 10
++			|| major == 10 && minor > 0
++			|| major == 10 && minor == 0 && info->compilation >= 1703) {
++			win_support = true;
++		}
++	}
++	free (info);
++	char *ansicon = r_sys_getenv ("ANSICON");
++	if (ansicon) {
++		free (ansicon);
+ 		win_support = true;
+ 	}
+-beach:
+-	RegCloseKey (key);
+-ANSICON:
+-	char *env_ansicon_str = r_sys_getenv ("ANSICON");
+-	bool env_ansicon = !!env_ansicon_str;
+-	free (env_ansicon_str);
+-	return win_support || env_ansicon;
++	return win_support;
+ }
+ #endif
+ 
+
+
+
+
+@@ -1430,6 +1430,10 @@ beach:
+ static int cmd_dbg_map_heap_glibc_32(RCore *core, const char *input);
+ static int cmd_dbg_map_heap_glibc_64(RCore *core, const char *input);
+ #endif // __linux__ && __GNU_LIBRARY__ && __GLIBC__ && __GLIBC_MINOR__
++#if __WINDOWS__
++static int cmd_debug_map_heap_win(RCore *core, const char *input);
++#endif // __WINDOWS__
++
+ 
+ static ut64 addroflib(RCore *core, const char *libname) {
+ 	RListIter *iter;
+@@ -1493,8 +1497,12 @@ static int r_debug_heap(RCore *core, const char *input) {
+ 		}
+ #endif
+ 	} else {
++#if __WINDOWS__
++		cmd_debug_map_heap_win (core, input + 1);
++#else
+ 		eprintf ("MALLOC algorithm not supported\n");
+ 		return false;
++#endif
+ 	}
+ 	return true;
+ }
+@@ -1837,6 +1845,8 @@ static int cmd_debug_map(RCore *core, const char *input) {
+ 
+ #if __linux__ && __GNU_LIBRARY__ && __GLIBC__ && __GLIBC_MINOR__
+ #include "linux_heap_glibc.c"
++#elif __WINDOWS__
++#include "windows_heap.c"
+ #endif
+ 
+ // move into basic_types.h
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,894 @@
++﻿#include <r_core.h>
++#include <TlHelp32.h>
++#include <windows_heap.h>
++#include "..\..\debug\p\native\maps\windows_maps.h"
++
++/*
++*	Viewer discretion advised: Spaghetti code ahead
++*	Some Code references:
++*	https://securityxploded.com/enumheaps.php
++*	https://bitbucket.org/evolution536/crysearch-memory-scanner/
++*	https://processhacker.sourceforge.io
++*	http://www.tssc.de/winint
++*	https://www.nirsoft.net/kernel_struct/vista/
++*	https://github.com/yoichi/HeapStat/blob/master/heapstat.cpp
++*	https://doxygen.reactos.org/
++*
++*	References:
++*	Windows NT(2000) Native API Reference (Book)
++*	Papers: 
++*	http://illmatics.com/Understanding_the_LFH.pdf
++*	http://illmatics.com/Windows%208%20Heap%20Internals.pdf
++*	https://www.blackhat.com/docs/us-16/materials/us-16-Yason-Windows-10-Segment-Heap-Internals-wp.pdf
++*
++*	This code has 2 different approaches to getting the heap info:
++*		1) Calling InitHeapInfo with both PDI_HEAPS and PDI_HEAP_BLOCKS.
++*			This will fill a buffer with HeapBlockBasicInfo like structures which
++*			is then walked through by calling GetFirstHeapBlock and subsequently GetNextHeapBlock
++*			(see 1st link). This approach is the more generic one as it uses Windows functions.

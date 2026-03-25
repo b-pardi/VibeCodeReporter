@@ -1,0 +1,163 @@
+@@ -112,6 +112,7 @@ registered: Dict[Any, List[Callable]] = {
+     gdb.events.new_objfile: [],
+     gdb.events.stop: [],
+     gdb.events.start: [],
++    gdb.events.new_thread: [],
+     gdb.events.before_prompt: [],  # The real event might not exist, but we wrap it
+ }
+ 
+@@ -184,6 +185,10 @@ def start(func):
+     return connect(func, gdb.events.start, "start")
+ 
+ 
++def thread(func):
++    return connect(func, gdb.events.new_thread, "thread")
++
++
+ before_prompt = partial(connect, event_handler=gdb.events.before_prompt, name="before_prompt")
+ 
+ 
+
+
+
+
+@@ -7,6 +7,7 @@ from pwndbg.lib.memoize import reset_on_objfile
+ from pwndbg.lib.memoize import reset_on_prompt
+ from pwndbg.lib.memoize import reset_on_start
+ from pwndbg.lib.memoize import reset_on_stop
++from pwndbg.lib.memoize import reset_on_thread
+ from pwndbg.lib.memoize import while_running
+ 
+ # TODO: Combine these `update_*` hook callbacks into one method
+@@ -60,6 +61,11 @@ def memoize_on_exit():
+     reset_on_exit._reset()
+ 
+ 
++@pwndbg.gdblib.events.thread
++def memoize_on_new_thread():
++    reset_on_thread._reset()
++
++
+ def init():
+     """Calls all GDB hook functions that need to be called when GDB/pwndbg
+     itself is loaded, as opposed to when an actual hook event occurs
+
+
+
+
+@@ -242,6 +242,7 @@ def address(symbol: str) -> int:
+ 
+ 
+ @pwndbg.lib.memoize.reset_on_objfile
++@pwndbg.lib.memoize.reset_on_thread
+ def static_linkage_symbol_address(symbol):
+     if isinstance(symbol, int):
+         return symbol
+
+
+
+
+@@ -432,6 +432,7 @@ class Heap(pwndbg.heap.heap.BaseHeap):
+ 
+     @property
+     @pwndbg.lib.memoize.reset_on_objfile
++    @pwndbg.lib.memoize.reset_on_thread
+     def multithreaded(self):
+         """Is malloc operating within a multithreaded environment."""
+         addr = pwndbg.gdblib.symbol.address("__libc_multiple_threads")
+
+
+
+
+@@ -151,6 +151,18 @@ class reset_on_cont(memoize):
+     _reset = __reset_on_cont
+ 
+ 
++class reset_on_thread(memoize):
++    caches = []  # type: List[reset_on_thread]
++    kind = "thread"
++
++    @staticmethod
++    def __reset_on_thread() -> None:
++        for obj in reset_on_thread.caches:
++            obj.clear()
++
++    _reset = __reset_on_thread
++
++
+ class while_running(memoize):
+     caches = []  # type: List[while_running]
+     kind = "running"
+
+
+
+
+@@ -12,6 +12,8 @@
+ #define mem2chunk(mem) ((void*)(mem) - CHUNK_HDR_SZ)
+ 
+ void break_here(void) {}
++void configure_heap_layout(void);
++void* thread_func(void*);
+ 
+ void* allocated_chunk = NULL;
+ void* tcache_chunk = NULL;
+@@ -21,6 +23,17 @@ void* large_chunk = NULL;
+ void* unsorted_chunk = NULL;
+ 
+ int main(void)
++{
++    configure_heap_layout();
++
++    break_here();
++
++    pthread_t thread;
++    pthread_create(&thread, NULL, thread_func, NULL);
++    pthread_join(thread, NULL);
++}
++
++void configure_heap_layout(void)
+ {
+     void* chunks[6] = {0};
+ 
+@@ -67,12 +80,16 @@ int main(void)
+     small_chunk = mem2chunk(before_remainder + 0x210);
+     large_chunk = mem2chunk(large);
+     unsorted_chunk = mem2chunk(unsorted);
++}
++
++void* thread_func(void* args)
++{
++    // Initialize a 2nd arena by allocating any size chunk.
++    malloc(0x18);
++    break_here();
+ 
++    configure_heap_layout();
+     break_here();
+ 
+-    // Required for CI build to retrieve TLS variables.
+-    // See:
+-    // - https://github.com/pwndbg/pwndbg/pull/1086
+-    // - https://sourceware.org/bugzilla/show_bug.cgi?id=24548
+-    pthread_create(0,0,0,0);
++    pthread_exit(NULL);
+ }
+
+
+
+
+@@ -89,6 +89,37 @@ def test_malloc_chunk_command(start_binary):
+     for name in chunk_types:
+         assert results[name] == expected[name]
+ 
++    gdb.execute("continue")
++
++    # Print main thread's chunk from another thread
++    assert gdb.selected_thread().num == 2
++    results["large"] = gdb.execute("malloc_chunk large_chunk", to_string=True).splitlines()
++    expected = generate_expected_malloc_chunk_output(chunks)
++    assert results["large"] == expected["large"]
++
++    gdb.execute("continue")
++
++    # Test some non-main-arena chunks
++    for n

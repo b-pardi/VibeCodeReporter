@@ -1,0 +1,140 @@
+deleted file mode 100644
+
+
+
+@@ -1,24 +0,0 @@
+-/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+-/* Copyright Authors of Cilium */
+-
+-// Header of functions to be mocked in conntrack.h.
+-// It is used to generate corresponding mock functions in conntrack.h.
+-// If other functions in conntrack.h are needed, please add the function
+-// declarations at the bottom. To avoid conflict between functions in
+-// bpf/builtins.h and string.h, define __BPF_BUILTINS__ in conntrack_stub.h to
+-// make sure the mock library can be compiled without functions in
+-// bpf/builtins.h. To avoid conflict, we do not name the mock customized
+-// functions as the original name like mock helper functions because customized
+-// functions are actually implemented. Instead, we use "mock_" as the prefix of
+-// each mock customized function.
+-#define __BPF_BUILTINS__
+-#include <bpf/ctx/skb.h>
+-#include "lib/common.h"
+-
+-
+-int mock_ct_lookup4(const void *map, struct ipv4_ct_tuple *tuple, struct __ctx_buff *ctx,
+-		    int off, int dir, struct ct_state *ct_state, __u32 *monitor);
+-int mock_ct_create4(const void *map_main, const void *map_related,
+-		    struct ipv4_ct_tuple *tuple, struct __ctx_buff *ctx,
+-		    const int dir, const struct ct_state *ct_state,
+-		    bool proxy_redirect, bool from_l7lb);
+
+deleted file mode 100644
+
+
+
+@@ -1,60 +0,0 @@
+-/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+-/* Copyright Authors of Cilium */
+-
+-// library for user-space map emulation
+-// It emulates the eBPF map operations in the user space by wrapping up the raw
+-// hashmap functions.
+-
+-#include "hashmap.h"
+-
+-typedef HASHMAP(void, void) hashmap_void_t;
+-
+-
+-// Get the number of entries inside map.
+-size_t fake_get_size(hashmap_void_t *map) {
+-  return hashmap_size(map);
+-}
+-
+-// Initiate map with given length of keys and capacity.
+-void fake_init_map(hashmap_void_t *map, size_t (*hash)(const void *key), int (*compare)(const void *a, const void *b)) {
+-  hashmap_init(map, hash, compare);
+-}
+-
+-// Loop up the value of given key.
+-void *fake_lookup_elem(hashmap_void_t *map, const void *key)
+-{
+-  return hashmap_get(map, key);
+-}
+-
+-// Update the value of given key.
+-int fake_update_elem(hashmap_void_t *map, const void *key, const void *value, __u32 flags,
+-		     size_t size)
+-{
+-  void *entry = hashmap_get(map, key);
+-  if (entry == NULL && hashmap_size(map) >= size) {
+-      printf("Update failed: Map is full\n");
+-      return -1;
+-    }
+-
+-  int r = hashmap_put(map, key, (void *)value);
+-  if (r == -EEXIST) {
+-    if (flags == BPF_NOEXIST) return -1;
+-    hashmap_remove(map, key);
+-    hashmap_put(map, key, (void *)value);
+-    return 0;
+-  } else if (r == 0) {
+-    if (flags == BPF_EXIST) {
+-      hashmap_remove(map, key);
+-      return -1;
+-    }
+-    return 0;
+-  }
+-
+-  return r;
+-}
+-
+-// Delete given key.
+-int fake_delete_elem(hashmap_void_t *map, const void *key)
+-{
+-  return (int)hashmap_remove(map, key);
+-}
+
+
+
+
+@@ -1,10 +1,14 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+ /* Copyright Authors of Cilium */
+ 
++#include "common.h"
++
+ #include <bpf/ctx/skb.h>
+ #include <bpf/api.h>
+ 
+ /* most values taken from node_config.h */
++#define ENABLE_IPV4
++
+ #define ENDPOINTS_MAP test_cilium_lxc
+ #define POLICY_PROG_MAP_SIZE ENDPOINTS_MAP_SIZE
+ #define METRICS_MAP test_cilium_metrics
+@@ -12,7 +16,7 @@
+ #define ENDPOINTS_MAP_SIZE 65536
+ #define IPCACHE_MAP_SIZE 512000
+ #define METRICS_MAP_SIZE 65536
+-#define EVENTS_MAP test_events_map
++#define EVENTS_MAP test_cilium_events
+ 
+ #define CT_MAP_TCP6 test_cilium_ct_tcp6_65535
+ #define CT_MAP_ANY6 test_cilium_ct_any6_65535
+@@ -36,128 +40,198 @@
+ #include <lib/dbg.h>
+ #include <lib/conntrack.h>
+ #include <lib/conntrack_map.h>
++#include <lib/time.h>
+ 
+-__section("action/test-nop")
+-int test_nop(struct __ctx_buff __maybe_unused *ctx)
++__always_inline int mkpkt(void *dst, bool first)
+ {
+-	return CTX_ACT_OK;
+-}
++	void *orig = dst;
++	struct ethhdr *l2 = dst;
+ 
+-__section("action/test-map")
+-in

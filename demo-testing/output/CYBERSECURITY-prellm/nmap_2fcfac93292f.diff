@@ -1,0 +1,162 @@
+@@ -145,6 +145,11 @@ void Target::FreeInternal() {
+   }
+ 
+   if (FPR) delete FPR;
++  for (std::vector<EarlySvcResponse *>::iterator it=earlySvcResponses.begin();
++      it != earlySvcResponses.end(); it++) {
++    free(*it);
++  }
++  earlySvcResponses.clear();
+ }
+ 
+ /*  Creates a "presentation" formatted string out of the IPv4/IPv6 address.
+
+
+
+
+@@ -83,6 +83,7 @@ class FingerPrintResults;
+ 
+ #include <list>
+ #include <string>
++#include <vector>
+ #include <time.h> /* time_t */
+ 
+ #ifndef INET6_ADDRSTRLEN
+@@ -116,6 +117,12 @@ struct TracerouteHop {
+   }
+ };
+ 
++struct EarlySvcResponse {
++  probespec pspec;
++  int len;
++  u8 data[1];
++};
++
+ class Target {
+  public: /* For now ... TODO: a lot of the data members should be made private */
+   Target();
+@@ -248,6 +255,7 @@ class Target {
+   enum dist_calc_method distance_calculation_method;
+   FingerPrintResults *FPR; /* FP results get by the OS scan system. */
+   PortList ports;
++  std::vector<EarlySvcResponse *> earlySvcResponses;
+ 
+   int weird_responses; /* echo responses from other addresses, Ie a network broadcast address */
+   int flags; /* HOST_UNKNOWN, HOST_UP, or HOST_DOWN. */
+
+
+
+
+@@ -1792,7 +1792,6 @@ void nmap_free_mem() {
+   cp_free();
+   free_services();
+   freeinterfaces();
+-  free_payloads();
+   AllProbes::service_scan_free();
+   traceroute_hop_cache_clear();
+   nsock_set_default_engine(NULL);
+
+
+
+
+@@ -77,374 +77,83 @@
+ #include "utils.h"
+ #include "nmap_error.h"
+ #include "scan_lists.h"
++#include "service_scan.h"
+ 
+ extern NmapOps o;
+ 
+-struct payload {
+-  std::string data;
++/* The key for the payload lookup map is u16 dport. We can make it a u32 and
++ * add proto later if needed. */
+ 
+-  payload (const char *c, size_t n)
+-    : data(c, n)
+-    {}
+-  /* Extra data such as source port goes here. */
++static std::map<u16, std::vector<ServiceProbe *> > portPayloads;
+ 
+-  /* If 2 payloads are equivalent according to this operator, we'll only keep
+-   * the first one, so be sure you update it when adding other attributes. */
+-  bool operator==(const payload& other) const {
+-    return data == other.data;
+-  }
+-};
+-
+-/* The key for the payload lookup map is a (proto, port) pair. */
+-struct proto_dport {
+-  u8 proto;
+-  u16 dport;
+-
+-  proto_dport(u8 proto, u16 dport) {
+-    this->proto = proto;
+-    this->dport = dport;
+-  }
+-
+-  bool operator<(const proto_dport& other) const {
+-    if (proto == other.proto)
+-      return dport < other.dport;
+-    else
+-      return proto < other.proto;
+-  }
+-};
+-
+-static std::map<struct proto_dport, std::vector<struct payload *> > portPayloads;
+-static std::vector<struct payload *> uniquePayloads; // for accounting
+-
+-/* Newlines are significant because keyword directives (like "source") that
+-   follow the payload string are significant to the end of the line. */
+-typedef enum token_type {
+-  TOKEN_ERROR = -1,
+-  TOKEN_EOF = 0,
+-  TOKEN_NEWLINE,
+-  TOKEN_SYMBOL,
+-  TOKEN_STRING,
+-} token_t;
+-
+-struct token {
+-  token_t type;
+-  size_t len;
+-  char text[1024];
+-};
+-
+-static unsigned long line_no;
+-
+-/* Get the next token from fp. The return value is the token type, or -1 on
+-   error. The token type is also stored in token->type. For TOKEN_SYMBOL and
+-   TOKEN_STRING, the text is stored in token->text and token->len. The text is
+-   null terminated. */
+-static token_t next_token(FILE *fp, struct token *token) {
+-  unsigned int i, tmplen;
+-  int c;
+-
+-  token->len = 0;
+-
+-  /* Skip whitespace and comments. */
+-  while (isspace(c = fgetc(fp)) && c != '\n')
+-    ;
+-
+-  switch(c) {
+-    case EOF:
+-      token->type = TOKEN_EOF;
+-      break;
+-    case '\n':
+-      line_no++;
+-      token->type = TOKEN_NEWLINE;
+-      break;
+-    case '#':
+-      while ((c = fgetc(fp)) != EOF && c != '\n')
+-        ;
+-      if (c == EOF) {
+-        token->type = TOKEN_EOF;
+-      } else {
+-        line_no++;
+-        token->type = TOKEN_NEWLINE;
+-      }
+-      break;
+-    case '"':
+-      token->type = TOKEN_STRING;
+-      i = 0;
+-      while ((c = fgetc(fp)) != EO

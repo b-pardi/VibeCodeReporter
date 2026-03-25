@@ -1,0 +1,136 @@
+@@ -26,6 +26,8 @@
+ 
+ #include "rust.h"
+ 
++/** special value for matching any type */
++#define FRAME_ANY_TYPE 62
+ /** max 63 to fit the 64 bit per protocol space */
+ #define FRAME_STREAM_TYPE 63
+ 
+
+
+
+
+@@ -95,6 +95,9 @@ enum PktSrcEnum {
+ 
+ #include "util-validate.h"
+ 
++/* for now a uint8_t is enough -- here in decode as it's part of the packet */
++#define SignatureMask uint8_t
++
+ /* forward declarations */
+ struct DetectionEngineThreadCtx_;
+ typedef struct AppLayerThreadCtx_ AppLayerThreadCtx;
+@@ -509,6 +512,7 @@ typedef struct Packet_
+     /* coccinelle: Packet:flowflags:FLOW_PKT_ */
+ 
+     uint8_t app_update_direction; // enum StreamUpdateDir
++    SignatureMask sig_mask;
+ 
+     /* Pkt Flags */
+     uint32_t flags;
+
+
+
+
+@@ -1983,8 +1983,6 @@ int SigPrepareStage4(DetectEngineCtx *de_ctx)
+ 
+         PrefilterSetupRuleGroup(de_ctx, sgh);
+ 
+-        SigGroupHeadBuildNonPrefilterArray(de_ctx, sgh);
+-
+         sgh->id = idx;
+         cnt++;
+     }
+@@ -1995,7 +1993,7 @@ int SigPrepareStage4(DetectEngineCtx *de_ctx)
+     if (de_ctx->decoder_event_sgh != NULL) {
+         /* no need to set filestore count here as that would make a
+          * signature not decode event only. */
+-        SigGroupHeadBuildNonPrefilterArray(de_ctx, de_ctx->decoder_event_sgh);
++        PrefilterSetupRuleGroup(de_ctx, de_ctx->decoder_event_sgh);
+     }
+ 
+     int dump_grouping = 0;
+
+
+
+
+@@ -76,8 +76,9 @@ void DetectRunPrefilterFrame(DetectEngineThreadCtx *det_ctx, const SigGroupHead
+     SCLogDebug("pcap_cnt %" PRIu64, p->pcap_cnt);
+     PrefilterEngine *engine = sgh->frame_engines;
+     do {
+-        BUG_ON(engine->alproto == ALPROTO_UNKNOWN);
+-        if (engine->alproto == alproto && engine->ctx.frame_type == frame->type) {
++        if ((engine->alproto == alproto || engine->alproto == ALPROTO_UNKNOWN) &&
++                (engine->ctx.frame_type == frame->type ||
++                        engine->ctx.frame_type == FRAME_ANY_TYPE)) {
+             SCLogDebug("frame %p engine %p", frame, engine);
+             PREFILTER_PROFILING_START(det_ctx);
+             engine->cb.PrefilterFrame(det_ctx, engine->pectx, p, frames, frame);
+
+
+
+
+@@ -51,12 +51,14 @@
+ #include "detect-engine-prefilter.h"
+ #include "detect-engine-mpm.h"
+ #include "detect-engine-frame.h"
++#include "detect-engine-uint.h"
+ 
+ #include "app-layer-parser.h"
+ #include "app-layer-htp.h"
+ 
+ #include "util-profiling.h"
+ #include "util-validate.h"
++#include "util-hash-string.h"
+ 
+ static int PrefilterStoreGetId(DetectEngineCtx *de_ctx,
+         const char *name, void (*FreeFunc)(void *));
+@@ -490,7 +492,536 @@ static int PrefilterSetupRuleGroupSortHelper(const void *a, const void *b)
+     }
+ }
+ 
+-void PrefilterSetupRuleGroup(DetectEngineCtx *de_ctx, SigGroupHead *sgh)
++/** prefilter engine data for the non-prefilter engine for the prefilter API */
++struct PrefilterNonPFDataSig {
++    uint32_t sid : 30;
++    uint32_t type : 2; /**< type for `value` field below: 0:alproto 1:dport 2:dsize */
++    uint16_t value;
++    /* since we have 2 more bytes available due to padding, we can add some additional
++     * filters here. */
++    union {
++        struct {
++            SignatureMask sig_mask;
++        } pkt;
++        struct {
++            /* filter for frame type */
++            uint8_t type;
++        } frame;
++        struct {
++            uint8_t foo; // TODO unused
++        } app;
++    };
++};
++
++struct PrefilterNonPFData {
++    uint32_t size;
++    struct PrefilterNonPFDataSig array[];
++};
++
++struct PrefilterNonPFDataTx {
++    uint32_t size;
++    uint32_t array[];
++};
++
++/** \internal
++ *  \brief wrapper for use in APIs */
++static void PrefilterNonPFDataFree(void *data)
++{
++    SCFree(data);
++}
++
++static void PrefilterTxNonPF(DetectEngineThreadCtx *det_ctx, const void *pectx, Packet *p, Flow *f,
++        void *tx, const uint64_t tx_id, const AppLayerTxData *tx_data, const uint8_t flags)
++{
++    const struct PrefilterNonPFDataTx *data = (const struct PrefilterNonPFDataTx *)pectx;
++    SCLogDebug("adding %u sids",

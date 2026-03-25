@@ -1,0 +1,106 @@
+@@ -12,6 +12,7 @@ from vulnerabilities.improvers import vulnerability_status
+ from vulnerabilities.pipelines import VulnerableCodePipeline
+ from vulnerabilities.pipelines import add_cvss31_to_CVEs
+ from vulnerabilities.pipelines import collect_commits
++from vulnerabilities.pipelines import compute_advisory_todo
+ from vulnerabilities.pipelines import compute_package_risk
+ from vulnerabilities.pipelines import compute_package_version_rank
+ from vulnerabilities.pipelines import enhance_with_exploitdb
+@@ -49,6 +50,7 @@ IMPROVERS_REGISTRY = [
+     add_cvss31_to_CVEs.CVEAdvisoryMappingPipeline,
+     remove_duplicate_advisories.RemoveDuplicateAdvisoriesPipeline,
+     populate_vulnerability_summary_pipeline.PopulateVulnerabilitySummariesPipeline,
++    compute_advisory_todo.ComputeToDo,
+ ]
+ 
+ IMPROVERS_REGISTRY = {
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,271 @@
++#
++# Copyright (c) nexB Inc. and others. All rights reserved.
++# VulnerableCode is a trademark of nexB Inc.
++# SPDX-License-Identifier: Apache-2.0
++# See http://www.apache.org/licenses/LICENSE-2.0 for the license text.
++# See https://github.com/aboutcode-org/vulnerablecode for support or download.
++# See https://aboutcode.org for more information about nexB OSS projects.
++#
++
++
++from aboutcode.pipeline import LoopProgress
++
++from vulnerabilities.models import Advisory
++from vulnerabilities.models import AdvisoryToDo
++from vulnerabilities.models import Alias
++from vulnerabilities.pipelines import VulnerableCodePipeline
++from vulnerabilities.pipes import fetchcode_utils
++from vulnerabilities.pipes.advisory import advisories_checksum
++
++
++class ComputeToDo(VulnerableCodePipeline):
++    """Compute advisory AdvisoryToDo."""
++
++    pipeline_id = "compute_advisory_todo"
++
++    @classmethod
++    def steps(cls):
++        return (
++            cls.compute_individual_advisory_todo,
++            cls.detect_conflicting_advisories,
++        )
++
++    def compute_individual_advisory_todo(self):
++        advisories = Advisory.objects.all().paginated()
++        advisories_count = Advisory.objects.all().count()
++
++        self.log(
++            f"Checking missing summary, affected and fixed packages in {advisories_count} Advisories"
++        )
++        progress = LoopProgress(
++            total_iterations=advisories_count,
++            logger=self.log,
++            progress_step=1,
++        )
++        for advisory in progress.iter(advisories):
++            advisory_todo_id = advisories_checksum(advisories=advisory)
++            check_missing_summary(
++                advisory=advisory,
++                todo_id=advisory_todo_id,
++                logger=self.log,
++            )
++            check_missing_affected_and_fixed_by_packages(
++                advisory=advisory,
++                todo_id=advisory_todo_id,
++                logger=self.log,
++            )
++
++    def detect_conflicting_advisories(self):
++        PACKAGE_VERSIONS = {}
++        aliases = Alias.objects.filter(alias__istartswith="cve")
++        aliases_count = aliases.count()
++
++        self.log(f"Cross validating advisory affected and fixed package for {aliases_count} CVEs")
++
++        progress = LoopProgress(total_iterations=aliases_count, logger=self.log)
++        for alias in progress.iter(aliases.paginated()):
++            advisories = (
++                Advisory.objects.filter(aliases__contains=alias.alias)
++                .exclude(advisory_todos__issue_type="MISSING_AFFECTED_AND_FIXED_BY_PACKAGES")
++                .distinct()
++            )
++            purls = get_advisories_purls(advisories=advisories)
++            get_package_versions(
++                purls=purls,
++                package_versions=PACKAGE_VERSIONS,
++                logger=self.log,
++            )
++            check_conflicting_affected_and_fixed_by_packages(
++                advisories=advisories,
++                package_versions=PACKAGE_VERSIONS,
++                purls=purls,
++                cve=alias,
++                logger=self.log,
++            )

@@ -1,0 +1,98 @@
+@@ -144,9 +144,6 @@ class NetworkInterface : public Checkpointable {
+   u_int8_t numSubInterfaces;
+   NetworkInterface *subInterfaces[MAX_NUM_VIEW_INTERFACES];
+ 
+-  /* Companion Interface */
+-  NetworkInterface *companion_interface;
+-
+   u_int nextFlowAggregation;
+   TcpFlowStats tcpFlowStats;
+   TcpPacketStats tcpPacketStats;
+@@ -637,7 +634,7 @@ class NetworkInterface : public Checkpointable {
+   void refreshHostsAlertPrefs(bool full_refresh);
+   int updateHostTrafficPolicy(AddressTree* allowed_networks, char *host_ip, u_int16_t host_vlan);
+ 
+-  void reloadCompanion();
++  virtual void reloadCompanions() {};
+   void reloadHideFromTop(bool refreshHosts=true);
+   void updateLbdIdentifier();
+   inline bool serializeLbdHostsAsMacs()             { return(lbd_serialize_by_mac); }
+@@ -737,7 +734,6 @@ class NetworkInterface : public Checkpointable {
+   bool isInDhcpRange(IpAddress *ip);
+   void getPodsStats(lua_State* vm);
+   void getContainersStats(lua_State* vm, const char *pod_filter);
+-  inline NetworkInterface * getCompanion() const { return companion_interface; };
+   bool enqueueeBPFFlow(ParsedFlow * const pf, bool skip_loopback_traffic);
+   bool dequeueeBPFFlow(ParsedFlow ** pf);
+ 
+
+
+
+
+@@ -26,6 +26,9 @@
+ 
+ class ZMQParserInterface : public ParserInterface {
+  private:
++  Mutex companions_lock;
++  u_int8_t num_companion_interfaces;
++  NetworkInterface **companion_interfaces;
+   typedef std::pair<u_int32_t, u_int32_t> pen_value_t;
+   typedef std::map<string, pen_value_t > labels_map_t;
+   labels_map_t labels_map;
+@@ -36,6 +39,8 @@ class ZMQParserInterface : public ParserInterface {
+ #ifdef NTOPNG_PRO
+   CustomAppMaps *custom_app_maps;
+ #endif
++  virtual void reloadCompanions();
++  void deliverFlowToCompanions(ParsedFlow * const flow);
+   bool getKeyId(char *sym, u_int32_t * const pen, u_int32_t * const field) const;
+   void addMapping(const char *sym, u_int32_t num, u_int32_t pen = 0);
+   bool parsePENZeroField(ParsedFlow * const flow, u_int32_t field, const char * const value) const;
+
+
+
+
+@@ -535,7 +535,7 @@
+ #define CONST_IFACE_SCALING_FACTOR_PREFS    NTOPNG_PREFS_PREFIX".iface_%d.scaling_factor"
+ #define CONST_IFACE_PACKET_DROPS_ALERT_PREFS NTOPNG_PREFS_PREFIX".iface_%d.packet_drops_alert"
+ #define CONST_IFACE_HIDE_FROM_TOP_PREFS     NTOPNG_PREFS_PREFIX".iface_%d.hide_from_top"
+-#define CONST_IFACE_COMPANION_INTERFACE     NTOPNG_PREFS_PREFIX".companion_interface.ifid_%d.companion"
++#define CONST_IFACE_COMPANIONS_SET          NTOPNG_PREFS_PREFIX".companion_interface.ifid_%d.companion_of"
+ #define CONST_HOST_ANOMALIES_THRESHOLD      NTOPNG_PREFS_PREFIX".%s:%d.alerts_config"
+ #define CONST_HOSTS_ALERT_COUNTERS          "ntopng.cache.alerts.iface_%u.host_engaged_alert_counters"
+ #define CONST_REMOTE_HOST_IDLE_PREFS        NTOPNG_PREFS_PREFIX".non_local_host_max_idle"
+@@ -1024,7 +1024,7 @@ extern struct ntopngLuaContext* getUserdata(struct lua_State *vm);
+ #define DONT_NOT_EXPIRE_BEFORE_SEC        30 /* sec */
+ #define MAX_NDPI_IDLE_TIME_BEFORE_GUESS   5 /* sec */
+ #define MAX_NUM_PCAP_CAPTURES             4
+-
++#define MAX_NUM_COMPANION_INTERFACES      4
+ #define MAX_NUM_FINGERPRINT               25
+ 
+ #define ALERT_ACTION_ENGAGE           "engage"
+
+
+
+
+@@ -7696,15 +7696,16 @@ static int ntop_interface_get_containers_stats(lua_State* vm) {
+ }
+ /* ****************************************** */
+ 
+-static int ntop_interface_reload_companion(lua_State* vm) {
++static int ntop_interface_reload_companions(lua_State* vm) {
+   int ifid;
+   NetworkInterface *iface;
+ 
+   if(ntop_lua_check(vm, __FUNCTION__, 1, LUA_TNUMBER) != CONST_LUA_OK) return CONST_LUA_ERROR;
+   ifid = lua_tonumber(vm, 1);
+ 
+-  if((iface = ntop->getInterfaceById(ifid)))
+-    iface->reloadCompanion();
++  if((iface = ntop->getInterfaceById(ifid))
++     && (iface = dynamic_cast<ZMQParserInterface*>(iface)))
++    iface->reloadCompanions();
+ 
+   return CONST_LUA_OK;
+ }
+@@ -8490,7 +8491,7 @@ static const luaL_Reg ntop_interface_reg[] = {
+   /* eBPF, Containers and Companion Interfa

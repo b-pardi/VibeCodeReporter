@@ -1,0 +1,96 @@
+@@ -60,6 +60,15 @@ public class IspModelingTest {
+     assertThat(bgpTopology.getGraph().edges(), hasSize(4));
+   }
+ 
++  @Test
++  public void testBasicBgpPeerInfoInferredLocalIp() throws IOException {
++    IBatfish batfish = setup("basic-bgppeerinfo-implicit", ImmutableList.of("border1.cfg"), false);
++    BgpTopology bgpTopology = batfish.getTopologyProvider().getBgpTopology(batfish.getSnapshot());
++
++    // internet to ISP and ISP to border (4 uni edges)
++    assertThat(bgpTopology.getGraph().edges(), hasSize(4));
++  }
++
+   @Test
+   public void testSviPeering() throws IOException {
+     IBatfish batfish = setup("svi-peering", ImmutableList.of("border1.cfg", "border2.cfg"), true);
+
+
+
+
+@@ -1,5 +1,6 @@
+ package org.batfish.common.util.isp;
+ 
++import static com.google.common.base.MoreObjects.firstNonNull;
+ import static com.google.common.base.Preconditions.checkArgument;
+ import static com.google.common.base.Preconditions.checkState;
+ import static java.util.Comparator.naturalOrder;
+@@ -27,6 +28,7 @@ import java.util.Map.Entry;
+ import java.util.Objects;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.function.Predicate;
+ import java.util.stream.Collectors;
+ import java.util.stream.StreamSupport;
+ import javax.annotation.Nonnull;
+@@ -485,7 +487,9 @@ public final class IspModelingUtils {
+       checkArgument(peerAddress != null, "Peer address should not be null");
+       ConcreteInterfaceAddress ifaceAddress =
+           getSnapshotIfaceAddressForBgpPeer(
+-                  (BgpActivePeerConfig) bgpPeerConfig, snapshotIface.getAllConcreteAddresses())
++                  (BgpActivePeerConfig) bgpPeerConfig,
++                  null,
++                  snapshotIface.getAllConcreteAddresses())
+               .get();
+       InterfaceAddress ispInterfaceAddress =
+           ConcreteInterfaceAddress.create(peerAddress, ifaceAddress.getNetworkBits());
+@@ -500,7 +504,10 @@ public final class IspModelingUtils {
+ 
+   /**
+    * Given a {@link BgpPeerInfo} object, return the corresponding {@link SnapshotConnection} object.
+-   * Nothing is returned if the interface established BGP sessions with multiple ISPs.
++   *
++   * <p>{@link Optional#empty()} is returned if the interface established BGP sessions with multiple
++   * ISPs, if the peer has incomplete configuration, if the peer's configuration is not allowed by
++   * the ISP Configuration, and other cases.
+    */
+   @VisibleForTesting
+   static Optional<SnapshotConnection> getSnapshotConnectionForBgpPeerInfo(
+@@ -509,22 +516,44 @@ public final class IspModelingUtils {
+       LongSpace remoteAsns,
+       Map<String, Configuration> configurations,
+       Warnings warnings) {
++    // 0a. Resolve the device indicated by the BgpPeerInfo.
+     Configuration snapshotBgpHost = configurations.get(bgpPeerInfo.getHostname());
+     if (snapshotBgpHost == null) {
+       warnings.redFlag(
+           String.format("ISP Modeling: Non-existent border node %s", bgpPeerInfo.getHostname()));
+       return Optional.empty();
+     }
+-    String bgpPeerVrf =
+-        bgpPeerInfo.getVrf() == null
+-            ? snapshotBgpHost.getDefaultVrf().getName()
+-            : bgpPeerInfo.getVrf();
++
++    // 0b. Resolve the user-provided (or default) VRF in which to find the peering.
++    String bgpPeerVrf;
++    if (bgpPeerInfo.getVrf() != null) {
++      Optional<String> matchingVrf =
++          snapshotBgpHost.getVrfs().values().stream()
++              .map(Vrf::getName)
++              .filter(name -> name.equalsIgnoreCase(bgpPeerInfo.getVrf()))
++              .sorted()
++              .findFirst();
++      if (!matchingVrf.isPresent()) {
++        warnings.redFlag(
++            String.format(
++                "ISP Modeling: No VRF %s found on node %s",
++                bgpPeerInfo.getVrf(), snapshotBgpHost.getHostname()));
++        return Optional.empty();
++      }
++      bgpPeerVrf = matchingVrf.get();
++    } else {
++      bgpPeerVrf = snapshotBgpHost.getDefaultVrf().getName();
++    }
++
++    // 1. Find the

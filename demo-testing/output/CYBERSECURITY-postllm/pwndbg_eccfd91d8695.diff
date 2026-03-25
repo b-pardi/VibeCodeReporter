@@ -1,0 +1,136 @@
+@@ -711,6 +711,7 @@ def load_commands() -> None:
+         import pwndbg.commands.kcmdline
+         import pwndbg.commands.kconfig
+         import pwndbg.commands.killthreads
++        import pwndbg.commands.klookup
+         import pwndbg.commands.kversion
+         import pwndbg.commands.linkmap
+         import pwndbg.commands.memoize
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,32 @@
++from __future__ import annotations
++
++import argparse
++
++import pwndbg.commands
++import pwndbg.gdblib.kernel.kallsyms
++from pwndbg.color import message
++from pwndbg.commands import CommandCategory
++
++parser = argparse.ArgumentParser(description="Lookup kernel symbols")
++
++parser.add_argument("symbol", type=str, help="Address or symbol name to lookup")
++
++
++@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.KERNEL)
++@pwndbg.commands.OnlyWhenQemuKernel
++@pwndbg.commands.OnlyWhenPagingEnabled
++def klookup(symbol: str) -> None:
++    ksyms = pwndbg.gdblib.kernel.kallsyms.get()
++    try:
++        symbol_addr = int(symbol)
++        for k, v in ksyms.items():
++            if v[0] == symbol_addr:
++                print(message.success(f"{k} = {symbol_addr:#x}"))
++                return
++        print(message.error(f"No symbol found at {symbol_addr:#x}"))
++    except ValueError:
++        if symbol in ksyms:
++            addr = ksyms[symbol][0]
++            print(message.success(f"{symbol} = {addr:#x}"))
++        else:
++            print(message.error(f"No symbol found for {symbol}"))
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,401 @@
++from __future__ import annotations
++
++from struct import unpack_from
++
++from pwnlib.util.packing import p16
++from pwnlib.util.packing import u32
++from pwnlib.util.packing import u64
++
++import pwndbg.aglib
++import pwndbg.color.message as M
++import pwndbg.commands
++import pwndbg.gdblib.kernel
++import pwndbg.lib.cache
++import pwndbg.search
++
++
++@pwndbg.lib.cache.cache_until("start")
++def get():
++    ks = Kallsyms()
++    return ks.kallsyms
++
++
++class Kallsyms:
++    """
++    - linux_banner >= 6.4
++    - ... <= 6.4
++    - kallsyms_offsets
++    - kallsyms_relative_base
++    - kallsyms_num_syms
++    - kallsyms_names
++    - kallsyms_markers
++    - kallsyms_token_table
++    - kallsyms_token_index
++    - kallsyms_offsets >= 6.4
++    - kallsyms_relative_base >= 6.4
++    """
++
++    def __init__(self):
++        self.kallsyms = {}
++        self.kbase = pwndbg.gdblib.kernel.kbase()
++
++        mapping = pwndbg.gdblib.kernel.get_first_kernel_ro()
++        self.r_base = mapping.vaddr
++        self.kernel_ro_mem = pwndbg.gdblib.memory.read(mapping.vaddr, mapping.memsz)
++
++        self.kernel_version = pwndbg.gdblib.kernel.krelease()
++        self.is_offsets = False
++
++        self.rbase_offset = 0
++
++        self.token_table = self.find_token_table()
++        # TODO: if self.token_table is None its maybe an uncompressed kallsyms
++
++        self.token_index = self.find_token_index()
++        self.markers = self.find_markers()
++        self.num_syms = self.find_num_syms()
++        self.offsets = self.find_offsets()
++
++        if self.is_offsets:
++            self.rbase_offset = self.find_relative_base()
++
++        self.names = self.find_names()
++        self.kernel_addresses = self.get_kernel_addresses()
++        self.parse_symbol_table()
++
++    def find_token_table(self) -> int:
++        """
++        This function searches for the kallsyms_token_table structure in the kernel memory.
++        The kallsyms_token_table contains 256 zero-terminated tokens from which symbol names are built.
++        Example structure:
++        0xffffffff827b2f00:	"mm"
++        0xffffffff827b2f03:	"tim"
++        0xffffffff827b2f07:	"bu"
++        0xffffffff827b2f0a:	"ode_"
++        0xffffffff827b2f0f:	"robestub"
++        <SKIPPED>
++        0xffffffff827b2fdb:	"0"
++        0xffffffff827b2fdd:	"1"
++        0xffffffff827b2fdf:	"2"
++        0xffffffff827b2fe1:	"3"
++        0xffffffff827b2fe3:	"4"
++        0xffffffff827b2fe5:	"5"
++        0xffffffff827b2fe7:	"6"
++        0xfff

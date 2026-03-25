@@ -1,0 +1,144 @@
+@@ -580,6 +580,7 @@ enum {
+ 	CB_SRC_LABEL,
+ #define	CB_PORT			CB_SRC_LABEL	/* Alias, non-overlapping */
+ #define	CB_HINT			CB_SRC_LABEL	/* Alias, non-overlapping */
++#define	CB_NAT_46X64		CB_SRC_LABEL	/* Alias, non-overlapping */
+ #define	CB_PROXY_MAGIC		CB_SRC_LABEL	/* Alias, non-overlapping */
+ #define	CB_ENCRYPT_MAGIC	CB_SRC_LABEL	/* Alias, non-overlapping */
+ #define	CB_DST_ENDPOINT_ID	CB_SRC_LABEL    /* Alias, non-overlapping */
+
+
+
+
+@@ -520,6 +520,16 @@ bool lb6_src_range_ok(const struct lb6_service *svc __maybe_unused,
+ #endif /* ENABLE_SRC_RANGE_CHECK */
+ }
+ 
++static __always_inline bool
++lb6_to_lb4_service(const struct lb6_service *svc __maybe_unused)
++{
++#ifdef ENABLE_NAT_46X64
++	return svc->flags2 & SVC_FLAG_NAT_46X64;
++#else
++	return false;
++#endif
++}
++
+ static __always_inline
+ struct lb6_service *lb6_lookup_service(struct lb6_key *key,
+ 				       const bool scope_switch)
+@@ -1094,6 +1104,24 @@ bool lb4_src_range_ok(const struct lb4_service *svc __maybe_unused,
+ #endif /* ENABLE_SRC_RANGE_CHECK */
+ }
+ 
++static __always_inline int
++lb4_populate_ports(struct __ctx_buff *ctx, struct ipv4_ct_tuple *tuple, int off)
++{
++	if (tuple->nexthdr == IPPROTO_TCP ||
++	    tuple->nexthdr == IPPROTO_UDP) {
++		struct {
++			__be16 sport;
++			__be16 dport;
++		} l4hdr;
++		if (ctx_load_bytes(ctx, off, &l4hdr, sizeof(l4hdr)) < 0)
++			return -EFAULT;
++		tuple->sport = l4hdr.sport;
++		tuple->dport = l4hdr.dport;
++		return 0;
++	}
++	return -ENOTSUP;
++}
++
+ static __always_inline bool
+ lb4_to_lb6_service(const struct lb4_service *svc __maybe_unused)
+ {
+
+
+
+
+@@ -18,6 +18,7 @@
+ #include "conntrack.h"
+ #include "conntrack_map.h"
+ #include "icmp6.h"
++#include "nat_46x64.h"
+ 
+ enum  nat_dir {
+ 	NAT_DIR_EGRESS  = TUPLE_F_OUT,
+@@ -1066,6 +1067,26 @@ void snat_v6_delete_tuples(struct ipv6_ct_tuple *tuple __maybe_unused)
+ }
+ #endif
+ 
++static __always_inline bool
++snat_v6_has_v4_match(const struct ipv4_ct_tuple *tuple4 __maybe_unused)
++{
++#if defined(ENABLE_IPV6) && defined(ENABLE_NODEPORT)
++	struct ipv6_ct_tuple tuple6;
++
++	memset(&tuple6, 0, sizeof(tuple6));
++	tuple6.nexthdr = tuple4->nexthdr;
++	build_v4_in_v6(&tuple6.saddr, tuple4->saddr);
++	build_v4_in_v6(&tuple6.daddr, tuple4->daddr);
++	tuple6.sport = tuple4->sport;
++	tuple6.dport = tuple4->dport;
++	tuple6.flags = NAT_DIR_INGRESS;
++
++	return snat_v6_lookup(&tuple6);
++#else
++	return false;
++#endif
++}
++
+ static __always_inline __maybe_unused void
+ ct_delete4(const void *map, struct ipv4_ct_tuple *tuple, struct __ctx_buff *ctx)
+ {
+
+
+
+
+@@ -572,6 +572,7 @@ __section_tail(CILIUM_MAP_CALLS, CILIUM_CALL_IPV6_NODEPORT_NAT)
+ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ {
+ 	enum nat_dir dir = (enum nat_dir)ctx_load_meta(ctx, CB_NAT);
++	const bool nat_46x64 = ctx_load_meta(ctx, CB_NAT_46X64);
+ 	union v6addr tmp = IPV6_DIRECT_ROUTING;
+ 	struct bpf_fib_lookup_padded fib_params = {
+ 		.l = {
+@@ -584,11 +585,13 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 		.max_port = NODEPORT_PORT_MAX_NAT,
+ 		.src_from_world = true,
+ 	};
++	bool l2_hdr_required = true;
+ 	void *data, *data_end;
+ 	struct ipv6hdr *ip6;
+-	bool l2_hdr_required = true;
+ 	int ret;
+ 
++	if (nat_46x64)
++		build_v4_in_v6(&tmp, IPV4_DIRECT_ROUTING);
+ 	target.addr = tmp;
+ #ifdef TUNNEL_MODE
+ 	if (dir == NAT_DIR_EGRESS) {
+@@ -655,11 +658,25 @@ int tail_nodeport_nat_ipv6(struct __ctx_buff *ctx)
+ 		ret = DROP_INVALID;
+ 		goto drop_err;
+ 	}
++	if (nat_46x64) {
++		struct iphdr *ip4;
+ 
+-	ipv6_addr_copy((union v6addr *)&fib_params.l.ipv6_src,
+-		       (union v6addr *)&ip6->saddr);
+-	ipv6_addr_copy((union v6addr *)&fib_params.l.ipv6_dst,
+-		       (union v6addr *)&ip6->daddr);
++		ret = lb6_to_lb4(ctx, ip6);
++		if (ret < 0)
++			goto drop_err;
++		if (!revalidate_data(ctx, &data, &data_end, &ip4)) {
++			ret = DROP_INVALID;
++			goto drop_err;
++		}
++		fib_params.l.ipv4_src = ip4->saddr;
++		fib_params.l.ipv4_dst = ip4->daddr;
++		fib_params.l.family = AF_INET;
++	} else {
++		ipv6_addr_copy((union v6addr *)&fib_params.l.ipv6_src,
++			       (union v6addr *)&ip

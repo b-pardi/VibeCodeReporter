@@ -1,0 +1,146 @@
+@@ -83,6 +83,7 @@ void DetectLuaRegister(void)
+ #else /* HAVE_LUA */
+ 
+ #include "util-lua.h"
++#include "util-lua-sandbox.h"
+ 
+ static int DetectLuaMatch (DetectEngineThreadCtx *,
+         Packet *, const Signature *, const SigMatchCtx *);
+@@ -97,6 +98,9 @@ static void DetectLuaRegisterTests(void);
+ static void DetectLuaFree(DetectEngineCtx *, void *);
+ static int g_smtp_generic_list_id = 0;
+ 
++// TODO: move to config
++static const uint64_t g_lua_alloc_limit = 500000, g_lua_instruction_limit = 500000;
++
+ /**
+  * \brief Registration function for keyword: lua
+  */
+@@ -479,7 +483,7 @@ static void *DetectLuaThreadInit(void *data)
+     t->alproto = lua->alproto;
+     t->flags = lua->flags;
+ 
+-    t->luastate = LuaGetState();
++    t->luastate = sb_newstate(g_lua_alloc_limit, g_lua_instruction_limit);
+     if (t->luastate == NULL) {
+         SCLogError("luastate pool depleted");
+         goto error;
+@@ -525,7 +529,7 @@ static void *DetectLuaThreadInit(void *data)
+ 
+ error:
+     if (t->luastate != NULL)
+-        LuaReturnState(t->luastate);
++        sb_close(t->luastate);
+     SCFree(t);
+     return NULL;
+ }
+@@ -535,7 +539,7 @@ static void DetectLuaThreadFree(void *ctx)
+     if (ctx != NULL) {
+         DetectLuaThreadData *t = (DetectLuaThreadData *)ctx;
+         if (t->luastate != NULL)
+-            LuaReturnState(t->luastate);
++            sb_close(t->luastate);
+         SCFree(t);
+     }
+ }
+@@ -581,10 +585,10 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
+ {
+     int status;
+ 
+-    lua_State *luastate = luaL_newstate();
++    lua_State *luastate = sb_newstate(g_lua_alloc_limit, g_lua_instruction_limit);
+     if (luastate == NULL)
+         return -1;
+-    luaL_openlibs(luastate);
++    luaL_openlibs(luastate); // TODO: get sandbox config and load appropriate libs
+ 
+     /* hackish, needed to allow unittests to pass buffers as scripts instead of files */
+ #ifdef UNITTESTS
+@@ -863,10 +867,10 @@ static int DetectLuaSetupPrime(DetectEngineCtx *de_ctx, DetectLuaData *ld, const
+ 
+     /* pop the table */
+     lua_pop(luastate, 1);
+-    lua_close(luastate);
++    sb_close(luastate);
+     return 0;
+ error:
+-    lua_close(luastate);
++    sb_close(luastate);
+     return -1;
+ }
+ 
+
+
+
+
+@@ -27,6 +27,7 @@
+ #ifdef HAVE_LUA
+ 
+ #include "util-lua.h"
++#include "util-lua-sandbox.h"
+ 
+ typedef struct DetectLuaThreadData {
+     lua_State *luastate;
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,299 @@
++/* Copyright (C) 2014-2023 Open Information Security Foundation
++ *
++ * You can copy, redistribute or modify this Program under the terms of
++ * the GNU General Public License version 2 as published by the Free
++ * Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * version 2 along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++
++/**
++ * \file
++ *
++ * \author Jo Johnson <pyrojoe314@gmail.com>
++ */
++
++#include "suricata-common.h"
++
++#ifdef HAVE_LUA
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "lua.h"
++
++#include "lauxlib.h"
++#include "lualib.h"
++
++#include "util-lua-sandbox.h"
++
++typedef struct sb_block_function {
++    const char *module;
++    const char *name;
++} sb_block_function;
++
++static void sb_hook(lua_State *L, lua_Debug *ar);
++LUAMOD_API int luaopen_sandbox(lua_State *L);
++
++static void *sb_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
++{
++    (void)ud;
++    (void)osize; /* not used */
++    sb_lua_state *ctx = (sb_lua_state *)ud;
++    if (nsize == 0) {
++        if (ptr != NULL) {
++            // ASSERT: alloc_bytes > osize
++            ctx->alloc_bytes -= osize;
++        }
++        SCFree(ptr)

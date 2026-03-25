@@ -1,0 +1,121 @@
+@@ -120,6 +120,14 @@ TmEcode PcapFileDispatch(PcapFileFileVars *ptv)
+ {
+     SCEnter();
+ 
++    /* initialize all the threads initial timestamp */
++    if (likely(ptv->first_pkt_hdr != NULL)) {
++        TmThreadsInitThreadsTimestamp(&ptv->first_pkt_ts);
++        PcapFileCallbackLoop((char *)ptv, ptv->first_pkt_hdr, (u_char *)ptv->first_pkt_data);
++        ptv->first_pkt_hdr = NULL;
++        ptv->first_pkt_data = NULL;
++    }
++
+     int packet_q_len = 64;
+     int r;
+     TmEcode loop_result = TM_ECODE_OK;
+@@ -160,6 +168,23 @@ TmEcode PcapFileDispatch(PcapFileFileVars *ptv)
+     SCReturnInt(loop_result);
+ }
+ 
++/** \internal
++ *  \brief get the timestamp of the first packet and rewind
++ *  \retval bool true on success, false on error
++ */
++static bool PeekFirstPacketTimestamp(PcapFileFileVars *pfv)
++{
++    int r = pcap_next_ex(pfv->pcap_handle, &pfv->first_pkt_hdr, &pfv->first_pkt_data);
++    if (r <= 0 || pfv->first_pkt_hdr == NULL) {
++        SCLogError(SC_ERR_PCAP_OPEN_OFFLINE,
++                "failed to get first packet timestamp. pcap_next_ex(): %d", r);
++        return false;
++    }
++    pfv->first_pkt_ts.tv_sec = pfv->first_pkt_hdr->ts.tv_sec;
++    pfv->first_pkt_ts.tv_usec = pfv->first_pkt_hdr->ts.tv_usec;
++    return true;
++}
++
+ TmEcode InitPcapFile(PcapFileFileVars *pfv)
+ {
+     char errbuf[PCAP_ERRBUF_SIZE] = "";
+@@ -196,6 +221,9 @@ TmEcode InitPcapFile(PcapFileFileVars *pfv)
+     pfv->datalink = pcap_datalink(pfv->pcap_handle);
+     SCLogDebug("datalink %" PRId32 "", pfv->datalink);
+ 
++    if (!PeekFirstPacketTimestamp(pfv))
++        SCReturnInt(TM_ECODE_FAILED);
++
+     DecoderFunc temp;
+     TmEcode validated = ValidateLinkType(pfv->datalink, &temp);
+     SCReturnInt(validated);
+
+
+
+
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2007-2010 Open Information Security Foundation
++/* Copyright (C) 2007-2020 Open Information Security Foundation
+  *
+  * You can copy, redistribute or modify this Program under the terms of
+  * the GNU General Public License version 2 as published by the Free
+@@ -74,6 +74,12 @@ typedef struct PcapFileFileVars_
+     struct bpf_program filter;
+ 
+     PcapFileSharedVars *shared;
++
++    /* fields used to get the first packets timestamp early,
++     * so it can be used to setup the time subsys. */
++    const u_char *first_pkt_data;
++    struct pcap_pkthdr *first_pkt_hdr;
++    struct timeval first_pkt_ts;
+ } PcapFileFileVars;
+ 
+ /**
+
+
+
+
+@@ -2213,6 +2213,7 @@ end:
+     SCMutexUnlock(&thread_store_lock);
+ }
+ 
++#define COPY_TIMESTAMP(src,dst) ((dst)->tv_sec = (src)->tv_sec, (dst)->tv_usec = (src)->tv_usec) // XXX unify with flow-util.h
+ void TmThreadsSetThreadTimestamp(const int id, const struct timeval *ts)
+ {
+     SCMutexLock(&thread_store_lock);
+@@ -2223,12 +2224,22 @@ void TmThreadsSetThreadTimestamp(const int id, const struct timeval *ts)
+ 
+     int idx = id - 1;
+     Thread *t = &thread_store.threads[idx];
+-    t->ts.tv_sec = ts->tv_sec;
+-    t->ts.tv_usec = ts->tv_usec;
++    COPY_TIMESTAMP(ts, &t->ts);
++    SCMutexUnlock(&thread_store_lock);
++}
++
++void TmThreadsInitThreadsTimestamp(const struct timeval *ts)
++{
++    SCMutexLock(&thread_store_lock);
++    for (size_t s = 0; s < thread_store.threads_size; s++) {
++        Thread *t = &thread_store.threads[s];
++        if (!t->in_use)
++            break;
++        COPY_TIMESTAMP(ts, &t->ts);
++    }
+     SCMutexUnlock(&thread_store_lock);
+ }
+ 
+-#define COPY_TIMESTAMP(src,dst) ((dst)->tv_sec = (src)->tv_sec, (dst)->tv_usec = (src)->tv_usec) // XXX unify with flow-util.h
+ void TmThreadsGetMinimalTimestamp(struct timeval *ts)
+ {
+     struct timeval local, nullts;
+
+
+
+
+@@ -240,6 +240,7 @@ int TmThreadsRegisterThread(ThreadVars *tv, const int type);
+ void TmThreadsUnregisterThread(const int id);
+ int TmThreadsInjectPacketsById(Packet **, int id);
+ 
++void TmThreadsInitThreadsTimestamp(const struct timeval *ts);
+ void TmThreadsSetThreadTimestamp(const int id, const struct timeval *ts);
+ void TmThreadsGetMinimalTimestamp(struct timeval *ts);

@@ -1,0 +1,110 @@
+@@ -32,6 +32,11 @@ typedef struct {
+   u_int64_t last, next;
+ } TCPSeqNum;
+ 
++typedef struct {
++  u_int16_t score;
++  char *script_key;
++} StatusInfo;
++
+ class Flow : public GenericHashEntry {
+  private:
+   Host *cli_host, *srv_host;
+@@ -45,8 +50,8 @@ class Flow : public GenericHashEntry {
+   struct ndpi_flow_struct *ndpiFlow;
+ 
+   Bitmap status_map;              /* The bitmap of the possible problems on the flow */
++  StatusInfo *status_infos;       /* An array of 64 StatusInfo, one for each status (lazy allocation upon setStatus call) */
+   FlowStatus alerted_status;      /* This is the status which has triggered the alert */
+-  FlowStatus predominant_status;  /* This is the most important status currently set in the status_map */
+   AlertType alert_type;
+   AlertLevel alert_level;
+   char *alert_status_info;        /* Alert specific status info */
+@@ -255,11 +260,10 @@ class Flow : public GenericHashEntry {
+   ~Flow();
+ 
+   inline Bitmap getStatusBitmap()     const     { return(status_map);           }
+-  void setStatus(FlowStatus status);
++  bool setStatus(FlowStatus status, u_int16_t flow_inc, u_int16_t cli_inc, u_int16_t srv_inc, const char*script_key);
+   void clearStatus(FlowStatus status);
+   bool triggerAlert(FlowStatus status, AlertType atype, AlertLevel severity, const char*alert_json);
+-  inline void setPredominantStatus(FlowStatus status) { predominant_status = status; }
+-  inline FlowStatus getPredominantStatus() const      { return(predominant_status); }
++  FlowStatus getPredominantStatus() const;
+   inline const char* getStatusInfo() const      { return(alert_status_info);    }
+ 
+   bool isBlacklistedFlow()   const;
+@@ -602,7 +606,6 @@ class Flow : public GenericHashEntry {
+   inline u_int16_t getFlowDeviceInIndex()  { return flow_device.in_index;  };
+   inline u_int16_t getFlowDeviceOutIndex() { return flow_device.out_index; };
+ 
+-  void incScore(u_int16_t flow_inc, u_int16_t cli_inc, u_int16_t srv_inc);
+   inline u_int16_t getCliScore() const     { return(cli_score); };
+   inline u_int16_t getSrvScore() const     { return(srv_score); };
+   inline u_int16_t getScore() const        { return(flow_score); };
+
+
+
+
+@@ -47,8 +47,8 @@ Flow::Flow(NetworkInterface *_iface,
+   alert_type = alert_none;
+   alert_level = alert_level_none;
+   alerted_status = status_normal;
+-  predominant_status = status_normal;
+   peers_score_accounted = false;
++  status_infos = NULL;
+ 
+   detection_completed = update_flow_port_stats = false;
+   fully_processed = false;
+@@ -293,6 +293,14 @@ Flow::~Flow() {
+ 
+   if(bt_hash)                free(bt_hash);
+ 
++  if(status_infos) {
++    for(int i=0; i<BITMAP_NUM_BITS; i++) {
++      if(status_infos[i].script_key)
++	free(status_infos[i].script_key);
++    }
++    free(status_infos);
++  }
++
+   freeDPIMemory();
+   if(icmp_info) delete(icmp_info);
+   if(external_alert) free(external_alert);
+@@ -4417,13 +4425,58 @@ bool Flow::triggerAlert(FlowStatus status, AlertType atype, AlertLevel severity,
+ 
+ /* *************************************** */
+ 
+-void Flow::setStatus(FlowStatus status) {
++static void incPeerScorePcap(Host *h, u_int16_t score_inc) {
++  u_int32_t old_score = h->getScore()->getValue();
++  u_int32_t new_score = old_score + score_inc;
++
++  if(new_score >= (u_int16_t)-1)
++    new_score = (u_int16_t)-1;
++
++  h->getScore()->incValue(new_score);
++  h->getScore()->refreshValue();
++}
++
++/* *************************************** */
++
++bool Flow::setStatus(FlowStatus status, u_int16_t flow_inc, u_int16_t cli_inc,
++	  u_int16_t srv_inc, const char*script_key) {
+   if(status_map.get() == status_normal) {
+     /* First misbehaving status */
+     iface->incNumMisbehavingFlows();
+   }
+ 
+-  status_map.setBit(status);
++  if(!status_map.issetBit(status)) {
++    status_map.setBit(status);
++
++#ifdef NTOPNG_PRO
++    if(ntop->getPrefs()->is_enterprise_edition()) {
++      flow_score += flow_inc;
++      cli_score += cli_inc;
++      srv_score += srv_inc;
++
++      if(!status_infos)
++	status_infos = (StatusInfo*) ca

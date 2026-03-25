@@ -1,0 +1,116 @@
+@@ -41,7 +41,11 @@ typedef struct {
+   u_int16_t cli2srv_window, srv2cli_window;
+   struct timeval synTime, synAckTime, ackTime; /* network Latency (3-way handshake) */
+   float clientRTT3WH, serverRTT3WH; /* Computed at 3WH (msec) */
+-
++  struct {
++    u_int8_t cli_to_srv_winscale, srv_to_cli_winscale;
++    struct ndpi_analyze_struct cli_to_srv, srv_to_cli;
++  } tcpWin;
++  
+   struct {
+     u_int32_t last_cli_ack, last_srv_ack;
+     struct bpf_timeval last_cli_ts, last_srv_ts;
+@@ -86,8 +90,10 @@ class Flow : public GenericHashEntry {
+   int32_t iface_index;  /* Interface index on which this flow has been first observed */
+   Host *cli_host, *srv_host; /* They are ALWAYS NULL on ViewInterfaces. For shared hosts see below viewFlowStats */
+   IpAddress *cli_ip_addr, *srv_ip_addr;
++#ifdef NTOPNG_PRO
+   FlowTCP *tcp;
+   FlowUDP *udp;
++#endif
+   FlowCollectionInfo *collection;
+ 
+   /* Data collected from nProbe */
+@@ -1136,7 +1142,9 @@ inline float get_goodput_bytes_thpt() const { return (goodput_bytes_thpt); };
+ #if defined(NTOPNG_PRO)
+   void updateTCPAck(const struct bpf_timeval *when,
+ 		    bool src2dst_direction, u_int32_t ack_id);
+-
++  void updateTCPWinScale(bool src2dst_direction, u_int8_t winscale);
++  void updateTCPWin(bool src2dst_direction, u_int16_t win);
++  
+ #if !defined(HAVE_NEDGE)
+   inline void updateProfile() { trafficProfile = iface->getFlowProfile(this); }
+ #endif
+
+
+
+
+@@ -52,6 +52,8 @@ Flow::Flow(NetworkInterface *_iface,
+     srv_port = _srv_port, privateFlowId = _private_flow_id;
+   flow_dropped_counts_increased = 0, protocolErrorCode = 0;
+   srcAS = dstAS = 0, rttSec = 0;
++
++#ifdef NTOPNG_PRO
+   tcp = NULL, udp = NULL;
+     
+   if(_protocol == IPPROTO_TCP) {
+@@ -59,7 +61,9 @@ Flow::Flow(NetworkInterface *_iface,
+ 
+     if(tcp != NULL)
+       ndpi_init_data_analysis(&tcp->rtt.cli_to_srv, 4),
+-	ndpi_init_data_analysis(&tcp->rtt.srv_to_cli, 4);
++	ndpi_init_data_analysis(&tcp->rtt.srv_to_cli, 4),
++	ndpi_init_data_analysis(&tcp->tcpWin.cli_to_srv, 4),
++	ndpi_init_data_analysis(&tcp->tcpWin.srv_to_cli, 4);
+   } else {
+     if(protocol == IPPROTO_UDP) {
+       udp = (FlowUDP*)calloc(1, sizeof(FlowUDP));
+@@ -69,7 +73,8 @@ Flow::Flow(NetworkInterface *_iface,
+ 	  ndpi_init_data_analysis(&udp->rtt.srv_min_rtt, 4);
+     }
+   }
+-
++#endif
++  
+   collection = NULL;
+ 
+   predominant_alert.id = flow_alert_normal,
+@@ -507,10 +512,14 @@ Flow::~Flow() {
+ 
+   freeDPIMemory();
+ 
++#ifdef NTOPNG_PRO
+   if(tcp != NULL) {
+     if(tcp->tcp_fingerprint) free(tcp->tcp_fingerprint);
+ 
+-    ndpi_free_data_analysis(&tcp->rtt.cli_to_srv, 0), ndpi_free_data_analysis(&tcp->rtt.srv_to_cli, 0);
++    ndpi_free_data_analysis(&tcp->rtt.cli_to_srv, 0),
++      ndpi_free_data_analysis(&tcp->rtt.srv_to_cli, 0),
++      ndpi_free_data_analysis(&tcp->tcpWin.cli_to_srv, 0),
++      ndpi_free_data_analysis(&tcp->tcpWin.srv_to_cli, 0);
+     free(tcp);
+   }
+ 
+@@ -519,7 +528,8 @@ Flow::~Flow() {
+       ndpi_free_data_analysis(&udp->rtt.srv_min_rtt, 0);
+     free(udp);
+   }
+-
++#endif
++  
+   if(riskInfo) free(riskInfo);
+   if(end_reason) free(end_reason);
+ 
+@@ -1998,32 +2008,26 @@ void Flow::hosts_periodic_stats_update(NetworkInterface *iface, Host *cli_host,
+ 	*srv_as = srv_host ? srv_host->get_as() : NULL;
+ 
+       if(cli_as)
+-        cli_as->incStats(
+-			 tv->tv_sec, stats_protocol, partial->get_cli2srv_packets(),
++        cli_as->incStats(tv->tv_sec, stats_protocol, partial->get_cli2srv_packets(),
+ 			 partial->get_cli2srv_bytes(), partial->get_srv2cli_packets(),
+ 			 partial->get_srv2cli_bytes());
+       if(srv_as)
+-        srv_as->incStats(
+-			 tv->tv_sec, stats_protocol, partial->get_srv2cli_packets(),
++        srv_as->incStats(tv->tv_sec, stats_protocol, partial->get_srv2cli_packets(),
+ 			 partial->get_srv2cli_bytes(), partial->get_cli2srv_packets(),
+ 			 partial->get_cli2srv_bytes());
+     }
+ 
+     if(cli_host->get_observation_point_id() &&
+         srv_host->get_observation_point_id()) {
+-      ObservationPoint *cli_obs_point =
+-	cli_host ? cli_hos

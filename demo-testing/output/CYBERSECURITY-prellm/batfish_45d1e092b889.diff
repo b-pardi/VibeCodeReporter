@@ -1,0 +1,113 @@
+@@ -93,6 +93,9 @@ public final class TcpFlagsMatchConditions
+   /** Shorthand for match conditions for a ACK (acknowledgement) packet */
+   public static final TcpFlagsMatchConditions ACK_TCP_FLAG =
+       builder().setTcpFlags(TcpFlags.builder().setAck(true).build()).setUseAck(true).build();
++  /** Shorthand for match conditions for a RST (reset) packet */
++  public static final TcpFlagsMatchConditions RST_TCP_FLAG =
++      builder().setTcpFlags(TcpFlags.builder().setRst(true).build()).setUseRst(true).build();
+   /** Shorthand for match conditions for a SYN-ACK packet */
+   public static final TcpFlagsMatchConditions SYN_ACK_TCP_FLAG =
+       builder()
+
+
+
+
+@@ -2,6 +2,7 @@ package org.batfish.datamodel.acl;
+ 
+ import static com.google.common.base.Preconditions.checkArgument;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSortedSet;
+ import com.google.common.collect.Ordering;
+@@ -31,6 +32,22 @@ public final class AclLineMatchExprs {
+ 
+   public static final TrueExpr TRUE = TrueExpr.INSTANCE;
+ 
++  static final AclLineMatchExpr TCP_FLOWS = matchIpProtocol(IpProtocol.TCP);
++
++  @VisibleForTesting
++  static final AclLineMatchExpr ESTABLISHED_TCP_FLOWS =
++      and(
++          TCP_FLOWS,
++          matchTcpFlags(
++              // ack or rst
++              TcpFlagsMatchConditions.ACK_TCP_FLAG, TcpFlagsMatchConditions.RST_TCP_FLAG));
++
++  @VisibleForTesting
++  static final AclLineMatchExpr NEW_TCP_FLOWS = and(TCP_FLOWS, not(ESTABLISHED_TCP_FLOWS));
++
++  public static final AclLineMatchExpr NEW_FLOWS =
++      implies(matchIpProtocol(IpProtocol.TCP), NEW_TCP_FLOWS);
++
+   public static AclLineMatchExpr and(AclLineMatchExpr... exprs) {
+     return and(
+         Arrays.stream(exprs)
+@@ -58,6 +75,13 @@ public final class AclLineMatchExprs {
+     return new AndMatchExpr(exprs);
+   }
+ 
++  /**
++   * Construct an {@link AclLineMatchExpr} encoding if {@code condition} then {@code consequent}.
++   */
++  public static AclLineMatchExpr implies(AclLineMatchExpr condition, AclLineMatchExpr consequent) {
++    return or(not(condition), consequent);
++  }
++
+   public static MatchHeaderSpace match(HeaderSpace headerSpace) {
+     return new MatchHeaderSpace(headerSpace);
+   }
+
+
+
+
+@@ -112,6 +112,11 @@ public final class ReachabilityParameters {
+       return this;
+     }
+ 
++    public Builder setHeaderSpace(@Nonnull AclLineMatchExpr headerSpace) {
++      _headerSpace = headerSpace;
++      return this;
++    }
++
+     public Builder setMaxChunkSize(int maxChunkSize) {
+       _maxChunkSize = maxChunkSize;
+       return this;
+
+
+
+
+@@ -1,15 +1,44 @@
+ package org.batfish.datamodel.acl;
+ 
++import static org.batfish.datamodel.acl.AclLineMatchExprs.ESTABLISHED_TCP_FLOWS;
++import static org.batfish.datamodel.acl.AclLineMatchExprs.NEW_FLOWS;
++import static org.batfish.datamodel.acl.AclLineMatchExprs.NEW_TCP_FLOWS;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.and;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.matchSrcInterface;
+ import static org.batfish.datamodel.acl.AclLineMatchExprs.or;
+ import static org.hamcrest.Matchers.equalTo;
++import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertThat;
++import static org.junit.Assert.assertTrue;
+ 
+ import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableMap;
++import java.util.function.Supplier;
++import org.batfish.datamodel.Flow;
++import org.batfish.datamodel.IpProtocol;
++import org.batfish.datamodel.TcpFlags;
+ import org.junit.Test;
+ 
+ public class AclLineMatchExprsTest {
++  private static boolean matches(AclLineMatchExpr expr, Flow flow) {
++    return new Evaluator(flow, "src", ImmutableMap.of(), ImmutableMap.of()).visit(expr);
++  }
++
++  private static final Flow NEW_TCP_FLOW;
++  private static final Flow ACK_FLOW;
++  private static final Flow RST_FLOW;
++  private static final Flow UDP_FLOW;
++
++  static {
++    Supplier<Flow.Builder> fb

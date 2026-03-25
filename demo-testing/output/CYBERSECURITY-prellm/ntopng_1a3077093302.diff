@@ -1,0 +1,114 @@
+@@ -29,8 +29,13 @@ class LocalHostStats: public HostStats {
+   HTTPstats *http;
+   ICMPstats *icmp;
+   FrequentStringItems *top_sites;
++#if defined(NTOPNG_PRO)
++  TrafficStatsMonitor traffic_stats;
++#endif
+   /* nextPeriodicUpdate done every 5 min */
+   time_t nextPeriodicUpdate;
++  /* nextHourlyPeriodicUpdate done every 60 min */
++  time_t nextHourlyPeriodicUpdate;
+   u_int32_t num_contacts_as_cli, num_contacts_as_srv;
+ 
+   /* Estimate of the number of critical servers used by this host */
+@@ -62,7 +67,9 @@ class LocalHostStats: public HostStats {
+   void serializeDeserialize(char *host_buf, struct tm *t_now, bool do_serialize);
+   void deserializeTopSites(char* redis_key_current);
+   void updateContactedHostsBehaviour();
+-  
++#if defined(NTOPNG_PRO)
++  void resetTrafficStats();
++#endif
+  public:
+   LocalHostStats(Host *_host);
+   LocalHostStats(LocalHostStats &s);
+
+
+
+
+@@ -98,6 +98,11 @@ class NetworkInterface : public OtherAlertableEntity {
+   FlowCallbacksExecutor *flow_callbacks_executor, *prev_flow_callbacks_executor;
+   HostCallbacksExecutor *host_callbacks_executor, *prev_host_callbacks_executor;
+ 
++#if defined(NTOPNG_PRO)
++  /* Map containing various stats resetted every day */
++  CheckTrafficMap *check_traffic_stats;
++#endif
++  
+   /* Variables used by top sites periodic update */
+   u_int8_t current_cycle = 0;
+   FrequentStringItems *top_sites;
+@@ -394,6 +399,12 @@ class NetworkInterface : public OtherAlertableEntity {
+   inline void decScoreValue(u_int16_t score_incr, bool as_client)  { as_client ? score_as_cli -= score_incr : score_as_srv -= score_incr; };
+   inline void setCPUAffinity(int core_id)      { cpu_affinity = core_id; };
+   inline void getIPv4Address(bpf_u_int32 *a, bpf_u_int32 *m) { *a = ipv4_network, *m = ipv4_network_mask; };
++#if defined(NTOPNG_PRO)
++  void luaTrafficMap(lua_State *vm);
++  void enableTrafficMap(bool enable);
++  inline bool isTrafficMapEnabled() { return(check_traffic_stats != NULL); };
++  inline bool updateCheckTrafficMap(IpAddress *ip, Mac *mac, u_int16_t vlan_id, TrafficStatsMonitor updated_stats) { return(check_traffic_stats) ? check_traffic_stats->updateElement(ip, mac, vlan_id, updated_stats) : false; };
++#endif
+   inline bool are_ip_reassignment_alerts_enabled()       { return(enable_ip_reassignment_alerts); };
+   inline AddressTree* getInterfaceNetworks()   { return(&interface_networks); };
+   virtual void startPacketPolling();
+
+
+
+
+@@ -305,6 +305,7 @@
+ #define CONST_EST_MAX_HOSTS            200000
+ #define MIN_HOST_RESOLUTION_FREQUENCY  60  /* 1 min */
+ #define HOST_SITES_REFRESH             300 /* 5 min */
++#define HOST_TRAFFIC_REFRESH           3600 /* 60 min */
+ #define HOST_SITES_TOP_NUMBER          10
+ #define HOST_MAX_SERIALIZED_LEN        1048576 /* 1MB, use only when allocating memory in the heap */
+ #define POOL_MAX_SERIALIZED_LEN        32768 /* bytes */
+
+
+
+
+@@ -325,6 +325,7 @@ using namespace std;
+ #include "RecipientQueues.h"
+ #include "Recipients.h"
+ #ifdef NTOPNG_PRO
++#include "CheckTrafficMap.h"
+ #include "PeriodicityMatchInfo.h"
+ #include "PeriodicityStats.h"
+ #include "PeriodicityHash.h"
+
+
+
+
+@@ -227,6 +227,16 @@ typedef struct {
+   char *alert;
+ } AlertFifoItem;
+ 
++typedef struct {
++  IpAddress *ip;
++  /* DNS traffic counted in bytes */
++  u_int32_t dns_traffic_sent;
++  u_int32_t dns_traffic_rcvd;
++  /* NTP traffic counted in packtes */
++  u_int32_t ntp_traffic_sent;
++  u_int32_t ntp_traffic_rcvd;
++} TrafficStatsMonitor;
++
+ struct zmq_msg_hdr_v0 {
+   char url[32];
+   u_int32_t version;
+
+
+
+
+@@ -33,9 +33,15 @@ LocalHostStats::LocalHostStats(Host *_host) : HostStats(_host) {
+   peers = new (std::nothrow) PeerStats(MAX_DYNAMIC_STATS_VALUES /* 10 as default */ );
+ 
+   nextPeriodicUpdate = 0;
++  nextHourlyPeriodicUpdate = 0;
+   num_contacts_as_cli = num_contacts_as_srv = 0;
+   current_cycle = 0;
+   
++#if defined(NTOPNG_PRO)
++  traffic_stats.ntp_traffic_sent = traffic_stats.dns_traffic_sent = traffic_stats.ntp_traffic_rcvd = traffic_stats.dns_traffic_rcvd = 0;
++  tra

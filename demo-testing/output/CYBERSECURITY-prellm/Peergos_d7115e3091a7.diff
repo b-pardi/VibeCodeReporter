@@ -1,0 +1,78 @@
+@@ -453,7 +453,7 @@ public class Main extends Builder {
+ 
+             Supplier<Connection> usageDb = getDBConnector(a, "space-usage-sql-file", dbConnectionPool);
+             UsageStore usageStore = new JdbcUsageStore(usageDb, sqlCommands);
+-            JdbcIpnsAndSocial rawSocial = new JdbcIpnsAndSocial(getDBConnector(a, "social-sql-file"), sqlCommands);
++            JdbcIpnsAndSocial rawSocial = new JdbcIpnsAndSocial(getDBConnector(a, "social-sql-file", dbConnectionPool), sqlCommands);
+             HttpSpaceUsage httpSpaceUsage = new HttpSpaceUsage(p2pHttpProxy, p2pHttpProxy);
+ 
+             CoreNode core = buildCorenode(a, localStorage, transactions, rawPointers, localPointers, proxingMutable,
+
+
+
+
+@@ -20,7 +20,7 @@ public class Migrate {
+      * @param network
+      * @return
+      */
+-    public static boolean migrateToLocal(UserContext user,
++    public static void migrateToLocal(UserContext user,
+                                          DeletableContentAddressedStorage localStorage,
+                                          NetworkAccess network) {
+         List<UserPublicKeyLink> existing = network.coreNode.getChain(user.username).join();
+@@ -28,7 +28,6 @@ public class Migrate {
+ 
+         Multihash currentStorageNodeId = existing.get(existing.size() - 1).claim.storageProviders.get(0);
+         network.coreNode.migrateUser(user.username, updatedChain, currentStorageNodeId).join();
+-        return true;
+     }
+ 
+     public static List<UserPublicKeyLink> buildMigrationChain(List<UserPublicKeyLink> existing,
+
+
+
+
+@@ -101,8 +101,8 @@ public class ServerMessages extends Builder {
+         JdbcIpnsAndSocial rawPointers = buildRawPointers(a, getDBConnector(a, "mutable-pointers-file", dbConnectionPool));
+         MutablePointers localPointers = UserRepository.build(localStorage, rawPointers);
+         MutablePointersProxy proxingMutable = new HttpMutablePointers(buildP2pHttpProxy(a), getPkiServerId(a));
+-        JdbcIpnsAndSocial rawSocial = new JdbcIpnsAndSocial(getDBConnector(a, "social-sql-file"), getSqlCommands(a));
+-        UsageStore usageStore = new JdbcUsageStore(getDBConnector(a, "space-usage-sql-file"), getSqlCommands(a));
++        JdbcIpnsAndSocial rawSocial = new JdbcIpnsAndSocial(getDBConnector(a, "social-sql-file", dbConnectionPool), getSqlCommands(a));
++        UsageStore usageStore = new JdbcUsageStore(getDBConnector(a, "space-usage-sql-file", dbConnectionPool), getSqlCommands(a));
+         CoreNode core = buildCorenode(a, localStorage, transactions, rawPointers, localPointers, proxingMutable,
+                 rawSocial, usageStore, Main.initCrypto().hasher);
+         return buildSpaceQuotas(a, localStorage, core,
+
+
+
+
+@@ -164,6 +164,16 @@ public class JdbcIpnsAndSocial {
+         return CompletableFuture.completedFuture(resp.serialize());
+     }
+ 
++    public List<BlindFollowRequest> getAndParseFollowRequests(PublicKeyHash owner) {
++        byte[] reqs = getFollowRequests(owner).join();
++        CborObject cbor = CborObject.fromByteArray(reqs);
++        if (!(cbor instanceof CborObject.CborList))
++            throw new IllegalStateException("Invalid cbor for list of follow requests: " + cbor);
++        return ((CborObject.CborList) cbor).value.stream()
++                .map(BlindFollowRequest::fromCbor)
++                .collect(Collectors.toList());
++    }
++
+     public CompletableFuture<Boolean> setPointer(PublicKeyHash writingKey, Optional<byte[]> existingCas, byte[] newCas) {
+         if (existingCas.isPresent()) {
+             try (Connection conn = getConnection();
+
+
+
+
+@@ -312,12 +312,14 @@ public class MirrorCoreNode implements CoreNode {
+             throw new IllegalStateException("Migration claim has earlier expiry than current one!");
+         UserPublicKeyLink.merge(existingChain, newChain, ipfs).join();
+         Multihash migrationTargetNode = newLast.claim.storageProviders.get(0);
++        PublicKeyHash owner = newLast.owner;
+ 
+         if (currentStorageId.equals(ourNodeId)) {
+             // a 

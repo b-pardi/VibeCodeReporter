@@ -1,0 +1,87 @@
+@@ -651,8 +651,12 @@ class Host : public GenericHashEntry, public HostAlertableEntity, public Score,
+   inline u_int8_t getCustomHostAlertScore()     { return(customHostAlert.score);                          }
+   inline char*    getCustomHostAlertMessage()   { return(customHostAlert.msg);                            }
+   void triggerCustomHostAlert(u_int8_t score, char *msg);
+-  virtual void setUnidirectionalTCPNoTXEgressFlow(IpAddress *ip, u_int16_t port) { ; }
+-  virtual u_int32_t getNumUnidirectionalTCPNoTXExgressFlows()                    { return(0); }
++
++  virtual void setUnidirectionalTCPNoTXEgressFlow(IpAddress *ip, u_int16_t port)  { ; }
++  virtual void setUnidirectionalTCPNoTXIngressFlow(IpAddress *ip, u_int16_t port) { ; }
++  virtual u_int32_t getNumContactedPeersAsClientTCPNoTX()    { return(0); };
++  virtual u_int32_t getNumContactsFromPeersAsServerTCPNoTX() { return(0); };
++  
+ };
+ 
+ #endif /* _HOST_H_ */
+
+
+
+
+@@ -34,7 +34,7 @@ class LocalHost : public Host, public SerializableElement {
+   u_int8_t router_mac[6]; /* MAC address pf the first router used (no Mac* to avoid purging race conditions) */
+   bool router_mac_set;
+   UsedPorts usedPorts;
+-  struct ndpi_hll server_port_with_no_tx_hll;
++  struct ndpi_hll outgoing_hosts_port_with_no_tx_hll, incoming_hosts_port_with_no_tx_hll;
+   
+   /* LocalHost data: update LocalHost::deleteHostData when adding new fields */
+   char *os_detail;
+@@ -122,8 +122,11 @@ class LocalHost : public Host, public SerializableElement {
+   inline void setContactedPort(bool isTCP, u_int16_t port, ndpi_protocol *proto) { usedPorts.setContactedPort(isTCP, port, proto); };
+   virtual inline void luaUsedPorts(lua_State* vm)                                         { usedPorts.lua(vm, iface);                     };
+   virtual inline std::unordered_map<u_int16_t, ndpi_protocol>* getServerPorts(bool isTCP) { return(usedPorts.getServerPorts(isTCP));      };
++
+   void setUnidirectionalTCPNoTXEgressFlow(IpAddress *ip, u_int16_t port);
+-  inline u_int32_t getNumUnidirectionalTCPNoTXExgressFlows() { return((u_int32_t)ndpi_hll_count(&server_port_with_no_tx_hll)); }
++  void setUnidirectionalTCPNoTXIngressFlow(IpAddress *ip, u_int16_t port);
++  inline u_int32_t getNumContactedPeersAsClientTCPNoTX()    { return((u_int32_t)ndpi_hll_count(&outgoing_hosts_port_with_no_tx_hll)); };
++  inline u_int32_t getNumContactsFromPeersAsServerTCPNoTX() { return((u_int32_t)ndpi_hll_count(&incoming_hosts_port_with_no_tx_hll)); };
+ };
+ 
+ #endif /* _LOCAL_HOST_H_ */
+
+
+
+
+@@ -305,7 +305,10 @@ void Flow::freeDPIMemory() {
+ /* *************************************** */
+ 
+ Flow::~Flow() {
+-  bool is_oneway_tcp_syn_seen = ((protocol == IPPROTO_TCP) && (get_packets_srv2cli() == 0) && (src2dst_tcp_flags == TH_SYN)) ? true : false;
++  bool is_oneway_tcp_syn_seen = ((protocol == IPPROTO_TCP)
++				 && (src2dst_tcp_flags == TH_SYN)
++				 && ((dst2src_tcp_flags & TH_SYN) == 0) /* Either no reply or connection refused (e.g. RST) */
++    ) ? true : false;
+ 
+   if(getUses() != 0 && !ntop->getGlobals()->isShutdown())
+     ntop->getTrace()->traceEvent(TRACE_NORMAL, "[%s] Deleting flow [%u]", __FUNCTION__, getUses());
+@@ -350,8 +353,10 @@ Flow::~Flow() {
+     if(is_oneway_tcp_syn_seen) {
+       srv_u->incUnidirectionalIngressFlows();
+ 
+-      if(cli_u)
+-	cli_u->setUnidirectionalTCPNoTXEgressFlow(srv_u->get_ip(), ntohs(srv_port));
++      if(cli_u) {
++	cli_u->setUnidirectionalTCPNoTXEgressFlow(srv_u->get_ip(), ntohs(srv_port));      
++	srv_u->setUnidirectionalTCPNoTXIngressFlow(cli_u->get_ip(), ntohs(srv_port));
++      }
+     }
+   }
+ 
+
+
+
+
+@@ -62,6 +62,7 @@ void LocalHost::set_hash_entry_state_idle() {
+       || ntop->getPrefs()->is_active_local_host_cache_enabled())
+      && (!ip.isEmpty())) {
+     Mac *mac = getMac();
++
+     checkStatsReset();
+     serializeToRedis();
+ 
+@@ -146,7 +147,8 @@ void LocalHost::initialize() {
+ #endif
+ 
+   router_mac_set = false, memset(router_mac, 0, sizeof(router_mac));
+-  ndpi_hll_init(&server_port_with_no_tx_hll, 5

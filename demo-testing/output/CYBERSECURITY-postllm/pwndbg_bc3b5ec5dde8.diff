@@ -1,0 +1,110 @@
+@@ -420,8 +420,8 @@ class Slot:
+             else:
+                 # Value forced due to bit-size.
+                 assert self.reserved_in_header == 7
+-                # Should never happen. It is possible for start[-3]
+-                # to contain (7<<5) but p[-3] can't.
++                # It is possible for start[-3] to contain (7<<5),
++                # but p[-3] shouldn't unless the slot is free.
+                 return -1
+ 
+         return self._reserved
+@@ -829,7 +829,9 @@ class Meta:
+         created by being mmaped.
+         """
+         # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L177
+-        return not self.is_donated and not self.last_idx and bool(self.maplen)
++        # The if-statement in the source also checks for !g->last_idx but in practice
++        # I've seen this value be non-zero for mmap()-ed groups, so we're leaving it out.
++        return not self.is_donated and bool(self.maplen)
+ 
+     @property
+     def is_nested(self) -> bool:
+@@ -839,6 +841,28 @@ class Meta:
+         """
+         return not self.is_donated and not self.is_mmaped
+ 
++    def parent_group(self) -> int:
++        """
++        If this group is nested, returns the address of the group which
++        contains the slot in which this group is in. Otherwise, returns -1.
++        """
++        if not self.is_nested:
++            return -1
++
++        return Slot(Group(self.mem).addr).group.addr
++
++    def root_group(self) -> Group:
++        """
++        Returns the topmost/biggest parent group. It will never be a nested
++        group. If this group isn't nested, this group is returned.
++        """
++        cur: Group = Group(self.mem)
++
++        while cur.meta.is_nested:
++            cur = Slot(cur.addr).group
++
++        return cur
++
+     def slotstate_at_index(self, idx: int) -> SlotState:
+         me = 1 << idx
+         if self.freed_mask & me:
+@@ -966,9 +990,6 @@ class MallocContext:
+         self.sizeof: int = 0
+         self.has_pagesize_field: bool = False
+ 
+-        # We will always load() since we read this object
+-        # only once - there is no performance benefit to lazy
+-        # evaluation.
+         self.load()
+ 
+     def load(self) -> None:
+@@ -1052,6 +1073,29 @@ class MallocContext:
+ 
+         assert cur_offset == self.sizeof
+ 
++    def looks_valid(self) -> bool:
++        """
++        Returns true if this object looks like a valid `struct malloc_context` object
++        describing an initialized heap. False otherwise.
++
++        This is used by `class Mallocng` to find the correct ctx object.
++
++        We consider it invalid if the heap reads as uninitialized because:
++        1. Performing this check filters out invalid ctx objects very well.
++        2. When musl is dynmically linked, due to the ld donation logic,
++           the heap will usually be initialized before the start of main().
++        """
++        print(f"{self.addr:#x} says {self.init_done}")
++
++        if self.init_done != 1:
++            return False
++
++        if self.secret <= 0x0000FFFFFFFFFFFF:
++            # 1 / 65536 chance this is a false negative.
++            return False
++
++        return True
++
+ 
+ class Mallocng(pwndbg.aglib.heap.heap.MemoryAllocator):
+     """
+@@ -1071,8 +1115,6 @@ class Mallocng(pwndbg.aglib.heap.heap.MemoryAllocator):
+         self.ctx_addr: int = 0
+         self.ctx: Optional[MallocContext] = None
+         self.has_debug_syms: bool = False
+-        self.secret: bytearray = b""
+-        self.hope: bool = True
+ 
+     def init_if_needed(self) -> bool:
+         """
+@@ -1080,7 +1122,8 @@ class Mallocng(pwndbg.aglib.heap.heap.MemoryAllocator):
+         initialize it as soon as pwndbg is loaded.
+ 
+         Users of the object are responsible for calling this to
+-        make sure the object is initialized.
++        make sure the object is initialized. This also ensures
++        our view of the heap is up-to-date.
+ 
+         Returns:
+             True if this object is successfully initialized (wheth

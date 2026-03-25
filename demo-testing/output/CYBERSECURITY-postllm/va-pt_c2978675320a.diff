@@ -1,0 +1,152 @@
+@@ -35,8 +35,10 @@
+ #
+ # =============================================================================
+ 
++#!/usr/bin/env python3
+ from datetime import datetime
+ import argparse
++import struct
+ 
+ from scapy.all import (
+     sniff,
+@@ -47,16 +49,6 @@ from scapy.all import (
+     IP,
+ )
+ 
+-# Optional layers (may not exist in all Scapy builds)
+-try:
+-    from scapy.layers.l2 import CDP, Dot3, LLC, STP
+-except ImportError:
+-    CDP = None
+-    Dot3 = None
+-    LLC = None
+-    STP = None
+-
+-# Broadcast / common L2 multicast MACs
+ BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+ MULTICAST_MAC_LABELS = {
+     "01:00:0c:cc:cc:cc": "CDP",
+@@ -69,7 +61,7 @@ MULTICAST_MAC_LABELS = {
+ 
+ def parse_args():
+     p = argparse.ArgumentParser(
+-        description="Listen for DHCP, CDP, ARP, LLDP, STP and other L2 broadcast/multicast frames."
++        description="Listen for L2 broadcast / discovery traffic (DHCP, CDP, ARP, LLDP, STP, etc.)"
+     )
+     p.add_argument(
+         "-i",
+@@ -81,41 +73,34 @@ def parse_args():
+ 
+ 
+ def is_interesting_l2(pkt):
+-    """Filter to only L2 broadcast / common multicast frames."""
+     if Ether not in pkt:
+         return False
+-
+     dst = pkt[Ether].dst.lower()
+     if dst == BROADCAST_MAC:
+         return True
+     if dst in MULTICAST_MAC_LABELS:
+         return True
+-
+-    # You can extend this to include more MACs if needed.
+     return False
+ 
+ 
+ def get_proto_label(pkt):
+-    """Rough classification for display."""
+     try:
+         if ARP in pkt:
+             return "ARP"
+         if DHCP in pkt or BOOTP in pkt:
+             return "DHCP"
+-        if CDP and CDP in pkt:
++
++        eth = pkt[Ether]
++        dst = eth.dst.lower()
++
++        if dst == "01:00:0c:cc:cc:cc":
+             return "CDP"
+-        # LLDP EtherType
+-        if pkt[Ether].type == 0x88CC:
++        if eth.type == 0x88CC:
+             return "LLDP"
+-        if STP and STP in pkt:
+-            return "STP"
+-
+-        dst = pkt[Ether].dst.lower()
+         if dst == BROADCAST_MAC:
+             return "BCAST"
+         if dst in MULTICAST_MAC_LABELS:
+             return MULTICAST_MAC_LABELS[dst]
+-
+         return "OTHER"
+     except Exception:
+         return "UNK"
+@@ -168,20 +153,208 @@ def arp_info(pkt):
+     return f"ARP[{op} {a.psrc} -> {a.pdst}]"
+ 
+ 
+-def cdp_info(pkt):
+-    if not (CDP and CDP in pkt):
+-        return ""
+-    c = pkt[CDP]
+-    # Not all fields are always present; use getattr defensively
+-    dev_id = getattr(c, "deviceid", "") or ""
+-    port_id = getattr(c, "portid", "") or ""
+-    parts = []
+-    if dev_id:
+-        parts.append(f"dev={dev_id}")
+-    if port_id:
+-        parts.append(f"port={port_id}")
+-    return "CDP[" + ", ".join(parts) + "]" if parts else "CDP"
++# ---------- CDP DECODER (custom, no Scapy dependency) ----------
++
++CDP_TLV_TYPES = {
++    0x0001: "device_id",
++    0x0002: "addresses",
++    0x0003: "port_id",
++    0x0004: "capabilities",
++    0x0005: "software_version",
++    0x0006: "platform",
++    0x0007: "ip_prefix",      # rarely used
++    0x0009: "vtp_domain",
++    0x000a: "native_vlan",
++    0x000b: "duplex",
++    0x0010: "trust_bitmap",
++    0x0011: "untrusted_port_cos",
++}
++
++
++CDP_CAP_BITS = {
++    0x00000001: "Router",
++    0x00000002: "Transparent-Bridge",
++    0x00000004: "Source-Route-Bridge",
++    0x00000008: "Switch",
++    0x00000010: "Host",
++    0x00000020: "IGMP",
++    0x00000040: "Repeater",
++}
++
++
++def _decode_cdp_caps(val_bytes):
++    if len(val_bytes) < 4:
++        return None, None
++    bm = struct.unpack("!I", val_bytes[:4])[0]
++    caps = [name for bit, name in CDP_CAP_BITS.items() if bm & bit]
++    return bm, caps
++
++
++def _decode_cdp_addresses(val_bytes):
++    """
++    Decode CDP Addresses TLV (type 0x0002).
++    Returns list of textual addresses (mostly IPv4).
++    """
++    addrs = []
++    if len(val_bytes) < 4:
++        return addrs
++    try:
++        num_addrs = struct.unpack("!I", val_bytes[:4])[0]
++        idx = 4
++        for _ in range(num_addrs):
++            if idx + 2 >

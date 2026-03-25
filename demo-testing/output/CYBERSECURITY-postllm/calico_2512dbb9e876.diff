@@ -1,0 +1,100 @@
+@@ -280,45 +280,6 @@ EOF
+             retry_until_success(lambda: self.assertIn(local_svc_ip, self.get_routes()))
+             retry_until_success(lambda: self.assertNotIn(cluster_svc_ip, self.get_routes()))
+ 
+-            # TODO: This assertion is actually incorrect. Kubernetes performs
+-            # SNAT on all traffic destined to a service ClusterIP that doesn't
+-            # originate from within the cluster's pod CIDR. This assertion
+-            # pass for External / LoadBalancer IPs, though.
+-            #
+-            # Create a network policy that only accepts traffic from the external node.
+-            # kubectl("""apply -f - << EOF
+-# apiVersion: networking.k8s.io/v1
+-# kind: NetworkPolicy
+-# metadata:
+-  # name: allow-tcp-80-ex
+-  # namespace: bgp-test
+-# spec:
+-  # podSelector: {}
+-  # policyTypes:
+-  # - Ingress
+-  # ingress:
+-  # - from:
+-    # - ipBlock: { cidr: %s/32 }
+-    # ports:
+-    # - protocol: TCP
+-      # port: 80
+-# EOF
+-# """ % self.external_node_ip)
+-
+-            # Connectivity to nginx-local should always succeed.
+-            # for i in range(attempts):
+-            #   retry_until_success(curl, function_args=[local_svc_ip])
+-
+-            # # Connectivity to nginx-cluster will rarely succeed because it is load-balanced across all nodes.
+-            # # When the traffic hits a node that doesn't host one of the service's pod, it will be re-routed
+-            # #  to another node and SNAT will cause the policy to drop the traffic.
+-            # # Try to curl 10 times.
+-            # try:
+-            #   for i in range(attempts):
+-            #     curl(cluster_svc_ip)
+-            #   self.fail("external node should not be able to consistently access the cluster svc")
+-            # except subprocess.CalledProcessError:
+-            #   pass
+ 
+             # Scale the local_svc to 4 replicas
+             self.scale_deployment(local_svc, self.ns, 4)
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,99 @@
++# Copyright (c) 2018-2025 Tigera, Inc. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++import logging
++import re
++from subprocess import CalledProcessError
++
++from tests.k8st.test_base import TestBase
++from tests.k8st.utils.utils import DiagsCollector, calicoctl, kubectl, exec_in_calico_node, run, retry_until_success, node_info, start_external_node_with_bgp, update_ds_env
++
++_log = logging.getLogger(__name__)
++_log.setLevel(logging.DEBUG)
++
++
++class TestReadiness(TestBase):
++    def setUp(self):
++        # Wait for all Calico pods to be ready.
++        kubectl("wait --for=condition=Ready pods --all -n calico-system --timeout=120s")
++
++    def tearDown(self):
++        # Make sure nodes are healthy for next test.
++        nodes, _, _ = node_info()
++        for node in nodes:
++            exec_in_calico_node(node, "sv start /etc/service/enabled/bird")
++            exec_in_calico_node(node, "sv start /etc/service/enabled/bird6")
++            exec_in_calico_node(node, "sv start /etc/service/enabled/confd")
++            exec_in_calico_node(node, "sv start /etc/service/enabled/felix")
++
++    def assert_readiness(self, node, flag, ready):
++        if not ready:
++            try:
++                exec_in_calico_node(node, "/bin/calico-node -%s-ready" % flag)
++            except CalledProcessError as e:
++                _log.info("Got expected error: %s", e)
++                return
++            raise AssertionError("Expected %s not to be ready" % flag)
++
++        exec_in_calico_node(node, "/b

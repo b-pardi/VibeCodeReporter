@@ -1,0 +1,118 @@
+@@ -62,7 +62,7 @@ class Ntop {
+   NtopGlobals *globals; /**< Pointer of Ntop globals info and variables. */
+   u_int num_cpus; /**< Number of physical CPU cores. */
+   Redis *redis; /**< Pointer to the Redis server. */
+-  Mutex m;
++  Mutex m, users_m;
+   struct ndpi_detection_module_struct *ndpi_struct, *ndpi_struct_shadow;
+ #ifndef HAVE_NEDGE
+   ElasticSearch *elastic_search; /**< Pointer of Elastic Search. */
+@@ -104,6 +104,16 @@ class Ntop {
+   /* Hosts Control (e.g., disabled alerts) */
+   AlertExclusions *alert_exclusions, *alert_exclusions_shadow;
+ 
++#ifdef NTOPNG_PRO
++  /* Allowed users */
++  bool allowedUsersReloadInProgress;
++  AllowedUsers *allowed_users, *allowed_users_shadow;
++
++  void checkReloadAllowedUsers();
++  inline void reloadAllowedUsers() { allowedUsersReloadInProgress = true; };
++#endif
++  bool assignUserId(u_int8_t *new_user_id);
++
+ #ifndef WIN32
+   ContinuousPing *cping;
+   Ping *ping;
+
+
+
+
+@@ -104,6 +104,7 @@ class Redis {
+   int srem(const char *set_name, char *item);
+   int smembers(lua_State* vm, char *setName);
+   int smembers(const char *set_name, char ***members);
++  bool sismember(const char *set_name, const char * const member);
+ 
+   int lpush(const char * const queue_name, const char * const msg, u_int queue_trim_size, bool trace_errors = true);
+   int rpush(const char * const queue_name, const char * const msg, u_int queue_trim_size);
+
+
+
+
+@@ -258,6 +258,7 @@
+ #define CONST_STR_NTOPNG_KEY           "ntopng.key"
+ #define CONST_STR_PRODUCT_NAME_KEY     "ntopng.product_name"
+ #define CONST_STR_USER_GROUP           NTOPNG_USER_PREFIX".%s.group"
++#define CONST_STR_USER_ID              NTOPNG_USER_PREFIX".%s.user_id"
+ #define CONST_STR_USER_FULL_NAME       NTOPNG_USER_PREFIX".%s.full_name"
+ #define CONST_STR_USER_PASSWORD        NTOPNG_USER_PREFIX".%s.password"
+ #define CONST_STR_USER_NETS            NTOPNG_USER_PREFIX".%s.allowed_nets"
+@@ -925,12 +926,14 @@
+ 
+ #define HOST_LOW_GOODPUT_THRESHOLD  25 /* No more than X low goodput flows per host */
+ 
++#define NTOP_MAX_NUM_USERS          63 /* Maximum number of ntopng users */
+ #define NTOP_USERNAME_MAXLEN        33 /* NOTE: do not change, is this bound to mg_md5 ? */
+ #define NTOP_GROUP_MAXLEN           33
+ #define NTOP_SESSION_ID_LENGTH      33
+ #define NTOP_CSRF_TOKEN_LENGTH      33
+ #define NTOP_CSRF_TOKEN_NO_SESSION  "CSRF_TOKEN_NO_SESSION"
+ #define NTOP_UNKNOWN_GROUP "unknown"
++#define PREF_NTOP_USER_IDS            NTOPNG_PREFS_PREFIX".user_ids"
+ #define PREF_NTOP_LDAP_AUTH           NTOPNG_PREFS_PREFIX".ldap.auth_enabled"
+ #define PREF_LDAP_ACCOUNT_TYPE        NTOPNG_PREFS_PREFIX".ldap.account_type"
+ #define PREF_LDAP_SERVER              NTOPNG_PREFS_PREFIX".ldap.ldap_server_address"
+
+
+
+
+@@ -270,6 +270,9 @@ using namespace std;
+ #endif
+ #endif
+ #include "AlertExclusions.h"
++#ifdef NTOPNG_PRO
++#include "AllowedUsers.h"
++#endif
+ #include "HostPoolStats.h"
+ #include "HostPools.h"
+ #include "Fingerprint.h"
+
+
+
+
+@@ -77,10 +77,16 @@ Ntop::Ntop(char *appName) {
+   flow_callbacks_loader = NULL;
+   host_callbacks_loader = NULL;
+   
+-/* Flow alerts loader */
++  /* Flow alerts loader */
+   alertExclusionsReloadInProgress = true;
+   alert_exclusions = alert_exclusions_shadow = NULL;
+-  
++
++  /* Allowed users for alerts and flows */
++#ifdef NTOPNG_PRO
++  allowedUsersReloadInProgress = true; /* Lazy, immediately triggers a reload */
++  allowed_users = allowed_users_shadow = NULL;
++#endif
++
+   httpd = NULL, geo = NULL, mac_manufacturers = NULL;
+   memset(&cpu_stats, 0, sizeof(cpu_stats));
+   cpu_load = 0;
+@@ -554,6 +560,9 @@ void Ntop::start() {
+   checkReloadAlertExclusions();
+   checkReloadFlowCallbacks();
+   checkReloadHostCallbacks();
++#ifdef NTOPNG_PRO
++  checkReloadAllowedUsers();
++#endif
+ 
+   for(int i=0; i<num_defined_interfaces; i++)
+     iface[i]->startPacketPolling();
+@@ -2090,6 +2099,36 @@ bool Ntop::getUserPermission(const char * const username, bool *allow_pcap_downl
+ 
+ /* ******************************************* */
+ 
++/*
++  Assigns a unique use

@@ -1,0 +1,118 @@
+@@ -9,8 +9,11 @@
+ 
+ #include "nss.h"
+ #include "pk11pub.h"
++#include "pk11priv.h"
+ #include "seccomon.h"
+ #include "selfencrypt.h"
++#include "secmodti.h"
++#include "sslproto.h"
+ 
+ SECStatus SSLInt_SetDCAdvertisedSigSchemes(PRFileDesc *fd,
+                                            const SSLSignatureScheme *schemes,
+@@ -331,6 +334,9 @@ SECStatus SSLInt_AdvanceReadSeqNum(PRFileDesc *fd, PRUint64 to) {
+ 
+ SECStatus SSLInt_AdvanceWriteSeqNum(PRFileDesc *fd, PRUint64 to) {
+   sslSocket *ss;
++  ssl3CipherSpec *spec;
++  PK11Context *pk11ctxt;
++  const ssl3BulkCipherDef *cipher_def;
+ 
+   ss = ssl_FindSocket(fd);
+   if (!ss) {
+@@ -341,7 +347,43 @@ SECStatus SSLInt_AdvanceWriteSeqNum(PRFileDesc *fd, PRUint64 to) {
+     return SECFailure;
+   }
+   ssl_GetSpecWriteLock(ss);
+-  ss->ssl3.cwSpec->nextSeqNum = to;
++  spec = ss->ssl3.cwSpec;
++  cipher_def = spec->cipherDef;
++  spec->nextSeqNum = to;
++  if (cipher_def->type != type_aead) {
++    ssl_ReleaseSpecWriteLock(ss);
++    return SECSuccess;
++  }
++  /* If we are using aead, we need to advance the counter in the
++   * internal IV generator as well.
++   * This could be in the token or software. */
++  pk11ctxt = spec->cipherContext;
++  /* If counter is in the token, we need to switch it to software,
++   * since we don't have access to the internal state of the token. We do
++   * that by turning on the simulated message interface, then setting up the
++   * software IV generator */
++  if (pk11ctxt->ivCounter == 0) {
++    _PK11_ContextSetAEADSimulation(pk11ctxt);
++    pk11ctxt->ivLen = cipher_def->iv_size + cipher_def->explicit_nonce_size;
++    pk11ctxt->ivMaxCount = PR_UINT64(0xffffffffffffffff);
++    if ((cipher_def->explicit_nonce_size == 0) ||
++        (spec->version >= SSL_LIBRARY_VERSION_TLS_1_3)) {
++      pk11ctxt->ivFixedBits =
++          (pk11ctxt->ivLen - sizeof(sslSequenceNumber)) * BPB;
++      pk11ctxt->ivGen = CKG_GENERATE_COUNTER_XOR;
++    } else {
++      pk11ctxt->ivFixedBits = cipher_def->iv_size * BPB;
++      pk11ctxt->ivGen = CKG_GENERATE_COUNTER;
++    }
++    /* DTLS included the epoch in the fixed portion of the IV */
++    if (IS_DTLS(ss)) {
++      pk11ctxt->ivFixedBits += 2 * BPB;
++    }
++  }
++  /* now we can update the internal counter (either we are already using
++   * the software IV generator, or we just switched to it above */
++  pk11ctxt->ivCounter = to;
++
+   ssl_ReleaseSpecWriteLock(ss);
+   return SECSuccess;
+ }
+
+
+
+
+@@ -392,7 +392,7 @@ static const SSLCipher2Mech alg2Mech[] = {
+     { ssl_calg_camellia, CKM_CAMELLIA_CBC },
+     { ssl_calg_seed, CKM_SEED_CBC },
+     { ssl_calg_aes_gcm, CKM_AES_GCM },
+-    { ssl_calg_chacha20, CKM_NSS_CHACHA20_POLY1305 },
++    { ssl_calg_chacha20, CKM_CHACHA20_POLY1305 },
+ };
+ 
+ const PRUint8 tls12_downgrade_random[] = { 0x44, 0x4F, 0x57, 0x4E,
+@@ -1740,117 +1740,6 @@ ssl3_BuildRecordPseudoHeader(DTLSEpoch epoch,
+     return SECSuccess;
+ }
+ 
+-static SECStatus
+-ssl3_AESGCM(const ssl3KeyMaterial *keys,
+-            PRBool doDecrypt,
+-            unsigned char *out,
+-            unsigned int *outlen,
+-            unsigned int maxout,
+-            const unsigned char *in,
+-            unsigned int inlen,
+-            const unsigned char *additionalData,
+-            unsigned int additionalDataLen)
+-{
+-    SECItem param;
+-    SECStatus rv = SECFailure;
+-    unsigned char nonce[12];
+-    unsigned int uOutLen;
+-    CK_NSS_GCM_PARAMS gcmParams; /* future use CK_GCM_PARAMS_V3 with fallback */
+-
+-    const int tagSize = 16;
+-    const int explicitNonceLen = 8;
+-
+-    /* See https://tools.ietf.org/html/rfc5288#section-3 for details of how the
+-     * nonce is formed. */
+-    memcpy(nonce, keys->iv, 4);
+-    if (doDecrypt) {
+-        memcpy(nonce + 4, in, explicitNonceLen);
+-        in += explicitNonceLen;
+-        inlen -= explicitNonceLen;
+-        *outlen = 0;
+-    } else {
+-        if (maxout < explicitNonceLen) {
+-            PORT_SetError(SEC_ERROR_INPUT_LEN);
+-            return SECFailure;
+-        }
+-        /* Use the 64-bit sequence numb

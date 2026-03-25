@@ -1,0 +1,83 @@
+@@ -41,13 +41,15 @@ class ZMQParserInterface : public ParserInterface {
+ #endif
+   virtual void reloadCompanions();
+   void deliverFlowToCompanions(ParsedFlow * const flow);
++  void preprocessFlow(ParsedFlow *flow, NetworkInterface *iface);
+   bool getKeyId(char *sym, u_int32_t * const pen, u_int32_t * const field) const;
+   void addMapping(const char *sym, u_int32_t num, u_int32_t pen = 0);
+-  bool parsePENZeroField(ParsedFlow * const flow, u_int32_t field, const char * const value) const;
+-  bool parsePENNtopField(ParsedFlow * const flow, u_int32_t field, const char * const value, json_object * const jvalue) const;
++  bool parsePENZeroField(ParsedFlow * const flow, u_int32_t field, const char * const value, u_int32_t ivalue) const;
++  bool parsePENNtopField(ParsedFlow * const flow, u_int32_t field, const char * const value, u_int32_t ivalue) const;
+   static bool parseContainerInfo(json_object *jo, ContainerInfo * const container_info);
+   bool parseNProbeMiniField(ParsedFlow * const flow, const char * const key, const char * const value, json_object * const jvalue) const;
+-  void parseSingleFlow(json_object *o, u_int8_t source_id, NetworkInterface *iface);
++  void parseSingleJSONFlow(json_object *o, u_int8_t source_id, NetworkInterface *iface);
++  void parseSingleTLVFlow(ndpi_deserializer *deserializer, u_int8_t source_id, NetworkInterface *iface);
+   void setFieldMap(const ZMQ_FieldMap * const field_map) const;
+   void setFieldValueMap(const ZMQ_FieldValueMap * const field_value_map) const;
+ 
+@@ -58,7 +60,8 @@ class ZMQParserInterface : public ParserInterface {
+   ZMQParserInterface(const char *endpoint, const char *custom_interface_type = NULL);
+   ~ZMQParserInterface();
+ 
+-  u_int8_t parseFlow(const char * const payload, int payload_size, u_int8_t source_id, void *data);
++  u_int8_t parseJSONFlow(const char * const payload, int payload_size, u_int8_t source_id, void *data);
++  u_int8_t parseTLVFlow(const char * const payload, int payload_size, u_int8_t source_id, void *data);
+   u_int8_t parseEvent(const char * const payload, int payload_size, u_int8_t source_id, void *data);
+   u_int8_t parseCounter(const char * const payload, int payload_size, u_int8_t source_id, void *data);
+   u_int8_t parseTemplate(const char * const payload, int payload_size, u_int8_t source_id, void *data);
+
+
+
+
+@@ -108,6 +108,7 @@
+ 
+ #define ZMQ_COMPATIBILITY_MSG_VERSION 1
+ #define ZMQ_MSG_VERSION           2
++#define ZMQ_MSG_VERSION_TLV       3
+ #define LOGIN_URL                 "/lua/login.lua"
+ #define LOGOUT_URL                "/lua/logout.lua"
+ #define CAPTIVE_PORTAL_URL        "/lua/captive_portal.lua"
+
+
+
+
+@@ -69,7 +69,7 @@ void DummyInterface::forgeFlow(u_int iteration) {
+ 	     iteration, iteration*1500,
+ 	     now-120, now-60, sport, dport);
+ 
+-    parseFlow(payload, sizeof(payload), 1 /* source_id */, this /* iface */);
++    parseJSONFlow(payload, sizeof(payload), 1 /* source_id */, this /* iface */);
+   }
+ 
+   if(id == 0) sleep(ntop->getPrefs()->get_housekeeping_frequency());
+
+
+
+
+@@ -97,7 +97,7 @@ void ZCCollectorInterface::collect_flows() {
+       if(strncmp((char*)json, master, strlen(master)) == 0) {
+ 	parseEvent((char*)json, buffer->len, 0, (void*)this);
+       } else
+-	parseFlow((char*)json, buffer->len, 0, (void*)this);
++	parseJSONFlow((char*)json, buffer->len, 0, (void*)this);
+       // fprintf(stdout, "."); fflush(stdout);
+     } else if(rc == 0) {
+       usleep(1);
+
+
+
+
+@@ -137,7 +137,8 @@ ZMQCollectorInterface::~ZMQCollectorInterface() {
+ /* **************************************************** */
+ 
+ void ZMQCollectorInterface::collect_flows() {
+-  struct zmq_msg_hdr h; /* NOTE: in network-byte-order format */
++  struct zmq_msg_hdr_v0 h0;
++  struct zmq_msg_hdr *h = (struct zmq_msg_hdr *) &h0; /* NOTE: in network-byte-order format */
+   char payload[8192];
+   const u_int payload_len = sizeof(payload) - 1;
+   zmq_pollitem_t items[MAX_ZMQ_SUBSCRIBERS];
+@@ -175,22 +176,30 @@ void ZMQCollectorInterface::collect_flows() {
+     for(int

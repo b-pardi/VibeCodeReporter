@@ -1,0 +1,103 @@
+@@ -22,11 +22,15 @@ def analyze(vw):
+             continue
+         analyzePLT(vw, sva, ssize)
+ 
++
+ def analyzePLT(vw, ssva, ssize):
+         # make code for every opcode in PLT
+         sva = ssva
+         nextseg = sva + ssize
+ 
++        trampbr = None
++        hastramp = False
++
+         branchvas = []
+         while sva < nextseg:
+             if vw.getLocation(sva) is None:
+@@ -41,9 +45,14 @@ def analyzePLT(vw, ssva, ssize):
+             if ltup is not None:
+                 op = vw.parseOpcode(ltup[vivisect.L_VA])
+                 if op.iflags & envi.IF_BRANCH and \
+-                        not op.iflags & envi.IF_COND and \
+-                        not op.opers[-1].getOperValue(op) == ssva:
+-                    branchvas.append(op.va)
++                        not op.iflags & envi.IF_COND:
++
++                    # we grab all unconditional branches, and tag them
++                    realplt = not bool(op.opers[-1].getOperValue(op) == ssva)
++                    if not realplt:
++                        hastramp = True
++
++                    branchvas.append((op.va, realplt))
+ 
+                 sva += ltup[vivisect.L_SIZE]
+                 logger.debug('incrementing to next va: 0x%x', sva)
+@@ -51,43 +60,115 @@ def analyzePLT(vw, ssva, ssize):
+                 logger.warn('makeCode(0x%x) failed to make a location (probably failed instruction decode)!  incrementing instruction pointer by 1 to continue PLT analysis <fingers crossed>', sva)
+                 sva += 1
+ 
+-
+         if not len(branchvas):
+             return
+ 
+-        # heuristically determine PLT entry size
++        ###### FIXME BETWEEN THESE ######
++        # plt entries have:
++        #   a distance between starts/finish 
++        #   a size
++        # they are not the same.
++
++        if hastramp:
++            # find the tramp's branch
++            trampbr = ssva
++            loc = vw.getLocation(trampbr)
++            while loc is not None and (loc[vivisect.L_TINFO] & envi.IF_BRANCH == 0):
++                lva, lsz, ltype, ltinfo = loc
++                trampbr += lsz
++                loc = vw.getLocation(trampbr)
++
++            # set our branchva list straight.  trampoline is *not* a realplt.
++            if branchvas[0][0] == trampbr:
++                branchvas[0] = (trampbr, False)
++            else:
++                logger.debug("hastramp: trampbr: 0x%x    branchvas[0][0]: 0x%x", trampbr, branchvas[0][0])
++
++        # heuristically determine PLT entry size and distance
+         heur = {}
+         lastva = ssva
++        # first determine distance between GOT branches:
+         for vidx in range(1, len(branchvas)):
+-            bva = branchvas[vidx]
++            bva, realplt = branchvas[vidx]
++            if not realplt:
++                continue
++
+             delta = bva - lastva
+             lastva = bva
+             heur[delta] = heur.get(delta, 0) + 1
+ 
+-        heurlist = [(y, x) for x, y in  heur.items()]
++        heurlist = [(y, x) for x, y in heur.items()]
+         heurlist.sort()
+ 
+-        plt_size = heurlist[-1][1]
+-        logger.debug('plt_size: 0x%x\n%r', plt_size, heurlist)
++        # distance should be the greatest value.
++        plt_distance = heurlist[-1][1]
++        logger.debug('plt_distance : 0x%x\n%r', plt_distance, heurlist)
++
++        # there should be only one heuristic
++        if len(heurlist) > 1:
++            logger.warn("heuristics have more than one tracked branch: investigate!  PLT analysis is likely to be wrong (%r)", heurlist)
++
++        # now determine plt_size (basically, how far to backup from the branch to find the start of function
++        # *don't* use the first entry, because the trampoline is often odd...
++        plt_size = 0    # not including the branch instruction size?
++        bridx = 1
++
++        # if hastramp, we need to skip two to make sure we're not analyzing the first real plt
++        if hastramp:    
++            bridx += 1
++
++        brva, realplt = branchvas[bridx]
++        while brva != trampbr and

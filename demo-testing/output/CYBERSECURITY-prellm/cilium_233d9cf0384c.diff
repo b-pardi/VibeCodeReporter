@@ -1,0 +1,165 @@
+@@ -35,6 +35,10 @@ struct bpf_elf_map {
+ 	__u32 flags;
+ 	__u32 id;
+ 	__u32 pinning;
++#ifdef SOCKMAP
++	__u32 inner_id;
++	__u32 inner_idx;
++#endif
+ };
+ 
+ #endif /* __BPF_ELF__ */
+
+
+
+
+@@ -35,16 +35,35 @@ lookup_ip6_endpoint(struct ipv6hdr *ip6)
+ }
+ 
+ static __always_inline struct endpoint_info *
+-lookup_ip4_endpoint(struct iphdr *ip4)
++__lookup_ip4_endpoint(uint32_t ip)
+ {
+ 	struct endpoint_key key = {};
+ 
+-	key.ip4 = ip4->daddr;
++	key.ip4 = ip;
+ 	key.family = ENDPOINT_KEY_IPV4;
+ 
+ 	return map_lookup_elem(&cilium_lxc, &key);
+ }
+ 
++static __always_inline struct endpoint_info *
++lookup_ip4_endpoint(struct iphdr *ip4)
++{
++	return __lookup_ip4_endpoint(ip4->daddr);
++}
++
++#ifdef SOCKMAP
++static __always_inline void *
++lookup_ip4_endpoint_policy_map(uint32_t ip)
++{
++	struct endpoint_key key = {};
++
++	key.ip4 = ip;
++	key.family = ENDPOINT_KEY_IPV4;
++
++	return map_lookup_elem(&cilium_ep_to_policy, &key);
++}
++#endif
++
+ /* IPCACHE_STATIC_PREFIX gets sizeof non-IP, non-prefix part of ipcache_key */
+ #define IPCACHE_STATIC_PREFIX							\
+ 	(8 * (sizeof(struct ipcache_key) - sizeof(struct bpf_lpm_trie_key)	\
+@@ -79,7 +98,7 @@ ipcache_lookup4(struct bpf_elf_map *map, __be32 addr, __u32 prefix)
+ 	return map_lookup_elem(map, &key);
+ }
+ 
+-#if defined LXC_ID
++#if defined LXC_ID || defined SOCKMAP
+ #ifndef HAVE_LPM_MAP_TYPE
+ /* Define a function with the following NAME which iterates through PREFIXES
+  * (a list of integers ordered from high to low representing prefix length),
+
+
+
+
+@@ -601,8 +601,7 @@ static inline int __inline__ lb4_extract_key(struct __sk_buff *skb, struct ipv4_
+ #endif
+ }
+ 
+-static inline struct lb4_service *lb4_lookup_service(struct __sk_buff *skb,
+-						     struct lb4_key *key)
++static inline struct lb4_service *__lb4_lookup_service(struct lb4_key *key)
+ {
+ #ifdef LB_L4
+ 	if (key->dport) {
+@@ -629,11 +628,19 @@ static inline struct lb4_service *lb4_lookup_service(struct __sk_buff *skb,
+ 			return svc;
+ 	}
+ #endif
+-
+-	cilium_dbg_lb(skb, DBG_LB4_LOOKUP_MASTER_FAIL, 0, 0);
+ 	return NULL;
+ }
+ 
++static inline struct lb4_service *lb4_lookup_service(struct __sk_buff *skb,
++						     struct lb4_key *key)
++{
++	struct lb4_service *svc = __lb4_lookup_service(key);
++
++	if (!svc)
++		cilium_dbg_lb(skb, DBG_LB4_LOOKUP_MASTER_FAIL, 0, 0);
++	return svc;
++}
++
+ static inline struct lb4_service *lb4_lookup_slave(struct __sk_buff *skb,
+ 						   struct lb4_key *key, __u16 slave)
+ {
+
+
+
+
+@@ -50,8 +50,19 @@ struct bpf_elf_map __section_maps cilium_policy = {
+ 	.max_elem	= POLICY_PROG_MAP_SIZE,
+ };
+ 
+-/* Per-endpoint policy enforcement map */
++/* Map to link endpoint id to per endpoint cilium_policy map */
++#ifdef SOCKMAP
++struct bpf_elf_map __section_maps cilium_ep_to_policy = {
++	.type		= BPF_MAP_TYPE_HASH_OF_MAPS,
++	.size_key	= sizeof(struct endpoint_key),
++	.size_value	= sizeof(int),
++	.pinning	= PIN_GLOBAL_NS,
++	.max_elem	= ENDPOINTS_MAP_SIZE,
++};
++#endif
++
+ #ifdef POLICY_MAP
++/* Per-endpoint policy enforcement map */
+ struct bpf_elf_map __section_maps POLICY_MAP = {
+ 	.type		= BPF_MAP_TYPE_HASH,
+ 	.size_key	= sizeof(struct policy_key),
+
+
+
+
+@@ -43,6 +43,60 @@ static inline bool identity_is_reserved(__u32 identity)
+ 	return identity < UNMANAGED_ID;
+ }
+ 
++#ifdef SOCKMAP
++static inline int __inline__
++policy_sk_egress(__u32 identity, __u32 ip,  __u16 dport)
++{
++	void *map = lookup_ip4_endpoint_policy_map(ip);
++	int dir = CT_EGRESS;
++	__u8 proto = IPPROTO_TCP;
++	struct policy_entry *policy;
++	struct policy_key key = {
++		.sec_label = identity,
++		.dport = dport,
++		.protocol = proto,
++		.egress = !dir,
++		.pad = 0,
++	};
++
++	if (!map)
++		return 0;
++
++	policy = map_lookup_elem(map, &key);
++	if (likely(policy)) {
++		/* FIXME: Need byte counter */
++		__sync_fetch_and_add(&policy->packets, 1);
++		goto get_proxy_port;
++	}
++
++	/* If L4 policy check misses, fall back to L3. */
++	key.dport = 0;
++	key.protocol = 0;
++	policy = map_lookup_elem(map, &key);
++	if (likely(policy)) {
++		/* FIXME: Need byte counter */
++		__sync_fetch_and_add(&policy->packets, 1);
++	

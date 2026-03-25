@@ -1,0 +1,136 @@
+@@ -7,16 +7,16 @@
+ 
+ #include "wasm.h"
+ 
+-typedef size_t (*ConsumeFcn) (const ut8 *p, const ut8 *max, ut32 *out_value);
+-typedef void *(*ParseEntryFcn) (RBuffer *b, ut64 max);
++typedef size_t (*ConsumeFcn) (const ut8 *p, const ut8 *bound, ut32 *out_value);
++typedef void *(*ParseEntryFcn) (RBuffer *b, ut64 bound);
+ 
+ // RBuffer consume functions
+-static ut32 consume_r(RBuffer *b, ut64 max, size_t *n_out, ConsumeFcn consume_fcn) {
++static ut32 consume_r(RBuffer *b, ut64 bound, size_t *n_out, ConsumeFcn consume_fcn) {
+ 	r_return_val_if_fail (b && n_out && consume_fcn, 0);
+ 
+ 	ut32 tmp;
+ 	ut64 cur = r_buf_tell (b);
+-	if (max >= r_buf_size (b) || cur > max) {
++	if (bound >= r_buf_size (b) || cur > bound) {
+ 		return 0;
+ 	}
+ 	// 16 bytes are enough to store 128bits values
+@@ -25,7 +25,7 @@ static ut32 consume_r(RBuffer *b, ut64 max, size_t *n_out, ConsumeFcn consume_fc
+ 		return 0;
+ 	}
+ 	r_buf_read (b, buf, 16);
+-	size_t n = consume_fcn (buf, buf + max + 1, &tmp);
++	size_t n = consume_fcn (buf, buf + bound + 1, &tmp);
+ 	if (!n) {
+ 		free (buf);
+ 		return 0;
+@@ -36,68 +36,85 @@ static ut32 consume_r(RBuffer *b, ut64 max, size_t *n_out, ConsumeFcn consume_fc
+ 	return tmp;
+ }
+ 
+-static size_t consume_u32_r(RBuffer *b, ut64 max, ut32 *out) {
++static size_t consume_u32_r(RBuffer *b, ut64 bound, ut32 *out) {
+ 	size_t n = 0;
+-	ut32 tmp = consume_r (b, max, &n, read_u32_leb128);
++	ut32 tmp = consume_r (b, bound, &n, read_u32_leb128);
+ 	if (out) {
+ 		*out = tmp;
+ 	}
+ 	return n;
+ }
+ 
+-static size_t consume_u7_r(RBuffer *b, ut64 max, ut8 *out) {
++static size_t consume_u7_r(RBuffer *b, ut64 bound, ut8 *out) {
+ 	size_t n = 0;
+-	ut32 tmp = consume_r (b, max, &n, read_u32_leb128);
++	ut32 tmp = consume_r (b, bound, &n, read_u32_leb128);
+ 	if (out) {
+ 		*out = (ut8) (tmp & 0x7f);
+ 	}
+ 	return n;
+ }
+ 
+-static size_t consume_s7_r(RBuffer *b, ut64 max, st8 *out) {
++static size_t consume_s7_r(RBuffer *b, ut64 bound, st8 *out) {
+ 	size_t n = 0;
+-	ut32 tmp = consume_r (b, max, &n, (ConsumeFcn)read_i32_leb128);
++	ut32 tmp = consume_r (b, bound, &n, (ConsumeFcn)read_i32_leb128);
+ 	if (out) {
+ 		*out = (st8) (((tmp & 0x10000000) << 7) | (tmp & 0x7f));
+ 	}
+ 	return n;
+ }
+ 
+-static size_t consume_u1_r(RBuffer *b, ut64 max, ut8 *out) {
++static size_t consume_u1_r(RBuffer *b, ut64 bound, ut8 *out) {
+ 	size_t n = 0;
+-	ut32 tmp = consume_r (b, max, &n, read_u32_leb128);
++	ut32 tmp = consume_r (b, bound, &n, read_u32_leb128);
+ 	if (out) {
+ 		*out = (ut8) (tmp & 0x1);
+ 	}
+ 	return n;
+ }
+ 
+-static size_t consume_str_r(RBuffer *b, ut64 max, size_t sz, char *out) {
+-	r_return_val_if_fail (b, 0);
+-	ut64 cur = r_buf_tell (b);
++static bool consume_str_r(RBuffer *b, ut64 bound, size_t len, char *out) {
++	r_return_val_if_fail (b && bound > 0 && bound < r_buf_size (b), 0);
+ 	*out = 0;
+-	max = R_MIN (max, sz);
+-	if (max >= r_buf_size (b) || cur > max) {
+-		return 0;
++
++	if (r_buf_tell (b) + len <= bound) {
++		if (r_buf_read (b, (ut8 *)out, len) == len) {
++			out[len] = 0;
++			return true;
++		}
+ 	}
+-	if (!(cur + sz - 1 <= max)) {
+-		return 0;
++	return false;
++}
++
++static bool consume_str_new(RBuffer *b, ut64 bound, ut32 *len_out, char **str_out) {
++	r_return_val_if_fail (str_out, false);
++	*str_out = NULL;
++	if (len_out) {
++		*len_out = 0;
+ 	}
+-	if (sz > 0) {
+-		r_buf_read (b, (ut8 *)out, sz);
+-	} else {
+-		*out = 0;
++
++	ut32 len = 0;
++	// module_str
++	if (consume_u32_r (b, bound, &len)) {
++		char *str = (char *)malloc (len + 1);
++		if (str && consume_str_r (b, bound, len, str)) {
++			if (len_out) {
++				*len_out = len;
++			}
++			*str_out = str;
++			return true;
++		}
++		free (str);
+ 	}
+-	return sz;
++	return false;
+ }
+ 
+-static size_t consume_init_expr_r(RBuffer *b, ut64 max, ut8 eoc, void *out) {
+-	if (!b || max >= r_buf_size (b) || r_buf_tell (b) > max) {
++static size_t consume_init_expr_r(RBuffer *b, ut64 bound, ut8 eoc, void *out) {
++	if (!b || bound >= r_buf_size (b) || r_buf_tell (b) > bound) {
+ 		return 0;
+ 	}
+ 	size_t res = 0;
+ 	ut8 cur = r_buf_read8 (b);
+-	while (r_buf

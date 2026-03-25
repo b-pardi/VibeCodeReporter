@@ -1,0 +1,152 @@
+@@ -1146,6 +1146,8 @@ class Conf(ConfClass):
+     )
+     #: Dictionary containing parsed NSS Keys
+     tls_nss_keys: Dict[str, bytes] = None
++    #: Whether to use NDR64 by default instead of NDR 32
++    ndr64: bool = True
+     #: When TCPSession is used, parse DCE/RPC sessions automatically.
+     #: This should be used for passive sniffing.
+     dcerpc_session_enable = False
+
+
+
+
+@@ -21,12 +21,15 @@ https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-rpce/290c38b1-92
+     `DCE/RPC <https://scapy.readthedocs.io/en/latest/layers/dcerpc.html>`_
+ """
+ 
+-from functools import partial
+-
+ import collections
++import importlib
++import inspect
+ import struct
++
+ from enum import IntEnum
++from functools import partial
+ from uuid import UUID
++
+ from scapy.base_classes import Packet_metaclass
+ 
+ from scapy.config import conf
+@@ -116,6 +119,7 @@ from scapy.contrib.rtps.common_types import (
+ # Typing imports
+ from typing import (
+     Optional,
++    Union,
+ )
+ 
+ # the alignment of auth_pad
+@@ -179,11 +183,45 @@ DCE_RPC_INTERFACES_NAMES_rev = {}
+ 
+ 
+ class DCERPC_Transport(IntEnum):
+-    NCACN_IP_TCP = 1
+-    NCACN_NP = 2
++    """
++    Protocols identifiers currently supported by Scapy
++    """
++
++    NCACN_IP_TCP = 0x07
++    NCACN_NP = 0x0F
+     # TODO: add more.. if people use them?
+ 
+ 
++# [C706] Appendix I with names from Appendix B
++DCE_RPC_PROTOCOL_IDENTIFIERS = {
++    0x0: "OSI OID",  # Special
++    0x0D: "UUID",  # Special
++    # Transports
++    # 0x2: "DNA Session Control",
++    # 0x3: "DNA Session Control V3",
++    # 0x4: "DNA NSP Transport",
++    # 0x5: "OSI TP4",
++    0x06: "NCADG_OSI_CLSN",  # [C706]
++    0x07: "NCACN_IP_TCP",  # [C706]
++    0x08: "NCADG_IP_UDP",  # [C706]
++    0x09: "IP",  # [C706]
++    0x0A: "RPC connectionless protocol",  # [C706]
++    0x0B: "RPC connection-oriented protocol",  # [C706]
++    0x0C: "NCALRPC",
++    0x0F: "NCACN_NP",  # [MS-RPCE]
++    0x11: "NCACN_NB",  # [C706]
++    0x12: "NCACN_NB_NB",  # [MS-RPCE]
++    0x13: "NCACN_SPX",  # [C706]
++    0x14: "NCADG_IPX",  # [C706]
++    0x16: "NCACN_AT_DSP",  # [C706]
++    0x17: "NCADG_AT_DSP",  # [C706]
++    0x19: "NCADG_NB",  # [C706]
++    0x1A: "NCACN_VNS_SPP",  # [C706]
++    0x1B: "NCADG_VNS_IPC",  # [C706]
++    0x1F: "NCACN_HTTP",  # [MS-RPCE]
++}
++
++
+ def _dce_rpc_endianness(pkt):
+     """
+     Determine the right endianness sign for a given DCE/RPC packet
+@@ -585,18 +623,9 @@ class DceRpcSecVTCommand(Packet):
+             },
+             end_tot_size=-2,
+         ),
+-        LEShortField("Length", None),
++        LenField("Length", None, fmt="<H"),
+     ]
+ 
+-    def guess_payload_class(self, payload):
+-        if self.Command == 0x0001:
+-            return DceRpcSecVTBitmask
+-        elif self.Command == 0x0002:
+-            return DceRpcSecVTPcontext
+-        elif self.Command == 0x0003:
+-            return DceRpcSecVTHeader2
+-        return conf.raw_payload
+-
+ 
+ # [MS-RPCE] sect 2.2.2.13.2
+ 
+@@ -611,6 +640,9 @@ class DceRpcSecVTBitmask(Packet):
+         return conf.padding_layer
+ 
+ 
++bind_layers(DceRpcSecVTCommand, DceRpcSecVTBitmask, Command=0x0001)
++
++
+ # [MS-RPCE] sect 2.2.2.13.4
+ 
+ 
+@@ -640,6 +672,9 @@ class DceRpcSecVTPcontext(Packet):
+         return conf.padding_layer
+ 
+ 
++bind_layers(DceRpcSecVTCommand, DceRpcSecVTPcontext, Command=0x0002)
++
++
+ # [MS-RPCE] sect 2.2.2.13.3
+ 
+ 
+@@ -659,6 +694,9 @@ class DceRpcSecVTHeader2(Packet):
+         return conf.padding_layer
+ 
+ 
++bind_layers(DceRpcSecVTCommand, DceRpcSecVTHeader2, Command=0x0003)
++
++
+ class DceRpcSecVT(Packet):
+     name = "Verification trailer"
+     fields_desc = [
+@@ -706,6 +744,10 @@ _DCE_RPC_5_FLAGS_2[0x04] = "PFC_SUPPORT_HEADER_SIGN"
+ 
+ 
+ _DCE_RPC_ERROR_CODES = {
++    # Win32
++    0x776: "OR_INVALID_OXID",
++    0x777: "OR_INVALID_OID",
++    0x778: "OR_INVALID_SET",
+     # Appendix N
+     0x1C010001: "nca_s_comm_failure",
+     0x1C010002: "nca_s_op_rng_error",
+@@ -754,9 +796,28 @@ _DCE_RPC_ERROR_CODES = {
+     0x1C000025: "nca_s_fault_no_client_stub",
+     # [MS-ERREF]
+     0

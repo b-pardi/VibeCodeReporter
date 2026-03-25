@@ -1,0 +1,132 @@
+@@ -18,6 +18,7 @@ extensions = [
+     'sphinx.ext.viewcode',
+     'sphinx.ext.imgmath',
+     'sphinx.ext.todo',
++    'sphinx_rtd_theme',
+     'breathe',
+ ]
+ 
+
+
+
+
+@@ -37,6 +37,14 @@
+ 		.off   = 0,					\
+ 		.imm   = IMM })
+ 
++#define BPF_CALL_REL(DST)					\
++	((struct bpf_insn) {					\
++		.code = BPF_JMP | BPF_CALL,			\
++		.dst_reg = 0,					\
++		.src_reg = BPF_PSEUDO_CALL,			\
++		.off = 0,					\
++		.imm = DST })
++
+ #define BPF_EXIT_INSN()						\
+ 	((struct bpf_insn) {					\
+ 		.code  = BPF_JMP | BPF_EXIT,			\
+
+
+
+
+@@ -3,6 +3,8 @@
+ #ifndef __LINUX_KERNEL_H
+ #define __LINUX_KERNEL_H
+ 
++#include <linux/compiler.h>
++
+ #ifndef offsetof
+ #define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+ #endif
+
+
+
+
+@@ -19,6 +19,7 @@
+ 
+ /* ld/ldx fields */
+ #define BPF_DW		0x18	/* double word (64-bit) */
++#define BPF_MEMSX	0x80	/* load with sign extension */
+ #define BPF_ATOMIC	0xc0	/* atomic memory ops - op type in immediate */
+ #define BPF_XADD	0xc0	/* exclusive add - legacy name */
+ 
+@@ -41,6 +42,7 @@
+ #define BPF_JSGE	0x70	/* SGE is signed '>=', GE in x86 */
+ #define BPF_JSLT	0xc0	/* SLT is signed, '<' */
+ #define BPF_JSLE	0xd0	/* SLE is signed, '<=' */
++#define BPF_JCOND	0xe0	/* conditional pseudo jumps: may_goto, goto_or_nop */
+ #define BPF_CALL	0x80	/* function call */
+ #define BPF_EXIT	0x90	/* function return */
+ 
+@@ -49,6 +51,10 @@
+ #define BPF_XCHG	(0xe0 | BPF_FETCH)	/* atomic exchange */
+ #define BPF_CMPXCHG	(0xf0 | BPF_FETCH)	/* atomic compare-and-write */
+ 
++enum bpf_cond_pseudo_jmp {
++	BPF_MAY_GOTO = 0,
++};
++
+ /* Register numbers */
+ enum {
+ 	BPF_REG_0 = 0,
+@@ -76,12 +82,29 @@ struct bpf_insn {
+ 	__s32	imm;		/* signed immediate constant */
+ };
+ 
+-/* Key of an a BPF_MAP_TYPE_LPM_TRIE entry */
++/* Deprecated: use struct bpf_lpm_trie_key_u8 (when the "data" member is needed for
++ * byte access) or struct bpf_lpm_trie_key_hdr (when using an alternative type for
++ * the trailing flexible array member) instead.
++ */
+ struct bpf_lpm_trie_key {
+ 	__u32	prefixlen;	/* up to 32 for AF_INET, 128 for AF_INET6 */
+ 	__u8	data[0];	/* Arbitrary size */
+ };
+ 
++/* Header for bpf_lpm_trie_key structs */
++struct bpf_lpm_trie_key_hdr {
++	__u32	prefixlen;
++};
++
++/* Key of an a BPF_MAP_TYPE_LPM_TRIE entry, with trailing byte array. */
++struct bpf_lpm_trie_key_u8 {
++	union {
++		struct bpf_lpm_trie_key_hdr	hdr;
++		__u32				prefixlen;
++	};
++	__u8	data[];		/* Arbitrary size */
++};
++
+ struct bpf_cgroup_storage_key {
+ 	__u64	cgroup_inode_id;	/* cgroup inode id */
+ 	__u32	attach_type;		/* program attach type (enum bpf_attach_type) */
+@@ -616,7 +639,11 @@ union bpf_iter_link_info {
+  *		to NULL to begin the batched operation. After each subsequent
+  *		**BPF_MAP_LOOKUP_BATCH**, the caller should pass the resultant
+  *		*out_batch* as the *in_batch* for the next operation to
+- *		continue iteration from the current point.
++ *		continue iteration from the current point. Both *in_batch* and
++ *		*out_batch* must point to memory large enough to hold a key,
++ *		except for maps of type **BPF_MAP_TYPE_{HASH, PERCPU_HASH,
++ *		LRU_HASH, LRU_PERCPU_HASH}**, for which batch parameters
++ *		must be at least 4 bytes wide regardless of key size.
+  *
+  *		The *keys* and *values* are output parameters which must point
+  *		to memory large enough to hold *count* items based on the key
+@@ -846,6 +873,36 @@ union bpf_iter_link_info {
+  *		Returns zero on success. On error, -1 is returned and *errno*
+  *		is set appropriately.
+  *
++ * BPF_TOKEN_CREATE
++ *	Description
++ *		Create BPF token with embedded information about what
++ *		BPF-related functionality it allows:
++ *		- a set of allowed bpf() syscall commands;
++ *		- a set of allowed BPF map types to be created with
++ *		BPF_MAP_CREATE command, if BPF_MAP_CREATE itself is allowed;
++ *		- a set of allowed BPF program types and BPF program attach
++ *		types to be loaded with BPF_PROG_LOAD command, if
++ *		BPF_PROG_LOAD itself is allowed.
++ *
++ *		BPF token is created (derived) from an instance of BPF FS,
++ *		assuming it has

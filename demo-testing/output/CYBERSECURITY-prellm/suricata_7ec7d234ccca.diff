@@ -1,0 +1,121 @@
+@@ -46,12 +46,18 @@ typedef struct TcpStateQueue_ {
+     struct TcpStateQueue_ *next;
+ } TcpStateQueue;
+ 
+-typedef struct StreamTcpSackRecord_ {
++typedef struct StreamTcpSackRecord {
+     uint32_t le;    /**< left edge, host order */
+     uint32_t re;    /**< right edge, host order */
+-    struct StreamTcpSackRecord_ *next;
++    RB_ENTRY(StreamTcpSackRecord) rb;
+ } StreamTcpSackRecord;
+ 
++int TcpSackCompare(struct StreamTcpSackRecord *a, struct StreamTcpSackRecord *b);
++
++/* red-black tree prototype for SACK records */
++RB_HEAD(TCPSACK, StreamTcpSackRecord);
++RB_PROTOTYPE(TCPSACK, StreamTcpSackRecord, rb, TcpSackCompare);
++
+ typedef struct TcpSegment {
+     PoolThreadReserved res;
+     uint16_t payload_len;       /**< actual size of the payload */
+@@ -105,8 +111,7 @@ typedef struct TcpStream_ {
+     StreamingBuffer sb;
+     struct TCPSEG seg_tree;         /**< red black tree of TCP segments. Data is stored in TcpStream::sb */
+ 
+-    StreamTcpSackRecord *sack_head; /**< head of list of SACK records */
+-    StreamTcpSackRecord *sack_tail; /**< tail of list of SACK records */
++    struct TCPSACK sack_tree;       /**< red back tree of TCP SACK records. */
+ } TcpStream;
+ 
+ #define STREAM_BASE_OFFSET(stream)  ((stream)->sb.stream_offset)
+
+
+
+
+@@ -29,17 +29,34 @@
+ #include "stream-tcp-sack.h"
+ #include "util-unittest.h"
+ 
++RB_GENERATE(TCPSACK, StreamTcpSackRecord, rb, TcpSackCompare);
++
++int TcpSackCompare(struct StreamTcpSackRecord *a, struct StreamTcpSackRecord *b)
++{
++    if (SEQ_GT(a->le, b->le))
++        return 1;
++    else if (SEQ_LT(a->le, b->le))
++        return -1;
++    else {
++        if (SEQ_EQ(a->re, b->re))
++            return 0;
++        else if (SEQ_GT(a->re, b->re))
++            return 1;
++        else
++            return -1;
++    }
++}
+ #ifdef DEBUG
+ static void StreamTcpSackPrintList(TcpStream *stream)
+ {
+-    StreamTcpSackRecord *rec = stream->sack_head;
+-    for (; rec != NULL; rec = rec->next) {
++    StreamTcpSackRecord *rec = NULL;
++    RB_FOREACH(rec, TCPSACK, &stream->sack_tree) {
+         SCLogDebug("record %8u - %8u", rec->le, rec->re);
+     }
+ }
+ #endif /* DEBUG */
+ 
+-static StreamTcpSackRecord *StreamTcpSackRecordAlloc(void)
++static inline StreamTcpSackRecord *StreamTcpSackRecordAlloc(void)
+ {
+     if (StreamTcpCheckMemcap((uint32_t)sizeof(StreamTcpSackRecord)) == 0)
+         return NULL;
+@@ -52,12 +69,124 @@ static StreamTcpSackRecord *StreamTcpSackRecordAlloc(void)
+     return rec;
+ }
+ 
+-static void StreamTcpSackRecordFree(StreamTcpSackRecord *rec)
++static inline void StreamTcpSackRecordFree(StreamTcpSackRecord *rec)
+ {
+     SCFree(rec);
+     StreamTcpDecrMemuse((uint64_t)sizeof(*rec));
+ }
+ 
++static inline void ConsolidateFwd(struct TCPSACK *tree, struct StreamTcpSackRecord *sa)
++{
++    struct StreamTcpSackRecord *tr, *s = sa;
++    RB_FOREACH_FROM(tr, TCPSACK, s) {
++        if (sa == tr)
++            continue;
++        SCLogDebug("-> (fwd) tr %p %u/%u", tr, tr->le, tr->re);
++
++        if (SEQ_LT(sa->re, tr->le))
++            break; // entirely before
++
++        if (SEQ_GEQ(sa->le, tr->le) && SEQ_LEQ(sa->re, tr->re)) {
++            sa->re = tr->re;
++            sa->le = tr->le;
++            SCLogDebug("-> (fwd) tr %p %u/%u REMOVED ECLIPSED2", tr, tr->le, tr->re);
++            TCPSACK_RB_REMOVE(tree, tr);
++            StreamTcpSackRecordFree(tr);
++        /*
++            sa: [         ]
++            tr: [         ]
++            sa: [         ]
++            tr:    [      ]
++            sa: [         ]
++            tr:    [   ]
++        */
++        } else if (SEQ_LEQ(sa->le, tr->le) && SEQ_GEQ(sa->re, tr->re)) {
++            SCLogDebug("-> (fwd) tr %p %u/%u REMOVED ECLIPSED", tr, tr->le, tr->re);
++            TCPSACK_RB_REMOVE(tree, tr);
++            StreamTcpSackRecordFree(tr);
++        /*
++            sa: [         ]
++            tr:      [         ]
++            sa: [       ]
++            tr:         [       ]
++        */
++        } else if (SEQ_LT(sa->le, tr->le) && // starts before
++                   SEQ

@@ -1,0 +1,97 @@
+@@ -64,6 +64,7 @@ class AlertsManager : protected StoreManager {
+     ========== FLOW alerts API =========
+    */
+   int storeFlowAlert(Flow *f);
++  int storeFlowAlert(Flow *f, AlertType alert_type, AlertLevel alert_severity, const char *status_info);
+ 
+   /*
+     ========== raw API ======
+
+
+
+
+@@ -462,6 +462,7 @@ class Flow : public GenericHashEntry {
+   inline void setIDSAlert(json_object *a, u_int8_t severity) { if (ids_alert) json_object_put(ids_alert); ids_alert = a; ids_alert_severity = severity; };
+   inline json_object *getIDSAlert() { return ids_alert; };
+   inline u_int8_t getIDSAlertSeverity() { return ids_alert_severity; };
++  int storeFlowAlert(AlertType alert_type, AlertLevel alert_severity, const char *status_info);
+ 
+ #if defined(NTOPNG_PRO) && !defined(HAVE_NEDGE)
+   inline void updateProfile()     { trafficProfile = iface->getFlowProfile(this); }
+
+
+
+
+@@ -580,6 +580,213 @@ int AlertsManager::storeFlowAlert(Flow *f) {
+     return(-1);
+ }
+ 
++
++/* **************************************************** */
++
++int AlertsManager::storeFlowAlert(Flow *f, AlertType alert_type, AlertLevel alert_severity, const char *status_info) {
++  if(!ntop->getPrefs()->are_alerts_disabled()) {
++    const char *alert_json;
++    char cli_ip_buf[64], srv_ip_buf[64];
++    char query[STORE_MANAGER_MAX_QUERY];
++    sqlite3_stmt *stmt = NULL, *stmt2 = NULL, *stmt3 = NULL;
++    int rc = 0;
++    Host *cli, *srv;
++    const IpAddress *cli_ip_addr, *srv_ip_addr;
++    char *cli_ip = NULL, *srv_ip = NULL;
++    char cb[64], cb1[64], cli_os[64], srv_os[64];
++    time_t now = time(NULL);
++    const char *info;
++    json_object *alert_json_obj;
++    u_int64_t cur_rowid = (u_int64_t)-1, cur_counter;
++    u_int64_t cur_cli2srv_bytes, cur_srv2cli_bytes, cur_cli2srv_packets, cur_srv2cli_packets = 0;
++    FlowStatus status;
++    FlowStatusMap status_map;
++ 
++    if(!store_initialized || !store_opened || !f)
++      return(-1);
++
++    markForMakeRoom(true);
++
++    info = f->getFlowInfo();
++    status = f->getFlowStatus(&status_map);
++
++    cli = f->get_cli_host(), srv = f->get_srv_host();
++    cli_ip_addr = f->get_cli_ip_addr(), srv_ip_addr = f->get_srv_ip_addr();
++
++    if(cli_ip_addr)
++      cli_ip = cli_ip_addr->print(cli_ip_buf, sizeof(cli_ip_buf));
++    if(srv_ip_addr)
++      srv_ip = srv_ip_addr->print(srv_ip_buf, sizeof(srv_ip_buf));
++
++    if((alert_json_obj = json_object_new_object()) == NULL)
++      return(-1);
++
++    json_object_object_add(alert_json_obj, "info", json_object_new_string(info ? info : (char*)""));
++    json_object_object_add(alert_json_obj, "status_info", json_object_new_string(status_info ? status_info : (char*)""));
++    alert_json = json_object_to_json_string(alert_json_obj);
++
++    m.lock(__FILE__, __LINE__);
++
++    /* Check if this alert already exists ...*/
++    snprintf(query, sizeof(query),
++	     "SELECT rowid, alert_counter, cli2srv_bytes, srv2cli_bytes, cli2srv_packets, srv2cli_packets "
++	     "FROM %s "
++	     "WHERE alert_type = ? AND alert_severity = ? "
++	     "AND vlan_id = ? AND proto = ? AND l7_master_proto = ? AND l7_proto = ? "
++	     "AND flow_status = ? AND cli_addr = ? AND srv_addr = ? "
++	     "AND alert_tstamp >= ? "
++	     "LIMIT 1; ",
++	     ALERTS_MANAGER_FLOWS_TABLE_NAME);
++
++    if(sqlite3_prepare_v2(db, query, -1, &stmt, 0)
++       || sqlite3_bind_int(stmt,    1, static_cast<int>(alert_type))
++       || sqlite3_bind_int(stmt,    2, static_cast<int>(alert_severity))
++       || sqlite3_bind_int(stmt,    3, f->get_vlan_id())
++       || sqlite3_bind_int(stmt,    4, f->get_protocol())
++       || sqlite3_bind_int(stmt,    5, f->get_detected_protocol().master_protocol)
++       || sqlite3_bind_int(stmt,    6, f->get_detected_protocol().app_protocol)
++       || sqlite3_bind_int(stmt,    7, (int)status)
++       || sqlite3_bind_text(stmt,   8, cli_ip, -1, SQLITE_STATIC)
++       || sqlite3_bind_text(stmt,   9, srv_ip, -1, SQLITE_STATIC)
++       || sqlite3_bind_int64(stmt, 10, static_cast<long int>(now) - ALERTS_MAN

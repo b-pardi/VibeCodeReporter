@@ -1,0 +1,136 @@
+@@ -139,6 +139,7 @@ static const char *help_msg_ae[] = {
+ 	"aecue", " [esil]", "continue until esil expression match",
+ 	"aef", " [addr]", "emulate function",
+ 	"aefa", " [addr]", "emulate function to find out args in given or current offset",
++	"aeg", " [expr]", "esil graph",
+ 	"aei", "", "initialize ESIL VM state (aei- to deinitialize)",
+ 	"aeim", " [addr] [size] [name]", "initialize ESIL VM stack (aeim- remove)",
+ 	"aeip", "", "initialize ESIL program counter to curseek",
+@@ -5077,6 +5078,21 @@ static void cmd_anal_esil(RCore *core, const char *input) {
+ 			}
+ 		}
+ 		break;
++	case 'g': // "aeg"
++		if (input[1] == 'v') {
++			r_core_cmd0 (core, ".aeg;agg");
++		} else if (input[1] == ' ') {
++			r_core_anal_esil_graph (core, input + 2);
++		} else { // "*"
++			RAnalOp *aop = r_core_anal_op (core, core->offset, R_ANAL_OP_MASK_ESIL);
++			if (aop) {
++				const char *esilstr = r_strbuf_get (&aop->esil);
++				if (esilstr) {
++					r_core_anal_esil_graph (core, esilstr);
++				}
++			}
++		}
++		break;
+ 	case 'f': // "aef"
+ 		if (input[1] == 'a') { // "aefa"
+ 			r_anal_aefa (core, r_str_trim_ro (input + 2));
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,537 @@
++/* radare - LGPL - Copyright 2019 - condret */
++
++#include <r_core.h>
++#include <r_util.h>
++#include <r_anal.h>
++#include <sdb.h>
++
++
++typedef struct esil_data_flow_t {
++	ut32 idx;
++	Sdb *latest_nodes;
++	RGraph *flow;
++} EsilDataFlow;
++
++typedef struct esil_data_flow_node_t {
++	// add more info here
++	ut32 idx;
++	RStrBuf *content;
++} EsilDataFlowNode;
++
++EsilDataFlowNode *new_edf_node (EsilDataFlow *edf, const char *c) {
++	EsilDataFlowNode *ret = R_NEW(EsilDataFlowNode);
++	ret->content = r_strbuf_new(c);
++	ret->idx = edf->idx++;
++	return ret;
++}
++
++void edf_node_free (EsilDataFlowNode *free_me) {
++	if (free_me) {
++		r_strbuf_free (free_me->content);
++	}
++	free (free_me);
++}
++
++static int edf_consume_2_set_reg (RAnalEsil *esil, const char *op_string);
++static int edf_consume_2_push_1 (RAnalEsil *esil, const char *op_string);
++static int edf_consume_1_push_1 (RAnalEsil *esil, const char *op_string);
++typedef void (*AddConstraintStringUseNewCB)(RStrBuf *result, const char *new_node_str);
++static int edf_use_new_push_1 (RAnalEsil *esil, const char *op_string, AddConstraintStringUseNewCB cb);
++typedef void (*AddConstraintStringConsume1UseOldNewCB)(RStrBuf *result, const char *consume_str, const char *old_node_str, const char *new_node_str);
++static int edf_consume_1_use_old_new_push_1 (RAnalEsil *esil, const char *op_string, AddConstraintStringConsume1UseOldNewCB cb);
++
++static int edf_eq_weak (RAnalEsil *esil) {
++	EsilDataFlow *edf = (EsilDataFlow *)esil->user;
++	RGraphNode *o_old = sdb_ptr_get (edf->latest_nodes, "old", 0);	//node for esil->old
++	RGraphNode *o_new = sdb_ptr_get (edf->latest_nodes, "new", 0);	//node for esil->cur
++	if (!edf_consume_2_set_reg (esil, ":=")) {
++		return 0;
++	}
++	//work-around
++	if (o_old) {
++		sdb_ptr_set (edf->latest_nodes, "old", o_old, 0);
++	} else {
++		sdb_remove (edf->latest_nodes, "old", 0);
++	}
++	if (o_new) {
++		sdb_ptr_set (edf->latest_nodes, "new", o_new, 0);
++	} else {
++		sdb_remove (edf->latest_nodes, "new", 0);
++	}
++	return 1;
++}
++
++static int edf_eq (RAnalEsil *esil) {
++	return edf_consume_2_set_reg (esil, "=");
++}
++
++static int edf_xoreq (RAnalEsil *esil) {
++	return edf_consume_2_set_reg (esil, "^=");
++}
++
++static int edf_subeq (RAnalEsil *esil) {
++	return edf_consume_2_set_reg (esil, "-=");
++}
++
++static int edf_addeq (RAnalEsil *esil) {
++	return edf_consume_2_set_reg (esil, "+=");
++}
++
++static int edf_add (RAnalEsil *esil) {
++	return edf_consume_2_push_1 (esil, "+");
++}
++
++static int edf_sub (RAnalEsil *esil) {
++	return edf_consume_2_push_1 (esil, "-");
++}
++
++static int edf_and (RAnalEsil *esil) {
++	return edf_consume_2_push_1 (esil, "&");
++}
++
++static int edf_or (RAnalEsil *esil) {
++	return edf_consume_2_push_1 (esil, "|");
++}
++
++static int edf_xor (RAnalEsil *esil) {
++	return edf_consume_2_push_1 (esil, "^");
++}
++
++static int edf_mod (RAnalEsil *esi

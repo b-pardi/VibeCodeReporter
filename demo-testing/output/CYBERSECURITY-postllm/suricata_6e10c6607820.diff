@@ -1,0 +1,103 @@
+@@ -125,61 +125,88 @@ static void PayloadAsHex(const uint8_t *data, uint32_t data_len, char *str, size
+ }
+ #endif
+ 
+-static void FrameAddPayloadTCP(JsonBuilder *js, const TcpStream *stream, const Frame *frame)
++struct FrameJsonStreamDataCallbackData {
++    MemBuffer *payload;
++    const Frame *frame;
++    uint64_t last_re; /**< used to detect gaps */
++};
++
++static int FrameJsonStreamDataCallback(
++        void *cb_data, const uint8_t *input, const uint32_t input_len, const uint64_t input_offset)
+ {
+-    uint32_t sb_data_len = 0;
+-    const uint8_t *data = NULL;
+-    uint64_t data_offset = 0;
++    struct FrameJsonStreamDataCallbackData *cbd = cb_data;
++    const Frame *frame = cbd->frame;
+ 
+-    // TODO consider ACK'd
++    uint32_t write_size = input_len;
++    int done = 0;
+ 
+-    if (frame->offset < STREAM_BASE_OFFSET(stream)) {
+-        if (StreamingBufferGetData(&stream->sb, &data, &sb_data_len, &data_offset) == 0) {
+-            SCLogDebug("NO DATA1");
+-            return;
++    if (frame->len >= 0) {
++        const uint64_t data_re = input_offset + input_len;
++        const uint64_t frame_re = frame->offset + (uint64_t)frame->len;
++
++        /* data entirely after frame, we're done */
++        if (input_offset >= frame_re) {
++            return 1;
+         }
+-    } else {
+-        data_offset = (uint64_t)frame->offset;
+-        SCLogDebug("data_offset %" PRIu64, data_offset);
+-        if (StreamingBufferGetDataAtOffset(
+-                    &stream->sb, &data, &sb_data_len, (uint64_t)data_offset) == 0) {
+-            SCLogDebug("NO DATA1");
+-            return;
++        /* make sure to only log data belonging to the frame */
++        if (data_re >= frame_re) {
++            const uint64_t to_write = frame_re - input_offset;
++            if (to_write < (uint64_t)write_size) {
++                write_size = (uint32_t)to_write;
++            }
++            done = 1;
+         }
+     }
+-    if (data == NULL || sb_data_len == 0) {
+-        SCLogDebug("NO DATA2");
+-        return;
++    if (input_offset > cbd->last_re) {
++        MemBufferWriteString(
++                cbd->payload, "[%" PRIu64 " bytes missing]", input_offset - cbd->last_re);
+     }
+ 
+-    if (frame->len >= 0) {
+-        sb_data_len = MIN(frame->len, (int32_t)sb_data_len);
++    if (write_size > 0) {
++        MemBufferWriteRaw(cbd->payload, input, write_size);
+     }
+-    SCLogDebug("frame data_offset %" PRIu64 ", data_len %u frame len %" PRIi64, data_offset,
+-            sb_data_len, frame->len);
++    cbd->last_re = input_offset + write_size;
++    return done;
++}
++
++/** \internal
++ *  \brief try to log frame's stream data into payload/payload_printable
++ */
++static void FrameAddPayloadTCP(Flow *f, const TcpSession *ssn, const TcpStream *stream,
++        const Frame *frame, JsonBuilder *jb, MemBuffer *buffer)
++{
++    MemBufferReset(buffer);
+ 
++    /* consider all data, ACK'd and non-ACK'd */
++    const uint64_t stream_data_re = StreamDataRightEdge(stream, true);
+     bool complete = false;
+-    if (frame->len > 0) {
+-        const uint64_t frame_re = frame->offset + (uint64_t)frame->len;
+-        const uint64_t data_re = data_offset + sb_data_len;
+-        complete = frame_re <= data_re;
++    if (frame->len >= 0 && frame->offset + (uint64_t)frame->len <= stream_data_re) {
++        complete = true;
+     }
+-    jb_set_bool(js, "complete", complete);
+ 
+-    uint32_t data_len = MIN(sb_data_len, 256);
+-    jb_set_base64(js, "payload", data, data_len);
++    struct FrameJsonStreamDataCallbackData cbd = {
++        .payload = buffer, .frame = frame, .last_re = frame->offset
++    };
++    uint64_t unused = 0;
++    StreamReassembleLog(
++            ssn, stream, FrameJsonStreamDataCallback, &cbd, frame->offset, &unused, false);
++    /* if we have all data, but didn't log until the end of the frame, we have a gap at the
++     * end of the frame
++     * TODO what about not logging due to buffer full? */
++    if (complete && frame->len >= 0 && cbd.last_re < frame->offset + (uint64_t)fr

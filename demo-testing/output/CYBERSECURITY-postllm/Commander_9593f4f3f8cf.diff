@@ -1,0 +1,79 @@
+@@ -6,6 +6,7 @@ import copy
+ import datetime
+ import fnmatch
+ import json
++import logging
+ import os.path
+ import re
+ from urllib.parse import urlunparse
+@@ -15,13 +16,15 @@ import requests
+ from cryptography import x509
+ from cryptography.hazmat.primitives import serialization
+ 
+-from ... import crypto, constants, utils, api
++from ... import crypto, constants, utils, api, vault
+ from ...params import KeeperParams
+ from ...pedm import admin_plugin, pedm_shared, admin_types, admin_storage
+ from ...proto import NotificationCenter_pb2, pedm_pb2
+ from .. import base
+ from ..helpers import report_utils, prompt_utils, whoami
+ from . import pedm_aram
++from ...scim.data_sources import AdCrmDataSource, AzureAdCrmDataSource
++from ...scim.models import ScimUser, ScimGroup
+ 
+ 
+ class PedmUtils:
+@@ -176,9 +179,323 @@ class PedmCommand(base.GroupCommandNew):
+         self.register_command_new(PedmPolicyCommand(), 'policy', 'p')
+         self.register_command_new(PedmCollectionCommand(), 'collection', 'c')
+         self.register_command_new(PedmApprovalCommand(), 'approval')
++        self.register_command_new(PedmScimCommand(), 'scim')
+         self.register_command_new(pedm_aram.PedmReportCommand(), 'report')
+         #self.register_command_new(PedmBICommand(), 'bi')
+ 
++class PedmScimCommand(base.ArgparseCommand):
++    def __init__(self):
++        parser = argparse.ArgumentParser(prog='scim', description='Sync PEDM user/group collections from AD or AzureAD')
++
++        subparsers = parser.add_subparsers(title='Directory Type', dest='auth_type', required=True, help='Authentication method')
++        record_parser = subparsers.add_parser('record', help='Connection parameters from Keeper record')
++        record_parser.add_argument('record_uid', help='Keeper record UID')
++
++        azure_parser = subparsers.add_parser('azure', help='Connect via Azure AD')
++        azure_parser.add_argument('--tenant-id', dest='tenant_id', required=True)
++        azure_parser.add_argument('--client-id', dest='client_id', required=True)
++        azure_parser.add_argument('--client-secret', dest='client_secret', required=True)
++        azure_parser.add_argument('--azure-cloud', dest='azure_cloud', choices=['US', 'GOV', 'CN', 'EU'],
++                                  help='Azure cloud (AzureCloud, AzureChinaCloud, etc.)')
++
++        ad_parser = subparsers.add_parser('ad', help='Connect via Active Directory')
++        ad_parser.add_argument('--ad-url', dest='ad_url', help='AD LDAP URL (e.g., ldap(s)://<host>)')
++        ad_parser.add_argument('--ad-user', dest='ad_user', help='AD bind user (DOMAIN\\username or DN)')
++        ad_parser.add_argument('--ad-password', dest='ad_password', help='AD password')
++        ad_parser.add_argument('--group', dest='groups', action='append', help='AD group name or DN (repeatable)')
++        ad_parser.add_argument('--netbios-domain', dest='use_netbios_domain', action='store_true',
++                              help='Use NetBIOS domain names (e.g., TEST) instead of DNS names (e.g., test.local)')
++
++        for subparser in subparsers.choices.values():
++            subparser.exit = base.suppress_exit
++            subparser.error = base.raise_parse_exception
++
++        super().__init__(parser)
++
++    def execute(self, context: KeeperParams, **kwargs):
++        plugin = admin_plugin.get_pedm_plugin(context)
++
++        source = (kwargs.get('auth_type') or '').lower()
++        if source == 'record':
++            config_record: vault.TypedRecord
++            record_uid = kwargs.get('record_uid')
++
++            if not record_uid:
++                raise base.CommandError(f'Record UID parameter cannot be empty')
++            if record_uid not in context.record_cache:
++                raise base.CommandError(f'Record UID "{record_uid}" not found')
++            r = vault.KeeperRecord.load(context, record_uid)
++            if isinstance(r, vault.TypedRecord):
++                config_record = r
++            else:
++                raise base.Com

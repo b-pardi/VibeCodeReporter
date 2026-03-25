@@ -1,0 +1,108 @@
+@@ -101,6 +101,9 @@ def register_commands(commands, aliases, command_info):
+     rsync.register_commands(commands)
+     rsync.register_command_info(aliases, command_info)
+ 
++    from .keeper_fill import KeeperFillCommand
++    commands['keeper-fill'] = KeeperFillCommand()
++
+ 
+ def register_enterprise_commands(commands, aliases, command_info):
+     from . import enterprise
+@@ -721,8 +724,9 @@ class FolderMixin:
+         records = set()
+ 
+         def add_records(f):   # type: (BaseFolderNode) -> None
+-            if f.uid in params.subfolder_record_cache:
+-                records.update(params.subfolder_record_cache[f.uid])
++            folder_uid = f.uid or ''
++            if folder_uid in params.subfolder_record_cache:
++                records.update(params.subfolder_record_cache[folder_uid])
+ 
+         FolderMixin.traverse_folder_tree(params, folder_uid, add_records)
+         return records
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,291 @@
++#  _  __
++# | |/ /___ ___ _ __  ___ _ _ ®
++# | ' </ -_) -_) '_ \/ -_) '_|
++# |_|\_\___\___| .__/\___|_|
++#              |_|
++#
++# Keeper Commander
++# Copyright 2023 Keeper Security Inc.
++# Contact: ops@keepersecurity.com
++#
++
++import argparse
++import fnmatch
++import itertools
++import json
++import logging
++import re
++from typing import Union, Iterable, Optional, List
++
++from .base import GroupCommand, Command, FolderMixin, try_resolve_path, report_output_parser, dump_report_data
++from .. import vault, utils, crypto, api
++from ..params import KeeperParams
++from ..proto import record_pb2
++
++
++kf_parse = argparse.ArgumentParser(add_help=False)
++kf_parse.add_argument('-r', '--recursive', dest='recursive', action='store_true',
++                           help='Traverse recursively through subfolders')
++kf_parse.add_argument('paths', nargs='+', type=str, help='folder or record path or UID')
++
++
++kf_list_parser = argparse.ArgumentParser(prog='keeper-fill list', parents=[kf_parse, report_output_parser])
++kf_list_parser.add_argument('-v', '--verbose', dest='verbose', action='store_true', help='Do not truncate long names')
++
++
++kf_set_parser = argparse.ArgumentParser(prog='keeper-fill set', parents=[kf_parse])
++kf_set_parser.add_argument('--auto-fill', dest='auto_fill', action='store', choices=['on', 'off', 'none'],
++                           help='Auto Fill')
++kf_set_parser.add_argument('--auto-submit', dest='auto_submit', action='store', choices=['on', 'off', 'none'],
++                           help='Auto Submit')
++
++
++class KeeperFillCommand(GroupCommand):
++    def __init__(self):
++        super().__init__()
++        self.register_command('list', KeeperFillListCommand(), 'Displays a list of KeeperFill values.')
++        self.register_command('set', KeeperFillSetCommand(), 'Sets Keeper Fill settings.')
++        self.default_verb = 'list'
++
++
++class KeeperFillMixin:
++    @staticmethod
++    def resolve_records(params, **kwargs):   # type: (KeeperParams, ...) -> Iterable[str]
++        recursive = kwargs.get('recursive') is True
++        folders = []
++        records = set()
++
++        paths = kwargs.get('paths')
++        if not paths:
++            raise Exception('"paths" parameter is required.')
++
++        for path in paths:
++            if path in params.folder_cache:
++                folders.append(path)
++            elif path in params.record_cache:
++                records.add(path)
++            else:
++                rs = try_resolve_path(params, path)
++                if rs is None:
++                    raise Exception(f'Folder or record path {path} not found')
++
++                folder, pattern = rs
++                folder_uid = folder.uid or ''
++                if len(pattern) == 0:
++                    folders.append(folder_uid)
++                else:
++                    regex = re.compile(fnmatch.translate(pattern), re.IGNORECASE).match
++                    if folder_uid in params.subfolder_record_cache:
++                        for record_uid in params.subfolder_record_cache[folder_uid]:
++    

@@ -1,0 +1,167 @@
+@@ -1,5 +1,4 @@
+ /* radare - LGPL - Copyright 2021 - pancake */
+-
+ #include <r_main.h>
+ 
+ int main (int argc, const char *argv[]) {
+
+
+
+
+@@ -1,55 +1,25 @@
+ /* radare - LGPL - Copyright 2021 - RHL120, pancake */
+ 
+ #include <rvc.h>
++#define FIRST_BRANCH "branches.master"
++#define NOT_SPECIAL(c) IS_DIGIT (c) || IS_LOWER (c) || c == '_'
++#define COMMIT_BLOB_SEP "----"
++#define DBNAME "branches.sdb"
++#define CURRENTB "current_branch"
++#define BPREFIX "branches."
++#define NULLVAL "-"
+ 
+-static inline bool is_branch_name(const char *name) {
+-	for (; *name; name++) {
+-		if (!IS_DIGIT (*name) && !isalpha (*name)) {
+-			return false;
+-		}
+-	}
+-	return true;
+-}
+-
+-static bool copy_commits(const Rvc *repo, const char *dpath, const char *spath) {
+-	char *name, *commit_path;
+-	RListIter *iter;
+-	RList *files;
+-	files = r_sys_dir (spath);
+-	bool ret = true;
+-	if (!files) {
+-		eprintf ("Can't Open Files\n");
++static bool is_valid_branch_name(const char *name) {
++	if (r_str_len_utf8 (name) >= 16) {
+ 		return false;
+ 	}
+-	r_list_foreach (files, iter, name) {
+-		if (r_str_cmp (name, "..", 2) == 0 ||
+-				r_str_cmp (name, ".", 1) == 0) {
+-			printf ("%s", name);
++	for (; *name; name++) {
++		if (NOT_SPECIAL (*name)) {
+ 			continue;
+ 		}
+-		commit_path = r_str_newf ("%s" R_SYS_DIR "%s", spath, name);
+-		if (!commit_path) {
+-			ret = false;
+-			break;
+-		}
+-		ret = r_file_copy (commit_path, dpath);
+-		free (commit_path);
+-		if (!ret) {
+-			break;
+-		}
++		return false;
+ 	}
+-	r_list_free (files);
+-	return ret;
+-}
+-
+-static char *branch_mkdir(Rvc *repo, RvcBranch *b) {
+-	char *path = r_str_newf ("%s" R_SYS_DIR "branches" R_SYS_DIR "%s"
+-			R_SYS_DIR "commits" R_SYS_DIR, repo->path, b->name);
+-	r_return_val_if_fail (path, NULL);
+-	if (!r_sys_mkdirp (path)) {
+-		R_FREE (path);
+-	}
+-	return path;
++	return true;
+ }
+ 
+ static char *find_sha256(const ut8 *block, int len) {
+@@ -66,492 +36,721 @@ static inline char *sha256_file(const char *fname) {
+ 	return find_sha256 ((ut8 *)content, r_str_len_utf8 (content) * sizeof (ut8));
+ }
+ 
+-static char *read_until(const char *str, const char *find) {
++static void free_blobs (RList *blobs) {
++	RListIter *iter;
++	RvcBlob *blob;
++	r_list_foreach (blobs, iter, blob) {
++		free (blob->fhash);
++		free (blob->fname);
++	}
++	r_list_free (blobs);
++}
++
++static char *absp2rp(const char *rp, const char *absp) {
+ 	char *ret;
+-	char *f = strstr (str, find);
+-	if (!f) {
++	char *arp = r_file_abspath (rp);
++	if (!arp) {
+ 		return NULL;
+ 	}
+-	ret = malloc (f - str + 1);
+-	if (!ret) {
++	if (r_str_len_utf8 (arp) < r_str_len_utf8 (rp)) {
++		free (arp);
+ 		return NULL;
+ 	}
+-	r_str_ncpy(ret, str, f - str + 1);
++	ret = r_str_new (absp + r_str_len_utf8 (arp));
++	printf ("%s:%s\n", absp, ret);
++	free (arp);
+ 	return ret;
+ }
+ 
+-static char *p2rvcp(const Rvc *repo, const char *path) {
+-	char *ret;
+-	char *p;
+-	char *rp = read_until (repo->path, R_SYS_DIR ".rvc");
+-	if (!rp) {
++char *rp2absp(const char *rp, const char *path) {
++	char *arp = r_file_abspath (rp);
++	if (!arp) {
+ 		return NULL;
+ 	}
+-	if (!r_file_is_abspath (path)) {
+-		p = r_file_abspath (path);
+-	} else {
+-		p = r_str_new (path);
++	return r_str_appendf (arp, R_SYS_DIR "%s", path);
++}
++
++//TODO:Make the tree related functions abit cleaner & more efficient
++
++static RList *get_commits(const char *rp, const size_t max_num) {
++	char *i;
++	RList *ret = r_list_new ();
++	if (!ret) {
++		return NULL;
+ 	}
+-	if (!p) {
+-		free (rp);
++	Sdb *db = sdb_new0 ();
++	if (!db) {
++		r_list_free (ret);
+ 		return NULL;
+ 	}
+-	ret = r_str_new (p + r_str_len_utf8 (rp) + 1);
+-	free (p);
+-	free (rp);
+-	return ret;
+-}
+-
+-static RvcBranch *branch_by_name(Rvc *repo, const char *name) {
+-	RListIter *iter;
+-	RvcBranch *b;
+-	r_list_foreach (repo->branches, iter, b) {
+-		if  (!r_str_cmp (name, b->name, r_str_len_utf8 (b->name) * sizeof (ut8))) {
+-			return b;
++	char *dbp = r_str_newf ("%s" R_SYS_DIR ".rvc" R_SYS_DIR DBNAME,
++			rp);
++	if (!dbp) {
++		r_list_free (ret);
++		sdb_free (db);
++		return NULL;
++	}
++	if (sdb_open

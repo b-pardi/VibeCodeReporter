@@ -1,0 +1,136 @@
+@@ -32,6 +32,7 @@ const uint8_t kTlsHandshakeCertificateVerify = 15;
+ const uint8_t kTlsHandshakeClientKeyExchange = 16;
+ const uint8_t kTlsHandshakeFinished = 20;
+ const uint8_t kTlsHandshakeKeyUpdate = 24;
++const uint8_t kTlsHandshakeCertificateCompression = 25;
+ 
+ const uint8_t kTlsAlertWarning = 1;
+ const uint8_t kTlsAlertFatal = 2;
+
+
+
+
+@@ -553,4 +553,44 @@ SECStatus SSLInt_SetRawEchConfigForRetry(PRFileDesc *fd, const uint8_t *buf,
+   return SECSuccess;
+ }
+ 
+-PRBool SSLInt_IsIp(PRUint8 *s, unsigned int len) { return tls13_IsIp(s, len); }
+\ No newline at end of file
++PRBool SSLInt_IsIp(PRUint8 *s, unsigned int len) { return tls13_IsIp(s, len); }
++
++SECStatus SSLInt_GetCertificateCompressionAlgorithm(
++    PRFileDesc *fd, SSLCertificateCompressionAlgorithm *alg) {
++  sslSocket *ss = ssl_FindSocket(fd);
++  if (!ss) {
++    return SECFailure; /* Code already set. */
++  }
++
++  PRBool algFound = PR_FALSE;
++
++  if (!ssl_HaveXmitBufLock(ss)) {
++    ssl_GetSSL3HandshakeLock(ss);
++  }
++
++  if (!ss->xtnData.compressionAlg) {
++    if (!ssl_HaveXmitBufLock(ss)) {
++      ssl_ReleaseSSL3HandshakeLock(ss);
++    }
++
++    PORT_SetError(SEC_ERROR_INVALID_ARGS);
++    return SECFailure;
++  }
++  for (int i = 0; i < ss->ssl3.supportedCertCompressionAlgorithmsCount; i++) {
++    if (ss->ssl3.supportedCertCompressionAlgorithms[i].id ==
++        ss->xtnData.compressionAlg) {
++      *alg = ss->ssl3.supportedCertCompressionAlgorithms[i];
++      algFound = PR_TRUE;
++      break;
++    }
++  }
++
++  if (!ssl_HaveXmitBufLock(ss)) {
++    ssl_ReleaseSSL3HandshakeLock(ss);
++  }
++
++  if (algFound) {
++    return SECSuccess;
++  }
++  return SECFailure;
++}
+
+
+
+
+@@ -56,4 +56,6 @@ SECStatus SSLInt_SetRawEchConfigForRetry(PRFileDesc *fd, const uint8_t *buf,
+                                          size_t len);
+ PRBool SSLInt_IsIp(PRUint8 *s, unsigned int len);
+ 
++SECStatus SSLInt_GetCertificateCompressionAlgorithm(
++    PRFileDesc *fd, SSLCertificateCompressionAlgorithm *alg);
+ #endif  // ifndef libssl_internals_h_
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,1240 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++#include "secerr.h"
++#include "ssl.h"
++#include "sslerr.h"
++#include "sslproto.h"
++
++extern "C" {
++// This is not something that should make you happy.
++#include "libssl_internals.h"
++}
++
++#include "gtest_utils.h"
++#include "nss_scoped_ptrs.h"
++#include "tls_connect.h"
++#include "tls_filter.h"
++#include "tls_parser.h"
++
++namespace nss_test {
++
++class TLSCertificateCompressionExtensionCatcher : public TlsExtensionFilter {
++ public:
++  TLSCertificateCompressionExtensionCatcher(const std::shared_ptr<TlsAgent>& a)
++      : TlsExtensionFilter(a),
++        received_compressed_certificate_extension_(false){};
++
++  PacketFilter::Action FilterExtension(uint16_t extension_type,
++                                       const DataBuffer& input,
++                                       DataBuffer* output) {
++    if (extension_type != ssl_certificate_compression_xtn) {
++      return KEEP;
++    }
++    received_compressed_certificate_extension_ = true;
++
++    /* struct {
++     *   CertificateCompressionAlgorithm algorithms<2..2^8-2>;
++     * } CertificateCompressionAlgorithms;
++     */
++    uint32_t numberOfExtensions = input.data()[0];
++    algorithms = DataBuffer(&input.data()[1], numberOfExtensions);
++    return KEEP;
++  }
++
++  DataBuffer GetBufCompressionAlgs() { return algorithms; }
++
++  bool sawCertificateCompressionExtension() {
++    return received_compressed_certificate_extension_;
++  }
++
++ private:
++  DataBuffer algorithms;
++  bool received_compressed_certificate_extension_;
++};
++
++class TLSCertificateCompressionExtensionModifier : public TlsExtensionFilter {
++ public:
++  TLSCertificateCompressionExten

@@ -1,0 +1,106 @@
+@@ -5188,6 +5188,8 @@ class TestComplianceOverviewViewSet:
+             assert "description" in attributes
+             assert "status" in attributes
+ 
++    # TODO: This test may fail randomly because requirements are not ordered
++    @pytest.mark.xfail
+     def test_compliance_overview_requirements_manual(
+         self, authenticated_client, compliance_requirements_overviews_fixture
+     ):
+
+
+
+
+@@ -292,7 +292,7 @@ class SchemaView(SpectacularAPIView):
+ 
+     def get(self, request, *args, **kwargs):
+         spectacular_settings.TITLE = "Prowler API"
+-        spectacular_settings.VERSION = "1.10.0"
++        spectacular_settings.VERSION = "1.10.1"
+         spectacular_settings.DESCRIPTION = (
+             "Prowler API specification.\n\nThis file is auto-generated."
+         )
+
+
+
+
+@@ -1,11 +1,12 @@
+ import json
+ import time
++from collections import defaultdict
+ from copy import deepcopy
+ from datetime import datetime, timezone
+ 
+ from celery.utils.log import get_task_logger
+ from config.settings.celery import CELERY_DEADLOCK_ATTEMPTS
+-from django.db import IntegrityError, OperationalError, connection
++from django.db import IntegrityError, OperationalError
+ from django.db.models import Case, Count, IntegerField, Prefetch, Sum, When
+ from tasks.utils import CustomEncoder
+ 
+@@ -13,7 +14,11 @@ from api.compliance import (
+     PROWLER_COMPLIANCE_OVERVIEW_TEMPLATE,
+     generate_scan_compliance,
+ )
+-from api.db_utils import create_objects_in_batches, rls_transaction
++from api.db_utils import (
++    create_objects_in_batches,
++    rls_transaction,
++    update_objects_in_batches,
++)
+ from api.exceptions import ProviderConnectionError
+ from api.models import (
+     ComplianceRequirementOverview,
+@@ -103,7 +108,10 @@ def _store_resources(
+ 
+ 
+ def perform_prowler_scan(
+-    tenant_id: str, scan_id: str, provider_id: str, checks_to_execute: list[str] = None
++    tenant_id: str,
++    scan_id: str,
++    provider_id: str,
++    checks_to_execute: list[str] | None = None,
+ ):
+     """
+     Perform a scan using Prowler and store the findings and resources in the database.
+@@ -175,6 +183,7 @@ def perform_prowler_scan(
+         resource_cache = {}
+         tag_cache = {}
+         last_status_cache = {}
++        resource_failed_findings_cache = defaultdict(int)
+ 
+         for progress, findings in prowler_scan.scan():
+             for finding in findings:
+@@ -200,6 +209,9 @@ def perform_prowler_scan(
+                                     },
+                                 )
+                                 resource_cache[resource_uid] = resource_instance
++
++                                # Initialize all processed resources in the cache
++                                resource_failed_findings_cache[resource_uid] = 0
+                             else:
+                                 resource_instance = resource_cache[resource_uid]
+ 
+@@ -313,6 +325,11 @@ def perform_prowler_scan(
+                     )
+                     finding_instance.add_resources([resource_instance])
+ 
++                    # Increment failed_findings_count cache if the finding status is FAIL and not muted
++                    if status == FindingStatus.FAIL and not finding.muted:
++                        resource_uid = finding.resource_uid
++                        resource_failed_findings_cache[resource_uid] += 1
++
+                 # Update scan resource summaries
+                 scan_resource_cache.add(
+                     (
+@@ -330,6 +347,24 @@ def perform_prowler_scan(
+ 
+         scan_instance.state = StateChoices.COMPLETED
+ 
++        # Update failed_findings_count for all resources in batches if scan completed successfully
++        if resource_failed_findings_cache:
++            resources_to_update = []
++            for resource_uid, failed_count in resource_failed_findings_cache.items():
++                if resource_uid in resource_cache:
++                    resource_instance = resource_cache[resource_uid]
++                    resource_instance.failed_findings_cou

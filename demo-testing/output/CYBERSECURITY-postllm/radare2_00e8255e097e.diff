@@ -1,0 +1,124 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,18 @@
++/* radare2 - LGPL - Copyright */
++
++#ifndef R_MIPS_UTILS_H
++#define R_MIPS_UTILS_H
++
++#include <r_endian.h>
++#include <r_bin.h>
++
++static inline ut64 mips_read_ptr_at(RBin *bin, ut64 addr, bool be, int bits) {
++	const int ptrsz = bits == 64 ? 8 : 4;
++	ut8 v[8] = {0};
++	if (!bin || !bin->iob.read_at (bin->iob.io, addr, v, ptrsz)) {
++		return UT64_MAX;
++	}
++	return ptrsz == 8 ? r_read_ble64 (v, be) : r_read_ble32 (v, be);
++}
++
++#endif
+
+
+
+
+@@ -1,6 +1,8 @@
+ /* radare2 - LGPL - Copyright 2013-2024 - pancake */
+ 
+ #include <r_asm.h>
++#include <r_endian.h>
++#include "mips_utils.h"
+ #include <capstone/capstone.h>
+ #include <capstone/mips.h>
+ 
+@@ -62,24 +64,23 @@ R_IPI int mips_assemble(const char *str, ut64 pc, ut8 *out);
+ #define ES_IS_NEGATIVE(arg) "1,"arg",<<<,1,&"
+ 
+ 
+-// call with delay slot
+-#define ES_CALL_DR(ra, addr) "pc,4,+,"ra",=,"ES_J(addr)
++// Call with delay slot.
++#define ES_CALL_DR(ra, addr) "pc,4,+,"ra",=,"ES_J_D(addr)
+ #define ES_CALL_D(addr) ES_CALL_DR("ra", addr)
+ 
+-// call without delay slot
+-#define ES_CALL_NDR(ra, addr) "pc,"ra",=,"ES_J(addr)
++// Call without delay slot.
++#define ES_CALL_NDR(ra, addr) "pc,"ra",=,"ES_J_ND(addr)
+ #define ES_CALL_ND(addr) ES_CALL_NDR("ra", addr)
+ 
+-#define USE_DS 0
+-#if USE_DS
+-// emit ERR trap if executed in a delay slot
+-#define ES_TRAP_DS() "$ds,!,!,?{,$$,1,TRAP,BREAK,},"
+-// jump to address
+-#define ES_J(addr) addr",SETJT,1,SETD"
+-#else
+-#define ES_TRAP_DS() ""
+-#define ES_J(addr) addr",pc,:="
+-#endif
++// Delay-slot helper macros.
++// Trap if executed in a delay slot.
++#define ES_TRAP_DS(addr) "$ds,!,!,?{," addr ",1,TRAP,BREAK,},"
++// Jump with delay slot: record target and mark delay.
++#define ES_J_D(addr) addr",SETJT,1,SETD"
++// Jump without delay slot: update PC immediately.
++#define ES_J_ND(addr) addr",pc,:="
++// For likely branches: skip delay slot by advancing PC over it.
++#define ES_SKIP_NXT() "pc,4,+,pc,:="
+ 
+ #define ES_B(x) "0xff,"x",&"
+ #define ES_H(x) "0xffff,"x",&"
+@@ -240,11 +241,13 @@ static const char *arg(csh *handle, cs_insn *insn, char *buf, size_t buf_sz, int
+ static int analop_esil(RArchSession *as, RAnalOp *op, csh *handle, cs_insn *insn) {
+ 	char str[8][32] = {{0}};
+ 	int i;
++	ut64 addr = op->addr;
+ 
+ 	r_strbuf_init (&op->esil);
+ 	r_strbuf_set (&op->esil, "");
+ 
+ 	if (insn) {
++		addr = insn->address;
+ 		// caching operands
+ 		for (i = 0; i < insn->detail->mips.op_count && i < 8; i++) {
+ 			*str[i] = 0;
+@@ -313,386 +316,403 @@ static int analop_esil(RArchSession *as, RAnalOp *op, csh *handle, cs_insn *insn
+ 		case MIPS_INS_SLL:
+ 			r_strbuf_appendf (&op->esil, "%s,%s,<<,%s,=", ARG (2), ARG (1), ARG (0));
+ 			break;
++		case MIPS_INS_BALC:
++			// BALC address
++			// Branch And Link, Compact. Unconditional PC relative branch to address,
++			// placing return address in register $31.
++			r_strbuf_appendf (&op->esil, ES_TRAP_DS ("0x%"PFMT64x) "" ES_CALL_ND ("%s"), addr, ARG (0));
++			break;
+ 		case MIPS_INS_BAL:
+ 		case MIPS_INS_JAL:
+-			r_strbuf_appendf (&op->esil, ES_TRAP_DS () "" ES_CALL_D ("%s"), ARG (0));
+-#if USE_DS
+-			r_strbuf_replacef (&op->esil, "$$", "0x%"PFMT64x, addr);
+-#endif
++			r_strbuf_appendf (&op->esil, ES_TRAP_DS ("0x%"PFMT64x) "" ES_CALL_D ("%s"), addr, ARG (0));
+ 			break;
+ 		case MIPS_INS_JALR:
+ 		case MIPS_INS_JALRS:
+ 			if (OPCOUNT () < 2) {
+-				r_strbuf_appendf (&op->esil, ES_TRAP_DS () "" ES_CALL_D ("%s"), ARG (0));
++				r_strbuf_appendf (&op->esil, ES_TRAP_DS ("0x%"PFMT64x) "" ES_CALL_D ("%s"), addr, ARG (0));
+ 			} else {
+ 				PROTECT_ZERO () {
+-					r_strbuf_appendf (&op->esil, ES_TRAP_DS () "" ES_CALL_DR ("%s", "%s"), ARG (0), ARG (1));
++					r_strbuf_appendf (&op->esil, ES_TRAP_DS ("0x%"PFMT64x) "" ES_CALL_DR ("%s", "%s"), addr, ARG (0), ARG (1));
+ 				}
+ 			}
+-#if USE_DS
+-			r_strbuf_replacef (&op->esil, "$$", "0x%"PFMT64x, addr);
+-#endif
+ 			break;
+ 		case MIPS_INS_JALRC: // no delay
+ 			if (OPCOUNT () < 2) {
+-				r_strbuf_appendf (&op->esil, ES_TRAP_DS () "" ES_CALL_ND ("%s"), ARG (0)

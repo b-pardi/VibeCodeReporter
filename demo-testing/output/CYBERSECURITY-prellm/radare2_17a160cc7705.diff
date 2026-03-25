@@ -1,0 +1,128 @@
+@@ -1,4 +1,4 @@
+-/* radare - LGPL - Copyright 2008-2020 - nibble, pancake, alvaro_fe */
++/* radare - LGPL - Copyright 2008-2021 - nibble, pancake, alvaro_fe */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -3472,7 +3472,41 @@ static int cmp_RBinElfSymbol(const RBinElfSymbol *a, const RBinElfSymbol *b) {
+ 	if (result != 0) {
+ 		return result;
+ 	}
+-	return strcmp(a->type, b->type);
++	return strcmp (a->type, b->type);
++}
++
++static RBinElfSymbol* parse_gnu_debugdata(ELFOBJ *bin) {
++	if (bin->g_sections) {
++		size_t i;
++		for (i = 0; !bin->g_sections[i].last; i++) {
++			if (!strcmp (bin->g_sections[i].name, ".gnu_debugdata")) {
++				ut64 addr = bin->g_sections[i].offset;
++				ut64 size = bin->g_sections[i].size;
++				if (size < 10) {
++					return false;
++				}
++				ut8 *data = malloc (size + 1);
++				if (r_buf_read_at (bin->b, addr, data, size) == -1) {
++					eprintf ("Cannot read%c", 10);
++				}
++				size_t osize;
++				ut8 *odata = r_sys_unxz (data, size, &osize);
++				if (odata) {
++					RBuffer *newelf = r_buf_new_with_pointers (odata, osize, false);
++					ELFOBJ* newobj = Elf_(r_bin_elf_new_buf)(newelf, false);
++					struct r_bin_elf_symbol_t *symbol = Elf_(r_bin_elf_get_symbols) (newobj);
++					newobj->g_symbols = NULL;
++					Elf_(r_bin_elf_free)(newobj);
++					r_buf_free (newelf);
++					free (odata);
++					return symbol;
++				}
++				free (data);
++				return NULL;
++			}
++		}
++	}
++	return NULL;
+ }
+ 
+ // TODO: return RList<RBinSymbol*> .. or run a callback with that symbol constructed, so we don't have to do it twice
+@@ -3503,10 +3537,14 @@ static RBinElfSymbol* Elf_(_r_bin_elf_get_symbols_imports)(ELFOBJ *bin, int type
+ 		return Elf_(get_phdr_symbols) (bin, type);
+ 	}
+ 	if (!UT32_MUL (&shdr_size, bin->ehdr.e_shnum, sizeof (Elf_(Shdr)))) {
+-		return false;
++		return NULL;
+ 	}
+ 	if (shdr_size + 8 > bin->size) {
+-		return false;
++		return NULL;
++	}
++	RBinElfSymbol *dbgsyms = parse_gnu_debugdata (bin);
++	if (dbgsyms) {
++		ret = dbgsyms;
+ 	}
+ 	for (i = 0; i < bin->ehdr.e_shnum; i++) {
+ 		if (((type & R_BIN_ELF_SYMTAB_SYMBOLS) && bin->shdr[i].sh_type == SHT_SYMTAB) ||
+
+
+
+
+@@ -286,14 +286,13 @@ R_API ut8 *r_sys_unxz(const ut8 *buf, size_t len, size_t *olen) {
+ 	ut8 *out = NULL;
+ 	int _olen = 0;
+ 	int rc = r_sys_cmd_str_full ("xz -d", (const char *)buf, (int)len, (char **)&out, &_olen, &err);
+-	if (rc == 0) {
++	if (rc == 0 || rc == 1) {
+ 		if (olen) {
+ 			*olen = (size_t)_olen;
+ 		}
+ 		free (err);
+ 		return out;
+ 	}
+-	eprintf ("%s\n", err);
+ 	free (out);
+ 	free (err);
+ 	return NULL;
+@@ -621,7 +620,8 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, int ilen, char
+ 	if (!sterr) {
+ 		sterr = &mysterr;
+ 	}
+-	char buffer[1024], *outputptr = NULL;
++	ut8 buffer[1024];
++	char *outputptr = NULL;
+ 	char *inputptr = (char *)input;
+ 	int pid, bytes = 0, status;
+ 	int sh_in[2], sh_out[2], sh_err[2];
+@@ -629,6 +629,9 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, int ilen, char
+ 	if (len) {
+ 		*len = 0;
+ 	}
++	if (ilen == -1 && inputptr) {
++		ilen = strlen (inputptr);
++	}
+ 	if (pipe (sh_in)) {
+ 		return false;
+ 	}
+@@ -690,6 +693,7 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, int ilen, char
+ 		// we should handle broken pipes somehow better
+ 		r_sys_signal (SIGPIPE, SIG_IGN);
+ 		size_t err_len = 0, out_len = 0;
++		size_t written = 0;
+ 		for (;;) {
+ 			fd_set rfds, wfds;
+ 			int nfd;
+@@ -707,7 +711,7 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, int ilen, char
+ 			memset (buffer, 0, sizeof (buffer));
+ 			nfd = select (sh_err[0] + 1, &rfds, &wfds, NULL, NULL);
+ 			if (nfd < 0) {
+-				break;
++				// eprintf ("nfd %d 2%c", nfd, 10);
+ 			}
+ 			if (output && FD_ISSET (sh_out[0], &rfds)) {
+ 				if ((bytes = read (sh_out[0], buffer, sizeof (buffer))) < 1) {
+@@ -733,20 +737,14 @@ R_API int r_sys_cmd_str_full(const char *cmd, const char *input, int ilen, char
+ 				*sterr = tmp;
+ 				memcpy (*sterr + err_len, buffer, bytes);
+ 				err_len += bytes;
+-			} else if (FD_ISSET (sh_in[1

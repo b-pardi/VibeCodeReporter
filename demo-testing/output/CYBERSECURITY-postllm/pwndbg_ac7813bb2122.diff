@@ -1,0 +1,133 @@
+@@ -40,6 +40,7 @@ import argparse
+ import asyncio
+ import os
+ import re
++import shutil
+ import signal
+ import sys
+ import threading
+@@ -70,12 +71,19 @@ from pwndbg.dbg.lldb.repl.io import IODriver
+ from pwndbg.dbg.lldb.repl.io import get_io_driver
+ from pwndbg.dbg.lldb.repl.proc import EventHandler
+ from pwndbg.dbg.lldb.repl.proc import ProcessDriver
+-from pwndbg.dbg.lldb.repl.readline import PROMPT
+-from pwndbg.dbg.lldb.repl.readline import enable_readline
+-from pwndbg.dbg.lldb.repl.readline import wrap_with_history
+ from pwndbg.lib.tips import color_tip
+ from pwndbg.lib.tips import get_tip_of_the_day
+ 
++HAS_FZF = shutil.which("fzf") is not None
++if HAS_FZF:
++    from pwndbg.dbg.lldb.repl.fuzzy import PROMPT
++    from pwndbg.dbg.lldb.repl.fuzzy import get_prompt_session
++    from pwndbg.dbg.lldb.repl.fuzzy import wrap_with_history
++else:
++    from pwndbg.dbg.lldb.repl.readline import PROMPT
++    from pwndbg.dbg.lldb.repl.readline import enable_readline
++    from pwndbg.dbg.lldb.repl.readline import wrap_with_history
++
+ show_tip = pwndbg.config.add_param(
+     "show-tips", True, "whether to display the tip of the day on startup"
+ )
+@@ -284,7 +292,10 @@ def run(
+     assert isinstance(pwndbg.dbg, LLDB)
+     dbg: LLDB = pwndbg.dbg
+ 
+-    enable_readline(dbg)
++    if HAS_FZF:
++        session = get_prompt_session(dbg)
++    else:
++        enable_readline(dbg)
+ 
+     # We're gonna be dealing with process events ourselves, so we'll want to run
+     # LLDB in asynchronous mode.
+@@ -335,7 +346,13 @@ def run(
+                 print("[-] REPL: Prompt next command from user interactively")
+ 
+             try:
+-                line = input(PROMPT)
++                if HAS_FZF:
++                    try:
++                        line = session.prompt(message=PROMPT)
++                    except KeyboardInterrupt:
++                        continue
++                else:
++                    line = input(PROMPT)
+                 # If the input is empty (i.e., 'Enter'), use the previous command
+                 if line:
+                     last_command = line
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,332 @@
++# Licensed under the MIT License
++# Modified from https://github.com/lebr0nli/GEP
++# Copyright (c) 2022 Alan Li
++# Copyright (c) 2025 Zhi-Qiang Zhou
++
++from __future__ import annotations
++
++import atexit
++import functools
++import os
++import re
++import shutil
++import sys
++import tempfile
++import threading
++from subprocess import PIPE
++from subprocess import Popen
++from typing import Callable
++from typing import Iterator
++from typing import ParamSpec
++from typing import TypeVar
++
++import lldb
++from prompt_toolkit import ANSI
++from prompt_toolkit import PromptSession
++from prompt_toolkit.application import run_in_terminal
++from prompt_toolkit.completion import CompleteEvent
++from prompt_toolkit.completion import Completer
++from prompt_toolkit.completion import Completion
++from prompt_toolkit.document import Document
++from prompt_toolkit.history import FileHistory
++from prompt_toolkit.key_binding import KeyBindings
++from prompt_toolkit.key_binding import KeyPressEvent
++from prompt_toolkit.output import create_output
++
++from pwndbg.dbg.lldb import LLDB
++
++# global variables
++P = ParamSpec("P")
++T = TypeVar("T")
++
++PROMPT = ANSI("\x1b[34mpwndbg-lldb> ")
++HISTORY_FILE = os.path.expanduser("~/.pwndbg_history")
++
++FZF_RUN_CMD = (
++    "fzf",
++    "--select-1",
++    "--exit-0",
++    "--tiebreak=index",
++    "--no-multi",
++    "--height=40%",
++    "--layout=reverse",
++)
++
++FZF_PRVIEW_WINDOW_ARGS = (
++    "--preview-window",
++    "right:55%:wrap",
++)
++
++
++def get_lldb_completes(dbg: LLDB, query: str = "") -> list[str]:
++    interp: lldb.SBCommandInterpreter = dbg.debugger.GetCommandInterpreter()
++    matches = lldb.SBStringList()
++    _num_matches = interp.HandleCompletion(query, len(query), 0, -1, matches)
++    proposals = [matches.GetStringAtIndex(i) for i in range(1, matches.GetSize())]
++    return proposals
++
++
++def safe_get_help_docs(dbg: LLDB, command:

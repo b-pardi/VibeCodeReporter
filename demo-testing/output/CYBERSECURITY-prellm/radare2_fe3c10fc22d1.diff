@@ -1,0 +1,168 @@
+@@ -539,6 +539,7 @@ extern RIOPlugin r_io_plugin_null;
+ extern RIOPlugin r_io_plugin_ar;
+ extern RIOPlugin r_io_plugin_rbuf;
+ extern RIOPlugin r_io_plugin_winedbg;
++extern RIOPlugin r_io_plugin_gprobe;
+ 
+ #if __cplusplus
+ }
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,968 @@
++/* radare - LGPL - Copyright 2018 - Dirk Eibach, Guntermann & Drunck GmbH */
++
++#include <r_io.h>
++#include <r_lib.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#if __WINDOWS__
++#include <cfgmgr32.h>
++#include <setupapi.h>
++#include <tchar.h>
++#include <windows.h>
++#else
++#include <termios.h>
++#endif
++
++#define GPROBE_SIZE (1LL << 32)
++
++/* serial port code adapted from git://sigrok.org/libserialport */
++struct sp_port {
++	const char *name;
++#if __WINDOWS__
++	HANDLE hdl;
++	COMMTIMEOUTS timeouts;
++	OVERLAPPED write_ovl;
++	OVERLAPPED read_ovl;
++	OVERLAPPED wait_ovl;
++	DWORD events;
++	BYTE pending_byte;
++	BOOL writing;
++	BOOL wait_running;
++#else
++	int fd;
++#endif
++};
++
++typedef struct {
++	struct sp_port sp_port;
++	ut64 offset;
++} RIOGprobe;
++
++enum {
++	GPROBE_DEBUGON = 0x09,
++	GPROBE_DEBUGOFF = 0x0a,
++	GPROBE_ACK = 0x0c,
++	GPROBE_RESET = 0x20,
++	GPROBE_GET_DEVICE_ID = 0x30,
++	GPROBE_RAM_READ_2 = 0x52,
++	GPROBE_RAM_WRITE_2 = 0x53,
++	GPROBE_RUN_CODE_2 = 0x54,
++};
++
++static int sp_close (struct sp_port *port) {
++#if __WINDOWS__
++	/* Returns non-zero upon success, 0 upon failure. */
++	if (CloseHandle (port->hdl) == 0)
++		return -1;
++	port->hdl = INVALID_HANDLE_VALUE;
++
++	/* Close event handles for overlapped structures. */
++#define CLOSE_OVERLAPPED(ovl)                                   \
++	do {                                                    \
++		if (port->ovl.hEvent != INVALID_HANDLE_VALUE && \
++		    CloseHandle (port->ovl.hEvent) == 0)        \
++			return -1;                              \
++	} while (0)
++	CLOSE_OVERLAPPED (read_ovl);
++	CLOSE_OVERLAPPED (write_ovl);
++	CLOSE_OVERLAPPED (wait_ovl);
++
++#else
++	if (close (port->fd) == -1)
++		return -1;
++
++	port->fd = -1;
++#endif
++
++	return 0;
++}
++
++#if __WINDOWS__
++/* To be called after port receive buffer is emptied. */
++static int restart_wait (struct sp_port *port) {
++	DWORD wait_result;
++
++	if (port->wait_running) {
++		/* Check status of running wait operation. */
++		if (GetOverlappedResult (port->hdl, &port->wait_ovl,
++					 &wait_result, FALSE)) {
++			port->wait_running = FALSE;
++		} else if (GetLastError () == ERROR_IO_INCOMPLETE) {
++			return 0;
++		} else {
++			return -1;
++		}
++	}
++
++	if (!port->wait_running) {
++		/* Start new wait operation. */
++		if (WaitCommEvent (port->hdl, &port->events,
++				   &port->wait_ovl)) {
++		} else if (GetLastError () == ERROR_IO_PENDING) {
++			port->wait_running = TRUE;
++		} else {
++			return -1;
++		}
++	}
++
++	return 0;
++}
++#endif
++
++static int sp_open (struct sp_port *port) {
++#if __WINDOWS__
++	int ret;
++	DWORD errors;
++	char *escaped_port_name;
++	COMSTAT status;
++	DCB dcb;
++	LPTSTR filename_;
++
++	/* Prefix port name with '\\.\' to work with ports above COM9. */
++	if (!(escaped_port_name = malloc (strlen (port->name) + 5)))
++		return -1;
++	sprintf (escaped_port_name, "\\\\.\\%s", port->name);
++
++	filename_ = r_sys_conv_utf8_to_utf16 (escaped_port_name);
++
++	port->hdl = CreateFile (filename_, GENERIC_READ | GENERIC_WRITE, 0, 0,
++				OPEN_EXISTING,
++				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0);
++
++	free (escaped_port_name);
++
++	if (port->hdl == INVALID_HANDLE_VALUE)
++		return -1;
++
++	/* All timeouts initially disabled. */
++	port->timeouts.ReadIntervalTimeout = 0;
++	port->timeouts.ReadTotalTimeoutMultiplier = 0;
++	port->timeouts.ReadTotalTimeoutConstant = 0;
++	port->timeouts.WriteTotalTimeoutMultiplier = 0;
++	port->timeouts.WriteTotalTimeoutConstant = 0;
++
++	if (SetCommTimeouts (port->hdl, &port->timeouts) == 0) {
++		sp_close (port);
++		return -1;
++	}
++
++	/* Prepare OVERLAPPED structures. */
++#define INIT_OVERLAPPED(ovl)                                                                             \
++	do {                                               

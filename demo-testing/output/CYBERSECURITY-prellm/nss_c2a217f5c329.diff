@@ -1,0 +1,93 @@
+@@ -1968,10 +1968,12 @@ TEST_F(TlsConnectStreamTls13, EchRejectUnknownCriticalExtension) {
+   len_buf.Write(0, tmp + non_crit_exts.len() - 2, 2);
+   echconfig.Splice(len_buf, 4, 2);
+ 
++  /* Expect that retry configs containing unsupported mandatory extensions can
++   * not be set and lead to SEC_ERROR_INVALID_ARGS. */
+   EXPECT_EQ(SECFailure,
+             SSL_SetClientEchConfigs(client_->ssl_fd(), crit_rec.data(),
+                                     crit_rec.len()));
+-  EXPECT_EQ(SEC_ERROR_UNKNOWN_CRITICAL_EXTENSION, PORT_GetError());
++  EXPECT_EQ(SEC_ERROR_INVALID_ARGS, PORT_GetError());
+   EXPECT_EQ(SECSuccess, SSL_EnableTls13GreaseEch(client_->ssl_fd(),
+                                                  PR_FALSE));  // Don't GREASE
+   auto filter = MakeTlsFilter<TlsExtensionCapture>(
+
+
+
+
+@@ -176,6 +176,7 @@ tls13_DecodeEchConfigContents(const sslReadBuffer *rawConfig,
+     sslReader suiteReader;
+     sslReader extensionReader;
+     PRBool hasValidSuite = PR_FALSE;
++    PRBool unsupportedMandatoryXtn = PR_FALSE;
+ 
+     /* HpkeKeyConfig key_config */
+     /* uint8 config_id */
+@@ -297,10 +298,12 @@ tls13_DecodeEchConfigContents(const sslReadBuffer *rawConfig,
+         }
+         extensionTypes[extensionIndex++] = (PRUint16)tmpn;
+ 
+-        /* If it's mandatory, fail. */
++        /* Clients MUST parse the extension list and check for unsupported
++         * mandatory extensions.  If an unsupported mandatory extension is
++         * present, clients MUST ignore the ECHConfig
++         * [draft-ietf-tls-esni, Section 4.2]. */
+         if (tmpn & (1 << 15)) {
+-            PORT_SetError(SEC_ERROR_UNKNOWN_CRITICAL_EXTENSION);
+-            goto loser;
++            unsupportedMandatoryXtn = PR_TRUE;
+         }
+ 
+         /* Skip. */
+@@ -316,10 +319,10 @@ tls13_DecodeEchConfigContents(const sslReadBuffer *rawConfig,
+         goto loser;
+     }
+ 
+-    /* If the ciphersuites weren't compatible, don't
+-     * set the outparam. Return success to indicate
+-     * the config was well-formed. */
+-    if (hasValidSuite) {
++    /* If the ciphersuites were compatible AND if NO unsupported mandatory
++     * extensions were found set the outparam. Return success either way if the
++     * config was well-formed. */
++    if (hasValidSuite && !unsupportedMandatoryXtn) {
+         decodedConfig = PORT_ZNew(sslEchConfig);
+         if (!decodedConfig) {
+             goto loser;
+
+
+
+
+@@ -1241,6 +1241,33 @@ tls13_ClientHandleEchXtn(const sslSocket *ss, TLSExtensionData *xtnData,
+     PRCList parsedConfigs;
+     PR_INIT_CLIST(&parsedConfigs);
+ 
++    /* The [retry config] response is valid only when the server used the
++     * ClientHelloOuter. If the server sent this extension in response to the
++     * inner variant [ECH was accepted], then the client MUST abort with an
++     * "unsupported_extension" alert [draft-ietf-tls-esni-14, Section 5]. */
++    if (ss->ssl3.hs.echAccepted) {
++        PORT_SetError(SSL_ERROR_RX_UNEXPECTED_EXTENSION);
++        ssl3_ExtSendAlert(ss, alert_fatal, unsupported_extension);
++        return SECFailure;
++    }
++
++    /* If the server is configured with any ECHConfigs, it MUST include the
++     * "encrypted_client_hello" extension in its EncryptedExtensions with the
++     * "retry_configs" field set to one or more ECHConfig structures with
++     * up-to-date keys [draft-ietf-tls-esni-14, Section 7.1]. */
++    if (ss->ssl3.hs.msg_type != ssl_hs_encrypted_extensions) {
++        PORT_SetError(SSL_ERROR_RX_UNEXPECTED_EXTENSION);
++        if (ss->version < SSL_LIBRARY_VERSION_TLS_1_3) {
++            /* For TLS < 1.3 the extension is unkown/unsupported. */
++            ssl3_ExtSendAlert(ss, alert_fatal, unsupported_extension);
++        } else {
++            /* For TLS 1.3 the extension is known but prohibited outside EE
++             * (see RFC8446, Section 4.2 for alert rationale). */
++            ssl3_ExtSendAlert(ss, alert_fatal, illegal_parameter);
++        }
++        return SECFailure;
++    }
++
+     PORT_Assert(!xtnData->ech);

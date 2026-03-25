@@ -1,0 +1,106 @@
+@@ -90,6 +90,26 @@ static bool rtti_itanium_read_type_name(RVTableContext *context, ut64 addr, clas
+ 	return true;
+ }
+ 
++// Custom for the prototype now
++static char *rtti_itanium_read_type_name_custom(RVTableContext *context, ut64 addr, ut64 *str_addr, bool *unique_name) {
++	ut64 at;
++	if (!context->read_addr (context->anal, addr, &at)) {
++		return NULL;
++	}
++	ut64 unique_mask = 1ULL << (VT_WORD_SIZE (context) * 8 - 1);
++	*unique_name = (at & unique_mask) == 0;
++	at &= ~unique_mask;
++	*str_addr = at;
++	ut8 buf[NAME_BUF_SIZE];
++	if (!context->anal->iob.read_at (context->anal->iob.io, at, buf, sizeof (buf))) {
++		return NULL;
++	}
++	buf[NAME_BUF_SIZE - 1] = 0;
++	char *name = r_anal_rtti_itanium_demangle_class_name (context, (char *)buf);
++
++	return name;
++}
++
+ static void rtti_itanium_class_type_info_fini(class_type_info *cti) {
+ 	if (cti) {
+ 		free (cti->name);
+@@ -324,12 +344,11 @@ static void rtti_itanium_print_vmi_class_type_info(vmi_class_type_info *vmi_cti,
+ 	r_cons_printf ("%sType Info at 0x%08" PFMT64x ":\n"
+ 			"%s  Type Info type: %s\n"
+ 			"%s  Belongs to class vtable: 0x%08" PFMT64x "\n"
+-			"%s  Reference to RTTI's type class: 0x%08" PFMT32x "\n"
+-			"%s  Reference to type's name: 0x%08" PFMT32x "\n"
++			"%s  Reference to RTTI's type class: 0x%08" PFMT64x "\n"
++			"%s  Reference to type's name: 0x%08" PFMT64x "\n"
+ 			"%s  Type Name: %s\n"
+ 			"%s  Name unique: %s\n"
+-			"%s  Flags: 0x%x"
+-			"\n"
++			"%s  Flags: 0x%x\n"
+ 			"%s  Count of base classes: 0x%x"
+ 			"\n",
+ 			prefix, vmi_cti->typeinfo_addr,
+@@ -344,7 +363,7 @@ static void rtti_itanium_print_vmi_class_type_info(vmi_class_type_info *vmi_cti,
+ 
+ 	int i;
+ 	for (i = 0; i < vmi_cti->vmi_base_count; i++) {
+-		r_cons_printf ("%s    Base class type descriptor address: 0x%08" PFMT32x "\n"
++		r_cons_printf ("%s    Base class type descriptor address: 0x%08" PFMT64x "\n"
+ 			       "%s    Base class flags: 0x%x"
+ 			       "\n",
+ 			prefix, vmi_cti->vmi_bases[i].base_class_addr,
+@@ -427,6 +446,7 @@ static RTypeInfoType rtti_itanium_type_info_type_from_flag(RVTableContext *conte
+ 	RCore *core = context->anal->coreb.core;
+ 	r_return_val_if_fail (core, R_TYPEINFO_TYPE_CLASS);
+ 
++	// get the reloc flags
+ 	const RList *flags = context->anal->flb.get_list (core->flags, atAddress);
+ 	if (!flags) {
+ 		return R_TYPEINFO_TYPE_UNKNOWN;
+@@ -439,24 +459,197 @@ static RTypeInfoType rtti_itanium_type_info_type_from_flag(RVTableContext *conte
+ 			return R_TYPEINFO_TYPE_VMI_CLASS;
+ 		} else if (strstr (flag->name, SI_CLASS_TYPE_INFO_NAME)) {
+ 			return R_TYPEINFO_TYPE_SI_CLASS;
++		} else if (strstr (flag->name, CLASS_TYPE_INFO_NAME)) {
++			return R_TYPEINFO_TYPE_CLASS;
+ 		}
+ 	}
+ 
+ 	return R_TYPEINFO_TYPE_UNKNOWN;
+ }
+ 
+-static class_type_info *rtti_itanium_type_info_new(RVTableContext *context, ut64 atAddress) {
+-	ut64 colRefAddr = atAddress - VT_WORD_SIZE (context); //Vtable: Type Info
+-	ut64 colAddr; //Type Info
++// used to check if vpointer or RTTI can be in the section
++static bool can_section_contain_rtti_vpointer(RBinSection *section) {
++	if (!section) {
++		return false;
++	}
++	if (section->is_data) {
++		return true;
++	}
++	return !strcmp (section->name, ".data.rel.ro") ||
++		!strcmp (section->name, ".data.rel.ro.local") ||
++		r_str_endswith (section->name, "__const");
++}
++
++static class_type_info *create_class_type(ut64 vtable_addr, char *name, ut64 name_addr, bool unique_name, ut64 typeinfo_addr, ut64 source_vtable) {
++	class_type_info *result = R_NEW0 (class_type_info);
++	if (!result) {
++		return NULL;
++	}
++	result->type = R_TYPEINFO_TYPE_CLASS;
+ 
+-	if (!context->read_addr (context->anal, colRefAddr, &colAddr)) {
++	result->vtable_addr = vtable_addr;
++	result->name_addr = name_addr;
++	result->name = name;
++	result->name_unique = unique_name;
++	result->typeinfo_addr = typeinfo_addr;
++	result->class_vtable_addr = source_vtable;
++	return result;
++}
++
++static si_class_type_info *create_si_class_type(ut64 vtable_addr, char *name, ut64 name_addr, bool unique_name, ut64 basetype_addr,

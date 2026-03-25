@@ -1,0 +1,120 @@
+@@ -1249,7 +1249,7 @@ static void post_connect(nsock_pool nsp, nsock_iod iod)
+        refresh_idle_timer. */
+     if (o.idletimeout > 0) {
+         cs.idle_timer_event_id =
+-            nsock_timer_create(nsp, idle_timer_handler, o.idletimeout, NULL);
++            nsock_timer_create(nsp, idle_timer_handler, o.idletimeout, &o.idletimeout);
+     }
+ }
+ 
+@@ -1274,9 +1274,15 @@ static void read_stdin_handler(nsock_pool nsp, nsock_event evt, void *data)
+ #endif
+                 shutdown(nsock_iod_get_sd(cs.sock_nsi), SHUT_WR);
+         }
+-        /* In --send-only mode or non-TCP mode, exit after EOF on stdin. */
+-        if (o.proto != IPPROTO_TCP || (o.proto == IPPROTO_TCP && o.sendonly))
++        if (o.quitafter > 0) {
++            nsock_timer_create(nsp, idle_timer_handler, o.quitafter, &o.quitafter);
++        }
++        // if o.quitafter is negative, do not quit even on EOF
++        else if (o.quitafter == 0 &&
++                /* In --send-only mode or non-TCP mode, exit after EOF on stdin. */
++                (o.proto != IPPROTO_TCP || (o.proto == IPPROTO_TCP && o.sendonly))) {
+             nsock_loop_quit(nsp);
++        }
+         return;
+     } else if (status == NSE_STATUS_ERROR) {
+         loguser("%s.\n", socket_strerror(nse_errorcode(evt)));
+@@ -1392,6 +1398,7 @@ static void idle_timer_handler(nsock_pool nsp, nsock_event evt, void *data)
+ {
+     enum nse_status status = nse_status(evt);
+     enum nse_type type = nse_type(evt);
++    int timeout = *(int *)data;
+ 
+     ncat_assert(type == NSE_TYPE_TIMER);
+ 
+@@ -1407,7 +1414,7 @@ static void idle_timer_handler(nsock_pool nsp, nsock_event evt, void *data)
+       return;
+     }
+ 
+-    loguser("Idle timeout expired (%d ms).\n", o.idletimeout);
++    loguser("Idle timeout expired (%d ms).\n", timeout);
+ 
+     exit(1);
+ }
+@@ -1418,5 +1425,5 @@ static void refresh_idle_timer(nsock_pool nsp)
+         return;
+     nsock_event_cancel(nsp, cs.idle_timer_event_id, 0);
+     cs.idle_timer_event_id =
+-        nsock_timer_create(nsp, idle_timer_handler, o.idletimeout, NULL);
++        nsock_timer_create(nsp, idle_timer_handler, o.idletimeout, &o.idletimeout);
+ }
+
+
+
+
+@@ -115,6 +115,7 @@ void options_init(void)
+     o.normlogfd = -1;
+     o.hexlogfd = -1;
+     o.append = 0;
++    o.quitafter = 0;
+     o.idletimeout = 0;
+     o.crlf = 0;
+     o.allow = 0;
+
+
+
+
+@@ -119,6 +119,7 @@ struct options {
+     int normlogfd;
+     int hexlogfd;
+     int append;
++    int quitafter;
+     int idletimeout;
+     int crlf;
+     /* Were any hosts specifically allowed? If so, deny all others. */
+
+
+
+
+@@ -127,7 +127,7 @@ static int stdin_eof = 0;
+ static int crlf_state = 0;
+ 
+ static void handle_connection(int socket_accept, int type, fd_set *listen_fds);
+-static int read_stdin(void);
++static int read_stdin(struct timeval *qtv);
+ static int read_socket(int recv_fd);
+ static void post_handle_connection(struct fdinfo *sinfo);
+ static void close_fd(struct fdinfo *fdn, int eof);
+@@ -203,7 +203,7 @@ int ncat_listen()
+ {
+     int rc, i, j, fds_ready;
+     fd_set listen_fds;
+-    struct timeval tv;
++    struct timeval tv, qtv;
+     struct timeval *tvp = NULL;
+     unsigned int num_sockets;
+     int proto = o.proto;
+@@ -296,10 +296,9 @@ int ncat_listen()
+ 
+     init_fdlist(&broadcast_fdlist, o.conn_limit);
+ 
+-    if (o.idletimeout > 0)
+-        tvp = &tv;
+-
+     while (client_fdlist.nfds > 1 || get_conn_count() > 0) {
++        long usec_wait = -1;
++        tvp = NULL;
+         /* We pass these temporary descriptor sets to fselect, since fselect
+            modifies the sets it receives. */
+         fd_set readfds = master_readfds, writefds = master_writefds;
+@@ -311,20 +310,31 @@ int ncat_listen()
+         if (o.debug > 1 && o.broker)
+             logdebug("Broker connection count is %d\n", get_conn_count());
+ 
+-        if (o.idletimeout > 0)
+-            ms_to_timeval(tvp, o.idletimeout);
++        if (stdin_eof && o.quitafter > 0) {
++            struct timeval now;
++            gettimeofday(&now, 0);
++            usec_wai

@@ -1,0 +1,130 @@
+@@ -90,7 +90,6 @@ typedef struct r_io_t {
+ 	RIDPool *map_ids;
+ 	RPVector maps; //from tail backwards maps with higher priority are found
+ 	RPVector map_skyline; // map parts that are not covered by others
+-	RPVector map_skyline_shadow; // map parts that are not covered by others
+ 	RIDStorage *files;
+ 	RCache *buffer;
+ 	RList *cache;	//sdblist?
+
+
+
+
+@@ -43,6 +43,11 @@ static inline ut64 r_itv_end(RInterval itv) {
+ 	return itv.addr + itv.size;
+ }
+ 
++// Returns true if itv equals itv2
++static inline bool r_itv_eq(RInterval itv, RInterval itv2) {
++	return itv.addr == itv2.addr && itv.size == itv2.size;
++}
++
+ // Returns true if itv contained addr
+ static inline bool r_itv_contain(RInterval itv, ut64 addr) {
+ 	const ut64 end = itv.addr + itv.size;
+
+
+
+
+@@ -107,7 +107,6 @@ R_API RIO* r_io_init(RIO* io) {
+ 	io->addrbytes = 1;
+ 	r_io_desc_init (io);
+ 	r_pvector_init (&io->map_skyline, free);
+-	r_pvector_init (&io->map_skyline_shadow, free);
+ 	r_io_map_init (io);
+ 	r_io_cache_init (io);
+ 	r_io_plugin_init (io);
+
+
+
+
+@@ -9,193 +9,77 @@
+ 
+ #define END_OF_MAP_IDS UT32_MAX
+ 
+-#define MAP_USE_HALF_CLOSED 0
+-
+ #define CMP_END_GTE(addr, itv) \
+ 	(((addr) < r_itv_end (*(RInterval *)(itv))) ? -1 : 1)
+ 
+-struct map_event_t {
+-	RIOMap *map;
+-	ut64 addr;
+-	int id; // distinct priority in [0, len(maps))
+-	bool is_to;
+-};
+-
+-// Sort by address, (addr, is_to) precedes (addr, !is_to)
+-static int _cmp_map_event(const void *a_, const void *b_) {
+-	struct map_event_t *a = (void *)a_, *b = (void *)b_;
+-	ut64 addr0 = a->addr - a->is_to, addr1 = b->addr - b->is_to;
+-	if (addr0 != addr1) {
+-		return addr0 < addr1? -1: 1;
+-	}
+-	if (a->is_to != b->is_to) {
+-		return !a->is_to? -1: 1;
+-	}
+-	if (a->id != b->id) {
+-		return a->id < b->id? -1: 1;
+-	}
+-	return 0;
+-}
+-
+-static int _cmp_map_event_by_id(const void *a_, const void *b_) {
+-	struct map_event_t *a = (void *)a_, *b = (void *)b_;
+-	return a->id - b->id;
+-}
+-
+-// Precondition: from == 0 && to == 0 (full address) or from < to
+-static bool _map_skyline_push(RPVector *map_skyline, ut64 from, ut64 to, RIOMap *map) {
+-	RIOMapSkyline *part = R_NEW (RIOMapSkyline), *part1;
+-	if (!part) {
+-		return false;
++#define CMP_END_GTE_PART(addr, part) \
++	(((addr) < (r_itv_end (((RIOMapSkyline *)(part))->itv)) || !r_itv_end (((RIOMapSkyline *)(part))->itv)) ? -1 : 1)
++
++#define CMP_BEGIN_GTE_PART(addr, part) \
++	(((addr) > (r_itv_begin (((RIOMapSkyline *)(part))->itv))) - ((addr) < (r_itv_begin (((RIOMapSkyline *)(part))->itv))))
++
++static bool add_map_to_skyline(RIO *io, RIOMap *map) {
++	size_t slot;
++	RPVector *skyline = &io->map_skyline;
++
++	RIOMapSkyline *new_part = R_NEW (RIOMapSkyline);
++	new_part->map = map;
++	new_part->itv = map->itv;
++	const ut64 new_part_end = r_itv_end (new_part->itv);
++
++	// `part` is the first RIOMapSkyline with part->itv.addr >= new_part->itv.addr
++	r_pvector_lower_bound (skyline, new_part->itv.addr, slot, CMP_BEGIN_GTE_PART);
++	RIOMapSkyline *part = slot < r_pvector_len (skyline) ? r_pvector_at (skyline, slot) : NULL;
++	if (slot) {
++		RIOMapSkyline *prev_part = r_pvector_at (skyline, slot - 1);
++		const ut64 prev_part_end = r_itv_end (prev_part->itv);
++		if (prev_part_end > r_itv_begin (new_part->itv)) {
++			if (prev_part_end > new_part_end) {
++				RIOMapSkyline *tail = R_NEW (RIOMapSkyline);
++				tail->map = prev_part->map;
++				tail->itv.addr = new_part_end;
++				tail->itv.size = prev_part_end - r_itv_begin (tail->itv);
++				if (slot < r_pvector_len (skyline)) {
++					r_pvector_insert (skyline, slot, tail);
++				} else {
++					r_pvector_push (skyline, tail);
++				}
++			}
++			prev_part->itv.size = r_itv_begin (new_part->itv) - r_itv_begin (prev_part->itv);
++		}
+ 	}
+-	part->map = map;
+-	part->itv = (RInterval){ from, to - from };
+-	if (!from && !to) {
+-		// Split to two maps
+-		part1 = R_NEW (RIOMapSkyline);
+-		if (!part1) {
+-			free (part);
+-			return false;
++	if (part) {
++		while (part && r_itv_include (new_part->itv, part->itv)) {
++			// Remove `part` that fits in `new_part`
++			r_pvector_remov

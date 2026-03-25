@@ -1,0 +1,139 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,1336 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/script_opt/GenRDs.h"
++#include "zeek/script_opt/ScriptOpt.h"
++#include "zeek/Scope.h"
++#include "zeek/Reporter.h"
++#include "zeek/Desc.h"
++
++
++namespace zeek::detail {
++
++
++// Helper class that tracks definitions gathered in a block that either
++// need to be propagated to the beginning of the block or to the end.
++// Used for RD propagation due to altered control flow (next/break/fallthrough).
++// Managed as a stack (vector) to deal with nested loops, switches, etc.
++// Only applies to gathering maximum RDs.
++class BlockDefs {
++public:
++	BlockDefs(bool _is_case)
++		{ is_case = _is_case; }
++
++	void AddPreRDs(RDPtr RDs)	{ pre_RDs.push_back(RDs); }
++	void AddPostRDs(RDPtr RDs)	{ post_RDs.push_back(RDs); }
++	void AddFutureRDs(RDPtr RDs)	{ future_RDs.push_back(RDs); }
++
++	const std::vector<RDPtr>& PreRDs() const	{ return pre_RDs; }
++	const std::vector<RDPtr>& PostRDs() const	{ return post_RDs; }
++	const std::vector<RDPtr>& FutureRDs() const	{ return future_RDs; }
++
++	void Clear()
++		{ pre_RDs.clear(); post_RDs.clear(); future_RDs.clear(); }
++
++	bool IsCase() const	{ return is_case; }
++
++private:
++	std::vector<RDPtr> pre_RDs;
++	std::vector<RDPtr> post_RDs;
++	std::vector<RDPtr> future_RDs;	// RDs for next case block
++
++	// Whether this block is for a switch case.  If not,
++	// it's for a loop body.
++	bool is_case;
++};
++
++
++void RD_Decorate::TraverseFunction(const Func* f, Scope* scope, StmtPtr body)
++	{
++	func_flavor = f->Flavor();
++
++	auto args = scope->OrderedVars();
++	int nparam = f->GetType()->Params()->NumFields();
++
++	mgr.SetEmptyPre(f);
++
++	for ( auto a : args )
++		{
++		if ( --nparam < 0 )
++			break;
++
++		CreateInitPostDef(a.get(), DefinitionPoint(f), true, nullptr);
++		}
++
++	for ( const auto& g : pf->Globals() )
++		CreateInitPostDef(g, DefinitionPoint(f), true, nullptr);
++
++	if ( ! mgr.HasPostMinRDs(f) )
++		// This happens if we have no arguments or globals.  Use the
++		// empty ones we set up.
++		mgr.SetPostFromPre(f);
++
++	mgr.SetPreFromPost(body.get(), f);
++	body->Traverse(this);
++	}
++
++TraversalCode RD_Decorate::PreStmt(const Stmt* s)
++	{
++	ASSERT(mgr.HasPreMinRDs(s));
++	ASSERT(mgr.HasPreMaxRDs(s));
++
++	switch ( s->Tag() ) {
++	case STMT_EXPR:
++	case STMT_EVENT:
++	case STMT_ADD:
++	case STMT_DELETE:
++	case STMT_RETURN:
++	case STMT_CHECK_ANY_LEN:
++		{
++		// Can't use AsExprStmt() since it doesn't know about
++		// the tags of its subclasses.
++		auto e = ((const ExprStmt*) s)->StmtExpr();
++		mgr.SetPreFromPre(e, s);
++		break;
++		}
++
++	case STMT_PRINT:
++		{
++		auto l = s->AsPrintStmt()->ExprList();
++		mgr.SetPreFromPre(l, s);
++		break;
++		}
++
++	case STMT_CATCH_RETURN:
++		{
++		auto cr = s->AsCatchReturnStmt();
++		auto block = cr->Block().get();
++
++		mgr.SetPreFromPre(block, s);
++		block->Traverse(this);
++
++		// Treat the block as a no-op for analyzing RDs,
++		// since it shouldn't affect the definition status of
++		// any of the RDs outside of it.  (The one exception is
++		// for globals, which we can address by synchronizing
++		// globals after inlined returns.)  The only question is
++		// how to propagate RDs relating to the return value.
++		mgr.SetPostFromPre(s);
++
++		auto ret_var = cr->RetVar();
++		if ( ret_var )
++			{
++			// Ideally for the return variable (if any) we'd track
++			// whether all of the paths out of the block go through
++			// a "return <expr>".  One way we could do that would
++			// be to literally assign it for internal returns.
++			// The trick with that is it could entail some subtle
++			// debugging of how RDs are propagated across internal
++			// returns.  For now, we punt and just mark it as
++			// defined.  This doesn't lead to any incorrect
++			// optimization decisions, it just misses out on
++			// an opportunity to flag a potential return-without-
++			// value ... but only in the case where we're using
++			// inlining, too.
++			CreateInitPostDef(ret_var->Id(), De

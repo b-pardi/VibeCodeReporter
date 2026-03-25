@@ -1,0 +1,116 @@
+@@ -6,6 +6,7 @@ import java.nio.file.Paths;
+ import java.util.Arrays;
+ import java.util.List;
+ import java.util.stream.Collectors;
++import javax.annotation.Nonnull;
+ import javax.annotation.Nullable;
+ import org.batfish.common.BaseSettings;
+ import org.batfish.common.BatfishLogger;
+@@ -1011,6 +1012,10 @@ public final class Settings extends BaseSettings implements GrammarSettings {
+     _config.setProperty(BfConsts.ARG_HALT_ON_PARSE_ERROR, haltOnParseError);
+   }
+ 
++  public void setIgnoreFilesWithStrings(@Nonnull List<String> ignored) {
++    _config.setProperty(BfConsts.ARG_IGNORE_FILES_WITH_STRINGS, ignored);
++  }
++
+   public void setInitInfo(boolean initInfo) {
+     _config.setProperty(BfConsts.COMMAND_INIT_INFO, initInfo);
+   }
+
+
+
+
+@@ -1,9 +1,15 @@
+ package org.batfish.job;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.collect.Multimap;
++import io.opentracing.ActiveSpan;
++import io.opentracing.References;
++import io.opentracing.SpanContext;
++import io.opentracing.util.GlobalTracer;
+ import java.nio.file.Paths;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
++import javax.annotation.Nullable;
+ import org.antlr.v4.runtime.ParserRuleContext;
+ import org.batfish.common.BatfishException;
+ import org.batfish.common.ParseTreeSentences;
+@@ -78,6 +84,8 @@ public class ParseVendorConfigurationJob extends BatfishJob<ParseVendorConfigura
+ 
+   private ParseTreeSentences _ptSentences;
+ 
++  @Nullable private SpanContext _spanContext;
++
+   private Warnings _warnings;
+ 
+   public ParseVendorConfigurationJob(
+@@ -86,7 +94,8 @@ public class ParseVendorConfigurationJob extends BatfishJob<ParseVendorConfigura
+       String filename,
+       Warnings warnings,
+       ConfigurationFormat configurationFormat,
+-      Multimap<String, String> duplicateHostnames) {
++      Multimap<String, String> duplicateHostnames,
++      @Nullable SpanContext spanContext) {
+     super(settings);
+     _fileText = fileText;
+     _filename = filename;
+@@ -94,350 +103,395 @@ public class ParseVendorConfigurationJob extends BatfishJob<ParseVendorConfigura
+     _warnings = warnings;
+     _format = configurationFormat;
+     _duplicateHostnames = duplicateHostnames;
++    _spanContext = spanContext;
++  }
++
++  private static final Pattern WHITESPACE_ONLY = Pattern.compile("^\\s*$");
++
++  /**
++   * Detects and returns the {@link ConfigurationFormat format} of the given text using the given
++   * default format.
++   */
++  @VisibleForTesting
++  static ConfigurationFormat detectFormat(
++      String fileText, Settings settings, ConfigurationFormat format) {
++    try (ActiveSpan span = GlobalTracer.get().buildSpan("Detecting file format").startActive()) {
++      assert span != null; // avoid unused warning
++
++      if (WHITESPACE_ONLY.matcher(fileText).matches()) {
++        return ConfigurationFormat.EMPTY;
++      }
++
++      if (settings.ignoreFilesWithStrings().stream().anyMatch(fileText::contains)) {
++        return ConfigurationFormat.IGNORED;
++      }
++
++      if (format == ConfigurationFormat.UNKNOWN) {
++        return VendorConfigurationFormatDetector.identifyConfigurationFormat(fileText);
++      }
++
++      return format;
++    }
+   }
+ 
+   @SuppressWarnings("fallthrough")
+   @Override
+   public ParseVendorConfigurationResult call() throws Exception {
+     long startTime = System.currentTimeMillis();
+-    long elapsedTime;
+-    VendorConfiguration vc = null;
+-    BatfishCombinedParser<?, ?> combinedParser = null;
+-    ParserRuleContext tree = null;
+-    ControlPlaneExtractor extractor = null;
+-    ConfigurationFormat format = _format;
+-    FlattenerLineMap lineMap = null;
+     _logger.infof("Processing: '%s'\n", _filename);
+ 
+-    try {
+-      for (String s : _settings.ignoreFilesWithStrings()) {
+-        if (_fileText.contains(s)) {
+-          format = ConfigurationFormat.IGNORED;
+-          break;
+-        }
+-      }
++    try (ActiveSpan span =
++        GlobalTracer.get()
++            .buildSpan("ParseVendorConfigurati

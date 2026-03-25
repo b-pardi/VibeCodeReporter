@@ -1,0 +1,107 @@
+@@ -74,11 +74,6 @@ class Flow : public GenericHashEntry {
+ 
+   u_int hash_entry_id; /* Uniquely identify this Flow inside the flows_hash hash table */
+ 
+-  /* When the interface isViewed(), the corresponding view needs to acknowledge the purge
+-     before the flow can actually be deleted from memory. This guarantees the view has
+-     seen the flow until it has become idle. */
+-  bool purge_acknowledged_mark;
+-
+   bool detection_completed, protocol_processed, fully_processed,
+     cli2srv_direction, twh_over, twh_ok, dissect_next_http_packet, passVerdict,
+     l7_protocol_guessed, flow_dropped_counts_increased,
+@@ -444,9 +439,6 @@ class Flow : public GenericHashEntry {
+   bool is_hash_entry_state_idle_transition_ready() const;
+   void periodic_hash_entry_state_update(void *user_data, bool quick);
+   void periodic_stats_update(void *user_data, bool quick);
+-  void set_to_purge(time_t t);
+-  bool is_acknowledged_to_purge() const;
+-  void set_acknowledge_to_purge();
+   void  set_hash_entry_id(u_int assigned_hash_entry_id);
+   u_int get_hash_entry_id() const;
+ 
+
+
+
+
+@@ -457,7 +457,9 @@ class NetworkInterface : public AlertableEntity {
+   void getActiveFlowsStats(nDPIStats *stats, FlowStats *status_stats, AddressTree *allowed_hosts, Host *h, Paginator *p);
+   virtual u_int32_t periodicStatsUpdateFrequency() const;
+   void periodicStatsUpdate();
+-  void periodicHTStateUpdate(time_t deadline, lua_State* vm);
++  virtual void periodicHTStateUpdate(time_t deadline, lua_State* vm);
++  static bool quick_periodic_ht_state_update(time_t deadline, GenericHashEntry *ghe);
++  static void generic_periodic_hash_entry_state_update(GenericHashEntry *node, void *user_data);
+   virtual u_int32_t getFlowMaxIdle();
+   virtual void lua(lua_State* vm);
+   void lua_hash_tables_stats(lua_State* vm);
+
+
+
+
+@@ -33,6 +33,7 @@ class ThreadedActivity {
+   char *path;
+   u_int32_t periodicity;
+   bool align_to_localtime;
++  bool exclude_viewed_interfaces;
+   bool thread_started;
+   bool systemTaskRunning;
+   bool *interfaceTasksRunning;
+@@ -52,6 +53,7 @@ class ThreadedActivity {
+   ThreadedActivity(const char* _path,
+ 		   u_int32_t _periodicity_seconds = 0,
+ 		   bool _align_to_localtime = false,
++		   bool _exclude_viewed_interfaces = false,
+ 		   u_int8_t thread_pool_size = 1);
+   ~ThreadedActivity();
+ 
+
+
+
+
+@@ -29,7 +29,6 @@ class ViewInterface : public NetworkInterface {
+   bool is_packet_interface;
+   u_int8_t num_viewed_interfaces;
+   NetworkInterface *viewed_interfaces[MAX_NUM_VIEW_INTERFACES];
+-  void viewedFlowsWalker();
+ 
+   virtual void sumStats(TcpFlowStats *_tcpFlowStats, EthStats *_ethStats,
+ 			LocalTrafficStats *_localStats, nDPIStats *_ndpiStats,
+@@ -37,7 +36,14 @@ class ViewInterface : public NetworkInterface {
+ 
+  public:
+   ViewInterface(const char *_endpoint);
+-
++  virtual void periodicHTStateUpdate(time_t deadline, lua_State* vm);
++  bool walker(u_int32_t *begin_slot,
++	      bool walk_all,
++	      WalkerType wtype,
++	      bool (*walker)(GenericHashEntry *h, void *user_data, bool *matched),
++	      void *user_data);
++  void viewed_flows_walker(Flow *f, void *user_data);
++  static void generic_periodic_hash_entry_state_update(GenericHashEntry *node, void *user_data);
+   virtual InterfaceType getIfType() const { return interface_type_VIEW;           };
+   inline const char* get_type()           { return CONST_INTERFACE_TYPE_VIEW;     };
+   virtual bool is_ndpi_enabled()    const { return false;                         };
+
+
+
+
+@@ -56,6 +56,7 @@ typedef enum {
+ /* Struct used to pass parameters when walking hosts and flows periodically to update their stats */
+ class AlertCheckLuaEngine;
+ typedef struct {
++  NetworkInterface *iface;
+   AlertCheckLuaEngine *acle;
+   struct timeval *tv;
+   time_t deadline;
+
+
+
+
+@@ -54,7 +54,7 @@ Flow::Flow(NetworkInterface *_iface,
+   predominant_status = status_normal;
+ 
+   alert_rowid = -1;
+-  purge_acknowledged_mark = detection_completed = update_flow_port_stats = false;
++  detection_completed = update_flow_port

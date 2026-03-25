@@ -1,0 +1,112 @@
+@@ -70,9 +70,11 @@ class Flow : public GenericHashEntry {
+ 
+   char *json_protocol_info, *riskInfo;
+ 
++  /* Calculate the entropy on the first MAX_ENTROPY_BYTES bytes */
+   struct {
+     struct ndpi_analyze_struct *c2s, *s2c;
+-  } entropy;
++  } initial_bytes_entropy;
++  
+   u_int32_t hash_entry_id; /* Uniquely identify this Flow inside the flows_hash hash table */
+   
+   u_int16_t detection_completed:1, extra_dissection_completed:1,
+@@ -187,6 +189,10 @@ class Flow : public GenericHashEntry {
+ 	u_int8_t icmp_type, icmp_code;
+       } cli2srv, srv2cli;
+       u_int16_t max_icmp_payload_size;
++
++      struct {
++	float min_entropy, max_entropy;
++      } client_to_server;
+     } icmp;
+   } protos;
+ 
+@@ -895,11 +901,15 @@ class Flow : public GenericHashEntry {
+   inline u_int8_t getSrv2CliECN()  { return (srv2cli_tos & 0x3); }
+ 
+   inline float getEntropy(bool src2dst_direction) {
+-    struct ndpi_analyze_struct *e = src2dst_direction ? entropy.c2s : entropy.s2c;
++    struct ndpi_analyze_struct *e = src2dst_direction ? initial_bytes_entropy.c2s : initial_bytes_entropy.s2c;
+ 
+     return(e ? ndpi_data_entropy(e) : 0);
+   }
+ 
++  inline float getICMPPacketsEntropy() {
++    return(protos.icmp.client_to_server.max_entropy - protos.icmp.client_to_server.min_entropy);
++  }
++  
+   inline bool timeToPeriodicDump(u_int sec) {
+     return((sec - get_first_seen()        >= CONST_DB_DUMP_FREQUENCY) &&
+            (sec - get_partial_last_seen() >= CONST_DB_DUMP_FREQUENCY));
+
+
+
+
+@@ -216,12 +216,12 @@ Flow::Flow(NetworkInterface *_iface,
+   if(iface->isPacketInterface() && !iface->isSampledTraffic()) {
+     cli2srvPktTime = new (std::nothrow) InterarrivalStats();
+     srv2cliPktTime = new (std::nothrow) InterarrivalStats();
+-    entropy.c2s = ndpi_alloc_data_analysis(256);
+-    entropy.s2c = ndpi_alloc_data_analysis(256);
++    initial_bytes_entropy.c2s = ndpi_alloc_data_analysis(256);
++    initial_bytes_entropy.s2c = ndpi_alloc_data_analysis(256);
+   } else {
+     cli2srvPktTime = NULL;
+     srv2cliPktTime = NULL;
+-    entropy.c2s = entropy.s2c = NULL;
++    initial_bytes_entropy.c2s = initial_bytes_entropy.s2c = NULL;
+   }
+ 
+ #ifdef NTOPNG_PRO
+@@ -376,8 +376,8 @@ Flow::~Flow() {
+   if(cli2srvPktTime) delete cli2srvPktTime;
+   if(srv2cliPktTime) delete srv2cliPktTime;
+ 
+-  if(entropy.c2s) ndpi_free_data_analysis(entropy.c2s, 1);
+-  if(entropy.s2c) ndpi_free_data_analysis(entropy.s2c, 1);
++  if(initial_bytes_entropy.c2s) ndpi_free_data_analysis(initial_bytes_entropy.c2s, 1);
++  if(initial_bytes_entropy.s2c) ndpi_free_data_analysis(initial_bytes_entropy.s2c, 1);
+ 
+   if(flow_payload)                   free(flow_payload);
+ 
+@@ -964,6 +964,7 @@ void Flow::processPacket(const struct pcap_pkthdr *h,
+       ntop->incBlacklisHits(std::string(get_custom_category_file()));
+     }
+   }
++
+ }
+ 
+ /* *************************************** */
+@@ -4100,6 +4101,38 @@ void Flow::incStats(bool cli2srv_direction, u_int pkt_len,
+   if((l4_proto == IPPROTO_TCP) && (tcp_flags & (TH_SYN|TH_FIN|TH_RST)))
+     update_iat = false;
+ 
++  if((protocol == IPPROTO_ICMP)
++     && cli2srv_direction
++     && (payload != NULL)
++     && (payload_len > 0)) {
++    /* 
++       We compute cli->srv entropy to see how much
++       packets are different and see if they are 
++       repetitions or not
++    */
++    struct ndpi_analyze_struct e;
++    float res;
++    
++    ndpi_init_data_analysis(&e, 256);
++    updateEntropy(&e, payload, payload_len);
++    res = ndpi_data_entropy(&e);
++
++    if(protos.icmp.client_to_server.min_entropy == 0)
++      protos.icmp.client_to_server.min_entropy = protos.icmp.client_to_server.max_entropy = res;
++    else {
++      if(protos.icmp.client_to_server.min_entropy > res)
++	protos.icmp.client_to_server.min_entropy = res;
++      else if(protos.icmp.client_to_server.max_entropy < res)
++	protos.icmp.client_to_server.max_entropy = res;
++    }
++
++#ifdef DEBUG
++    ntop->getTrace()->traceEvent(TRACE_NORMAL, "Entropy %.23f - %.23f",
++				 protos.icmp.client_to_server.mi

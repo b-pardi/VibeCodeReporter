@@ -1,0 +1,126 @@
+@@ -27,7 +27,6 @@ void MCInst_Init(MCInst *inst)
+ 	inst->size = 0;
+ 	inst->has_imm = false;
+ 	inst->op1_size = 0;
+-	inst->writeback = false;
+ 	inst->ac_idx = 0;
+ 	inst->popcode_adjust = 0;
+ 	inst->assembly[0] = '\0';
+@@ -268,3 +267,16 @@ bool MCInst_opIsTying(const MCInst *MI, unsigned OpNum)
+ 	assert(OpNum < MAX_MC_OPS && "Maximum number of MC operands exceeded.");
+ 	return MI->tied_op_idx[OpNum] != -1;
+ }
++
++/// Returns the value of the @MCInst operand at index @OpNum.
++uint64_t MCInst_getOpVal(MCInst *MI, unsigned OpNum)
++{
++	assert(OpNum < MAX_MC_OPS);
++	MCOperand *op = MCInst_getOperand(MI, OpNum);
++	if (MCOperand_isReg(op))
++		return MCOperand_getReg(op);
++	else if (MCOperand_isImm(op))
++		return MCOperand_getImm(op);
++	else
++		assert(0 && "Operand type not handled in this getter.");
++}
+
+
+
+
+@@ -38,7 +38,6 @@ struct MCOperand {
+ 		kDFPImmediate, ///< Double-Floating-point immediate operand.
+ 		kExpr,	       ///< Relocatable immediate operand.
+ 		kInst	       ///< Sub-instruction operand.
+-
+ 	} MachineOperandType;
+ 	unsigned char Kind;
+ 
+@@ -162,4 +161,6 @@ bool MCInst_opIsTied(const MCInst *MI, unsigned OpNum);
+ 
+ bool MCInst_opIsTying(const MCInst *MI, unsigned OpNum);
+ 
++uint64_t MCInst_getOpVal(MCInst *MI, unsigned OpNum);
++
+ #endif
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,227 @@
++/* Capstone Disassembly Engine */
++/* By Rot127 <unisono@quyllur.org>, 2023 */
++
++#include "MCInstPrinter.h"
++#include "cs_priv.h"
++#include <capstone/platform.h>
++
++extern bool ARM_getFeatureBits(unsigned int mode, unsigned int feature);
++
++static bool testFeatureBits(const MCInst *MI, uint32_t Value)
++{
++	assert(MI && MI->csh);
++	switch (MI->csh->arch) {
++	default:
++		assert(0 && "Not implemented for current arch.");
++	case CS_ARCH_ARM:
++		return ARM_getFeatureBits(MI->csh->mode, Value);
++	}
++}
++
++static bool matchAliasCondition(MCInst *MI, const MCRegisterInfo *MRI,
++								unsigned *OpIdx, const AliasMatchingData *M,
++								const AliasPatternCond *C,
++								bool *OrPredicateResult)
++{
++	// Feature tests are special, they don't consume operands.
++	if (C->Kind == AliasPatternCond_K_Feature)
++		return testFeatureBits(MI, C->Value);
++	if (C->Kind == AliasPatternCond_K_NegFeature)
++		return !testFeatureBits(MI, C->Value);
++	// For feature tests where just one feature is required in a list, set the
++	// predicate result bit to whether the expression will return true, and only
++	// return the real result at the end of list marker.
++	if (C->Kind == AliasPatternCond_K_OrFeature) {
++		*OrPredicateResult |= testFeatureBits(MI, C->Value);
++		return true;
++	}
++	if (C->Kind == AliasPatternCond_K_OrNegFeature) {
++		*OrPredicateResult |= !(testFeatureBits(MI, C->Value));
++		return true;
++	}
++	if (C->Kind == AliasPatternCond_K_EndOrFeatures) {
++		bool Res = *OrPredicateResult;
++		*OrPredicateResult = false;
++		return Res;
++	}
++
++	// Get and consume an operand.
++	MCOperand *Opnd = MCInst_getOperand(MI, *OpIdx);
++	++(*OpIdx);
++
++	// Check the specific condition for the operand.
++	switch (C->Kind) {
++	case AliasPatternCond_K_Imm:
++		// Operand must be a specific immediate.
++		return MCOperand_isImm(Opnd) &&
++			   MCOperand_getImm(Opnd) == (int32_t)C->Value;
++	case AliasPatternCond_K_Reg:
++		// Operand must be a specific register.
++		return MCOperand_isReg(Opnd) && MCOperand_getReg(Opnd) == C->Value;
++	case AliasPatternCond_K_TiedReg:
++		// Operand must match the register of another operand.
++		return MCOperand_isReg(Opnd) &&
++			   MCOperand_getReg(Opnd) ==
++				   MCOperand_getReg(MCInst_getOperand(MI, C->Value));
++	case AliasPatternCond_K_RegClass:
++		// Operand must be a register in this class. Value is a register class
++		// id.
++		return MCOperand_isReg(Opnd) &&
++			   MCRegisterClass_contains(
++				   MCRegisterInfo_getRegClass(MRI, C->Value),
++				   MCOperand_getReg(Opnd));
++	case AliasPatternCond_K_Custom:
++		// Operand must match some custom criteria.
++		assert(M->ValidateMCOperand && "A custom validator should be set but isn't.");
++		return M->Va

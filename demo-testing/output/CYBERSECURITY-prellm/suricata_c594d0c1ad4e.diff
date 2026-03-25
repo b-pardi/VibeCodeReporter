@@ -1,0 +1,127 @@
+@@ -57,13 +57,17 @@
+ #define LIBNET_INIT_CAST
+ #endif
+ 
++/* Globally configured device to use for sending resets in IDS mode. */
++const char *g_reject_dev = NULL;
++
+ /** set to true in main if we're setting caps. We need it here if we're using
+   * reject rules as libnet 1.1 is not compatible with caps. */
+ extern int sc_set_caps;
+ 
+ #include <libnet.h>
+ 
+-extern uint8_t host_mode;
++thread_local libnet_t *t_c = NULL;
++thread_local int t_inject_mode = -1;
+ 
+ typedef struct Libnet11Packet_ {
+     uint32_t ack, seq;
+@@ -76,38 +80,59 @@ typedef struct Libnet11Packet_ {
+     uint32_t src4, dst4;
+     uint16_t sp, dp;
+     size_t len;
++    uint8_t *smac, *dmac;
+ } Libnet11Packet;
+ 
+-int RejectSendLibnet11L3IPv4TCP(ThreadVars *tv, Packet *p, void *data, int dir)
++static inline libnet_t *GetCtx(const Packet *p, int injection_type)
+ {
+-    Libnet11Packet lpacket;
+-    libnet_t *c; /* libnet context */
+-    char ebuf[LIBNET_ERRBUF_SIZE];
+-    int result;
+-    const char *devname = NULL;
+-
+-    /* fill in struct defaults */
+-    lpacket.ttl = 0;
+-    lpacket.id = 0;
+-    lpacket.flow = 0;
+-    lpacket.class = 0;
++    /* fast path: use cache ctx */
++    if (t_c)
++        return t_c;
+ 
+-    if (IS_SURI_HOST_MODE_SNIFFER_ONLY(host_mode) && (p->livedev)) {
+-        devname = p->livedev->dev;
+-        SCLogDebug("Will emit reject packet on dev %s", devname);
++    /* slow path: setup a new ctx */
++    bool store_ctx = false;
++    const char *devname = NULL;
++    extern uint8_t host_mode;
++    if (IS_SURI_HOST_MODE_SNIFFER_ONLY(host_mode)) {
++        if (g_reject_dev != NULL) {
++            if (p->datalink == LINKTYPE_ETHERNET)
++                injection_type = t_inject_mode = LIBNET_LINK;
++            devname = g_reject_dev;
++            store_ctx = true;
++        } else {
++            devname = p->livedev ? p->livedev->dev : NULL;
++        }
+     }
+ 
+-    if (p->tcph == NULL)
+-        return 1;
+-
+-    if ((c = libnet_init(LIBNET_RAW4, LIBNET_INIT_CAST devname, ebuf)) == NULL) {
++    char ebuf[LIBNET_ERRBUF_SIZE];
++    libnet_t *c = libnet_init(injection_type, LIBNET_INIT_CAST devname, ebuf);
++    if (c == NULL) {
+         SCLogError(SC_ERR_LIBNET_INIT,"libnet_init failed: %s", ebuf);
+-        return 1;
+     }
++    if (store_ctx) {
++        t_c = c;
++    }
++    return c;
++}
+ 
+-    /* save payload len */
+-    lpacket.dsize = p->payload_len;
++static inline void ClearCtx(libnet_t *c)
++{
++    if (t_c == c)
++        libnet_clear_packet(c);
++    else
++        libnet_destroy(c);
++}
+ 
++void FreeCachedCtx(void)
++{
++    if (t_c) {
++        libnet_destroy(t_c);
++        t_c = NULL;
++    }
++}
++
++static inline void SetupTCP(Packet *p, Libnet11Packet *lpacket, int dir)
++{
+     switch (dir) {
+         case REJECT_DIR_SRC:
+             SCLogDebug("sending a tcp reset to src");
+@@ -117,50 +142,41 @@ int RejectSendLibnet11L3IPv4TCP(ThreadVars *tv, Packet *p, void *data, int dir)
+              *  is equal to the ACK of incoming packet and the ACK is build
+              *  using packet sequence number and size of the data. */
+             if (TCP_GET_ACK(p) == 0) {
+-                lpacket.seq = 0;
+-                lpacket.ack = TCP_GET_SEQ(p) + lpacket.dsize + 1;
++                lpacket->seq = 0;
++                lpacket->ack = TCP_GET_SEQ(p) + lpacket->dsize + 1;
+             } else {
+-                lpacket.seq = TCP_GET_ACK(p);
+-                lpacket.ack = TCP_GET_SEQ(p) + lpacket.dsize;
++                lpacket->seq = TCP_GET_ACK(p);
++                lpacket->ack = TCP_GET_SEQ(p) + lpacket->dsize;
+             }
+ 
+-            lpacket.sp = TCP_GET_DST_PORT(p);
+-            lpacket.dp = TCP_GET_SRC_PORT(p);
+-
+-            lpacket.src4 = GET_IPV4_DST_ADDR_U32(p);
+-            lpacket.dst4 = GET_IPV4_SRC_ADDR_U32(p);
++            lpacket->sp = TCP_GET_DST_PORT(p);
++            lpacket->dp = TCP_GET_SRC_PORT(p);
+             break;
+         case REJECT_DIR_DST:
+             SCLogDebug("sending a tcp reset to dst");
+-            lpacket.seq = TCP_GET_SEQ(p);

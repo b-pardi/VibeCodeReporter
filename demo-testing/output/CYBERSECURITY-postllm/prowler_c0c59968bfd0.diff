@@ -1,0 +1,119 @@
+@@ -31,6 +31,8 @@ class VPC(AWSService):
+         self.vpc_subnets = {}
+         self.__threading_call__(self._describe_vpc_subnets)
+         self._describe_network_interfaces()
++        self.vpn_connections = {}
++        self.__threading_call__(self._describe_vpn_connections)
+ 
+     def _describe_vpcs(self, regional_client):
+         logger.info("VPC - Describing VPCs...")
+@@ -399,6 +401,35 @@ class VPC(AWSService):
+                 f"{regional_client.region} -- {error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
+             )
+ 
++    def _describe_vpn_connections(self, regional_client):
++        try:
++            describe_vpn_connections = regional_client.describe_vpn_connections()
++
++            for vpn_connection in describe_vpn_connections["VpnConnections"]:
++                arn = f"arn:{self.audited_partition}:ec2:{regional_client.region}:{self.audited_account}:vpn-connection/{vpn_connection['VpnConnectionId']}"
++                if not self.audit_resources or (
++                    is_resource_filtered(arn, self.audit_resources)
++                ):
++                    tunnels = []
++                    for tunnel in vpn_connection["VgwTelemetry"]:
++                        tunnels.append(
++                            VpnTunnel(
++                                status=tunnel["Status"],
++                                outside_ip_address=tunnel["OutsideIpAddress"],
++                            )
++                        )
++                    self.vpn_connections[arn] = VpnConnection(
++                        id=vpn_connection["VpnConnectionId"],
++                        tunnels=tunnels,
++                        region=regional_client.region,
++                        tags=vpn_connection.get("Tags"),
++                    )
++
++        except Exception as error:
++            logger.error(
++                f"{regional_client.region} -- {error.__class__.__name__}[{error.__traceback__.tb_lineno}]: {error}"
++            )
++
+ 
+ class VpcSubnet(BaseModel):
+     arn: str
+@@ -467,3 +498,15 @@ class VpcEndpointService(BaseModel):
+     allowed_principals: list = []
+     region: str
+     tags: Optional[list] = []
++
++
++class VpnTunnel(BaseModel):
++    status: str
++    outside_ip_address: str
++
++
++class VpnConnection(BaseModel):
++    id: str
++    tunnels: list[VpnTunnel]
++    region: str
++    tags: Optional[list] = []
+
+new file mode 100644
+
+
+new file mode 100644
+
+
+
+@@ -0,0 +1,31 @@
++from prowler.lib.check.models import Check, Check_Report_AWS
++from prowler.providers.aws.services.vpc.vpc_client import vpc_client
++
++
++class vpc_vpn_connection_tunnels_up(Check):
++    def execute(self):
++        findings = []
++        for vpn_arn, vpn_connection in vpc_client.vpn_connections.items():
++            report = Check_Report_AWS(self.metadata())
++            report.region = vpn_connection.region
++            report.resource_id = vpn_connection.id
++            report.resource_arn = vpn_arn
++            report.resource_tags = vpn_connection.tags
++
++            if (
++                vpn_connection.tunnels[0].status != "UP"
++                or vpn_connection.tunnels[1].status != "UP"
++            ):
++                report.status = "FAIL"
++                report.status_extended = (
++                    f"VPN Connection {vpn_connection.id} has at least one tunnel DOWN. "
++                )
++            else:
++                report.status = "PASS"
++                report.status_extended = (
++                    f"VPN Connection {vpn_connection.id} has both tunnels UP. "
++                )
++
++            findings.append(report)
++
++        return findings
+
+
+
+
+@@ -1,9 +1,11 @@
+ import json
+ 
++import botocore
++import mock
+ from boto3 import client, resource
+ from moto import mock_aws
+ 
+-from prowler.providers.aws.services.vpc.vpc_service import Route
++from prowler.providers.aws.services.vpc.vpc_service import VPC, Route
+ from tests.providers.aws.utils import (
+     AWS_ACCOUNT_NUMBER,
+     AWS_REGION_EU_WEST_1,
+@@ -11,6 +13,37 @@ from tests.

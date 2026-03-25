@@ -1,0 +1,138 @@
+@@ -85,7 +85,6 @@ NetSessions::NetSessions()
+ 
+ 	packet_filter = nullptr;
+ 
+-	dump_this_packet = false;
+ 	num_packets_processed = 0;
+ 	static auto pkt_profile_file = id::find_val("pkt_profile_file");
+ 
+@@ -132,10 +131,15 @@ void NetSessions::NextPacket(double t, const Packet* pkt)
+ 
+ 	++num_packets_processed;
+ 
+-	dump_this_packet = false;
+-
+-	if ( zeek::detail::record_all_packets )
++	bool dumped_packet = false;
++	if ( pkt->dump_packet || zeek::detail::record_all_packets )
++		{
+ 		DumpPacket(pkt);
++		dumped_packet = true;
++		}
++
++	if ( ! pkt->session_analysis )
++		return;
+ 
+ 	if ( pkt->hdr_size > pkt->cap_len )
+ 		{
+@@ -153,7 +157,7 @@ void NetSessions::NextPacket(double t, const Packet* pkt)
+ 			return;
+ 			}
+ 
+-		const struct ip* ip = (const struct ip*) (pkt->data + pkt->hdr_size);
++		auto ip = (const struct ip*) (pkt->data + pkt->hdr_size);
+ 		IP_Hdr ip_hdr(ip, false);
+ 		DoNextPacket(t, pkt, &ip_hdr, nullptr);
+ 		}
+@@ -170,19 +174,14 @@ void NetSessions::NextPacket(double t, const Packet* pkt)
+ 		DoNextPacket(t, pkt, &ip_hdr, nullptr);
+ 		}
+ 
+-	else if ( pkt->l3_proto == L3_ARP )
+-		{
+-		// Do nothing here as ARP has moved into a packet analyzer
+-		//TODO: Revisit the use of packet's l3_proto
+-		}
+-
+ 	else
+ 		{
+ 		Weird("unknown_packet_type", pkt);
+ 		return;
+ 		}
+ 
+-	if ( dump_this_packet && ! zeek::detail::record_all_packets )
++	// Check whether packet should be recorded based on session analysis
++	if ( pkt->dump_packet && ! dumped_packet )
+ 		DumpPacket(pkt);
+ 	}
+ 
+@@ -283,7 +282,7 @@ void NetSessions::DoNextPacket(double t, const Packet* pkt, const IP_Hdr* ip_hdr
+ 
+ 	if ( ip_hdr->IsFragment() )
+ 		{
+-		dump_this_packet = true;	// always record fragments
++		pkt->dump_packet = true;	// always record fragments
+ 
+ 		if ( caplen < len )
+ 			{
+@@ -326,7 +325,7 @@ void NetSessions::DoNextPacket(double t, const Packet* pkt, const IP_Hdr* ip_hdr
+ 	// there, it's always the last.
+ 	if ( ip_hdr->LastHeader() == IPPROTO_ESP )
+ 		{
+-		dump_this_packet = true;
++		pkt->dump_packet = true;
+ 		if ( esp_packet )
+ 			event_mgr.Enqueue(esp_packet, ip_hdr->ToPktHdrVal());
+ 
+@@ -728,7 +727,7 @@ void NetSessions::DoNextPacket(double t, const Packet* pkt, const IP_Hdr* ip_hdr
+ 	else if ( record_packet )
+ 		{
+ 		if ( record_content )
+-			dump_this_packet = true;	// save the whole thing
++			pkt->dump_packet = true;	// save the whole thing
+ 
+ 		else
+ 			{
+@@ -1322,7 +1321,7 @@ void NetSessions::Weird(const char* name, const Packet* pkt,
+                         const EncapsulationStack* encap, const char* addl)
+ 	{
+ 	if ( pkt )
+-		dump_this_packet = true;
++		pkt->dump_packet = true;
+ 
+ 	if ( encap && encap->LastType() != BifEnum::Tunnel::NONE )
+ 		reporter->Weird(util::fmt("%s_in_tunnel", name), addl);
+
+
+
+
+@@ -239,7 +239,6 @@ protected:
+ 	detail::PacketFilter* packet_filter;
+ 	uint64_t num_packets_processed;
+ 	detail::PacketProfiler* pkt_profiler;
+-	bool dump_this_packet;	// if true, current packet should be recorded
+ };
+ 
+ namespace detail {
+
+
+
+
+@@ -61,8 +61,8 @@ void Packet::Init(int arg_link_type, pkt_timeval *arg_ts, uint32_t arg_caplen,
+ 
+ 	if ( data )
+ 		{
+-		// From here we assume that layer 2 is valid. If a packet analyzer encounters
+-		// an issue, it will call Packet::Weird(), which sets l2_valid to false.
++		// From here we assume that layer 2 is valid. If the packet analysis fails,
++		// the packet manager will invalidate the packet.
+ 		l2_valid = true;
+ 		packet_mgr->ProcessPacket(this);
+ 		}
+@@ -76,7 +76,6 @@ const IP_Hdr Packet::IP() const
+ void Packet::Weird(const char* name)
+ 	{
+ 	sessions->Weird(name, this);
+-	l2_valid = false;
+ 	}
+ 
+ IntrusivePtr<RecordVal> Packet::ToRawPktHdrVal() const
+@@ -99,6 +98,7 @@ IntrusivePtr<RecordVal> Packet::ToRawPktHdrVal() const
+ 	else if ( l3_proto == L3_ARP )
+ 		l3 = BifEnum::L3_ARP;
+ 
++	// TODO: Get rid of hardcoded l3 protocols.
+ 	// l2_hdr layout:
+ 	//      encap: link_encap;      ##< L2 link encapsulation
+ 	//      len: count;		##< Total frame length on wire
+@@ -169,32 +169,4 @@ ValPtr Packe

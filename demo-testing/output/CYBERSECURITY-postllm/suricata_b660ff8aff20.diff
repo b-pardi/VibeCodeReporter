@@ -1,0 +1,141 @@
+@@ -425,7 +425,7 @@ static int EveStreamLogger(ThreadVars *tv, void *thread_data, const Packet *p)
+     /* Close stream. */
+     jb_close(js);
+ 
+-    OutputJsonBuilderBuffer(js, td->ctx);
++    OutputJsonBuilderBuffer(tv, p, p->flow, js, td->ctx);
+     jb_free(js);
+ 
+     return TM_ECODE_OK;
+
+
+
+
+@@ -15,11 +15,50 @@
+  * 02110-1301, USA.
+  */
+ 
++#include "suricata-common.h"
+ #include "output-eve.h"
+ #include "util-debug.h"
++#include "rust.h"
++
++typedef struct EveUserCallback_ {
++    SCEveUserCallbackFn Callback;
++    void *user;
++    struct EveUserCallback_ *next;
++} EveUserCallback;
++
++static EveUserCallback *eve_user_callbacks = NULL;
+ 
+ static TAILQ_HEAD(, SCEveFileType_) output_types = TAILQ_HEAD_INITIALIZER(output_types);
+ 
++bool SCEveRegisterCallback(SCEveUserCallbackFn fn, void *user)
++{
++    EveUserCallback *cb = SCCalloc(1, sizeof(*cb));
++    if (cb == NULL) {
++        return false;
++    }
++    cb->Callback = fn;
++    cb->user = user;
++    if (eve_user_callbacks == NULL) {
++        eve_user_callbacks = cb;
++    } else {
++        EveUserCallback *current = eve_user_callbacks;
++        while (current->next != NULL) {
++            current = current->next;
++        }
++        current->next = cb;
++    }
++    return true;
++}
++
++void SCEveRunCallbacks(ThreadVars *tv, const Packet *p, Flow *f, JsonBuilder *jb)
++{
++    EveUserCallback *cb = eve_user_callbacks;
++    while (cb != NULL) {
++        cb->Callback(tv, p, f, jb, cb->user);
++        cb = cb->next;
++    }
++}
++
+ static bool IsBuiltinTypeName(const char *name)
+ {
+     const char *builtin[] = {
+
+
+
+
+@@ -31,6 +31,7 @@
+ #define SURICATA_OUTPUT_EVE_H
+ 
+ #include "suricata-common.h"
++#include "rust.h"
+ #include "conf.h"
+ 
+ typedef uint32_t ThreadId;
+@@ -173,4 +174,46 @@ bool SCRegisterEveFileType(SCEveFileType *);
+ 
+ SCEveFileType *SCEveFindFileType(const char *name);
+ 
++/** \brief Function type for EVE callbacks.
++ *
++ * The function type for callbacks registered with
++ * SCEveRegisterCallback. This function will be called with the
++ * JsonBuilder just prior to the top-level object being closed. New
++ * fields maybe added, however there is no way to alter existing
++ * objects already added to the JsonBuilder.
++ *
++ * \param tv The ThreadVars for the thread performing the logging.
++ * \param p Packet if available.
++ * \param f Flow if available.
++ * \param user User data provided during callback registration.
++ */
++typedef void (*SCEveUserCallbackFn)(
++        ThreadVars *tv, const Packet *p, Flow *f, JsonBuilder *jb, void *user);
++
++/** \brief Register a callback for adding extra information to EVE logs.
++ *
++ * Allow users to register a callback for each EVE log. The callback
++ * is called just before the root object on the JsonBuilder is to be
++ * closed.
++ *
++ * New objects and fields can be append, but exist entries cannot be modified.
++ *
++ * Packet and Flow will be provided if available, but will other be
++ * NULL.
++ *
++ * Limitations: At this time the callbacks will only be called for EVE
++ * loggers that use JsonBuilder, notably this means it won't be called
++ * for stats records at this time.
++ *
++ * \returns true if callback is registered, false is not due to memory
++ *     allocation error.
++ */
++bool SCEveRegisterCallback(SCEveUserCallbackFn fn, void *user);
++
++/** \internal
++ *
++ * Run EVE callbacks.
++ */
++void SCEveRunCallbacks(ThreadVars *tv, const Packet *p, Flow *f, JsonBuilder *jb);
++
+ #endif
+
+
+
+
+@@ -757,7 +757,7 @@ static int AlertJson(ThreadVars *tv, JsonAlertLogThread *aft, const Packet *p)
+             EveAddVerdict(jb, p);
+         }
+ 
+-        OutputJsonBuilderBuffer(jb, aft->ctx);
++        OutputJsonBuilderBuffer(tv, p, p->flow, jb, aft->ctx);
+         jb_free(jb);
+     }
+ 
+@@ -767,7 +767,7 @@ static int AlertJson(ThreadVars *tv, JsonAlertLogThread *aft, const Packet *p)
+                 CreateEveHeader(p, LOG_DIR_PACKET, "packet", NULL, json_output_ctx->eve_ctx);
+         if (unlikely(packetjs != NULL)) {
+             EvePacket(p, packetjs, 0);
+-        

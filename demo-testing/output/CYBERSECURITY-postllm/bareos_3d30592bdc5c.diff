@@ -1,0 +1,93 @@
+@@ -51,7 +51,7 @@ except ImportError:
+ from pyVim.connect import SmartConnect, Disconnect
+ from pyVmomi import vim
+ from pyVmomi import vmodl
+-from pyVim.task import WaitForTask
++import pyVim.task
+ from pyVmomi.VmomiSupport import VmomiJSONEncoder
+ 
+ # if OrderedDict is not available from collection (eg. SLES11),
+@@ -302,7 +302,7 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+ 
+         # strip trailing "/" from folder option value value
+         if "folder" in self.options:
+-            self.options["folder"] = self.options["folder"].rstrip("/")
++            self.options["folder"] = self.vadp.proper_path(self.options["folder"])
+ 
+         if self.options.get("restore_powerstate"):
+             if self.options["restore_powerstate"] not in ["on", "off", "previous"]:
+@@ -375,13 +375,6 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+                 % (option, StringCodec.encode(self.options[option])),
+             )
+ 
+-        for options in self.options:
+-            bareosfd.DebugMessage(
+-                100,
+-                "Using Option %s=%s\n"
+-                % (option, StringCodec.encode(self.options[option])),
+-            )
+-
+         if not self.options.get("localvmdk") == "yes":
+             if "vcthumbprint" in self.options:
+                 # fetch the thumbprint and compare it with the passed thumbprint,
+@@ -424,10 +417,13 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+         if "uuid" in self.options:
+             self.vadp.backup_path = "/VMS/%s" % (self.options["uuid"])
+         else:
+-            self.vadp.backup_path = "/VMS/%s/%s/%s" % (
+-                self.options["dc"],
+-                self.options["folder"].strip("/"),
+-                self.options["vmname"],
++            self.vadp.backup_path = self.vadp.proper_path(
++                "/VMS/%s/%s/%s"
++                % (
++                    self.options["dc"],
++                    self.options["folder"],
++                    self.options["vmname"],
++                )
+             )
+ 
+         return self.vadp.prepare_vm_backup()
+@@ -818,7 +814,12 @@ class BareosFdPluginVMware(BareosFdPluginBaseclass.BareosFdPluginBaseclass):
+                 100, "handle_plugin_event() called with bEventEndBackupJob\n"
+             )
+             bareosfd.DebugMessage(100, "removing Snapshot\n")
+-            self.vadp.remove_vm_snapshot()
++            # Normal snapshot removal usually failed when there were long
++            # delays during backup, so that keepalive had to reconnect
++            # to vCenter. Retrieving the VM details again and cleaning
++            # up any snapshots taken by this plugin is more reliable.
++            self.vadp.get_vm_details()
++            self.vadp.cleanup_vm_snapshots()
+ 
+         elif event == bareosfd.bEventEndFileSet:
+             bareosfd.DebugMessage(
+@@ -1008,6 +1009,7 @@ class BareosVADPWrapper(object):
+         self.fetched_vcthumbprint = None
+         self.snapshot_retries = 3
+         self.snapshot_retry_wait = 5
++        self.snapshot_prefix = "BareosTmpSnap_jobId"
+ 
+     def connect_vmware(self):
+         # this prevents from repeating on second call
+@@ -1097,15 +1099,23 @@ class BareosVADPWrapper(object):
+             return
+ 
+         if int(time.time()) - self.si_last_keepalive > 600:
+-            self.si.CurrentTime()
++            try:
++                self.si.CurrentTime()
++            except vim.fault.NotAuthenticated as keepalive_error:
++                bareosfd.JobMessage(
++                    bareosfd.M_INFO,
++                    "keepalive failed with %s, last keepalive was %s s ago, trying to reconnect.\n"
++                    % (keepalive_error.msg, time.time() - self.si_last_keepalive),
++                )
++                self.si = None
++                self.connect_vmware()
++                self.get_vm_details()
++
+             self.si_last_keepalive = int(time.time())
+ 
+-    def prepare_vm_backup(self):
++

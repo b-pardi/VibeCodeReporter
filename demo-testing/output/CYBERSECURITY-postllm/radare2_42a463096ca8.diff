@@ -1,0 +1,130 @@
+@@ -1551,7 +1551,8 @@ R_API char *r_bin_name_tostring2(RBinName *bn, int type) {
+ 	}
+ 	if (type == 'd' && bn->name) {
+ 		return bn->name;
+-	} else if (type == 'f' && bn->fname) {
++	}
++	if (type == 'f' && bn->fname) {
+ 		if (bn->fname) {
+ 			return bn->fname;
+ 		}
+
+
+
+
+@@ -1753,7 +1753,7 @@ static int init_items(struct MACH0_(obj_t) *mo) {
+ 
+ 	mo->uuidn = 0;
+ 	mo->os = 0;
+-	mo->has_crypto = 0;
++	mo->has_crypto = false;
+ 	mo->segments_vec = NULL;
+ 	r_pvector_init (&mo->libs_cache, (RPVectorFree) free);
+ 
+
+
+
+
+@@ -165,7 +165,7 @@ struct MACH0_(obj_t) {
+ 	RBuffer *b;
+ 	int os;
+ 	Sdb *kv;
+-	int has_crypto;
++	bool has_crypto;
+ 	int has_canary;
+ 	int has_retguard;
+ 	int has_sanitizers;
+@@ -200,6 +200,8 @@ struct MACH0_(obj_t) {
+ 	bool nofuncstarts;
+ 	ut64 exports_trie_off;
+ 	ut32 exports_trie_size;
++	RInterval lastrange;
++	ut64 lastrange_pa;
+ };
+ 
+ typedef struct {
+
+
+
+
+@@ -99,15 +99,14 @@ static void metadata_sections_fini(MetaSections *ms) {
+ static MetaSections metadata_sections_init(RBinFile *bf) {
+ 	MetaSections ms = {{0}};
+ 	const RVector *sections = MACH0_(load_sections) (bf->bo->bin_obj);
+-	if (!sections) {
+-		return ms;
+-	}
+-	struct section_t *section;
+-	r_vector_foreach (sections, section) {
+-		PARSECTION (&ms.clslist, "__objc_classlist");
+-		PARSECTION (&ms.catlist, "__objc_catlist");
+-		PARSECTION (&ms.types, "swift5_types");
+-		PARSECTION (&ms.fieldmd, "swift5_fieldmd");
++	if (sections) {
++		struct section_t *section;
++		r_vector_foreach (sections, section) {
++			PARSECTION (&ms.clslist, "__objc_classlist");
++			PARSECTION (&ms.catlist, "__objc_catlist");
++			PARSECTION (&ms.types, "swift5_types");
++			PARSECTION (&ms.fieldmd, "swift5_fieldmd");
++		}
+ 	}
+ 	return ms;
+ }
+@@ -198,7 +197,6 @@ struct MACH0_(SCategory) {
+ 	mach0_ut properties;
+ };
+ 
+-static char *readstr(RBinFile *bf, ut64 addr);
+ static mach0_ut va2pa(RBinFile *bf, mach0_ut p, ut32 *offset, ut32 *left);
+ static void get_ivar_list(RBinFile *bf, RBinClass *klass, mach0_ut p);
+ static void get_objc_property_list(RBinFile *bf, RBinClass *klass, mach0_ut p);
+@@ -210,10 +208,10 @@ static void get_class_ro_t(RBinFile *bf, bool *is_meta_class, RBinClass *klass,
+ static RList *MACH0_(parse_categories)(RBinFile *bf, MetaSections *ms, const RSkipList *relocs, objc_cache_opt_info *oi);
+ static bool read_ptr_pa(RBinFile *bf, ut64 paddr, mach0_ut *out);
+ static bool read_ptr_va(RBinFile *bf, ut64 vaddr, mach0_ut *out);
+-static char *read_str(RBinFile *bf, mach0_ut p, ut32 *offset, ut32 *left);
++static char *readstr(RBinFile *bf, mach0_ut p, ut32 *offset, ut32 *left);
+ 
+ static inline bool is_thumb(RBinFile *bf) {
+-	struct MACH0_(obj_t) *bin = (struct MACH0_(obj_t) *)bf->bo->bin_obj;
++	const struct MACH0_(obj_t) *bin = (struct MACH0_(obj_t) *)bf->bo->bin_obj;
+ 	return (bin->hdr.cputype == 12 && bin->hdr.cpusubtype == 9);
+ }
+ 
+@@ -229,16 +227,34 @@ static mach0_ut va2pa(RBinFile *bf, mach0_ut p, ut32 *offset, ut32 *left) {
+ 	if (left) {
+ 		*left = 0;
+ 	}
++	// rename bin to 'mo'
+ 	struct MACH0_(obj_t) *bin = (struct MACH0_(obj_t)*) obj->bin_obj;
+ 	if (bin->va2pa) {
+ 		// TODO: bf must be first
+ 		return bin->va2pa (p, offset, left, bf);
+ 	}
+ 	mach0_ut addr = p;
++	if (bin->lastrange.addr) {
++		// memoizatiooon
++		RInterval itv = bin->lastrange;
++		if (addr >= itv.addr && addr < itv.addr + itv.size) {
++			if (offset) {
++				*offset = addr - itv.addr;
++			}
++			if (left) {
++				*left = itv.size - (addr - itv.addr);
++			}
++			return bin->lastrange_pa - obj->boffset + (addr - itv.addr);
++		}
++	}
+ 	RBinSection *s;
+ 	RVecSegment *sections = MACH0_(get_segments_vec) (bf, bin);  // don't free, cached by bin
+ 	R_VEC_FOREACH (sections, s) {
+ 		if (addr >= s->vaddr && addr < s->vaddr + s->vsize) {
++			// XXX range should be with psize, otherwise the bound can be wrong on pa
++			bin->lastrange.addr = s->vaddr;
++			bin->lastrange.size = s->vsize;
++			bin->lastrange_pa = s->paddr;
+ 			if (offset) {
+ 				*offset = addr - s->vaddr;
+ 			}
+@@ -253,8 +269,8 @@ static mach0_ut va2pa(RBinFile *bf, m

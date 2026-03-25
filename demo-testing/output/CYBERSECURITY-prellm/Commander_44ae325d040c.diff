@@ -1,0 +1,102 @@
+@@ -8,6 +8,7 @@
+ # Copyright 2018 Keeper Security Inc.
+ # Contact: ops@keepersecurity.com
+ #
++from typing import Optional, List, NoReturn
+ 
+ import re
+ import os
+@@ -16,15 +17,18 @@ import argparse
+ import logging
+ import datetime
+ import getpass
+-from typing import Optional, List
+ 
+ import requests
+ import tempfile
+ import json
+ 
++from socket import AF_UNIX, IPPROTO_TCP, SOCK_STREAM, socket
++
+ from urllib.parse import urlsplit
+ from tabulate import tabulate
+ from Cryptodome.Cipher import AES
++from Cryptodome.PublicKey import RSA
++from Cryptodome.Math.Numbers import Integer
+ 
+ from ..params import KeeperParams, LAST_RECORD_UID, LAST_FOLDER_UID, LAST_SHARED_FOLDER_UID
+ from ..record import Record
+@@ -33,6 +37,15 @@ from .base import raise_parse_exception, suppress_exit, user_choice, Command
+ from ..subfolder import try_resolve_path, find_folders, get_folder_path
+ 
+ 
++SSH_AGENT_FAILURE = 5
++SSH_AGENT_SUCCESS = 6
++SSH2_AGENTC_ADD_IDENTITY = 17
++SSH2_AGENTC_REMOVE_IDENTITY = 18
++SSH2_AGENTC_ADD_ID_CONSTRAINED = 25
++
++SSH_AGENT_CONSTRAIN_LIFETIME = 1
++
++
+ def register_commands(commands):
+     commands['sync-down'] = SyncDownCommand()
+     commands['delete-all'] = RecordDeleteAllCommand()
+@@ -306,8 +319,9 @@ Connect Command Syntax Description:
+ 
+ This command reads the custom fields for names starting with "connect:"
+ 
+-  endpoint:<name>                command 
+-  endpoint:<name>:description    command description
++  connect:<name>                        command 
++  connect:<name>:description            command description
++  connect:<name>:ssh-key:<key-comment>  ssh private key to add to ssh-agent
+ 
+ Connection command may contain template parameters.
+ Parameter syntax is ${<parameter_name>}
+@@ -321,6 +335,7 @@ Supported parameters:
+     ${mask:<name>}                  secured user variable. Stored to non-shared data
+     ${file:<attachment_name>}       stores attachment into temporary file. parameter is replaced with temp file name
+     ${body:<attachment_name>}       content of the attachment file.
++    ${<custom_field_name>}          custom field value
+ 
+ SSH Example:
+ 
+@@ -379,7 +394,8 @@ class ConnectCommand(Command):
+                             endpoint = endpoint[rpos+1:]
+                 endpoints = [x for x in ConnectCommand.Endpoints if x.name == endpoint]
+             if len(endpoints) > 0:
+-                ConnectCommand.connect_endpoint(params, endpoint, api.get_record(params, endpoints[0].record_uid), kwargs.get('new_data') or False)
++                record = api.get_record(params, endpoints[0].record_uid)
++                ConnectCommand.connect_endpoint(params, endpoint, record, kwargs.get('new_data') or False)
+             else:
+                 logging.info("Connect endpoint '{0}' not found".format(endpoint))
+         else:
+@@ -410,6 +426,100 @@ class ConnectCommand(Command):
+                 logging.info("No connect endpoints found")
+             return
+ 
++    @staticmethod
++    def delete_ssh_keys(delete_requests):
++        ssh_socket_path = os.environ['SSH_AUTH_SOCK']
++        try:
++            with socket(AF_UNIX, SOCK_STREAM, 0) as sock:
++                sock.settimeout(1)
++                sock.connect(ssh_socket_path)
++                for rq in delete_requests:
++                    sock.send(ConnectCommand.ssh_agent_encode_bytes(rq))
++                    len_bytes = sock.recv(4)
++                    answer_len = int.from_bytes(len_bytes, byteorder='big')
++                    recv_payload = sock.recv(answer_len)
++                    if recv_payload[0] == SSH_AGENT_FAILURE:
++                        logging.info('Failed to delete added ssh key')
++        except Exception as e:
++            logging.error(e)
++
++    @staticmethod
++    def add_ssh_keys(params, endpoint, record, temp_files, non_shared):
++        # type: (KeeperParams, str, Record, List[str], dict) -> List[bytes]
++        rs = []
++        key_prefix = 'connect:{0}:ssh-key'.format(endpoint)
++        ssh_socket_path = os.environ['SSH_AUTH_SOCK']
++     

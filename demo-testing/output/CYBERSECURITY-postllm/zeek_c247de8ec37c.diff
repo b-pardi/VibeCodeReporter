@@ -1,0 +1,111 @@
+@@ -109,7 +109,7 @@ ErrorResult Backend::Put(ValPtr key, ValPtr value, bool overwrite, double expira
+ 
+     auto res = DoPut(std::move(key), std::move(value), overwrite, expiration_time, cb);
+ 
+-    if ( (! native_async || zeek::run_state::reading_traces) && cb ) {
++    if ( ! native_async && cb ) {
+         cb->Complete(res);
+         delete cb;
+     }
+@@ -125,7 +125,7 @@ ValResult Backend::Get(ValPtr key, ValResultCallback* cb) {
+ 
+     auto res = DoGet(std::move(key), cb);
+ 
+-    if ( (! native_async || zeek::run_state::reading_traces) && cb ) {
++    if ( ! native_async && cb ) {
+         cb->Complete(res);
+         delete cb;
+     }
+@@ -141,7 +141,7 @@ ErrorResult Backend::Erase(ValPtr key, ErrorResultCallback* cb) {
+ 
+     auto res = DoErase(std::move(key), cb);
+ 
+-    if ( (! native_async || zeek::run_state::reading_traces) && cb ) {
++    if ( ! native_async && cb ) {
+         cb->Complete(res);
+         delete cb;
+     }
+
+
+
+
+@@ -8,6 +8,7 @@
+ #include "zeek/Val.h"
+ #include "zeek/iosource/Manager.h"
+ 
++#include "hiredis/adapters/poll.h"
+ #include "hiredis/async.h"
+ #include "hiredis/hiredis.h"
+ 
+@@ -16,8 +17,10 @@ namespace {
+ 
+ class Tracer {
+ public:
+-    Tracer(const std::string& where) : where(where) { /*printf("%s\n", where.c_str());*/ }
+-    ~Tracer() { /* printf("%s done\n", where.c_str()); */ }
++    Tracer(const std::string& where) : where(where) { // printf("%s\n", where.c_str());
++    }
++    ~Tracer() { // printf("%s done\n", where.c_str());
++    }
+     std::string where;
+ };
+ 
+@@ -54,25 +57,62 @@ void redisErase(redisAsyncContext* ctx, void* reply, void* privdata) {
+     backend->HandleEraseResult(static_cast<redisReply*>(reply), callback);
+ }
+ 
++void redisZRANGEBYSCORE(redisAsyncContext* ctx, void* reply, void* privdata) {
++    auto t = Tracer("erase");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    backend->HandleZRANGEBYSCORE(static_cast<redisReply*>(reply));
++}
++
++void redisGeneric(redisAsyncContext* ctx, void* reply, void* privdata) {
++    auto t = Tracer("generic");
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(ctx->data);
++    backend->HandleGeneric();
++    freeReplyObject(reply);
++}
++
++// Because we called redisPollAttach in DoOpen(), privdata here is a
++// redisPollEvents object. We can go through that object to get the context's
++// data, which contains the backend. Because we overrode these callbacks in
++// DoOpen, we still want to mimic their callbacks to redisPollTick functions
++// correctly.
+ void redisAddRead(void* privdata) {
+     auto t = Tracer("addread");
+-    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
+-    backend->OnAddRead();
++    auto rpe = static_cast<redisPollEvents*>(privdata);
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
++
++    if ( rpe->reading == 0 )
++        zeek::iosource_mgr->RegisterFd(rpe->fd, backend, zeek::iosource::IOSource::READ);
++    rpe->reading = 1;
+ }
++
+ void redisDelRead(void* privdata) {
+     auto t = Tracer("delread");
+-    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
+-    backend->OnDelRead();
++    auto rpe = static_cast<redisPollEvents*>(privdata);
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
++
++    if ( rpe->reading == 1 )
++        zeek::iosource_mgr->UnregisterFd(rpe->fd, backend, zeek::iosource::IOSource::READ);
++    rpe->reading = 0;
+ }
++
+ void redisAddWrite(void* privdata) {
+     auto t = Tracer("addwrite");
+-    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(privdata);
+-    backend->OnAddWrite();
++    auto rpe = static_cast<redisPollEvents*>(privdata);
++    auto backend = static_cast<zeek::storage::backend::redis::Redis*>(rpe->context->data);
++
++    if ( rpe->writing == 0 )
++        zeek::iosource_mgr->RegisterFd(rpe->fd, backend, zeek::iosource::IOSource::WRITE);
++    rpe->writing = 1;
+ }
++
+ void redisDelWrite(void*

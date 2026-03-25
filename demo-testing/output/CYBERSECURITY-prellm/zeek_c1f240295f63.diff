@@ -1,0 +1,134 @@
+new file mode 100644
+
+
+
+@@ -0,0 +1,2223 @@
++// See the file "COPYING" in the main distribution directory for copyright.
++
++#include "zeek/script_opt/ZAM/Gen-ZAM.h"
++
++#include <ctype.h>
++#include <regex>
++
++using namespace std;
++
++// Helper functions to convert dashes to underscores or vice versa.
++static char dash_to_under(char c)
++	{
++	return c == '-' ? '_' : c;
++	}
++
++static char under_to_dash(char c)
++	{
++	return c == '_' ? '-' : c;
++	}
++
++// Structure for binding together Zeek script types, internal names Gen-ZAM
++// uses to track them, mnemonics for referring to them in instruction names,
++// the corresponding Val accessor, and whether the type requires memory
++// management.
++struct TypeInfo
++	{
++	string tag;
++	ZAM_ExprType et;
++	string suffix;
++	string accessor; // doesn't include "As" prefix or "()" suffix
++	bool is_managed;
++	};
++
++static vector<TypeInfo> ZAM_type_info = {
++	{"TYPE_ADDR", ZAM_EXPR_TYPE_ADDR, "A", "Addr", true},
++	{"TYPE_ANY", ZAM_EXPR_TYPE_ANY, "a", "Any", true},
++	{"TYPE_COUNT", ZAM_EXPR_TYPE_UINT, "U", "Count", false},
++	{"TYPE_DOUBLE", ZAM_EXPR_TYPE_DOUBLE, "D", "Double", false},
++	{"TYPE_FILE", ZAM_EXPR_TYPE_FILE, "f", "File", true},
++	{"TYPE_FUNC", ZAM_EXPR_TYPE_FUNC, "F", "Func", true},
++	{"TYPE_INT", ZAM_EXPR_TYPE_INT, "I", "Int", false},
++	{"TYPE_LIST", ZAM_EXPR_TYPE_LIST, "L", "List", true},
++	{"TYPE_OPAQUE", ZAM_EXPR_TYPE_OPAQUE, "O", "Opaque", true},
++	{"TYPE_PATTERN", ZAM_EXPR_TYPE_PATTERN, "P", "Pattern", true},
++	{"TYPE_RECORD", ZAM_EXPR_TYPE_RECORD, "R", "Record", true},
++	{"TYPE_STRING", ZAM_EXPR_TYPE_STRING, "S", "String", true},
++	{"TYPE_SUBNET", ZAM_EXPR_TYPE_SUBNET, "N", "SubNet", true},
++	{"TYPE_TABLE", ZAM_EXPR_TYPE_TABLE, "T", "Table", true},
++	{"TYPE_TYPE", ZAM_EXPR_TYPE_TYPE, "t", "Type", true},
++	{"TYPE_VECTOR", ZAM_EXPR_TYPE_VECTOR, "V", "Vector", true},
++};
++
++// Given a ZAM_ExprType, returns the corresponding TypeInfo.
++const TypeInfo& find_type_info(ZAM_ExprType et)
++	{
++	assert(et != ZAM_EXPR_TYPE_NONE);
++
++	auto pred = [et](const TypeInfo& ti) -> bool
++	{
++		return ti.et == et;
++	};
++	auto ti = std::find_if(ZAM_type_info.begin(), ZAM_type_info.end(), pred);
++
++	assert(ti != ZAM_type_info.end());
++	return *ti;
++	}
++
++// Given a ZAM_ExprType, return its ZVal accessor.  Takes into account
++// some naming inconsistencies between ZVal's and Val's.
++string find_type_accessor(ZAM_ExprType et)
++	{
++	switch ( et )
++		{
++		case ZAM_EXPR_TYPE_NONE:
++			return "";
++
++		case ZAM_EXPR_TYPE_UINT:
++			return "uint_val";
++
++		case ZAM_EXPR_TYPE_PATTERN:
++			return "re_val";
++
++		default:
++			{
++			string acc = find_type_info(et).accessor;
++			transform(acc.begin(), acc.end(), acc.begin(), ::tolower);
++			return acc + "_val";
++			}
++		}
++	}
++
++// Maps ZAM operand types to pairs of (1) the C++ name used to declare
++// the operand in a method declaration, and (2) the variable name to
++// use for the operand.
++unordered_map<ZAM_OperandType, pair<const char*, const char*>> ArgsManager::ot_to_args = {
++	{ZAM_OT_AUX, {"OpaqueVals*", "v"}},
++	{ZAM_OT_CONSTANT, {"const ConstExpr*", "c"}},
++	{ZAM_OT_EVENT_HANDLER, {"EventHandler*", "h"}},
++	{ZAM_OT_INT, {"int", "i"}},
++	{ZAM_OT_LIST, {"const ListExpr*", "l"}},
++	{ZAM_OT_RECORD_FIELD, {"const NameExpr*", "n"}},
++	{ZAM_OT_VAR, {"const NameExpr*", "n"}},
++
++	// The following gets special treatment.
++	{ZAM_OT_ASSIGN_FIELD, {"const NameExpr*", "n"}},
++};
++
++ArgsManager::ArgsManager(const vector<ZAM_OperandType>& ot, ZAM_InstClass zc)
++	{
++	int n = 0;
++	bool add_field = false;
++
++	for ( const auto& ot_i : ot )
++		{
++		if ( ot_i == ZAM_OT_NONE )
++			{ // it had better be the only operand type
++			assert(ot.size() == 1);
++			break;
++			}
++
++		if ( n++ == 0 && zc == ZIC_COND )
++			// Skip the conditional's nominal assignment slot.
++			continue;
++
++		// Start off the argument info using the usual case
++		// of (1) same method parameter name as GenInst argument,
++		// and (2) not requiring a record field.
++		auto& arg_i = ot_to_args[ot_i];
++		Arg arg = {ar

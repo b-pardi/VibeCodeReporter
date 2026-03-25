@@ -1,0 +1,94 @@
+@@ -58,9 +58,10 @@ class RestApi(BaseWorld):
+         await self.auth_svc.logout_user(request)
+ 
+     async def landing(self, request):
++        """If user doesn't have access, server will attempt to redirect to login."""
+         access = await self.auth_svc.get_permissions(request)
+         if not access:
+-            return render_template('login.html', request, dict())
++            return await self.auth_svc.login_redirect(request)
+         plugins = await self.data_svc.locate('plugins', {'access': tuple(access), **dict(enabled=True)})
+         data = dict(plugins=[p.display for p in plugins], errors=self.app_svc.errors + self._request_errors(request))
+         return render_template('%s.html' % access[0].name, request, data)
+
+
+
+
+@@ -1,8 +1,10 @@
+ import base64
++import logging
+ from collections import namedtuple
+ 
+ from aiohttp import web, web_request
+ from aiohttp.web_exceptions import HTTPUnauthorized, HTTPForbidden
++from aiohttp_jinja2 import render_template
+ from aiohttp_security import api as aiohttp_security_api
+ from aiohttp_security import SessionIdentityPolicy, check_permission, remember, forget
+ from aiohttp_security import setup as setup_security
+@@ -10,10 +12,12 @@ from aiohttp_security.abc import AbstractAuthorizationPolicy
+ from aiohttp_session import setup as setup_session
+ from aiohttp_session.cookie_storage import EncryptedCookieStorage
+ from cryptography import fernet
++from importlib import import_module
+ import ldap3
+ from ldap3.core.exceptions import LDAPAttributeError, LDAPException
+ 
+ from app.service.interfaces.i_auth_svc import AuthServiceInterface
++from app.service.interfaces.i_login_handler import LoginHandlerInterface
+ from app.utility.base_service import BaseService
+ 
+ 
+@@ -52,13 +56,17 @@ def check_authorization(func):
+ 
+ 
+ class AuthService(AuthServiceInterface, BaseService):
+-
+     User = namedtuple('User', ['username', 'password', 'permissions'])
+ 
+     def __init__(self):
+         self.user_map = dict()
+         self.log = self.add_service('auth_svc', self)
+-        self.ldap_config = self.get_config('ldap')
++        self._default_login_handler = self.DefaultLoginHandler(self.get_services())
++        self._login_handler = self._get_primary_login_handler()
++
++    @property
++    def default_login_handler(self):
++        return self._default_login_handler
+ 
+     async def apply(self, app, users):
+         if users:
+@@ -88,21 +96,36 @@ class AuthService(AuthServiceInterface, BaseService):
+         :param request:
+         :return: the response/location of where the user is trying to navigate
+         """
+-        data = await request.post()
+-        username = data.get('username')
+-        password = data.get('password')
+-        if self.ldap_config:
+-            verified = await self._ldap_login(username, password)
+-        else:
+-            verified = await self._check_credentials(request.app.user_map, username, password)
+-
+-        if verified:
+-            self.log.debug('%s logging in:' % username)
+-            response = web.HTTPFound('/')
+-            await remember(request, response, username)
+-            raise response
+-        self.log.debug('%s failed login attempt: ' % username)
+-        raise web.HTTPFound('/login')
++        try:
++            self.log.debug('Using login handler "%s" for login' % self._login_handler.name)
++            await self._login_handler.handle_login(request)
++        except web.HTTPRedirection as http_redirect:
++            raise http_redirect
++        except Exception as e:
++            self.log.error('Exception when handling login request: %s' % e)
++
++        # Fallback if not already using default login handler
++        if not isinstance(self._login_handler, self.DefaultLoginHandler):
++            self.log.debug('Falling back to default login handler')
++            return await self._default_login_handler.handle_login(request)
++
++    async def login_redirect(self, request, use_template=True):
++        """Redirect user to login page using the configured l
